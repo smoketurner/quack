@@ -77,7 +77,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/workspaces/{id}/query", post(query::query))
         .route("/workspaces/{id}/query/stream", post(query::stream))
         .route("/workspaces/{id}/sql", post(query::sql))
-        .route("/workspaces/{id}/search", get(query::search))
+        .route("/workspaces/{id}/search", post(query::search))
         .route(
             "/workspaces/{id}/documents",
             get(documents::list).post(documents::upload),
@@ -94,7 +94,7 @@ pub(crate) fn router() -> Router<App> {
             post(embeddings::refresh),
         )
         .route("/workspaces/{id}/tables", get(tables::list))
-        .route("/workspaces/{id}/tables/{name}", get(tables::describe))
+        .route("/workspaces/{id}/tables/describe", post(tables::describe))
         .route(
             "/workspaces/{id}/context",
             get(context::show).put(context::replace),
@@ -128,8 +128,8 @@ pub(crate) fn router() -> Router<App> {
         )
         .route("/workspaces/{id}/okf", get(okf::export))
         .route("/workspaces/{id}/import", post(import::import))
-        .route("/workspaces/{id}/graph/search", get(graph::search))
-        .route("/workspaces/{id}/graph/path", get(graph::path))
+        .route("/workspaces/{id}/graph/search", post(graph::search))
+        .route("/workspaces/{id}/graph/path", post(graph::path))
         .route("/workspaces/{id}/graph/status", get(graph::status))
         .route("/workspaces/{id}/graph/extract", post(graph::extract))
         .route("/workspaces/{id}/graph/revalidate", post(graph::revalidate))

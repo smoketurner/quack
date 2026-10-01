@@ -12,14 +12,14 @@ use axum::response::IntoResponse;
 use quack_core::error::Record;
 use quack_core::ids::{DocumentId, WorkspaceId};
 use quack_core::ingestion;
-use quack_core::jobs::{JobId, LaneKey};
+use quack_core::jobs::JobId;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::text::NonBlankText;
 use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::queue::{MAX_WAITING_UPLOADS, UPLOAD_RETRY_SECONDS, UploadJob};
+use crate::server::queue::UploadJob;
 use crate::server::state::{App, with_db};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store::Revision;
@@ -281,15 +281,6 @@ pub(crate) async fn enqueue(
         return Err(ApiError::bad_request("no file or text in the request"));
     }
     let id = access.workspace.id.clone();
-    // Backpressure: every queued upload holds its bytes in memory, so a
-    // workspace with a deep line of them turns more away until it drains.
-    let waiting = app.jobs.lane_active(&LaneKey::Ingest(id.clone()));
-    if waiting.saturating_add(files.len()) > MAX_WAITING_UPLOADS {
-        return Err(ApiError::busy(
-            format!("{waiting} uploads are already waiting in this workspace; try again shortly"),
-            UPLOAD_RETRY_SECONDS,
-        ));
-    }
     let db = app.workspace_db(&id).await?;
     let mut queued = Vec::new();
     for IncomingFile {
@@ -359,17 +350,14 @@ pub(crate) async fn enqueue(
                 Some(serde_json::json!({ "filename": filename, "size_bytes": size })),
             )
             .await?;
-        let job = UploadJob {
-            document_id: document_id.clone(),
-            filename: filename.clone(),
-            data,
-        }
-        .submit(
-            app,
-            &id,
-            Some(access.identity.user_id.clone()),
-            Arc::clone(&db),
-        );
+        let job = UploadJob::spool(app, &id, &db, document_id.clone(), filename.clone(), &data)
+            .await?
+            .submit(
+                app,
+                &id,
+                Some(access.identity.user_id.clone()),
+                Arc::clone(&db),
+            );
         queued.push(Enqueued::Queued {
             id: document_id,
             filename,

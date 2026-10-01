@@ -143,7 +143,7 @@ Every interface calls the same core entry points:
 | Operation | Core | Web | REST | MCP | TUI / print |
 |-----------|------|-----|------|-----|-------------|
 | Ask | `llm::TurnRequest::run` (event stream) | SSE fragments | SSE or JSON | `query` tool | inline / stdout+stderr |
-| Retrieve | `WorkspaceDb::search_hybrid_chunks`, `analysis::rerank` | via agent, `/search` page | `GET .../search` | `search` tool | via agent |
+| Retrieve | `WorkspaceDb::search_hybrid_chunks`, `analysis::rerank` | via agent, `/search` page | `POST .../search` | `search` tool | via agent |
 | SQL | `WorkspaceDb::execute_query{,_capped}` | SQL page | `POST .../sql` | `sql` tool | `/sql`, `-q` |
 | Ingest | `ingestion::ingest_file` | upload | `POST .../documents` | - | `/ingest`, `quack ingest` |
 | Graph | `graph::traverse::{neighborhood,path}` | graph page | `GET .../graph/*` | `search_graph` | `/graph`, `quack graph` |
@@ -294,7 +294,11 @@ records nothing.
 
 Internal tables are prefixed `_quack_`, hidden from the agent's table listing, and refused
 to user and agent SQL: `classify_user_statement` returns "internal tables are not
-accessible", with no opt-in flag. IDs are UUID v7 via `uuid::Uuid::now_v7()`.
+accessible", with no opt-in flag. Nor do errors name them: every workspace connection reports
+errors as JSON (`SET GLOBAL errors_as_json` while it is confined, so reader and audit clones
+inherit it), and `Error::DuckDb` renders them through `storage::workspace::DuckDbMessage`,
+which rebuilds DuckDB's "Did you mean" and "Candidate bindings" suggestions from the report's
+`candidates` without `_quack_` names. IDs are UUID v7 via `uuid::Uuid::now_v7()`.
 
 ```sql
 -- workspace metadata
@@ -479,7 +483,7 @@ CREATE TABLE _quack_messages (
     seq        INTEGER NOT NULL,
     role       TEXT NOT NULL,                -- user | assistant | tool
     content    TEXT NOT NULL,
-    metadata   JSON,                         -- tool: ToolMeta (tool, detail, duration_ms, rows); assistant: AssistantMeta (chart, citations, write_refused, graph, usage)
+    metadata   JSON,                         -- tool: ToolMeta (tool, detail, duration_ms, rows); assistant: AssistantMeta (chart, citations, write_refused, graph, usage, duration_ms)
     created_at TIMESTAMP DEFAULT now(),
     UNIQUE (session_id, seq)
 );
@@ -1170,7 +1174,7 @@ write. Statements referencing `_quack_` tables are refused regardless.
 Every interface returns one response object (11.2), built by `AgentResponse::to_json`:
 `answer`, `citations` (each with `n`, `chunk_id`, `document_id`, `filename`, `chunk_index`,
 `page`, `heading`, `label`), `queries`, `steps`, `graph`, `chart`, `write_refused`,
-`cancelled`, `usage`, `session_id`. `AuthRequired` is exit code 4 from every command that
+`cancelled`, `usage`, `duration_ms`, `session_id`. `AuthRequired` is exit code 4 from every command that
 reaches a provider.
 
 `usage` is the provider's report for the turn (`input_tokens`, `output_tokens`,
@@ -1179,6 +1183,11 @@ per-request counts when the turn derailed before a final response. It is `null`,
 when the provider reported nothing, as local models often do. The counts also go on the
 assistant message's metadata in `_quack_messages`, so session exports carry them. They are a
 record, not an input: the history trim and Ollama's `num_ctx` estimate before the call.
+
+`duration_ms` is the turn's wall-clock time, from the question's arrival (prompt assembly
+included) to the answer, cancelled turns too. It goes on the assistant message's metadata
+beside `usage`. The turn is recorded when it ends, so the user message's `created_at` is set
+to the time it was asked rather than left at the insert's `now()`.
 
 **Limits.** The agent's connection runs with `SET memory_limit` and `SET threads` from
 config. A statement runs on the calling thread (for the agent, a `spawn_blocking` one) while
@@ -1611,6 +1620,7 @@ mode emits:
   "write_refused": false,
   "cancelled": false,
   "usage": {"input_tokens": 1204, "output_tokens": 57, "total_tokens": 1261},
+  "duration_ms": 2345,
   "session_id": "..."
 }
 ```
@@ -1627,7 +1637,7 @@ POST   /api/v1/auth/login  POST /api/v1/auth/logout  GET /api/v1/auth/me
 POST   /api/v1/workspaces/{id}/query              {prompt, session_id?, mode?, allow_write?}
 POST   /api/v1/workspaces/{id}/query/stream       same, SSE agent events; closing the stream cancels the turn
 POST   /api/v1/workspaces/{id}/sql                {sql}
-GET    /api/v1/workspaces/{id}/search?query=&top_k=   hybrid retrieval, no LLM (the MCP `search` tool's names)
+POST   /api/v1/workspaces/{id}/search         {query, top_k?}: hybrid retrieval, no LLM (the MCP `search` tool's names)
 GET    /api/v1/workspaces/{id}/documents
 POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 202 {id}
                                                   (identical bytes: status "duplicate";
@@ -1635,9 +1645,10 @@ POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 2
 GET    /api/v1/workspaces/{id}/documents/{doc}    status, metadata
 PATCH  /api/v1/workspaces/{id}/documents/{doc}    {pinned}
 DELETE /api/v1/workspaces/{id}/documents/{doc}
-GET    /api/v1/workspaces/{id}/tables[/{name}]
-GET    /api/v1/workspaces/{id}/graph/search?entity=&class=&relation=&hops=
-GET    /api/v1/workspaces/{id}/graph/path?from=&to=
+GET    /api/v1/workspaces/{id}/tables
+POST   /api/v1/workspaces/{id}/tables/describe  {name}: columns, row count, sample rows
+POST   /api/v1/workspaces/{id}/graph/search    {entity?, class?, relation?, hops?}
+POST   /api/v1/workspaces/{id}/graph/path      {from, to, max_hops?}
 GET    /api/v1/workspaces/{id}/graph/status
 POST   /api/v1/workspaces/{id}/graph/extract       tables now; documents -> 202 with the cost, one run per workspace (409 while one runs)
 POST   /api/v1/workspaces/{id}/graph/revalidate
@@ -1672,7 +1683,13 @@ GET    /api/v1/admin/users  POST ...  GET /api/v1/admin/audit   (admin; skeletal
 
 Uploads, extraction, and proposals return `202` with a `job` id and run on the work queue
 (section 4.1); clients poll the resource or the job. Agent turns run there too, in their
-session's lane. Rate limiting is in section 12. Errors:
+session's lane. Rate limiting is in section 12.
+
+Workspace content never travels in a URL: search text, entity names, table names, and SQL
+go in a request body, since request logs, proxies, and browser history keep URLs and all of
+them sit outside the workspace file. Paths and query strings carry only ids, versions,
+fixed-set values, and paging. The request log records each request's route template
+(`/api/v1/workspaces/{id}/documents/{doc}`), never its URI. Errors:
 
 - An unknown value for a fixed-set field (`mode`, `role`, `scopes`, an audit `outcome`, a
   merge or candidate `action`, an extraction `source`) is refused while the request is
@@ -2481,8 +2498,10 @@ Every gap is a GitHub issue unless the item says otherwise.
     - Done: the terminal, the web chat, REST `query`, uploads, graph extraction, and the
       document pass run on `quack_core::jobs`. `llm::LimitedHttp` limits model requests per
       provider and model, interactive first. Ingest and import stop on cancel, mid-embedding
-      included. A workspace with 64 uploads waiting answers the next with 503 and
-      `Retry-After: 30`. The web Jobs page follows `.../jobs/stream` instead of polling; the
+      included. A queued upload's bytes wait on disk in the workspace's `uploads/`
+      directory until its job ends (`server::queue::UploadJob`), so a batch of any size is
+      queued; an earlier process's leftovers are failed and deleted when the workspace
+      opens. The web Jobs page follows `.../jobs/stream` instead of polling; the
       terminal re-renders only changed messages.
     - Done: the writer is an actor (section 4.1), so no runtime worker blocks on the
       database. Ingestion, import, extraction, and the CLI commands take the `Writer` (the

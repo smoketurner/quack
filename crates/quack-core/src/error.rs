@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::storage::workspace::DuckDbMessage;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("configuration error: {0}")]
@@ -11,8 +13,10 @@ pub enum Error {
     #[error(transparent)]
     Sqlite(#[from] sqlx::Error),
 
-    #[error(transparent)]
-    DuckDb(#[from] duckdb::Error),
+    /// Shown through `DuckDbMessage`, and not a `source`, so nothing that
+    /// walks the error chain prints the raw report with its suggestions.
+    #[error("{}", DuckDbMessage(.0))]
+    DuckDb(duckdb::Error),
 
     #[error("workspace not found: {0}")]
     WorkspaceNotFound(String),
@@ -95,6 +99,13 @@ pub enum Error {
     #[error("cancelled")]
     Cancelled,
 
+    /// A statement ran past the query timeout and the watchdog stopped it.
+    #[error(
+        "the statement ran longer than the {timeout:?} query timeout \
+         ([analysis].query_timeout_seconds) and was stopped"
+    )]
+    QueryTimeout { timeout: std::time::Duration },
+
     /// A structured file would load into a table another document owns
     /// (issue #51): one document per table.
     #[error(
@@ -117,6 +128,10 @@ pub enum Error {
         allowed: String,
     },
 
+    /// A file with no bytes: there is nothing to load or chunk.
+    #[error("'{0}' is empty; there is nothing to ingest")]
+    EmptyFile(String),
+
     #[error("unsupported file type: {0}")]
     UnsupportedFileType(String),
 
@@ -137,6 +152,12 @@ pub enum Error {
 
     #[error("format error: {0}")]
     Fmt(#[from] fmt::Error),
+}
+
+impl From<duckdb::Error> for Error {
+    fn from(error: duckdb::Error) -> Self {
+        Self::DuckDb(error)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

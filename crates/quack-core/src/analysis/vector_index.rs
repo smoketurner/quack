@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::tools::ReaderDb;
-use crate::embedding::{Embedder, Input};
+use crate::embedding::{Embedder, EmbeddingModel, Input};
 use crate::storage::workspace::{ChunkScope, ChunkSearchResult};
 
 /// Chunks returned when a request's sample count does not fit.
@@ -28,9 +28,13 @@ fn store_error(e: impl std::fmt::Display) -> VectorStoreError {
 
 impl<M> DuckDbVectorIndex<M>
 where
-    M: rig::embeddings::EmbeddingModel + Send + Sync,
+    M: EmbeddingModel + Send + Sync,
 {
     /// The chunks nearest the request's query, across the workspace.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rig's VectorStoreError, which the VectorStoreIndex methods return"
+    )]
     async fn search(
         &self,
         req: &VectorSearchRequest<Filter<serde_json::Value>>,
@@ -50,10 +54,14 @@ where
 
 impl<M> VectorStoreIndex for DuckDbVectorIndex<M>
 where
-    M: rig::embeddings::EmbeddingModel + Send + Sync,
+    M: EmbeddingModel + Send + Sync,
 {
     type Filter = Filter<serde_json::Value>;
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "rig's VectorStoreError, which the VectorStoreIndex methods return"
+    )]
     async fn top_n<T: for<'a> Deserialize<'a> + Send>(
         &self,
         req: VectorSearchRequest<Self::Filter>,

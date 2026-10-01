@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use quack_core::config::Config;
 use quack_core::embedding::refresh::{self, Plan, Retype};
-use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
+use quack_core::embedding::{Dimension, Embedder, EmbeddingModel, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::graph::store::{self as graph_store, NewNode};
 use quack_core::graph::{Properties, Standing};
@@ -21,7 +21,8 @@ use quack_core::storage::workspace::{
     ChunkScope, DocumentStatus, HybridLimits, MetaKey, NewChunk, NewDocument, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
-use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
+use rig::ProviderError;
+use rig::embeddings::Embedding;
 use tokio_util::sync::CancellationToken;
 
 /// Records every input and answers with vectors of `width`.
@@ -45,22 +46,10 @@ impl Tape {
 }
 
 impl EmbeddingModel for Tape {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self::new(4)
-    }
-
-    fn ndims(&self) -> usize {
-        self.width
-    }
-
     fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
-        let texts: Vec<String> = texts.into_iter().collect();
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Embedding>, ProviderError>> + Send {
         self.inputs.lock().unwrap().extend(texts.iter().cloned());
         let mut vec = vec![0.0; self.width];
         if let Some(first) = vec.first_mut() {

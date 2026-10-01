@@ -3,7 +3,6 @@ use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use rig::embeddings::EmbeddingModel;
 use rig::tool::{Tool, ToolContext};
 use schemars::generate::SchemaSettings;
 use schemars::transform::{Transform, transform_subschemas};
@@ -25,8 +24,9 @@ use super::policy::{RefusalFlag, WritePolicy};
 use super::rerank::{self, ModelReranker, Reranker};
 use super::text_to_sql::Modeled;
 use crate::config::{RerankMode, RetrievalConfig};
-use crate::embedding::{Embedder, Input, Vector};
+use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
+use crate::llm::ChatModel;
 use crate::ontology::{ClassRelations, Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
 use crate::text::NonBlankText;
@@ -698,7 +698,7 @@ impl<M> SearchDocumentsTool<M> {
     /// reranker when `rerank = "model"`.
     pub fn from_config(
         db: ReaderDb,
-        completion_model: &(impl rig::completion::CompletionModel + Clone + 'static),
+        completion_model: &ChatModel,
         embedding_model: Option<Embedder<M>>,
         retrieval: &RetrievalConfig,
         recorder: TurnRecorder,
@@ -1351,25 +1351,11 @@ mod tests {
     }
 
     impl EmbeddingModel for CountingEmbeddingModel {
-        const MAX_DOCUMENTS: usize = 1024;
-        type Client = ();
-
-        fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-            Self {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-
-        fn ndims(&self) -> usize {
-            4
-        }
-
         fn embed_texts(
             &self,
-            texts: impl IntoIterator<Item = String> + Send,
-        ) -> impl Future<
-            Output = Result<Vec<rig::embeddings::Embedding>, rig::embeddings::EmbeddingError>,
-        > + Send {
+            texts: Vec<String>,
+        ) -> impl Future<Output = Result<Vec<rig::embeddings::Embedding>, rig::ProviderError>> + Send
+        {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let result = texts
                 .into_iter()

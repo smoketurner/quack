@@ -17,7 +17,9 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use super::error::{ApiError, ApiResult};
 use super::oidc::Oidc;
+use super::queue::UploadJob;
 use super::resource::ProtectedResource;
+use super::web::flash::Flashes;
 use crate::mcp::McpServer;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::storage::control::ControlPlane;
@@ -72,6 +74,8 @@ pub(crate) struct AppState {
     /// Workspaces with a graph extraction in flight: one at a time each,
     /// so a reset cannot clear a run part way (issue #48).
     extractions: Mutex<HashSet<WorkspaceId>>,
+    /// Messages between a form's redirect and the page it lands on.
+    pub flashes: Flashes,
 }
 
 /// Holds a workspace's extraction slot; dropping it frees the slot.
@@ -121,6 +125,7 @@ impl AppState {
             oidc,
             mcp: tokio::sync::Mutex::new(HashMap::new()),
             extractions: Mutex::new(HashSet::new()),
+            flashes: Flashes::default(),
         }
     }
 
@@ -192,12 +197,14 @@ impl AppState {
         cell.get_or_try_init(|| async move {
             let (db, audit) = tokio::task::spawn_blocking(move || {
                 let db = WorkspaceDb::open(&config, id.as_str())?;
-                // Uploads a previous process took but never finished cannot
-                // be resumed: their bytes are gone with it.
+                // Uploads a previous process took but never finished are
+                // failed, and their spooled bytes deleted: the person who
+                // sent them is told to send them again.
                 let stale = db.fail_stale_uploads()?;
                 if stale > 0 {
                     tracing::warn!(workspace = %id, stale, "failed uploads left queued by an earlier process");
                 }
+                UploadJob::clear_stale(&config, &id)?;
                 let audit = AuditLog::open(&db)?;
                 Ok::<_, CoreError>((db, audit))
             })

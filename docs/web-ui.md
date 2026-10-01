@@ -36,10 +36,11 @@ slot; a success opens the same session cookie a password login does.
 
 ## Templates
 
-Every page struct carries a `page: Page`: title, username, admin flag, local flag, and the
-current workspace with its role and what the caller may do. `base.html` reads it for the
-header and the workspace tabs: chat, documents, tables (with the import form), SQL,
-context, ontology, graph, settings.
+Every page struct carries a `page: Page`: title, its `Tab`, username, admin flag, local flag,
+and the current workspace with its role and what the caller may do. `base.html` reads it for
+the header and the workspace tabs (`Tab::WORKSPACE`: chat, documents, tables with the import
+form, SQL, context, ontology, graph, jobs, settings), highlighting the page's tab, or the
+Users or Audit link, with `aria-current="page"`.
 
 - **`ontology.html`** shows the class tree, relations, properties, and mappings; the JSON
   editor; the version list with the diff to the previous version; the propose form; and the
@@ -47,14 +48,61 @@ context, ontology, graph, settings.
 - **`graph.html`** shows status banners (provisional, stale, missing mapped tables,
   drift), the search and path forms, the ECharts result with a node inspector, the merge
   queue, and the extract, revalidate, and review buttons.
+- **Dark only.** `styles/input.css` sets `color-scheme: dark`, so native controls and the
+  file picker follow; panels are `slate-900` on a `slate-950` page and primary buttons are
+  `blue-600`. Charts and the graph use ECharts' built-in `dark` theme.
+- **Tables never let columns touch or overrun.** Listing tables carry `data-table` (padded
+  cells, from `input.css`); prose and names wrap with `wrap-anywhere`; short fixed values
+  (status, sizes, times) are `whitespace-nowrap`; data grids (sample rows, SQL results) and
+  opaque ids keep one line per cell, cut at a width with "…", and carry the full value in a
+  `title` tooltip. Every grid track is `minmax(0,1fr)` (`grid-cols-1` below `md`), so a
+  wide grid or a long name scrolls or truncates inside its own box instead of widening the
+  page, on a phone too; the Documents and Jobs tables scroll sideways in their own box.
+- **Times are localized in the browser; no page prints a raw timestamp.** Every stored time
+  goes through `web::When` (`Clock` or `Relative`), which renders `<time datetime="…Z"
+  data-when="clock|relative">` with UTC text from `web::Moment` (DuckDB and SQLite timestamp
+  text, or RFC 3339), and falls back to the escaped text when a value is not a time. `app.js`
+  rewrites each in the viewer's zone, with the full local date and time as the tooltip.
+  `clock` (chat messages, versions, the audit log, token expiry) is the time of day, with the
+  date when not today; `relative` (jobs, documents, sessions, token last use) is "5 min ago"
+  for today and the date before that, refreshed every 30 seconds and after every htmx swap.
+  Chat messages show when they were asked or answered, and an answer how many milliseconds it
+  took (`duration_ms` on the response object and the assistant message's metadata). A SQL
+  result shows its row count and the statement's own run time in milliseconds
+  (`SqlOutcome::duration_ms`, also in the `POST .../sql` body), timed on the connection's
+  thread so a wait for the writer is not counted.
+- **SQL results sort by rewriting the statement.** A header is a button that posts the
+  statement that ran back with `sort` (the 1-based column) and `dir`. When the statement is
+  one `SELECT`-shaped query (`WorkspaceDb::sortable`, from `json_serialize_sql`),
+  `WorkspaceDb::sort_statement` sets its own top-level `ORDER BY` in `DuckDB`'s parse tree,
+  replacing any it had and placing it before a `LIMIT`, and `json_deserialize_sql` prints it
+  back; the column is named when that name is unique and resolves, and given by position
+  otherwise. Nulls sort last both ways. The rewritten SQL runs, and the response swaps it
+  into the editor (`hx-swap-oob`), so what ran is what the person sees and keeps editing.
+  Without a click, rows come back in the statement's own order. Anything else (a write,
+  several statements) runs as typed with plain headers. "Download CSV" is a `POST` of the
+  same statement: SQL never travels in a URL, where request logs and proxies would keep it.
+- **Accessibility.** Every page starts with a "Skip to content" link to `<main id="main">`;
+  the workspace tabs and the admin links are named `<nav>` landmarks, and the current tab or
+  chat session carries `aria-current="page"`. A control with only a placeholder has an
+  `aria-label`; table headers carry `scope="col"`, and a table with no header row has an
+  `aria-label`. Errors are `role="alert"`, notices and "refreshes itself" lines
+  `role="status"`, and the SQL result is `aria-live="polite"`. The conversation is a polite
+  `role="log"`; a streaming answer stays `aria-busy` until it completes, so a screen reader
+  reads it once. Charts and graphs are `role="img"` with a label naming what they show.
 - **Fragments that htmx swaps** (`documents_rows.html`, `sql_result.html`) are their own
   structs, rendered to a string and inserted with `|safe`. askama escapes everything else.
 
 A form handler calls the same typed operation as the REST handler (a method on `Access` or
 `Identity` in `server::api`), so both apply the same validation and audit rows. The API
-wraps the result in JSON; the web handler in a `web::flash::Flash` redirect. Redirects carry
-outcomes in the query string: `?error=` renders red and `?notice=` green, so a started
-background pass or a revalidation count does not look like a failure. The documents list polls its rows fragment only while a
+wraps the result in JSON; the web handler in a `web::flash::Flash` redirect. A redirect's
+outcome (an error in red, a notice in green, so a started background pass or a revalidation
+count does not look like a failure), and for the Tables page the table to open, can name
+workspace content, so it never goes in the URL: `web::flash::keep` stashes it in this
+process's memory (`Flashes`, one minute) under a random id, and the browser carries only the
+id in an `HttpOnly` `quack_flash` cookie; the landing page's `Flashed` extractor takes it, so
+it shows once. The graph page's searches and the Tables page's choice of table are posted
+forms for the same reason. The documents list polls its rows fragment only while a
 row is processing (marked `data-pending`).
 
 ## Assets

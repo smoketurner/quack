@@ -4,42 +4,39 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ page.title }} · quack</title>
-  <link rel="stylesheet" href="/static/css/output.css">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/css/output.css">
   <script src="/static/js/htmx.min.js" defer></script>
   <script src="/static/js/echarts.min.js" defer></script>
   <script src="/static/js/app.js" defer></script>
 </head>
-<body class="min-h-screen bg-slate-50 text-slate-900">
-  <header class="border-b border-slate-200 bg-white">
+<body class="min-h-screen bg-slate-950 text-slate-100">
+  <a href="#main" class="sr-only rounded bg-blue-600 px-3 py-2 text-white focus:not-sr-only focus:absolute focus:left-4 focus:top-3 focus:z-10">Skip to content</a>
+  <header class="border-b border-slate-800 bg-slate-900">
     <div class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
       <a href="/workspaces" class="text-lg font-semibold tracking-tight">quack</a>
       {% if let Some(ws) = page.workspace %}
-      <nav class="flex flex-wrap items-center gap-1 text-sm">
-        <span class="mr-2 rounded bg-slate-100 px-2 py-1 font-medium">{{ ws.name }} <span class="text-slate-500">· {{ ws.role }}</span></span>
-        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/chat">Chat</a>
-        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/documents">Documents</a>
-        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/tables">Tables</a>
-        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/sql">SQL</a>
-        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/context">Context</a>
-        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/ontology">Ontology</a>
-        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/graph">Graph</a>
-        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/jobs">Jobs</a>
-        <a class="rounded px-2 py-1 hover:bg-slate-100" href="/w/{{ ws.id }}/settings">Settings</a>
+      <nav aria-label="Workspace" class="flex flex-wrap items-center gap-1 text-sm">
+        <span class="mr-2 max-w-[16rem] truncate rounded bg-slate-800 px-2 py-1 font-medium" title="{{ ws.name }}">{{ ws.name }} <span class="text-slate-400">· {{ ws.role }}</span></span>
+        {% for tab in Tab::WORKSPACE %}
+        <a class="rounded px-2 py-1 {% if page.tab == tab %}bg-blue-500/15 font-medium text-blue-300{% else %}hover:bg-slate-800{% endif %}" href="/w/{{ ws.id }}/{{ tab.path() }}"{% if page.tab == tab %} aria-current="page"{% endif %}>{{ tab.label() }}</a>
+        {% endfor %}
       </nav>
       {% endif %}
-      <div class="ml-auto flex items-center gap-3 text-sm text-slate-600">
+      <div class="ml-auto flex items-center gap-3 text-sm text-slate-400">
         {% if page.is_admin %}
-        <a class="hover:underline" href="/admin/users">Users</a>
-        <a class="hover:underline" href="/admin/audit">Audit</a>
+        <nav aria-label="Administration" class="flex items-center gap-3">
+        <a class="{% if page.tab == Tab::Users %}font-medium text-blue-300{% else %}hover:underline{% endif %}" href="/admin/users"{% if page.tab == Tab::Users %} aria-current="page"{% endif %}>Users</a>
+        <a class="{% if page.tab == Tab::Audit %}font-medium text-blue-300{% else %}hover:underline{% endif %}" href="/admin/audit"{% if page.tab == Tab::Audit %} aria-current="page"{% endif %}>Audit</a>
+        </nav>
         {% endif %}
         <span>{{ page.username }}</span>
         {% if !page.local %}
-        <form method="post" action="/logout"><button class="rounded border border-slate-300 px-2 py-1 hover:bg-slate-100" type="submit">Log out</button></form>
+        <form method="post" action="/logout"><button class="rounded border border-slate-700 px-2 py-1 hover:bg-slate-800" type="submit">Log out</button></form>
         {% endif %}
       </div>
     </div>
   </header>
-  <main class="mx-auto max-w-6xl px-4 py-6">
+  <main id="main" class="mx-auto max-w-6xl px-4 py-6">
     {% block content %}{% endblock %}
   </main>
 </body>

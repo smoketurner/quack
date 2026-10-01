@@ -12,7 +12,7 @@
 use std::fmt;
 use std::time::Instant;
 
-use rig::embeddings::EmbeddingModel;
+use crate::embedding::EmbeddingModel;
 
 use super::{Dimension, Embedder, EmbeddingStatus, Input, Profile, StaleVectors};
 use crate::error::{Error, Result};

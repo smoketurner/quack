@@ -798,21 +798,15 @@ async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: bool) -> Check {
         .models(name, provider)
         .await
         .map(Listing::Ids)
-        .map_err(|e| match e {
-            rig::http_client::Error::InvalidStatusCode(status)
-            | rig::http_client::Error::InvalidStatusCodeWithMessage(status, _)
-            | rig::http_client::Error::InvalidStatusCodeWithDetails { status, .. }
-                if matches!(status.as_u16(), 401 | 403) =>
-            {
-                Probe::Rejected(status.as_u16())
-            }
-            rig::http_client::Error::InvalidStatusCode(status)
-            | rig::http_client::Error::InvalidStatusCodeWithMessage(status, _)
-            | rig::http_client::Error::InvalidStatusCodeWithDetails { status, .. } => {
-                Probe::Unexpected(format!("HTTP {}", status.as_u16()))
-            }
-            other => Probe::Unreachable(ErrorChain(&other).to_string()),
-        });
+        // rig's accessor, not its variant: the variant that carries a status
+        // is rig's to change, and a match on it would silently stop firing.
+        .map_err(
+            |e| match e.non_success_status().map(|status| status.as_u16()) {
+                Some(code @ (401 | 403)) => Probe::Rejected(code),
+                Some(code) => Probe::Unexpected(format!("HTTP {code}")),
+                None => Probe::Unreachable(ErrorChain(&e).to_string()),
+            },
+        );
     listing_check(area, model, &base, listing)
 }
 

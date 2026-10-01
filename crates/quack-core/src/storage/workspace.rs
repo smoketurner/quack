@@ -1,7 +1,8 @@
+use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
@@ -69,8 +70,8 @@ impl VectorTable {
     }
 }
 
-impl std::fmt::Display for VectorTable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for VectorTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
@@ -162,6 +163,117 @@ impl SerializedStatement {
         let mut names = Vec::new();
         collect_table_names(tree, &mut names);
         Some(names)
+    }
+}
+
+/// Which way a result is sorted. Nulls go last either way, so a column
+/// with gaps shows its values first in both directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+impl SortDirection {
+    /// The other direction: what clicking a sorted column asks for next.
+    #[must_use]
+    pub const fn flipped(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+}
+
+/// A sort on a query's results: the column by its 1-based position, so a
+/// name that needs quoting, or two columns sharing one, sorts the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResultSort {
+    pub column: std::num::NonZeroUsize,
+    pub direction: SortDirection,
+}
+
+/// A single `SELECT`-shaped statement's parse tree, which a sort rewrites:
+/// its own `ORDER BY` is set, and `DuckDB` prints the statement back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sortable(serde_json::Value);
+
+/// How a rewritten `ORDER BY` names its column.
+enum OrderKey<'a> {
+    Name(&'a str),
+    Position(std::num::NonZeroUsize),
+}
+
+impl OrderKey<'_> {
+    fn expression(&self) -> serde_json::Value {
+        match self {
+            Self::Name(name) => serde_json::json!({
+                "class": "COLUMN_REF",
+                "type": "COLUMN_REF",
+                "alias": "",
+                "column_names": [name],
+            }),
+            Self::Position(position) => serde_json::json!({
+                "class": "CONSTANT",
+                "type": "VALUE_CONSTANT",
+                "alias": "",
+                "value": {
+                    "type": { "id": "BIGINT", "type_info": null },
+                    "is_null": false,
+                    "value": position.get(),
+                },
+            }),
+        }
+    }
+}
+
+impl Sortable {
+    /// The top-level query's modifiers (`ORDER BY`, `LIMIT`, `DISTINCT`).
+    fn modifiers(tree: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
+        tree.get_mut("statements")?
+            .get_mut(0)?
+            .get_mut("node")?
+            .get_mut("modifiers")?
+            .as_array_mut()
+    }
+
+    /// The tree with its `ORDER BY` replaced by `sort` on `key`, placed
+    /// before any `LIMIT`, so the rows are sorted and then cut, as the
+    /// printed SQL reads.
+    fn ordered_by(&self, sort: ResultSort, key: &OrderKey<'_>) -> serde_json::Value {
+        let mut tree = self.0.clone();
+        let order = serde_json::json!({
+            "type": "ORDER_MODIFIER",
+            "orders": [{
+                "type": match sort.direction {
+                    SortDirection::Asc => "ASCENDING",
+                    SortDirection::Desc => "DESCENDING",
+                },
+                "null_order": "NULLS LAST",
+                "expression": key.expression(),
+            }],
+        });
+        if let Some(modifiers) = Self::modifiers(&mut tree) {
+            let kind = |m: &serde_json::Value| {
+                m.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            };
+            if let Some(existing) = modifiers
+                .iter_mut()
+                .find(|m| kind(m).as_deref() == Some("ORDER_MODIFIER"))
+            {
+                *existing = order;
+            } else {
+                let at = modifiers
+                    .iter()
+                    .position(|m| kind(m).as_deref() == Some("LIMIT_MODIFIER"))
+                    .unwrap_or(modifiers.len());
+                modifiers.insert(at, order);
+            }
+        }
+        tree
     }
 }
 
@@ -598,9 +710,14 @@ impl WorkspaceDb {
                 self.conn.execute("SET allowed_directories = []", [])?;
             }
         }
+        // Errors as JSON, for every connection to the database (the reader
+        // and audit clones included): it keeps the names `DuckDB` suggests
+        // apart from the message, so `DuckDbMessage` can leave quack's
+        // internal tables out of them.
         self.conn.execute_batch(
             "SET enable_external_access = false;\n\
              SET allow_persistent_secrets = false;\n\
+             SET GLOBAL errors_as_json = true;\n\
              SET lock_configuration = true;",
         )?;
         Ok(())
@@ -637,6 +754,67 @@ impl WorkspaceDb {
             }
             SerializedStatement::Unserializable => StatementKind::Write,
         })
+    }
+
+    /// `sql` in a form that can be sorted, when it is exactly one
+    /// `SELECT`-shaped statement; `None` for anything else (a write,
+    /// several statements), which has no rows of its own to reorder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parse fails.
+    pub fn sortable(&self, sql: &str) -> Result<Option<Sortable>> {
+        let SerializedStatement::Tree(mut tree) = self.serialize(sql)? else {
+            return Ok(None);
+        };
+        let single = tree
+            .get("statements")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|statements| statements.len() == 1);
+        if !single || Sortable::modifiers(&mut tree).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Sortable(tree)))
+    }
+
+    /// The statement with its own `ORDER BY` set to `sort`, replacing any
+    /// it had, as `DuckDB` prints it. The column is named when its name is
+    /// unique among the results and `DuckDB` resolves it, which reads
+    /// better in the editor; otherwise it is given by position, which
+    /// always resolves (an unnamed expression, two columns sharing a name).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if printing or planning the statement fails.
+    pub fn sort_statement(&self, sortable: &Sortable, sort: ResultSort) -> Result<String> {
+        let names = self.result_columns(&self.print(&sortable.0)?)?;
+        let index = sort.column.get().saturating_sub(1);
+        if let Some(name) = names.get(index)
+            && names.iter().filter(|n| *n == name).count() == 1
+        {
+            let named = self.print(&sortable.ordered_by(sort, &OrderKey::Name(name)))?;
+            if self.result_columns(&named).is_ok() {
+                return Ok(named);
+            }
+        }
+        self.print(&sortable.ordered_by(sort, &OrderKey::Position(sort.column)))
+    }
+
+    /// A parse tree printed back as SQL by `DuckDB`.
+    fn print(&self, tree: &serde_json::Value) -> Result<String> {
+        Ok(self.conn.query_row(
+            "SELECT json_deserialize_sql(?::JSON)",
+            duckdb::params![tree.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The result columns `sql` would return, from planning it with no rows.
+    fn result_columns(&self, sql: &str) -> Result<Vec<String>> {
+        Ok(self
+            .read_rows(&format!("SELECT * FROM ({sql}) LIMIT 0"), Some(0))?
+            .results
+            .columns)
     }
 
     /// `sql` as `DuckDB`'s own parser sees it.
@@ -2065,7 +2243,10 @@ impl WorkspaceDb {
     }
 
     fn read_rows(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
-        let _guard = self.arm_timeout();
+        self.under_timeout(|db| db.read_rows_untimed(sql, keep))
+    }
+
+    fn read_rows_untimed(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
 
@@ -2125,9 +2306,10 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the SQL is invalid or execution fails.
     pub fn execute_with_params<P: duckdb::Params>(&self, sql: &str, params: P) -> Result<()> {
-        let _guard = self.arm_timeout();
-        self.conn.execute(sql, params)?;
-        Ok(())
+        self.under_timeout(|db| {
+            db.conn.execute(sql, params)?;
+            Ok(())
+        })
     }
 
     /// Run `f` under the statement watchdog: if it is still going after
@@ -2137,10 +2319,16 @@ impl WorkspaceDb {
     ///
     /// # Errors
     ///
-    /// Returns `f`'s error, including the interruption.
+    /// Returns `f`'s error, or [`Error::QueryTimeout`] when the watchdog
+    /// interrupted it.
     pub fn under_timeout<R>(&self, f: impl FnOnce(&Self) -> Result<R>) -> Result<R> {
-        let _guard = self.arm_timeout();
-        f(self)
+        let guard = self.arm_timeout();
+        match f(self) {
+            Err(_) if guard.fired() => Err(Error::QueryTimeout {
+                timeout: self.query_timeout,
+            }),
+            other => other,
+        }
     }
 
     /// Run `f` so that `canceller` can interrupt its statements while it
@@ -2214,15 +2402,21 @@ impl WorkspaceDb {
         let (disarm, armed) = std::sync::mpsc::channel::<()>();
         let handle = self.conn.interrupt_handle();
         let timeout = self.query_timeout;
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
         // The watchdog sleeps on the channel: dropping the guard closes it
         // and wakes the thread at once, so nothing polls (issue #62).
         std::thread::spawn(move || {
             if armed.recv_timeout(timeout) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
                 tracing::warn!(?timeout, "statement exceeded timeout; interrupting");
+                flag.store(true, Ordering::SeqCst);
                 handle.interrupt();
             }
         });
-        TimeoutGuard { _disarm: disarm }
+        TimeoutGuard {
+            _disarm: disarm,
+            fired,
+        }
     }
 
     /// List all user-created tables in the workspace (excludes internal tables).
@@ -2296,6 +2490,27 @@ impl WorkspaceDb {
                     row.get(0)
                 })?;
         Ok(version)
+    }
+
+    /// The `limit` most recently ingested documents, and how many there are
+    /// in all: the bounded inventory the system prompt carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn recent_documents(&self, limit: usize) -> Result<(Vec<DocumentInfo>, usize)> {
+        let sql = format!("{DOCUMENT_SELECT} ORDER BY ingested_at DESC, id DESC LIMIT ?");
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let docs = stmt
+            .query_map(duckdb::params![limit], |row| DocumentInfo::try_from(row))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        let total: i64 =
+            self.conn
+                .query_row("SELECT count(*) FROM _quack_documents", [], |row| {
+                    row.get(0)
+                })?;
+        Ok((docs, usize::try_from(total).unwrap_or(usize::MAX)))
     }
 
     /// List all ingested documents with their status.
@@ -2963,6 +3178,15 @@ impl QueryCanceller {
 /// Disarms the watchdog when dropped: the closed channel wakes it.
 struct TimeoutGuard {
     _disarm: std::sync::mpsc::Sender<()>,
+    /// Set by the watchdog before it interrupts, so an error after it is
+    /// known to be the timeout rather than the statement's own.
+    fired: Arc<AtomicBool>,
+}
+
+impl TimeoutGuard {
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
 }
 
 /// Guards one `BEGIN TRANSACTION READ ONLY` on a reader connection.
@@ -3081,6 +3305,72 @@ fn collect_table_names(node: &serde_json::Value, out: &mut Vec<String>) {
 /// Conservative token scan used for statements the parser will not serialize.
 fn is_internal_name(name: &str) -> bool {
     name.to_ascii_lowercase().starts_with(INTERNAL_PREFIX)
+}
+
+/// A `DuckDB` error as quack shows it. Workspace connections report errors
+/// as JSON (`errors_as_json`, set as they open), which keeps the names
+/// `DuckDB` suggests ("Did you mean ...?") apart from the message, so the
+/// message is rebuilt here without quack's internal tables: otherwise every
+/// misspelled table name would offer `_quack_meta` to the person and the
+/// model. An error that is not that JSON is shown as `DuckDB` wrote it.
+pub struct DuckDbMessage<'a>(pub &'a duckdb::Error);
+
+/// The fields of a JSON error report that quack shows.
+#[derive(serde::Deserialize)]
+struct ErrorReport {
+    exception_type: String,
+    exception_message: String,
+    /// The names `DuckDB` suggests, comma-separated.
+    #[serde(default)]
+    candidates: Option<String>,
+}
+
+impl fmt::Display for DuckDbMessage<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = self.0.to_string();
+        // A parser error comes as `Parser Error: {...}`, any other as the
+        // bare report.
+        let report = serde_json::from_str::<ErrorReport>(&text).ok().or_else(|| {
+            text.split_once(": ")
+                .and_then(|(_, rest)| serde_json::from_str(rest).ok())
+        });
+        match report {
+            Some(report) => report.fmt(f),
+            None => f.write_str(&text),
+        }
+    }
+}
+
+impl fmt::Display for ErrorReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match &self.candidates {
+            // `DuckDB` appends its suggestions below the message's first line.
+            Some(_) => self
+                .exception_message
+                .split_once('\n')
+                .map_or(self.exception_message.as_str(), |(first, _)| first),
+            None => self.exception_message.as_str(),
+        };
+        write!(f, "{} Error: {message}", self.exception_type)?;
+        let shown: Vec<String> = self
+            .candidates
+            .iter()
+            .flat_map(|names| names.split(','))
+            .map(str::trim)
+            .filter(|name| {
+                !name.is_empty() && !name.rsplit('.').next().is_some_and(is_internal_name)
+            })
+            .map(|name| format!("\"{name}\""))
+            .collect();
+        if shown.is_empty() {
+            return Ok(());
+        }
+        if self.exception_type == "Binder" {
+            write!(f, "\nCandidate bindings: {}", shown.join(", "))
+        } else {
+            write!(f, "\nDid you mean {}?", shown.join(" or "))
+        }
+    }
 }
 
 fn mentions_internal_table_token(sql: &str) -> bool {
@@ -3272,16 +3562,17 @@ fn display_json_value(val: &serde_json::Value) -> String {
 }
 
 impl QueryResults {
-    /// The rows with every text cell longer than `max_chars` cut, with an
-    /// ellipsis.
+    /// The rows with every cell whose printed text is longer than
+    /// `max_chars` cut, with an ellipsis. A nested value (a `STRUCT`, a
+    /// `LIST`) is cut by the text `write_table` prints for it, so one JSON
+    /// column cannot make a row any wider than a long string can.
     #[must_use]
     pub fn with_cells_cut(&self, max_chars: usize) -> Self {
         let mut out = self.clone();
         for row in &mut out.rows {
             for cell in row.iter_mut() {
-                if let serde_json::Value::String(text) = cell
-                    && text.chars().count() > max_chars
-                {
+                let text = display_json_value(cell);
+                if text.chars().count() > max_chars {
                     let mut cut: String = text.chars().take(max_chars).collect();
                     cut.push('\u{2026}');
                     *cell = serde_json::Value::String(cut);
@@ -3642,6 +3933,58 @@ mod tests {
         assert_ne!(nevada, shape("SELECT x FROM t WHERE s = 'NEVADA' LIMIT 5"));
         assert_eq!(shape("CREATE TABLE t2 AS SELECT 1"), None);
         assert_eq!(shape("SELECT FROM WHERE"), None);
+    }
+
+    /// An error never suggests one of quack's internal tables, on the
+    /// writer or a reader clone: a misspelled name gets the user's own near
+    /// matches or none, and every other error reads as `DuckDB` wrote it.
+    #[test]
+    fn errors_never_suggest_internal_tables() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        db.execute_query("CREATE TABLE orders (id INTEGER, customer VARCHAR, customers VARCHAR)")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let reader = db
+            .try_clone_reader()
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        for conn in [&db, &reader] {
+            let error = |sql: &str| {
+                conn.execute_query(sql)
+                    .err()
+                    .map_or_else(|| fail(&format!("{sql} ran")), |e| e.to_string())
+            };
+            // The only near match is internal: no suggestion at all.
+            assert_eq!(
+                error("SELECT * FROM _quack_meto"),
+                "Catalog Error: Table with name _quack_meto does not exist!"
+            );
+            let missing = error("SELECT * FROM no_such_table");
+            assert!(
+                missing.starts_with("Catalog Error: Table with name no_such_table does not exist!")
+                    && !missing.contains("_quack_"),
+                "{missing}"
+            );
+            // The user's own near matches still come through.
+            assert_eq!(
+                error("SELECT * FROM orderz"),
+                "Catalog Error: Table with name orderz does not exist!\nDid you mean \"orders\"?"
+            );
+            assert_eq!(
+                error("SELECT customr FROM orders"),
+                "Binder Error: Referenced column \"customr\" not found in FROM clause!\n\
+                 Candidate bindings: \"customer\", \"customers\""
+            );
+            // Everything else reads as it always did.
+            assert_eq!(
+                error("SELEC 1"),
+                "Parser Error: syntax error at or near \"SELEC\""
+            );
+            assert_eq!(
+                error("INSERT INTO orders VALUES ('x', 'a', 'b')"),
+                "Conversion Error: Could not convert string 'x' to INT32"
+            );
+        }
     }
 
     /// Design doc 7.4: a read-classified statement may still name a file, so
@@ -4976,5 +5319,113 @@ mod tests {
             single.rows.first().and_then(|r| r.first()),
             Some(&serde_json::json!("rejected"))
         );
+    }
+
+    /// Sample rows in the system prompt are cut per cell: nested values
+    /// too, which once put a 58,000-character JSON cell (and a header
+    /// padded to match) into every turn's prompt.
+    #[test]
+    fn cells_are_cut_whatever_their_type() {
+        let long = "x".repeat(100);
+        let results = QueryResults {
+            columns: vec![String::from("s"), String::from("j"), String::from("n")],
+            rows: vec![vec![
+                serde_json::Value::String(long.clone()),
+                serde_json::json!({ "a": [long.clone(), long] }),
+                serde_json::json!(12_345),
+            ]],
+        };
+        let cut = results.with_cells_cut(10);
+        let cells: Vec<String> = cut.rows.iter().flatten().map(display_json_value).collect();
+        assert_eq!(
+            cells,
+            vec![
+                format!("{}\u{2026}", "x".repeat(10)),
+                String::from("{\"a\":[\"xxx\u{2026}"),
+                String::from("12345"),
+            ]
+        );
+    }
+
+    /// A sort rewrites the statement's own `ORDER BY`, replacing any it
+    /// had and sitting before its `LIMIT`; the column is named when the
+    /// name resolves and given by position when it does not. Anything that
+    /// is not one `SELECT` has no rows of its own to reorder.
+    #[test]
+    fn sorting_rewrites_the_statements_own_order_by() {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        db.execute_query(
+            "CREATE TABLE t AS SELECT * FROM (VALUES (2, 'b'), (NULL, 'n'), (1, 'a')) v(x, y)",
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let rewrite = |sql: &str, column: usize, direction: SortDirection| {
+            let sortable = db
+                .sortable(sql)
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .unwrap_or_else(|| fail(&format!("{sql} is not sortable")));
+            let column = std::num::NonZeroUsize::new(column).unwrap_or_else(|| fail("zero column"));
+            db.sort_statement(&sortable, ResultSort { column, direction })
+                .unwrap_or_else(|e| fail(&e.to_string()))
+        };
+        let ys = |sql: &str| -> Vec<String> {
+            db.execute_query(sql)
+                .unwrap_or_else(|e| fail(&format!("{sql}: {e}")))
+                .rows
+                .iter()
+                .filter_map(|r| {
+                    r.get(1)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        };
+
+        let sql = rewrite("SELECT x, y FROM t", 1, SortDirection::Asc);
+        assert_eq!(sql, "SELECT x, y FROM t ORDER BY x ASC NULLS LAST");
+        assert_eq!(ys(&sql), ["a", "b", "n"]);
+
+        // Sorting the rewritten statement again replaces its ORDER BY.
+        let again = rewrite(&sql, 2, SortDirection::Desc);
+        assert_eq!(again, "SELECT x, y FROM t ORDER BY y DESC NULLS LAST");
+        assert_eq!(ys(&again), ["n", "b", "a"]);
+
+        // Comments and the semicolon go; the sort comes before the LIMIT.
+        let limited = rewrite(
+            "-- note\nSELECT * FROM t /* all */ LIMIT 2;",
+            1,
+            SortDirection::Desc,
+        );
+        assert_eq!(
+            limited,
+            "SELECT * FROM t ORDER BY x DESC NULLS LAST LIMIT 2"
+        );
+        assert_eq!(ys(&limited), ["b", "a"]);
+
+        // An unnamed expression, or a name two columns share, sorts by position.
+        let counted = rewrite(
+            "SELECT y, count(*) FROM t GROUP BY y",
+            2,
+            SortDirection::Desc,
+        );
+        assert!(counted.ends_with("ORDER BY 2 DESC NULLS LAST"), "{counted}");
+        let shared = rewrite("SELECT x AS v, y AS v FROM t", 2, SortDirection::Asc);
+        assert!(shared.ends_with("ORDER BY 2 ASC NULLS LAST"), "{shared}");
+        assert!(db.execute_query(&shared).is_ok());
+
+        for unsortable in [
+            "CREATE TABLE u (x INT)",
+            "INSERT INTO t VALUES (3, 'c')",
+            "SELECT 1; SELECT 2",
+            "SELEC broken",
+            "",
+        ] {
+            assert!(
+                db.sortable(unsortable)
+                    .unwrap_or_else(|e| fail(&e.to_string()))
+                    .is_none(),
+                "{unsortable}"
+            );
+        }
     }
 }

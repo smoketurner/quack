@@ -86,6 +86,10 @@ const LISTED_COLUMNS: usize = 40;
 const SAMPLED_COLUMNS: usize = 20;
 /// A sample cell longer than this is cut, with an ellipsis.
 const SAMPLE_CELL_CHARS: usize = 60;
+/// Documents past this many (newest first) are counted, not listed.
+const LISTED_DOCUMENTS: usize = 40;
+/// A document title longer than this is cut, with an ellipsis.
+const DOCUMENT_TITLE_CHARS: usize = 80;
 
 /// How far the workspace's knowledge model goes, which decides the
 /// ontology and graph tools a turn registers and the guidance the prompt
@@ -281,19 +285,25 @@ impl SystemPrompt {
         }
     }
 
-    /// The document inventory block; returns how many documents it listed
-    /// so the caller can tell an empty workspace from a full one.
+    /// The document inventory block, newest first and bounded like the
+    /// tables block, so a workspace of thousands of files cannot crowd the
+    /// question out (`list_documents` has the rest). Returns how many
+    /// documents the workspace holds, so the caller can tell an empty
+    /// workspace from a full one.
     fn documents(&mut self, db: &WorkspaceDb) -> Result<usize> {
-        let docs = db.list_documents()?;
+        let (docs, total) = db.recent_documents(LISTED_DOCUMENTS)?;
         if docs.is_empty() {
             return Ok(0);
         }
         writeln!(self.text, "Ingested documents:")?;
         for doc in &docs {
-            let title = doc
-                .title
-                .as_deref()
-                .map_or(String::new(), |t| format!(" \"{t}\""));
+            let title = doc.title.as_deref().map_or(String::new(), |t| {
+                let mut cut: String = t.chars().take(DOCUMENT_TITLE_CHARS).collect();
+                if t.chars().count() > DOCUMENT_TITLE_CHARS {
+                    cut.push('\u{2026}');
+                }
+                format!(" \"{cut}\"")
+            });
             writeln!(
                 self.text,
                 "- {}{title} (status: {}, type: {})",
@@ -302,8 +312,15 @@ impl SystemPrompt {
                 doc.mime_type.as_deref().unwrap_or("unknown"),
             )?;
         }
+        if total > docs.len() {
+            writeln!(
+                self.text,
+                "... and {} older documents; list_documents lists them all",
+                total.saturating_sub(docs.len())
+            )?;
+        }
         writeln!(self.text)?;
-        Ok(docs.len())
+        Ok(total)
     }
 
     /// The tables block: every user table with its row count, columns, and
@@ -603,6 +620,39 @@ mod tests {
         assert!(tables_at < documents_at);
         assert!(documents_at < ontology_at);
         assert!(ontology_at < context_at, "{first}");
+    }
+
+    /// The inventory lists the newest documents and counts the rest, so a
+    /// workspace of thousands of files keeps a prompt the model can hold.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn document_inventory_is_bounded() {
+        let db = db();
+        let extra = 5;
+        for n in 0..(LISTED_DOCUMENTS + extra) {
+            db.insert_document(
+                &NewDocument::new(
+                    &DocumentId::from(format!("d{n:03}")),
+                    &format!("file-{n:03}.md"),
+                    "text/markdown",
+                    1,
+                )
+                .with_status(DocumentStatus::Ready),
+            )
+            .unwrap();
+        }
+        let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
+        assert_eq!(
+            prompt.matches("- file-").count(),
+            LISTED_DOCUMENTS,
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!(
+                "... and {extra} older documents; list_documents lists them all"
+            )),
+            "{prompt}"
+        );
     }
 
     #[test]

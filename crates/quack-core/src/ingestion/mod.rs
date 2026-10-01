@@ -8,7 +8,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rig::embeddings::EmbeddingModel;
+use crate::embedding::EmbeddingModel;
 
 use crate::config::Config;
 use crate::embedding::{Embedder, Input};
@@ -22,7 +22,7 @@ use crate::storage::workspace::{
 use crate::storage::writer::Writer;
 use crate::text::NonBlankText;
 use chunker::Chunker;
-use parser::{FileType, Load, Reader, TextFormat};
+use parser::{FileType, Load, Reader, Separator, TextFormat};
 
 /// Result of ingesting a single file into a workspace.
 #[derive(Debug)]
@@ -178,11 +178,15 @@ struct Pending {
 }
 
 impl Pending {
-    /// Hash the bytes and refuse a type nothing can parse, before any write.
+    /// Hash the bytes and refuse an empty file or a type nothing can parse,
+    /// before any write.
     fn of(file: &NewFile<'_>) -> Result<Self> {
         let Some(file_type) = FileType::of(file.filename) else {
             return Err(Error::UnsupportedFileType(file.filename.to_owned()));
         };
+        if file.data.is_empty() {
+            return Err(Error::EmptyFile(file.filename.to_owned()));
+        }
         Ok(Self {
             filename: file.filename.to_owned(),
             title: file.title.and_then(str::non_blank).map(str::to_owned),
@@ -464,24 +468,25 @@ pub fn load_stdin_table(
     if data.iter().all(u8::is_ascii_whitespace) {
         return Ok(None);
     }
-    let reader = Reader::sniff(data).sql_fn();
+    let reader = Reader::sniff(data);
     let files_dir = config.workspace_files_dir(workspace_id);
     std::fs::create_dir_all(&files_dir)?;
     let dest = files_dir.join(format!(".stdin-{}", uuid::Uuid::now_v7()));
     std::fs::write(&dest, data)?;
     let path = dest.to_string_lossy();
-    let create_sql = format!(
-        "CREATE OR REPLACE TEMP TABLE {} AS SELECT * FROM {reader}(?)",
-        quote_ident(STDIN_TABLE)
-    );
-    let loaded = db.execute_with_params(&create_sql, duckdb::params![path.as_ref()]);
+    let loaded = TableLoad {
+        reader,
+        name: "standard input",
+        path: &path,
+    }
+    .create(db, STDIN_TABLE, TableKind::Temp);
     if let Err(e) = std::fs::remove_file(&dest) {
         tracing::warn!(path = %dest.display(), error = %e, "could not remove the stdin scratch file");
     }
     loaded?;
     tracing::info!(
         table = STDIN_TABLE,
-        reader,
+        reader = reader.sql_fn(),
         bytes = data.len(),
         "loaded piped data"
     );
@@ -513,14 +518,92 @@ impl StructuredLoad {
             })?);
         std::fs::write(&dest, &self.data)?;
         let path = dest.to_string_lossy();
-        let create_sql = format!(
-            "CREATE OR REPLACE TABLE {} AS SELECT * FROM {}(?)",
-            quote_ident(table_name.as_str()),
-            self.reader.sql_fn()
-        );
-        db.execute_with_params(&create_sql, duckdb::params![path.as_ref()])?;
+        TableLoad {
+            reader: self.reader,
+            name: &self.filename,
+            path: &path,
+        }
+        .create(db, table_name.as_str(), TableKind::Stored)?;
         tracing::info!(table = %table_name, file = %self.filename, "created table from structured file");
         Ok(table_name.into_string())
+    }
+}
+
+/// Whether a loaded table lasts beyond the connection.
+#[derive(Debug, Clone, Copy)]
+enum TableKind {
+    Temp,
+    Stored,
+}
+
+impl TableKind {
+    const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Temp => "TEMP TABLE",
+            Self::Stored => "TABLE",
+        }
+    }
+}
+
+/// One data file under `files/`, loaded into a table with `DuckDB`'s
+/// reader for its type. The path is bound, never interpolated.
+struct TableLoad<'a> {
+    reader: Reader,
+    /// The file as the person named it, for errors.
+    name: &'a str,
+    path: &'a str,
+}
+
+impl TableLoad<'_> {
+    /// `CREATE OR REPLACE` `table` from the file. A delimited file is read
+    /// with its sniffed dialect, except when the sniffer settles on a
+    /// single column: it does that both for a genuine one-column file and,
+    /// as a fallback, for one no separator splits consistently, which
+    /// would load a malformed file as its raw lines. So a one-column sniff
+    /// is read again with the separator the file's type names and strict
+    /// parsing, and `DuckDB` decides which of the two it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Ingestion` error naming the file and the separator when
+    /// it does not parse strictly, or the reader's error otherwise.
+    fn create(&self, db: &WorkspaceDb, table: &str, kind: TableKind) -> Result<()> {
+        let create = format!(
+            "CREATE OR REPLACE {} {} AS SELECT * FROM ",
+            kind.as_sql(),
+            quote_ident(table)
+        );
+        let Reader::Csv(separator) = self.reader else {
+            let sql = format!("{create}{}(?)", self.reader.sql_fn());
+            return db.execute_with_params(&sql, duckdb::params![self.path]);
+        };
+        let sniffed_columns: i64 = db.connection().query_row(
+            "SELECT len(Columns) FROM sniff_csv(?)",
+            duckdb::params![self.path],
+            |row| row.get(0),
+        )?;
+        if sniffed_columns > 1 {
+            let sql = format!("{create}{}(?)", self.reader.sql_fn());
+            return db.execute_with_params(&sql, duckdb::params![self.path]);
+        }
+        let sql = format!(
+            "{create}read_csv(?, delim = '{}', strict_mode = true)",
+            separator.as_sql()
+        );
+        match db.execute_with_params(&sql, duckdb::params![self.path]) {
+            Err(Error::DuckDb(e)) => {
+                // DuckDB's text names the server's path to the file; the
+                // person gets what to fix, the log gets the detail.
+                tracing::warn!(file = self.name, error = %e, "delimited file refused");
+                Err(Error::Ingestion(format!(
+                    "'{}' does not parse as {}-separated values: its rows do not split into the \
+                     same columns",
+                    self.name,
+                    separator.name()
+                )))
+            }
+            other => other,
+        }
     }
 }
 
@@ -587,7 +670,7 @@ impl WorkbookLoad {
             let create_sql = format!(
                 "CREATE OR REPLACE TABLE {} AS SELECT * FROM {}(?, header = true)",
                 quote_ident(table_name.as_str()),
-                Reader::Csv.sql_fn()
+                Reader::Csv(Separator::Comma).sql_fn()
             );
             db.execute_with_params(&create_sql, duckdb::params![path.as_ref()])?;
             tracing::info!(table = %table_name, sheet = %sheet.sheet, rows = sheet.rows, file = %self.filename, "created table from workbook sheet");

@@ -251,6 +251,15 @@ impl<'a> WorkspaceResource<'a> {
         }
     }
 
+    /// The resource as `control.db`'s access log names it: a table's
+    /// schema by the template, so no table name leaves the workspace.
+    fn audit_id(self) -> String {
+        match self {
+            Self::Schema(_) => String::from(Self::SCHEMA_TEMPLATE),
+            Self::Tables | Self::Documents | Self::Ontology | Self::Context => self.uri(),
+        }
+    }
+
     fn uri(self) -> String {
         match self {
             Self::Schema(table) => format!("{}tables/{table}/schema", Self::PREFIX),
@@ -935,16 +944,20 @@ impl ServerHandler for McpServer {
     ) -> Result<ReadResourceResponse, McpError> {
         let caller = self.caller(&context.extensions)?;
         let uri = request.uri;
+        let parsed = WorkspaceResource::parse(&uri);
+        // The access log takes the resource's template, the workspace's own
+        // audit detail the full URI: a table name is workspace content.
+        let audit_id = parsed.map(WorkspaceResource::audit_id);
         caller
             .record(
                 AuditAction::Open,
-                Some(ResourceKind::Resource.id(&uri)),
+                audit_id.as_deref().map(|id| ResourceKind::Resource.id(id)),
                 Outcome::Allowed,
                 Some(serde_json::json!({ "uri": uri })),
             )
             .await?;
         let not_found = || McpError::resource_not_found(format!("no resource at {uri}"), None);
-        let resource = WorkspaceResource::parse(&uri).ok_or_else(not_found)?;
+        let resource = parsed.ok_or_else(not_found)?;
         let text = self.resource_text(resource).await?.ok_or_else(not_found)?;
         let mime = resource.mime_type();
         Ok(

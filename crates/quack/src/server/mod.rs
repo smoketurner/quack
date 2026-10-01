@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, MatchedPath};
 use axum::http::{HeaderValue, Request, StatusCode, header};
 use axum::routing::get;
 use quack_core::DUCK;
@@ -160,7 +160,8 @@ pub(crate) fn router(app: App) -> Router {
     // Everything a caller can reach is rate limited, not just the API: the
     // web UI drives the same handlers, and MCP drives the agent. `/healthz`
     // stays outside, because a throttled health check reads as a dead
-    // server to whatever is watching it.
+    // server to whatever is watching it, and so do the static assets
+    // (`web::assets`), which reveal nothing and cost nothing to serve.
     let mut limited = Router::new()
         .route("/mcp/v1/{workspace}", axum::routing::any(mcp_http::handle))
         .route(resource::METADATA_PATH, get(resource::metadata))
@@ -176,12 +177,17 @@ pub(crate) fn router(app: App) -> Router {
         limited = limited.layer(GovernorLayer::new(config));
     }
     let limited = limited
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&app),
+            web::flash::keep,
+        ))
         .layer(axum::middleware::map_response(no_store))
         // Every request gets an empty acting slot, which the identity
         // extractor fills once it knows the caller.
         .layer(axum::middleware::from_fn(acting_slot));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .merge(web::assets())
         .merge(limited)
         .layer(DefaultBodyLimit::max(upload_limit))
         // One span per request, carrying the id the request-id layer set
@@ -195,10 +201,18 @@ pub(crate) fn router(app: App) -> Router {
                         .get(auth::REQUEST_ID_HEADER)
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("-");
+                    // The route's template, never the URI: a path or query
+                    // can name workspace content (a table, a search), and the
+                    // log is outside the workspace. An unmatched path is not
+                    // logged either, for the same reason.
+                    let route = request
+                        .extensions()
+                        .get::<MatchedPath>()
+                        .map_or("-", MatchedPath::as_str);
                     tracing::info_span!(
                         "request",
                         method = %request.method(),
-                        uri = %request.uri(),
+                        route,
                         request_id
                     )
                 })

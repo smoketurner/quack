@@ -3,12 +3,13 @@
 //! the streamed chat (design doc 11.1). Everything a page does, the API can
 //! do; the handlers here only shape the response as HTML.
 
-mod flash;
+pub(crate) mod flash;
 pub(crate) mod markdown;
 mod sign_in;
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroUsize;
 
 use askama::Template;
 use axum::extract::{FromRequestParts, Multipart, Path, Query, State};
@@ -18,6 +19,9 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use axum_extra::extract::CookieJar;
+use jiff::Timestamp;
+use jiff::civil::DateTime;
+use jiff::tz::TimeZone;
 // Multi-valued fields (checkboxes) need serde_html_form, which axum's own
 // Form extractor does not use.
 use axum_extra::extract::Form as MultiForm;
@@ -37,11 +41,13 @@ use quack_core::storage::control::{
     WorkspaceChanges,
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
-use quack_core::storage::workspace::{DocumentInfo, DocumentSource, Pinning, SamplePool};
+use quack_core::storage::workspace::{
+    DocumentInfo, DocumentSource, Pinning, ResultSort, SamplePool, SortDirection, TableDescription,
+};
 use rust_embed::Embed;
 use serde::Deserialize;
 
-use self::flash::{Flash, UrlEncoded};
+use self::flash::{Flash, Flashed};
 use super::api::admin::CreateUser;
 use super::api::auth::LoginRequest;
 use super::api::context::ReplaceContext;
@@ -51,7 +57,6 @@ use super::api::graph::ExtractionStarted;
 use super::api::import::ImportBody;
 use super::api::members::AddMember;
 use super::api::ontology::DecideRequest;
-use super::api::query::SqlRequest;
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
     documents as docs_api, graph as graph_api, import as import_api, workspaces as workspaces_api,
@@ -134,10 +139,77 @@ type WebResult<T> = Result<T, HtmlError>;
 /// What the layout needs on every page.
 struct Page {
     title: String,
+    /// The header link to mark as current.
+    tab: Tab,
     username: String,
     is_admin: bool,
     local: bool,
     workspace: Option<WsNav>,
+}
+
+/// A header link: the workspace tabs, then the admin pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Workspaces,
+    Chat,
+    Documents,
+    Tables,
+    Sql,
+    Context,
+    Ontology,
+    Graph,
+    Jobs,
+    Settings,
+    Users,
+    Audit,
+}
+
+impl Tab {
+    /// The workspace tabs, in header order.
+    const WORKSPACE: [Self; 9] = [
+        Self::Chat,
+        Self::Documents,
+        Self::Tables,
+        Self::Sql,
+        Self::Context,
+        Self::Ontology,
+        Self::Graph,
+        Self::Jobs,
+        Self::Settings,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Workspaces => "Workspaces",
+            Self::Chat => "Chat",
+            Self::Documents => "Documents",
+            Self::Tables => "Tables",
+            Self::Sql => "SQL",
+            Self::Context => "Context",
+            Self::Ontology => "Ontology",
+            Self::Graph => "Graph",
+            Self::Jobs => "Jobs",
+            Self::Settings => "Settings",
+            Self::Users => "Users",
+            Self::Audit => "Audit",
+        }
+    }
+
+    /// The path under `/w/{id}/` for a workspace tab.
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Documents => "documents",
+            Self::Tables => "tables",
+            Self::Sql => "sql",
+            Self::Context => "context",
+            Self::Ontology => "ontology",
+            Self::Graph => "graph",
+            Self::Jobs => "jobs",
+            Self::Settings => "settings",
+            Self::Workspaces | Self::Users | Self::Audit => "",
+        }
+    }
 }
 
 struct WsNav {
@@ -174,9 +246,10 @@ impl fmt::Display for Standing {
 
 impl Page {
     /// A page outside any workspace.
-    fn new(app: &App, identity: &Identity, title: &str) -> Self {
+    fn new(app: &App, identity: &Identity, tab: Tab) -> Self {
         Self {
-            title: title.to_owned(),
+            title: tab.label().to_owned(),
+            tab,
             username: identity.username.clone(),
             is_admin: identity.is_admin,
             local: app.mode == ServeMode::Local,
@@ -185,7 +258,7 @@ impl Page {
     }
 
     /// A page inside `access`'s workspace, with its navigation.
-    fn in_workspace(app: &App, title: &str, access: &Access) -> Self {
+    fn in_workspace(app: &App, tab: Tab, access: &Access) -> Self {
         Self {
             workspace: Some(WsNav {
                 id: access.workspace.id.to_string(),
@@ -194,7 +267,7 @@ impl Page {
                 can_write: access.permits(Need::WRITE),
                 can_manage: access.permits(Need::OWN),
             }),
-            ..Self::new(app, &access.identity, title)
+            ..Self::new(app, &access.identity, tab)
         }
     }
 }
@@ -236,8 +309,80 @@ struct WorkspacesPage {
     error: Option<String>,
 }
 
+/// A point in time as a page shows it: `app.js` rewrites every
+/// `time[data-when]` in the viewer's time zone, and the UTC text stands
+/// for a page without scripts.
+struct Moment(Timestamp);
+
+impl Moment {
+    /// Stored UTC text: an RFC 3339 instant, or a `DuckDB` or `SQLite`
+    /// timestamp with no zone, which both hold UTC.
+    fn from_utc_text(text: &str) -> Option<Self> {
+        if let Ok(at) = text.parse::<Timestamp>() {
+            return Some(Self(at));
+        }
+        let civil: DateTime = text.parse().ok()?;
+        civil
+            .to_zoned(TimeZone::UTC)
+            .ok()
+            .map(|z| Self(z.timestamp()))
+    }
+
+    fn iso(&self) -> String {
+        self.0.to_string()
+    }
+
+    fn utc(&self) -> String {
+        self.0.strftime("%Y-%m-%d %H:%M UTC").to_string()
+    }
+}
+
+/// How `app.js` words a time: the time of day (with the date when not
+/// today), or how long ago for today and the date before that.
+#[derive(Debug, Clone, Copy)]
+enum When {
+    Clock,
+    Relative,
+}
+
+impl When {
+    const fn attr(self) -> &'static str {
+        match self {
+            Self::Clock => "clock",
+            Self::Relative => "relative",
+        }
+    }
+
+    /// The `<time>` element for `at`.
+    fn element(self, at: &Moment) -> String {
+        format!(
+            "<time datetime=\"{}\" data-when=\"{}\">{}</time>",
+            at.iso(),
+            self.attr(),
+            at.utc()
+        )
+    }
+
+    /// The `<time>` element for stored UTC text, or the text itself,
+    /// escaped, when it is not a time.
+    fn html(self, text: &str) -> String {
+        Moment::from_utc_text(text).map_or_else(
+            || {
+                askama::filters::escape(text, askama::filters::Html)
+                    .map(|e| e.to_string())
+                    .unwrap_or_default()
+            },
+            |at| self.element(&at),
+        )
+    }
+}
+
 struct MessageView {
     role: String,
+    /// When the question was asked or the answer finished.
+    at: Option<Moment>,
+    /// How long the answer took; `None` for questions and older answers.
+    duration_ms: Option<u64>,
     /// Rendered HTML for assistant answers; escaped text for user messages.
     content_html: String,
     steps: Vec<ToolStep>,
@@ -295,7 +440,7 @@ struct JobView {
     can_cancel: bool,
     progress: String,
     outcome: Option<String>,
-    queued_at: String,
+    queued_at: Moment,
 }
 
 #[derive(Template)]
@@ -322,6 +467,26 @@ struct TableView {
     sample_rows: Vec<Vec<String>>,
 }
 
+impl TableView {
+    fn of(described: TableDescription) -> Self {
+        Self {
+            name: described.table_name,
+            columns: described
+                .columns
+                .into_iter()
+                .map(|c| (c.name, c.column_type))
+                .collect(),
+            sample_columns: described.sample_rows.columns,
+            sample_rows: described
+                .sample_rows
+                .rows
+                .iter()
+                .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
+                .collect(),
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "tables.html")]
 struct TablesPage {
@@ -331,23 +496,166 @@ struct TablesPage {
     error: Option<String>,
 }
 
+impl TablesPage {
+    /// The table list, with `open` described beside it when one is asked
+    /// for (a click, or an import that just made it).
+    async fn render(
+        app: &App,
+        identity: Identity,
+        id: &WorkspaceId,
+        open: Option<String>,
+        error: Option<String>,
+    ) -> WebResult<Response> {
+        let access = Access::resolve(app, identity, id, Need::READ).await?;
+        let selected = if let Some(name) = open {
+            Some(TableView::of(access.describe_table(app, &name).await?))
+        } else {
+            access.audit_read(app, AuditAction::Page, "tables").await?;
+            None
+        };
+        let list = app.read(id, WorkspaceDb::list_tables).await?;
+        let mut page = Page::in_workspace(app, Tab::Tables, &access);
+        if let Some(table) = &selected {
+            page.title.clone_from(&table.name);
+        }
+        html(&Self {
+            page,
+            tables: list,
+            selected,
+            error,
+        })
+    }
+}
+
 #[derive(Template)]
 #[template(path = "sql.html")]
 struct SqlPage {
     page: Page,
     sql: String,
     result: String,
+    /// The editor is rendered in place here, never swapped in.
+    editor_swap: bool,
+}
+
+/// A SQL page run: the statement as typed, and the column sort a header
+/// click asked for. With no sort, the rows come back in the statement's own
+/// order; nothing is imposed.
+#[derive(Deserialize)]
+struct SqlRun {
+    sql: String,
+    /// The 1-based column position to sort by.
+    sort: Option<NonZeroUsize>,
+    dir: Option<SortDirection>,
+}
+
+impl SqlRun {
+    fn result_sort(&self) -> Option<ResultSort> {
+        self.sort.map(|column| ResultSort {
+            column,
+            direction: self.dir.unwrap_or(SortDirection::Asc),
+        })
+    }
+
+    /// The statement to run and whether its results can be sorted. A sort
+    /// rewrites the statement's own `ORDER BY` (replacing any it had), and
+    /// the rewritten SQL is what runs and what the editor then shows; a
+    /// statement that is not one `SELECT` runs as typed.
+    async fn statement(&self, app: &App, access: &Access) -> Statement {
+        let (sql, sort) = (self.sql.clone(), self.result_sort());
+        let planned = app
+            .read(&access.workspace.id, move |db| {
+                let Some(sortable) = db.sortable(&sql)? else {
+                    return Ok(None);
+                };
+                sort.map(|sort| db.sort_statement(&sortable, sort))
+                    .transpose()
+                    .map(Some)
+            })
+            .await;
+        let as_typed = |sortable| Statement {
+            sql: self.sql.clone(),
+            sortable,
+            rewritten: false,
+        };
+        match planned {
+            Ok(Some(Some(rewritten))) => Statement {
+                sql: rewritten,
+                sortable: true,
+                rewritten: true,
+            },
+            Ok(Some(None)) => as_typed(true),
+            // Not sortable, or the rewrite failed: run it as typed, and
+            // let the run report whatever is wrong with it.
+            Ok(None) | Err(_) => as_typed(false),
+        }
+    }
+}
+
+/// What a SQL page run executes.
+struct Statement {
+    sql: String,
+    sortable: bool,
+    /// A header's sort rewrote the SQL; the editor takes the new text.
+    rewritten: bool,
+}
+
+/// A result column's header: a button that sorts by it, ascending first,
+/// then the other way.
+struct SortHeader {
+    name: String,
+    position: NonZeroUsize,
+    sorted: Option<SortDirection>,
+}
+
+impl SortHeader {
+    const fn param(direction: SortDirection) -> &'static str {
+        match direction {
+            SortDirection::Asc => "asc",
+            SortDirection::Desc => "desc",
+        }
+    }
+
+    /// The direction a click asks for.
+    fn next(&self) -> &'static str {
+        Self::param(
+            self.sorted
+                .map_or(SortDirection::Asc, SortDirection::flipped),
+        )
+    }
+
+    fn aria_sort(&self) -> &'static str {
+        match self.sorted {
+            Some(SortDirection::Asc) => "ascending",
+            Some(SortDirection::Desc) => "descending",
+            None => "none",
+        }
+    }
+
+    fn arrow(&self) -> &'static str {
+        match self.sorted {
+            Some(SortDirection::Asc) => "▲",
+            Some(SortDirection::Desc) => "▼",
+            None => "",
+        }
+    }
 }
 
 #[derive(Template)]
 #[template(path = "sql_result.html")]
 struct SqlResult {
-    columns: Vec<String>,
+    ws_id: String,
+    /// The statement that ran, which a header click sends back with its
+    /// sort.
+    sql: String,
+    sortable: bool,
+    /// Swap the rewritten statement into the editor.
+    editor_swap: bool,
+    headers: Vec<SortHeader>,
     rows: Vec<Vec<String>>,
     row_count: usize,
     truncated: bool,
+    duration_ms: u64,
     error: Option<String>,
-    csv_href: String,
 }
 
 #[derive(Template)]
@@ -402,8 +710,6 @@ const CANDIDATES_PER_PAGE: usize = 50;
 
 #[derive(Deserialize, Default)]
 struct OntologyQuery {
-    error: Option<String>,
-    notice: Option<String>,
     /// The main queue unless `low_support` is asked for.
     #[serde(default, deserialize_with = "blank_as_none")]
     status: Option<Queue>,
@@ -508,10 +814,17 @@ struct AdminAuditPage {
 
 // --- routes ------------------------------------------------------------------
 
+/// The embedded stylesheet, scripts, and icon. They sit outside the rate
+/// limiter: every page load fetches four of them, so counting them spent a
+/// person's request budget four times faster than their clicks did, and a
+/// refused stylesheet left the page unstyled.
+pub(crate) fn assets() -> Router<App> {
+    Router::new().route("/static/{*path}", get(static_asset))
+}
+
 pub(crate) fn router() -> Router<App> {
     Router::new()
         .route("/", get(index))
-        .route("/static/{*path}", get(static_asset))
         .route(
             "/login",
             get(login_page).merge(super::throttled_login(post(login_submit))),
@@ -540,11 +853,10 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/jobs", get(jobs_page))
         .route("/w/{id}/jobs/rows", get(job_rows))
         .route("/w/{id}/jobs/{job}/cancel", post(job_cancel))
-        .route("/w/{id}/tables", get(tables))
+        .route("/w/{id}/tables", get(tables).post(table))
         .route("/w/{id}/import", post(import_submit))
-        .route("/w/{id}/tables/{name}", get(table))
         .route("/w/{id}/sql", get(sql_page).post(sql_run))
-        .route("/w/{id}/sql.csv", get(sql_csv))
+        .route("/w/{id}/sql.csv", post(sql_csv))
         .route("/w/{id}/context", get(context_page).post(context_save))
         .route("/w/{id}/ontology", get(ontology_page).post(ontology_import))
         .route("/w/{id}/ontology/init", post(ontology_init))
@@ -552,7 +864,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/ontology/candidates", post(ontology_decide_many))
         .route("/w/{id}/ontology/candidates/{cid}", post(ontology_decide))
         .route("/w/{id}/ontology/{v}/restore", post(ontology_restore))
-        .route("/w/{id}/graph", get(graph_page))
+        .route("/w/{id}/graph", get(graph_page).post(graph_search))
         .route("/w/{id}/graph/extract", post(graph_extract))
         .route("/w/{id}/graph/revalidate", post(graph_revalidate))
         .route("/w/{id}/graph/review", post(graph_review))
@@ -609,17 +921,12 @@ async fn index() -> Redirect {
     Redirect::to("/workspaces")
 }
 
-#[derive(Deserialize)]
-struct LoginQuery {
-    error: Option<String>,
-}
-
-async fn login_page(State(app): State<App>, Query(q): Query<LoginQuery>) -> WebResult<Response> {
+async fn login_page(State(app): State<App>, flash: Flashed) -> WebResult<Response> {
     if app.mode == ServeMode::Local {
         return Ok(Redirect::to("/workspaces").into_response());
     }
     html(&LoginPage {
-        error: q.error,
+        error: flash.error(),
         sign_in: app.oidc.as_ref().map(Oidc::issuer_host),
     })
 }
@@ -659,17 +966,10 @@ async fn logout(
     Ok((jar, Redirect::to("/login")).into_response())
 }
 
-#[derive(Deserialize)]
-struct FlashQuery {
-    error: Option<String>,
-    /// A success message: the same flash slot, green.
-    notice: Option<String>,
-}
-
 async fn workspaces(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Query(q): Query<FlashQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
     let items: Vec<WsItem> = if app.mode == ServeMode::Local || identity.is_admin {
         let mine = if app.mode == ServeMode::Local {
@@ -707,9 +1007,9 @@ async fn workspaces(
     };
     html(&WorkspacesPage {
         can_create: identity.is_admin,
-        page: Page::new(&app, &identity, "Workspaces"),
+        page: Page::new(&app, &identity, Tab::Workspaces),
         workspaces: items,
-        error: q.error,
+        error: flash.error(),
     })
 }
 
@@ -752,6 +1052,8 @@ impl MessageView {
     fn question(row: &MessageRow) -> Self {
         Self {
             role: String::from("user"),
+            at: Moment::from_utc_text(&row.created_at),
+            duration_ms: None,
             content_html: askama::filters::escape(&row.content, askama::filters::Html)
                 .map(|e| e.to_string())
                 .unwrap_or_default(),
@@ -766,6 +1068,8 @@ impl MessageView {
         let meta = row.assistant().cloned().unwrap_or_default();
         Self {
             role: String::from("assistant"),
+            at: Moment::from_utc_text(&row.created_at),
+            duration_ms: meta.duration_ms,
             content_html: markdown::to_html(&row.content),
             steps,
             citations: meta
@@ -832,7 +1136,7 @@ async fn chat(
         (Vec::new(), Vec::new())
     };
     html(&ChatPage {
-        page: Page::in_workspace(&app, "Chat", &access),
+        page: Page::in_workspace(&app, Tab::Chat, &access),
         sessions: sessions_list,
         current,
         messages: MessageView::transcript(&messages),
@@ -911,7 +1215,7 @@ impl JobRows {
                 active: !j.state.is_finished(),
                 progress: j.progress.map(|p| p.to_string()).unwrap_or_default(),
                 outcome: j.outcome.or(j.status),
-                queued_at: j.queued_at.strftime("%Y-%m-%d %H:%M:%S").to_string(),
+                queued_at: Moment(j.queued_at),
             })
             .collect();
         let pending = jobs.iter().any(|j| j.active);
@@ -932,7 +1236,7 @@ async fn jobs_page(
     access.audit_read(&app, AuditAction::Page, "jobs").await?;
     let rows = JobRows::of(&app, &access).render()?;
     html(&JobsPage {
-        page: Page::in_workspace(&app, "Jobs", &access),
+        page: Page::in_workspace(&app, Tab::Jobs, &access),
         rows,
     })
 }
@@ -964,7 +1268,7 @@ async fn documents(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<FlashQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -973,10 +1277,10 @@ async fn documents(
     let rows = DocumentRows::load(&app, &access).await?.render()?;
     let embeddings_note = app.read(&id, WorkspaceDb::embedding_status).await?.note();
     html(&DocumentsPage {
-        page: Page::in_workspace(&app, "Documents", &access),
+        page: Page::in_workspace(&app, Tab::Documents, &access),
         rows,
-        error: q.error,
-        notice: q.notice,
+        error: flash.error(),
+        notice: flash.notice(),
         embeddings_note,
     })
 }
@@ -1108,17 +1412,25 @@ async fn tables(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<FlashQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
-    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, AuditAction::Page, "tables").await?;
-    let list = app.read(&id, WorkspaceDb::list_tables).await?;
-    html(&TablesPage {
-        page: Page::in_workspace(&app, "Tables", &access),
-        tables: list,
-        selected: None,
-        error: q.error,
-    })
+    TablesPage::render(&app, identity, &id, flash.table(), flash.error()).await
+}
+
+/// The Tables page's choice: the table to open. Posted, never in the URL:
+/// a table's name is workspace content, and a URL ends up in logs.
+#[derive(Deserialize)]
+struct TableChoice {
+    name: String,
+}
+
+async fn table(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(choice): Form<TableChoice>,
+) -> WebResult<Response> {
+    TablesPage::render(&app, identity, &id, Some(choice.name), None).await
 }
 
 async fn import_submit(
@@ -1131,7 +1443,7 @@ async fn import_submit(
     let request = ImportRequest::from(form);
     Ok(
         match import_api::run_import(&app, &access, &request).await {
-            Ok(summary) => Flash::to(format!("/w/{id}/tables/{}", summary.table)),
+            Ok(summary) => Flash::to(format!("/w/{id}/tables")).opening(summary.table),
             Err(e) => Flash::error(format!("/w/{id}/tables"), e.message),
         }
         .into_response(),
@@ -1152,36 +1464,6 @@ impl fmt::Display for JsonText<'_> {
     }
 }
 
-async fn table(
-    State(app): State<App>,
-    WebUser(identity): WebUser,
-    Path((id, name)): Path<(WorkspaceId, String)>,
-) -> WebResult<Response> {
-    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let described = access.describe_table(&app, &name).await?;
-    let list = app.read(&id, WorkspaceDb::list_tables).await?;
-    html(&TablesPage {
-        page: Page::in_workspace(&app, &name, &access),
-        tables: list,
-        error: None,
-        selected: Some(TableView {
-            name: described.table_name,
-            columns: described
-                .columns
-                .into_iter()
-                .map(|c| (c.name, c.column_type))
-                .collect(),
-            sample_columns: described.sample_rows.columns,
-            sample_rows: described
-                .sample_rows
-                .rows
-                .iter()
-                .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
-                .collect(),
-        }),
-    })
-}
-
 async fn sql_page(
     State(app): State<App>,
     WebUser(identity): WebUser,
@@ -1190,19 +1472,39 @@ async fn sql_page(
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Page, "sql").await?;
     html(&SqlPage {
-        page: Page::in_workspace(&app, "SQL", &access),
+        page: Page::in_workspace(&app, Tab::Sql, &access),
         sql: String::new(),
         result: String::new(),
+        editor_swap: false,
     })
 }
 
 impl SqlResult {
-    /// Run `sql` for the caller: its rows, or why it could not run.
-    async fn run(app: &App, access: &Access, sql: &str) -> Self {
-        let csv_href = format!("/w/{}/sql.csv?sql={}", access.workspace.id, UrlEncoded(sql));
-        match access.execute_sql(app, sql).await {
+    /// Run the statement for the caller: its rows, or why it could not run.
+    async fn run(app: &App, access: &Access, run: &SqlRun) -> Self {
+        let Statement {
+            sql,
+            sortable,
+            rewritten,
+        } = run.statement(app, access).await;
+        let sort = run.result_sort().filter(|_| rewritten);
+        let ws_id = access.workspace.id.to_string();
+        match access.execute_sql(app, &sql).await {
             Ok(outcome) => Self {
-                columns: outcome.columns,
+                ws_id,
+                sql,
+                sortable,
+                editor_swap: rewritten,
+                headers: outcome
+                    .columns
+                    .into_iter()
+                    .zip((1..).filter_map(NonZeroUsize::new))
+                    .map(|(name, position)| SortHeader {
+                        name,
+                        position,
+                        sorted: sort.filter(|s| s.column == position).map(|s| s.direction),
+                    })
+                    .collect(),
                 rows: outcome
                     .rows
                     .iter()
@@ -1210,16 +1512,20 @@ impl SqlResult {
                     .collect(),
                 row_count: outcome.row_count,
                 truncated: outcome.truncated,
+                duration_ms: outcome.duration_ms,
                 error: None,
-                csv_href,
             },
             Err(e) => Self {
-                columns: Vec::new(),
+                ws_id,
+                sql,
+                sortable,
+                editor_swap: false,
+                headers: Vec::new(),
                 rows: Vec::new(),
                 row_count: 0,
                 truncated: false,
+                duration_ms: 0,
                 error: Some(e.message),
-                csv_href,
             },
         }
     }
@@ -1229,20 +1535,24 @@ async fn sql_run(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Form(form): Form<SqlRequest>,
+    Form(form): Form<SqlRun>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    Ok(Html(SqlResult::run(&app, &access, &form.sql).await.render()?).into_response())
+    Ok(Html(SqlResult::run(&app, &access, &form).await.render()?).into_response())
 }
 
+/// The rows as a CSV download. A POST, so the statement travels in the
+/// body: in a URL it would land in request logs, proxies, and browser
+/// history, and a long one would not fit.
 async fn sql_csv(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<SqlRequest>,
+    Form(q): Form<SqlRun>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let outcome = access.execute_sql(&app, &q.sql).await?;
+    let statement = q.statement(&app, &access).await;
+    let outcome = access.execute_sql(&app, &statement.sql).await?;
     let mut writer = csv::Writer::from_writer(Vec::new());
     writer
         .write_record(&outcome.columns)
@@ -1296,6 +1606,7 @@ async fn ontology_page(
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
     Query(q): Query<OntologyQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
@@ -1346,7 +1657,7 @@ async fn ontology_page(
         None => String::new(),
     };
     html(&OntologyPage {
-        page: Page::in_workspace(&app, "Ontology", &access),
+        page: Page::in_workspace(&app, Tab::Ontology, &access),
         classes: ontology.as_ref().map(ClassRow::tree).unwrap_or_default(),
         ontology,
         json,
@@ -1359,8 +1670,8 @@ async fn ontology_page(
         pending_total,
         low_support_total,
         has_tables,
-        error: q.error,
-        notice: q.notice,
+        error: flash.error(),
+        notice: flash.notice(),
     })
 }
 
@@ -1632,7 +1943,7 @@ async fn context_page(
         })
         .await?;
     html(&ContextPage {
-        page: Page::in_workspace(&app, "Context", &access),
+        page: Page::in_workspace(&app, Tab::Context, &access),
         content: current
             .as_ref()
             .map(|c| c.content.clone())
@@ -1651,11 +1962,6 @@ async fn context_save(
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     access.save_context(&app, form.content).await?;
     Ok(Flash::to(format!("/w/{id}/context")).into_response())
-}
-
-#[derive(Deserialize)]
-struct SettingsQuery {
-    error: Option<String>,
 }
 
 impl SettingsPage {
@@ -1683,7 +1989,7 @@ impl SettingsPage {
             (Vec::new(), Vec::new())
         };
         Ok(Self {
-            page: Page::in_workspace(app, "Settings", access),
+            page: Page::in_workspace(app, Tab::Settings, access),
             classification: access.workspace.classification.clone(),
             providers,
             members,
@@ -1698,13 +2004,13 @@ async fn settings(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<SettingsQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
     access
         .audit_read(&app, AuditAction::Page, "settings")
         .await?;
-    html(&SettingsPage::load(&app, &access, None, q.error).await?)
+    html(&SettingsPage::load(&app, &access, None, flash.error()).await?)
 }
 
 #[derive(Deserialize)]
@@ -1831,13 +2137,13 @@ async fn token_revoke(
 async fn admin_users(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Query(q): Query<FlashQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
     identity.require_admin()?;
     html(&AdminUsersPage {
-        page: Page::new(&app, &identity, "Users"),
+        page: Page::new(&app, &identity, Tab::Users),
         users: app.control.list_users().await?,
-        error: q.error,
+        error: flash.error(),
     })
 }
 
@@ -1901,7 +2207,7 @@ async fn admin_audit(
     let filter = AuditFilter::from(q);
     let AuditPage { rows, next } = app.control.query_audit(&filter).await?;
     html(&AdminAuditPage {
-        page: Page::new(&app, &identity, "Audit"),
+        page: Page::new(&app, &identity, Tab::Audit),
         rows,
         continued: filter.after.is_some(),
         next_cursor: next.map(|c| c.to_string()),
@@ -1991,12 +2297,91 @@ mod tests {
             ]
         );
     }
+
+    /// A stored `TIMESTAMP` is UTC text; the page gets an instant the
+    /// browser can localize, and text it cannot parse shows no time at all.
+    #[test]
+    fn moments_read_duckdb_timestamps_as_utc() {
+        let at = Moment::from_utc_text("2026-09-30 14:03:22.123456");
+        assert_eq!(
+            at.as_ref().map(Moment::iso).as_deref(),
+            Some("2026-09-30T14:03:22.123456Z")
+        );
+        assert_eq!(
+            at.as_ref().map(Moment::utc).as_deref(),
+            Some("2026-09-30 14:03 UTC")
+        );
+        assert_eq!(
+            Moment::from_utc_text("2026-09-30 14:03:22")
+                .map(|m| m.iso())
+                .as_deref(),
+            Some("2026-09-30T14:03:22Z")
+        );
+        assert!(Moment::from_utc_text("").is_none());
+        assert!(Moment::from_utc_text("yesterday").is_none());
+        // control.db keeps SQLite's CURRENT_TIMESTAMP text and RFC 3339 expiries.
+        assert_eq!(
+            Moment::from_utc_text("2026-10-01T02:37:57Z")
+                .map(|m| m.iso())
+                .as_deref(),
+            Some("2026-10-01T02:37:57Z")
+        );
+    }
+
+    /// A stored time becomes a `<time>` element the browser localizes; text
+    /// that is not a time is shown as it is, escaped.
+    #[test]
+    fn when_renders_time_elements_and_escapes_anything_else() {
+        assert_eq!(
+            When::Relative.html("2026-10-01 02:37:57"),
+            "<time datetime=\"2026-10-01T02:37:57Z\" data-when=\"relative\">2026-10-01 02:37 UTC</time>"
+        );
+        assert!(
+            When::Clock
+                .html("2026-10-01 02:37:57")
+                .contains("data-when=\"clock\"")
+        );
+        assert_eq!(
+            When::Clock.html("<b>soon</b>"),
+            "&#60;b&#62;soon&#60;/b&#62;"
+        );
+    }
+
+    /// An answer shows how long it took; a question and an answer recorded
+    /// before durations were kept show none.
+    #[test]
+    fn transcript_carries_the_answer_duration() {
+        let row = |seq: i64, role: MessageRole, metadata: Option<MessageMeta>| MessageRow {
+            id: MessageId::from(format!("m{seq}")),
+            session_id: SessionId::from("s"),
+            seq,
+            role,
+            content: String::from("x"),
+            metadata,
+            created_at: String::from("2026-09-30 14:03:22"),
+        };
+        let timed = Some(MessageMeta::Assistant(AssistantMeta {
+            duration_ms: Some(2_345),
+            ..AssistantMeta::default()
+        }));
+        let views = MessageView::transcript(&[
+            row(1, MessageRole::User, None),
+            row(2, MessageRole::Assistant, timed),
+            row(3, MessageRole::User, None),
+            row(4, MessageRole::Assistant, None),
+        ]);
+        let durations: Vec<Option<u64>> = views.iter().map(|v| v.duration_ms).collect();
+        assert_eq!(durations, vec![None, Some(2_345), None, None]);
+        assert!(views.iter().all(|v| v.at.is_some()));
+    }
 }
 
 // --- graph ----------------------------------------------------------------------
 
+/// The graph page's explore or path form. Posted, never a query string:
+/// entity names are workspace content, and a URL ends up in logs.
 #[derive(Deserialize, Default)]
-struct GraphPageQuery {
+struct GraphSearch {
     entity: Option<String>,
     class: Option<String>,
     relation: Option<String>,
@@ -2004,14 +2389,12 @@ struct GraphPageQuery {
     from: Option<String>,
     to: Option<String>,
     max_hops: Option<u32>,
-    error: Option<String>,
-    notice: Option<String>,
 }
 
 impl GraphQueryView {
     /// The page's query: blank fields are empty strings, which the form
     /// shows as they are; hops at their defaults when not given.
-    fn from_query(q: &GraphPageQuery) -> Self {
+    fn from_query(q: &GraphSearch) -> Self {
         let given = |value: Option<&String>| {
             value
                 .and_then(|v| v.non_blank())
@@ -2034,18 +2417,39 @@ async fn graph_page(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<GraphPageQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
-    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    access.audit_read(&app, AuditAction::Page, "graph").await?;
+    render_graph(&app, identity, &id, &GraphSearch::default(), &flash).await
+}
+
+async fn graph_search(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    flash: Flashed,
+    Form(q): Form<GraphSearch>,
+) -> WebResult<Response> {
+    render_graph(&app, identity, &id, &q, &flash).await
+}
+
+/// The graph page, with `q`'s search or path result when it asks for one.
+async fn render_graph(
+    app: &App,
+    identity: Identity,
+    id: &WorkspaceId,
+    q: &GraphSearch,
+    flash: &Flashed,
+) -> WebResult<Response> {
+    let access = Access::resolve(app, identity, id, Need::READ).await?;
+    access.audit_read(app, AuditAction::Page, "graph").await?;
     let options = app.config.graph.options();
-    let query = GraphQueryView::from_query(&q);
-    let ask = GraphAsk::of(&q, &app).await?;
+    let query = GraphQueryView::from_query(q);
+    let ask = GraphAsk::of(q, app).await?;
     let data = app
-        .read(&id, move |db| GraphPageData::read(db, &ask, &options))
+        .read(id, move |db| GraphPageData::read(db, &ask, &options))
         .await?;
     // An unknown class or entity is shown on the page, not as a failed page.
-    let mut error = q.error;
+    let mut error = flash.error();
     let result = match data.result {
         Some(GraphAnswer {
             title,
@@ -2073,7 +2477,7 @@ async fn graph_page(
         .collect();
     drift.sort();
     html(&GraphPage {
-        page: Page::in_workspace(&app, "Graph", &access),
+        page: Page::in_workspace(app, Tab::Graph, &access),
         status,
         drift,
         has_ontology: data.has_ontology,
@@ -2082,7 +2486,7 @@ async fn graph_page(
         query,
         result,
         error,
-        notice: q.notice,
+        notice: flash.notice(),
     })
 }
 
@@ -2097,7 +2501,7 @@ enum GraphAsk {
 impl GraphAsk {
     /// A path when both ends are given, else a search when an entity or a
     /// class is.
-    async fn of(q: &GraphPageQuery, app: &App) -> WebResult<Self> {
+    async fn of(q: &GraphSearch, app: &App) -> WebResult<Self> {
         let path = PathQuery::new(
             q.from.as_deref().unwrap_or_default(),
             q.to.as_deref().unwrap_or_default(),

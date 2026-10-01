@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use rig::embeddings::EmbeddingModel;
+use crate::embedding::EmbeddingModel;
 use serde::Serialize;
 
 use super::traverse::{self, Hops};

@@ -7,6 +7,8 @@
 
 use std::fmt::Write as _;
 
+use jiff::Timestamp;
+
 use crate::analysis::agent::{AgentResponse, TokenUsage};
 use crate::analysis::chart::ChartSpec;
 use crate::analysis::citations::Citation;
@@ -177,6 +179,9 @@ pub struct AssistantMeta {
     pub graph: Vec<GraphResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
+    /// How long the turn took, in milliseconds; absent on turns recorded before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 impl AssistantMeta {
@@ -190,6 +195,7 @@ impl AssistantMeta {
             write_refused: response.write_refused,
             graph: response.graph.clone(),
             usage: response.usage,
+            duration_ms: response.duration_ms,
         };
         (meta != Self::default()).then_some(meta)
     }
@@ -468,9 +474,9 @@ pub fn messages(db: &WorkspaceDb, session_id: &SessionId) -> Result<Vec<MessageR
     Ok(out)
 }
 
-/// Record a completed turn: the user message, one tool message per step,
-/// and the assistant answer. Sets the session title from the first user
-/// message.
+/// Record a completed turn: the user message, stamped `asked_at`, one tool
+/// message per step, and the assistant answer. Sets the session title from
+/// the first user message.
 ///
 /// # Errors
 ///
@@ -479,12 +485,23 @@ pub fn record_turn(
     db: &WorkspaceDb,
     session_id: &SessionId,
     user_message: &str,
+    asked_at: Timestamp,
     response: &AgentResponse,
 ) -> Result<()> {
     let session =
         get_session(db, session_id)?.ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
 
-    append_message(db, session_id, MessageRole::User, user_message, None)?;
+    // The turn is recorded once it ends; the question keeps the time it was asked.
+    let seq = append_message(db, session_id, MessageRole::User, user_message, None)?;
+    db.connection().execute(
+        "UPDATE _quack_messages SET created_at = CAST(? AS TIMESTAMP) \
+         WHERE session_id = ? AND seq = ?",
+        duckdb::params![
+            asked_at.strftime("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+            session_id,
+            seq
+        ],
+    )?;
 
     for step in &response.steps {
         append_message(
@@ -521,14 +538,14 @@ pub fn record_turn(
     Ok(())
 }
 
-/// Prior user and assistant messages to replay to the model, newest last,
-/// trimmed from the oldest end to fit `token_budget`. Tool messages are not
-/// replayed; the assistant text already describes what the tools found.
-///
-/// The result is always anchored on a `User` message: when trimming drops
-/// the `User` that preceded a kept `Assistant`, that orphaned assistant is
-/// dropped too, so the replayed thread opens with a `User` rather than an
-/// answer whose question was discarded for budget.
+/// Prior turns to replay to the model, newest last, trimmed from the
+/// oldest end to fit `token_budget`. A turn is its question and its answer,
+/// kept or dropped together, so the thread opens on a question and
+/// alternates; tool messages are not replayed, since the answer already
+/// describes what the tools found. A turn with no text on either side is
+/// skipped: it tells the model nothing, and a provider that drops empty
+/// text blocks (Anthropic) would be left with a message of no content and
+/// refuse every later turn of the session.
 ///
 /// # Errors
 ///
@@ -539,27 +556,36 @@ pub fn history_for_model(
     token_budget: Tokens,
 ) -> Result<Vec<rig::message::Message>> {
     let stored = messages(db, session_id)?;
-    let budget = token_budget;
+    let mut turns: Vec<(&MessageRow, &MessageRow)> = Vec::new();
+    let mut question = None;
+    for row in &stored {
+        match row.role {
+            MessageRole::User => question = Some(row),
+            MessageRole::Assistant => {
+                if let Some(asked) = question.take() {
+                    turns.push((asked, row));
+                }
+            }
+            MessageRole::Tool => {}
+        }
+    }
 
     let mut kept: Vec<rig::message::Message> = Vec::new();
     let mut used = Tokens::default();
-    for row in stored.iter().rev() {
-        let message = match row.role {
-            MessageRole::User => rig::message::Message::user(row.content.clone()),
-            MessageRole::Assistant => rig::message::Message::assistant(row.content.clone()),
-            MessageRole::Tool => continue,
-        };
-        let cost = Tokens::estimate(&row.content);
-        if used.saturating_add(cost) > budget {
+    for (asked, answered) in turns.iter().rev() {
+        if asked.content.trim().is_empty() || answered.content.trim().is_empty() {
+            continue;
+        }
+        let cost =
+            Tokens::estimate(&asked.content).saturating_add(Tokens::estimate(&answered.content));
+        if used.saturating_add(cost) > token_budget {
             break;
         }
         used = used.saturating_add(cost);
-        kept.push(message);
+        kept.push(rig::message::Message::assistant(answered.content.clone()));
+        kept.push(rig::message::Message::user(asked.content.clone()));
     }
     kept.reverse();
-    while matches!(kept.first(), Some(rig::message::Message::Assistant { .. })) {
-        kept.remove(0);
-    }
     Ok(kept)
 }
 
@@ -754,6 +780,7 @@ mod tests {
             write_refused: false,
             cancelled: false,
             usage: None,
+            duration_ms: None,
         }
     }
 
@@ -857,6 +884,7 @@ mod tests {
             &db,
             &session.id,
             "  how many   claims are open?  ",
+            Timestamp::now(),
             &response(
                 "There are 4 open claims.",
                 vec![step(
@@ -898,7 +926,7 @@ mod tests {
             output_tokens: 57,
             total_tokens: 1_261,
         });
-        record_turn(&db, &session.id, "how many?", &answer).unwrap();
+        record_turn(&db, &session.id, "how many?", Timestamp::now(), &answer).unwrap();
 
         let rows = messages(&db, &session.id).unwrap();
         let assistant = rows
@@ -915,6 +943,49 @@ mod tests {
         );
     }
 
+    /// The question keeps the time it was asked, not the time the turn was
+    /// recorded, and the answer keeps how long it took. Both columns hold
+    /// UTC, which the web UI turns into the viewer's time zone.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn a_turn_keeps_when_it_was_asked_and_how_long_it_took() {
+        let db = db();
+        let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
+        let asked = Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_secs(90))
+            .unwrap();
+        let mut answer = response("4", vec![]);
+        answer.duration_ms = Some(2_345);
+        record_turn(&db, &session.id, "how many?", asked, &answer).unwrap();
+
+        let rows = messages(&db, &session.id).unwrap();
+        let utc = |text: &str| {
+            text.parse::<jiff::civil::DateTime>()
+                .unwrap()
+                .to_zoned(jiff::tz::TimeZone::UTC)
+                .unwrap()
+                .timestamp()
+        };
+        let question = rows.iter().find(|r| r.role == MessageRole::User).unwrap();
+        assert_eq!(
+            utc(&question.created_at).as_microsecond(),
+            asked.as_microsecond()
+        );
+        let assistant = rows
+            .iter()
+            .find(|r| r.role == MessageRole::Assistant)
+            .unwrap();
+        let recorded = utc(&assistant.created_at);
+        assert!(
+            Timestamp::now().duration_since(recorded).abs() < jiff::SignedDuration::from_secs(60),
+            "the default now() is not UTC: {recorded}"
+        );
+        assert_eq!(
+            assistant.assistant().and_then(|m| m.duration_ms),
+            Some(2_345)
+        );
+    }
+
     /// The typed metadata writes the same JSON keys the column always held,
     /// leaving out what a message did not have, and reads it back.
     #[test]
@@ -926,7 +997,7 @@ mod tests {
         sql.rows = Some(1);
         let mut answer = response("One.", vec![sql]);
         answer.write_refused = true;
-        record_turn(&db, &session.id, "one?", &answer).unwrap();
+        record_turn(&db, &session.id, "one?", Timestamp::now(), &answer).unwrap();
 
         let stored: Vec<String> = {
             let conn = db.connection();
@@ -989,7 +1060,14 @@ mod tests {
     fn a_turn_without_reported_usage_records_no_usage_key() {
         let db = db();
         let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
-        record_turn(&db, &session.id, "q", &response("a", vec![])).unwrap();
+        record_turn(
+            &db,
+            &session.id,
+            "q",
+            Timestamp::now(),
+            &response("a", vec![]),
+        )
+        .unwrap();
 
         let rows = messages(&db, &session.id).unwrap();
         let assistant = rows
@@ -1008,7 +1086,14 @@ mod tests {
         let first = create_session(&db, "m", ChatMode::Query, None).unwrap();
         let second = create_session(&db, "m", ChatMode::Query, None).unwrap();
         assert_eq!(latest_session(&db).unwrap().unwrap().id, second.id);
-        record_turn(&db, &first.id, "q", &response("a", vec![])).unwrap();
+        record_turn(
+            &db,
+            &first.id,
+            "q",
+            Timestamp::now(),
+            &response("a", vec![]),
+        )
+        .unwrap();
         assert_eq!(latest_session(&db).unwrap().unwrap().id, first.id);
         assert_eq!(list_sessions(&db, 10).unwrap().len(), 2);
     }
@@ -1035,6 +1120,7 @@ mod tests {
             &db,
             &session.id,
             "first question",
+            Timestamp::now(),
             &response(
                 "first answer",
                 vec![step(ToolName::RunSql, "SELECT 1", "1 rows")],
@@ -1045,6 +1131,7 @@ mod tests {
             &db,
             &session.id,
             "second question",
+            Timestamp::now(),
             &response("second answer", vec![]),
         )
         .unwrap();
@@ -1069,6 +1156,7 @@ mod tests {
             &db,
             &session.id,
             "first question",
+            Timestamp::now(),
             &response(
                 "first answer",
                 vec![step(ToolName::RunSql, "SELECT 1", "1 rows")],
@@ -1079,6 +1167,7 @@ mod tests {
             &db,
             &session.id,
             "second question",
+            Timestamp::now(),
             &response("second answer", vec![]),
         )
         .unwrap();
@@ -1102,6 +1191,54 @@ mod tests {
         );
     }
 
+    /// A turn whose answer (or question) holds no text is left out whole:
+    /// the replayed thread still alternates, and no message reaches the
+    /// provider without content.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn history_skips_turns_with_no_text() {
+        let db = db();
+        let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
+        record_turn(
+            &db,
+            &session.id,
+            "first",
+            Timestamp::now(),
+            &response("one", vec![]),
+        )
+        .unwrap();
+        append_message(&db, &session.id, MessageRole::User, "second", None).unwrap();
+        append_message(&db, &session.id, MessageRole::Assistant, "  ", None).unwrap();
+        append_message(&db, &session.id, MessageRole::User, "", None).unwrap();
+        append_message(&db, &session.id, MessageRole::Assistant, "orphaned", None).unwrap();
+        record_turn(
+            &db,
+            &session.id,
+            "third",
+            Timestamp::now(),
+            &response("three", vec![]),
+        )
+        .unwrap();
+
+        let history = history_for_model(&db, &session.id, Tokens::new(10_000)).unwrap();
+        let texts: Vec<String> = history
+            .iter()
+            .map(|m| match m {
+                rig::message::Message::User { .. } => format!("user: {m:?}"),
+                rig::message::Message::Assistant { .. } => format!("assistant: {m:?}"),
+                rig::message::Message::System { .. } => format!("system: {m:?}"),
+            })
+            .collect();
+        assert_eq!(history.len(), 4, "{texts:#?}");
+        for (text, expected) in texts.iter().zip(["first", "one", "third", "three"]) {
+            assert!(text.contains(expected), "{text} lacks {expected}");
+        }
+        assert!(
+            texts.iter().step_by(2).all(|t| t.starts_with("user:")),
+            "{texts:#?}"
+        );
+    }
+
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn history_is_always_user_anchored_and_strictly_alternating() {
@@ -1121,6 +1258,7 @@ mod tests {
                 &db,
                 &session.id,
                 question,
+                Timestamp::now(),
                 &response(answer, vec![step(ToolName::RunSql, "SELECT 1", "1 rows")]),
             )
             .unwrap();
@@ -1181,6 +1319,7 @@ mod tests {
             &db,
             &session.id,
             "open claims?",
+            Timestamp::now(),
             &response(
                 "4",
                 vec![
@@ -1211,7 +1350,7 @@ mod tests {
         let db = db();
         let empty = create_session(&db, "m", ChatMode::Query, None).unwrap();
         let used = create_session(&db, "m", ChatMode::Query, None).unwrap();
-        record_turn(&db, &used.id, "q", &response("a", vec![])).unwrap();
+        record_turn(&db, &used.id, "q", Timestamp::now(), &response("a", vec![])).unwrap();
         assert!(delete_if_empty(&db, &empty.id).unwrap());
         assert!(!delete_if_empty(&db, &used.id).unwrap());
         assert!(!delete_if_empty(&db, &SessionId::from("missing")).unwrap());
@@ -1227,6 +1366,7 @@ mod tests {
             &db,
             &session.id,
             "open claims?",
+            Timestamp::now(),
             &response("Four.", vec![step(ToolName::RunSql, "SELECT 1", "1 rows")]),
         )
         .unwrap();

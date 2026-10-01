@@ -27,7 +27,7 @@ use quack_core::config::{
     ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig, ProviderType,
     RetrievalConfig, ServerConfig,
 };
-use quack_core::embedding::{Dimension, Embedder, Input, Profile, Prompts};
+use quack_core::embedding::{Dimension, Embedder, EmbeddingModel, Input, Profile, Prompts};
 use quack_core::error::{Error, Result};
 use quack_core::extraction::{Extract, ExtractFuture, ExtractionRun};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
@@ -41,7 +41,8 @@ use quack_core::ontology::store::{self as ontology_store, Revision};
 use quack_core::progress::RunControl;
 use quack_core::storage::workspace::{ChunkScope, ChunkSearchResult, HybridLimits, WorkspaceDb};
 use quack_core::storage::writer::Writer;
-use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
+use rig::ProviderError;
+use rig::embeddings::Embedding;
 use serde::{Deserialize, Serialize};
 
 const HASH_DIM: usize = 64;
@@ -172,21 +173,10 @@ fn eval_config(data_dir: &Path) -> Result<Config> {
 struct HashEmbedder;
 
 impl EmbeddingModel for HashEmbedder {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self
-    }
-
-    fn ndims(&self) -> usize {
-        HASH_DIM
-    }
-
     fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = std::result::Result<Vec<Embedding>, EmbeddingError>> + Send {
+        texts: Vec<String>,
+    ) -> impl Future<Output = std::result::Result<Vec<Embedding>, ProviderError>> + Send {
         let embeddings = texts
             .into_iter()
             .map(|text| {

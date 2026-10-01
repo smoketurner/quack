@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::extraction::{Extract, ExtractionRun};
 use quack_core::graph::extract::ChunkPlan;
@@ -31,6 +31,8 @@ use quack_core::jobs::JobId;
 use quack_core::ontology::{Ontology, OntologyVersion};
 use quack_core::progress::{ChunkDone, RunControl};
 
+/// A graph search, in the body: entity names are workspace content, and a
+/// URL ends up in logs.
 #[derive(Deserialize, Default)]
 pub(crate) struct SearchQuery {
     pub entity: Option<String>,
@@ -43,7 +45,7 @@ pub(crate) async fn search(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<SearchQuery>,
+    Json(q): Json<SearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let query = GraphQuery::new(
@@ -76,6 +78,7 @@ pub(crate) async fn search(
     Ok(Json(serde_json::to_value(result?)?))
 }
 
+/// A path's two ends, in the body for the same reason as [`SearchQuery`].
 #[derive(Deserialize)]
 pub(crate) struct PathParams {
     pub from: String,
@@ -87,7 +90,7 @@ pub(crate) async fn path(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<PathParams>,
+    Json(q): Json<PathParams>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let query = PathQuery::new(&q.from, &q.to, q.max_hops)

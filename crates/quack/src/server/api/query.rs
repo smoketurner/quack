@@ -3,9 +3,10 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
 use quack_core::analysis::agent::AgentResponse;
@@ -20,7 +21,7 @@ use quack_core::llm::{self, Embeddings};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{
-    ChunkScope, HybridLimits, TEMP_OBJECT_REFUSED, creates_temp_object,
+    ChunkScope, HybridLimits, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
 };
 use serde::{Deserialize, Serialize};
 
@@ -349,6 +350,9 @@ pub(crate) struct SqlOutcome {
     pub rows: Vec<Vec<serde_json::Value>>,
     pub row_count: usize,
     pub truncated: bool,
+    /// How long the statement ran, timed on its connection's thread, so a
+    /// wait for the writer is not counted.
+    pub duration_ms: u64,
 }
 
 /// Direct SQL. Reads need the viewer role; anything that mutates needs the
@@ -395,9 +399,14 @@ impl Access {
         let reader_db = app.reader_db(&access.workspace.id).await?;
         let sql = statement.to_owned();
         let max_rows = app.config.analysis.max_query_rows;
+        let timed = move |db: &WorkspaceDb| {
+            let began = Instant::now();
+            db.execute_query_capped(&sql, max_rows)
+                .map(|capped| (capped, began.elapsed()))
+        };
         let result = if is_write {
             let db = app.workspace_db(&access.workspace.id).await?;
-            let result = with_db(db, move |db| db.execute_query_capped(&sql, max_rows)).await;
+            let result = with_db(db, timed).await;
             // Whatever ran might have created a temp object the check above
             // did not catch (a leading comment, a multi-statement batch);
             // check the writer's catalog regardless of whether the statement
@@ -408,21 +417,19 @@ impl Access {
         } else {
             // A read never queues behind a write: run it on the workspace's
             // reader connection instead of the writer.
-            reader_db
-                .with_db(move |db| db.execute_query_capped(&sql, max_rows))
-                .await
-                .map_err(ApiError::from)
+            reader_db.with_db(timed).await.map_err(ApiError::from)
         };
         let outcome = Outcome::of(&result);
         access
             .audit(app, AuditAction::Sql, None, outcome, Some(detail))
             .await?;
-        let capped = result.map_err(|e| ApiError::unprocessable(e.message))?;
+        let (capped, took) = result.map_err(|e| ApiError::unprocessable(e.message))?;
         Ok(SqlOutcome {
             truncated: capped.truncated(),
             columns: capped.results.columns,
             rows: capped.results.rows,
             row_count: capped.total_rows,
+            duration_ms: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
         })
     }
 }
@@ -434,12 +441,13 @@ pub(crate) struct SearchQuery {
 }
 
 /// Hybrid retrieval with no model call: the embedding provider when one is
-/// configured, else keyword search alone.
+/// configured, else keyword search alone. The query is in the body: search
+/// text is workspace content, and a URL ends up in logs.
 pub(crate) async fn search(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-    Query(q): Query<SearchQuery>,
+    Json(q): Json<SearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let query = q.query.trim().to_owned();

@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use futures::StreamExt;
 use rig::prelude::*;
-use rig::streaming::StreamedAssistantContent;
+use rig::streaming::{Item, StreamEvent};
 
 use crate::config::{AnalysisConfig, RetrievalConfig};
-use crate::embedding::Embedder;
+use crate::embedding::{Embedder, EmbeddingModel};
 use crate::error::{Error, Result};
 use crate::ids::SessionId;
 use crate::text::Tokens;
@@ -22,7 +23,7 @@ use super::tools::{
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::{GraphOptions, GraphResult, store as graph_store};
-use crate::llm::OLLAMA_KEEP_ALIVE;
+use crate::llm::{ChatModel, OLLAMA_KEEP_ALIVE};
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
 
@@ -45,12 +46,14 @@ pub struct TokenUsage {
     pub total_tokens: u64,
 }
 
+/// A counter the provider did not report counts as zero here; a turn where
+/// it reported none at all is `None` (see [`TokenUsage::reported`]).
 impl From<rig::completion::Usage> for TokenUsage {
     fn from(usage: rig::completion::Usage) -> Self {
         Self {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            total_tokens: usage.total_tokens,
+            input_tokens: usage.input_tokens.unwrap_or_default(),
+            output_tokens: usage.output_tokens.unwrap_or_default(),
+            total_tokens: usage.total_tokens.unwrap_or_default(),
         }
     }
 }
@@ -59,13 +62,14 @@ impl TokenUsage {
     /// Add one completion request's counts, for the turns that never reach
     /// a final response.
     fn add(&mut self, usage: rig::completion::Usage) {
+        let usage = Self::from(usage);
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
         self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
     }
 
-    /// The counts, unless every one is zero — rig's sentinel for a provider
-    /// that reported no usage at all.
+    /// The counts, unless every one is zero: a provider that reported no
+    /// usage at all, or only zeroes.
     fn reported(self) -> Option<Self> {
         (self != Self::default()).then_some(self)
     }
@@ -93,6 +97,10 @@ pub struct AgentResponse {
     /// turn that cost nothing.
     #[serde(default)]
     pub usage: Option<TokenUsage>,
+    /// Milliseconds from the question to the answer, prompt assembly
+    /// included. `None` on a response no turn timed.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 /// One SQL statement the turn ran, as the response object lists it.
@@ -145,6 +153,7 @@ impl AgentResponse {
             "write_refused": self.write_refused,
             "cancelled": self.cancelled,
             "usage": self.usage,
+            "duration_ms": self.duration_ms,
             "session_id": session_id,
         })
     }
@@ -169,6 +178,8 @@ pub struct Analysis<'a, M> {
     pub prompt: PromptOptions,
     pub history: Vec<Message>,
     pub message: &'a str,
+    /// When the question arrived; the answer's `duration_ms` counts from here.
+    pub asked: Instant,
 }
 
 impl<M> Analysis<'_, M>
@@ -187,11 +198,7 @@ where
     ///
     /// Returns an error if system prompt generation, agent building, or
     /// the model call fails.
-    pub async fn run(
-        self,
-        completion_model: impl CompletionModel + Clone + 'static,
-        sink: EventSink,
-    ) -> Result<AgentResponse> {
+    pub async fn run(self, completion_model: ChatModel, sink: EventSink) -> Result<AgentResponse> {
         let max_turns = usize::try_from(self.config.max_turns)
             .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
         let recorder = TurnRecorder::new(sink).with_turn_limit(max_turns);
@@ -229,6 +236,71 @@ impl PromptAndModel {
                 })
             })
             .await
+    }
+}
+
+/// A model call that stopped before its answer was whole: rig's
+/// normalized `Length` or `ContentFilter` finish reason. rig ends a call
+/// that stopped so with no answer at all as an error of its own, whose
+/// advice ("raise `max_tokens`") names no setting quack has; this is what
+/// quack says instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cutoff {
+    /// The output limit, which with Ollama is the context window.
+    Length,
+    /// The provider's content filter.
+    Filtered,
+}
+
+impl Cutoff {
+    pub(crate) fn of(reason: Option<&rig::completion::FinishReason>) -> Option<Self> {
+        use rig::completion::FinishReason;
+        match reason? {
+            FinishReason::Length => Some(Self::Length),
+            FinishReason::ContentFilter => Some(Self::Filtered),
+            FinishReason::Stop | FinishReason::ToolCalls | FinishReason::Other(_) => None,
+        }
+    }
+
+    /// The note a turn carries; `answered` when part of the answer came
+    /// through before the stop.
+    fn note(self, answered: bool, window: Window) -> String {
+        let advice = match window {
+            Window::Ollama(_) => {
+                " With Ollama the answer shares the context window with the prompt and the \
+                 model's reasoning; raise [analysis].max_context_tokens or ask a narrower \
+                 question."
+            }
+            Window::Provider => " Ask a narrower question.",
+        };
+        match (self, answered) {
+            (Self::Length, false) => {
+                format!("The model reached its output limit before it answered.{advice}")
+            }
+            (Self::Length, true) => {
+                format!("The answer was cut off at the model's output limit.{advice}")
+            }
+            (Self::Filtered, false) => {
+                String::from("The provider's content filter stopped the answer before it began.")
+            }
+            (Self::Filtered, true) => {
+                String::from("The provider's content filter cut the answer off.")
+            }
+        }
+    }
+
+    /// Why a one-shot call's answer cannot be used: a cut-off answer is
+    /// not one to parse.
+    pub(crate) fn refusal(self, what: &str) -> Error {
+        Error::Llm(match self {
+            Self::Length => format!(
+                "the {what} answer was cut off at the model's output limit (with Ollama, the \
+                 context window: [analysis].max_context_tokens)"
+            ),
+            Self::Filtered => {
+                format!("the {what} answer was stopped by the provider's content filter")
+            }
+        })
     }
 }
 
@@ -304,7 +376,7 @@ where
 {
     async fn run_inner(
         self,
-        completion_model: impl CompletionModel + Clone + 'static,
+        completion_model: ChatModel,
         recorder: &TurnRecorder,
     ) -> Result<AgentResponse> {
         let Self {
@@ -318,6 +390,7 @@ where
             prompt,
             history,
             message: user_message,
+            asked,
         } = self;
         let PromptAndModel {
             system_prompt,
@@ -349,9 +422,10 @@ where
             .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
 
         let mut stream = agent
-            .stream_chat(user_message, history)
+            .prompt(user_message)
+            .history(history)
             .max_turns(max_turns)
-            .await;
+            .stream();
 
         let mut streamed = String::new();
         let mut final_text: Option<String> = None;
@@ -361,6 +435,8 @@ where
         // which is exactly the turn whose cost is worth knowing.
         let mut aggregate: Option<TokenUsage> = None;
         let mut per_call = TokenUsage::default();
+        // How the latest model call stopped, when it stopped short.
+        let mut cutoff: Option<Cutoff> = None;
 
         while let Some(item) = stream.next().await {
             let item = match item {
@@ -375,52 +451,69 @@ where
                         return Err(Error::Analysis(e.to_string()));
                     }
                     tracing::warn!(error = %e, "agent turn stopped early");
-                    stopped = Some(stop.explain(analysis_config.max_turns, window));
+                    stopped = Some(cutoff.map_or_else(
+                        || stop.explain(analysis_config.max_turns, window),
+                        |cut| cut.note(!streamed.trim().is_empty(), window),
+                    ));
                     break;
                 }
             };
             match item {
-                MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
-                    streamed.push_str(&text.text);
-                    recorder.emit(AgentEvent::TextDelta(text.text));
+                MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                    text,
+                    ..
+                })) => {
+                    streamed.push_str(&text);
+                    recorder.emit(AgentEvent::TextDelta(text));
                 }
                 MultiTurnStreamItem::FinalResponse(response) => {
-                    if response.usage.has_values() {
+                    if response.usage.is_reported() {
                         aggregate = Some(response.usage.into());
                     }
                     final_text = Some(response.output);
                 }
-                MultiTurnStreamItem::CompletionCall(call) => per_call.add(call.usage),
+                MultiTurnStreamItem::CompletionCall(call) => {
+                    per_call.add(call.usage);
+                    cutoff = Cutoff::of(call.finish_reason.as_ref());
+                }
                 MultiTurnStreamItem::StreamAssistantItem(_)
                 | MultiTurnStreamItem::StreamUserItem(_)
+                | MultiTurnStreamItem::ToolCall { .. }
                 | MultiTurnStreamItem::ToolExecutionCommitted { .. }
                 | MultiTurnStreamItem::ModelTurnRetried { .. } => {}
             }
         }
 
-        let raw = turn_text(streamed, final_text, stopped, window);
-        Ok(outputs.finish(
-            recorder.citations().validate(&raw),
-            aggregate.or_else(|| per_call.reported()),
-        ))
+        // A turn that answered but was cut short says so; rig counts a
+        // partial answer as a valid one.
+        let stopped = stopped.or_else(|| cutoff.map(|cut| cut.note(true, window)));
+        let answer = turn_text(streamed, final_text, stopped, window, |text| {
+            recorder.citations().validate(text)
+        });
+        Ok(outputs.finish(answer, aggregate.or_else(|| per_call.reported()), asked))
     }
 }
 
-/// The answer text: what the model streamed for the last turn, else the
-/// aggregated final text when a provider did not stream deltas, with a
-/// note when the turn stopped early or produced nothing.
+/// The answer: what the model streamed for the last turn, else the
+/// aggregated final text when a provider did not stream deltas, put through
+/// `check` (the citation check), then quack's own note when the turn
+/// stopped early or the check left no text. The note goes on after the
+/// check, which drops leaked channel tokens such as `[analysis]` and would
+/// otherwise eat quack's references to `[analysis]` settings.
 fn turn_text(
     streamed: String,
     final_text: Option<String>,
     stopped: Option<String>,
     window: Window,
-) -> String {
-    let mut raw = match final_text {
+    check: impl FnOnce(&str) -> CitedAnswer,
+) -> CitedAnswer {
+    let raw = match final_text {
         Some(text) if streamed.trim().is_empty() => text,
         Some(_) | None => streamed,
     };
+    let mut answer = check(&raw);
     let note = stopped.or_else(|| {
-        raw.trim().is_empty().then(|| {
+        answer.text.trim().is_empty().then(|| {
             String::from(if matches!(window, Window::Ollama(_)) {
                 "The model returned no text. With Ollama this usually means the answer or the \
                  prompt did not fit the context window; raise [analysis].max_context_tokens or \
@@ -431,14 +524,14 @@ fn turn_text(
         })
     });
     if let Some(reason) = note {
-        if !raw.trim().is_empty() {
-            raw.push_str("\n\n");
+        if !answer.text.trim().is_empty() {
+            answer.text.push_str("\n\n");
         }
-        raw.push('(');
-        raw.push_str(&reason);
-        raw.push(')');
+        answer.text.push('(');
+        answer.text.push_str(&reason);
+        answer.text.push(')');
     }
-    raw
+    answer
 }
 
 /// Why a turn's stream ended early.
@@ -455,7 +548,7 @@ impl StreamStop<'_> {
     fn explain(&self, max_turns: u32, window: Window) -> String {
         use rig::completion::PromptError;
         match self.0 {
-            rig::agent::StreamingError::Prompt(prompt_error) => match prompt_error.as_ref() {
+            rig::agent::StreamingError::Prompt(prompt_error) => match prompt_error {
                 PromptError::UnknownToolCall { tool_name, .. } => format!(
                     "The model called a tool that does not exist ({tool_name}), so the turn \
                      stopped.{}",
@@ -477,9 +570,13 @@ impl StreamStop<'_> {
                 }
                 PromptError::CompletionError(e) => format!("The model call failed: {e}"),
                 PromptError::MemoryError(e) => format!("The turn failed: {e}"),
+                PromptError::Report(report) => format!("The turn failed: {report}"),
             },
             rig::agent::StreamingError::Completion(e) => {
                 format!("The model call failed part way through: {e}")
+            }
+            rig::agent::StreamingError::Report(report) => {
+                format!("The turn failed: {report}")
             }
         }
     }
@@ -506,7 +603,12 @@ impl TurnOutputs {
 
     /// The response once the stream has ended: the checked answer, the
     /// chart and graph results the tools left behind, and the steps.
-    fn finish(&self, answer: CitedAnswer, usage: Option<TokenUsage>) -> AgentResponse {
+    fn finish(
+        &self,
+        answer: CitedAnswer,
+        usage: Option<TokenUsage>,
+        asked: Instant,
+    ) -> AgentResponse {
         let graph = std::mem::take(&mut *self.graph.lock().unwrap_or_else(PoisonError::into_inner));
         AgentResponse {
             content: answer.text,
@@ -517,6 +619,7 @@ impl TurnOutputs {
             write_refused: self.refused.was_refused(),
             cancelled: false,
             usage,
+            duration_ms: Some(u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX)),
         }
     }
 }
@@ -541,7 +644,7 @@ impl BuildContext<'_> {
     /// The rig agent with every tool this workspace and mode register.
     fn build_agent<M>(
         &self,
-        completion_model: impl CompletionModel + Clone + 'static,
+        completion_model: ChatModel,
         embedding_model: Option<Embedder<M>>,
         system_prompt: &str,
     ) -> Result<Agent>
@@ -561,8 +664,7 @@ impl BuildContext<'_> {
             db: ctx.reader_db.clone(),
             recorder: ctx.outputs.recorder.clone(),
         };
-        let mut builder = completion_model
-            .into_agent_builder()
+        let mut builder = AgentBuilder::new(completion_model)
             .preamble(system_prompt)
             .tool(search)
             .tool(RunSqlTool::new(
@@ -637,6 +739,7 @@ impl BuildContext<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::citations::CitationRegistry;
 
     #[test]
     fn the_ollama_window_rounds_up_within_bounds() {
@@ -653,7 +756,7 @@ mod tests {
     use rig::completion::PromptError;
 
     fn prompt_error(e: PromptError) -> rig::agent::StreamingError {
-        rig::agent::StreamingError::Prompt(Box::new(e))
+        rig::agent::StreamingError::Prompt(e)
     }
 
     #[test]
@@ -663,7 +766,7 @@ mod tests {
             tool_name: String::from("container.exec"),
             available_tools: vec![String::from("run_sql")],
             allowed_tools: vec![String::from("run_sql")],
-            chat_history: Box::new(Vec::new()),
+            chat_history: Vec::new(),
         });
         assert!(StreamStop(&unknown).by_agent_loop());
         let text =
@@ -675,8 +778,8 @@ mod tests {
 
         let limit = prompt_error(PromptError::MaxTurnsError {
             max_turns: 10,
-            chat_history: Box::new(Vec::new()),
-            prompt: Box::new(Message::user("q")),
+            chat_history: Vec::new(),
+            prompt: Message::user("q"),
         });
         let text = StreamStop(&limit).explain(config.max_turns, Window::Provider);
         assert!(
@@ -684,7 +787,7 @@ mod tests {
             "{text}"
         );
 
-        let provider = rig::agent::StreamingError::Completion(CompletionError::ProviderError(
+        let provider = rig::agent::StreamingError::Completion(ProviderError::Provider(
             String::from("connection refused"),
         ));
         assert!(!StreamStop(&provider).by_agent_loop());
@@ -756,13 +859,10 @@ mod tests {
     #[test]
     fn per_call_usage_accumulates_across_a_turns_completion_requests() {
         let call = |input: u64, output: u64| rig::completion::Usage {
-            input_tokens: input,
-            output_tokens: output,
-            total_tokens: input.saturating_add(output),
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            tool_use_prompt_tokens: 0,
-            reasoning_tokens: 0,
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            total_tokens: Some(input.saturating_add(output)),
+            ..rig::completion::Usage::default()
         };
         let mut usage = TokenUsage::default();
         usage.add(call(400, 20));
@@ -779,39 +879,65 @@ mod tests {
         // A provider that reports nothing leaves the accumulator at its
         // default, which `run_inner` reads as "no counts", not zero cost.
         let mut none = TokenUsage::default();
-        none.add(call(0, 0));
+        none.add(rig::completion::Usage::default());
         assert_eq!(none, TokenUsage::default());
         assert_eq!(none.reported(), None);
     }
 
     #[test]
     fn turn_text_keeps_streamed_text_and_notes_early_stops() {
-        assert_eq!(
+        let as_is = |text: &str| CitedAnswer {
+            text: text.to_owned(),
+            citations: Vec::new(),
+        };
+        let text = |streamed: &str, final_text: Option<&str>, stopped: Option<&str>, window| {
             turn_text(
-                String::from("so far"),
-                None,
-                Some(String::from("why")),
-                Window::Provider
-            ),
+                streamed.to_owned(),
+                final_text.map(str::to_owned),
+                stopped.map(str::to_owned),
+                window,
+                as_is,
+            )
+            .text
+        };
+        assert_eq!(
+            text("so far", None, Some("why"), Window::Provider),
             "so far\n\n(why)"
         );
-        assert_eq!(
-            turn_text(
-                String::new(),
-                Some(String::from("final")),
-                None,
-                Window::Provider
-            ),
-            "final"
-        );
-        let empty = turn_text(
-            String::new(),
-            Some(String::new()),
+        assert_eq!(text("", Some("final"), None, Window::Provider), "final");
+        let empty = text("", Some(""), None, Window::Ollama(OllamaWindow(8_192)));
+        assert!(empty.contains("[analysis].max_context_tokens"), "{empty}");
+        let empty = text("", None, None, Window::Provider);
+        assert!(!empty.contains("Ollama"), "{empty}");
+    }
+
+    /// The note goes on after the citation check: an answer the check
+    /// empties (a lone invented marker) gets the no-text note, and the
+    /// check, which drops leaked `[analysis]` channel tokens, never sees
+    /// quack's own `[analysis]` setting names.
+    #[test]
+    fn notes_are_added_after_the_citation_check() {
+        let check = |text: &str| CitationRegistry::default().validate(text);
+        let answer = turn_text(
+            String::from("[7]"),
+            None,
             None,
             Window::Ollama(OllamaWindow(8_192)),
+            check,
         );
-        assert!(empty.contains("max_context_tokens"), "{empty}");
-        let empty = turn_text(String::new(), None, None, Window::Provider);
-        assert!(!empty.contains("Ollama"), "{empty}");
+        assert!(
+            answer.text.starts_with("(The model returned no text.")
+                && answer.text.contains("raise [analysis].max_context_tokens"),
+            "{}",
+            answer.text
+        );
+        let answer = turn_text(
+            String::from("Partly [analysis]answered"),
+            None,
+            Some(String::from("see [analysis].max_turns")),
+            Window::Provider,
+            check,
+        );
+        assert_eq!(answer.text, "Partly answered\n\n(see [analysis].max_turns)");
     }
 }

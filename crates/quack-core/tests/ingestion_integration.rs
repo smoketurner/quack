@@ -9,7 +9,7 @@ use quack_core::config::{
     RetrievalConfig, ServerConfig,
 };
 use quack_core::embedding::refresh::{Plan, Retype};
-use quack_core::embedding::{Dimension, Embedder, Profile, Prompts, Vector};
+use quack_core::embedding::{Dimension, Embedder, EmbeddingModel, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::graph::{Properties, Standing, store as graph_store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId};
@@ -24,7 +24,8 @@ use quack_core::storage::workspace::{
 };
 use quack_core::storage::writer::Writer;
 use quack_core::{import, ingestion};
-use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
+use rig::ProviderError;
+use rig::embeddings::Embedding;
 
 const TEST_DIM: usize = 4;
 const TEST_DIM_U32: u32 = 4;
@@ -58,24 +59,10 @@ struct BatchRecordingModel {
 }
 
 impl EmbeddingModel for BatchRecordingModel {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self {
-            batches: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    fn ndims(&self) -> usize {
-        TEST_DIM
-    }
-
     fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
-        let texts: Vec<String> = texts.into_iter().collect();
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Embedding>, ProviderError>> + Send {
         if let Ok(mut batches) = self.batches.lock() {
             batches.push(texts.len());
         }
@@ -93,43 +80,21 @@ impl EmbeddingModel for BatchRecordingModel {
 struct FailingEmbeddingModel;
 
 impl EmbeddingModel for FailingEmbeddingModel {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self
-    }
-
-    fn ndims(&self) -> usize {
-        TEST_DIM
-    }
-
     fn embed_texts(
         &self,
-        _texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
-        std::future::ready(Err(EmbeddingError::ProviderError(String::from(
+        _texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Embedding>, ProviderError>> + Send {
+        std::future::ready(Err(ProviderError::Provider(String::from(
             "connection refused",
         ))))
     }
 }
 
 impl EmbeddingModel for MockEmbeddingModel {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self { dim: TEST_DIM }
-    }
-
-    fn ndims(&self) -> usize {
-        self.dim
-    }
-
     fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Embedding>, ProviderError>> + Send {
         let mut result = Vec::new();
         for text in texts {
             result.push(Embedding {
@@ -292,27 +257,11 @@ struct InFlightModel {
 }
 
 impl EmbeddingModel for InFlightModel {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self {
-            in_flight: std::sync::atomic::AtomicUsize::new(0),
-            peak: std::sync::atomic::AtomicUsize::new(0),
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    fn ndims(&self) -> usize {
-        TEST_DIM
-    }
-
     fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Embedding>, ProviderError>> + Send {
         use std::sync::atomic::Ordering;
-        let texts: Vec<String> = texts.into_iter().collect();
         async move {
             let now = self
                 .in_flight
@@ -381,7 +330,11 @@ async fn embedding_concurrency_overlaps_requests_and_keeps_vectors_with_their_ch
     let mut config = test_config(dir.path());
     config.ingestion.embedding_batch_size = 1;
     config.ingestion.embedding_concurrency = 3;
-    let model = embedder(InFlightModel::make(&(), "mock", None));
+    let model = embedder(InFlightModel {
+        in_flight: std::sync::atomic::AtomicUsize::new(0),
+        peak: std::sync::atomic::AtomicUsize::new(0),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
 
     let (db, result) = ingest_six_sections(&config, "ws-concurrent", &model).await;
 
@@ -400,7 +353,11 @@ async fn embedding_concurrency_of_one_stays_serial() {
     let mut config = test_config(dir.path());
     config.ingestion.embedding_batch_size = 1;
     config.ingestion.embedding_concurrency = 1;
-    let model = embedder(InFlightModel::make(&(), "mock", None));
+    let model = embedder(InFlightModel {
+        in_flight: std::sync::atomic::AtomicUsize::new(0),
+        peak: std::sync::atomic::AtomicUsize::new(0),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
 
     let (db, _) = ingest_six_sections(&config, "ws-serial", &model).await;
 
@@ -418,7 +375,9 @@ async fn embedding_batch_size_bounds_every_embed_request() {
     let db = WorkspaceDb::open(&config, workspace_id).unwrap();
 
     let writer = writer_of(&db);
-    let model = embedder(BatchRecordingModel::make(&(), "mock", None));
+    let model = embedder(BatchRecordingModel {
+        batches: std::sync::Mutex::new(Vec::new()),
+    });
 
     // Five headed sections, each its own chunk at 50 tokens.
     let sections: Vec<String> = (1..=5)
@@ -506,6 +465,143 @@ async fn ingest_csv_structured() {
     assert_eq!(count, &serde_json::Value::Number(3.into()));
 }
 
+/// Delimited files load with their sniffed dialect, and a one-column sniff
+/// is checked against the type's own separator: a genuine one-column file
+/// loads, in either type.
+#[tokio::test]
+async fn delimited_files_load_by_their_dialect() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let workspace_id = "ws-dialects";
+    std::fs::create_dir_all(config.workspace_files_dir(workspace_id)).unwrap();
+    let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+    let writer = writer_of(&db);
+    let ingest = |name: &'static str, bytes: &'static [u8]| {
+        let (config, writer) = (&config, &writer);
+        async move {
+            ingestion::ingest_file::<MockEmbeddingModel>(
+                config,
+                writer,
+                workspace_id,
+                &ingestion::NewFile::new(name, bytes),
+                None,
+            )
+            .await
+            .map(|outcome| outcome.ingested().unwrap())
+        }
+    };
+    let shape = |table: &str| {
+        let columns = db
+            .execute_query(&format!("SELECT * FROM \"{table}\" LIMIT 0"))
+            .unwrap()
+            .columns;
+        let rows = db
+            .execute_query(&format!("SELECT count(*) FROM \"{table}\""))
+            .unwrap()
+            .rows;
+        (columns, rows.first().unwrap().first().unwrap().clone())
+    };
+
+    for (name, bytes, table, columns, rows) in [
+        (
+            "single.csv",
+            &b"name\nalpha\nbeta\n"[..],
+            "single",
+            vec!["name"],
+            2,
+        ),
+        (
+            "semi.csv",
+            &b"a;b\n1;2\n3;4\n"[..],
+            "semi",
+            vec!["a", "b"],
+            2,
+        ),
+        (
+            "tabbed.tsv",
+            &b"a\tb\n1\t2\n"[..],
+            "tabbed",
+            vec!["a", "b"],
+            1,
+        ),
+        ("lone.tsv", &b"only\nx\n"[..], "lone", vec!["only"], 1),
+        (
+            "header_only.csv",
+            &b"a,b,c\n"[..],
+            "header_only",
+            vec!["a", "b", "c"],
+            0,
+        ),
+    ] {
+        let result = ingest(name, bytes).await.unwrap();
+        assert_eq!(result.tables, [table], "{name}");
+        assert_eq!(
+            shape(table),
+            (
+                columns.iter().map(|c| (*c).to_owned()).collect(),
+                serde_json::json!(rows)
+            ),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        ingest("tabbed2.tsv", b"x\ty\n1\t2\n")
+            .await
+            .unwrap()
+            .file_type,
+        FileType::Tsv
+    );
+}
+
+/// A file no separator splits consistently is refused instead of loading
+/// its raw lines, and an empty file is refused before anything is written.
+#[tokio::test]
+async fn malformed_and_empty_delimited_files_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let workspace_id = "ws-dialects";
+    std::fs::create_dir_all(config.workspace_files_dir(workspace_id)).unwrap();
+    let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+    let writer = writer_of(&db);
+    let ingest = |name: &'static str, bytes: &'static [u8]| {
+        let (config, writer) = (&config, &writer);
+        async move {
+            ingestion::ingest_file::<MockEmbeddingModel>(
+                config,
+                writer,
+                workspace_id,
+                &ingestion::NewFile::new(name, bytes),
+                None,
+            )
+            .await
+            .map(|outcome| outcome.ingested().unwrap())
+        }
+    };
+
+    let malformed = ingest("malformed.csv", b"a,b\n1,2,3,4\n\"unterminated,5\n6\n").await;
+    assert!(
+        matches!(&malformed, Err(Error::Ingestion(m)) if m.contains("'malformed.csv' does not parse as comma-separated values")),
+        "{malformed:?}"
+    );
+    assert!(
+        !db.list_tables()
+            .unwrap()
+            .contains(&String::from("malformed"))
+    );
+
+    let empty = ingest("empty.csv", b"").await;
+    assert!(
+        matches!(&empty, Err(Error::EmptyFile(name)) if name == "empty.csv"),
+        "{empty:?}"
+    );
+    assert!(
+        db.list_documents()
+            .unwrap()
+            .iter()
+            .all(|d| d.filename != "empty.csv")
+    );
+}
+
 #[tokio::test]
 async fn ingest_json_structured() {
     let dir = tempfile::tempdir().unwrap();
@@ -570,8 +666,10 @@ async fn ingest_unknown_file_type_returns_error() {
     );
 }
 
+/// An empty file of a chunked type is refused like an empty table file:
+/// a document with nothing in it would only ever answer "no results".
 #[tokio::test]
-async fn ingest_empty_text_file() {
+async fn ingest_empty_text_file_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let workspace_id = "ws-empty";
@@ -587,13 +685,13 @@ async fn ingest_empty_text_file() {
         &ingestion::NewFile::new("empty.txt", b""),
         None,
     )
-    .await
-    .unwrap()
-    .ingested()
-    .unwrap();
+    .await;
 
-    assert_eq!(result.file_type, FileType::Text);
-    assert_eq!(result.chunks_stored, 0);
+    assert!(
+        matches!(&result, Err(Error::EmptyFile(name)) if name == "empty.txt"),
+        "{result:?}"
+    );
+    assert!(db.list_documents().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1057,8 +1155,12 @@ fn long_running_statement_is_interrupted_at_timeout() {
     let elapsed = started.elapsed();
     let err = result.err().unwrap();
     assert!(
-        err.to_string().to_lowercase().contains("interrupt"),
+        matches!(err, Error::QueryTimeout { timeout } if timeout == std::time::Duration::from_millis(200)),
         "unexpected error: {err}"
+    );
+    assert!(
+        err.to_string().contains("200ms query timeout"),
+        "unexpected message: {err}"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(10),
@@ -2764,24 +2866,10 @@ struct SlowModel {
 }
 
 impl EmbeddingModel for SlowModel {
-    const MAX_DOCUMENTS: usize = 1024;
-    type Client = ();
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-        Self {
-            delay: std::time::Duration::from_secs(60),
-        }
-    }
-
-    fn ndims(&self) -> usize {
-        TEST_DIM
-    }
-
     fn embed_texts(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> impl Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
-        let texts: Vec<String> = texts.into_iter().collect();
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Embedding>, ProviderError>> + Send {
         let delay = self.delay;
         async move {
             tokio::time::sleep(delay).await;

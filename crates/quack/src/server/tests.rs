@@ -26,10 +26,9 @@ use tower::ServiceExt;
 
 use super::state::{App, AppState, ServeMode, with_db};
 use crate::server::auth::{Access, Credential, Identity};
-use crate::server::queue::MAX_WAITING_UPLOADS;
+use crate::server::queue::UploadJob;
 use crate::server::run::{BackgroundRun, RunKind, RunReport};
 use quack_core::jobs::LaneKey;
-use quack_core::llm::CancellationToken;
 use quack_core::okf::{Bundle, BundleSink, TarSink};
 use quack_core::storage::audit;
 use quack_core::storage::control::{
@@ -640,7 +639,11 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["tables"], serde_json::json!(["t"]));
     let (status, body) = h
-        .get(&format!("/api/v1/workspaces/{ws}/tables/t"), &viewer_token)
+        .post(
+            &format!("/api/v1/workspaces/{ws}/tables/describe"),
+            &viewer_token,
+            serde_json::json!({ "name": "t" }),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["columns"][0]["name"], "a");
@@ -893,9 +896,10 @@ async fn uploads_are_queued_processed_pinned_and_deleted() {
     assert_eq!(body["pinned"], true);
 
     let (status, body) = h
-        .get(
-            &format!("/api/v1/workspaces/{ws}/search?query=flood"),
+        .post(
+            &format!("/api/v1/workspaces/{ws}/search"),
             &token,
+            serde_json::json!({ "query": "flood" }),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1136,9 +1140,10 @@ async fn query_endpoints_fail_cleanly_without_a_chat_model() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = h
-        .get(
-            &format!("/api/v1/workspaces/{ws}/search?query="),
+        .post(
+            &format!("/api/v1/workspaces/{ws}/search"),
             &owner_token,
+            serde_json::json!({ "query": "" }),
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1218,10 +1223,10 @@ async fn a_failed_authorized_search_is_audited_as_error() {
     // READ is granted, but `embed_interactive` cannot reach the provider.
     let (status, _body) = h
         .call(
-            Method::GET,
-            &format!("/api/v1/workspaces/{ws}/search?query=hello"),
+            Method::POST,
+            &format!("/api/v1/workspaces/{ws}/search"),
             None,
-            None,
+            Some(serde_json::json!({ "query": "hello" })),
         )
         .await;
     assert!(
@@ -1284,9 +1289,10 @@ async fn a_failed_authorized_search_on_a_db_error_is_audited_as_error() {
         .unwrap_or_else(|e| fail(&e.to_string()));
 
     let (status, _body) = h
-        .get(
-            &format!("/api/v1/workspaces/{ws}/search?query=hello"),
+        .post(
+            &format!("/api/v1/workspaces/{ws}/search"),
             &token,
+            serde_json::json!({ "query": "hello" }),
         )
         .await;
     assert!(
@@ -1326,11 +1332,17 @@ async fn a_failed_authorized_graph_search_is_audited_as_error() {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
 
-    for uri in [
-        format!("/api/v1/workspaces/{ws}/graph/search?entity=acme"),
-        format!("/api/v1/workspaces/{ws}/graph/path?from=acme&to=globex"),
+    for (uri, ask) in [
+        (
+            format!("/api/v1/workspaces/{ws}/graph/search"),
+            serde_json::json!({ "entity": "acme" }),
+        ),
+        (
+            format!("/api/v1/workspaces/{ws}/graph/path"),
+            serde_json::json!({ "from": "acme", "to": "globex" }),
+        ),
     ] {
-        let (status, body) = h.get(&uri, &token).await;
+        let (status, body) = h.post(&uri, &token, ask).await;
         assert!(
             status.is_server_error(),
             "expected 5xx from the missing nodes table for {uri}, got {status}: {body}"
@@ -1750,11 +1762,9 @@ async fn ontology_is_versioned_over_the_api_and_the_web_page() {
         )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(
-        location(&headers).contains("error="),
-        "{}",
-        location(&headers)
-    );
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, format!("/w/{ws}/ontology"));
+    assert!(html.contains("role=\"alert\""), "{html}");
     let (status, _, headers) = h
         .form(&format!("/w/{ws}/ontology/2/restore"), Some(&cookie), "")
         .await;
@@ -2362,6 +2372,38 @@ impl Harness {
         )
     }
 
+    /// A form's redirect followed as a browser would: where it went, and
+    /// that page fetched with the session and the flash cookie the redirect
+    /// set, so a message is checked where the person sees it.
+    async fn land(
+        &self,
+        redirect: &axum::http::HeaderMap,
+        session: Option<&str>,
+    ) -> (String, String) {
+        let to = location(redirect);
+        let flash = redirect
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(|c| c.strip_prefix("quack_flash="))
+            .and_then(|c| c.split(';').next())
+            .map(|id| format!("quack_flash={id}"));
+        let cookies: Vec<String> = session
+            .map(|token| format!("quack_session={token}"))
+            .into_iter()
+            .chain(flash)
+            .collect();
+        let mut builder = Request::builder().uri(&to);
+        if !cookies.is_empty() {
+            builder = builder.header(header::COOKIE, cookies.join("; "));
+        }
+        let request = builder
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let (_, body, _) = self.send(request).await;
+        (to, body.as_str().unwrap_or_default().to_owned())
+    }
+
     /// A form POST that arrives from `peer`, so the handler sees the same
     /// `ConnectInfo` the real server sets.
     async fn form_from(
@@ -2447,7 +2489,12 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
     );
     let (status, _, headers) = h.form("/login", None, "username=root&password=wrong").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(location(&headers).starts_with("/login?error="));
+    let (to, html) = h.land(&headers, None).await;
+    assert_eq!(to, "/login");
+    assert!(html.contains("wrong username or password"), "{html}");
+    // A flash shows once: the page again has no message.
+    let (_, html, _) = h.page("/login", None).await;
+    assert!(!html.contains("wrong username or password"), "{html}");
     let (status, _, headers) = h.form("/login", None, "username=root&password=pw").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location(&headers), "/workspaces");
@@ -2523,11 +2570,92 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        html.contains("<th class=\"px-3 py-2 font-mono\">n</th>") && html.contains("Download CSV"),
+        html.contains("aria-sort=\"none\"")
+            && html.contains("hx-vals='{\"sort\": 1, \"dir\": \"asc\"}'")
+            && html.contains("<div class=\"max-w-xs truncate\" title=\"a\">a</div>")
+            && html.contains("Download CSV"),
         "{html}"
     );
-    let (status, csv, headers) = h
+
+    // Rows come back in the statement's own order until a header asks for
+    // another; a click sorts by that column, and the next click reverses it.
+    let values =
+        "SELECT+*+FROM+(VALUES+(2%2C+%27b%27)%2C+(1%2C+%27a%27)%2C+(3%2C+%27c%27))+v(n%2C+s)";
+    let order = |html: &str| -> Vec<char> {
+        ["a", "b", "c"]
+            .iter()
+            .filter_map(|v| html.find(&format!("title=\"{v}\"")).map(|at| (at, v)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .filter_map(|v| v.chars().next())
+            .collect()
+    };
+    let (_, html, _) = h
+        .form(
+            &format!("/w/{ws}/sql"),
+            Some(&cookie),
+            &format!("sql={values}"),
+        )
+        .await;
+    assert_eq!(order(&html), ['b', 'a', 'c'], "{html}");
+    let (_, html, _) = h
+        .form(
+            &format!("/w/{ws}/sql"),
+            Some(&cookie),
+            &format!("sql={values}&sort=1&dir=asc"),
+        )
+        .await;
+    assert_eq!(order(&html), ['a', 'b', 'c'], "{html}");
+    // The sort is the statement's own ORDER BY: the editor takes the
+    // rewritten SQL, and the CSV link and the next click carry it.
+    assert!(
+        html.contains("aria-sort=\"ascending\"")
+            && html.contains("hx-vals='{\"sort\": 1, \"dir\": \"desc\"}'")
+            && html.contains("id=\"sql-input\"")
+            && html.contains("hx-swap-oob=\"true\"")
+            && html.contains("v(n, s) ORDER BY n ASC NULLS LAST</textarea>")
+            && html.contains("ORDER BY n ASC NULLS LAST\">"),
+        "{html}"
+    );
+    let (_, html, _) = h
+        .form(
+            &format!("/w/{ws}/sql"),
+            Some(&cookie),
+            &format!("sql={values}&sort=2&dir=desc"),
+        )
+        .await;
+    assert_eq!(order(&html), ['c', 'b', 'a'], "{html}");
+    let (_, csv, _) = h
+        .form(
+            &format!("/w/{ws}/sql.csv"),
+            Some(&cookie),
+            &format!("sql={values}&sort=1&dir=desc"),
+        )
+        .await;
+    assert_eq!(csv, "n,s\n3,c\n2,b\n1,a\n");
+    // A write has no rows to reorder: no sort buttons, and a stray sort is ignored.
+    let (_, html, _) = h
+        .form(
+            &format!("/w/{ws}/sql"),
+            Some(&cookie),
+            "sql=DROP+TABLE+IF+EXISTS+no_such_table&sort=1&dir=asc",
+        )
+        .await;
+    assert!(
+        !html.contains("aria-sort") && !html.contains("role=\"alert\""),
+        "{html}"
+    );
+    // The download is a POST: a statement never travels in a URL.
+    let (status, _, _) = h
         .page(&format!("/w/{ws}/sql.csv?sql=SELECT+1+AS+n"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let (status, csv, headers) = h
+        .form(
+            &format!("/w/{ws}/sql.csv"),
+            Some(&cookie),
+            "sql=SELECT+1+AS+n",
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -2540,7 +2668,7 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         .form(&format!("/w/{ws}/sql"), Some(&cookie), "sql=SELEC+broken")
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains("text-red-800"), "{html}");
+    assert!(html.contains("<p role=\"alert\""), "{html}");
 
     // Context, settings, tables, admin pages all render.
     let (status, _, headers) = h
@@ -2554,6 +2682,15 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
     assert_eq!(location(&headers), format!("/w/{ws}/context"));
     let (status, html, _) = h.page(&format!("/w/{ws}/context"), Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(html.matches("aria-current=\"page\"").count(), 1, "{html}");
+    assert!(html.contains("aria-current=\"page\">Context</a>"), "{html}");
+    assert!(
+        html.contains("href=\"#main\"")
+            && html.contains("<main id=\"main\"")
+            && html.contains("<nav aria-label=\"Workspace\"")
+            && html.contains("aria-label=\"Workspace context\""),
+        "{html}"
+    );
     assert!(
         html.contains("Be brief.") && html.contains("by root"),
         "{html}"
@@ -2574,13 +2711,8 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let refused = location(&headers);
-    assert!(
-        refused.starts_with(&format!("/w/{ws}/settings?error=")),
-        "{refused}"
-    );
-    let (status, html, _) = h.page(&refused, Some(&cookie)).await;
-    assert_eq!(status, StatusCode::OK);
+    let (refused, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(refused, format!("/w/{ws}/settings"));
     assert!(html.contains("not a configured provider"), "{html}");
     let unchanged = h.app.control.get_workspace(&ws).await;
     assert!(
@@ -3038,6 +3170,28 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
             .is_some_and(|m| m.contains("no resource")),
         "{body}"
     );
+    // control.db's access log names the resource by its template: a table's
+    // name, and whatever an unknown URI says, stay in the workspace.
+    let opened: Vec<Option<String>> = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("open")),
+            ..AuditFilter::default()
+        })
+        .await
+        .into_iter()
+        .map(|r| r.resource_id)
+        .collect();
+    assert!(
+        opened.contains(&Some(String::from(
+            "quack://workspace/tables/{name}/schema"
+        ))) && opened.contains(&None)
+            && opened
+                .iter()
+                .flatten()
+                .all(|id| !id.contains("tables/t/") && !id.contains("nothing")),
+        "{opened:?}"
+    );
 
     let sql_rows = h
         .audit(AuditFilter {
@@ -3313,7 +3467,6 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
     assert_eq!(status, StatusCode::OK);
     for path in [
         "tables",
-        "tables/customer_secrets",
         "documents",
         "sessions",
         "ontology/versions",
@@ -3326,6 +3479,14 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
             .await;
         assert_eq!(status, StatusCode::OK, "{path}: {body}");
     }
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/tables/describe"),
+            &token,
+            serde_json::json!({ "name": "customer_secrets" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
     let cookie = headers
         .get(header::SET_COOKIE)
@@ -3335,7 +3496,11 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
         .unwrap_or_default()
         .to_owned();
     let (status, _, _) = h
-        .page(&format!("/w/{ws}/tables/customer_secrets"), Some(&cookie))
+        .form(
+            &format!("/w/{ws}/tables"),
+            Some(&cookie),
+            "name=customer_secrets",
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3498,7 +3663,11 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
 
     // Search, class listing, and path.
     let (status, body) = h
-        .get(&format!("{base}/search?entity=Kenya&hops=1"), "")
+        .post(
+            &format!("{base}/search"),
+            "",
+            serde_json::json!({ "entity": "Kenya", "hops": 1 }),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let labels: Vec<&str> = body["nodes"]
@@ -3511,23 +3680,33 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
     );
     assert!(!labels.contains(&"Orgenics"));
     assert!(body["provenance"].as_array().is_some_and(|p| !p.is_empty()));
-    let (status, body) = h.get(&format!("{base}/search?class=vendor"), "").await;
+    let (status, body) = h
+        .post(
+            &format!("{base}/search"),
+            "",
+            serde_json::json!({ "class": "vendor" }),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["nodes"].as_array().map(Vec::len), Some(2));
-    let (status, _) = h.get(&format!("{base}/search"), "").await;
+    let (status, _) = h
+        .post(&format!("{base}/search"), "", serde_json::json!({}))
+        .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, body) = h
-        .get(
-            &format!("{base}/path?from=Uganda&to=Aurobindo&max_hops=6"),
+        .post(
+            &format!("{base}/path"),
             "",
+            serde_json::json!({ "from": "Uganda", "to": "Aurobindo", "max_hops": 6 }),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["edges"].as_array().map(Vec::len), Some(6), "{body}");
     let (_, body) = h
-        .get(
-            &format!("{base}/path?from=Uganda&to=Aurobindo&max_hops=2"),
+        .post(
+            &format!("{base}/path"),
             "",
+            serde_json::json!({ "from": "Uganda", "to": "Aurobindo", "max_hops": 2 }),
         )
         .await;
     assert_eq!(body["nodes"].as_array().map(Vec::len), Some(0));
@@ -3591,14 +3770,14 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
         .form(&format!("/w/{ws}/graph/merges/nope"), None, "action=acept")
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(
-        location(&headers).contains("unknown+merge+decision"),
-        "{}",
-        location(&headers)
-    );
+    let (to, html) = h.land(&headers, None).await;
+    assert_eq!(to, format!("/w/{ws}/graph"));
+    assert!(html.contains("unknown merge decision"), "{html}");
 
     // The web page renders the status and a search result.
-    let (status, html, _) = h.page(&format!("/w/{ws}/graph?entity=Kenya"), None).await;
+    let (status, html, _) = h
+        .form(&format!("/w/{ws}/graph"), None, "entity=Kenya")
+        .await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("Knowledge graph"), "{html}");
     assert!(html.contains("5 nodes, 3 edges"), "{html}");
@@ -3606,7 +3785,9 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
         html.contains("Nothing matched"),
         "Kenya was dropped: {html}"
     );
-    let (status, html, _) = h.page(&format!("/w/{ws}/graph?class=vendor"), None).await;
+    let (status, html, _) = h
+        .form(&format!("/w/{ws}/graph"), None, "class=vendor")
+        .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         html.contains("Orgenics") && html.contains("Aurobindo") && html.contains("data-graph="),
@@ -4175,7 +4356,12 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
         )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(location(&headers), format!("/w/{ws}/tables/vendors2"));
+    let (to, html) = h.land(&headers, None).await;
+    assert_eq!(to, format!("/w/{ws}/tables"));
+    assert!(
+        html.contains(">vendors2</h1>"),
+        "the imported table opens: {html}"
+    );
     let (status, _, headers) = h
         .form(
             &format!("/w/{ws}/import"),
@@ -4184,7 +4370,9 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
         )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(location(&headers).contains("/tables?error="));
+    let (to, html) = h.land(&headers, None).await;
+    assert_eq!(to, format!("/w/{ws}/tables"));
+    assert!(html.contains("role=\"alert\""), "{html}");
 
     let imports = h
         .audit(AuditFilter {
@@ -4464,6 +4652,45 @@ async fn rotating_the_authorization_header_does_not_escape_the_login_limit() {
     );
 }
 
+/// Static assets sit outside the general limiter: a caller who has spent
+/// its budget is refused the API but still gets the stylesheet, so a page
+/// it is allowed never renders unstyled.
+#[tokio::test(flavor = "multi_thread")]
+async fn static_assets_are_not_rate_limited() {
+    let h = harness(ServeMode::Login).await;
+    let peer: std::net::SocketAddr = "192.0.2.45:53001"
+        .parse()
+        .unwrap_or_else(|e| fail(&format!("{e}")));
+    let request = |uri: &str| {
+        let mut request = Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        h.send(request)
+    };
+    let spent = (0..(super::RATE_BURST + 4)).map(|_| request("/api/v1/workspaces"));
+    let refused = futures::future::join_all(spent)
+        .await
+        .into_iter()
+        .filter(|(status, _, _)| *status == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert!(
+        refused >= 3,
+        "{refused} requests were refused; the budget was not spent"
+    );
+    for asset in [
+        "/static/css/output.css",
+        "/static/js/app.js",
+        "/static/favicon.svg",
+    ] {
+        let (status, _, _) = request(asset).await;
+        assert_eq!(status, StatusCode::OK, "{asset}");
+    }
+}
+
 // --- jobs ----------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4605,67 +4832,76 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
     assert!(!html.contains("Cancel</button>"), "{html}");
 }
 
+/// A queued upload waits on disk, not in memory, so one request may carry
+/// more files than any in-memory line would hold: each is queued and
+/// processed, and its spooled bytes are gone once its job ends.
 #[tokio::test(flavor = "multi_thread")]
-async fn uploads_are_turned_away_with_retry_after_while_the_lane_is_full() {
-    use quack_core::jobs::{JobKind, JobSpec, Lane};
-
+async fn a_large_batch_of_uploads_is_spooled_and_processed() {
     let h = harness(ServeMode::Login).await;
     let owner = h.user("owner", UserKind::Standard).await;
-    let ws = h.workspace("busy", &owner).await;
+    let ws = h.workspace("batch", &owner).await;
     let token = h.login("owner").await;
-    let release = CancellationToken::new();
-    let lane = LaneKey::Ingest(ws.clone());
-    for n in 0..MAX_WAITING_UPLOADS {
-        let release = release.clone();
-        h.app.jobs.submit(
-            JobSpec::new(JobKind::Ingest, format!("held {n}"))
-                .workspace(ws.clone())
-                .lane(Lane::new(&lane, 1)),
-            move |_| async move {
-                release.cancelled().await;
-                Ok(String::new())
-            },
-        );
-    }
+    let files = 80;
+    let boundary = "quackbatch";
+    let body: String = (0..files)
+        .map(|n| {
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"note-{n}.md\"\r\nContent-Type: text/markdown\r\n\r\n# Note {n}\n\nNumber {n}.\r\n"
+            )
+        })
+        .chain(std::iter::once(format!("--{boundary}--\r\n")))
+        .collect();
     let request = Request::builder()
         .method(Method::POST)
         .uri(format!("/api/v1/workspaces/{ws}/documents"))
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::json!({ "text": "one more", "title": "late" }).to_string(),
-        ))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let (status, body, headers) = h.send(request).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(
-        headers
-            .get(header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok()),
-        Some("30")
-    );
-    // Nothing was registered for the refused upload.
-    let (_, listed) = h
-        .get(&format!("/api/v1/workspaces/{ws}/documents"), &token)
-        .await;
-    assert_eq!(listed["documents"].as_array().map(Vec::len), Some(0));
-
-    // Once the line drains, uploads are taken again.
-    release.cancel();
+    let (status, body, _) = h.send(request).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let ids: Vec<String> = body["documents"]
+        .as_array()
+        .map(|docs| {
+            docs.iter()
+                .filter_map(|d| d["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(ids.len(), files);
+    for id in &ids {
+        let ready = h.wait_ready(&ws, id, &token).await;
+        assert_eq!(ready["status"], "ready", "{ready}");
+    }
+    let lane = LaneKey::Ingest(ws.clone());
     for _ in 0..100 {
         if h.app.jobs.lane_active(&lane) == 0 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let (status, body) = h
-        .post(
-            &format!("/api/v1/workspaces/{ws}/documents"),
-            &token,
-            serde_json::json!({ "text": "one more", "title": "late" }),
-        )
-        .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let spool = h.app.config.workspace_uploads_dir(ws.as_str());
+    let left = std::fs::read_dir(&spool).map_or(0, Iterator::count);
+    assert_eq!(left, 0, "spooled uploads left in {}", spool.display());
+}
+
+/// What an earlier process spooled and never processed is deleted when the
+/// workspace opens; a workspace with nothing spooled opens the same way.
+#[test]
+fn stale_spooled_uploads_are_cleared() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut config = Config::default();
+    config.general.data_dir = dir.path().to_path_buf();
+    let ws = WorkspaceId::from("ws-spool");
+    assert!(UploadJob::clear_stale(&config, &ws).is_ok());
+    let spool = config.workspace_uploads_dir(ws.as_str());
+    std::fs::create_dir_all(&spool).unwrap_or_else(|e| fail(&e.to_string()));
+    std::fs::write(spool.join("doc-1"), b"left behind").unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(UploadJob::clear_stale(&config, &ws).is_ok());
+    assert!(!spool.exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4881,11 +5117,8 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
         )
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(
-        location(&headers).contains("background"),
-        "{}",
-        location(&headers)
-    );
+    let (_, html) = h.land(&headers, Some(&owner_token)).await;
+    assert!(html.contains("background"), "{html}");
 }
 
 /// What the stand-in work reports when it succeeds.
@@ -5045,28 +5278,27 @@ async fn web_forms_follow_the_api_rules_and_say_why() {
     // Workspace names: the API's validation and message.
     let (status, _, headers) = h.form("/workspaces", Some(&cookie), "name=a.b").await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(
-        location(&headers).starts_with("/workspaces?error=workspace+name+must+be+non-empty"),
-        "{}",
-        location(&headers)
-    );
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, "/workspaces");
+    assert!(html.contains("workspace name must be non-empty"), "{html}");
     let (_, _, headers) = h.form("/workspaces", Some(&cookie), "name=team").await;
     let ws = location(&headers)
         .trim_start_matches("/w/")
         .trim_end_matches("/chat")
         .to_owned();
     let (_, _, headers) = h.form("/workspaces", Some(&cookie), "name=team").await;
-    assert_eq!(location(&headers), "/workspaces?error=workspace+exists");
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, "/workspaces");
+    assert!(html.contains("workspace exists"), "{html}");
 
     // Removing someone who is not a member says so; it used to pass silently.
     let (status, _, headers) = h
         .form(&format!("/w/{ws}/members/nobody/remove"), Some(&cookie), "")
         .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(
-        location(&headers),
-        format!("/w/{ws}/settings?error=not+a+member")
-    );
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, format!("/w/{ws}/settings"));
+    assert!(html.contains("not a member"), "{html}");
 
     // Bulk decisions need at least one candidate.
     let (_, _, headers) = h
@@ -5076,18 +5308,21 @@ async fn web_forms_follow_the_api_rules_and_say_why() {
             "bulk=accept",
         )
         .await;
-    assert_eq!(
-        location(&headers),
-        format!("/w/{ws}/ontology?error=choose+at+least+one+candidate+to+accept+or+reject")
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, format!("/w/{ws}/ontology"));
+    assert!(
+        html.contains("choose at least one candidate to accept or reject"),
+        "{html}"
     );
 
     // Proposing over no tables queues nothing and says so.
     let (_, _, headers) = h
         .form(&format!("/w/{ws}/ontology/propose"), Some(&cookie), "")
         .await;
-    assert_eq!(
-        location(&headers),
-        format!("/w/{ws}/ontology?notice=nothing+to+propose%3A+the+tables+are+already+covered")
+    let (_, html) = h.land(&headers, Some(&cookie)).await;
+    assert!(
+        html.contains("nothing to propose: the tables are already covered"),
+        "{html}"
     );
 
     // A second init is refused with the API's reason.
@@ -5098,10 +5333,9 @@ async fn web_forms_follow_the_api_rules_and_say_why() {
     let (_, _, headers) = h
         .form(&format!("/w/{ws}/ontology/init"), Some(&cookie), "")
         .await;
-    assert_eq!(
-        location(&headers),
-        format!("/w/{ws}/ontology?error=an+ontology+already+exists")
-    );
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, format!("/w/{ws}/ontology"));
+    assert!(html.contains("an ontology already exists"), "{html}");
 }
 
 /// Local mode has no logins, so no users can be added from the API

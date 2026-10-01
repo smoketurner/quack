@@ -2,17 +2,17 @@
 {% block content %}
 <h1 class="text-xl font-semibold">Access audit</h1>
 <form method="get" action="/admin/audit" class="mt-4 flex flex-wrap items-end gap-2 text-sm">
-  <input name="action" value="{{ action }}" placeholder="action" class="rounded border border-slate-300 px-3 py-2">
-  <select name="outcome" class="rounded border border-slate-300 px-2 py-2">
+  <input aria-label="Action" name="action" value="{{ action }}" placeholder="action" class="rounded border border-slate-700 px-3 py-2">
+  <select aria-label="Outcome" name="outcome" class="rounded border border-slate-700 px-2 py-2">
     <option value="">any outcome</option>
     {% for o in outcomes %}<option value="{{ o }}" {% if outcome == Some(**o) %}selected{% endif %}>{{ o }}</option>{% endfor %}
   </select>
-  <input name="workspace_id" value="{{ workspace_id }}" placeholder="workspace id" class="rounded border border-slate-300 px-3 py-2">
-  <button type="submit" class="rounded bg-slate-900 px-3 py-2 text-white hover:bg-slate-700">Filter</button>
+  <input aria-label="Workspace id" name="workspace_id" value="{{ workspace_id }}" placeholder="workspace id" class="rounded border border-slate-700 px-3 py-2">
+  <button type="submit" class="rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500">Filter</button>
 </form>
-<div class="mt-4 overflow-x-auto rounded border border-slate-200 bg-white">
-<table class="min-w-full text-xs"><thead><tr class="border-b border-slate-300 text-left uppercase text-slate-500"><th class="px-2 py-2">Time</th><th>Outcome</th><th>Channel</th><th>Action</th><th>User</th><th>Workspace</th><th>Resource</th><th>Client</th></tr></thead><tbody>
-  {% for r in rows %}<tr class="border-b border-slate-100 {% if r.outcome == Outcome::Denied %}bg-red-50{% endif %}"><td class="px-2 py-1 whitespace-nowrap">{{ r.timestamp }}</td><td>{{ r.outcome }}</td><td>{{ r.channel }}</td><td>{{ r.action }}</td><td class="font-mono">{% if let Some(u) = r.user_id %}{{ u }}{% else %}-{% endif %}</td><td class="font-mono">{% if let Some(w) = r.workspace_id %}{{ w }}{% else %}-{% endif %}</td><td class="font-mono">{{ r.resource_type.as_deref().unwrap_or("") }} {{ r.resource_id.as_deref().unwrap_or("") }}</td><td>{{ r.client_addr.as_deref().unwrap_or("") }}</td></tr>{% endfor %}
+<div class="mt-4 overflow-x-auto rounded border border-slate-800 bg-slate-900">
+<table class="data-table min-w-full text-xs"><thead><tr class="border-b border-slate-700 text-left uppercase text-slate-400"><th scope="col" class="pl-2">Time</th><th scope="col">Outcome</th><th scope="col">Channel</th><th scope="col">Action</th><th scope="col">User</th><th scope="col">Workspace</th><th scope="col">Resource</th><th scope="col">Client</th></tr></thead><tbody>
+  {% for r in rows %}<tr class="border-b border-slate-800 {% if r.outcome == Outcome::Denied %}bg-red-950{% endif %}"><td class="pl-2 whitespace-nowrap">{{ When::Clock.html(r.timestamp.as_str())|safe }}</td><td>{{ r.outcome }}</td><td>{{ r.channel }}</td><td>{{ r.action }}</td><td class="font-mono">{% if let Some(u) = r.user_id %}<div class="max-w-[9rem] truncate" title="{{ u }}">{{ u }}</div>{% else %}-{% endif %}</td><td class="font-mono">{% if let Some(w) = r.workspace_id %}<div class="max-w-[9rem] truncate" title="{{ w }}">{{ w }}</div>{% else %}-{% endif %}</td><td class="font-mono"><div class="max-w-[14rem] truncate" title="{{ r.resource_type.as_deref().unwrap_or("") }} {{ r.resource_id.as_deref().unwrap_or("") }}">{{ r.resource_type.as_deref().unwrap_or("") }} {{ r.resource_id.as_deref().unwrap_or("") }}</div></td><td>{{ r.client_addr.as_deref().unwrap_or("") }}</td></tr>{% endfor %}
 </tbody></table>
 </div>
 <div class="mt-2 flex items-center gap-3 text-sm">
@@ -21,7 +21,7 @@
     <input type="hidden" name="action" value="{{ action }}">
     <input type="hidden" name="outcome" value="{% if let Some(o) = outcome %}{{ o }}{% endif %}">
     <input type="hidden" name="workspace_id" value="{{ workspace_id }}">
-    <button type="submit" class="rounded border border-slate-300 px-3 py-1 hover:bg-slate-100">Newest</button>
+    <button type="submit" class="rounded border border-slate-700 px-3 py-1 hover:bg-slate-800">Newest</button>
   </form>
   {% endif %}
   {% if let Some(cursor) = next_cursor %}
@@ -30,9 +30,9 @@
     <input type="hidden" name="outcome" value="{% if let Some(o) = outcome %}{{ o }}{% endif %}">
     <input type="hidden" name="workspace_id" value="{{ workspace_id }}">
     <input type="hidden" name="cursor" value="{{ cursor }}">
-    <button type="submit" class="rounded border border-slate-300 px-3 py-1 hover:bg-slate-100">Next page</button>
+    <button type="submit" class="rounded border border-slate-700 px-3 py-1 hover:bg-slate-800">Next page</button>
   </form>
   {% endif %}
 </div>
-<p class="mt-2 text-xs text-slate-500">This is the access record: who touched which resource by id. The content detail is inside each workspace, visible to its members.</p>
+<p class="mt-2 text-xs text-slate-400">This is the access record: who touched which resource by id. The content detail is inside each workspace, visible to its members.</p>
 {% endblock %}
