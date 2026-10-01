@@ -27,8 +27,8 @@ use crate::analysis::policy::WritePolicy;
 use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::{
-    BaseUrl, BedrockApi, Config, Effort, ModelRef, ModelSettings, ProviderAuth, ProviderConfig,
-    ProviderName, ProviderType, config_file_path,
+    BaseUrl, BedrockApi, BedrockEndpoint, Config, Effort, ModelRef, ModelSettings, ProviderAuth,
+    ProviderConfig, ProviderName, ProviderType, config_file_path,
 };
 use crate::embedding::{Embedder, EmbeddingModel, Profile};
 use crate::error::{Error, Record, Result};
@@ -81,8 +81,17 @@ impl OllamaEndpoint {
         name: &ProviderName,
         provider: &ProviderConfig,
     ) -> Result<Self> {
+        Self::new(
+            name,
+            provider,
+            provider.auth.credential(config, name).await?.as_deref(),
+        )
+    }
+
+    /// The server with `key`, already resolved, as its bearer.
+    fn new(name: &ProviderName, provider: &ProviderConfig, key: Option<&str>) -> Result<Self> {
         let mut settings = ollama::OllamaConfig::new();
-        if let Some(key) = provider.auth.credential(config, name).await? {
+        if let Some(key) = key {
             settings = settings.with_api_key(key);
         }
         if let Some(base_url) = &provider.base_url {
@@ -343,7 +352,7 @@ impl EmbeddingModel for EmbedModel {
 
 /// The chat provider's rig client, one variant per provider type, so a
 /// caller builds it once and matches only where the provider matters.
-enum ChatClient {
+pub(crate) enum ChatClient {
     Ollama(OllamaEndpoint),
     /// OpenAI-compatible Chat Completions.
     OpenAi(openai::OpenAI),
@@ -358,28 +367,90 @@ enum ChatClient {
 
 impl ChatClient {
     async fn build(config: &Config, chat: &ModelRef<'_>) -> Result<Self> {
-        let (name, provider) = (chat.provider_name, chat.provider);
-        Ok(match provider.provider_type {
-            ProviderType::Ollama => {
-                Self::Ollama(OllamaEndpoint::build(config, name, provider).await?)
+        Self::for_provider(config, chat.provider_name, chat.provider).await
+    }
+
+    /// The client for `provider`, its credential resolved the way a turn
+    /// resolves it.
+    pub(crate) async fn for_provider(
+        config: &Config,
+        name: &ProviderName,
+        provider: &ProviderConfig,
+    ) -> Result<Self> {
+        match provider.provider_type {
+            ProviderType::Bedrock | ProviderType::BedrockMantle => {
+                Self::bedrock(&*bedrock::session(name, provider).await?, name, provider)
             }
+            ProviderType::Ollama | ProviderType::Openai | ProviderType::Anthropic => Self::connect(
+                name,
+                provider,
+                provider.auth.credential(config, name).await?.as_deref(),
+            ),
+        }
+    }
+
+    /// The client for a provider reached over plain HTTPS, with `key`
+    /// already resolved: the provider's limited client, headers, and the
+    /// credential where a turn sends it. Bedrock signs with AWS
+    /// credentials instead; build it with [`Self::for_provider`].
+    pub(crate) fn connect(
+        name: &ProviderName,
+        provider: &ProviderConfig,
+        key: Option<&str>,
+    ) -> Result<Self> {
+        let required = |kind: &str| {
+            key.ok_or_else(|| {
+                Error::Config(format!(
+                    "provider '{name}' ({kind}) requires auth = \"api-key\" or \"oauth\""
+                ))
+            })
+        };
+        let http = || -> Result<LimitedHttp> {
+            Ok(LimitedHttp::for_provider(name, provider).with_headers(provider.header_map()?))
+        };
+        let base_url = provider.base_url.as_ref().map(BaseUrl::as_str);
+        Ok(match provider.provider_type {
+            ProviderType::Ollama => Self::Ollama(OllamaEndpoint::new(name, provider, key)?),
             ProviderType::Openai if provider.openai_chat_api() == BedrockApi::Responses => {
-                Self::Responses(build_openai_client(config, name, provider).await?)
+                Self::Responses(openai_client(base_url, required("openai")?, http()?))
             }
             ProviderType::Openai => {
-                Self::OpenAi(build_openai_client(config, name, provider).await?)
+                Self::OpenAi(openai_client(base_url, required("openai")?, http()?))
             }
             ProviderType::Anthropic => {
-                Self::Anthropic(build_anthropic_client(config, name, provider).await?)
+                Self::Anthropic(anthropic_client(name, provider, required("anthropic")?)?)
             }
             ProviderType::Bedrock | ProviderType::BedrockMantle => {
-                Self::bedrock(&*bedrock::session(name, provider).await?, name, provider)?
+                return Err(Error::Config(format!(
+                    "provider '{name}' signs with AWS credentials, not a key"
+                )));
             }
         })
     }
 
+    /// The models the provider lists, through the same client, limit,
+    /// headers, and credential a turn uses. Bedrock's Converse API lists
+    /// none.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rig's ProviderError, which every listing returns; it keeps the failed response"
+    )]
+    pub(crate) async fn models(&self) -> std::result::Result<ProviderModels, ProviderError> {
+        let listed = match self {
+            Self::Ollama(endpoint) => endpoint.client().list_models().await?,
+            Self::OpenAi(client) | Self::Responses(client) => client.list_models().await?,
+            Self::Anthropic(client) => client.list_models().await?,
+            Self::Bedrock(_) => {
+                return Err(ProviderError::Provider(String::from(
+                    "Bedrock's Converse API lists no models",
+                )));
+            }
+        };
+        Ok(ProviderModels::from(listed))
+    }
+
     /// The client for a Bedrock provider's API on its endpoint.
-    fn bedrock(
+    pub(crate) fn bedrock(
         session: &bedrock::Session,
         name: &ProviderName,
         provider: &ProviderConfig,
@@ -761,23 +832,6 @@ fn openai_client(base_url: Option<&str>, key: &str, http: LimitedHttp) -> openai
     settings.connect(http)
 }
 
-async fn build_anthropic_client(
-    config: &Config,
-    name: &ProviderName,
-    provider: &ProviderConfig,
-) -> Result<anthropic::Anthropic> {
-    let key = provider
-        .auth
-        .credential(config, name)
-        .await?
-        .ok_or_else(|| {
-            Error::Config(format!(
-                "provider '{name}' (anthropic) requires auth = \"api-key\" or \"oauth\""
-            ))
-        })?;
-    anthropic_client(name, provider, &key)
-}
-
 /// The header an Anthropic provider's credential goes in, decided once for
 /// every request quack sends one on (completions and the doctor's probe).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -798,6 +852,147 @@ impl AnthropicCredential {
                 Self::ApiKey
             }
         }
+    }
+}
+
+/// The models a provider lists, in its order.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderModels(Vec<ProviderModel>);
+
+/// One listed model: its id and what the provider reports of its limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderModel {
+    pub id: String,
+    /// The context window in tokens, when the listing reports one (an
+    /// OpenAI-compatible server may; Ollama's and Anthropic's do not).
+    pub context_length: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+}
+
+impl From<rig::model::ModelList> for ProviderModels {
+    fn from(list: rig::model::ModelList) -> Self {
+        Self(
+            list.data
+                .into_iter()
+                .map(|info| ProviderModel {
+                    id: info.id,
+                    context_length: info.context_length,
+                    max_output_tokens: info.max_output_tokens,
+                })
+                .collect(),
+        )
+    }
+}
+
+impl ProviderModels {
+    /// How many suggestions [`Self::closest`] gives.
+    pub const SUGGESTIONS: usize = 3;
+
+    /// The models `name` lists, through the client a turn uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider is not configured, its credential
+    /// cannot be resolved, or the listing fails.
+    pub async fn fetch(config: &Config, name: &ProviderName) -> Result<Self> {
+        let provider = config
+            .providers
+            .get(name)
+            .ok_or_else(|| Error::Config(format!("no provider named '{name}' is configured")))?;
+        if provider.provider_type.bedrock_endpoint() == Some(BedrockEndpoint::Runtime) {
+            return Err(Error::Config(String::from(
+                "bedrock-runtime lists no models; a model's access shows on its first call",
+            )));
+        }
+        ChatClient::for_provider(config, name, provider)
+            .await?
+            .models()
+            .await
+            .map_err(|e| Error::Llm(format!("provider '{name}' could not list its models: {e}")))
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[ProviderModel] {
+        &self.0
+    }
+
+    /// The listed `model`. A bare name matches its `:latest` tag, which is
+    /// how Ollama lists it.
+    #[must_use]
+    pub fn get(&self, model: &str) -> Option<&ProviderModel> {
+        let tagged = format!("{model}:latest");
+        self.0
+            .iter()
+            .find(|m| m.id == model || (!model.contains(':') && m.id == tagged))
+    }
+
+    /// The listed ids nearest `model` by Jaro-Winkler similarity, best
+    /// first, at most [`Self::SUGGESTIONS`].
+    #[must_use]
+    pub fn closest(&self, model: &str) -> Vec<&str> {
+        let mut scored: Vec<(f64, &str)> = self
+            .0
+            .iter()
+            .map(|m| (strsim::jaro_winkler(model, &m.id), m.id.as_str()))
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        scored
+            .into_iter()
+            .take(Self::SUGGESTIONS)
+            .map(|(_, id)| id)
+            .collect()
+    }
+}
+
+/// Every configured provider's listed models, as `/model` shows them.
+pub struct ModelCatalog(Vec<(ProviderName, std::result::Result<ProviderModels, String>)>);
+
+impl ModelCatalog {
+    /// How many ids one provider's line shows before it counts the rest.
+    const SHOWN: usize = 40;
+
+    /// Each provider's listing, in config order; a provider that cannot
+    /// list says why.
+    pub async fn fetch(config: &Config) -> Self {
+        let mut listings = Vec::new();
+        for name in config.providers.keys() {
+            let listed = ProviderModels::fetch(config, name)
+                .await
+                .map_err(|e| e.to_string());
+            listings.push((name.clone(), listed));
+        }
+        Self(listings)
+    }
+}
+
+impl std::fmt::Display for ModelCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("No providers are configured.");
+        }
+        f.write_str("Models each provider lists:")?;
+        for (name, listed) in &self.0 {
+            match listed {
+                Ok(models) if models.as_slice().is_empty() => {
+                    write!(f, "\n  {name}: none")?;
+                }
+                Ok(models) => {
+                    let ids: Vec<&str> = models
+                        .as_slice()
+                        .iter()
+                        .take(Self::SHOWN)
+                        .map(|m| m.id.as_str())
+                        .collect();
+                    write!(f, "\n  {name}: {}", ids.join(", "))?;
+                    let rest = models.as_slice().len().saturating_sub(Self::SHOWN);
+                    if rest > 0 {
+                        write!(f, ", and {rest} more")?;
+                    }
+                }
+                Err(e) => write!(f, "\n  {name}: {e}")?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1063,6 +1258,58 @@ mod tests {
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    #[test]
+    fn the_catalog_lists_each_provider_and_says_why_one_cannot() {
+        let name = |n: &str| {
+            n.parse::<ProviderName>()
+                .unwrap_or_else(|e| fail(&e.to_string()))
+        };
+        let many: Vec<_> = (0..42)
+            .map(|i| rig::model::ModelInfo::from_id(format!("m{i}")))
+            .collect();
+        let catalog = ModelCatalog(vec![
+            (
+                name("local"),
+                Ok(ProviderModels::from(rig::model::ModelList::new(vec![
+                    rig::model::ModelInfo::from_id("gpt-oss:20b"),
+                    rig::model::ModelInfo::from_id("qwen3-embedding:0.6b"),
+                ]))),
+            ),
+            (
+                name("gateway"),
+                Ok(ProviderModels::from(rig::model::ModelList::new(many))),
+            ),
+            (name("empty"), Ok(ProviderModels::default())),
+            (name("down"), Err(String::from("connection refused"))),
+        ]);
+        let text = catalog.to_string();
+        assert!(
+            text.starts_with(
+                "Models each provider lists:\n  local: gpt-oss:20b, qwen3-embedding:0.6b\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains(", m39, and 2 more\n"), "{text}");
+        assert!(text.contains("\n  empty: none\n"), "{text}");
+        assert!(text.ends_with("\n  down: connection refused"), "{text}");
+        assert_eq!(
+            ModelCatalog(Vec::new()).to_string(),
+            "No providers are configured."
+        );
+    }
+
+    #[test]
+    fn a_bare_ollama_name_finds_its_latest_tag() {
+        let models = ProviderModels::from(rig::model::ModelList::new(vec![
+            rig::model::ModelInfo::from_id("llama3.1:latest"),
+            rig::model::ModelInfo::from_id("gpt-oss:20b"),
+        ]));
+        assert!(models.get("llama3.1").is_some());
+        assert!(models.get("gpt-oss:20b").is_some());
+        assert!(models.get("gpt-oss").is_none());
+        assert_eq!(models.closest("gpt-os:20b").first(), Some(&"gpt-oss:20b"));
     }
 
     /// One request's head and body, read off a loopback socket that

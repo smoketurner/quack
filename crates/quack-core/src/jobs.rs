@@ -121,6 +121,8 @@ pub enum JobKind {
     Embeddings,
     /// A bundle, context, or session written out.
     Export,
+    /// The models each provider lists, fetched for someone waiting on them.
+    Models,
 }
 
 impl JobKind {
@@ -136,6 +138,7 @@ impl JobKind {
             Self::Graph => "graph",
             Self::Embeddings => "embeddings",
             Self::Export => "export",
+            Self::Models => "models",
         }
     }
 }
@@ -147,7 +150,7 @@ impl JobKind {
     #[must_use]
     pub const fn priority(self) -> Priority {
         match self {
-            Self::Chat | Self::Sql => Priority::Interactive,
+            Self::Chat | Self::Sql | Self::Models => Priority::Interactive,
             Self::Ingest
             | Self::Import
             | Self::Ontology

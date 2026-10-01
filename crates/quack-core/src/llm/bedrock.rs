@@ -153,46 +153,6 @@ impl Session {
             converse: None,
         }
     }
-
-    /// The model ids the endpoint lists (`GET {openai_base}/models`, which
-    /// bedrock-mantle serves and bedrock-runtime does not), signed and
-    /// under the provider's limit like any request.
-    ///
-    /// # Errors
-    ///
-    /// Returns rig's HTTP error: a non-success status, or a transport,
-    /// signing, or decoding failure.
-    #[expect(
-        clippy::result_large_err,
-        reason = "rig's HTTP error, which HttpClientExt returns; it keeps the failed response's headers"
-    )]
-    pub(crate) async fn models(
-        &self,
-        name: &ProviderName,
-        provider: &ProviderConfig,
-    ) -> std::result::Result<Vec<String>, rig::http_client::Error> {
-        use rig::http_client::HttpClientExt;
-
-        #[derive(serde::Deserialize)]
-        struct Listed {
-            #[serde(default)]
-            data: Vec<Entry>,
-        }
-        #[derive(serde::Deserialize)]
-        struct Entry {
-            id: String,
-        }
-        let request =
-            http::Request::get(format!("{}/models", self.openai_base())).body(Bytes::new())?;
-        let response = self
-            .http(name, provider)
-            .send::<_, Vec<u8>>(request)
-            .await?;
-        let body = response.into_body().await?;
-        serde_json::from_slice::<Listed>(&body)
-            .map(|listed| listed.data.into_iter().map(|e| e.id).collect())
-            .map_err(|e| rig::http_client::Error::Instance(e.into()))
-    }
 }
 
 /// What makes one Bedrock session different from another: two provider

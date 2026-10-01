@@ -22,17 +22,19 @@ use crate::config::{
 };
 use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
-use crate::error::Error;
+use crate::error::{Error, Result as CoreResult};
 use crate::llm::bedrock;
 use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
 use crate::llm::sampling::{Sampling, Wire, check_tool_calls};
-use crate::llm::{AnthropicCredential, OllamaRunningModels};
+use crate::llm::{ChatClient, ProviderModels};
 use crate::oidc::SignIn;
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
 use crate::text::Count;
+use rig::ProviderError;
+use rig::error::ErrorKind;
 use secrecy::ExposeSecret;
 use serde::Serialize;
 
@@ -176,6 +178,14 @@ impl Default for Probing {
 }
 
 impl Probing {
+    /// How long each probe may take, or `None` offline.
+    const fn timeout(self) -> Option<Duration> {
+        match self {
+            Self::Offline => None,
+            Self::Online { timeout } => Some(timeout),
+        }
+    }
+
     /// The client the probes share, or `None` offline.
     fn client(self) -> Option<reqwest::Client> {
         let Self::Online { timeout } = self else {
@@ -204,9 +214,8 @@ pub async fn run(inspection: &Inspection, options: &Options) -> Report {
         None
     };
     check_workspace(&mut report, config, control.as_ref(), options).await;
-    let http = options.probing.client();
-    check_chat_model(&mut report, config, http.as_ref()).await;
-    check_embedding_model(&mut report, config, http.as_ref()).await;
+    check_chat_model(&mut report, config, options.probing).await;
+    check_embedding_model(&mut report, config, options.probing).await;
     check_server(&mut report, config, control.as_ref()).await;
     check_sign_in(&mut report, config, options.probing).await;
     check_registrations(
@@ -489,9 +498,9 @@ async fn check_workspace(
     }
 }
 
-async fn check_chat_model(report: &mut Report, config: &Config, http: Option<&reqwest::Client>) {
+async fn check_chat_model(report: &mut Report, config: &Config, probing: Probing) {
     let Some(spec) = config.general.chat_model.as_ref() else {
-        let suggestion = suggest_chat_model(http).await;
+        let suggestion = suggest_chat_model(probing).await;
         report.push(
             Check::new(
                 Area::ChatModel,
@@ -506,7 +515,7 @@ async fn check_chat_model(report: &mut Report, config: &Config, http: Option<&re
     };
     match config.chat_model_ref() {
         Ok(model) => {
-            check_model(report, Area::ChatModel, config, model, http).await;
+            check_model(report, Area::ChatModel, config, model, probing).await;
             report.push(sampling_check(config, model));
         }
         Err(e) => report.push(Check::new(
@@ -538,11 +547,7 @@ fn sampling_check(config: &Config, model: ModelRef<'_>) -> Check {
     }
 }
 
-async fn check_embedding_model(
-    report: &mut Report,
-    config: &Config,
-    http: Option<&reqwest::Client>,
-) {
+async fn check_embedding_model(report: &mut Report, config: &Config, probing: Probing) {
     match config.embedding_model_ref() {
         Ok(None) => report.push(
             Check::new(
@@ -557,10 +562,10 @@ async fn check_embedding_model(
             ),
         ),
         Ok(Some(model)) => {
-            check_model(report, Area::Embeddings, config, model, http).await;
+            check_model(report, Area::Embeddings, config, model, probing).await;
             report.push(prompts_check(config, model));
             if let (Some(http), ProviderType::Ollama, Some(configured)) = (
-                http,
+                probing.client(),
                 model.provider.provider_type,
                 config.embedding.dimension,
             ) {
@@ -569,7 +574,7 @@ async fn check_embedding_model(
                     .base_url
                     .clone()
                     .unwrap_or(ProviderType::OLLAMA_BASE_URL);
-                let show = OllamaShow::fetch(http, &base, model.model).await;
+                let show = OllamaShow::fetch(&http, &base, model.model).await;
                 if let Some(check) = width_check(model, configured, show) {
                     report.push(check);
                 }
@@ -688,7 +693,7 @@ async fn check_model(
     area: Area,
     config: &Config,
     model: ModelRef<'_>,
-    http: Option<&reqwest::Client>,
+    probing: Probing,
 ) {
     let provider = model.provider;
     let name = model.provider_name;
@@ -697,7 +702,7 @@ async fn check_model(
         .clone()
         .or_else(|| provider.provider_type.default_base_url())
     else {
-        report.push(check_bedrock(area, model, http.is_some()).await);
+        report.push(check_bedrock(area, model, probing.timeout()).await);
         return;
     };
 
@@ -720,7 +725,7 @@ async fn check_model(
         );
     }
 
-    let Some(http) = http else {
+    let Some(timeout) = probing.timeout() else {
         report.push(Check::new(
             area,
             Status::Ok,
@@ -728,15 +733,48 @@ async fn check_model(
         ));
         return;
     };
-    let listing = Listing::fetch(http, provider, &base, credential.as_deref()).await;
-    report.push(listing_check(area, model, &base, listing));
+    let client = ChatClient::connect(name, provider, credential.as_deref());
+    let listing = Probe::listing(client, timeout).await;
+    report.push(listing_check(area, model, &base, &listing));
+    if area == Area::ChatModel
+        && let Ok(models) = &listing
+        && let Some(check) = window_check(config, model, models)
+    {
+        report.push(check);
+    }
+}
+
+/// Whether a turn's budgets fit the context window the listing reports
+/// for the chat model: the replayed history, the pinned documents, and
+/// the workspace context are each capped, and together they can fill it.
+fn window_check(config: &Config, model: ModelRef<'_>, models: &ProviderModels) -> Option<Check> {
+    let window = models.get(model.model)?.context_length?;
+    let history = config.analysis.history_token_budget.get();
+    let pinned = config.retrieval.pinned_token_budget.get();
+    let context = config.context.max_tokens.get();
+    let budgets = history.saturating_add(pinned).saturating_add(context);
+    (budgets > window).then(|| {
+        Check::new(
+            Area::ChatModel,
+            Status::Warn,
+            format!(
+                "{model}: a turn may replay {history} tokens of history beside {pinned} of \
+                 pinned documents and {context} of workspace context, {budgets} in all, but \
+                 the model's context window is {window}"
+            ),
+        )
+        .fix(format!(
+            "lower [analysis].history_token_budget, [retrieval].pinned_token_budget, or \
+             [context].max_tokens so they total under {window}"
+        ))
+    })
 }
 
 /// Whether the AWS SDK finds a region and credentials for a Bedrock
 /// provider, where its endpoint is, and, on bedrock-mantle (the endpoint
 /// that lists its models), whether the model is there. On bedrock-runtime
 /// the model's access is only known from a model call.
-async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: bool) -> Check {
+async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: Option<Duration>) -> Check {
     let (name, provider) = (model.provider_name, model.provider);
     let Some(bedrock) = provider.bedrock.as_ref() else {
         return Check::new(
@@ -753,13 +791,13 @@ async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: bool) -> Check {
         );
     };
     let surface = format!("{endpoint}, api {}", bedrock.api);
-    if !probe {
+    let Some(timeout) = probe else {
         return Check::new(
             area,
             Status::Ok,
             format!("{model}: {surface} (not probed: --offline)"),
         );
-    }
+    };
     let session = match bedrock::session(name, provider).await {
         Ok(session) => session,
         Err(e) => {
@@ -794,20 +832,8 @@ async fn check_bedrock(area: Area, model: ModelRef<'_>, probe: bool) -> Check {
     let Ok(base) = BaseUrl::try_from(session.root().to_owned()) else {
         return Check::new(area, Status::Ok, found);
     };
-    let listing = session
-        .models(name, provider)
-        .await
-        .map(Listing::Ids)
-        // rig's accessor, not its variant: the variant that carries a status
-        // is rig's to change, and a match on it would silently stop firing.
-        .map_err(
-            |e| match e.non_success_status().map(|status| status.as_u16()) {
-                Some(code @ (401 | 403)) => Probe::Rejected(code),
-                Some(code) => Probe::Unexpected(format!("HTTP {code}")),
-                None => Probe::Unreachable(ErrorChain(&e).to_string()),
-            },
-        );
-    listing_check(area, model, &base, listing)
+    let listing = Probe::listing(ChatClient::bedrock(&session, name, provider), timeout).await;
+    listing_check(area, model, &base, &listing)
 }
 
 /// The credential a model's provider is called with, or the failed check
@@ -881,7 +907,7 @@ fn listing_check(
     area: Area,
     model: ModelRef<'_>,
     base: &BaseUrl,
-    listing: Result<Listing, Probe>,
+    listing: &Result<ProviderModels, Probe>,
 ) -> Check {
     let provider = model.provider;
     let name = model.provider_name;
@@ -904,7 +930,7 @@ fn listing_check(
         .fix(match provider.auth {
             ProviderAuth::Oauth(_) => format!("quack auth login {name}"),
             // 401: the credentials themselves; 403: what they may do.
-            ProviderAuth::Aws { .. } if status == 403 => String::from(
+            ProviderAuth::Aws { .. } if *status == 403 => String::from(
                 "grant the credentials' IAM principal bedrock-mantle:CreateInference (and allow \
                  it in the VPC endpoint's policy, when base_url is one)",
             ),
@@ -926,31 +952,47 @@ fn listing_check(
             Status::Warn,
             format!("{model}: {base} answered, but not with a model list ({detail})"),
         ),
-        Ok(Listing::Ollama(models)) if models.holds(model.model) => Check::new(
-            area,
-            Status::Ok,
-            format!("{model}: reachable, model pulled"),
-        ),
-        Ok(Listing::Ollama(_)) => Check::new(
-            area,
-            Status::Fail,
-            format!("{model}: Ollama at {base} does not have {}", model.model),
-        )
-        .fix(format!("ollama pull {}", model.model)),
-        Ok(Listing::Ids(ids)) if ids.iter().any(|id| id == model.model) => Check::new(
-            area,
-            Status::Ok,
-            format!("{model}: reachable, credential accepted, model listed"),
-        ),
-        Ok(Listing::Ids(_)) => Check::new(
-            area,
-            Status::Warn,
-            format!(
-                "{model}: reachable and the credential is accepted, but {} is not in the provider's model list",
-                model.model
-            ),
-        )
-        .fix("check the model name; some gateways and aliases are not listed"),
+        Ok(models) => {
+            let ollama = provider.provider_type == ProviderType::Ollama;
+            if models.get(model.model).is_some() {
+                return Check::new(
+                    area,
+                    Status::Ok,
+                    if ollama {
+                        format!("{model}: reachable, model pulled")
+                    } else {
+                        format!("{model}: reachable, credential accepted, model listed")
+                    },
+                );
+            }
+            let closest = models.closest(model.model);
+            let nearest = if closest.is_empty() {
+                String::new()
+            } else {
+                format!("; the closest it lists: {}", closest.join(", "))
+            };
+            if ollama {
+                Check::new(
+                    area,
+                    Status::Fail,
+                    format!(
+                        "{model}: Ollama at {base} does not have {}{nearest}",
+                        model.model
+                    ),
+                )
+                .fix(format!("ollama pull {}", model.model))
+            } else {
+                Check::new(
+                    area,
+                    Status::Warn,
+                    format!(
+                        "{model}: reachable and the credential is accepted, but {} is not in the provider's model list{nearest}",
+                        model.model
+                    ),
+                )
+                .fix("check the model name; some gateways and aliases are not listed")
+            }
+        }
     }
 }
 
@@ -1014,24 +1056,18 @@ async fn oauth_token(
 
 /// A config snippet for a chat model: a local Ollama's own models when one
 /// answers, otherwise the general shape.
-async fn suggest_chat_model(http: Option<&reqwest::Client>) -> String {
-    let pulled = match http {
-        Some(http) => match Listing::fetch(
-            http,
-            &ProviderConfig::new(ProviderType::Ollama),
-            &ProviderType::OLLAMA_BASE_URL,
-            None,
-        )
-        .await
-        {
-            Ok(Listing::Ollama(models)) => models
-                .models
-                .into_iter()
-                .map(|m| m.name)
-                .collect::<Vec<_>>(),
-            _ => Vec::new(),
-        },
-        None => Vec::new(),
+async fn suggest_chat_model(probing: Probing) -> String {
+    let local = (probing.timeout(), "ollama".parse::<ProviderName>());
+    let pulled = match local {
+        (Some(timeout), Ok(name)) => {
+            let client =
+                ChatClient::connect(&name, &ProviderConfig::new(ProviderType::Ollama), None);
+            Probe::listing(client, timeout).await.map_or_else(
+                |_| Vec::new(),
+                |models| models.as_slice().iter().map(|m| m.id.clone()).collect(),
+            )
+        }
+        (None, _) | (_, Err(_)) => Vec::new(),
     };
     let snippet = |model: &str| {
         format!(
@@ -1329,15 +1365,45 @@ pub(crate) async fn check_registrations(
     }
 }
 
-enum Listing {
-    Ollama(OllamaRunningModels),
-    Ids(Vec<String>),
-}
-
 enum Probe {
     Unreachable(String),
     Rejected(u16),
     Unexpected(String),
+}
+
+impl Probe {
+    /// What `client` lists, within `timeout`.
+    async fn listing(
+        client: CoreResult<ChatClient>,
+        timeout: Duration,
+    ) -> Result<ProviderModels, Self> {
+        let client = client.map_err(|e| Self::Unexpected(e.to_string()))?;
+        match tokio::time::timeout(timeout, client.models()).await {
+            Ok(Ok(models)) => Ok(models),
+            Ok(Err(e)) => Err(Self::of(&e)),
+            Err(_) => Err(Self::Unreachable(format!(
+                "no answer within {} seconds",
+                timeout.as_secs()
+            ))),
+        }
+    }
+
+    /// A failed listing: a refused credential, another status, or no
+    /// reply at all.
+    fn of(error: &ProviderError) -> Self {
+        let status = error
+            .provider_response()
+            .and_then(|response| response.status)
+            .map(|status| status.as_u16());
+        match status {
+            Some(code @ (401 | 403)) => Self::Rejected(code),
+            Some(code) => Self::Unexpected(format!("HTTP {code}")),
+            None if error.kind() == ErrorKind::Http => {
+                Self::Unreachable(ErrorChain(error).to_string())
+            }
+            None => Self::Unexpected(ErrorChain(error).to_string()),
+        }
+    }
 }
 
 impl From<reqwest::Error> for Probe {
@@ -1360,84 +1426,6 @@ impl std::fmt::Display for ErrorChain<'_> {
             source = cause.source();
         }
         Ok(())
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct IdList {
-    #[serde(default)]
-    data: Vec<IdEntry>,
-}
-
-#[derive(serde::Deserialize)]
-struct IdEntry {
-    id: String,
-}
-
-impl Listing {
-    /// One `GET` for the provider's model list.
-    async fn fetch(
-        http: &reqwest::Client,
-        config: &ProviderConfig,
-        base: &BaseUrl,
-        credential: Option<&str>,
-    ) -> Result<Self, Probe> {
-        let provider = config.provider_type;
-        let headers = config
-            .header_map()
-            .map_err(|e| Probe::Unexpected(e.to_string()))?;
-        let get = |url: String| http.get(url).headers(headers.clone());
-        let request = match provider {
-            ProviderType::Ollama => {
-                let request = get(format!("{}/api/tags", base.root()));
-                match credential {
-                    Some(key) => request.bearer_auth(key),
-                    None => request,
-                }
-            }
-            ProviderType::Openai => {
-                let request = get(format!("{}/models", base.trimmed()));
-                match credential {
-                    Some(key) => request.bearer_auth(key),
-                    None => request,
-                }
-            }
-            ProviderType::Anthropic => {
-                let request = get(format!("{}/v1/models?limit=1000", base.trimmed()))
-                    .header("anthropic-version", "2023-06-01");
-                match (credential, AnthropicCredential::of(&config.auth)) {
-                    (Some(key), AnthropicCredential::Bearer) => request.bearer_auth(key),
-                    (Some(key), AnthropicCredential::ApiKey) => request.header("x-api-key", key),
-                    (None, AnthropicCredential::Bearer | AnthropicCredential::ApiKey) => request,
-                }
-            }
-            // `check_bedrock` asks the AWS SDK instead.
-            ProviderType::Bedrock | ProviderType::BedrockMantle => {
-                return Err(Probe::Unexpected(String::from(
-                    "Bedrock is not probed over plain HTTP",
-                )));
-            }
-        };
-        let response = request.send().await.map_err(Probe::from)?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(Probe::Rejected(status.as_u16()));
-        }
-        if !status.is_success() {
-            return Err(Probe::Unexpected(format!("HTTP {}", status.as_u16())));
-        }
-        let bytes = response.bytes().await.map_err(Probe::from)?;
-        match provider {
-            ProviderType::Ollama => serde_json::from_slice::<OllamaRunningModels>(&bytes)
-                .map(Self::Ollama)
-                .map_err(|e| Probe::Unexpected(e.to_string())),
-            ProviderType::Openai
-            | ProviderType::Anthropic
-            | ProviderType::Bedrock
-            | ProviderType::BedrockMantle => serde_json::from_slice::<IdList>(&bytes)
-                .map(|list| Self::Ids(list.data.into_iter().map(|e| e.id).collect()))
-                .map_err(|e| Probe::Unexpected(e.to_string())),
-        }
     }
 }
 
@@ -1769,7 +1757,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 4096];
             let n = stream.read(&mut buf).await.unwrap_or(0);
-            let body = r#"{"data":[{"id":"m"}]}"#;
+            let body = r#"{"data":[{"id":"m","display_name":"M"}]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -1789,12 +1777,15 @@ mod tests {
                 String::from("X-Gateway-Team"),
                 String::from("quack"),
             )])),
+            base_url: Some(base),
             ..ProviderConfig::new(ProviderType::Openai)
         };
-        let http = reqwest::Client::new();
-        let listing = Listing::fetch(&http, &provider, &base, Some("key")).await;
-        assert!(matches!(listing, Ok(Listing::Ids(ids)) if ids == ["m"]));
+        let name: ProviderName = "gateway".parse().unwrap();
+        let client = ChatClient::connect(&name, &provider, Some("key"));
+        let listing = Probe::listing(client, Duration::from_secs(5)).await;
+        assert!(matches!(&listing, Ok(models) if models.get("m").is_some()));
         let request = seen.await.unwrap();
+        assert!(request.starts_with("get /models "), "{request}");
         assert!(request.contains("x-gateway-team: quack"), "{request}");
         assert!(request.contains("authorization: bearer key"), "{request}");
     }
@@ -1811,18 +1802,15 @@ mod tests {
             let (base, seen) = one_listing().await;
             let config: Config = toml::from_str(&format!(
                 "[general]\nchat_model = \"p/m\"\n[providers.p]\n\
-                 type = \"anthropic\"\n{auth}"
+                 type = \"anthropic\"\nbase_url = \"{base}\"\n{auth}"
             ))
             .unwrap();
-            let provider = config.chat_model_ref().unwrap().provider;
-            let http = reqwest::Client::new();
-            let listing = Listing::fetch(&http, provider, &base, Some("tok-1")).await;
-            assert!(matches!(listing, Ok(Listing::Ids(ids)) if ids == ["m"]));
+            let chat = config.chat_model_ref().unwrap();
+            let client = ChatClient::connect(chat.provider_name, chat.provider, Some("tok-1"));
+            let listing = Probe::listing(client, Duration::from_secs(5)).await;
+            assert!(matches!(&listing, Ok(models) if models.get("m").is_some()));
             let request = seen.await.unwrap();
-            assert!(
-                request.starts_with("get /v1/models?limit=1000 "),
-                "{request}"
-            );
+            assert!(request.starts_with("get /v1/models "), "{request}");
             assert!(request.contains("anthropic-version: "), "{request}");
             assert_eq!(
                 request.contains("authorization: bearer tok-1\r\n"),
@@ -1835,6 +1823,76 @@ mod tests {
                 "{request}"
             );
         }
+    }
+
+    fn listed(models: &[(&str, Option<u32>)]) -> ProviderModels {
+        ProviderModels::from(rig::model::ModelList::new(
+            models
+                .iter()
+                .map(|(id, window)| rig::model::ModelInfo {
+                    context_length: *window,
+                    ..rig::model::ModelInfo::from_id(*id)
+                })
+                .collect(),
+        ))
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn a_model_missing_from_the_listing_names_the_closest_ones() {
+        let base = BaseUrl::try_from(String::from("http://127.0.0.1:11434")).unwrap();
+        for (provider, status) in [("ollama", Status::Fail), ("openai", Status::Warn)] {
+            let config: Config = toml::from_str(&format!(
+                "[general]\nchat_model = \"p/gpt-oss:20\"\n[providers.p]\ntype = \"{provider}\"\n\
+                 auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n"
+            ))
+            .unwrap();
+            let model = config.chat_model_ref().unwrap();
+            let models = listed(&[
+                ("llama3.1:8b", None),
+                ("gpt-oss:20b", None),
+                ("gpt-oss:120b", None),
+                ("qwen3:4b", None),
+            ]);
+            let check = listing_check(Area::ChatModel, model, &base, &Ok(models));
+            assert_eq!(check.status, status, "{provider}");
+            assert!(
+                check
+                    .summary
+                    .ends_with("the closest it lists: gpt-oss:20b, gpt-oss:120b, qwen3:4b"),
+                "{}",
+                check.summary
+            );
+        }
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn a_context_window_smaller_than_the_budgets_is_a_warning() {
+        let config: Config = toml::from_str(
+            "[general]\nchat_model = \"p/small\"\n[providers.p]\ntype = \"openai\"\n\
+             auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n",
+        )
+        .unwrap();
+        let model = config.chat_model_ref().unwrap();
+        let budgets = config
+            .analysis
+            .history_token_budget
+            .get()
+            .saturating_add(config.retrieval.pinned_token_budget.get())
+            .saturating_add(config.context.max_tokens.get());
+        let small = listed(&[("small", Some(budgets.saturating_sub(1)))]);
+        let check = window_check(&config, model, &small).unwrap();
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.summary.contains(&format!("{budgets} in all")),
+            "{}",
+            check.summary
+        );
+        let roomy = listed(&[("small", Some(budgets))]);
+        assert!(window_check(&config, model, &roomy).is_none());
+        let unreported = listed(&[("small", None)]);
+        assert!(window_check(&config, model, &unreported).is_none());
     }
 
     /// A mock issuer for the doctor: its discovery document lists `grants`,

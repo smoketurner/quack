@@ -1793,6 +1793,18 @@ impl App {
             self.provider_display
         );
         self.note(MessageKind::System, text);
+        let config = Arc::clone(&self.config);
+        self.submit_work(
+            JobKind::Models,
+            String::from("list models"),
+            Some(String::from("Listing each provider's models")),
+            move |_ctx| async move {
+                BackgroundResult::Done {
+                    kind: MessageKind::System,
+                    text: llm::ModelCatalog::fetch(&config).await.to_string(),
+                }
+            },
+        );
     }
 
     fn show_sessions(&mut self) {
@@ -2689,7 +2701,18 @@ mod tests {
         db_settle(&mut app).await;
         assert!(last(&app).content.contains("shared"));
         app.handle_slash_command("/model");
-        assert!(last(&app).content.contains("keyword search only"));
+        let configured = app.messages.iter().rev().nth(1).map(|m| m.content.as_str());
+        assert!(
+            configured.is_some_and(|text| text.contains("keyword search only")),
+            "{configured:?}"
+        );
+        assert!(
+            last(&app)
+                .content
+                .contains("Listing each provider's models")
+        );
+        settle(&mut app).await;
+        assert_eq!(last(&app).content, "No providers are configured.");
         app.handle_slash_command("/nope");
         assert!(last(&app).content.contains("unknown command"));
 
