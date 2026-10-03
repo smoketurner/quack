@@ -94,6 +94,19 @@ impl Reader {
         }
     }
 
+    /// The reader's name as quack shows it to a person, never a server
+    /// path. Used for the user-facing message when a file fails to parse,
+    /// so the on-disk path the reader's raw error names stays in the log.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Csv(Separator::Comma) => "comma-separated values",
+            Self::Csv(Separator::Tab) => "tab-separated values",
+            Self::Parquet => "Parquet",
+            Self::Json => "JSON",
+        }
+    }
+
     /// The reader for bytes of no known name: Parquet by its magic, JSON
     /// when they start with `{` or `[`, else comma-separated text (its
     /// dialect sniffed).
