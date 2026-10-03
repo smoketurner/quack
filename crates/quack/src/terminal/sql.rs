@@ -95,9 +95,7 @@ impl Statement {
                 continue;
             }
             while let Some(Token::Word(table)) = tokens.next() {
-                let Some(columns) = schema.table(&table.value) else {
-                    break;
-                };
+                let columns = schema.table(&table.value);
                 if let Some(Token::Word(w)) = tokens.peek()
                     && w.keyword == Keyword::AS
                 {
@@ -113,7 +111,9 @@ impl Statement {
                     }
                     _ => table.value.clone(),
                 };
-                named.push((alias, columns));
+                if let Some(columns) = columns {
+                    named.push((alias, columns));
+                }
                 if tokens.peek() == Some(&&Token::Comma) {
                     tokens.next();
                 } else {
@@ -382,6 +382,36 @@ mod tests {
             ["sold", "sales", "stores"]
         );
         assert_eq!(offered("SELECT * FROM stores ORDER BY r"), ["\"Region\""]);
+    }
+
+    #[test]
+    fn a_comma_from_list_keeps_resolving_tables_after_an_unresolved_name() {
+        assert_eq!(
+            offered("WITH cte AS (SELECT 1 AS x) SELECT re| FROM cte, sales"),
+            ["region", "revenue"]
+        );
+        assert_eq!(
+            offered("WITH cte AS (SELECT 1 AS x) SELECT re| FROM cte JOIN sales"),
+            ["region", "revenue"]
+        );
+        assert_eq!(
+            offered("SELECT re| FROM cte, typo, sales"),
+            ["region", "revenue"]
+        );
+        assert_eq!(
+            offered("SELECT re| FROM cte AS c, sales"),
+            ["region", "revenue"]
+        );
+        assert_eq!(
+            offered("SELECT re| FROM cte c, sales"),
+            ["region", "revenue"]
+        );
+        assert_eq!(
+            offered("SELECT s.| FROM cte, sales AS s"),
+            ["region", "revenue", "sold"]
+        );
+        assert!(offered("SELECT c.| FROM cte c, sales").is_empty());
+        assert_eq!(offered("SELECT * FROM cte, st"), ["stores"]);
     }
 
     #[test]
