@@ -18,7 +18,9 @@ use tokio::sync::{broadcast, mpsc};
 
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::citations::{Citation, Sources};
-use quack_core::analysis::events::{self, AgentEvent, PermissionRequest, ToolName, ToolStep};
+use quack_core::analysis::events::{
+    self, AgentEvent, Delivery, PermissionRequest, ToolName, ToolStep,
+};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
@@ -83,6 +85,8 @@ const RUN_IT: &str = "Run it?  y = yes   n = no   a = yes, and allow writes for 
 
 /// The answer to `a` at a write prompt.
 const ALLOWED_FOR_SESSION: &str = "Allowed. Writes are permitted for the rest of this session.";
+/// An allow given after the question stopped waiting (cancelled) ran nothing.
+const TURN_GONE: &str = "That question had already ended; nothing ran.";
 
 /// What a transcript message is, which decides how it is drawn.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1531,17 +1535,20 @@ impl App {
     /// The user's answer to a write the agent asked for.
     fn decide_agent_write(&mut self, request: PermissionRequest, answer: Answer) {
         match answer {
-            Answer::Yes => {
-                request.allow();
-                self.note(MessageKind::System, "Allowed.");
-            }
+            Answer::Yes => match request.allow() {
+                Delivery::Delivered => self.note(MessageKind::System, "Allowed."),
+                Delivery::TurnGone => self.note(MessageKind::System, TURN_GONE),
+            },
             Answer::Always => {
                 // The rest of this turn through the request, the turns
                 // after (queued ones included) through the shared flag each
                 // reads when it starts.
-                request.allow_for_turn();
+                let delivered = request.allow_for_turn();
                 self.allow_write.store(true, Ordering::Relaxed);
                 self.note(MessageKind::System, ALLOWED_FOR_SESSION);
+                if delivered == Delivery::TurnGone {
+                    self.note(MessageKind::System, TURN_GONE);
+                }
             }
             Answer::No => {
                 request.deny();

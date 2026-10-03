@@ -22,6 +22,7 @@ judgement columns come from the batch's record in `.local/`.
 | 2026-09-25 | 29 | 23 | 0 | 0 | 7 | not recorded | all 23 merged (#252–#274); remaining auth, audit, and token findings closed by #275 | none (first batch) | 0 |
 | 2026-09-28 | 6 | 5 | 0 | 1 | 5 | not recorded | all 5 merged (#297–#301); #296 closed by class fix #302 | not recorded | 0 |
 | 2026-09-30 | 1 | 1 | 0 | 0 | 1 | not recorded | #315 merged | not recorded | 0 |
+| 2026-10-03 | 5 | 4 | 0 | 0 | 5 | 1 of 4 (#351 amended) | #349, #350, #352 ready as written; #351 amended with the workbook arm; #345 had no PR, fixed on `fix/345-permission-answer-undelivered` | none (first record) | 2 described, 0 requested (no CLI) |
 
 These three batches predate this skill and have no `.local/` record, so their
 judgement columns are reconstructed from GitHub, not from a review.
@@ -66,3 +67,40 @@ fresh regressions. They become informative after the first month.
 Missing audit rows are the clearest recurring class: #223, #231, #243, #244,
 #245, and #291 across two batches, plus the audit half of #293. No Detail rule
 has been requested for it yet.
+
+## 2026-10-03 — first triage under the skill
+
+41 issues, 2026-09-25 through 2026-10-03; 5 open, all from this batch.
+
+| month | n | no attr | median age | p90 age | <30d | >90d |
+|-------|---|---------|-----------|---------|------|------|
+| 2026-09 | 36 | 1 | 8 | 11 | 35 | 0 |
+| 2026-10 | 5 | 0 | 2 | 2 | 5 | 0 |
+
+**Reading:** PR≤3d is 5 of 5, but only three findings (#344, #345, #346) are
+defects in logic the blamed PR added (#331, #336, #333, all merged
+2026-10-01); #347 and #348 are older defects blamed on the last PR to touch
+the line. The Detail-only column stays at 0: no finding was in a Detail fix
+PR. Nothing matched residue, since this is the first record. Still too young
+for the age columns to separate backlog from regression.
+
+### Classes
+
+Every finding landed in a different keyword cluster (+1 each to audit, data
+loss, ordering, stale state, fail-open, lifecycle), and the sibling hunt
+confirmed one class: DuckDB reader errors persisted with the absolute
+`files/` path (#347), four arms across `TableLoad::create` and
+`WorkbookLoad::load`, three fixed by #351 and the fourth by its amendment.
+#345 (allow after the stream disconnected audited `allowed`, 204) joins the
+audit-outcome cluster, now 9 findings over four batches with no rule
+requested; its fix is on a branch of its own with a `Delivery` type as the
+guard.
+
+### Decided
+
+Instances merged as written: #349, #350, #352. #351 amended. #345 fixed on
+`fix/345-permission-answer-undelivered`. Two rule descriptions recorded in
+`.local/detail-triage-2026-10-03.md` for a machine with the `detail` CLI.
+Residue: the terminal's `named_tables` still ends a comma `FROM` list at a
+subquery; the workbook arm has no test.
+

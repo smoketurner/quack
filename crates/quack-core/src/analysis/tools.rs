@@ -1352,7 +1352,7 @@ mod tests {
 
     use super::*;
     use crate::analysis::chart::ChartKind;
-    use crate::analysis::events::{self, AgentEvent};
+    use crate::analysis::events::{self, AgentEvent, Delivery};
     use crate::embedding::{Dimension, Profile, Prompts};
     use crate::graph::store::NewNode;
     use crate::graph::{Properties, Standing};
@@ -2380,7 +2380,7 @@ mod tests {
         }
         .unwrap();
         assert_eq!(req.sql, "DELETE FROM t");
-        req.allow();
+        assert_eq!(req.allow(), Delivery::Delivered);
         assert!(gate.await.is_ok_and(|ran| ran));
         assert!(!refused.was_refused());
     }

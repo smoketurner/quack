@@ -120,6 +120,19 @@ pub struct PermissionRequest {
     reply: oneshot::Sender<Decision>,
 }
 
+/// Whether an answer reached the turn that asked. A turn that was cancelled
+/// (a stream that disconnected, `/cancel`) stops waiting, and an answer
+/// given after that changes nothing: an allow runs no write, so an
+/// interface must not report it as run.
+#[must_use = "an answer the turn no longer waits for ran nothing"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// The turn took the answer.
+    Delivered,
+    /// The turn had already stopped waiting.
+    TurnGone,
+}
+
 /// The interface's answer to a permission request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -133,21 +146,31 @@ pub enum Decision {
 }
 
 impl PermissionRequest {
-    pub fn allow(self) {
-        self.answer(Decision::Allow);
+    /// Run this statement. `TurnGone` means it was not run.
+    pub fn allow(self) -> Delivery {
+        self.answer(Decision::Allow)
     }
 
-    pub fn allow_for_turn(self) {
-        self.answer(Decision::AllowForTurn);
+    /// Run this statement and every later write of the turn. `TurnGone`
+    /// means nothing ran.
+    pub fn allow_for_turn(self) -> Delivery {
+        self.answer(Decision::AllowForTurn)
     }
 
+    /// Refuse the statement. A refusal needs no turn to take it: a request
+    /// nobody answers is refused, so there is nothing to report.
     pub fn deny(self) {
-        self.answer(Decision::Deny);
+        match self.answer(Decision::Deny) {
+            Delivery::Delivered | Delivery::TurnGone => {}
+        }
     }
 
-    fn answer(self, decision: Decision) {
-        if self.reply.send(decision).is_err() {
+    fn answer(self, decision: Decision) -> Delivery {
+        if self.reply.send(decision).is_ok() {
+            Delivery::Delivered
+        } else {
             tracing::debug!("permission answer arrived after the tool stopped waiting");
+            Delivery::TurnGone
         }
     }
 }
@@ -581,7 +604,7 @@ mod tests {
         let allowed = tokio::spawn(async move { asker.ask_permission("DROP TABLE t").await });
         let req = permission_request(rx.recv().await).unwrap();
         assert_eq!(req.sql, "DROP TABLE t");
-        req.allow();
+        assert_eq!(req.allow(), Delivery::Delivered);
         assert!(allowed.await.is_ok_and(|a| a));
 
         let asker = recorder.clone();
@@ -594,7 +617,7 @@ mod tests {
         let asker = recorder.clone();
         let granted = tokio::spawn(async move { asker.ask_permission("UPDATE t SET a = 1").await });
         let req = permission_request(rx.recv().await).unwrap();
-        req.allow_for_turn();
+        assert_eq!(req.allow_for_turn(), Delivery::Delivered);
         assert!(granted.await.is_ok_and(|a| a));
         assert!(recorder.ask_permission("DELETE FROM t").await);
         assert!(rx.try_recv().is_err(), "no request was emitted");
@@ -605,6 +628,28 @@ mod tests {
         let pending = tokio::spawn(async move { asker.ask_permission("DELETE FROM t").await });
         assert!(permission_request(rx.recv().await).is_some());
         pending.abort();
+    }
+
+    /// An answer to a turn that stopped waiting (cancelled, its stream
+    /// gone) says so, since an allow given then runs nothing.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test asserts the event kind")]
+    async fn an_answer_after_the_turn_stopped_waiting_is_not_delivered() {
+        let (sink, mut rx) = channel();
+        let recorder = TurnRecorder::new(sink);
+        let asker = recorder.clone();
+        let pending = tokio::spawn(async move { asker.ask_permission("DROP TABLE t").await });
+        let req = permission_request(rx.recv().await).unwrap();
+        pending.abort();
+        assert!(pending.await.is_err_and(|e| e.is_cancelled()));
+        assert_eq!(req.allow(), Delivery::TurnGone);
+
+        let asker = recorder.clone();
+        let pending = tokio::spawn(async move { asker.ask_permission("DELETE FROM t").await });
+        let req = permission_request(rx.recv().await).unwrap();
+        pending.abort();
+        assert!(pending.await.is_err_and(|e| e.is_cancelled()));
+        assert_eq!(req.allow_for_turn(), Delivery::TurnGone);
     }
 
     #[test]

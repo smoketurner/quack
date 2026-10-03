@@ -213,7 +213,7 @@ labels, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `du
 inside a turn is `write_refused: true` (REST 200, MCP structured content, print exit 3). A streamed
 web or REST turn from someone who may write asks instead: a `permission_required` SSE event, answered
 by `POST .../sessions/{sid}/permissions/{request}` (`server::permissions`, held in memory, refused after
-`[server].permission_timeout_seconds`, every answer audited as `permission`). `usage` is `AgentResponse::usage`, the provider's own
+`[server].permission_timeout_seconds`, 410 and a denied row when the turn had already stopped waiting, every answer audited as `permission`). `usage` is `AgentResponse::usage`, the provider's own
 `input_tokens`/`output_tokens`/`total_tokens` for the turn taken off rig's final response
 (the per-request counts summed when a turn derails first), `null` when the provider
 reported none, and copied onto the assistant message's metadata in `_quack_messages`. It is
