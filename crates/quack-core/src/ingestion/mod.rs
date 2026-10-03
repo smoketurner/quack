@@ -651,8 +651,10 @@ impl WorkbookLoad {
     /// # Errors
     ///
     /// Returns an `Ingestion` error when two of the workbook's sheet names
-    /// collide on the same sanitized table name, or `TableTaken` when a
-    /// table another document owns is in the way.
+    /// collide on the same sanitized table name, or when `DuckDB` cannot
+    /// read a sheet's CSV (the message names the sheet, the log keeps the
+    /// reader's text and its on-disk path), or `TableTaken` when a table
+    /// another document owns is in the way.
     fn load(self, db: &WorkspaceDb) -> Result<Vec<String>> {
         std::fs::create_dir_all(&self.files_dir)?;
         let stem = TableName::of_file(&self.filename);
@@ -696,7 +698,18 @@ impl WorkbookLoad {
                 quote_ident(table_name.as_str()),
                 Reader::Csv(Separator::Comma).sql_fn()
             );
-            db.execute_with_params(&create_sql, duckdb::params![path.as_ref()])?;
+            if let Err(e) = db.execute_with_params(&create_sql, duckdb::params![path.as_ref()]) {
+                return Err(match e {
+                    Error::DuckDb(e) => {
+                        tracing::warn!(file = %self.filename, sheet = %sheet.sheet, error = %e, "workbook sheet refused");
+                        Error::Ingestion(format!(
+                            "sheet '{}' of '{}' does not load as a table",
+                            sheet.sheet, self.filename
+                        ))
+                    }
+                    other => other,
+                });
+            }
             tracing::info!(table = %table_name, sheet = %sheet.sheet, rows = sheet.rows, file = %self.filename, "created table from workbook sheet");
             tables.push(table_name.into_string());
         }
