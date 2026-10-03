@@ -10,11 +10,11 @@ use std::future::Future;
 use std::pin::Pin;
 
 use rig::operation::RerankRequest;
-use schemars::{JsonSchema, schema_for};
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::llm::{ChatModel, RerankModel, SchemaCall, Task};
+use crate::llm::{RerankModel, SchemaCall};
 use crate::storage::workspace::ChunkSearchResult;
 
 /// Boxed future so implementations can be trait objects.
@@ -129,29 +129,29 @@ impl RerankAnswer {
 pub const PASSAGE_CHARS: usize = 1200;
 
 /// How long one ranking call may take.
-const RERANK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub const RERANK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The chat model as a listwise reranker: one tool-less call with the
 /// query and numbered passages, answered with the passage numbers in
 /// order.
+///
+/// Built from a [`SchemaCall`] the turn already routed through
+/// `ChatClient::schema_call`, so its reasoning effort is
+/// `[analysis].background_effort` — the same background effort graph
+/// extraction, the ontology document pass, and history summaries use —
+/// not the chat turn's `[analysis].effort`.
 pub struct ModelReranker {
     call: SchemaCall<RerankAnswer>,
 }
 
 impl ModelReranker {
+    /// Wrap the rerank one-shot built with `background_effort`. The
+    /// `SchemaCall` owns its model (sampled once, at construction), so the
+    /// caller must hand one built through `schema_call` rather than the
+    /// turn's model, or the rerank call inherits the turn's `effort`.
     #[must_use]
-    pub fn new(model: ChatModel) -> Self {
-        Self {
-            call: SchemaCall::new(
-                model,
-                Task {
-                    preamble: RERANK_PROMPT,
-                    timeout: RERANK_TIMEOUT,
-                    label: "rerank",
-                },
-                schema_for!(RerankAnswer),
-            ),
-        }
+    pub fn from_call(call: SchemaCall<RerankAnswer>) -> Self {
+        Self { call }
     }
 
     /// The user message for one ranking call: the query and numbered
@@ -226,6 +226,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::ids::{ChunkId, DocumentId};
+    use schemars::schema_for;
 
     fn hit(n: u32) -> ChunkSearchResult {
         ChunkSearchResult {

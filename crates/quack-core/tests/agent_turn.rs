@@ -152,7 +152,7 @@ async fn run_turn(
         message,
         asked: Instant::now(),
     };
-    let response = analysis.run(model.clone().erase(), sink).await;
+    let response = analysis.run(model.clone().erase(), None, sink).await;
     let mut events = Vec::new();
     while let Ok(event) = stream.try_recv() {
         events.push(event);
