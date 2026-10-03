@@ -16,6 +16,7 @@ use super::citations::{Citation, CitedAnswer};
 use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, TurnRecorder};
 use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls};
 use super::policy::WritePolicy;
+use super::rerank::RerankAnswer;
 use super::text_to_sql::{Modeled, PromptOptions, SystemPrompt};
 use super::tools::{
     CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphTools,
@@ -24,7 +25,7 @@ use super::tools::{
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::{GraphOptions, GraphResult, store as graph_store};
-use crate::llm::{ChatModel, OLLAMA_KEEP_ALIVE, RerankModel};
+use crate::llm::{ChatModel, OLLAMA_KEEP_ALIVE, RerankModel, SchemaCall};
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
 
@@ -201,11 +202,19 @@ where
     ///
     /// Returns an error if system prompt generation, agent building, or
     /// the model call fails.
-    pub async fn run(self, completion_model: ChatModel, sink: EventSink) -> Result<AgentResponse> {
+    pub async fn run(
+        self,
+        completion_model: ChatModel,
+        reranker_call: Option<SchemaCall<RerankAnswer>>,
+        sink: EventSink,
+    ) -> Result<AgentResponse> {
         let max_turns = usize::try_from(self.config.max_turns)
             .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
         let recorder = TurnRecorder::new(sink).with_turn_limit(max_turns);
-        match self.run_inner(completion_model, &recorder).await {
+        match self
+            .run_inner(completion_model, reranker_call, &recorder)
+            .await
+        {
             Ok(response) => {
                 recorder.emit(AgentEvent::TurnComplete(response.clone()));
                 Ok(response)
@@ -399,6 +408,7 @@ where
     async fn run_inner(
         self,
         completion_model: ChatModel,
+        reranker_call: Option<SchemaCall<RerankAnswer>>,
         recorder: &TurnRecorder,
     ) -> Result<AgentResponse> {
         let Self {
@@ -429,6 +439,7 @@ where
             mode: prompt.mode,
             window,
             rerank_model,
+            reranker_call,
         }
         .build_agent(completion_model, embedding_model, &read.system_prompt)?;
         let max_turns = usize::try_from(analysis_config.max_turns)
@@ -668,12 +679,16 @@ struct BuildContext<'a> {
     mode: ChatMode,
     window: Window,
     rerank_model: Option<RerankModel>,
+    /// The model reranker's one-shot, sampled with `background_effort` by
+    /// `dispatch`'s `schema_call`. `Some` only when `rerank = "model"`; the
+    /// search tool wires it in, the other rerank modes ignore it.
+    reranker_call: Option<SchemaCall<RerankAnswer>>,
 }
 
 impl BuildContext<'_> {
     /// The rig agent with every tool this workspace and mode register.
     fn build_agent<M>(
-        &self,
+        self,
         completion_model: ChatModel,
         embedding_model: Option<Embedder<M>>,
         system_prompt: &str,
@@ -684,7 +699,7 @@ impl BuildContext<'_> {
         let ctx = self;
         let search = SearchDocumentsTool::from_config(
             ctx.reader_db.clone(),
-            &completion_model,
+            ctx.reranker_call,
             ctx.rerank_model.clone(),
             embedding_model.clone(),
             ctx.retrieval_config,

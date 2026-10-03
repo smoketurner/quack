@@ -21,12 +21,12 @@ use super::chart::{ChartKind, ChartSpec};
 use super::citations::{ChunkLocation, Markers};
 use super::events::{DetailPreview, ToolName, TurnRecorder};
 use super::policy::{RefusalFlag, WritePolicy};
-use super::rerank::{self, ModelReranker, Reranker, ScoredReranker};
+use super::rerank::{self, ModelReranker, RerankAnswer, Reranker, ScoredReranker};
 use super::text_to_sql::Modeled;
 use crate::config::{RerankMode, RetrievalConfig};
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
-use crate::llm::{ChatModel, RerankModel};
+use crate::llm::{RerankModel, SchemaCall};
 use crate::ontology::{ClassRelations, Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
 use crate::text::NonBlankText;
@@ -713,20 +713,28 @@ impl<M> SearchDocumentsTool<M> {
     }
 
     /// The tool as `[retrieval]` configures it: the chat model as reranker
-    /// when `rerank = "model"`, `rerank_model` when `rerank = "reranker"`.
+    /// when `rerank = "model"` (`reranker_call`, already built with
+    /// `background_effort`), `rerank_model` when `rerank = "reranker"`.
     pub fn from_config(
         db: ReaderDb,
-        completion_model: &ChatModel,
+        reranker_call: Option<SchemaCall<RerankAnswer>>,
         rerank_model: Option<RerankModel>,
         embedding_model: Option<Embedder<M>>,
         retrieval: &RetrievalConfig,
     ) -> Self {
         let search = Self::new(db, embedding_model, retrieval);
-        let reranker: Arc<dyn Reranker> = match (retrieval.rerank, rerank_model) {
-            (RerankMode::None, _) => return search,
-            (RerankMode::Model, _) => Arc::new(ModelReranker::new(completion_model.clone())),
-            (RerankMode::Reranker, Some(model)) => Arc::new(ScoredReranker::new(model)),
-            (RerankMode::Reranker, None) => {
+        let reranker: Arc<dyn Reranker> = match (retrieval.rerank, reranker_call, rerank_model) {
+            (RerankMode::None, _, _) => return search,
+            (RerankMode::Model, Some(call), _) => Arc::new(ModelReranker::from_call(call)),
+            (RerankMode::Model, None, _) => {
+                tracing::warn!(
+                    "rerank = \"model\" but the background call was not built; keeping the fused \
+                     order"
+                );
+                return search;
+            }
+            (RerankMode::Reranker, _, Some(model)) => Arc::new(ScoredReranker::new(model)),
+            (RerankMode::Reranker, _, None) => {
                 tracing::warn!(
                     "rerank = \"reranker\" without a rerank model; keeping the fused order"
                 );
