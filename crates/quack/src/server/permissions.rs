@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use jiff::{SignedDuration, Timestamp};
-use quack_core::analysis::events::PermissionRequest;
+use quack_core::analysis::events::{Delivery, PermissionRequest};
 use quack_core::ids::{PermissionId, SessionId, UserId, WorkspaceId};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::Deserialize;
@@ -75,11 +75,19 @@ impl Answer {
         }
     }
 
-    fn give(self, request: PermissionRequest) {
+    /// Hand the answer to the turn. `TurnGone` means the turn had stopped
+    /// waiting (its stream disconnected, or it was cancelled) and nothing
+    /// ran.
+    fn give(self, request: PermissionRequest) -> Delivery {
         match self {
             Self::Allow => request.allow(),
-            Self::Deny => request.deny(),
             Self::AllowTurn => request.allow_for_turn(),
+            // A refusal needs no turn to take it: an unanswered write is
+            // refused either way.
+            Self::Deny => {
+                request.deny();
+                Delivery::Delivered
+            }
         }
     }
 }
@@ -93,6 +101,27 @@ pub(crate) enum Refusal {
     Decided,
     /// Only the person whose turn asked may answer.
     NotYours,
+    /// The turn that asked had stopped waiting before the answer came
+    /// (its stream disconnected, or it was cancelled), so the statement
+    /// did not run whatever the answer was.
+    Gone { sql: String },
+}
+
+impl Refusal {
+    /// The audit detail: the statement and the answer that reached no
+    /// turn, recorded like an expiry; the other refusals name nothing.
+    pub(crate) fn detail(
+        &self,
+        request: &PermissionId,
+        answer: Answer,
+    ) -> Option<serde_json::Value> {
+        match self {
+            Self::Gone { sql } => Some(serde_json::json!({
+                "request": request, "sql": sql, "decision": "gone", "answer": answer.as_str(),
+            })),
+            Self::Unknown | Self::Decided | Self::NotYours => None,
+        }
+    }
 }
 
 impl From<Refusal> for ApiError {
@@ -102,6 +131,9 @@ impl From<Refusal> for ApiError {
             Refusal::Decided => Self::conflict("that write was already decided"),
             Refusal::NotYours => {
                 Self::forbidden("only the person whose question asked for the write may decide it")
+            }
+            Refusal::Gone { .. } => {
+                Self::gone("the question that asked for this write has already ended; nothing ran")
             }
         }
     }
@@ -165,12 +197,15 @@ impl Permissions {
     }
 
     /// Give `answer` to the write `request` waits on in `session`, for the
-    /// person `access` names. Returns the statement.
+    /// person `access` names. Returns the statement once the turn has the
+    /// answer.
     ///
     /// # Errors
     ///
     /// A [`Refusal`] when no such write waits there, it was already
-    /// decided, or it belongs to another person's turn.
+    /// decided, it belongs to another person's turn, or the turn that
+    /// asked had stopped waiting (`Gone`: the answer is recorded, nothing
+    /// ran).
     pub(crate) fn decide(
         &self,
         request: &PermissionId,
@@ -187,10 +222,12 @@ impl Permissions {
             return Err(Refusal::NotYours);
         }
         match std::mem::replace(&mut entry.state, State::Decided) {
-            State::Open(open) => {
-                answer.give(open);
-                Ok(entry.sql.clone())
-            }
+            State::Open(open) => match answer.give(open) {
+                Delivery::Delivered => Ok(entry.sql.clone()),
+                Delivery::TurnGone => Err(Refusal::Gone {
+                    sql: entry.sql.clone(),
+                }),
+            },
             State::Decided => Err(Refusal::Decided),
         }
     }

@@ -323,7 +323,7 @@ pub(crate) async fn decide(
                     AuditAction::Permission,
                     resource,
                     Outcome::Denied,
-                    None,
+                    refusal.detail(&request, answer),
                 )
                 .await?;
             Err(refusal.into())
