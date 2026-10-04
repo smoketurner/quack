@@ -301,7 +301,6 @@ fn effort_fields(
         (Family::Claude, _) => {
             fields.insert(String::from("output_config"), json!({ "effort": level }))
         }
-        (_, Wire::Ollama) => fields.insert(String::from("think"), json!(level)),
         (_, Wire::Responses) => {
             fields.insert(String::from("reasoning"), json!({ "effort": level }))
         }
@@ -521,7 +520,7 @@ mod tests {
                 "gpt-oss:20b",
                 Wire::Ollama,
                 Effort::High,
-                json!({ "think": "high" }),
+                json!({ "reasoning_effort": "high" }),
             ),
             (
                 "openai.gpt-oss-120b",
@@ -551,12 +550,12 @@ mod tests {
             Some(json!({ "store": false, "reasoning": { "summary": "auto", "effort": "high" } }))
         );
         let mut asked = request();
-        asked.additional_params = Some(json!({ "num_ctx": 8192, "keep_alive": "30m" }));
+        asked.additional_params = Some(json!({ "keep_alive": "30m" }));
         assert_eq!(
             sampling("gpt-oss:20b", Wire::Ollama, Some(Effort::Low))
                 .apply(asked)
                 .additional_params,
-            Some(json!({ "num_ctx": 8192, "keep_alive": "30m", "think": "low" }))
+            Some(json!({ "keep_alive": "30m", "reasoning_effort": "low" }))
         );
     }
 

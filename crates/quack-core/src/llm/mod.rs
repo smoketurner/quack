@@ -29,7 +29,7 @@ use crate::analysis::agent::{AgentResponse, Analysis, Cutoff};
 use crate::analysis::events::{self, AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::rerank::{RERANK_PROMPT, RERANK_TIMEOUT, RerankAnswer};
-use crate::analysis::text_to_sql::PromptOptions;
+use crate::analysis::text_to_sql::{PromptOptions, Window};
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::{
     BaseUrl, BedrockApi, BedrockEndpoint, Config, Effort, ModelRef, ModelSettings, ProviderAuth,
@@ -1288,8 +1288,13 @@ async fn start_turn<'c>(
     let session_id = session_id.to_owned();
     let pinned_token_budget = config.retrieval.pinned_token_budget;
     let context_max_tokens = config.context.max_tokens;
-    let ollama_context_cap = (chat.provider.provider_type == ProviderType::Ollama)
-        .then_some(config.analysis.max_context_tokens);
+    let window = match chat.provider.provider_type {
+        ProviderType::Ollama => Window::Ollama,
+        ProviderType::Openai
+        | ProviderType::Anthropic
+        | ProviderType::Bedrock
+        | ProviderType::BedrockMantle => Window::Provider,
+    };
     let read = session_id.clone();
     let prompt = db
         .run(move |guard| {
@@ -1302,7 +1307,7 @@ async fn start_turn<'c>(
                 pinned_token_budget,
                 context: context::combined(guard)?,
                 context_max_tokens,
-                ollama_context_cap,
+                window,
             };
             Ok(prompt)
         })
@@ -1460,16 +1465,13 @@ mod tests {
 
     /// Graph extraction sends the ontology's schema as the provider's
     /// structured output, so the model is held to its class and relation
-    /// ids: Ollama's `format`, Chat Completions' strict `response_format`.
+    /// ids, as Chat Completions' strict `response_format` (Ollama's too).
     #[tokio::test]
     async fn graph_extraction_sends_the_ontology_schema() {
         let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
-        for (provider, field) in [
-            ("type = \"ollama\"\n", r#""format":{"#),
-            (
-                "type = \"openai\"\napi = \"chat-completions\"\n",
-                r#""response_format":{"json_schema":{"#,
-            ),
+        for provider in [
+            "type = \"ollama\"\n",
+            "type = \"openai\"\napi = \"chat-completions\"\n",
         ] {
             let (root, seen) = capture_one().await;
             let auth = if provider.contains("openai") {
@@ -1493,7 +1495,10 @@ mod tests {
                 .unwrap_or_else(|e| fail(&e.to_string()));
             assert!(extractor.extract("Orgenics ships to Kenya.").await.is_err());
             let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
-            assert!(request.contains(field), "{provider}: {request}");
+            assert!(
+                request.contains(r#""response_format":{"type":"json_schema","#),
+                "{provider}: {request}"
+            );
             assert!(
                 request.contains(r#""enum":["mentions","ships_to"]"#)
                     && request.contains(r#""enum":["entity"]"#),
@@ -1633,8 +1638,8 @@ mod tests {
         );
     }
 
-    /// A loopback Ollama that answers every request with `stream`, an
-    /// NDJSON chat stream, so a test can script how the model stops.
+    /// A loopback Ollama that answers every request with `stream`, a Chat
+    /// Completions event stream, so a test can script how the model stops.
     async fn scripted_ollama(stream: &'static str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1669,7 +1674,7 @@ mod tests {
                     }
                 }
                 let reply = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{stream}",
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{stream}",
                     stream.len()
                 );
                 drop(socket.write_all(reply.as_bytes()).await);
@@ -1680,18 +1685,22 @@ mod tests {
 
     /// A model that thinks until it hits the output limit, answering nothing.
     const THOUGHT_ONLY: &str = concat!(
-        r#"{"model":"m","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"","thinking":"Let me work through every table first."},"done":false}"#,
-        "\n",
-        r#"{"model":"m","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"length","prompt_eval_count":10,"eval_count":5}"#,
-        "\n",
+        r#"data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"Let me work through every table first."},"finish_reason":null}]}"#,
+        "\n\n",
+        r#"data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"length"}]}"#,
+        "\n\n",
+        r#"data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        "\n\ndata: [DONE]\n\n",
     );
 
     /// A model that starts answering and is cut off at the output limit.
     const CUT_SHORT: &str = concat!(
-        r#"{"model":"m","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"The regions are north, south"},"done":false}"#,
-        "\n",
-        r#"{"model":"m","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"length","prompt_eval_count":10,"eval_count":5}"#,
-        "\n",
+        r#"data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"The regions are north, south"},"finish_reason":null}]}"#,
+        "\n\n",
+        r#"data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"length"}]}"#,
+        "\n\n",
+        r#"data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        "\n\ndata: [DONE]\n\n",
     );
 
     /// A one-shot call (extraction, reranking) whose answer the output limit
@@ -1729,7 +1738,7 @@ mod tests {
             assert!(
                 message.contains(
                     "the graph extraction answer was cut off at the model's output limit"
-                ) && message.contains("[analysis].max_context_tokens")
+                ) && message.contains("OLLAMA_CONTEXT_LENGTH")
                     && !message.contains("max_tokens for this request"),
                 "{message}"
             );
@@ -1780,7 +1789,7 @@ mod tests {
             assert!(
                 response.content.starts_with(kept)
                     && response.content.contains(note)
-                    && response.content.contains("[analysis].max_context_tokens")
+                    && response.content.contains("OLLAMA_CONTEXT_LENGTH")
                     && !response.content.contains("max_tokens for this request"),
                 "{}",
                 response.content
@@ -1872,7 +1881,7 @@ mod tests {
         let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
         // Anthropic calls need a Claude model, which gets `max_tokens`.
         for (provider, auth, model, path) in [
-            ("type = \"ollama\"\n", "", "m", "POST /api/chat "),
+            ("type = \"ollama\"\n", "", "m", "POST /v1/chat/completions "),
             (
                 "type = \"openai\"\napi = \"chat-completions\"\n",
                 keyed,

@@ -2789,7 +2789,7 @@ impl EmptyLookup<'_> {
 
 /// The most characters one graph result may put into a turn. A listing of
 /// `max_nodes` entities, each with its properties, is otherwise large
-/// enough to push a fixed Ollama `num_ctx` over: the front of the prompt
+/// enough to push Ollama's context window over: the front of the prompt
 /// is cut, the tool list goes with it, and the model invents a tool name
 /// (seen live on gpt-oss:20b, the failure #40 describes).
 const MAX_GRAPH_TEXT_CHARS: usize = 6_000;

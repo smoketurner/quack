@@ -57,10 +57,19 @@ pub struct PromptOptions {
     pub context: Option<String>,
     /// Budget for `context` (four characters per token).
     pub context_max_tokens: Tokens,
-    /// For Ollama, the cap on the context window the turn requests
-    /// (`[analysis].max_context_tokens`); `None` for providers that size
-    /// their own.
-    pub ollama_context_cap: Option<Tokens>,
+    /// Who sizes the model's context window.
+    pub window: Window,
+}
+
+/// Who sizes the model's context window, which decides what a cut-off turn
+/// tells the person to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// The provider sizes its own.
+    Provider,
+    /// The Ollama server, at the size its operator set
+    /// (`OLLAMA_CONTEXT_LENGTH`); no request can change it.
+    Ollama,
 }
 
 /// The system prompt, assembled in the order the design fixes (section
@@ -516,7 +525,7 @@ mod tests {
             pinned_token_budget: Tokens::new(pinned),
             context: None,
             context_max_tokens: Tokens::new(4000),
-            ollama_context_cap: None,
+            window: Window::Provider,
         }
     }
 

@@ -57,7 +57,7 @@ and OpenAI reasoning models reject it with a 400, and every API accepts a reques
 
 `[analysis].effort` and `background_effort` go out as the field each API takes:
 `output_config.effort` for Claude, `reasoning.effort` on Responses, `reasoning_effort` on Chat
-Completions, `think` on Ollama. quack knows which levels Claude, OpenAI's reasoning models, and
+Completions and on Ollama. quack knows which levels Claude, OpenAI's reasoning models, and
 gpt-oss take, and refuses any other level before sending a request. A model it does not
 recognize, such as a gateway alias or an open-weight model on vLLM, gets the effort on Chat
 Completions and Responses, and the server decides whether it accepts that level.

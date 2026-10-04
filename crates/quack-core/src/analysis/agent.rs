@@ -10,7 +10,6 @@ use crate::config::{AnalysisConfig, RetrievalConfig};
 use crate::embedding::{Embedder, EmbeddingModel};
 use crate::error::{Error, Result};
 use crate::ids::SessionId;
-use crate::text::Tokens;
 
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
@@ -18,7 +17,7 @@ use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, Turn
 use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls};
 use super::policy::WritePolicy;
 use super::rerank::RerankAnswer;
-use super::text_to_sql::{Modeled, PromptOptions, SystemPrompt};
+use super::text_to_sql::{Modeled, PromptOptions, SystemPrompt, Window};
 use super::tools::{
     CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphTools,
     ListDocumentsTool, ListTablesTool, ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool,
@@ -31,8 +30,8 @@ use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
 
 /// What the provider charged for a turn. Every budget quack computes
-/// itself — the history trim, Ollama's `num_ctx` — is a four-characters-
-/// per-token estimate; this is the measured count the provider reported,
+/// itself, such as the history trim, is a four-characters-per-token
+/// estimate; this is the measured count the provider reported,
 /// for the response object and the transcript.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[expect(
@@ -279,10 +278,10 @@ impl Cutoff {
     /// through before the stop.
     fn note(self, answered: bool, window: Window) -> String {
         let advice = match window {
-            Window::Ollama(_) => {
+            Window::Ollama => {
                 " With Ollama the answer shares the context window with the prompt and the \
-                 model's reasoning; raise [analysis].max_context_tokens or ask a narrower \
-                 question."
+                 model's reasoning; raise the server's window (OLLAMA_CONTEXT_LENGTH) or ask a \
+                 narrower question."
             }
             Window::Provider => " Ask a narrower question.",
         };
@@ -308,97 +307,12 @@ impl Cutoff {
         Error::Llm(match self {
             Self::Length => format!(
                 "the {what} answer was cut off at the model's output limit (with Ollama, the \
-                 context window: [analysis].max_context_tokens)"
+                 server's context window: OLLAMA_CONTEXT_LENGTH)"
             ),
             Self::Filtered => {
                 format!("the {what} answer was stopped by the provider's content filter")
             }
         })
-    }
-}
-
-/// Who sizes the model's context window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Window {
-    /// The provider sizes its own.
-    Provider,
-    /// Ollama, asked for this `num_ctx`.
-    Ollama(OllamaWindow),
-}
-
-impl Window {
-    /// Ollama's window when the prompt options cap one, else the provider's.
-    fn for_turn(
-        prompt: &PromptOptions,
-        system_prompt: &str,
-        history: &[Message],
-        user_message: &str,
-    ) -> Self {
-        prompt.ollama_context_cap.map_or(Self::Provider, |cap| {
-            Self::Ollama(OllamaWindow::for_turn(
-                cap,
-                system_prompt,
-                history,
-                user_message,
-            ))
-        })
-    }
-}
-
-/// The `num_ctx` to ask Ollama for: the prompt's estimated tokens plus
-/// room for tool results and the answer, rounded up to 8,192, between
-/// 8,192 and `cap`. Ollama's default of 4,096 truncates the front of
-/// most workspace prompts, which loses the tool guidance and the question.
-///
-/// `num_ctx` is a load option: asking Ollama for a different value than
-/// the one the model is already loaded with forces a full model reload,
-/// which measured 4-5 seconds for `gpt-oss:20b` on this machine (`ollama
-/// serve`, repeated `/api/generate` calls that only changed `num_ctx`) —
-/// against single-digit milliseconds for a request that keeps the same
-/// value. A session's history only grows turn over turn until the
-/// history trim caps it, so the requested size is non-decreasing within
-/// a session; the step below is deliberately coarse (four tiers instead
-/// of one every 2,048 tokens) so a growing conversation crosses it, and
-/// pays that reload, at most three times instead of up to twelve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OllamaWindow(u32);
-
-impl OllamaWindow {
-    const HEADROOM: u32 = 8_192;
-    const FLOOR: u32 = 8_192;
-    const STEP: u32 = 8_192;
-
-    /// The window for a turn: the system prompt, the replayed history, and
-    /// the question, under `cap` (`[analysis].max_context_tokens`). Ollama
-    /// loads a model with a 4,096-token window unless the request says
-    /// otherwise and truncates the front of a longer prompt, which is where
-    /// the tool guidance is.
-    fn for_turn(cap: Tokens, system_prompt: &str, history: &[Message], user_message: &str) -> Self {
-        let history_chars = serde_json::to_string(history).map_or(0, |h| h.len());
-        let prompt = Tokens::of_chars(
-            system_prompt
-                .len()
-                .saturating_add(history_chars)
-                .saturating_add(user_message.len()),
-        );
-        if prompt > cap {
-            tracing::warn!(
-                prompt_tokens = %prompt,
-                %cap,
-                "the prompt is larger than [analysis].max_context_tokens; Ollama will truncate it"
-            );
-        }
-        Self::for_prompt(prompt, cap)
-    }
-
-    /// The window for a prompt of `prompt` tokens under `cap`.
-    fn for_prompt(prompt: Tokens, cap: Tokens) -> Self {
-        let needed = prompt.get().saturating_add(Self::HEADROOM);
-        let rounded = needed
-            .div_ceil(Self::STEP)
-            .saturating_mul(Self::STEP)
-            .max(Self::FLOOR);
-        Self(rounded.min(cap.get().max(Self::FLOOR)))
     }
 }
 
@@ -429,7 +343,7 @@ where
         let read = PromptAndModel::read(&reader_db, &prompt).await?;
         let turn = Turn::new(recorder.clone(), write_policy);
         let Replay { history, dropped } = Replay::check(history);
-        let window = Window::for_turn(&prompt, &read.system_prompt, &history, user_message);
+        let window = prompt.window;
         let agent = BuildContext {
             shared_db: Arc::clone(&shared_db),
             reader_db,
@@ -470,11 +384,12 @@ where
                 Ok(item) => item,
                 Err(e) => {
                     // A turn the model derailed (an unknown tool, the turn
-                    // limit) or that failed after text was streamed is still
-                    // a turn: keep the text, say what happened, record it. A
-                    // model that could not be reached at all stays an error.
+                    // limit), that the output limit or a filter cut, or that
+                    // failed after text was streamed is still a turn: keep
+                    // the text, say what happened, record it. A model that
+                    // could not be reached at all stays an error.
                     let stop = StreamStop(&e);
-                    if streamed.trim().is_empty() && !stop.by_agent_loop() {
+                    if streamed.trim().is_empty() && cutoff.is_none() && !stop.by_agent_loop() {
                         return Err(Error::Analysis(e.to_string()));
                     }
                     tracing::warn!(error = %e, "agent turn stopped early");
@@ -575,12 +490,13 @@ fn turn_text(
     let mut answer = check(&raw);
     let note = stopped.or_else(|| {
         answer.text.trim().is_empty().then(|| {
-            String::from(if matches!(window, Window::Ollama(_)) {
-                "The model returned no text. With Ollama this usually means the answer or the \
-                 prompt did not fit the context window; raise [analysis].max_context_tokens or \
-                 ask a narrower question."
-            } else {
-                "The model returned no text; ask again or narrow the question."
+            String::from(match window {
+                Window::Ollama => {
+                    "The model returned no text. With Ollama this usually means the answer or \
+                     the prompt did not fit the context window; raise the server's window \
+                     (OLLAMA_CONTEXT_LENGTH) or ask a narrower question."
+                }
+                Window::Provider => "The model returned no text; ask again or narrow the question.",
             })
         })
     });
@@ -618,9 +534,10 @@ impl StreamStop<'_> {
                 "The model called a tool that does not exist ({tool_name}), so the turn \
                  stopped.{}",
                 match window {
-                    Window::Ollama(_) => {
+                    Window::Ollama => {
                         " With Ollama this usually means the prompt was cut to the context \
-                         window; check [analysis].max_context_tokens and the model's own limit."
+                         window; check the server's window (OLLAMA_CONTEXT_LENGTH) and the \
+                         model's own limit."
                     }
                     Window::Provider => "",
                 }
@@ -718,22 +635,11 @@ impl BuildContext<'_> {
             .temperature(0.1)
             .add_hook(InvalidToolCalls)
             .add_hook(EmptyAnswer);
-        if let Window::Ollama(OllamaWindow(num_ctx)) = ctx.window {
-            // `keep_alive` is Ollama-only too (rig lifts it out of
-            // `additional_params` into the request's top-level field, never
-            // into `options`). Nothing was setting it, so every request fell
-            // back to Ollama's own default (`OLLAMA_KEEP_ALIVE`, 5 minutes
-            // unless the operator changed it) each time it decided whether to
-            // keep the model loaded. A turn with several tool calls, or an
-            // idle stretch between turns in a TUI or web session, can leave a
-            // gap longer than that, which pays a multi-second reload the same
-            // way a changed `num_ctx` does (measured live, both in the perf
-            // handoff). Sending it explicitly on every request keeps the
-            // model warm through longer gaps regardless of the server's
-            // default.
-            builder = builder.additional_params(
-                serde_json::json!({ "num_ctx": num_ctx, "keep_alive": OLLAMA_KEEP_ALIVE }),
-            );
+        if ctx.window == Window::Ollama {
+            // Ollama unloads a model 5 minutes after its last request unless
+            // the request says otherwise, and a reload costs seconds.
+            builder =
+                builder.additional_params(serde_json::json!({ "keep_alive": OLLAMA_KEEP_ALIVE }));
         }
 
         // The ontology is describable as soon as it exists: the prompt block
@@ -773,17 +679,6 @@ mod tests {
     use super::*;
     use crate::analysis::citations::CitationRegistry;
 
-    #[test]
-    fn the_ollama_window_rounds_up_within_bounds() {
-        let window =
-            |tokens, cap| OllamaWindow::for_prompt(Tokens::new(tokens), Tokens::new(cap)).0;
-        assert_eq!(window(0, 32_768), 8_192);
-        assert_eq!(window(1_000, 32_768), 16_384);
-        // 12,875 prompt tokens plus headroom rounds to 24,576.
-        assert_eq!(window(12_875, 32_768), 24_576);
-        assert_eq!(window(100_000, 32_768), 32_768);
-        assert_eq!(window(100_000, 2_048), 8_192);
-    }
     use crate::ids::{ChunkId, DocumentId};
     #[test]
     fn stream_errors_are_explained_for_the_user() {
@@ -795,10 +690,9 @@ mod tests {
             chat_history: Vec::new(),
         };
         assert!(StreamStop(&unknown).by_agent_loop());
-        let text =
-            StreamStop(&unknown).explain(config.max_turns, Window::Ollama(OllamaWindow(8_192)));
+        let text = StreamStop(&unknown).explain(config.max_turns, Window::Ollama);
         assert!(text.contains("container.exec"), "{text}");
-        assert!(text.contains("max_context_tokens"), "{text}");
+        assert!(text.contains("OLLAMA_CONTEXT_LENGTH"), "{text}");
         let text = StreamStop(&unknown).explain(config.max_turns, Window::Provider);
         assert!(!text.contains("Ollama"), "{text}");
 
@@ -930,8 +824,8 @@ mod tests {
             "so far\n\n(why)"
         );
         assert_eq!(text("", Some("final"), None, Window::Provider), "final");
-        let empty = text("", Some(""), None, Window::Ollama(OllamaWindow(8_192)));
-        assert!(empty.contains("[analysis].max_context_tokens"), "{empty}");
+        let empty = text("", Some(""), None, Window::Ollama);
+        assert!(empty.contains("OLLAMA_CONTEXT_LENGTH"), "{empty}");
         let empty = text("", None, None, Window::Provider);
         assert!(!empty.contains("Ollama"), "{empty}");
     }
@@ -943,16 +837,10 @@ mod tests {
     #[test]
     fn notes_are_added_after_the_citation_check() {
         let check = |text: &str| CitationRegistry::default().validate(text);
-        let answer = turn_text(
-            String::from("[7]"),
-            None,
-            None,
-            Window::Ollama(OllamaWindow(8_192)),
-            check,
-        );
+        let answer = turn_text(String::from("[7]"), None, None, Window::Ollama, check);
         assert!(
             answer.text.starts_with("(The model returned no text.")
-                && answer.text.contains("raise [analysis].max_context_tokens"),
+                && answer.text.contains("OLLAMA_CONTEXT_LENGTH"),
             "{}",
             answer.text
         );

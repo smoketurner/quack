@@ -1529,11 +1529,6 @@ pub struct AnalysisConfig {
     pub max_turns: u32,
     /// Approximate token budget for prior messages replayed to the model.
     pub history_token_budget: Tokens,
-    /// The largest context window quack asks Ollama for (`num_ctx`). Each
-    /// turn requests what its prompt needs, rounded up, no more than this;
-    /// Ollama's own default is 4,096 and it truncates silently past it.
-    /// Other providers size their own window.
-    pub max_context_tokens: Tokens,
     /// How long one extraction call (ontology document evidence, graph
     /// extraction) may run before the chunk is skipped.
     pub extraction_timeout_seconds: u32,
@@ -1580,7 +1575,6 @@ impl Default for AnalysisConfig {
             threads: 4,
             max_turns: 15,
             history_token_budget: Tokens::new(32_000),
-            max_context_tokens: Tokens::new(32_768),
             extraction_timeout_seconds: 120,
             extraction_concurrency: 1,
             reader_pool_size: 4,

@@ -15,7 +15,7 @@ use jiff::Timestamp;
 use quack_core::analysis::agent::{AgentResponse, Analysis};
 use quack_core::analysis::events::{self, AgentEvent, ToolName};
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::text_to_sql::PromptOptions;
+use quack_core::analysis::text_to_sql::{PromptOptions, Window};
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::{AnalysisConfig, RetrievalConfig};
 use quack_core::embedding::{Dimension, Embedder, EmbeddingModel};
@@ -146,7 +146,7 @@ async fn run_turn(
             pinned_token_budget: Tokens::new(1_000),
             context: None,
             context_max_tokens: Tokens::new(1_000),
-            ollama_context_cap: None,
+            window: Window::Provider,
         },
         history,
         message,

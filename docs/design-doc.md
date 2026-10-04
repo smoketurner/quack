@@ -1066,7 +1066,7 @@ is sent the temperature, because Claude and `OpenAI`'s reasoning models (GPT-5.x
 o-series) reject a non-default one and a gateway's model name need not say which model it is.
 Claude gets `max_tokens` 64,000, since thinking counts against it. `[analysis].effort` goes out
 as each API's field (`output_config.effort` for Claude, `reasoning_effort` or `reasoning.effort`
-for `OpenAI` and unrecognized models on those APIs, `think` on Ollama). A level a known family
+for `OpenAI` and unrecognized models on those APIs, and for Ollama). A level a known family
 lacks is refused before the call, and so is a GPT-5.6 model on Chat Completions, because it
 cannot call tools there. `temperature`, `effort`, and `background_effort` on a provider, or on
 one of its `models."ID"`, override the defaults and `[analysis]` (`docs/providers.md`). The turn races a
@@ -1110,14 +1110,12 @@ The guidance always names the table, SQL, chart and document tools; only the gra
 are conditional. Mode changes no registration; query mode only drops provisional graph
 results.
 
-**Ollama.** Every request carries `num_ctx`, because Ollama otherwise loads the model with a
-4,096-token window and silently truncates the front of the prompt. It is the prompt's
-estimated tokens plus a fixed 8,192-token headroom for tool results and answer, rounded up
-to 8,192, capped by `[analysis].max_context_tokens`, never below 8,192. `num_ctx` is a load
-option: a changed value forces a full reload (measured: several seconds for a 20B model).
-The coarse step means a growing session's history crosses it a few times at most, not every
-2,048 tokens. Every request also carries `keep_alive` (30 minutes), since otherwise a gap
-between tool calls or turns pays the same reload once Ollama's default (5 minutes) lapses.
+**Ollama.** Chat goes through Ollama's OpenAI-compatible `/v1/chat/completions`, which takes
+no context size: the server sizes the window (`OLLAMA_CONTEXT_LENGTH`, or the model's
+`num_ctx` parameter) and truncates the front of a prompt that does not fit. A turn the window
+cut short says so and names that setting. Every request carries `keep_alive` (30 minutes),
+since otherwise a gap between tool calls or turns pays a reload (measured: several seconds
+for a 20B model) once Ollama's default (5 minutes) lapses.
 
 Embedding requests go through quack's own `/api/embed` client (`llm::OllamaEmbedder`),
 because rig's sends neither option. They carry the same `keep_alive`, so the embedding model
@@ -1130,7 +1128,8 @@ size, this stops them evicting each other every turn.
 The agent recovers before it gives up (`analysis::hooks`, rig's agent hooks). A call to a
 tool that does not exist is repaired when the name matches a registered tool after
 trimming and lowercasing; otherwise the model is told which tools exist and asked again,
-at most twice a turn, as it is for arguments that are not JSON. A reply with no text and
+at most twice a turn. rig answers a call whose arguments are not JSON with an error result
+the model reads. A reply with no text and
 no tool call is asked for once more, unless the output limit or a content filter cut it
 off. A replayed history that rig's `transcript::validate_canonical` refuses is dropped,
 and the answer says so. Every retry counts against `max_turns`.
@@ -1211,7 +1210,7 @@ reaches a provider.
 per-request counts when the turn derailed before a final response. It is `null`, not zeroes,
 when the provider reported nothing, as local models often do. The counts also go on the
 assistant message's metadata in `_quack_messages`, so session exports carry them. They are a
-record, not an input: the history trim and Ollama's `num_ctx` estimate before the call.
+record, not an input: the history trim estimates before the call.
 
 `duration_ms` is the turn's wall-clock time, from the question's arrival (prompt assembly
 included) to the answer, cancelled turns too. It goes on the assistant message's metadata
@@ -2189,7 +2188,6 @@ threads = 4
 max_turns = 15
 history_token_budget = 32000
 compact_history = false                 # summarize the turns the budget leaves out instead of dropping them
-max_context_tokens = 32768              # Ollama num_ctx cap; each turn asks for what its prompt needs
 extraction_timeout_seconds = 120        # one chunk's extraction call (ontology evidence, graph extract)
 extraction_concurrency = 1              # chunks extracted at once; Ollama serves one unless OLLAMA_NUM_PARALLEL
 reader_pool_size = 4                    # reader connections per workspace handle, round-robined
