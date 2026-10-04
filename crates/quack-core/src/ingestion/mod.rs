@@ -565,8 +565,10 @@ impl TableLoad<'_> {
     ///
     /// # Errors
     ///
-    /// Returns an `Ingestion` error naming the file and the separator when
-    /// it does not parse strictly, or the reader's error otherwise.
+    /// Returns an `Ingestion` error naming the file when it does not parse
+    /// — at the sniffer, the dialect sniff, or the strict re-read — so the
+    /// on-disk path `DuckDB`'s reader error names never reaches the person;
+    /// the raw reader error is logged only.
     fn create(&self, db: &WorkspaceDb, table: &str, kind: TableKind) -> Result<()> {
         let create = format!(
             "CREATE OR REPLACE {} {} AS SELECT * FROM ",
@@ -575,16 +577,25 @@ impl TableLoad<'_> {
         );
         let Reader::Csv(separator) = self.reader else {
             let sql = format!("{create}{}(?)", self.reader.sql_fn());
-            return db.execute_with_params(&sql, duckdb::params![self.path]);
+            return match db.execute_with_params(&sql, duckdb::params![self.path]) {
+                Err(Error::DuckDb(e)) => Err(self.refused(&e)),
+                other => other,
+            };
         };
-        let sniffed_columns: i64 = db.connection().query_row(
+        let sniffed_columns: i64 = match db.connection().query_row(
             "SELECT len(Columns) FROM sniff_csv(?)",
             duckdb::params![self.path],
             |row| row.get(0),
-        )?;
+        ) {
+            Ok(n) => n,
+            Err(e) => return Err(self.refused(&e)),
+        };
         if sniffed_columns > 1 {
             let sql = format!("{create}{}(?)", self.reader.sql_fn());
-            return db.execute_with_params(&sql, duckdb::params![self.path]);
+            return match db.execute_with_params(&sql, duckdb::params![self.path]) {
+                Err(Error::DuckDb(e)) => Err(self.refused(&e)),
+                other => other,
+            };
         }
         let sql = format!(
             "{create}read_csv(?, delim = '{}', strict_mode = true)",
@@ -604,6 +615,19 @@ impl TableLoad<'_> {
             }
             other => other,
         }
+    }
+
+    /// The user-facing version of a reader error: the raw `DuckDB` text
+    /// names the server's path to the file, which a workspace is never
+    /// shown, so it is logged here and a path-free `Ingestion` message
+    /// naming the file and its type is returned instead.
+    fn refused(&self, error: &duckdb::Error) -> Error {
+        tracing::warn!(file = self.name, error = %error, "structured file refused");
+        Error::Ingestion(format!(
+            "'{}' does not parse as {}",
+            self.name,
+            self.reader.name()
+        ))
     }
 }
 
@@ -627,8 +651,10 @@ impl WorkbookLoad {
     /// # Errors
     ///
     /// Returns an `Ingestion` error when two of the workbook's sheet names
-    /// collide on the same sanitized table name, or `TableTaken` when a
-    /// table another document owns is in the way.
+    /// collide on the same sanitized table name, or when `DuckDB` cannot
+    /// read a sheet's CSV (the message names the sheet, the log keeps the
+    /// reader's text and its on-disk path), or `TableTaken` when a table
+    /// another document owns is in the way.
     fn load(self, db: &WorkspaceDb) -> Result<Vec<String>> {
         std::fs::create_dir_all(&self.files_dir)?;
         let stem = TableName::of_file(&self.filename);
@@ -672,7 +698,18 @@ impl WorkbookLoad {
                 quote_ident(table_name.as_str()),
                 Reader::Csv(Separator::Comma).sql_fn()
             );
-            db.execute_with_params(&create_sql, duckdb::params![path.as_ref()])?;
+            if let Err(e) = db.execute_with_params(&create_sql, duckdb::params![path.as_ref()]) {
+                return Err(match e {
+                    Error::DuckDb(e) => {
+                        tracing::warn!(file = %self.filename, sheet = %sheet.sheet, error = %e, "workbook sheet refused");
+                        Error::Ingestion(format!(
+                            "sheet '{}' of '{}' does not load as a table",
+                            sheet.sheet, self.filename
+                        ))
+                    }
+                    other => other,
+                });
+            }
             tracing::info!(table = %table_name, sheet = %sheet.sheet, rows = sheet.rows, file = %self.filename, "created table from workbook sheet");
             tables.push(table_name.into_string());
         }
