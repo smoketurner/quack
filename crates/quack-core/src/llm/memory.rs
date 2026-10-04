@@ -180,12 +180,29 @@ impl Compactor for SessionCompactor {
                 .await
                 .map_err(MemoryError::backend)?;
             let covered = stored.as_ref().map_or(0, |s| s.covers);
-            let Some(new) = evicted.get(covered..).filter(|new| !new.is_empty()) else {
+            // A budget that grew across a restart evicts fewer messages than a
+            // stored summary claims to cover: its `covers` is no longer a
+            // valid index into `evicted`, and the kept window already holds the
+            // turns it described, so summarize again from scratch.
+            let over_covered = covered > evicted.len();
+            let to_summarize: &[Message] = if over_covered {
+                evicted
+            } else {
+                evicted.get(covered..).unwrap_or_default()
+            };
+            if to_summarize.is_empty() {
                 // Nothing left the window since the stored summary.
                 return Ok(Summary(stored.map(|s| s.text).unwrap_or_default()));
+            }
+            // Re-summarizing from scratch drops the old, over-covering text:
+            // it described turns that are now kept verbatim, not "so far".
+            let prev = if over_covered {
+                None
+            } else {
+                stored.as_ref().map(|s| s.text.as_str())
             };
-            let request = Self::request(stored.as_ref().map(|s| s.text.as_str()), new);
-            tracing::info!(session = %session, messages = new.len(), "summarizing earlier turns");
+            let request = Self::request(prev, to_summarize);
+            tracing::info!(session = %session, messages = to_summarize.len(), "summarizing earlier turns");
             let answer = self
                 .summarizer
                 .answer(&request)
@@ -333,6 +350,111 @@ mod tests {
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(left, 0);
+    }
+
+    /// Raising `history_token_budget` across a resume evicts fewer messages
+    /// than a stored summary claims to cover, so the compactor summarizes
+    /// again from scratch over the smaller evicted prefix instead of
+    /// short-circuiting and replaying a stale summary over turns the kept
+    /// window already holds verbatim.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn growing_the_window_re_summarizes_instead_of_replaying_a_stale_summary() {
+        let (db, id) = session().await;
+        // Two scripted summaries: the first covers turns 1-3; the second
+        // re-summarizes turn one after the window grows. A third call fails.
+        let model = MockCompletionModel::from_stream_turns([
+            [
+                MockStreamEvent::text(r#"{"summary": "They asked questions 1 to 3."}"#),
+                MockStreamEvent::final_response(Usage::default()),
+            ],
+            [
+                MockStreamEvent::text(r#"{"summary": "They asked question 1."}"#),
+                MockStreamEvent::final_response(Usage::default()),
+            ],
+        ]);
+        // Each turn is 3 + 2 tokens, so budget 10 evicts turns 1-3.
+        let first = compacting(&db, &model, 10)
+            .load(&id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let shown: Vec<String> = first.iter().map(SpokenText::spoken_text).collect();
+        assert_eq!(
+            shown,
+            [
+                "Summary of the earlier conversation: They asked questions 1 to 3.",
+                "question 4",
+                "answer 4",
+                "question 5",
+                "answer 5"
+            ]
+        );
+        assert_eq!(model.request_count(), 1);
+
+        // Budget 20 keeps turns 2-5 and evicts only turn one: the stored
+        // `covers` (6) now exceeds `evicted.len()` (2), so the compactor
+        // summarizes again from scratch rather than replay the stale summary.
+        let second = compacting(&db, &model, 20)
+            .load(&id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let shown: Vec<String> = second.iter().map(SpokenText::spoken_text).collect();
+        assert_eq!(
+            shown,
+            [
+                "Summary of the earlier conversation: They asked question 1.",
+                "question 2",
+                "answer 2",
+                "question 3",
+                "answer 3",
+                "question 4",
+                "answer 4",
+                "question 5",
+                "answer 5"
+            ]
+        );
+        assert_eq!(model.request_count(), 2);
+        // The re-summarize covers turn one alone, without the old summary as
+        // "the summary so far".
+        let second_request = serde_json::to_string(
+            model
+                .requests()
+                .get(1)
+                .unwrap_or_else(|| fail("the re-summarize request was not made")),
+        )
+        .unwrap_or_default();
+        assert!(
+            second_request.contains("Person: question 1")
+                && second_request.contains("Assistant: answer 1"),
+            "{second_request}"
+        );
+        assert!(
+            !second_request.contains("The summary so far")
+                && !second_request.contains("Assistant: answer 3"),
+            "the stale summary must not lead the re-summarize: {second_request}"
+        );
+        // The next load reuses the newest summary without another model call:
+        // `latest_summary` returns the new lower-`covers` row, not the old
+        // higher-`covers` one, so the compactor does not loop on every load.
+        let again = compacting(&db, &model, 20)
+            .load(&id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(again, second);
+        assert_eq!(model.request_count(), 2);
+        let covers = db
+            .run(move |db| {
+                Ok(db.connection().query_row(
+                    "SELECT covers FROM _quack_session_summaries ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            covers, 2,
+            "the newest summary covers the new evicted prefix"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
