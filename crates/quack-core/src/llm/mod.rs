@@ -28,11 +28,12 @@ use rig::prelude::*;
 use crate::analysis::agent::{AgentResponse, Analysis, Cutoff};
 use crate::analysis::events::{self, AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
+use crate::analysis::rerank::{RERANK_PROMPT, RERANK_TIMEOUT, RerankAnswer};
 use crate::analysis::text_to_sql::PromptOptions;
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::{
     BaseUrl, BedrockApi, BedrockEndpoint, Config, Effort, ModelRef, ModelSettings, ProviderAuth,
-    ProviderConfig, ProviderName, ProviderType, config_file_path,
+    ProviderConfig, ProviderName, ProviderType, RerankMode, config_file_path,
 };
 use crate::embedding::{Embedder, EmbeddingModel, Profile};
 use crate::error::{Error, Record, Result};
@@ -1354,18 +1355,38 @@ async fn dispatch(
         }
     }
     let model = client.chat_model(chat.model, settings.effort, settings.temperature)?;
-    Box::pin(analysis.run(model, sink)).await
+    // The model reranker is the one schema-call consumer that runs *during*
+    // a turn, so it is built here — where the turn's `ChatClient` and settings
+    // are in scope — through `schema_call`, the same `background_effort`
+    // routing graph extraction, the ontology document pass, and history
+    // summaries use. Built only when `rerank = "model"`: a `reranker` or
+    // `none` retrieval turns this off and pays nothing to sample a model.
+    let reranker = if config.retrieval.rerank == RerankMode::Model {
+        Some(client.schema_call::<RerankAnswer>(
+            chat.model,
+            settings,
+            Task {
+                preamble: RERANK_PROMPT,
+                timeout: RERANK_TIMEOUT,
+                label: "rerank",
+            },
+            schema_for!(RerankAnswer),
+        )?)
+    } else {
+        None
+    };
+    Box::pin(analysis.run(model, reranker, sink)).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::rerank::RerankAnswer;
+    use crate::analysis::rerank::{ModelReranker, RerankOutcome, Reranked, apply};
     use crate::config::BedrockConfig;
     use crate::embedding::Dimension;
-    use crate::ids::{ClassId, RelationId};
+    use crate::ids::{ChunkId, ClassId, DocumentId, RelationId};
     use crate::ontology::Relation;
-    use crate::storage::workspace::WorkspaceDb;
+    use crate::storage::workspace::{ChunkSearchResult, WorkspaceDb};
     use crate::storage::writer::Writer;
 
     fn parse(toml_text: &str) -> Config {
@@ -1534,6 +1555,82 @@ mod tests {
             String::from_utf8_lossy(&read).to_string()
         });
         (format!("http://{addr}"), seen)
+    }
+
+    fn rerank_hit(n: u32) -> ChunkSearchResult {
+        ChunkSearchResult {
+            id: ChunkId::from(format!("c{n}")),
+            content: format!("passage {n}"),
+            document_id: DocumentId::from("d"),
+            chunk_index: n,
+            filename: String::from("f.md"),
+            heading: None,
+            page: None,
+            score: 1.0,
+        }
+    }
+
+    /// The model reranker is a background call: like graph extraction, the
+    /// ontology document pass, and history summaries, it runs at
+    /// `[analysis].background_effort`, never the chat turn's `effort`. Built
+    /// through `ChatClient::schema_call` (the same route its siblings take),
+    /// so the divergent `background_effort` reaches the rerank request.
+    #[tokio::test]
+    async fn the_model_reranker_uses_background_effort_not_turn_effort() {
+        let (root, seen) = capture_one().await;
+        let config = parse(&format!(
+            "[general]\nchat_model = \"p/gpt-5.6-sol\"\n\
+             [analysis]\neffort = \"xhigh\"\nbackground_effort = \"low\"\n\
+             [retrieval]\nrerank = \"model\"\n\
+             [providers.p]\ntype = \"openai\"\napi = \"chat-completions\"\n\
+             auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\nbase_url = \"{root}\"\n"
+        ));
+        // Build the rerank one-shot the way `dispatch` does: through
+        // `schema_call`, which samples the model at `background_effort`.
+        let call = {
+            let chat = config
+                .chat_model_ref()
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let client = ChatClient::build(&config, &chat)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let settings = config.model_settings(chat);
+            client
+                .schema_call::<RerankAnswer>(
+                    chat.model,
+                    settings,
+                    Task {
+                        preamble: RERANK_PROMPT,
+                        timeout: RERANK_TIMEOUT,
+                        label: "rerank",
+                    },
+                    schema_for!(RerankAnswer),
+                )
+                .unwrap_or_else(|e| fail(&e.to_string()))
+        };
+        let reranker = ModelReranker::from_call(call);
+        // Two candidates, so `apply` makes the ranking call rather than skip.
+        let Reranked { outcome, .. } = apply(
+            &reranker,
+            "which passage?",
+            vec![rerank_hit(1), rerank_hit(2)],
+            1,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, RerankOutcome::Failed(_)),
+            "the reranker must have made its call: {outcome:?}"
+        );
+        let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(
+            body.contains(r#""reasoning_effort":"low""#),
+            "the rerank call must use background_effort (\"low\"), not the turn effort: {request}"
+        );
+        assert!(
+            !body.contains("xhigh"),
+            "the turn effort leaked into the rerank call: {request}"
+        );
     }
 
     /// A loopback Ollama that answers every request with `stream`, an
