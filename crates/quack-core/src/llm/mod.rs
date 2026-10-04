@@ -760,7 +760,7 @@ impl<A> SchemaCall<A> {
                                 "provider token usage"
                             );
                         }
-                        final_text = Some(r.output);
+                        final_text = Some(r.output());
                     }
                     _ => {}
                 }

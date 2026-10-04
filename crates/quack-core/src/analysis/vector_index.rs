@@ -1,5 +1,8 @@
 use rig::vector_store::request::Filter;
-use rig::vector_store::{VectorSearchRequest, VectorStoreError, VectorStoreIndex};
+use rig::vector_store::{
+    VectorSearchIdResult, VectorSearchRequest, VectorSearchResult, VectorStoreError,
+    VectorStoreIndex,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -65,7 +68,7 @@ where
     async fn top_n<T: for<'a> Deserialize<'a> + Send>(
         &self,
         req: VectorSearchRequest<Self::Filter>,
-    ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
+    ) -> Result<Vec<VectorSearchResult<T>>, VectorStoreError> {
         self.search(&req)
             .await?
             .into_iter()
@@ -75,8 +78,11 @@ where
                     "source_document": chunk.document_id,
                     "filename": chunk.filename,
                 });
-                let doc: T = serde_json::from_value(value)?;
-                Ok((chunk.score, chunk.id.into_string(), doc))
+                Ok(VectorSearchResult {
+                    score: chunk.score,
+                    id: chunk.id.into_string(),
+                    document: serde_json::from_value(value)?,
+                })
             })
             .collect()
     }
@@ -84,12 +90,15 @@ where
     async fn top_n_ids(
         &self,
         req: VectorSearchRequest<Self::Filter>,
-    ) -> Result<Vec<(f64, String)>, VectorStoreError> {
+    ) -> Result<Vec<VectorSearchIdResult>, VectorStoreError> {
         Ok(self
             .search(&req)
             .await?
             .into_iter()
-            .map(|chunk| (chunk.score, chunk.id.into_string()))
+            .map(|chunk| VectorSearchIdResult {
+                score: chunk.score,
+                id: chunk.id.into_string(),
+            })
             .collect())
     }
 }

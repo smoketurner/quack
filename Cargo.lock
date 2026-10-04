@@ -571,7 +571,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-async",
- "aws-smithy-eventstream",
+ "aws-smithy-eventstream 0.61.4",
  "aws-smithy-http",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
@@ -599,7 +599,7 @@ dependencies = [
  "aws-runtime",
  "aws-sigv4",
  "aws-smithy-async",
- "aws-smithy-eventstream",
+ "aws-smithy-eventstream 0.61.4",
  "aws-smithy-http",
  "aws-smithy-json",
  "aws-smithy-observability",
@@ -699,7 +699,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2312577f088c9fbf4206dfdb884cf1de9407b43e1a923cbed5237775116fc24b"
 dependencies = [
  "aws-credential-types",
- "aws-smithy-eventstream",
+ "aws-smithy-eventstream 0.61.4",
  "aws-smithy-http",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
@@ -727,6 +727,17 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-eventstream"
+version = "0.60.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78d8391e65fcea47c586a22e1a41f173b38615b112b2c6b7a44e80cec3e6b706"
+dependencies = [
+ "aws-smithy-types",
+ "bytes",
+ "crc32fast",
+]
+
+[[package]]
+name = "aws-smithy-eventstream"
 version = "0.61.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80c2051c2f1016fb8e6548dd07b8bc2ac9c3fe583721444b92f515e856d31609"
@@ -742,7 +753,7 @@ version = "0.64.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "639b4d8f8555f24a9be649811c3eb0b4d4616f4d61daf0c32e28873bc1ea9af1"
 dependencies = [
- "aws-smithy-eventstream",
+ "aws-smithy-eventstream 0.61.4",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "bytes",
@@ -4610,8 +4621,7 @@ dependencies = [
 [[package]]
 name = "rig"
 version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "959c8db2d18e7e641684a38ab3c79413cebcba4d0f2045784f7dcea29ec40516"
+source = "git+https://github.com/0xPlaygrounds/rig?rev=a023bd5b40f7cf6371d01ad18454b1bb01be75e5#a023bd5b40f7cf6371d01ad18454b1bb01be75e5"
 dependencies = [
  "rig-agent",
  "rig-bedrock",
@@ -4626,8 +4636,7 @@ dependencies = [
 [[package]]
 name = "rig-agent"
 version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb11364e7ec4cb4cc20b7dda77a1963652baab01070f0ef2ac275aea3a6081f8"
+source = "git+https://github.com/0xPlaygrounds/rig?rev=a023bd5b40f7cf6371d01ad18454b1bb01be75e5#a023bd5b40f7cf6371d01ad18454b1bb01be75e5"
 dependencies = [
  "async-stream",
  "futures",
@@ -4648,15 +4657,18 @@ dependencies = [
 [[package]]
 name = "rig-bedrock"
 version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a594b329e08293c735a83d6670d26322904ba391ab9bd3882bc1ad3a4be6d6b7"
+source = "git+https://github.com/0xPlaygrounds/rig?rev=a023bd5b40f7cf6371d01ad18454b1bb01be75e5#a023bd5b40f7cf6371d01ad18454b1bb01be75e5"
 dependencies = [
  "async-stream",
  "aws-config",
  "aws-sdk-bedrockruntime",
+ "aws-smithy-eventstream 0.60.21",
+ "aws-smithy-runtime-api",
  "aws-smithy-types",
  "base64 0.22.1",
+ "bytes",
  "futures",
+ "http-body",
  "rig-core",
  "schemars",
  "serde",
@@ -4669,8 +4681,7 @@ dependencies = [
 [[package]]
 name = "rig-cassette"
 version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e882a511528a27a30b216ec9bad584728cc91815523d49742186107f420c338c"
+source = "git+https://github.com/0xPlaygrounds/rig?rev=a023bd5b40f7cf6371d01ad18454b1bb01be75e5#a023bd5b40f7cf6371d01ad18454b1bb01be75e5"
 dependencies = [
  "futures",
  "rig-agent",
@@ -4682,8 +4693,7 @@ dependencies = [
 [[package]]
 name = "rig-core"
 version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82919b6bebd878efc3dae97093e313584ebc7c46518514b0e26bde2e838271fd"
+source = "git+https://github.com/0xPlaygrounds/rig?rev=a023bd5b40f7cf6371d01ad18454b1bb01be75e5#a023bd5b40f7cf6371d01ad18454b1bb01be75e5"
 dependencies = [
  "async-stream",
  "base64 0.22.1",
@@ -4704,6 +4714,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]
@@ -4711,8 +4722,7 @@ dependencies = [
 [[package]]
 name = "rig-derive"
 version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94e6df879180e5cd0edf71bdb5d7aa85ee9cc3fc3b15c98ed9a8c9963b261257"
+source = "git+https://github.com/0xPlaygrounds/rig?rev=a023bd5b40f7cf6371d01ad18454b1bb01be75e5#a023bd5b40f7cf6371d01ad18454b1bb01be75e5"
 dependencies = [
  "convert_case 0.11.0",
  "proc-macro-crate",
@@ -4724,8 +4734,7 @@ dependencies = [
 [[package]]
 name = "rig-http"
 version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8359e3dbb4ba32c5d9ea08d59fa74819deb71915c86ebfc93ad9b30abebeaa27"
+source = "git+https://github.com/0xPlaygrounds/rig?rev=a023bd5b40f7cf6371d01ad18454b1bb01be75e5#a023bd5b40f7cf6371d01ad18454b1bb01be75e5"
 dependencies = [
  "bytes",
  "futures",
@@ -4739,8 +4748,7 @@ dependencies = [
 [[package]]
 name = "rig-memory"
 version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9b7e4b48e4f589b9ba55f460e23691faa89b4de24549822f7445c0d126c91cf"
+source = "git+https://github.com/0xPlaygrounds/rig?rev=a023bd5b40f7cf6371d01ad18454b1bb01be75e5#a023bd5b40f7cf6371d01ad18454b1bb01be75e5"
 dependencies = [
  "rig-core",
  "tracing",
@@ -4749,8 +4757,7 @@ dependencies = [
 [[package]]
 name = "rig-reqwest"
 version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80774c44c501b8283d1a385a0a72b7ffbeedd68106f81fcbb24a6db9cf6c1be6"
+source = "git+https://github.com/0xPlaygrounds/rig?rev=a023bd5b40f7cf6371d01ad18454b1bb01be75e5#a023bd5b40f7cf6371d01ad18454b1bb01be75e5"
 dependencies = [
  "bytes",
  "futures",
@@ -4765,8 +4772,7 @@ dependencies = [
 [[package]]
 name = "rig-typesafeai"
 version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a09f5aa650a26f4aa7893ef4e9fa5afa5a875b67f391fae7277521bb8f028774"
+source = "git+https://github.com/0xPlaygrounds/rig?rev=a023bd5b40f7cf6371d01ad18454b1bb01be75e5#a023bd5b40f7cf6371d01ad18454b1bb01be75e5"
 dependencies = [
  "http",
  "rig-core",
@@ -5234,6 +5240,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",

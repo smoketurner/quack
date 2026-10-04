@@ -2,6 +2,7 @@ use std::sync::{Arc, PoisonError};
 use std::time::Instant;
 
 use futures::StreamExt;
+use rig::completion::PromptError;
 use rig::prelude::*;
 use rig::streaming::{Item, StreamEvent};
 
@@ -496,14 +497,14 @@ where
                     if response.usage.is_reported() {
                         aggregate = Some(response.usage.into());
                     }
-                    final_text = Some(response.output);
+                    final_text = Some(response.output());
                 }
                 MultiTurnStreamItem::CompletionCall(call) => {
                     per_call.add(call.usage);
                     cutoff = Cutoff::of(call.finish_reason.as_ref());
                 }
                 MultiTurnStreamItem::StreamAssistantItem(_)
-                | MultiTurnStreamItem::StreamUserItem(_)
+                | MultiTurnStreamItem::ToolResult { .. }
                 | MultiTurnStreamItem::ToolCall { .. }
                 | MultiTurnStreamItem::ToolExecutionCommitted { .. }
                 | MultiTurnStreamItem::ModelTurnRetried { .. } => {}
@@ -595,49 +596,45 @@ fn turn_text(
 }
 
 /// Why a turn's stream ended early.
-struct StreamStop<'a>(&'a rig::agent::StreamingError);
+struct StreamStop<'a>(&'a PromptError);
 
 impl StreamStop<'_> {
-    /// Whether the agent loop itself stopped it (rig's `PromptError`: an
-    /// unknown tool, the turn limit) rather than the provider call failing.
+    /// Whether the agent loop itself stopped it (an unknown tool, the turn
+    /// limit) rather than the provider call failing.
     const fn by_agent_loop(&self) -> bool {
-        matches!(self.0, rig::agent::StreamingError::Prompt(_))
+        match self.0 {
+            PromptError::UnknownToolCall { .. }
+            | PromptError::MaxTurns { .. }
+            | PromptError::Cancelled { .. }
+            | PromptError::Memory(_) => true,
+            PromptError::Provider(_) | PromptError::Report(_) => false,
+        }
     }
 
     /// A user-facing sentence, for a stop worth keeping the turn for.
     fn explain(&self, max_turns: u32, window: Window) -> String {
-        use rig::completion::PromptError;
         match self.0 {
-            rig::agent::StreamingError::Prompt(prompt_error) => match prompt_error {
-                PromptError::UnknownToolCall { tool_name, .. } => format!(
-                    "The model called a tool that does not exist ({tool_name}), so the turn \
-                     stopped.{}",
-                    match window {
-                        Window::Ollama(_) => {
-                            " With Ollama this usually means the prompt was cut to the context \
-                             window; check [analysis].max_context_tokens and the model's own \
-                             limit."
-                        }
-                        Window::Provider => "",
+            PromptError::UnknownToolCall { tool_name, .. } => format!(
+                "The model called a tool that does not exist ({tool_name}), so the turn \
+                 stopped.{}",
+                match window {
+                    Window::Ollama(_) => {
+                        " With Ollama this usually means the prompt was cut to the context \
+                         window; check [analysis].max_context_tokens and the model's own limit."
                     }
-                ),
-                PromptError::MaxTurnsError { .. } => format!(
-                    "The turn reached the limit of {max_turns} tool calls ([analysis].max_turns) \
-                     before the model answered."
-                ),
-                PromptError::PromptCancelled { reason, .. } => {
-                    format!("The turn was cancelled: {reason}")
+                    Window::Provider => "",
                 }
-                PromptError::CompletionError(e) => format!("The model call failed: {e}"),
-                PromptError::MemoryError(e) => format!("The turn failed: {e}"),
-                PromptError::Report(report) => format!("The turn failed: {report}"),
-            },
-            rig::agent::StreamingError::Completion(e) => {
-                format!("The model call failed part way through: {e}")
+            ),
+            PromptError::MaxTurns { .. } => format!(
+                "The turn reached the limit of {max_turns} tool calls ([analysis].max_turns) \
+                 before the model answered."
+            ),
+            PromptError::Cancelled { reason, .. } => {
+                format!("The turn was cancelled: {reason}")
             }
-            rig::agent::StreamingError::Report(report) => {
-                format!("The turn failed: {report}")
-            }
+            PromptError::Provider(e) => format!("The model call failed part way through: {e}"),
+            PromptError::Memory(e) => format!("The turn failed: {e}"),
+            PromptError::Report(report) => format!("The turn failed: {report}"),
         }
     }
 }
@@ -788,21 +785,15 @@ mod tests {
         assert_eq!(window(100_000, 2_048), 8_192);
     }
     use crate::ids::{ChunkId, DocumentId};
-    use rig::completion::PromptError;
-
-    fn prompt_error(e: PromptError) -> rig::agent::StreamingError {
-        rig::agent::StreamingError::Prompt(e)
-    }
-
     #[test]
     fn stream_errors_are_explained_for_the_user() {
         let config = AnalysisConfig::default();
-        let unknown = prompt_error(PromptError::UnknownToolCall {
+        let unknown = PromptError::UnknownToolCall {
             tool_name: String::from("container.exec"),
             available_tools: vec![String::from("run_sql")],
             allowed_tools: vec![String::from("run_sql")],
             chat_history: Vec::new(),
-        });
+        };
         assert!(StreamStop(&unknown).by_agent_loop());
         let text =
             StreamStop(&unknown).explain(config.max_turns, Window::Ollama(OllamaWindow(8_192)));
@@ -811,20 +802,19 @@ mod tests {
         let text = StreamStop(&unknown).explain(config.max_turns, Window::Provider);
         assert!(!text.contains("Ollama"), "{text}");
 
-        let limit = prompt_error(PromptError::MaxTurnsError {
+        let limit = PromptError::MaxTurns {
             max_turns: 10,
             chat_history: Vec::new(),
             prompt: Message::user("q"),
-        });
+        };
         let text = StreamStop(&limit).explain(config.max_turns, Window::Provider);
         assert!(
             text.contains(&format!("{} tool calls", config.max_turns)),
             "{text}"
         );
 
-        let provider = rig::agent::StreamingError::Completion(ProviderError::Provider(
-            String::from("connection refused"),
-        ));
+        let provider =
+            PromptError::Provider(ProviderError::Provider(String::from("connection refused")));
         assert!(!StreamStop(&provider).by_agent_loop());
         let text = StreamStop(&provider).explain(config.max_turns, Window::Provider);
         assert!(text.contains("connection refused"), "{text}");
