@@ -5855,6 +5855,24 @@ async fn a_waiting_write_is_answered_once_by_its_asker_or_expires() {
     );
     assert!(!asked.await.unwrap_or(true), "the write is refused");
 
+    // The turn stopped waiting (its stream went away) before the answer:
+    // the allow reaches no turn, so nothing ran and the caller is told so,
+    // and the row records the answer under decision "gone" like an expiry.
+    let (request, asked) = ask("UPDATE t SET a = 1").await;
+    let id = h
+        .app
+        .permissions
+        .hold(&h.app, &access, &session, request)
+        .request
+        .to_string();
+    asked.abort();
+    assert!(asked.await.is_err_and(|e| e.is_cancelled()));
+    assert_eq!(decide(&id, &owner_token, "allow").await, StatusCode::GONE);
+    assert_eq!(
+        decide(&id, &owner_token, "allow").await,
+        StatusCode::CONFLICT
+    );
+
     // Nobody answers: refused when the time is up, and then unknown.
     let (request, asked) = ask("DROP TABLE t").await;
     let id = h
@@ -5882,15 +5900,16 @@ async fn a_waiting_write_is_answered_once_by_its_asker_or_expires() {
         .await;
     let mut outcomes: Vec<&str> = rows.iter().map(|r| r.outcome.as_str()).collect();
     outcomes.sort_unstable();
-    // allow; deny; expiry; and the refused answers (other, unknown, the
-    // second answer, the late one; the viewer is refused before it).
+    // allow; deny; expiry; the allow of an ended turn; and the refused
+    // answers (other, unknown, the second answers, the late one; the
+    // viewer is refused before it).
     assert_eq!(
         outcomes.iter().filter(|o| **o == "allowed").count(),
         1,
         "{outcomes:?}"
     );
     assert!(
-        outcomes.iter().filter(|o| **o == "denied").count() >= 6,
+        outcomes.iter().filter(|o| **o == "denied").count() >= 8,
         "{outcomes:?}"
     );
     let (status, body) = h
@@ -5898,8 +5917,9 @@ async fn a_waiting_write_is_answered_once_by_its_asker_or_expires() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let details = body.to_string();
-    for decision in ["\"allow\"", "\"deny\"", "\"expired\""] {
+    for decision in ["\"allow\"", "\"deny\"", "\"expired\"", "\"gone\""] {
         assert!(details.contains(decision), "{decision}: {details}");
     }
     assert!(details.contains("DROP TABLE t"), "{details}");
+    assert!(details.contains("UPDATE t SET a = 1"), "{details}");
 }

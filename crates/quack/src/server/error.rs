@@ -66,6 +66,11 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, message)
     }
 
+    /// 410: what the request addressed existed, and is over.
+    pub(crate) fn gone(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::GONE, message)
+    }
+
     /// 422: well-formed, but its content cannot be carried out.
     pub(crate) fn unprocessable(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, message)
