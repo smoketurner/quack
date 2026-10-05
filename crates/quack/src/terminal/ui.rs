@@ -16,6 +16,7 @@ use ratatui::widgets::{
 use crate::terminal::app::{App, Message, MessageKind, PendingWrite};
 use crate::terminal::chart::ChartData;
 use crate::terminal::commands::Suggestion;
+use crate::terminal::markdown;
 use quack_core::analysis::events::DetailPreview;
 use quack_core::jobs::{JobCounts, JobInfo, JobState};
 
@@ -830,116 +831,6 @@ pub(crate) mod wrap {
     }
 }
 
-/// A light Markdown rendering for the transcript: headings bold, bullets
-/// as dots, fenced code dim and verbatim, `**bold**`, `*italic*`, and
-/// `` `code` `` inline. Tables pass through as their source lines.
-pub(crate) mod markdown {
-    use ratatui::style::{Color, Modifier, Style};
-    use ratatui::text::Span;
-
-    pub(crate) fn render(content: &str) -> Vec<Vec<Span<'static>>> {
-        let mut rows = Vec::new();
-        let mut in_fence = false;
-        for line in content.lines() {
-            if line.trim_start().starts_with("```") {
-                in_fence = !in_fence;
-                continue;
-            }
-            if in_fence {
-                rows.push(vec![Span::styled(
-                    format!("  {line}"),
-                    Style::default().fg(Color::Cyan),
-                )]);
-                continue;
-            }
-            let trimmed = line.trim_start();
-            if let Some(heading) = trimmed.strip_prefix('#') {
-                let text = heading.trim_start_matches('#').trim();
-                rows.push(vec![Span::styled(
-                    text.to_owned(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )]);
-                continue;
-            }
-            let indent = line.len().saturating_sub(trimmed.len());
-            let (bullet, rest) = match trimmed
-                .strip_prefix("- ")
-                .or_else(|| trimmed.strip_prefix("* "))
-            {
-                Some(rest) => ("\u{2022} ", rest),
-                None => ("", trimmed),
-            };
-            let mut spans = Vec::new();
-            if indent > 0 || !bullet.is_empty() {
-                spans.push(Span::raw(format!("{}{bullet}", " ".repeat(indent))));
-            }
-            spans.extend(inline(rest));
-            rows.push(spans);
-        }
-        if rows.is_empty() {
-            rows.push(Vec::new());
-        }
-        rows
-    }
-
-    /// Inline `**bold**`, `*italic*`, and `` `code` `` runs.
-    fn inline(text: &str) -> Vec<Span<'static>> {
-        let mut spans = Vec::new();
-        let mut plain = String::new();
-        let mut rest = text;
-        while !rest.is_empty() {
-            if let Some(after) = rest.strip_prefix("**")
-                && let Some(end) = after.find("**")
-            {
-                flush(&mut spans, &mut plain, Style::default());
-                spans.push(Span::styled(
-                    after.get(..end).unwrap_or("").to_owned(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
-                rest = after.get(end.saturating_add(2)..).unwrap_or("");
-                continue;
-            }
-            if let Some(after) = rest.strip_prefix('`')
-                && let Some(end) = after.find('`')
-            {
-                flush(&mut spans, &mut plain, Style::default());
-                spans.push(Span::styled(
-                    after.get(..end).unwrap_or("").to_owned(),
-                    Style::default().fg(Color::Cyan),
-                ));
-                rest = after.get(end.saturating_add(1)..).unwrap_or("");
-                continue;
-            }
-            if let Some(after) = rest.strip_prefix('*')
-                && !after.starts_with(' ')
-                && let Some(end) = after.find('*')
-                && end > 0
-            {
-                flush(&mut spans, &mut plain, Style::default());
-                spans.push(Span::styled(
-                    after.get(..end).unwrap_or("").to_owned(),
-                    Style::default().add_modifier(Modifier::ITALIC),
-                ));
-                rest = after.get(end.saturating_add(1)..).unwrap_or("");
-                continue;
-            }
-            let mut chars = rest.chars();
-            if let Some(c) = chars.next() {
-                plain.push(c);
-            }
-            rest = chars.as_str();
-        }
-        flush(&mut spans, &mut plain, Style::default());
-        spans
-    }
-
-    fn flush(spans: &mut Vec<Span<'static>>, plain: &mut String, style: Style) {
-        if !plain.is_empty() {
-            spans.push(Span::styled(std::mem::take(plain), style));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,33 +874,6 @@ mod tests {
                 .first()
                 .and_then(|row| row.get(1))
                 .is_some_and(|span| span.style == bold)
-        );
-    }
-
-    #[test]
-    fn markdown_renders_headings_bullets_fences_and_inline_marks() {
-        let rows = markdown::render(
-            "## Deadliest\n- **Tornado** in `Texas`\n```sql\nSELECT 1\n```\n| a | b |",
-        );
-        let lines = text_of(&rows);
-        assert_eq!(
-            lines,
-            [
-                "Deadliest",
-                "\u{2022} Tornado in Texas",
-                "  SELECT 1",
-                "| a | b |"
-            ]
-        );
-        assert!(
-            rows.first()
-                .and_then(|r| r.first())
-                .is_some_and(|s| s.style.add_modifier.contains(Modifier::BOLD))
-        );
-        assert!(
-            rows.get(1)
-                .and_then(|r| r.get(1))
-                .is_some_and(|s| s.style.add_modifier.contains(Modifier::BOLD))
         );
     }
 }
