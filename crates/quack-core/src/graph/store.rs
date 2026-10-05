@@ -2,6 +2,7 @@
 //! `_quack_meta`: the ontology version it was built with, and drift.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use duckdb::OptionalExt as _;
 use duckdb::types::ToSqlOutput;
@@ -13,7 +14,7 @@ use super::{
 use crate::embedding::Vector;
 use crate::error::{Error, Result};
 use crate::ids::{ChunkId, ClassId, DocumentId, EdgeId, NodeId};
-use crate::ontology::{self, OntologyVersion, store as ontology_store};
+use crate::ontology::{self, IdRenames, Ontology, OntologyVersion, store as ontology_store};
 use crate::storage::workspace::{MetaKey, WorkspaceDb};
 
 /// A node to store: merged into an existing one with the same normalized
@@ -631,12 +632,200 @@ pub fn mark_reviewed(db: &WorkspaceDb) -> Result<()> {
     Ok(())
 }
 
-/// What revalidation removed.
+/// Move nodes and edges to renamed class and relation ids, inside the
+/// save that writes ontology version `next`. A graph that matched the
+/// version before still matches, so its recorded version advances with it.
+///
+/// # Errors
+///
+/// Returns an error when rows left from an earlier ontology already carry
+/// a new id (moving onto them would merge two classes or relations), or a
+/// write fails.
+pub(crate) fn rename_ids(
+    db: &WorkspaceDb,
+    renames: &IdRenames,
+    next: OntologyVersion,
+) -> Result<()> {
+    let conn = db.connection();
+    for (old, new) in &renames.classes {
+        let taken: u64 = conn.query_row(
+            "SELECT count(*) FROM _quack_graph_nodes WHERE class_id = ?",
+            duckdb::params![new],
+            |row| row.get(0),
+        )?;
+        if taken > 0 {
+            return Err(Error::Ontology(format!(
+                "the graph still holds {taken} nodes of a class '{new}' from an earlier ontology; \
+                 run `quack graph revalidate` before renaming '{old}' to it"
+            )));
+        }
+        conn.execute(
+            "UPDATE _quack_graph_nodes SET class_id = ? WHERE class_id = ?",
+            duckdb::params![new, old],
+        )?;
+    }
+    for (old, new) in &renames.relations {
+        let taken: u64 = conn.query_row(
+            "SELECT count(*) FROM _quack_graph_edges WHERE relation_id = ?",
+            duckdb::params![new],
+            |row| row.get(0),
+        )?;
+        if taken > 0 {
+            return Err(Error::Ontology(format!(
+                "the graph still holds {taken} edges of a relation '{new}' from an earlier ontology; \
+                 run `quack graph revalidate` before renaming '{old}' to it"
+            )));
+        }
+        conn.execute(
+            "UPDATE _quack_graph_edges SET relation_id = ? WHERE relation_id = ?",
+            duckdb::params![new, old],
+        )?;
+    }
+    if built_with(db)?.is_some_and(|built| Some(built) == next.previous()) {
+        set_built_with(db, next)?;
+    }
+    Ok(())
+}
+
+/// What a revalidation drops: what [`revalidate`] removed, or what
+/// [`Self::preview`] says it would, so an interface can ask first.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Revalidation {
     pub dropped_nodes: u64,
+    /// Every edge that goes, those of dropped nodes included.
     pub dropped_edges: u64,
+    /// The ontology version the graph matches afterwards.
     pub version: OntologyVersion,
+    /// Nodes per class id the ontology no longer defines.
+    pub classes: BTreeMap<String, u64>,
+    /// Edges per relation id the ontology no longer defines. The other
+    /// dropped edges lose an end or no longer fit their relation.
+    pub relations: BTreeMap<String, u64>,
+}
+
+impl Revalidation {
+    /// Count what the current ontology no longer allows, changing
+    /// nothing. Like [`revalidate`], it reads one row per class and per
+    /// (relation, source class, target class) combination, not per node
+    /// or edge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when there is no ontology or a read fails.
+    pub fn preview(db: &WorkspaceDb) -> Result<Self> {
+        let ontology = validating_ontology(db)?;
+        let mut preview = Self {
+            version: ontology.saved_version()?,
+            dropped_nodes: 0,
+            dropped_edges: 0,
+            classes: BTreeMap::new(),
+            relations: BTreeMap::new(),
+        };
+        let conn = db.connection();
+        let mut stmt =
+            conn.prepare("SELECT class_id, count(*) FROM _quack_graph_nodes GROUP BY class_id")?;
+        let per_class = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<duckdb::Result<Vec<(String, u64)>>>()?;
+        for (class, nodes) in per_class {
+            if !ontology.defines_class(&class) {
+                preview.dropped_nodes = preview.dropped_nodes.saturating_add(nodes);
+                preview.classes.insert(class, nodes);
+            }
+        }
+        let mut stmt = conn.prepare(
+            "SELECT e.relation_id, s.class_id, t.class_id, count(*) FROM _quack_graph_edges e \
+             LEFT JOIN _quack_graph_nodes s ON s.id = e.source_node_id \
+             LEFT JOIN _quack_graph_nodes t ON t.id = e.target_node_id \
+             GROUP BY ALL",
+        )?;
+        let combinations = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<duckdb::Result<Vec<(String, Option<String>, Option<String>, u64)>>>()?;
+        for (relation, source, target, edges) in combinations {
+            // An edge stays only when both ends exist, both stay, and the
+            // relation still joins their classes.
+            let stays = match (&source, &target) {
+                (Some(source), Some(target)) => {
+                    ontology.defines_class(source)
+                        && ontology.defines_class(target)
+                        && ontology.allows_edge(&relation, source, target)
+                }
+                (Some(_) | None, None) | (None, Some(_)) => false,
+            };
+            if stays {
+                continue;
+            }
+            preview.dropped_edges = preview.dropped_edges.saturating_add(edges);
+            if !ontology.defines_relation(&relation) {
+                let count = preview.relations.entry(relation).or_default();
+                *count = count.saturating_add(edges);
+            }
+        }
+        Ok(preview)
+    }
+
+    /// Whether revalidating would drop nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.dropped_nodes == 0 && self.dropped_edges == 0
+    }
+
+    /// Dropped edges of relations the ontology still defines: those that
+    /// lose an end or no longer fit the relation's domain and range.
+    #[must_use]
+    pub fn misfit_edges(&self) -> u64 {
+        self.relations
+            .values()
+            .fold(self.dropped_edges, |rest, edges| {
+                rest.saturating_sub(*edges)
+            })
+    }
+}
+
+/// A preview as `quack graph revalidate` prints it before asking.
+impl fmt::Display for Revalidation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_empty() {
+            return writeln!(
+                f,
+                "Nothing to drop: every node and edge fits ontology version {}.",
+                self.version
+            );
+        }
+        writeln!(
+            f,
+            "Revalidating against ontology version {} drops {} nodes and {} edges:",
+            self.version, self.dropped_nodes, self.dropped_edges
+        )?;
+        for (class, nodes) in &self.classes {
+            writeln!(
+                f,
+                "  class {class}, which the ontology no longer defines: {nodes} nodes"
+            )?;
+        }
+        for (relation, edges) in &self.relations {
+            writeln!(
+                f,
+                "  relation {relation}, which the ontology no longer defines: {edges} edges"
+            )?;
+        }
+        match self.misfit_edges() {
+            0 => Ok(()),
+            edges => writeln!(
+                f,
+                "  {edges} edges that lose an end or no longer fit their relation's domain and range"
+            ),
+        }
+    }
+}
+
+/// The ontology a graph is validated against.
+fn validating_ontology(db: &WorkspaceDb) -> Result<Ontology> {
+    ontology_store::current(db)?
+        .ok_or_else(|| Error::Ontology(String::from("no ontology to validate against")))
 }
 
 /// Bring a stale graph in line with the current ontology without a model
@@ -651,12 +840,12 @@ pub struct Revalidation {
 ///
 /// Returns an error when there is no ontology or a write fails.
 pub fn revalidate(db: &WorkspaceDb) -> Result<Revalidation> {
-    let ontology = ontology_store::current(db)?
-        .ok_or_else(|| Error::Ontology(String::from("no ontology to validate against")))?;
+    let ontology = validating_ontology(db)?;
     let version = ontology.saved_version()?;
+    let preview = Revalidation::preview(db)?;
     let mut classes: Vec<ClassId> = ontology.classes.iter().map(|c| c.id.clone()).collect();
     classes.push(ClassId::from(ontology::ROOT_CLASS));
-    let dropped_nodes = delete_nodes_outside(db, &IdList::new(&classes))?;
+    let (dropped_nodes, mut dropped_edges) = delete_nodes_outside(db, &IdList::new(&classes))?;
 
     let conn = db.connection();
     let mut stmt = conn.prepare(
@@ -668,7 +857,6 @@ pub fn revalidate(db: &WorkspaceDb) -> Result<Revalidation> {
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<duckdb::Result<Vec<(String, String, String)>>>()?;
     drop(stmt);
-    let mut dropped_edges: u64 = 0;
     for (relation, source, target) in combinations {
         if !ontology.allows_edge(&relation, &source, &target) {
             let set = EdgeSet::Combination {
@@ -679,21 +867,24 @@ pub fn revalidate(db: &WorkspaceDb) -> Result<Revalidation> {
             dropped_edges = dropped_edges.saturating_add(set.delete(db)?);
         }
     }
-    // Edges whose endpoint vanished with a dropped node are gone already;
-    // any left dangling (orphaned by an older bug) go too.
+    // Edges whose endpoint vanished with a dropped node are gone and
+    // counted already; any left dangling (orphaned by an older bug) go too.
     dropped_edges = dropped_edges.saturating_add(EdgeSet::Dangling.delete(db)?);
     set_built_with(db, version)?;
+    // The totals are what the deletes removed, not what was predicted.
     Ok(Revalidation {
         dropped_nodes,
         dropped_edges,
         version,
+        classes: preview.classes,
+        relations: preview.relations,
     })
 }
 
 /// Delete every node whose class is not in `classes`, with its edges,
 /// their provenance, its own, and its merge proposals; returns how many
-/// nodes went.
-fn delete_nodes_outside(db: &WorkspaceDb, classes: &IdList) -> Result<u64> {
+/// nodes and edges went.
+fn delete_nodes_outside(db: &WorkspaceDb, classes: &IdList) -> Result<(u64, u64)> {
     const NODES: &str =
         "SELECT id FROM _quack_graph_nodes WHERE NOT list_contains(?::VARCHAR[], class_id)";
     let conn = db.connection();
@@ -703,7 +894,7 @@ fn delete_nodes_outside(db: &WorkspaceDb, classes: &IdList) -> Result<u64> {
         |row| row.get(0),
     )?;
     if count == 0 {
-        return Ok(0);
+        return Ok((0, 0));
     }
     conn.execute(
         &format!(
@@ -712,7 +903,7 @@ fn delete_nodes_outside(db: &WorkspaceDb, classes: &IdList) -> Result<u64> {
         ),
         duckdb::params![classes, classes],
     )?;
-    conn.execute(
+    let edges = conn.execute(
         &format!(
             "DELETE FROM _quack_graph_edges \
              WHERE source_node_id IN ({NODES}) OR target_node_id IN ({NODES})"
@@ -734,7 +925,7 @@ fn delete_nodes_outside(db: &WorkspaceDb, classes: &IdList) -> Result<u64> {
         "DELETE FROM _quack_graph_nodes WHERE NOT list_contains(?::VARCHAR[], class_id)",
         duckdb::params![classes],
     )?;
-    Ok(count)
+    Ok((count, u64::try_from(edges).unwrap_or(u64::MAX)))
 }
 
 /// Edges revalidation drops, as a query over the stored graph.

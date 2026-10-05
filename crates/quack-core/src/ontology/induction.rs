@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Class, Mapping, MappingRelation, Ontology, Property, PropertyType, Relation, SnakeId};
+use super::{
+    Class, IdRenames, Mapping, MappingRelation, Ontology, Property, PropertyType, Relation, SnakeId,
+};
 use crate::error::{Error, Result};
 use crate::ids::{ClassId, RelationId};
 use crate::storage::workspace::{WorkspaceDb, quote_ident};
@@ -64,6 +66,16 @@ impl Proposal {
             Self::Property { .. } => ItemKind::Property,
             Self::Relation(_) => ItemKind::Relation,
             Self::Mapping(_) => ItemKind::Mapping,
+        }
+    }
+
+    /// Follow renamed class and relation ids wherever the proposal names one.
+    pub(crate) fn rename_ids(&mut self, renames: &IdRenames) {
+        match self {
+            Self::Class(class) => renames.rename_class(class),
+            Self::Property { class, .. } => renames.rename_owner(class),
+            Self::Relation(relation) => renames.rename_relation(relation),
+            Self::Mapping(mapping) => renames.rename_mapping(mapping),
         }
     }
 }
@@ -556,7 +568,7 @@ impl InductionPass<'_> {
     }
 }
 
-/// Old id to new for one kind of item.
+/// Old property id to new.
 #[derive(Default)]
 struct RenameMap(BTreeMap<String, String>);
 
@@ -567,12 +579,12 @@ impl RenameMap {
     }
 }
 
-/// Id renames from rename and merge decisions, by kind, so later proposals
-/// that reference a renamed or merged item follow it.
+/// Id renames from rename and merge decisions, so later proposals that
+/// reference a renamed or merged item follow it.
 #[derive(Default)]
 struct Renames {
-    classes: RenameMap,
-    relations: RenameMap,
+    /// Classes and relations.
+    ids: IdRenames,
     properties: RenameMap,
 }
 
@@ -585,10 +597,14 @@ impl From<&[(Proposal, Decision)]> for Renames {
             };
             match proposal {
                 Proposal::Class(c) => {
-                    out.classes.0.insert(c.id.to_string(), target.clone());
+                    out.ids
+                        .classes
+                        .insert(c.id.clone(), ClassId::from(target.as_str()));
                 }
                 Proposal::Relation(r) => {
-                    out.relations.0.insert(r.id.to_string(), target.clone());
+                    out.ids
+                        .relations
+                        .insert(r.id.clone(), RelationId::from(target.as_str()));
                 }
                 Proposal::Property { property, .. } => {
                     out.properties.0.insert(property.id.clone(), target.clone());
@@ -605,8 +621,7 @@ impl Renames {
     /// class already there with its properties and key.
     fn apply_class(&self, ontology: &mut Ontology, class: &Class, decision: &Decision) {
         let mut class = class.clone();
-        class.id = ClassId::from(self.classes.follow(class.id.as_str()));
-        class.parent = ClassId::from(self.classes.follow(class.parent.as_str()));
+        self.ids.rename_class(&mut class);
         if let Decision::Reparent(parent) = decision {
             class.parent = ClassId::from(parent.as_str());
         }
@@ -667,7 +682,8 @@ pub fn apply(base: Option<&Ontology>, accepted: &[(Proposal, Decision)]) -> Resu
         if let Proposal::Property { class, property } = proposal
             && !merged(decision)
         {
-            let class_id = names.classes.follow(class);
+            let mut class_id = class.clone();
+            names.ids.rename_owner(&mut class_id);
             let property_id = names.properties.follow(&property.id);
             if let Some(class) = ontology
                 .classes
@@ -684,9 +700,7 @@ pub fn apply(base: Option<&Ontology>, accepted: &[(Proposal, Decision)]) -> Resu
             && !merged(decision)
         {
             let mut relation = relation.clone();
-            relation.id = RelationId::from(names.relations.follow(relation.id.as_str()));
-            relation.domain = ClassId::from(names.classes.follow(relation.domain.as_str()));
-            relation.range = ClassId::from(names.classes.follow(relation.range.as_str()));
+            names.ids.rename_relation(&mut relation);
             if ontology.relation(relation.id.as_str()).is_none() {
                 ontology.relations.push(relation);
             }
@@ -695,15 +709,13 @@ pub fn apply(base: Option<&Ontology>, accepted: &[(Proposal, Decision)]) -> Resu
     for (proposal, _) in accepted {
         if let Proposal::Mapping(mapping) = proposal {
             let mut mapping = mapping.clone();
-            mapping.class = ClassId::from(names.classes.follow(mapping.class.as_str()));
+            names.ids.rename_mapping(&mut mapping);
             mapping.properties = mapping
                 .properties
                 .iter()
                 .map(|(column, p)| (column.clone(), names.properties.follow(p)))
                 .collect();
             for link in &mut mapping.relations {
-                link.relation = RelationId::from(names.relations.follow(link.relation.as_str()));
-                link.target_class = ClassId::from(names.classes.follow(link.target_class.as_str()));
                 link.target_key = names.properties.follow(&link.target_key);
             }
             ontology.mappings.retain(|m| m.table != mapping.table);

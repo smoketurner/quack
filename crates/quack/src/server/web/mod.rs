@@ -53,10 +53,11 @@ use super::api::auth::LoginRequest;
 use super::api::context::ReplaceContext;
 use super::api::documents::{Enqueued, IncomingFile, UploadForm};
 use super::api::embeddings::RefreshStarted;
+use super::api::graph::DropApproval;
 use super::api::graph::ExtractionStarted;
 use super::api::import::ImportBody;
 use super::api::members::AddMember;
-use super::api::ontology::DecideRequest;
+use super::api::ontology::{DecideRequest, RenameRequest};
 use super::api::query::Capped;
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
@@ -71,6 +72,7 @@ use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery};
 use quack_core::graph::resolve::MergeDecision;
+use quack_core::graph::store::Revalidation;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
     ExtractSource, GraphOptions, GraphResult, GraphStatus, Origin, resolve, store as graph_store,
@@ -806,6 +808,8 @@ struct GraphPage {
     drift: Vec<String>,
     has_ontology: bool,
     chunk_count: usize,
+    /// What revalidating a stale graph would drop.
+    revalidation: Option<Revalidation>,
     merges: Vec<resolve::MergeProposal>,
     query: GraphQueryView,
     result: Option<GraphResultView>,
@@ -903,6 +907,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/context", get(context_page).post(context_save))
         .route("/w/{id}/ontology", get(ontology_page).post(ontology_import))
         .route("/w/{id}/ontology/init", post(ontology_init))
+        .route("/w/{id}/ontology/rename", post(ontology_rename))
         .route("/w/{id}/ontology/propose", post(ontology_propose))
         .route("/w/{id}/ontology/candidates", post(ontology_decide_many))
         .route("/w/{id}/ontology/candidates/{cid}", post(ontology_decide))
@@ -1985,6 +1990,23 @@ async fn ontology_init(
     Ok(Flash::after(format!("/w/{id}/ontology"), stored, |_| None).into_response())
 }
 
+async fn ontology_rename(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(form): Form<RenameRequest>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let stored = access.rename_ontology_id(&app, &form).await;
+    Ok(Flash::after(format!("/w/{id}/ontology"), stored, |_| {
+        Some(format!(
+            "renamed {} {} to {}; the graph's nodes and edges moved with it",
+            form.kind, form.from, form.to
+        ))
+    })
+    .into_response())
+}
+
 async fn ontology_restore(
     State(app): State<App>,
     WebUser(identity): WebUser,
@@ -2570,6 +2592,7 @@ async fn render_graph(
         drift,
         has_ontology: data.has_ontology,
         chunk_count: data.chunk_count,
+        revalidation: data.revalidation,
         merges: data.merges,
         query,
         result,
@@ -2647,6 +2670,8 @@ struct GraphPageData {
     has_ontology: bool,
     /// Chunks not yet sent to extraction.
     chunk_count: usize,
+    /// What revalidating would drop, read only while the graph is stale.
+    revalidation: Option<Revalidation>,
     merges: Vec<resolve::MergeProposal>,
     /// The query's answer, when it asked for anything.
     result: Option<GraphAnswer>,
@@ -2664,12 +2689,18 @@ impl GraphPageData {
         let ontology = ontology_store::current(db)?;
         let chunk_count =
             usize::try_from(db.pool_size(SamplePool::NotGraphExtracted)?).unwrap_or(0);
+        let revalidation = if status.stale {
+            Some(Revalidation::preview(db)?)
+        } else {
+            None
+        };
         let merges = resolve::pending(db)?;
         let result = ask.run(db, options);
         Ok(Self {
             status,
             has_ontology: ontology.is_some(),
             chunk_count,
+            revalidation,
             merges,
             result,
         })
@@ -2786,13 +2817,28 @@ async fn graph_extract(
     )
 }
 
+/// The counts the graph page showed beside its revalidate button; a
+/// button shown with nothing to drop sends none.
+#[derive(Deserialize)]
+struct RevalidateForm {
+    #[serde(default)]
+    dropped_nodes: u64,
+    #[serde(default)]
+    dropped_edges: u64,
+}
+
 async fn graph_revalidate(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
+    Form(form): Form<RevalidateForm>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let revalidated = access.revalidate_graph(&app).await;
+    let approval = DropApproval::Shown {
+        nodes: form.dropped_nodes,
+        edges: form.dropped_edges,
+    };
+    let revalidated = access.revalidate_graph(&app, approval).await;
     Ok(Flash::after(format!("/w/{id}/graph"), revalidated, |r| {
         Some(format!(
             "dropped {} nodes and {} edges",

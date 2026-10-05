@@ -78,7 +78,7 @@ pub(crate) enum SlashCommand {
     /// Delete a document with its chunks, table, and graph rows
     #[command(name = "/delete", disable_help_flag = true)]
     Delete { id: String },
-    /// The ontology: show, init, propose, review, accept, reject, and versions
+    /// The ontology: show, init, propose, review, accept, reject, rename, and versions
     #[command(name = "/ontology")]
     Ontology {
         #[command(subcommand)]
@@ -817,7 +817,7 @@ mod tests {
         );
         assert_eq!(
             apply("/graph rev"),
-            Some((String::from("/graph revalidate"), true))
+            Some((String::from("/graph revalidate "), false))
         );
         assert_eq!(
             apply("/ontology propose --fr"),
@@ -886,6 +886,32 @@ mod tests {
         assert!(!parses("/mode fast"));
         assert!(!parses("/nothing"));
         assert!(parses("/ontology propose --documents"));
+        assert!(parses("/ontology rename class vendor supplier"));
+        assert!(parses("/ontology rename relation ships_to delivers_to"));
+        assert!(!parses("/ontology rename class vendor"));
+        assert_eq!(
+            Completion::for_line("/graph revalidate --").map(|c| c
+                .items
+                .into_iter()
+                .map(|i| i.word)
+                .collect::<Vec<_>>()),
+            Some(vec![String::from("--yes")]),
+            "the session offers the flag it does not supply itself"
+        );
+        assert!(matches!(
+            SlashCommand::parse("/graph revalidate -y"),
+            Ok(SlashCommand::Graph {
+                action: Some(GraphAction::Revalidate { yes: true }),
+                walk: None,
+            })
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/graph revalidate"),
+            Ok(SlashCommand::Graph {
+                action: Some(GraphAction::Revalidate { yes: false }),
+                walk: None,
+            })
+        ));
         assert!(
             !parses("/ontology propose --extend"),
             "propose has one behavior: what the ontology lacks"

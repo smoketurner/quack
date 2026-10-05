@@ -1,12 +1,13 @@
 //! The knowledge graph over REST: search and path (read), status, extract
-//! (202, background, cost in the response), revalidate, review, and the
-//! merge queue. Design doc 6.4 and 11.2.
+//! (202, background, cost in the response), revalidate with its preview,
+//! review, and the merge queue. Design doc 6.4 and 11.2.
 
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use quack_core::error::Error as CoreError;
 use quack_core::extraction::{Extract, ExtractionRun};
 use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::query::{GraphQuery, PathQuery};
@@ -20,6 +21,7 @@ use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::workspace::WorkspaceDb;
 use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Identity, Need};
@@ -415,6 +417,20 @@ impl DocumentJob {
     }
 }
 
+/// What a revalidation would drop, per class and relation id the
+/// ontology no longer defines; nothing changes.
+pub(crate) async fn revalidation_preview(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+) -> ApiResult<Json<Revalidation>> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access
+        .audit_read(&app, AuditAction::List, "graph_revalidation")
+        .await?;
+    Ok(Json(app.read(&id, Revalidation::preview).await?))
+}
+
 pub(crate) async fn revalidate(
     State(app): State<App>,
     identity: Identity,
@@ -422,8 +438,37 @@ pub(crate) async fn revalidate(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     Ok(Json(serde_json::to_value(
-        access.revalidate_graph(&app).await?,
+        access.revalidate_graph(&app, DropApproval::Any).await?,
     )?))
+}
+
+/// What the caller agreed a revalidation may drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropApproval {
+    /// Whatever no longer fits: the REST route, whose callers read the
+    /// preview route first.
+    Any,
+    /// The counts the graph page showed; anything else is refused.
+    Shown { nodes: u64, edges: u64 },
+}
+
+impl DropApproval {
+    /// Refuse when the graph would now lose something other than what
+    /// was approved.
+    fn check(self, db: &WorkspaceDb) -> Result<(), CoreError> {
+        let Self::Shown { nodes, edges } = self else {
+            return Ok(());
+        };
+        let preview = Revalidation::preview(db)?;
+        if (preview.dropped_nodes, preview.dropped_edges) == (nodes, edges) {
+            return Ok(());
+        }
+        Err(CoreError::Ontology(format!(
+            "nothing dropped: revalidating now drops {} nodes and {} edges, not the {nodes} and \
+             {edges} confirmed; check the list and confirm again",
+            preview.dropped_nodes, preview.dropped_edges
+        )))
+    }
 }
 
 pub(crate) async fn review(
@@ -469,12 +514,20 @@ pub(crate) async fn decide_merge(
 
 /// The graph writes the API and the web console share.
 impl Access {
-    /// Drop what the current ontology no longer allows.
-    pub(crate) async fn revalidate_graph(&self, app: &App) -> ApiResult<Revalidation> {
+    /// Drop what the current ontology no longer allows, when that is
+    /// what `approval` covers.
+    pub(crate) async fn revalidate_graph(
+        &self,
+        app: &App,
+        approval: DropApproval,
+    ) -> ApiResult<Revalidation> {
         let db = app.workspace_db(&self.workspace.id).await?;
-        let outcome = with_db(db, graph_store::revalidate)
-            .await
-            .map_err(|e| ApiError::bad_request(e.message))?;
+        let outcome = with_db(db, move |db| {
+            approval.check(db)?;
+            graph_store::revalidate(db)
+        })
+        .await
+        .map_err(|e| ApiError::bad_request(e.message))?;
         self.audit(
             app,
             AuditAction::GraphRevalidate,

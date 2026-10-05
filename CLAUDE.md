@@ -97,8 +97,9 @@ cargo run --bin quack -- -p "question" -w ws [-f text|json]                    #
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
+cargo run --bin quack -- ontology rename class|relation OLD NEW                   # a new id as a new version; the graph's nodes and edges move with it
 cargo run --bin quack -- ontology propose [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
-cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] | revalidate | review | merges | merge ID..
+cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] | revalidate [-y] | review | merges | merge ID..
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
 cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
@@ -241,6 +242,12 @@ It lives in the `_quack_ontology_*` tables; `ontology::store::save` validates, c
 mapped tables and columns against the workspace, and writes a new version with a JSON
 snapshot, `since_version` carried over for items that already existed. JSON is the only
 interchange form (export, import, `PUT /ontology`); a file is never the source of truth.
+A class or relation id changes only through `ontology::store::rename` (`quack ontology rename`,
+`POST .../ontology/rename`, the ontology page's Rename form): `IdRenames` on the save's
+`Revision` moves, in the save's transaction, the ontology's own references, `since_version`,
+undecided candidates, and the graph's `class_id` and `relation_id`; an id that already exists
+is refused, and earlier snapshots keep the old id. An import that swaps one id for another is
+a removal plus an addition; `Ontology::diff` does not guess renames.
 The system prompt carries a compact rendering when an ontology exists
 (`Ontology::render_capped`, 30 items per section with the rest counted; extraction still
 gets `render_for_prompt` in full, since the model may only answer with ids it was shown),
@@ -278,7 +285,11 @@ trims and defaults the caller's fields, `run` checks class and relation ids agai
 ontology and resolves the entry points, and an unresolved path end is an `UnknownEntity`
 naming the closest labels. `graph::store::status` reports size, `provisional` (the newest ontology version
 was auto-accepted), `stale` (`graph_built_with_ontology_version` lags), pending merges,
-and drift; `revalidate` drops what the current ontology no longer allows. The agent
+and drift; `revalidate` drops what the current ontology no longer allows, and
+`Revalidation::preview` counts that first (totals, per class id, per relation id) so
+`quack graph revalidate` asks before dropping (`-y` skips; with nobody to ask it fails,
+`Confirm::ask_to_drop`), the graph page posts back the totals it showed, and
+`GET .../graph/revalidate` serves the preview. The agent
 registers `search_graph` and `find_path` only when the graph has nodes, query mode drops
 provisional results, and every response shape carries the turn's `graph` results. Their
 rendering (`Display for GraphResult` in `graph::traverse`, shared with `quack graph` and the terminal)

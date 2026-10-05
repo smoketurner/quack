@@ -60,8 +60,8 @@ nothing in it knows about HTTP, terminals, or windows.
 | `ingestion` | registration with SHA-256 dedup, parsers (`parser`, `html`, `office`, `xlsx`), the decompression limit on zipped uploads (`budget`), chunking, embedding, tables from structured files, piped stdin | 6.1, 6.2 |
 | `import` | rows from Postgres, SQLite, or an HTTP data file as a workspace table | 6.2 |
 | `analysis` | the agent loop as an event stream (`agent`, `events`), the tools (`tools`: plain values over the workspace and its settings, the turn's state, `tools::Turn`, reaching each call as a runtime scope of rig's `ToolContext`), the system prompt (`text_to_sql`), write policy, citations, the chart spec, the reranking hook (`rerank`) | 7, 9 |
-| `ontology` | the model, validation, versions (`store`), induction from tables and documents (`induction`, `documents`), the review queue (`candidates`) | 6.3, 6.5 |
-| `graph` | the knowledge graph: `store`, `tables` (mapping extraction), `extract` (constrained model extraction with drift), `resolve` (merges), `traverse` | 6.4 |
+| `ontology` | the model, validation, versions and id renames that move the graph (`store`, `IdRenames`), induction from tables and documents (`induction`, `documents`), the review queue (`candidates`) | 6.3, 6.5 |
+| `graph` | the knowledge graph: `store`, `tables` (mapping extraction), `extract` (constrained model extraction with drift), `resolve` (merges), `traverse`; `store::Revalidation::preview` counts what a revalidation drops before it runs | 6.4 |
 | `ocsf` | access-audit rows rendered as OCSF 1.9.0 events | 12 |
 | `okf` | Open Knowledge Format bundles in and out | 17 |
 | `extraction` | what both extraction runs share: the `Extract` trait, lenient JSON answers, concurrent calls with per-chunk progress (`RunProgress`), even sampling across documents, name counts (`Tally`) | 6.4, 6.5 |

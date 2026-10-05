@@ -904,6 +904,28 @@ and a range class, each satisfied by any subclass. Properties are typed
 the `mentions` relation (`entity` to `entity`), so extraction never has to invent one. Ids
 are `snake_case` and stable; a rename is a new id plus a migration of nodes and edges.
 
+**Renaming an id.** `quack ontology rename class|relation OLD NEW`, `POST .../ontology/rename`,
+and the Rename form on the ontology page give a class or a relation a new id as a new version
+(`ontology::store::rename`, `IdRenames` on the save's `Revision`; the same `IdRenames` carries
+a candidate's rename or merge decision to the proposals accepted with it). One transaction moves
+everything keyed by the old id:
+
+| Where | What follows |
+|-------|--------------|
+| `_quack_ontology_classes`, `_relations`, `_properties`, `_mappings` | The id itself, subclass parents, relation domains and ranges, property owners, mapped classes, and mapping relations and their target classes; `since_version` carries over from the old id |
+| `_quack_ontology_candidates` | The proposal of every undecided candidate (pending or low support) |
+| `_quack_graph_nodes.class_id`, `_quack_graph_edges.relation_id` | Every node and edge; provenance and merge proposals are keyed by node and edge ids and need no change |
+| `_quack_meta.graph_built_with_ontology_version` | Advances when the graph matched the version before, so a rename alone never makes a graph stale |
+
+History keeps the old id: earlier snapshots in `_quack_ontology_versions`, decided
+candidates, recorded drift, audit detail, and graph results stored on past messages. The new
+version keeps the acceptance of the one before it, since a rename reviews nothing. A rename
+is refused when the old id is not defined, when the new id already is (merging two classes
+is a different operation), or when graph rows left from an earlier ontology still carry the
+new id. Only this operation renames. An import or a `PUT .../ontology` that removes one id
+and adds another is a removal plus an addition, the diff reports it as that, and the
+revalidation preview (below) is what shows the cost before anything is dropped.
+
 **Interchange format.** JSON, the stored snapshot's shape, used by `quack ontology export`
 and `import`, `GET/PUT .../ontology`, and the web editor's "download" and "save". Domain
 packs (an insurance ontology, a legal ontology) are shared between workspaces, diffed in
@@ -958,7 +980,22 @@ general ontology is installed as version 1: classes `person`, `organization`, `p
 **Versioning.** Every accepted change writes a `_quack_ontology_versions` row with a full
 snapshot. `_quack_meta.graph_built_with_ontology_version` records what the graph was built
 with. When it lags, the graph is stale and the interfaces offer re-extract (cost shown
-first) or revalidate (fast; drops nodes and edges that no longer validate). Any version can
+first) or revalidate (fast; drops nodes and edges that no longer validate). Revalidation
+says what it will drop before it drops anything (`graph::store::Revalidation::preview`): the
+node and edge totals, nodes per class id and edges per relation id the ontology no longer
+defines, and the edges that lose an end or no longer fit their relation. Nodes extracted
+from documents do not come back on the next extraction, because their chunks stay on
+record as extracted; only `graph extract --reset` rebuilds them. So each interface waits
+for a yes when there is something to drop:
+
+- `quack graph revalidate` prints the preview and asks `[y/N]`; `-y` skips the question.
+  Without a terminal, and in a terminal session (`/graph revalidate`), it fails with the
+  preview unless `-y` is given.
+- The graph page lists the preview in the stale banner. Its button posts the two totals it
+  showed, and the server drops only when they still match.
+- `GET .../graph/revalidate` returns the preview; `POST .../graph/revalidate` drops.
+
+With nothing to drop, none of them asks. Any version can
 be diffed against another or restored. Deleting a document removes its files under `files/`
 and the graph nodes and edges whose only provenance was that document or its tables, with
 their provenance rows. A mapping whose table is gone stays in the ontology (saves still
@@ -1755,7 +1792,8 @@ POST   /api/v1/workspaces/{id}/graph/search    {entity?, class?, relation?, hops
 POST   /api/v1/workspaces/{id}/graph/path      {from, to, max_hops?}
 GET    /api/v1/workspaces/{id}/graph/status
 POST   /api/v1/workspaces/{id}/graph/extract       tables now; documents -> 202 with the cost, one run per workspace (409 while one runs)
-POST   /api/v1/workspaces/{id}/graph/revalidate
+GET    /api/v1/workspaces/{id}/graph/revalidate    what a revalidation would drop: totals, per class id, per relation id
+POST   /api/v1/workspaces/{id}/graph/revalidate    drop it; read the preview first
 POST   /api/v1/workspaces/{id}/graph/review        mark a provisional graph reviewed
 GET    /api/v1/workspaces/{id}/graph/merges        PUT .../graph/merges/{mid} {action: accept|reject}
 POST   /api/v1/workspaces/{id}/import              {url, table, query?, source_table?, limit?}
@@ -1765,6 +1803,7 @@ GET    /api/v1/workspaces/{id}/okf                 the bundle as a tar (import i
 GET    /api/v1/workspaces/{id}/ontology            current version, JSON
 PUT    /api/v1/workspaces/{id}/ontology            import: validate, write a new version
 POST   /api/v1/workspaces/{id}/ontology/init       the built-in default as version 1
+POST   /api/v1/workspaces/{id}/ontology/rename     {kind: class|relation, from, to}: a new version; nodes and edges move to the new id
 GET    /api/v1/workspaces/{id}/ontology/versions[?limit=20] | /{v}[?against=N] for a diff
 POST   /api/v1/workspaces/{id}/ontology/versions/{v}/restore
 POST   /api/v1/workspaces/{id}/ontology/propose    {sample?, auto_accept?, documents?} -> 202 with documents
@@ -1947,14 +1986,17 @@ quack docs [--format json] [--pin ID | --unpin ID | --delete ID]
 quack embeddings refresh [-w NAME] [-y]
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
             | path FROM TO [--max-hops N] | status | extract [--source all|tables|documents]
-            [--sample N] [--reset] [-y] | revalidate | review | merges | merge ID.. | reject ID..
+            [--sample N] [--reset] [-y] | revalidate [-y] | review | merges | merge ID.. | reject ID..
 quack ontology show | init | propose [--documents] [--from FILE] [--sample N]
               [--auto-accept] [-y] | review [--low-support]
               | accept ID... [--rename N|--merge-into ID|--reparent C] | reject ID...
               | export FILE | import FILE | versions | diff [FROM] [TO] | restore V
+              | rename class|relation OLD NEW
 quack context show | edit | history | export FILE | import FILE
 # Commands that spend model calls ask first ([y/N]) on a terminal; with no
 # terminal the answer is no, and -y / --yes goes ahead.
+# `graph revalidate` asks before it drops anything; with no terminal it fails
+# with what it would drop, and -y / --yes goes ahead.
 quack sessions [--format json] [--limit N] | export SESSION [--sql|--markdown]
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-

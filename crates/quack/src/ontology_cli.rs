@@ -1,5 +1,6 @@
 //! `quack ontology`: show, install the default, export and import JSON,
-//! list versions, diff, restore, and propose and review candidates. The
+//! list versions, diff, restore, rename an id, and propose and review
+//! candidates. The
 //! ontology lives in the workspace file; a file on disk is only ever a copy.
 
 use std::io::Write;
@@ -19,7 +20,7 @@ use quack_core::ontology::candidates::Queue;
 use quack_core::ontology::documents::{self, DocumentProposal};
 use quack_core::ontology::induction::{Candidate, Decision, ItemKind, propose_from_tables};
 use quack_core::ontology::store::Revision;
-use quack_core::ontology::{Ontology, candidates, store};
+use quack_core::ontology::{IdRenames, Ontology, candidates, store};
 use quack_core::progress::RunControl;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
@@ -50,6 +51,14 @@ pub(crate) enum OntologyAction {
     },
     /// Store an earlier version as the newest one
     Restore { version: OntologyVersion },
+    /// Rename a class or relation id as a new version; the graph's nodes
+    /// and edges move with it
+    Rename {
+        /// `class` or `relation`
+        kind: ItemKind,
+        old: String,
+        new: String,
+    },
     /// Propose the classes, properties, keys, relations, and mappings the
     /// current ontology lacks (a full draft when there is none) from the
     /// tables (no model calls) and, with --documents, from a sample of the
@@ -174,6 +183,19 @@ pub(crate) async fn run(
                 writeln!(
                     out,
                     "restored version {version} as version {}",
+                    stored.saved_version()?
+                )?;
+                Ok(())
+            })
+            .await?;
+        }
+        OntologyAction::Rename { kind, old, new } => {
+            db.render(out, move |db, out| {
+                let renames = IdRenames::one(kind, &old, &new)?;
+                let stored = store::rename(db, &renames, None)?;
+                writeln!(
+                    out,
+                    "renamed {renames}; ontology is now version {}",
                     stored.saved_version()?
                 )?;
                 Ok(())
@@ -517,18 +539,105 @@ async fn run_documents(
 
 #[cfg(test)]
 mod tests {
+    use quack_core::embedding::Dimension;
+    use quack_core::graph::store::{self as graph_store, NewNode};
+    use quack_core::graph::{Properties, Standing};
+    use quack_core::ids::ClassId;
+
     use super::*;
+
+    #[expect(clippy::panic, reason = "test failure path")]
+    fn fail(msg: &str) -> ! {
+        panic!("{msg}")
+    }
+
+    #[derive(clap::Parser)]
+    #[command(no_binary_name = true)]
+    struct Line {
+        #[command(subcommand)]
+        action: OntologyAction,
+    }
+
+    /// `rename` moves the graph's nodes to the new id and reports the
+    /// version; an id that exists is refused.
+    #[tokio::test]
+    async fn rename_reports_the_version_and_moves_the_graph() {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        store::save(
+            &db,
+            &Ontology::builtin_default(),
+            Revision::reviewed(None, None),
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        graph_store::upsert_node(
+            &db,
+            &NewNode {
+                label: String::from("Ada"),
+                class_id: ClassId::from("person"),
+                properties: Properties::default(),
+                standing: Standing::Reviewed,
+            },
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let db = Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string()));
+        let rename = |line: &'static [&'static str]| {
+            let db = &db;
+            async move {
+                let action = <Line as clap::Parser>::try_parse_from(line)
+                    .unwrap_or_else(|e| fail(&e.to_string()))
+                    .action;
+                let mut out = Vec::new();
+                run(
+                    &Config::default(),
+                    db,
+                    action,
+                    Confirm::Ask,
+                    &mut out,
+                    RunControl::unobserved(),
+                )
+                .await
+                .map(|()| String::from_utf8_lossy(&out).into_owned())
+                .map_err(|e| e.to_string())
+            }
+        };
+        assert_eq!(
+            rename(&["rename", "class", "person", "human"]).await,
+            Ok(String::from(
+                "renamed class person to human; ontology is now version 2\n"
+            ))
+        );
+        let humans = db
+            .run(|db| graph_store::class_count(db, &[ClassId::from("human")]))
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(humans, 1);
+        assert_eq!(
+            rename(&["rename", "relation", "works_at", "employed_by"]).await,
+            Ok(String::from(
+                "renamed relation works_at to employed_by; ontology is now version 3\n"
+            ))
+        );
+        let refused = rename(&["rename", "class", "human", "organization"]).await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.contains("class 'organization' already exists")),
+            "{refused:?}"
+        );
+        let refused = rename(&["rename", "property", "title", "role"]).await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.contains("only a class or a relation id can")),
+            "{refused:?}"
+        );
+    }
 
     /// `accept` takes at most one change: two would leave one silently
     /// unapplied.
     #[test]
     fn accept_takes_one_change_at_a_time() {
-        #[derive(clap::Parser)]
-        #[command(no_binary_name = true)]
-        struct Line {
-            #[command(subcommand)]
-            action: OntologyAction,
-        }
         let parses = |args: &[&str]| <Line as clap::Parser>::try_parse_from(args).is_ok();
         assert!(parses(&["accept", "c1"]));
         assert!(parses(&["accept", "c1", "--reparent", "p"]));

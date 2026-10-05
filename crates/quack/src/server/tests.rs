@@ -4027,6 +4027,278 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
     assert!(searches.len() >= 4, "{searches:?}");
 }
 
+/// A rename over the API and the ontology page moves the graph with the
+/// id, and a revalidation that would drop something says what and waits
+/// for the counts it showed.
+#[tokio::test(flavor = "multi_thread")]
+async fn renames_move_the_graph_and_revalidation_shows_what_it_drops_first() {
+    let h = harness(ServeMode::Local).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "r" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    for sql in [
+        "CREATE TABLE shipments (po TEXT, vendor TEXT, country TEXT)",
+        "INSERT INTO shipments VALUES ('PO-1', 'Orgenics', 'Kenya'), ('PO-2', 'Orgenics', 'Uganda'), ('PO-3', 'Aurobindo', 'Kenya')",
+    ] {
+        let (status, body) = h
+            .call(
+                Method::POST,
+                &format!("/api/v1/workspaces/{ws}/sql"),
+                None,
+                Some(serde_json::json!({ "sql": sql })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let ontology = serde_json::json!({
+        "classes": [
+            { "id": "vendor", "key": "name", "properties": ["name"] },
+            { "id": "country", "key": "name", "properties": ["name"] },
+            { "id": "shipment", "key": "po", "properties": ["po"] }
+        ],
+        "relations": [
+            { "id": "supplied_by", "domain": "shipment", "range": "vendor" },
+            { "id": "delivered_to", "domain": "shipment", "range": "country" }
+        ],
+        "properties": [
+            { "id": "name", "type": "string" },
+            { "id": "po", "type": "string" }
+        ],
+        "mappings": [{
+            "table": "shipments", "class": "shipment", "key": "po",
+            "relations": [
+                { "relation": "supplied_by", "column": "vendor", "target_class": "vendor", "target_key": "name" },
+                { "relation": "delivered_to", "column": "country", "target_class": "country", "target_key": "name" }
+            ]
+        }]
+    });
+    let ontology_api = format!("/api/v1/workspaces/{ws}/ontology");
+    let base = format!("/api/v1/workspaces/{ws}/graph");
+    let (status, body) = h
+        .call(Method::PUT, &ontology_api, None, Some(ontology))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/extract"),
+            None,
+            Some(serde_json::json!({ "source": "tables" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A class renamed over the API: the ontology's references and the
+    // graph's nodes follow, and nothing is stale or droppable.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{ontology_api}/rename"),
+            None,
+            Some(serde_json::json!({ "kind": "class", "from": "vendor", "to": "supplier" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], 2);
+    assert!(
+        body["classes"]
+            .as_array()
+            .is_some_and(|c| c.iter().any(|c| c["id"] == "supplier")
+                && !c.iter().any(|c| c["id"] == "vendor")),
+        "{body}"
+    );
+    assert_eq!(
+        body["mappings"][0]["relations"][0]["target_class"],
+        "supplier"
+    );
+    let (_, body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(body["stale"], false, "{body}");
+    assert_eq!(
+        (&body["nodes"], &body["edges"]),
+        (&serde_json::json!(7), &serde_json::json!(6))
+    );
+    let (_, body) = h
+        .post(
+            &format!("{base}/search"),
+            "",
+            serde_json::json!({ "class": "supplier" }),
+        )
+        .await;
+    assert_eq!(body["nodes"].as_array().map(Vec::len), Some(2), "{body}");
+    let (status, body) = h.get(&format!("{base}/revalidate"), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["dropped_nodes"], 0, "{body}");
+    assert_eq!(body["dropped_edges"], 0);
+
+    // An id that exists is refused, as is a kind that has no graph ids.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{ontology_api}/rename"),
+            None,
+            Some(serde_json::json!({ "kind": "class", "from": "supplier", "to": "country" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("class 'country' already exists"),
+        "{body}"
+    );
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{ontology_api}/rename"),
+            None,
+            Some(serde_json::json!({ "kind": "property", "from": "name", "to": "title" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string()
+            .contains("only a class or a relation id can"),
+        "{body}"
+    );
+
+    // A relation renamed from the ontology page's form.
+    let (_, html, _) = h.page(&format!("/w/{ws}/ontology"), None).await;
+    assert!(
+        html.contains(&format!("action=\"/w/{ws}/ontology/rename\"")),
+        "{html}"
+    );
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/ontology/rename"),
+            None,
+            "kind=relation&from=supplied_by&to=sourced_from",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (to, html) = h.land(&headers, None).await;
+    assert_eq!(to, format!("/w/{ws}/ontology"));
+    assert!(
+        html.contains("renamed relation supplied_by to sourced_from")
+            && html.contains("sourced_from: shipment → supplier"),
+        "{html}"
+    );
+    let (_, _, headers) = h
+        .form(
+            &format!("/w/{ws}/ontology/rename"),
+            None,
+            "kind=class&from=nope&to=other",
+        )
+        .await;
+    let (_, html) = h.land(&headers, None).await;
+    assert!(
+        html.contains("role=\"alert\"") && html.contains("no class &#39;nope&#39; to rename"),
+        "{html}"
+    );
+    let (_, body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(body["stale"], false, "{body}");
+    assert_eq!(body["ontology_version"], 3);
+    let writes = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("ontology")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        writes.len(),
+        3,
+        "the import and the two renames: {writes:?}"
+    );
+
+    // The ontology loses a class: the preview says what a revalidation
+    // drops, and reading it drops nothing.
+    let (_, current) = h.get(&ontology_api, "").await;
+    let mut edited = current.clone();
+    if let Some(classes) = edited["classes"].as_array_mut() {
+        classes.retain(|c| c["id"] != "country");
+    }
+    if let Some(relations) = edited["relations"].as_array_mut() {
+        relations.retain(|r| r["id"] != "delivered_to");
+    }
+    if let Some(mapping_relations) = edited["mappings"][0]["relations"].as_array_mut() {
+        mapping_relations.retain(|r| r["target_class"] != "country");
+    }
+    let (status, body) = h.call(Method::PUT, &ontology_api, None, Some(edited)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h.get(&format!("{base}/revalidate"), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["dropped_nodes"], 2, "{body}");
+    assert_eq!(body["dropped_edges"], 3);
+    assert_eq!(body["classes"], serde_json::json!({ "country": 2 }));
+    assert_eq!(body["relations"], serde_json::json!({ "delivered_to": 3 }));
+    assert_eq!(body["version"], 4);
+    let (_, body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(body["nodes"], 7, "{body}");
+    assert_eq!(body["stale"], true);
+
+    // The graph page lists the same and its button carries the counts.
+    let (_, html, _) = h.page(&format!("/w/{ws}/graph"), None).await;
+    assert!(
+        html.contains("Revalidating drops <strong>2 nodes and 3 edges</strong>")
+            && html.contains(
+                "class <span class=\"font-mono\">country</span>, which the ontology no longer defines: 2 nodes"
+            )
+            && html.contains(
+                "relation <span class=\"font-mono\">delivered_to</span>, which the ontology no longer defines: 3 edges"
+            )
+            && html.contains("name=\"dropped_nodes\" value=\"2\"")
+            && html.contains("name=\"dropped_edges\" value=\"3\"")
+            && html.contains("Drop 2 nodes and 3 edges and revalidate"),
+        "{html}"
+    );
+
+    // A post that confirms nothing, or other counts, drops nothing.
+    for unconfirmed in ["", "dropped_nodes=2&dropped_edges=1"] {
+        let (status, _, headers) = h
+            .form(&format!("/w/{ws}/graph/revalidate"), None, unconfirmed)
+            .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let (to, html) = h.land(&headers, None).await;
+        assert_eq!(to, format!("/w/{ws}/graph"));
+        assert!(
+            html.contains("role=\"alert\"")
+                && html.contains("nothing dropped: revalidating now drops 2 nodes and 3 edges"),
+            "{unconfirmed:?}: {html}"
+        );
+        assert!(html.contains("7 nodes, 6 edges"), "{html}");
+    }
+    let (_, _, headers) = h
+        .form(
+            &format!("/w/{ws}/graph/revalidate"),
+            None,
+            "dropped_nodes=2&dropped_edges=3",
+        )
+        .await;
+    let (_, html) = h.land(&headers, None).await;
+    assert!(
+        html.contains("dropped 2 nodes and 3 edges") && html.contains("5 nodes, 3 edges"),
+        "{html}"
+    );
+    let (_, body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(body["stale"], false, "{body}");
+    let revalidations = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws),
+            action: Some(String::from("graph_revalidate")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        revalidations.len(),
+        1,
+        "refused posts drop and audit nothing"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
     let h = harness(ServeMode::Local).await;

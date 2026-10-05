@@ -49,11 +49,14 @@ signed-in user and reads no workspace, so it writes no audit row.
   the newest `audit_log` row naming it, allowed or denied; "never used" for a workspace
   the CLI made and nothing has opened through the server), one column each.
 - **`ontology.html`** shows the class tree, relations, properties, and mappings; the JSON
-  editor; the version list with the diff to the previous version; the propose form; and the
-  paged review queue with bulk accept and reject.
+  editor; the version list with the diff to the previous version; the propose form; the
+  Rename form, which gives a class or relation a new id and moves the graph's nodes and
+  edges with it; and the paged review queue with bulk accept and reject.
 - **`graph.html`** shows status banners (provisional, stale, missing mapped tables,
   drift), the search and path forms, the ECharts result with a node inspector, the merge
-  queue, and the extract, revalidate, and review buttons.
+  queue, and the extract, revalidate, and review buttons. The stale banner lists what a
+  revalidation would drop (totals, per class id, per relation id). Its button names those
+  totals and posts them, and the server drops only when they still match what it counts.
 - **Dark only.** `styles/input.css` sets `color-scheme: dark`, so native controls and the
   file picker follow; panels are `slate-900` on a `slate-950` page and primary buttons are
   `blue-600`. Charts and the graph use ECharts' built-in `dark` theme.

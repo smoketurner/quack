@@ -108,7 +108,10 @@ pub(crate) fn router() -> Router<App> {
         .route("/workspaces/{id}/graph/path", post(graph::path))
         .route("/workspaces/{id}/graph/status", get(graph::status))
         .route("/workspaces/{id}/graph/extract", post(graph::extract))
-        .route("/workspaces/{id}/graph/revalidate", post(graph::revalidate))
+        .route(
+            "/workspaces/{id}/graph/revalidate",
+            get(graph::revalidation_preview).post(graph::revalidate),
+        )
         .route("/workspaces/{id}/graph/review", post(graph::review))
         .route("/workspaces/{id}/graph/merges", get(graph::merges))
         .route(
@@ -151,6 +154,7 @@ fn ontology_routes() -> Router<App> {
             get(ontology::show).put(ontology::replace),
         )
         .route("/workspaces/{id}/ontology/init", post(ontology::init))
+        .route("/workspaces/{id}/ontology/rename", post(ontology::rename))
         .route("/workspaces/{id}/ontology/propose", post(ontology::propose))
         .route(
             "/workspaces/{id}/ontology/candidates",

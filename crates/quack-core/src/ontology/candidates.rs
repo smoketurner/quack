@@ -3,7 +3,7 @@
 
 use super::induction::{Candidate, Decision, ItemKind, Proposal, apply};
 use super::store::{self, Acceptance, Revision};
-use super::{Class, Ontology, ROOT_CLASS};
+use super::{Class, IdRenames, Ontology, ROOT_CLASS};
 use crate::error::{Error, Record, Result};
 use crate::ids::{CandidateId, ClassId, RunId};
 use crate::prefix::PrefixMatch;
@@ -323,6 +323,24 @@ pub fn queue(db: &WorkspaceDb, queue: Queue) -> Result<Vec<CandidateRow>> {
     Ok(rows.flatten().collect())
 }
 
+/// Point every undecided candidate at renamed class and relation ids.
+/// Decided candidates are history and keep the ids they were decided with.
+pub(crate) fn rename_ids(db: &WorkspaceDb, renames: &IdRenames) -> Result<()> {
+    for status in [Queue::Pending, Queue::LowSupport] {
+        for row in queue(db, status)? {
+            let mut proposal = row.proposal.clone();
+            proposal.rename_ids(renames);
+            if proposal != row.proposal {
+                db.connection().execute(
+                    "UPDATE _quack_ontology_candidates SET proposal = ? WHERE id = ?",
+                    duckdb::params![serde_json::to_string(&proposal)?, row.id],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The pending candidates a single run queued: the rows [`store_run`]
 /// inserted for `run` that are still awaiting a decision. A per-run
 /// auto-accept ([`accept_run`]) reads this instead of the shared [`queue`]
@@ -443,6 +461,7 @@ fn accept_as(
             author: decided_by,
             note: Some(&note),
             acceptance,
+            renames: None,
         },
     )?;
     for (id, _, _) in &resolved {
