@@ -30,7 +30,10 @@
 {% if status.stale %}
 <div class="mt-3 flex flex-wrap items-center gap-3 rounded border border-amber-900 bg-amber-950 px-3 py-2 text-sm text-amber-200">
   <span>Stale: the ontology changed since the graph was built (version {% if let Some(v) = status.built_with_version %}{{ v }}{% else %}none{% endif %} → {% if let Some(v) = status.ontology_version %}{{ v }}{% endif %}).</span>
-  {% if let Some(r) = revalidation %}
+  {% if let Some(Err(e)) = revalidation %}
+  <span role="alert" class="w-full wrap-anywhere">What revalidating would drop could not be counted: {{ e }}</span>
+  {% endif %}
+  {% if let Some(Ok(r)) = revalidation %}
   {% if r.is_empty() %}
   {% if ws.can_write %}<form method="post" action="/w/{{ ws.id }}/graph/revalidate"><button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Revalidate (no model calls)</button></form>{% endif %}
   <span>Every node and edge fits the new version: revalidating drops nothing.</span>

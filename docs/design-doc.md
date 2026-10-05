@@ -1003,7 +1003,10 @@ for a yes when there is something to drop:
   preview unless `-y` is given.
 - The graph page lists the preview in the stale banner. Its button posts the two totals it
   showed, and the server drops only when they still match.
-- `GET .../graph/revalidate` returns the preview; `POST .../graph/revalidate` drops.
+- `GET .../graph/revalidate` returns the preview. `POST .../graph/revalidate` takes the
+  preview's totals, `{"dropped_nodes": N, "dropped_edges": M}`, and drops only when they
+  still match, the same check as the graph page's button. Without them, or with totals the
+  graph no longer matches, it drops nothing and answers 409 with the current totals.
 
 With nothing to drop, none of them asks. Any version can
 be diffed against another or restored. Deleting a document removes its files under `files/`
@@ -1859,7 +1862,7 @@ POST   /api/v1/workspaces/{id}/graph/path      {from, to, max_hops?}
 GET    /api/v1/workspaces/{id}/graph/status
 POST   /api/v1/workspaces/{id}/graph/extract       tables now; documents -> 202 with the cost, one run per workspace (409 while one runs)
 GET    /api/v1/workspaces/{id}/graph/revalidate    what a revalidation would drop: totals, per class id, per relation id
-POST   /api/v1/workspaces/{id}/graph/revalidate    drop it; read the preview first
+POST   /api/v1/workspaces/{id}/graph/revalidate    drop it: {"dropped_nodes", "dropped_edges"} from the preview; 409 with the current totals when absent or stale
 POST   /api/v1/workspaces/{id}/graph/review        mark a provisional graph reviewed
 GET    /api/v1/workspaces/{id}/graph/merges        PUT .../graph/merges/{mid} {action: accept|reject}
 POST   /api/v1/workspaces/{id}/import              {url, table, query?, source_table?, limit?}

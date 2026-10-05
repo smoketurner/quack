@@ -7,7 +7,6 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use quack_core::error::Error as CoreError;
 use quack_core::extraction::{Extract, ExtractionRun};
 use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::query::{GraphQuery, PathQuery};
@@ -21,7 +20,6 @@ use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
-use quack_core::storage::workspace::WorkspaceDb;
 use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Identity, Need};
@@ -455,43 +453,50 @@ pub(crate) async fn revalidation_preview(
     Ok(Json(app.read(&id, Revalidation::preview).await?))
 }
 
+/// Drop what the preview counted. The body carries the preview's totals;
+/// with none, or with totals the graph no longer matches, nothing is
+/// dropped and the answer is 409 with the current totals.
 pub(crate) async fn revalidate(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
+    approval: Option<Json<DropApproval>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let approval = approval.map(|Json(approval)| approval).unwrap_or_default();
     Ok(Json(serde_json::to_value(
-        access.revalidate_graph(&app, DropApproval::Any).await?,
+        access.revalidate_graph(&app, approval).await?,
     )?))
 }
 
-/// What the caller agreed a revalidation may drop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DropApproval {
-    /// Whatever no longer fits: the REST route, whose callers read the
-    /// preview route first.
-    Any,
-    /// The counts the graph page showed; anything else is refused.
-    Shown { nodes: u64, edges: u64 },
+/// The totals the caller saw in the preview and agreed to drop: the API's
+/// body and the graph page's form. Totals left out are zero, which
+/// approves only a revalidation that drops nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct DropApproval {
+    #[serde(default)]
+    pub dropped_nodes: u64,
+    #[serde(default)]
+    pub dropped_edges: u64,
 }
 
 impl DropApproval {
-    /// Refuse when the graph would now lose something other than what
-    /// was approved.
-    fn check(self, db: &WorkspaceDb) -> Result<(), CoreError> {
-        let Self::Shown { nodes, edges } = self else {
-            return Ok(());
-        };
-        let preview = Revalidation::preview(db)?;
-        if (preview.dropped_nodes, preview.dropped_edges) == (nodes, edges) {
-            return Ok(());
+    /// `None` when `preview` drops what was approved, else what to tell
+    /// the caller.
+    fn refusal(self, preview: &Revalidation) -> Option<String> {
+        let Self {
+            dropped_nodes,
+            dropped_edges,
+        } = self;
+        if (preview.dropped_nodes, preview.dropped_edges) == (dropped_nodes, dropped_edges) {
+            return None;
         }
-        Err(CoreError::Ontology(format!(
-            "nothing dropped: revalidating now drops {} nodes and {} edges, not the {nodes} and \
-             {edges} confirmed; check the list and confirm again",
+        Some(format!(
+            "nothing dropped: revalidating now drops {} nodes and {} edges, not the \
+             {dropped_nodes} and {dropped_edges} confirmed; check the preview and confirm its \
+             totals",
             preview.dropped_nodes, preview.dropped_edges
-        )))
+        ))
     }
 }
 
@@ -539,7 +544,7 @@ pub(crate) async fn decide_merge(
 /// The graph writes the API and the web console share.
 impl Access {
     /// Drop what the current ontology no longer allows, when that is
-    /// what `approval` covers.
+    /// what `approval` covers; 409 with the current totals when it is not.
     pub(crate) async fn revalidate_graph(
         &self,
         app: &App,
@@ -547,11 +552,14 @@ impl Access {
     ) -> ApiResult<Revalidation> {
         let db = app.workspace_db(&self.workspace.id).await?;
         let outcome = with_db(db, move |db| {
-            approval.check(db)?;
-            graph_store::revalidate(db)
+            if let Some(refusal) = approval.refusal(&Revalidation::preview(db)?) {
+                return Ok(Err(refusal));
+            }
+            graph_store::revalidate(db).map(Ok)
         })
         .await
-        .map_err(|e| ApiError::bad_request(e.message))?;
+        .map_err(|e| ApiError::bad_request(e.message))?
+        .map_err(ApiError::conflict)?;
         self.audit(
             app,
             AuditAction::GraphRevalidate,

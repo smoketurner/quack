@@ -3954,8 +3954,40 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
     assert_eq!(status, StatusCode::OK, "{body}");
     let (_, body) = h.get(&format!("{base}/status"), "").await;
     assert_eq!(body["stale"], true, "{body}");
+    // A POST without the preview's totals, or with totals the graph no
+    // longer matches, drops nothing and names the current ones.
+    let (_, preview) = h.get(&format!("{base}/revalidate"), "").await;
+    let stale_totals = serde_json::json!({ "dropped_nodes": 2, "dropped_edges": 1 });
+    for unconfirmed in [None, Some(serde_json::json!({})), Some(stale_totals)] {
+        let (status, body) = h
+            .call(
+                Method::POST,
+                &format!("{base}/revalidate"),
+                None,
+                unconfirmed.clone(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{unconfirmed:?}: {body}");
+        assert!(
+            body.to_string()
+                .contains("nothing dropped: revalidating now drops 2 nodes and 3 edges"),
+            "{unconfirmed:?}: {body}"
+        );
+        let (_, body) = h.get(&format!("{base}/status"), "").await;
+        assert_eq!(body["stale"], true, "{unconfirmed:?}: {body}");
+        assert_eq!(body["nodes"], 7, "{unconfirmed:?}: {body}");
+    }
+    let confirmed = serde_json::json!({
+        "dropped_nodes": preview["dropped_nodes"],
+        "dropped_edges": preview["dropped_edges"],
+    });
     let (status, body) = h
-        .call(Method::POST, &format!("{base}/revalidate"), None, None)
+        .call(
+            Method::POST,
+            &format!("{base}/revalidate"),
+            None,
+            Some(confirmed),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["dropped_nodes"], 2);
@@ -4155,7 +4187,8 @@ async fn renames_move_the_graph_and_revalidation_shows_what_it_drops_first() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(
-        body.to_string().contains("class 'country' already exists"),
+        body.to_string()
+            .contains("class 'country' is declared twice"),
         "{body}"
     );
     let (status, body) = h

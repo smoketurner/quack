@@ -568,7 +568,8 @@ impl InductionPass<'_> {
     }
 }
 
-/// Old property id to new.
+/// Old property id to new. Not part of [`IdRenames`], which is what a save
+/// moves the graph by, and the graph is keyed by class and relation ids only.
 #[derive(Default)]
 struct RenameMap(BTreeMap<String, String>);
 

@@ -622,7 +622,7 @@ mod tests {
         assert!(
             refused
                 .as_ref()
-                .is_err_and(|e| e.contains("class 'organization' already exists")),
+                .is_err_and(|e| e.contains("class 'organization' is declared twice")),
             "{refused:?}"
         );
         let refused = rename(&["rename", "property", "title", "role"]).await;

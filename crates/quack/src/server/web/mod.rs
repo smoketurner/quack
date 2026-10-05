@@ -805,8 +805,9 @@ struct GraphPage {
     drift: Vec<String>,
     has_ontology: bool,
     chunk_count: usize,
-    /// What revalidating a stale graph would drop.
-    revalidation: Option<Revalidation>,
+    /// What revalidating a stale graph would drop, or why that could not
+    /// be counted.
+    revalidation: Option<Result<Revalidation, String>>,
     merges: Vec<resolve::MergeProposal>,
     query: GraphQueryView,
     result: Option<GraphResultView>,
@@ -2329,6 +2330,52 @@ mod tests {
 
     use super::*;
 
+    /// A stale graph whose preview could not be counted still gets its
+    /// page: the banner carries the reason and offers no drop.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn a_failed_revalidation_preview_is_shown_in_the_stale_banner() {
+        let page = GraphPage {
+            page: Page {
+                title: String::from("Graph"),
+                tab: Tab::Graph,
+                username: String::from("ada"),
+                is_admin: false,
+                local: false,
+                workspace: Some(WsNav {
+                    id: String::from("w1"),
+                    name: String::from("sales"),
+                    role: Standing::Member(Role::Owner),
+                    can_write: true,
+                    can_manage: true,
+                }),
+            },
+            status: GraphStatus {
+                nodes: 7,
+                stale: true,
+                ..GraphStatus::default()
+            },
+            drift: Vec::new(),
+            has_ontology: true,
+            chunk_count: 0,
+            revalidation: Some(Err(String::from("no ontology to validate against"))),
+            merges: Vec::new(),
+            query: GraphQueryView::default(),
+            result: None,
+            error: None,
+            notice: None,
+        };
+        let html = page.render().unwrap();
+        assert!(html.contains("7 nodes"), "{html}");
+        assert!(
+            html.contains(
+                "What revalidating would drop could not be counted: no ontology to validate against"
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("graph/revalidate"), "{html}");
+    }
+
     #[test]
     fn cells_render_strings_bare_and_null_empty() {
         let text = |v: &serde_json::Value| JsonText(v).to_string();
@@ -2594,7 +2641,9 @@ async fn render_graph(
         drift,
         has_ontology: data.has_ontology,
         chunk_count: data.chunk_count,
-        revalidation: data.revalidation,
+        revalidation: data
+            .revalidation
+            .map(|preview| preview.map_err(|e| e.to_string())),
         merges: data.merges,
         query,
         result,
@@ -2678,8 +2727,9 @@ struct GraphPageData {
     has_ontology: bool,
     /// Chunks not yet sent to extraction.
     chunk_count: usize,
-    /// What revalidating would drop, read only while the graph is stale.
-    revalidation: Option<Revalidation>,
+    /// What revalidating would drop, or why that could not be counted;
+    /// read only while the graph is stale.
+    revalidation: Option<CoreResult<Revalidation>>,
     merges: Vec<resolve::MergeProposal>,
     /// The query's answer, when it asked for anything.
     result: Option<GraphAnswer>,
@@ -2697,11 +2747,7 @@ impl GraphPageData {
         let ontology = ontology_store::current(db)?;
         let chunk_count =
             usize::try_from(db.pool_size(SamplePool::NotGraphExtracted)?).unwrap_or(0);
-        let revalidation = if status.stale {
-            Some(Revalidation::preview(db)?)
-        } else {
-            None
-        };
+        let revalidation = status.stale.then(|| Revalidation::preview(db));
         let merges = resolve::pending(db)?;
         let result = ask.run(db, options);
         Ok(Self {
@@ -2827,25 +2873,13 @@ async fn graph_extract(
 
 /// The counts the graph page showed beside its revalidate button; a
 /// button shown with nothing to drop sends none.
-#[derive(Deserialize)]
-struct RevalidateForm {
-    #[serde(default)]
-    dropped_nodes: u64,
-    #[serde(default)]
-    dropped_edges: u64,
-}
-
 async fn graph_revalidate(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Form(form): Form<RevalidateForm>,
+    Form(approval): Form<DropApproval>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let approval = DropApproval::Shown {
-        nodes: form.dropped_nodes,
-        edges: form.dropped_edges,
-    };
     let revalidated = access.revalidate_graph(&app, approval).await;
     Ok(Flash::after(format!("/w/{id}/graph"), revalidated, |r| {
         Some(format!(

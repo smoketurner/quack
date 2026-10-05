@@ -436,30 +436,30 @@ impl IdRenames {
         }
     }
 
-    /// Every old id must be one `ontology` defines and every new id one it
-    /// lacks: a rename onto an existing id would merge two items.
+    /// Every old id must be one `ontology` defines, renamed to another
+    /// id. A new id the ontology already has is left to
+    /// [`Ontology::validate`], which refuses the renamed ontology for
+    /// declaring it twice.
     ///
     /// # Errors
     ///
     /// Returns an `Ontology` error naming the first id that breaks this.
     pub(crate) fn check(&self, ontology: &Ontology) -> Result<()> {
-        for (old, new) in &self.classes {
-            if ontology.class(old.as_str()).is_none() {
-                return Err(Error::Ontology(format!("no class '{old}' to rename")));
+        let classes = self.classes.iter().map(|(old, new)| {
+            let defined = ontology.class(old.as_str()).is_some();
+            (ItemKind::Class, old.as_str(), new.as_str(), defined)
+        });
+        let relations = self.relations.iter().map(|(old, new)| {
+            let defined = ontology.relation(old.as_str()).is_some();
+            (ItemKind::Relation, old.as_str(), new.as_str(), defined)
+        });
+        for (kind, old, new, defined) in classes.chain(relations) {
+            if !defined {
+                return Err(Error::Ontology(format!("no {kind} '{old}' to rename")));
             }
-            if ontology.class(new.as_str()).is_some() {
+            if old == new {
                 return Err(Error::Ontology(format!(
-                    "class '{new}' already exists; a rename cannot merge two classes"
-                )));
-            }
-        }
-        for (old, new) in &self.relations {
-            if ontology.relation(old.as_str()).is_none() {
-                return Err(Error::Ontology(format!("no relation '{old}' to rename")));
-            }
-            if ontology.relation(new.as_str()).is_some() {
-                return Err(Error::Ontology(format!(
-                    "relation '{new}' already exists; a rename cannot merge two relations"
+                    "{kind} '{old}' already has that id"
                 )));
             }
         }
@@ -965,8 +965,8 @@ impl Ontology {
     ///
     /// # Errors
     ///
-    /// Returns an `Ontology` error when an old id is not defined or a new
-    /// id already is.
+    /// Returns an `Ontology` error when an old id is not defined or is
+    /// renamed to itself.
     pub(crate) fn renamed(&self, renames: &IdRenames) -> Result<Self> {
         renames.check(self)?;
         let mut out = self.clone();

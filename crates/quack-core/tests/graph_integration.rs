@@ -1751,13 +1751,13 @@ fn a_rename_onto_an_existing_id_is_refused_and_writes_nothing() {
             ItemKind::Class,
             "vendor",
             "country",
-            "class 'country' already exists",
+            "class 'country' is declared twice",
         ),
         (
             ItemKind::Class,
             "vendor",
             "vendor",
-            "class 'vendor' already exists",
+            "class 'vendor' already has that id",
         ),
         (
             ItemKind::Class,
@@ -1777,7 +1777,7 @@ fn a_rename_onto_an_existing_id_is_refused_and_writes_nothing() {
             ItemKind::Relation,
             "supplied_by",
             "ships_to",
-            "relation 'ships_to' already exists",
+            "relation 'ships_to' is declared twice",
         ),
         (
             ItemKind::Relation,

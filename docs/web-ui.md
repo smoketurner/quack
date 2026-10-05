@@ -57,6 +57,7 @@ signed-in user and reads no workspace, so it writes no audit row.
   queue, and the extract, revalidate, and review buttons. The stale banner lists what a
   revalidation would drop (totals, per class id, per relation id). Its button names those
   totals and posts them, and the server drops only when they still match what it counts.
+  When the preview cannot be counted, the banner says why and offers no drop.
 - **Dark only.** `styles/input.css` sets `color-scheme: dark`, so native controls and the
   file picker follow; panels are `slate-900` on a `slate-950` page and primary buttons are
   `blue-600`. Charts and the graph use ECharts' built-in `dark` theme.

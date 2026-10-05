@@ -309,8 +309,10 @@ was auto-accepted), `stale` (`graph_built_with_ontology_version` lags), pending 
 and drift; `revalidate` drops what the current ontology no longer allows, and
 `Revalidation::preview` counts that first (totals, per class id, per relation id) so
 `quack graph revalidate` asks before dropping (`-y` skips; with nobody to ask it fails,
-`Confirm::ask_to_drop`), the graph page posts back the totals it showed, and
-`GET .../graph/revalidate` serves the preview. The agent
+`Confirm::ask_to_drop`), and the graph page and `POST .../graph/revalidate` send back the
+preview's totals (`api::graph::DropApproval`; 409 with the current totals when they are absent or
+stale). `GET .../graph/revalidate` serves the preview, and the run deletes what the preview
+counted, since both start from `Revalidation::find`. The agent
 registers `search_graph` and `find_path` only when the graph has nodes, query mode drops
 provisional results, and every response shape carries the turn's `graph` results. Their
 rendering (`Display for GraphResult` in `graph::traverse`, shared with `quack graph` and the terminal)
