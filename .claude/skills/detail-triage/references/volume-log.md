@@ -23,6 +23,7 @@ judgement columns come from the batch's record in `.local/`.
 | 2026-09-28 | 6 | 5 | 0 | 1 | 5 | not recorded | all 5 merged (#297–#301); #296 closed by class fix #302 | not recorded | 0 |
 | 2026-09-30 | 1 | 1 | 0 | 0 | 1 | not recorded | #315 merged | not recorded | 0 |
 | 2026-10-03 | 5 | 4 | 0 | 0 | 5 | 1 of 4 (#351 amended) | #349, #350, #352 ready as written; #351 amended with the workbook arm; #345 had no PR, fixed on `fix/345-permission-answer-undelivered` | none (first record) | 2 described, 0 requested (no CLI) |
+| 2026-10-05 | 6 | 5 | 0 | 1 | 6 | 3 of 5 (#371 and #372 superseded, #373 rebuilt) | #369, #370 merged as written; #373 rebuilt as #377 after its test stopped compiling on `main`; #371 superseded by #374; #372 superseded by #376; #363 had no PR and was fixed as a class in #375 | none | 1 described, 0 requested |
 
 These three batches predate this skill and have no `.local/` record, so their
 judgement columns are reconstructed from GitHub, not from a review.
@@ -104,3 +105,55 @@ Instances merged as written: #349, #350, #352. #351 amended. #345 fixed on
 Residue: the terminal's `named_tables` still ends a comma `FROM` list at a
 subquery; the workbook arm has no test.
 
+
+## 2026-10-05
+
+47 issues, 2026-09-25 through 2026-10-05; the batch's 6 were open at triage
+and all are closed.
+
+| month | n | no attr | median age | p90 age | <30d | >90d |
+|-------|---|---------|-----------|---------|------|------|
+| 2026-09 | 36 | 1 | 8 | 11 | 35 | 0 |
+| 2026-10 | 11 | 0 | 1 | 2 | 11 | 0 |
+
+**Reading:** PR≤3d is 6 of 6, and all six are defects in logic the blamed PR
+added: two in #358 (file drop), three in #359 (ratatui widgets), both merged
+the day of the scan, and one in #352, Detail's own reranker fix from the
+2026-10-03 batch, which that triage passed as written. New code is producing
+the findings; this is not backlog.
+
+### Classes
+
+One confirmed class: a `background_effort` the model rejects passes
+`quack doctor` and then fails at use (#363), with the history summarizer as a
+second site on the turn path. It joins "config passes, runtime fails" (now 4).
+#365 and #366 share a cause (shlex's shell rules applied to a line of file
+names) but are two members with different fixes, not a class of three.
+
+### Decided
+
+All six issues closed the same day.
+
+- Merged as written: #369 (#364) and #370 (#365).
+- #373 (#368) failed its merge queue checks twice: its test called
+  `Message::lines`, which #362 had renamed the same day. Rebuilt on `main`
+  as #377.
+- #371 (#366) added a hand-written shell tokenizer. Superseded by #374: a
+  `FileLine` type refuses a line of names cut short by a `#` word, with shlex
+  still the only parser.
+- #372 (#367) kept or dropped a call's text by whether the previous call ran
+  a tool, so `A.` + tool, `B.` + tool, `C.` answered `B. C.` (reproduced).
+  Superseded by #376, which holds a call's text as provisional until its own
+  tool runs.
+- #363 had no PR. #375 fixed the class at both turn-path sites and added the
+  `background_effort` check to `quack doctor`.
+
+A flaky server test surfaced in the merge queue
+(`a_waiting_write_is_answered_once_by_its_asker_or_expires`, 404 for 409 on
+a slow runner): its answer cases raced its own one-second expiry. It came in
+with the 2026-10-03 batch's permission fix and was split in #377.
+
+No rule was requested. The description for the `background_effort` class is
+in `.local/detail-triage-2026-10-05.md`. Residue: the reranker's degraded
+path in `dispatch` has no whole-turn test; a rejected call's text still
+streams as live deltas before rig rejects it.
