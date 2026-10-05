@@ -1871,6 +1871,7 @@ existing file ingests it. An embedding provider is optional (keyword search with
 | `Enter` / `Shift+Enter` | send / newline |
 | `Up`/`Down` | history |
 | `PageUp`/`PageDown`, mouse wheel | scroll |
+| drag with the left button | select transcript text; releasing copies it to the system clipboard and, through OSC 52, to the terminal's (which reaches the local machine over SSH) |
 | `Home`/`End` | jump |
 | `Esc` or `Ctrl+C` | cancel this session's newest turn, running or queued (recorded with whatever streamed and a cancelled note) |
 | `Ctrl+C` with no turn | quit (twice when other jobs still run; they stop with the session) |

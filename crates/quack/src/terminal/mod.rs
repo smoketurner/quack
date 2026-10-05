@@ -2,9 +2,11 @@
 
 mod app;
 mod chart;
+mod clipboard;
 mod commands;
 mod markdown;
 mod picker;
+mod selection;
 mod sql;
 mod ui;
 

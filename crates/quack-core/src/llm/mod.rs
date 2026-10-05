@@ -611,6 +611,21 @@ impl ChatClient {
             schema,
         ))
     }
+
+    /// A background call a chat turn goes without when it cannot be built:
+    /// a `background_effort` the model refuses must not cost the answer.
+    fn optional_schema_call<A>(
+        &self,
+        model: &str,
+        settings: ModelSettings,
+        task: Task<'_>,
+        schema: Schema,
+    ) -> Option<SchemaCall<A>> {
+        let label = task.label;
+        self.schema_call(model, settings, task, schema)
+            .inspect_err(|e| tracing::warn!(error = %e, "the turn runs without its {label} call"))
+            .ok()
+    }
 }
 
 /// The key rig's `OpenAI` clients are built with when [`bedrock::Signer`]
@@ -1355,14 +1370,10 @@ async fn dispatch(
         }
     }
     let model = client.chat_model(chat.model, settings.effort, settings.temperature)?;
-    // The model reranker is the one schema-call consumer that runs *during*
-    // a turn, so it is built here — where the turn's `ChatClient` and settings
-    // are in scope — through `schema_call`, the same `background_effort`
-    // routing graph extraction, the ontology document pass, and history
-    // summaries use. Built only when `rerank = "model"`: a `reranker` or
-    // `none` retrieval turns this off and pays nothing to sample a model.
+    // Built here, where the turn's client is, at `background_effort` like
+    // every other background call; without it the search keeps its fused order.
     let reranker = if config.retrieval.rerank == RerankMode::Model {
-        Some(client.schema_call::<RerankAnswer>(
+        client.optional_schema_call::<RerankAnswer>(
             chat.model,
             settings,
             Task {
@@ -1371,7 +1382,7 @@ async fn dispatch(
                 label: "rerank",
             },
             schema_for!(RerankAnswer),
-        )?)
+        )
     } else {
         None
     };

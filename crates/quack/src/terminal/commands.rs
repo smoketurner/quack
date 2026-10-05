@@ -389,6 +389,7 @@ Shortcuts:
   Enter             Send message
   Up/Down           Browse input history (kept across sessions)
   PageUp/PageDown, mouse wheel   Scroll messages; Home/End jump
+  Drag the mouse    Select messages; letting go copies them to the clipboard
   Ctrl+U            Clear input line
   Ctrl+L            Clear screen
   Esc or Ctrl+C     Cancel this session's newest question (running or queued)

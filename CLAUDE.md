@@ -154,7 +154,10 @@ The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`,
 `AppMsg` channel, the job broadcast, a spinner tick) and submits every question,
 statement, file, import, and ontology or graph verb as a job, so it never blocks its input:
 a strip above the prompt shows active jobs, `/jobs` lists them, `/cancel N` stops one, and
-write prompts from concurrent work queue up. Its commands' database steps run in the order
+write prompts from concurrent work queue up. A left-button drag over the transcript
+selects text in transcript lines (`terminal::selection`), and releasing copies it without row
+markers or wrap breaks to the system clipboard (`arboard`) and the terminal's (OSC 52;
+`terminal::clipboard`). Its commands' database steps run in the order
 typed on one worker task (`App::on_db`: reads on the reader pool, writes in the writer's
 interactive line), never on the loop's thread; input typed during `/new`, `/resume`, or
 `/mode` waits for the switch. `SharedDb` is `Arc<storage::writer::Writer>`, an actor: one

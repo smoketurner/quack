@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use clap::error::ErrorKind;
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use futures::future::BoxFuture;
 use ratatui::style::{Color, Style};
@@ -54,10 +55,12 @@ use crate::graph_cli::{self, GraphAction};
 use crate::ontology_cli::{self, OntologyAction};
 use crate::terminal::SessionSetup;
 use crate::terminal::chart::ChartData;
+use crate::terminal::clipboard::{Clipboard, CopyStatus};
 use crate::terminal::commands::{
     Completion, ContextAction, FileLine, GraphWalk, Input, Route, SlashCommand,
 };
 use crate::terminal::picker::{Picked, Picker};
+use crate::terminal::selection::{Edge, Located, Selection, TranscriptView};
 use crate::terminal::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
 
 /// The spinner's frame interval; it ticks only while a job is active.
@@ -838,6 +841,12 @@ pub(crate) struct App {
     pub(crate) scroll: Scroll,
     /// How far back the transcript could scroll when last drawn.
     pub(crate) scroll_limit: Cell<usize>,
+    /// Where the transcript was when last drawn, to place the mouse on it.
+    pub(crate) view: Cell<TranscriptView>,
+    pub(crate) selection: Option<Selection>,
+    /// A finished selection's text, until the loop copies it.
+    to_copy: Option<String>,
+    pub(crate) copy_status: Option<CopyStatus>,
     pub(crate) quit: Quit,
     pub(crate) spinner: Spinner,
     pub(crate) workspace_name: String,
@@ -914,6 +923,10 @@ impl App {
             textarea: TextArea::default(),
             scroll: Scroll::Latest,
             scroll_limit: Cell::new(0),
+            view: Cell::new(TranscriptView::default()),
+            selection: None,
+            to_copy: None,
+            copy_status: None,
             quit: Quit::Stay,
             spinner: Spinner::default(),
             workspace_name,
@@ -1042,16 +1055,23 @@ impl App {
     /// waiting is applied before the next draw, so a burst of streamed text
     /// costs one redraw, not one per delta.
     pub(crate) async fn run(self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
-        self.run_with(terminal, EventStream::new()).await
+        let clipboard = Clipboard::new(std::io::stdout());
+        self.run_with(terminal, EventStream::new(), clipboard).await
     }
 
-    /// [`Self::run`] over any backend and input stream, so tests drive the
-    /// real loop with scripted keys and a `TestBackend`.
-    async fn run_with<B, S>(mut self, terminal: &mut ratatui::Terminal<B>, input: S) -> Result<()>
+    /// [`Self::run`] over any backend, input stream, and clipboard, so tests
+    /// drive the real loop with scripted keys and a `TestBackend`.
+    async fn run_with<B, S, W>(
+        mut self,
+        terminal: &mut ratatui::Terminal<B>,
+        input: S,
+        mut clipboard: Clipboard<W>,
+    ) -> Result<()>
     where
         B: ratatui::backend::Backend,
         B::Error: std::error::Error + Send + Sync + 'static,
         S: futures::Stream<Item = std::io::Result<Event>> + Unpin,
+        W: std::io::Write,
     {
         use futures::StreamExt as _;
 
@@ -1084,6 +1104,9 @@ impl App {
                     true
                 }
             };
+            if let Some(text) = self.to_copy.take() {
+                self.copy_status = Some(clipboard.copy(&text));
+            }
             if dirty {
                 self.pump();
             }
@@ -1104,35 +1127,102 @@ impl App {
     fn handle_terminal_event(&mut self, event: &Event) -> bool {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                self.clear_selection();
                 self.handle_key_event(key.code, key.modifiers);
                 true
             }
             Event::Paste(text) => {
+                self.clear_selection();
                 self.handle_paste(text);
                 true
             }
-            Event::Mouse(mouse) => match (mouse.kind, &mut self.picker) {
-                (MouseEventKind::ScrollUp, Some(picker)) => {
-                    picker.up(1);
-                    true
-                }
-                (MouseEventKind::ScrollDown, Some(picker)) => {
-                    picker.down(1);
-                    true
-                }
-                (MouseEventKind::ScrollUp, None) => {
-                    self.scroll_up(3);
-                    true
-                }
-                (MouseEventKind::ScrollDown, None) => {
-                    self.scroll_down(3);
-                    true
-                }
-                _ => false,
-            },
-            Event::Resize(..) => true,
+            Event::Mouse(mouse) => self.handle_mouse(*mouse),
+            Event::Resize(..) => {
+                // The transcript wraps again, so its lines are other lines.
+                self.clear_selection();
+                true
+            }
             _ => false,
         }
+    }
+
+    /// The wheel scrolls; a drag with the left button selects transcript
+    /// text, and letting go copies it. Returns whether to redraw.
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                match &mut self.picker {
+                    Some(picker) => picker.up(1),
+                    None => self.scroll_up(3),
+                }
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                match &mut self.picker {
+                    Some(picker) => picker.down(1),
+                    None => self.scroll_down(3),
+                }
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.clear_selection();
+                if self.picker.is_none()
+                    && !self.awaiting_permission()
+                    && let Some(Located {
+                        position,
+                        edge: Edge::Inside,
+                    }) = self.view.get().locate(mouse.column, mouse.row)
+                {
+                    self.selection = Some(Selection::at(position));
+                }
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(selection) = self.selection.as_mut().filter(|s| s.is_dragging()) else {
+                    return false;
+                };
+                let Some(located) = self.view.get().locate(mouse.column, mouse.row) else {
+                    return false;
+                };
+                selection.extend(located.position);
+                match located.edge {
+                    Edge::Above => self.scroll_up(1),
+                    Edge::Below => self.scroll_down(1),
+                    Edge::Inside => {}
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.finish_selection(),
+            MouseEventKind::Down(MouseButton::Right | MouseButton::Middle)
+            | MouseEventKind::Drag(MouseButton::Right | MouseButton::Middle)
+            | MouseEventKind::Up(MouseButton::Right | MouseButton::Middle)
+            | MouseEventKind::Moved
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => false,
+        }
+    }
+
+    /// The button came up: keep what was dragged over highlighted and
+    /// queue its text for the clipboard. Returns whether to redraw.
+    fn finish_selection(&mut self) -> bool {
+        let Some(mut selection) = self.selection.filter(Selection::is_dragging) else {
+            return false;
+        };
+        self.selection = None;
+        let width = usize::from(self.view.get().area.width);
+        let text = selection.text(&ui::format_messages(self, width));
+        if !text.is_empty() {
+            selection.finish();
+            self.selection = Some(selection);
+            self.to_copy = Some(text);
+        }
+        true
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.to_copy = None;
+        self.copy_status = None;
     }
 
     /// Pasted text. A terminal pastes the paths of files dropped on it, so
@@ -1142,16 +1232,18 @@ impl App {
         if self.awaiting_permission() || self.picker.is_some() {
             return;
         }
+        // Terminals paste a line break as a bare carriage return; normalize
+        // it once, up front, so the file-loading and typed-in branches see
+        // the same input (shlex split on '\n', not '\r').
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if self.textarea.is_empty()
-            && let Some(FileLine::Files(paths)) = FileLine::of(text)
+            && let Some(FileLine::Files(paths)) = FileLine::of(&text)
         {
             self.scroll = Scroll::Latest;
             self.load_files(FileLine::Files(paths));
             return;
         }
-        // Terminals paste a line break as a bare carriage return.
-        self.textarea
-            .insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
+        self.textarea.insert_str(&text);
         self.reset_completion();
         self.history.leave();
     }
@@ -2722,6 +2814,7 @@ mod tests {
 
     use super::*;
     use crate::terminal::commands::Suggestion;
+    use crate::terminal::selection::{Position, Row};
     use quack_core::ids::{ChunkId, DocumentId};
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
@@ -2990,7 +3083,7 @@ mod tests {
         assert!(assistant.chart.is_some(), "the chart belongs to the answer");
         let drawn: Vec<String> = ui::format_messages(&app, 80)
             .iter()
-            .map(ToString::to_string)
+            .map(|row| row.line.to_string())
             .collect();
         let at = |text: &str| drawn.iter().position(|l| l.contains(text));
         let (answer, chart) = (at("Three rows"), at(" Rows by kind "));
@@ -3011,7 +3104,7 @@ mod tests {
         let lines = ui::format_messages(&app, 20);
         let text: Vec<String> = lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .map(|l| l.line.spans.iter().map(|s| s.content.to_string()).collect())
             .collect();
         assert!(text.iter().any(|l| l.contains("3 more lines")), "{text:?}");
         assert!(text.iter().all(|l| l.chars().count() <= 20), "{text:?}");
@@ -3020,7 +3113,7 @@ mod tests {
         assert!(
             expanded
                 .iter()
-                .any(|l| l.spans.iter().any(|s| s.content.contains("line 6")))
+                .any(|l| l.line.spans.iter().any(|s| s.content.contains("line 6")))
         );
 
         // Esc while a turn runs cancels it; typing goes on meanwhile.
@@ -3424,6 +3517,59 @@ mod tests {
             last(&app).content
         );
 
+        // A drop of several files whose paths the terminal joins with a
+        // carriage return (CRLF or a bare CR) loads them at once too: both
+        // branches agree '\r' is a line break. Before the fix, the raw paste
+        // reached shlex, which splits only on ' ' | '\t' | '\n', so an
+        // internal '\r'/'\r\n' kept the paths stuck together and the drop was
+        // misrouted to the typed-in branch — escaped paths sat in the input
+        // and no Upload was announced until the user pressed Enter.
+        let more = dir.path().join("more notes.md");
+        std::fs::write(&more, "# More notes.").unwrap_or_else(|e| fail(&e.to_string()));
+        let more_dropped = more.display().to_string().replace(' ', "\\ ");
+        for sep in ["\r\n", "\r"] {
+            let before = app.messages.len();
+            assert!(
+                app.handle_terminal_event(&Event::Paste(format!("{dropped}{sep}{more_dropped}")))
+            );
+            assert!(
+                app.textarea.is_empty(),
+                "drop joined by {sep:?} was typed in, not loaded"
+            );
+            assert_eq!(
+                app.messages.len(),
+                before + 2,
+                "a {sep:?}-separated drop announces one Upload per file"
+            );
+            let first = app
+                .messages
+                .get(before)
+                .unwrap_or_else(|| fail("no first upload"));
+            assert_eq!(first.kind, MessageKind::Upload);
+            assert!(
+                first.content.contains("team notes.md (job #"),
+                "{}",
+                first.content
+            );
+            let second = app
+                .messages
+                .get(before + 1)
+                .unwrap_or_else(|| fail("no second upload"));
+            assert_eq!(second.kind, MessageKind::Upload);
+            assert!(
+                second.content.contains("more notes.md (job #"),
+                "{}",
+                second.content
+            );
+            settle(&mut app).await;
+            assert_ne!(
+                last(&app).kind,
+                MessageKind::Error,
+                "{}",
+                last(&app).content
+            );
+        }
+
         // Any other paste is typed in, line breaks kept.
         app.handle_terminal_event(&Event::Paste(String::from("SELECT 1\rFROM t\r\nLIMIT 1")));
         assert_eq!(app.textarea.lines(), ["SELECT 1", "FROM t", "LIMIT 1"]);
@@ -3478,7 +3624,9 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 30))
             .unwrap_or_else(|e| fail(&e.to_string()));
         let running = tokio::spawn(async move {
-            let result = app.run_with(&mut terminal, input).await;
+            let result = app
+                .run_with(&mut terminal, input, Clipboard::terminal_only(Vec::new()))
+                .await;
             (result, terminal)
         });
         // The answer arrives through the job queue and the loop draws it;
@@ -4082,11 +4230,11 @@ mod tests {
     fn the_transcript_rerenders_only_what_changed() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
-        let text = |lines: &[ratatui::text::Line<'_>]| -> String {
-            lines
-                .iter()
+        let text = |rows: &[Row]| -> String {
+            rows.iter()
                 .map(|l| {
-                    l.spans
+                    l.line
+                        .spans
                         .iter()
                         .map(|s| s.content.as_ref())
                         .collect::<String>()
@@ -4128,7 +4276,7 @@ mod tests {
         assert!(
             ui::format_messages(&app, 20)
                 .iter()
-                .all(|l| l.width() <= 20)
+                .all(|l| l.line.width() <= 20)
         );
         app.clear_transcript();
         assert!(ui::format_messages(&app, 60).is_empty());
@@ -4352,6 +4500,217 @@ mod tests {
         app.handle_key_event(KeyCode::PageUp, KeyModifiers::NONE);
         app.note(MessageKind::System, "news");
         assert_eq!(app.scroll, Scroll::Latest);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// An app whose transcript is two notes, drawn once so the mouse can
+    /// be placed on it: `alpha beta` on screen row 2 and `gamma` on row 4.
+    fn app_with_two_notes(dir: &Path) -> App {
+        let mut app = app(dir);
+        app.messages.clear();
+        app.note(MessageKind::System, "alpha beta");
+        app.note(MessageKind::System, "gamma");
+        drop(screen(&app));
+        app
+    }
+
+    #[test]
+    fn a_drag_over_the_transcript_selects_it_and_letting_go_copies_it() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app_with_two_notes(dir.path());
+        let left = MouseButton::Left;
+
+        assert!(app.handle_terminal_event(&mouse(MouseEventKind::Down(left), 9, 2)));
+        assert!(app.handle_terminal_event(&mouse(MouseEventKind::Drag(left), 5, 4)));
+        assert!(app.to_copy.is_none(), "nothing is copied mid-drag");
+        assert!(app.handle_terminal_event(&mouse(MouseEventKind::Up(left), 5, 4)));
+        assert_eq!(app.to_copy.as_deref(), Some("beta\n\ngam"));
+        assert!(
+            app.selection.is_some_and(|s| !s.is_dragging()),
+            "the highlight stays"
+        );
+        // A drag with no button down before it, as after the highlight.
+        assert!(!app.handle_terminal_event(&mouse(MouseEventKind::Drag(left), 9, 2)));
+        assert!(!app.handle_terminal_event(&mouse(MouseEventKind::Up(left), 9, 2)));
+
+        // The outcome replaces the key hints until the next key.
+        app.copy_status = Some(CopyStatus::Failed(String::from("no clipboard")));
+        let status = |app: &App| screen(app).last().cloned().unwrap_or_default();
+        assert_eq!(status(&app).trim(), "copy failed: no clipboard");
+        app.handle_terminal_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.selection.is_none() && app.to_copy.is_none());
+        assert!(status(&app).contains("enter send"), "{}", status(&app));
+    }
+
+    #[test]
+    fn a_click_a_resize_and_a_paste_clear_the_selection() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app_with_two_notes(dir.path());
+        let left = MouseButton::Left;
+        let select = |app: &mut App| {
+            app.handle_terminal_event(&mouse(MouseEventKind::Down(left), 3, 2));
+            app.handle_terminal_event(&mouse(MouseEventKind::Drag(left), 7, 2));
+            app.handle_terminal_event(&mouse(MouseEventKind::Up(left), 7, 2));
+            assert_eq!(app.to_copy.take().as_deref(), Some("alpha"));
+            assert!(app.selection.is_some());
+        };
+
+        select(&mut app);
+        app.handle_terminal_event(&mouse(MouseEventKind::Down(left), 4, 2));
+        app.handle_terminal_event(&mouse(MouseEventKind::Up(left), 4, 2));
+        assert!(app.selection.is_none() && app.to_copy.is_none());
+
+        select(&mut app);
+        app.handle_terminal_event(&Event::Resize(60, 20));
+        assert!(app.selection.is_none());
+
+        select(&mut app);
+        app.handle_terminal_event(&Event::Paste(String::from("typed")));
+        assert!(app.selection.is_none());
+
+        // Only blank cells: nothing to copy, nothing left highlighted.
+        app.handle_terminal_event(&mouse(MouseEventKind::Down(left), 20, 3));
+        app.handle_terminal_event(&mouse(MouseEventKind::Drag(left), 40, 3));
+        app.handle_terminal_event(&mouse(MouseEventKind::Up(left), 40, 3));
+        assert!(app.selection.is_none() && app.to_copy.is_none());
+
+        // The other buttons select nothing.
+        app.handle_terminal_event(&mouse(MouseEventKind::Down(MouseButton::Right), 3, 2));
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn a_press_outside_the_transcript_or_under_a_list_selects_nothing() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app_with_two_notes(dir.path());
+        let left = MouseButton::Left;
+        // The header, then the input.
+        for row in [0, 27] {
+            app.handle_terminal_event(&mouse(MouseEventKind::Down(left), 5, row));
+            assert!(app.selection.is_none(), "row {row}");
+        }
+        app.picker = Some(Picker::jobs(Vec::new()));
+        app.handle_terminal_event(&mouse(MouseEventKind::Down(left), 5, 2));
+        assert!(app.selection.is_none());
+        app.picker = None;
+        app.handle_terminal_event(&mouse(MouseEventKind::Down(left), 5, 2));
+        assert!(app.selection.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_press_while_a_write_waits_for_an_answer_selects_nothing() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app_with_two_notes(dir.path());
+        app.handle_slash_command("/sql CREATE TABLE t AS SELECT 1 AS a");
+        db_settle(&mut app).await;
+        assert!(app.awaiting_permission());
+        drop(screen(&app));
+        app.handle_terminal_event(&mouse(MouseEventKind::Down(MouseButton::Left), 5, 2));
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn a_drag_past_an_edge_scrolls_and_the_wheel_still_does() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        app.messages.clear();
+        for n in 0..60 {
+            app.note(MessageKind::System, format!("line {n}"));
+        }
+        drop(screen(&app));
+        let view = app.view.get();
+        let left = MouseButton::Left;
+
+        app.handle_terminal_event(&mouse(MouseEventKind::Down(left), 3, 10));
+        app.handle_terminal_event(&mouse(MouseEventKind::Drag(left), 3, 0));
+        assert_eq!(app.scroll, Scroll::Back(1), "above the transcript");
+        app.handle_terminal_event(&mouse(MouseEventKind::Drag(left), 3, 28));
+        assert_eq!(app.scroll, Scroll::Latest, "below it");
+        app.handle_terminal_event(&mouse(MouseEventKind::Up(left), 3, 28));
+        // From the press to the transcript's end: `line N`, a blank, ...
+        let first = view
+            .top
+            .saturating_add(8)
+            .checked_div(2)
+            .unwrap_or_default();
+        let expected: Vec<String> = (first..60).map(|n| format!("line {n}")).collect();
+        assert_eq!(app.to_copy.take(), Some(expected.join("\n\n")));
+
+        app.handle_terminal_event(&mouse(MouseEventKind::ScrollUp, 3, 10));
+        assert_eq!(app.scroll, Scroll::Back(3));
+        app.handle_terminal_event(&mouse(MouseEventKind::ScrollDown, 3, 10));
+        assert_eq!(app.scroll, Scroll::Latest);
+        assert_eq!(
+            app.view.get().locate(3, 10).map(|l| l.position),
+            Some(Position {
+                line: view.top.saturating_add(8),
+                column: 3
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_event_loop_highlights_a_selection_and_copies_it() {
+        use base64::Engine as _;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let app = app_with_two_notes(dir.path());
+        let (events, input) = futures::channel::mpsc::unbounded::<std::io::Result<Event>>();
+        let left = MouseButton::Left;
+        for event in [
+            mouse(MouseEventKind::Down(left), 3, 2),
+            mouse(MouseEventKind::Drag(left), 7, 2),
+            mouse(MouseEventKind::Up(left), 7, 2),
+        ] {
+            assert!(events.unbounded_send(Ok(event)).is_ok());
+        }
+        // The stream's end stops the loop.
+        drop(events);
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 30))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let mut sent = Vec::new();
+        let result = app
+            .run_with(&mut terminal, input, Clipboard::terminal_only(&mut sent))
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let sequence = String::from_utf8_lossy(&sent);
+        let copied = sequence
+            .strip_prefix("\u{1b}]52;c;")
+            .and_then(|rest| rest.strip_suffix("\u{1b}\\"))
+            .and_then(|payload| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(payload)
+                    .ok()
+            });
+        assert_eq!(copied.as_deref(), Some(b"alpha".as_slice()), "{sequence}");
+
+        let buffer = terminal.backend().buffer();
+        let reversed: String = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert_eq!(reversed, "alpha");
+        let status = rows_of(buffer).last().cloned().unwrap_or_default();
+        assert_eq!(
+            status.trim(),
+            "sent 5 characters to the terminal's clipboard"
+        );
     }
 
     #[test]
