@@ -376,6 +376,15 @@ impl Turn {
     }
 }
 
+/// Why a line is run as SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlIntent {
+    /// `/sql` said so.
+    Stated,
+    /// It starts with a SQL keyword, as a question can.
+    Guessed,
+}
+
 /// The command popup's state while a slash command is typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Popup {
@@ -1872,7 +1881,7 @@ impl App {
             SlashCommand::Path { route } => self.show_path(&route),
             SlashCommand::Sql {
                 statement: Some(sql),
-            } => self.run_direct_sql(sql),
+            } => self.run_direct_sql(sql, SqlIntent::Stated),
             SlashCommand::Sql { statement: None } => self.edit_last_sql(),
             SlashCommand::Share => self.set_sharing(Sharing::Shared),
             SlashCommand::Unshare => self.set_sharing(Sharing::Private),
@@ -2459,7 +2468,7 @@ impl App {
         match Input::classify(line) {
             Input::Command(command) => self.handle_slash_command(&command),
             Input::Files(paths) => self.load_files(paths),
-            Input::Sql(sql) => self.run_direct_sql(sql),
+            Input::Sql(sql) => self.run_direct_sql(sql, SqlIntent::Guessed),
             Input::Question(question) if self.config.general.chat_model.is_none() => {
                 self.note(MessageKind::User, question);
                 self.note(MessageKind::System, NO_CHAT_MODEL_TEXT);
@@ -2468,23 +2477,38 @@ impl App {
         }
     }
 
-    /// `/sql`: the same gate the agent's statements pass. Internal tables
-    /// are refused, an invalid statement is reported, and a write asks
-    /// y/n/a unless writes are already allowed for the session.
-    fn run_direct_sql(&mut self, sql: String) {
+    /// `/sql`, or a line that starts like a statement: the same gate the
+    /// agent's statements pass. Internal tables are refused, an invalid
+    /// statement is reported (or asked as a question, when it was only
+    /// guessed to be SQL), and a write asks y/n/a unless writes are
+    /// already allowed for the session.
+    fn run_direct_sql(&mut self, sql: String, intent: SqlIntent) {
         self.note(MessageKind::User, sql.clone());
-        self.last_sql = Some(sql.clone());
         // Classifying is a parse: the reader pool does it, off the loop.
         let statement = sql.clone();
         self.on_db(
             Side::Read,
             move |db| db.classify_user_statement(&statement),
-            move |app, kind| app.gate_direct_sql(sql, kind),
+            move |app, kind| app.gate_direct_sql(sql, kind, intent),
         );
     }
 
     /// Run a classified statement, or ask before a write.
-    fn gate_direct_sql(&mut self, sql: String, kind: CoreResult<StatementKind>) {
+    fn gate_direct_sql(&mut self, sql: String, kind: CoreResult<StatementKind>, intent: SqlIntent) {
+        // DuckDB could not parse it, so a question that happens to start
+        // with a keyword goes to the model after all.
+        if let Ok(StatementKind::Invalid(message)) = &kind
+            && intent == SqlIntent::Guessed
+            && self.config.general.chat_model.is_some()
+        {
+            self.note(
+                MessageKind::System,
+                format!("Not SQL ({message}), so asked as a question. /sql runs a line as typed."),
+            );
+            self.submit_turn(sql);
+            return;
+        }
+        self.last_sql = Some(sql.clone());
         match kind {
             Ok(StatementKind::Read) => self.execute_direct_sql(sql, Side::Read),
             Ok(StatementKind::Write) if self.writes_allowed() => {
@@ -2536,6 +2560,11 @@ impl App {
     /// everything else stays usable.
     fn start_agent_turn(&mut self, message: String) {
         self.note(MessageKind::User, message.clone());
+        self.submit_turn(message);
+    }
+
+    /// [`Self::start_agent_turn`] for a message already in the transcript.
+    fn submit_turn(&mut self, message: String) {
         let behind = self.current_turn();
 
         let (sink, rx) = events::channel();
@@ -4023,6 +4052,67 @@ mod tests {
         app.submit_message();
         settle(&mut app).await;
         assert!(last(&app).content.contains("42"), "{}", last(&app).content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_question_that_starts_like_sql_is_asked_when_it_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = Config::default();
+        config.general.chat_model = "ollama/llama3".parse().ok();
+        assert!(config.general.chat_model.is_some());
+        let mut app = app_with(dir.path(), config);
+        let chat_jobs = |app: &App| {
+            app.jobs
+                .list()
+                .iter()
+                .filter(|job| job.kind == JobKind::Chat)
+                .count()
+        };
+
+        app.set_input("show me the first five rows");
+        app.submit_message();
+        db_settle(&mut app).await;
+        assert_eq!(chat_jobs(&app), 1, "it became a turn");
+        app.cancel_all_jobs();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.kind == MessageKind::System && m.content.starts_with("Not SQL (")),
+        );
+        // Shown once, and not remembered as the last statement.
+        let shown = app
+            .messages
+            .iter()
+            .filter(|m| m.kind == MessageKind::User)
+            .count();
+        assert_eq!(shown, 1);
+        assert!(app.last_sql.is_none());
+
+        // `/sql` says it is a statement, so its syntax error is reported.
+        app.handle_slash_command("/sql show me the first five rows");
+        db_settle(&mut app).await;
+        assert_eq!(last(&app).kind, MessageKind::Error);
+        assert_eq!(chat_jobs(&app), 1);
+
+        // A statement that parses runs as SQL, even when it then fails.
+        app.set_input("SELECT * FROM no_such_table");
+        app.submit_message();
+        settle(&mut app).await;
+        assert_eq!(last(&app).kind, MessageKind::Error);
+        assert!(last(&app).content.contains("no_such_table"));
+        assert_eq!(chat_jobs(&app), 1);
+        assert_eq!(app.last_sql.as_deref(), Some("SELECT * FROM no_such_table"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_chat_model_a_line_that_starts_like_sql_reports_its_syntax_error() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        app.set_input("show me the first five rows");
+        app.submit_message();
+        db_settle(&mut app).await;
+        assert_eq!(last(&app).kind, MessageKind::Error);
+        assert!(app.jobs.list().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
