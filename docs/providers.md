@@ -213,6 +213,51 @@ issuer at each rotation step. [`authentication.md`](authentication.md#letting-qu
 lists its options. When `[server.oidc]` names the same issuer, one registration and one key
 serve both.
 
+## Proxies
+
+quack sends every outbound HTTP request through the forward proxy the environment names:
+model providers, Amazon Bedrock and its AWS credential calls, OAuth and OpenID Connect
+issuers, and `quack import` of an HTTP(S) file.
+
+| Variable | Used for |
+|---|---|
+| `HTTPS_PROXY` | `https://` requests |
+| `HTTP_PROXY` | `http://` requests |
+| `ALL_PROXY` | a scheme whose own variable is unset |
+| `NO_PROXY` | hosts to reach directly, comma-separated |
+
+The upper-case name wins over the lower-case one. A value without a scheme is an `http://`
+proxy. Credentials go in the URL (`http://user:password@proxy.corp:8080`); quack never
+prints them.
+
+**Always direct.** `localhost`, `127.0.0.0/8`, `::1`, and `169.254.0.0/16` never go through
+the proxy, whatever `NO_PROXY` holds. A local Ollama and the EC2 and ECS credential
+endpoints therefore need no entry. A model server on another host does: under Docker
+Compose, add the `ollama` service name to `NO_PROXY`.
+
+**`NO_PROXY` forms.** A domain matches itself and its subdomains (`corp.example` and
+`.corp.example` are the same). An address (`10.1.2.3`) and a range (`10.0.0.0/8`) match
+addresses written in the URL. A lone `*` matches every hostname, but no address. Globs
+(`*.corp.example`) and entries with a port (`host:8443`) match nothing; `quack doctor` names
+them.
+
+**Limits.**
+
+- SOCKS proxies are not supported. Requests through one fail, and `quack doctor` fails the
+  check.
+- Amazon Bedrock's `converse` API and AWS credential calls take one proxy. When
+  `HTTP_PROXY` and `HTTPS_PROXY` differ they use `HTTPS_PROXY`, and an `http://` Bedrock
+  `base_url` is reached directly.
+- `quack import` from Postgres connects over TCP and uses no proxy.
+- A proxy that inspects TLS presents its own certificate. Add its certificate authority
+  to the operating system's trust store.
+- With `[import].allow_private_hosts` off, an import through a proxy checks only an
+  address written in the URL. The proxy resolves names, so the proxy decides which hosts
+  a name may reach.
+
+`quack doctor` prints the proxy in effect, and `quack config` lists which of the four
+variables are set.
+
 ## Recipe: Amazon Bedrock
 
 Bedrock has two endpoints that host different models, so quack has one provider type for

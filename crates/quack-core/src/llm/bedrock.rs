@@ -61,6 +61,7 @@ use crate::config::{
     AwsRegion, BaseUrl, BedrockApi, BedrockConfig, BedrockEndpoint, ProviderConfig, ProviderName,
 };
 use crate::error::{Error, Result};
+use crate::proxy::Proxies;
 
 /// rig's Bedrock client: completions over the Converse API, embeddings
 /// over `InvokeModel` (Titan Text Embeddings V2's request shape).
@@ -387,19 +388,11 @@ fn runtime_endpoint_override(sdk: &SdkConfig) -> Option<String> {
 /// profile and region when the file names them, the SDK's defaults
 /// otherwise, and the provider's request limit on model calls.
 async fn sdk_config(name: &ProviderName, provider: &ProviderConfig) -> SdkConfig {
-    use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
-    // The same module `crypto::install_default_provider` installs: FIPS on
-    // Linux, where the feature is on (docs/crypto.md).
-    #[cfg(target_os = "linux")]
-    let mode = CryptoMode::AwsLcFips;
-    #[cfg(not(target_os = "linux"))]
-    let mode = CryptoMode::AwsLc;
-    let mut loader = aws_config::defaults(BehaviorVersion::latest()).http_client(LimitedAwsHttp {
-        inner: aws_smithy_http_client::Builder::new()
-            .tls_provider(tls::Provider::Rustls(mode))
-            .build_https(),
-        gates: ProviderGates::for_provider(name, provider),
-    });
+    let mut loader =
+        aws_config::defaults(BehaviorVersion::latest()).http_client(LimitedAwsHttp::new(
+            ProviderGates::for_provider(name, provider),
+            Proxies::from_env(),
+        ));
     if let Some(profile) = provider.auth.aws_profile() {
         loader = loader.profile_name(profile);
     }
@@ -529,6 +522,34 @@ struct LimitedAwsHttp {
     gates: ProviderGates,
 }
 
+impl LimitedAwsHttp {
+    fn new(gates: ProviderGates, proxies: &Proxies) -> Self {
+        use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
+        // The same module `crypto::install_default_provider` installs: FIPS on
+        // Linux, where the feature is on (docs/crypto.md).
+        #[cfg(target_os = "linux")]
+        let mode = CryptoMode::AwsLcFips;
+        #[cfg(not(target_os = "linux"))]
+        let mode = CryptoMode::AwsLc;
+        let proxy = proxies.aws();
+        // `build_https` takes no proxy; the SDK builds its own default
+        // client through this function for the same reason.
+        let inner = aws_smithy_http_client::Builder::new().build_with_connector_fn(
+            move |settings, components| {
+                let mut connector = aws_smithy_http_client::Connector::builder()
+                    .tls_provider(tls::Provider::Rustls(mode.clone()))
+                    .proxy_config(proxy.clone());
+                connector.set_connector_settings(settings.cloned());
+                if let Some(components) = components {
+                    connector.set_sleep_impl(components.sleep_impl());
+                }
+                connector.build()
+            },
+        );
+        Self { inner, gates }
+    }
+}
+
 impl HttpClient for LimitedAwsHttp {
     fn http_connector(
         &self,
@@ -621,6 +642,7 @@ mod tests {
 
     use super::*;
     use crate::config::{ProviderType, RequestLimit};
+    use crate::proxy::{Environment, Variable};
     use aws_types::service_config::{LoadServiceConfig, ServiceConfigKey};
 
     #[expect(clippy::panic, reason = "test failure path")]
@@ -1198,6 +1220,64 @@ mod tests {
         assert!(
             captured.iter().any(|uri| uri.contains("/model/")),
             "{captured:?}"
+        );
+    }
+
+    /// The SDK client opens a tunnel through the proxy for a Bedrock
+    /// request, where the SDK's builder alone would connect directly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sdk_client_tunnels_through_the_proxy() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let seen = tokio::spawn(async move {
+            let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept());
+            let Ok(Ok((mut socket, _))) = accepted.await else {
+                return String::new();
+            };
+            let mut buf = [0_u8; 2048];
+            let read = socket.read(&mut buf).await.unwrap_or_default();
+            drop(
+                socket
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n")
+                    .await,
+            );
+            let request = String::from_utf8_lossy(buf.get(..read).unwrap_or_default());
+            request.lines().next().unwrap_or_default().to_owned()
+        });
+        let proxies = Proxies::new(Environment {
+            https: Variable::named("HTTPS_PROXY", &format!("http://{addr}")),
+            ..Environment::default()
+        });
+        let sdk = aws_config::defaults(BehaviorVersion::latest())
+            .http_client(LimitedAwsHttp::new(ProviderGates::default(), &proxies))
+            .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
+                "AKIDEXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                None,
+                None,
+                "test",
+            )))
+            .region(Region::new("us-west-2"))
+            .endpoint_url("https://bedrock.invalid")
+            .retry_config(aws_config::retry::RetryConfig::disabled())
+            .load()
+            .await;
+        let sent = aws_sdk_bedrockruntime::Client::new(&sdk)
+            .invoke_model()
+            .model_id("amazon.titan-embed-text-v2:0")
+            .body(aws_smithy_types::Blob::new(b"{}".to_vec()))
+            .send()
+            .await;
+        assert!(sent.is_err(), "the stand-in proxy refuses the tunnel");
+        assert_eq!(
+            seen.await.unwrap_or_default(),
+            "CONNECT bedrock.invalid:443 HTTP/1.1"
         );
     }
 

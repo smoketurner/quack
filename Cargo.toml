@@ -67,6 +67,7 @@ ego-tree             = { version = "=0.11.0", default-features = false } # scrap
 fluent-bundle        = { version = "=0.16.0", default-features = false }
 futures              = { version = "=0.3.34", default-features = false }
 http                 = { version = "=1.5.0", default-features = false }
+hyper-util           = { version = "=0.1.21", default-features = false } # the proxy matcher reqwest and the AWS client both run
 http-body            = { version = "=1.1.0", default-features = false } # a Bedrock response body that holds its request permit
 i18n-embed           = { version = "=0.16.0", default-features = false }
 i18n-embed-fl        = { version = "=0.10.1", default-features = false }

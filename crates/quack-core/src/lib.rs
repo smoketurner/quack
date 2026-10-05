@@ -21,6 +21,7 @@ pub mod ontology;
 pub mod prefix;
 pub mod priority;
 pub mod progress;
+pub mod proxy;
 pub mod storage;
 pub mod text;
 pub mod vault;

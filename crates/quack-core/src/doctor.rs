@@ -30,6 +30,7 @@ use crate::llm::oauth::{KeySource, TokenManager};
 use crate::llm::sampling::{Sampling, Wire, check_tool_calls};
 use crate::llm::{ChatClient, ProviderModels, RerankModel};
 use crate::oidc::SignIn;
+use crate::proxy::Proxies;
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::WorkspaceDb;
 use crate::text::Count;
@@ -65,6 +66,8 @@ text_enum!(Status, "check status", {
 pub enum Area {
     Config,
     Crypto,
+    /// The forward proxy outbound requests use.
+    Proxy,
     Data,
     #[serde(rename = "control db")]
     ControlDb,
@@ -82,6 +85,7 @@ pub enum Area {
 text_enum!(Area, "doctor area", {
     Config => "config",
     Crypto => "crypto",
+    Proxy => "proxy",
     Data => "data",
     ControlDb => "control db",
     Workspace => "workspace",
@@ -225,7 +229,8 @@ impl Probing {
         let Self::Online { timeout } = self else {
             return None;
         };
-        reqwest::Client::builder()
+        Proxies::from_env()
+            .client()
             .timeout(timeout)
             .connect_timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -241,6 +246,7 @@ pub async fn run(inspection: &Inspection, options: &Options) -> Report {
     check_config(&mut report, inspection);
     let config = &inspection.config;
     check_crypto(&mut report);
+    check_proxy(&mut report, Proxies::from_env());
     let data_ready = check_data_dir(&mut report, config.data_dir());
     let control = if data_ready {
         check_control(&mut report, config).await
@@ -319,6 +325,49 @@ fn check_crypto(report: &mut Report) {
     } else {
         report.push(Check::new(Area::Crypto, Status::Ok, module.to_string()));
     }
+}
+
+/// What the proxy variables amount to, and each one that does not do what
+/// it says. No request is made.
+fn check_proxy(report: &mut Report, proxies: &Proxies) {
+    for problem in proxies.problems() {
+        let status = if problem.is_failure() {
+            Status::Fail
+        } else {
+            Status::Warn
+        };
+        report.push(Check::new(Area::Proxy, status, problem.to_string()).fix(problem.fix()));
+    }
+    let mut through = Vec::new();
+    if let Some(proxy) = proxies.https() {
+        through.push(format!("HTTPS through {proxy}"));
+    }
+    if let Some(proxy) = proxies.http() {
+        through.push(format!("HTTP through {proxy}"));
+    }
+    if through.is_empty() {
+        if proxies.problems().is_empty() {
+            report.push(Check::new(
+                Area::Proxy,
+                Status::Ok,
+                "none (no proxy variables set)",
+            ));
+        }
+        return;
+    }
+    let listed = match proxies.no_proxy_entries() {
+        0 => String::new(),
+        1 => String::from(", NO_PROXY (1 entry)"),
+        n => format!(", NO_PROXY ({n} entries)"),
+    };
+    report.push(Check::new(
+        Area::Proxy,
+        Status::Ok,
+        format!(
+            "{}; direct: loopback, 169.254.0.0/16{listed}",
+            through.join(", ")
+        ),
+    ));
 }
 
 /// Returns whether the directory exists, so the checks that read what is
@@ -1502,6 +1551,105 @@ impl std::fmt::Display for ErrorChain<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::{Environment, Variable};
+
+    fn proxy_checks(environment: Environment) -> Vec<Check> {
+        let mut report = Report::default();
+        check_proxy(&mut report, &Proxies::new(environment));
+        report.checks
+    }
+
+    #[test]
+    fn the_proxy_check_says_what_goes_where() {
+        let none = proxy_checks(Environment::default());
+        assert_eq!(
+            none,
+            [Check::new(
+                Area::Proxy,
+                Status::Ok,
+                "none (no proxy variables set)"
+            )]
+        );
+
+        let both = proxy_checks(Environment {
+            http: Variable::named("HTTP_PROXY", "http://user:s3cret@proxy.corp:8080"),
+            https: Variable::named("HTTPS_PROXY", "http://user:s3cret@proxy.corp:8080"),
+            all: None,
+            no: Variable::named("NO_PROXY", "internal.corp,10.0.0.0/8,.models.corp"),
+        });
+        assert_eq!(
+            both,
+            [Check::new(
+                Area::Proxy,
+                Status::Ok,
+                "HTTPS through proxy.corp:8080, HTTP through proxy.corp:8080; direct: loopback, \
+                 169.254.0.0/16, NO_PROXY (3 entries)"
+            )]
+        );
+
+        let https_only = proxy_checks(Environment {
+            https: Variable::named("https_proxy", "proxy.corp:3128"),
+            ..Environment::default()
+        });
+        assert_eq!(
+            https_only.first().map(|c| c.summary.as_str()),
+            Some("HTTPS through proxy.corp:3128; direct: loopback, 169.254.0.0/16")
+        );
+    }
+
+    #[test]
+    fn the_proxy_check_fails_what_cannot_work_and_warns_on_dead_no_proxy_entries() {
+        let socks = proxy_checks(Environment {
+            https: Variable::named("HTTPS_PROXY", "socks5://127.0.0.1:1080"),
+            ..Environment::default()
+        });
+        let first = socks.first().cloned();
+        assert_eq!(
+            first,
+            Some(
+                Check::new(
+                    Area::Proxy,
+                    Status::Fail,
+                    "HTTPS_PROXY is a socks5 proxy, which quack does not support; requests \
+                     through it fail"
+                )
+                .fix("set HTTPS_PROXY to an http:// or https:// proxy URL, or unset it")
+            )
+        );
+
+        let unusable = proxy_checks(Environment {
+            http: Variable::named("HTTP_PROXY", "ftp://proxy.corp"),
+            ..Environment::default()
+        });
+        assert_eq!(
+            unusable,
+            [Check::new(
+                Area::Proxy,
+                Status::Fail,
+                "HTTP_PROXY is not an http:// or https:// proxy URL; requests go direct until \
+                 it is fixed"
+            )
+            .fix("set HTTP_PROXY to an http:// or https:// proxy URL, or unset it")]
+        );
+
+        let glob = proxy_checks(Environment {
+            https: Variable::named("HTTPS_PROXY", "http://proxy.corp:8080"),
+            no: Variable::named("NO_PROXY", "*.internal"),
+            ..Environment::default()
+        });
+        assert_eq!(
+            glob.first().cloned(),
+            Some(
+                Check::new(
+                    Area::Proxy,
+                    Status::Warn,
+                    "NO_PROXY entry \"*.internal\" never matches"
+                )
+                .fix("write \".internal\"")
+            )
+        );
+        assert_eq!(glob.len(), 2);
+    }
 
     #[expect(clippy::unwrap_used, reason = "test")]
     fn embedding_config(model: &str, extra: &str) -> Config {

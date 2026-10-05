@@ -825,7 +825,10 @@ files) are refused for every caller. The CLI, the terminal, and `quack serve --l
 the owner and reach any other source. `quack serve` with logins refuses `sqlite:` paths
 unless `[import].allow_local_files` is on. Unless `allow_private_hosts` is on, it resolves
 the host first, refuses loopback, private, link-local, and metadata addresses, pins the
-connection to the checked addresses, and does not follow redirects.
+connection to the checked addresses, and does not follow redirects. When a forward proxy
+applies to the URL (`HTTPS_PROXY`, `HTTP_PROXY`; loopback and link-local are never proxied),
+the proxy resolves the name, so quack checks only an address written in the URL and the
+proxy decides which hosts a name may reach.
 
 **Table naming.** The sanitized file stem. On collision the web UI and TUI ask (replace,
 rename, skip); the API and print mode require an explicit name. The prompt describes tables
@@ -1334,6 +1337,11 @@ assistant message that produced it and appears there in every rendering.
 embedding model, width, or prefixes leaves a workspace's vectors stale, not wrong: they are
 not searched, and their chunks are found by keyword. `quack embeddings refresh` shows what
 it will refresh, asks, and updates them in place (section 5.4).
+
+**Proxies.** Every outbound HTTP client takes its forward proxy from `proxy::Proxies`, which
+reads `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` once. It configures reqwest and
+the AWS SDK connector alike, and never proxies loopback or `169.254.0.0/16`, so a local model
+server and the instance credential endpoints stay direct (`docs/providers.md`).
 
 ### 10.2 Authentication
 
