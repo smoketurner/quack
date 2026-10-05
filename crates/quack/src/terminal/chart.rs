@@ -300,14 +300,20 @@ impl Pie<'_> {
 
     /// The slice that holds `turn`, a share of the full circle clockwise
     /// from twelve o'clock.
+    #[expect(clippy::cast_precision_loss, reason = "a slice's share of the total")]
     fn slice_at(&self, turn: f64) -> Option<usize> {
+        let total = self.total();
+        if total == 0 {
+            return None;
+        }
+        let total = total as f64;
         let mut end = 0.0;
         let mut last = None;
         for (index, slice) in self.0.iter().enumerate() {
             if slice.value == 0 {
                 continue;
             }
-            end += self.share(slice);
+            end += slice.value as f64 / total;
             if turn < end {
                 return Some(index);
             }
