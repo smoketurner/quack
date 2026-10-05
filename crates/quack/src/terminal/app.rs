@@ -1681,6 +1681,7 @@ impl App {
     /// Clear the transcript; streaming turns start a new message.
     fn clear_transcript(&mut self) {
         self.messages.clear();
+        self.wrap_cache.borrow_mut().clear();
         self.scroll = Scroll::Latest;
         for turn in &mut self.turns {
             turn.streaming = None;
@@ -4724,5 +4725,20 @@ mod tests {
         assert_eq!(note.outcome(), Ok(String::from("Loaded x")));
         let failed = BackgroundResult::from(Err(anyhow!("outer").context("while loading")));
         assert_eq!(failed.outcome(), Err(String::from("while loading: outer")));
+    }
+
+    #[test]
+    fn clear_transcript_clears_the_wrap_cache_so_a_replay_renders_fresh() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        app.messages
+            .push(Message::new(MessageKind::Assistant, String::from("cached")));
+        drop(ui::format_messages(&app, 60));
+        assert!(!app.wrap_cache.borrow().is_empty());
+        app.clear_transcript();
+        assert!(
+            app.wrap_cache.borrow().is_empty(),
+            "clear_transcript must reset the render cache so a repopulation cannot reuse stale slots",
+        );
     }
 }
