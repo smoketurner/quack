@@ -8,6 +8,8 @@ use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
+use crate::terminal::ui::wrap;
+
 type Row = Vec<Span<'static>>;
 
 /// Columns of a thematic break.
@@ -17,11 +19,14 @@ const CODE: Style = Style::new().fg(Color::Cyan);
 const DIM: Style = Style::new().fg(Color::DarkGray);
 
 /// `content` as rows: headings bold, list items marked and indented, code
-/// verbatim, tables as aligned columns, and a link's address after its
-/// text. A line break in the source stays a line break.
-pub(crate) fn render(content: &str) -> Vec<Row> {
+/// verbatim, tables as aligned columns that fit `width`, and a link's
+/// address after its text. A line break in the source stays a line break.
+pub(crate) fn render(content: &str, width: usize) -> Vec<Row> {
     let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
-    let mut renderer = Renderer::default();
+    let mut renderer = Renderer {
+        width,
+        ..Renderer::default()
+    };
     for event in Parser::new_ext(content, options) {
         renderer.event(event);
     }
@@ -30,6 +35,8 @@ pub(crate) fn render(content: &str) -> Vec<Row> {
 
 #[derive(Default)]
 struct Renderer {
+    /// Columns a row may take before the transcript wraps it.
+    width: usize,
     rows: Vec<Row>,
     /// The row being written.
     current: Row,
@@ -76,28 +83,40 @@ struct Link {
     text: String,
 }
 
-/// A table being read: its cells are rows of spans until every column's
+/// A table being read: its cells are lines of spans until every column's
 /// width is known.
 #[derive(Default)]
 struct Table {
     alignments: Vec<Alignment>,
-    header: Vec<Row>,
-    body: Vec<Vec<Row>>,
+    header: Vec<Cell>,
+    body: Vec<Vec<Cell>>,
     /// The cells of the row being read.
-    cells: Vec<Row>,
+    cells: Vec<Cell>,
+    /// The lines of the cell being read that a break has ended.
+    lines: Cell,
 }
 
+/// A cell's lines: one, unless the cell holds line breaks.
+type Cell = Vec<Row>;
+
 impl Table {
-    fn cell_width(cell: &[Span<'static>]) -> usize {
-        cell.iter().map(Span::width).sum()
+    /// Columns between two cells: a bar with a space either side.
+    const GAP: usize = 3;
+
+    fn line_width(line: &[Span<'static>]) -> usize {
+        line.iter().map(Span::width).sum()
     }
 
-    /// Each column's width: its widest cell.
-    fn widths(&self) -> Vec<usize> {
+    /// Each column's width when nothing is wrapped: its widest line.
+    fn natural_widths(&self) -> Vec<usize> {
         let mut widths: Vec<usize> = Vec::new();
         for row in self.body.iter().chain([&self.header]) {
             for (column, cell) in row.iter().enumerate() {
-                let width = Self::cell_width(cell);
+                let width = cell
+                    .iter()
+                    .map(|line| Self::line_width(line))
+                    .max()
+                    .unwrap_or(0);
                 match widths.get_mut(column) {
                     Some(widest) => *widest = width.max(*widest),
                     None => widths.push(width),
@@ -107,37 +126,82 @@ impl Table {
         widths
     }
 
-    /// One row's cells padded to `widths` by each column's alignment.
-    fn line(&self, cells: &[Row], widths: &[usize]) -> Row {
-        let mut line = Row::new();
-        for (column, width) in widths.iter().enumerate() {
-            if column > 0 {
-                line.push(Span::styled(" \u{2502} ", DIM));
+    /// `natural` narrowed to `available` columns in all: the narrowest
+    /// columns keep their width and the wide ones share what is left.
+    fn fit(natural: &[usize], available: usize) -> Vec<usize> {
+        let mut order: Vec<(usize, usize)> = natural.iter().copied().enumerate().collect();
+        order.sort_by_key(|(_, width)| *width);
+        let mut widths = natural.to_vec();
+        let mut left = available;
+        let mut remaining = order.len();
+        for (column, width) in order {
+            // At least one, so wrapping a cell always ends.
+            let share = left.checked_div(remaining).unwrap_or(0).max(1);
+            let width = width.min(share);
+            if let Some(slot) = widths.get_mut(column) {
+                *slot = width;
             }
-            let cell = cells.get(column).map_or(&[][..], Vec::as_slice);
-            let pad = width.saturating_sub(Self::cell_width(cell));
-            let before = match self.alignments.get(column) {
-                Some(Alignment::Right) => pad,
-                Some(Alignment::Center) => pad.checked_div(2).unwrap_or(0),
-                Some(Alignment::Left | Alignment::None) | None => 0,
-            };
-            let after = pad.saturating_sub(before);
-            if before > 0 {
-                line.push(Span::raw(" ".repeat(before)));
-            }
-            line.extend(cell.iter().cloned());
-            // No padding after the last column: it would only wrap.
-            if after > 0 && column.saturating_add(1) < widths.len() {
-                line.push(Span::raw(" ".repeat(after)));
-            }
+            left = left.saturating_sub(width);
+            remaining = remaining.saturating_sub(1);
         }
-        line
+        widths
     }
 
-    /// The header in bold, a rule, then the body.
-    fn rows(mut self) -> Vec<Row> {
-        let widths = self.widths();
-        for span in self.header.iter_mut().flatten() {
+    /// One table row as screen rows: each cell wrapped to its column and
+    /// padded by the column's alignment, as many rows as the tallest cell.
+    fn rows_of(&self, cells: &[Cell], widths: &[usize]) -> Vec<Row> {
+        let wrapped: Vec<Vec<Row>> = widths
+            .iter()
+            .enumerate()
+            .map(|(column, width)| {
+                cells
+                    .get(column)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|line| wrap::wrap(line, *width))
+                    .collect()
+            })
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let mut rows = Vec::new();
+        for at in 0..height {
+            let mut row = Row::new();
+            for (column, width) in widths.iter().enumerate() {
+                if column > 0 {
+                    row.push(Span::styled(" \u{2502} ", DIM));
+                }
+                let line = wrapped
+                    .get(column)
+                    .and_then(|lines| lines.get(at))
+                    .map_or(&[][..], Vec::as_slice);
+                let pad = width.saturating_sub(Self::line_width(line));
+                let before = match self.alignments.get(column) {
+                    Some(Alignment::Right) => pad,
+                    Some(Alignment::Center) => pad.checked_div(2).unwrap_or(0),
+                    Some(Alignment::Left | Alignment::None) | None => 0,
+                };
+                let after = pad.saturating_sub(before);
+                if before > 0 {
+                    row.push(Span::raw(" ".repeat(before)));
+                }
+                row.extend(line.iter().cloned());
+                // No padding after the last column: it would only wrap.
+                if after > 0 && column.saturating_add(1) < widths.len() {
+                    row.push(Span::raw(" ".repeat(after)));
+                }
+            }
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// The header in bold, a rule, then the body, no wider than `width`
+    /// while every column can keep at least one.
+    fn rows(mut self, width: usize) -> Vec<Row> {
+        let natural = self.natural_widths();
+        let gaps = natural.len().saturating_sub(1).saturating_mul(Self::GAP);
+        let widths = Self::fit(&natural, width.saturating_sub(gaps));
+        for span in self.header.iter_mut().flatten().flatten() {
             span.style = span.style.add_modifier(Modifier::BOLD);
         }
         let rule = widths
@@ -145,12 +209,10 @@ impl Table {
             .map(|width| "\u{2500}".repeat(*width))
             .collect::<Vec<_>>()
             .join("\u{2500}\u{253C}\u{2500}");
-        let mut rows = vec![
-            self.line(&self.header, &widths),
-            vec![Span::styled(rule, DIM)],
-        ];
+        let mut rows = self.rows_of(&self.header, &widths);
+        rows.push(vec![Span::styled(rule, DIM)]);
         for cells in &self.body {
-            rows.push(self.line(cells, &widths));
+            rows.extend(self.rows_of(cells, &widths));
         }
         rows
     }
@@ -180,6 +242,12 @@ impl Renderer {
         prefix
     }
 
+    /// Columns [`Self::prefix`] takes.
+    fn prefix_width(&self) -> usize {
+        let lists: usize = self.lists.iter().map(|level| level.width).sum();
+        self.quotes.saturating_mul(2).saturating_add(lists)
+    }
+
     /// Close the row being written, if anything is on it.
     fn end_row(&mut self) {
         if self.current.is_empty() {
@@ -188,6 +256,21 @@ impl Renderer {
         let mut row = self.prefix();
         row.append(&mut self.current);
         self.rows.push(row);
+    }
+
+    /// A line break: inside a table cell it starts the cell's next line.
+    fn line_break(&mut self) {
+        match &mut self.table {
+            Some(table) => table.lines.push(mem::take(&mut self.current)),
+            None => self.end_row(),
+        }
+    }
+
+    /// Whether `html` is a `<br>` tag, which models write for a line
+    /// break inside a table cell.
+    fn is_break(html: &str) -> bool {
+        let tag = html.trim_start_matches('<').trim_end_matches('>');
+        tag.trim_end_matches('/').trim().eq_ignore_ascii_case("br")
     }
 
     /// Close the row being written and leave a blank one between blocks,
@@ -235,6 +318,7 @@ impl Renderer {
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
+            Event::InlineHtml(html) if Self::is_break(&html) => self.line_break(),
             Event::Text(text) | Event::InlineHtml(text) | Event::InlineMath(text) => {
                 self.text(&text);
             }
@@ -252,7 +336,7 @@ impl Renderer {
                 }
             }
             Event::FootnoteReference(name) => self.text(&format!("[^{name}]")),
-            Event::SoftBreak | Event::HardBreak => self.end_row(),
+            Event::SoftBreak | Event::HardBreak => self.line_break(),
             Event::Rule => {
                 self.start_block();
                 self.current
@@ -353,8 +437,10 @@ impl Renderer {
                 }
             }
             TagEnd::TableCell => {
-                let cell = mem::take(&mut self.current);
+                let line = mem::take(&mut self.current);
                 if let Some(table) = &mut self.table {
+                    table.lines.push(line);
+                    let cell = mem::take(&mut table.lines);
                     table.cells.push(cell);
                 }
             }
@@ -370,7 +456,14 @@ impl Renderer {
                 }
             }
             TagEnd::Table => {
-                let rows = self.table.take().map(Table::rows).unwrap_or_default();
+                // The row's prefix comes out of the table's width.
+                let indent = self.prefix_width();
+                let width = self.width.saturating_sub(indent);
+                let rows = self
+                    .table
+                    .take()
+                    .map(|table| table.rows(width))
+                    .unwrap_or_default();
                 for row in rows {
                     self.current = row;
                     self.end_row();
@@ -410,13 +503,14 @@ mod tests {
     }
 
     fn rendered(content: &str) -> Vec<String> {
-        text_of(&render(content))
+        text_of(&render(content, 80))
     }
 
     #[test]
     fn headings_bullets_fences_and_inline_marks_render() {
         let rows = render(
             "## Deadliest\n- **Tornado** in `Texas`, *twice*\n```sql\nSELECT 1\n\n\tFROM t\n```\n| a | b |",
+            80,
         );
         assert_eq!(
             text_of(&rows),
@@ -450,6 +544,7 @@ mod tests {
     fn a_table_is_columns_padded_by_their_alignment() {
         let rows = render(
             "| name | n | mid |\n|:--|--:|:-:|\n| a | 10 | x |\n| long | 2 | \u{65E5}\u{672C}\u{8A9E} |",
+            80,
         );
         assert_eq!(
             text_of(&rows),
@@ -475,6 +570,43 @@ mod tests {
                 "only \u{2502} "
             ]
         );
+    }
+
+    #[test]
+    fn a_table_wider_than_the_transcript_wraps_inside_its_columns() {
+        let table = "| k | value |\n|---|---|\n| a | one two three four<br>five |\n| bb | x |";
+        // The narrow column keeps its width; the wide one takes the rest
+        // and wraps, and a `<br>` starts a new line in its cell.
+        let rows = text_of(&render(table, 15));
+        assert_eq!(
+            rows,
+            [
+                "k  \u{2502} value",
+                "\u{2500}\u{2500}\u{2500}\u{253C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+                "a  \u{2502} one two ",
+                "   \u{2502} three four",
+                "   \u{2502} five",
+                "bb \u{2502} x",
+            ]
+        );
+        assert!(rows.iter().all(|row| row.chars().count() <= 15), "{rows:?}");
+        // Inside a list the marker's columns come out of the table's.
+        let listed = text_of(&render(
+            &format!("- item\n\n  {}", table.replace('\n', "\n  ")),
+            17,
+        ));
+        assert_eq!(
+            listed.get(1).map(String::as_str),
+            Some("  k  \u{2502} value")
+        );
+        assert!(
+            listed.iter().all(|row| row.chars().count() <= 17),
+            "{listed:?}"
+        );
+        // Too narrow for every column: each keeps one and wrapping ends.
+        assert!(!render(table, 1).is_empty());
+        // Outside a table a `<br>` is a line break too.
+        assert_eq!(rendered("one<br/>two<BR />three"), ["one", "two", "three"]);
     }
 
     #[test]

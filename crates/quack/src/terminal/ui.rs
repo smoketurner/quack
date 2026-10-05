@@ -691,7 +691,8 @@ impl Message {
             style
         };
         let body: Vec<Vec<Span<'static>>> = match self.kind {
-            MessageKind::Assistant => markdown::render(&self.content),
+            // Every row gets a three-column prefix below.
+            MessageKind::Assistant => markdown::render(&self.content, width.saturating_sub(3)),
             MessageKind::Step => self.step_rows(expand_steps, style),
             MessageKind::User
             | MessageKind::Sql
