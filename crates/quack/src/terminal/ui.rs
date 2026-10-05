@@ -117,25 +117,24 @@ impl fmt::Display for JobsIndicator {
 pub(crate) struct JobRow<'a>(pub(crate) &'a JobInfo);
 
 impl JobRow<'_> {
-    /// `/jobs`: number, state, kind, label, progress, and how it ended.
-    pub(crate) fn listing(&self) -> String {
+    /// Everything on record about it: number, state, kind, label, and
+    /// progress, then its latest status and how it ended.
+    pub(crate) fn details(&self) -> String {
         let job = self.0;
         let progress = job.progress.map(|p| format!(" {p}")).unwrap_or_default();
-        let outcome = match (&job.outcome, job.state) {
-            (Some(text), JobState::Succeeded | JobState::Failed | JobState::Cancelled)
-                if !text.is_empty() =>
-            {
-                format!(" \u{2014} {}", one_line(text))
-            }
-            _ => String::new(),
-        };
-        format!(
-            "#{:<3} {:<9} {:<8} {}{progress}{outcome}",
-            job.number,
-            job.state.as_str(),
-            job.kind.as_str(),
-            job.label
-        )
+        let mut text = format!(
+            "Job #{} {} {} {}{progress}",
+            job.number, job.state, job.kind, job.label
+        );
+        for extra in [job.status.as_deref(), job.outcome.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|extra| !extra.trim().is_empty())
+        {
+            text.push('\n');
+            text.push_str(extra);
+        }
+        text
     }
 
     /// Its strip row: a spinner while it runs, its number, kind, and label,
@@ -258,6 +257,23 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_input(frame, input_area, app, permission);
     draw_status(frame, status_area, app);
     draw_completion(frame, messages_area, jobs_area.y, app);
+    draw_picker(frame, messages_area, jobs_area.y, app);
+}
+
+/// The `/jobs` or `/sessions` box, drawn over `area` so its last row sits
+/// just above `bottom`, like the command popup.
+fn draw_picker(frame: &mut Frame<'_>, area: Rect, bottom: u16, app: &App) {
+    let Some(picker) = &app.picker else {
+        return;
+    };
+    let height = picker.height().min(bottom.saturating_sub(area.y));
+    let outer = Rect {
+        x: area.x,
+        y: bottom.saturating_sub(height),
+        width: area.width,
+        height,
+    };
+    frame.render_widget(picker, outer);
 }
 
 /// The command popup, drawn over the bottom of `area` so its last row sits

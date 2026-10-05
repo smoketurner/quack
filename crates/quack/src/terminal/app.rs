@@ -54,6 +54,7 @@ use crate::ontology_cli::{self, OntologyAction};
 use crate::terminal::SessionSetup;
 use crate::terminal::chart::ChartData;
 use crate::terminal::commands::{Completion, ContextAction, GraphWalk, Input, Route, SlashCommand};
+use crate::terminal::picker::{Picked, Picker};
 use crate::terminal::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
 
 /// The spinner's frame interval; it ticks only while a job is active.
@@ -64,6 +65,9 @@ const QUIT_GRACE: Duration = Duration::from_secs(3);
 
 /// Lines typed before, newest last; kept per data directory.
 const HISTORY_LINES: usize = 500;
+
+/// Sessions `/sessions` lists at most, newest first.
+const PICKER_SESSIONS: u32 = 200;
 
 const WELCOME_TEXT: &str = "\
 Welcome to quack!
@@ -785,6 +789,8 @@ pub(crate) struct App {
     job_events: broadcast::Receiver<JobInfo>,
     /// Jobs still queued or running, for the strip above the input.
     pub(crate) active_jobs: Vec<JobInfo>,
+    /// The `/jobs` or `/sessions` box, while it is open (and takes the keys).
+    pub(crate) picker: Option<Picker>,
     /// The session's database worker: every command's database step runs
     /// there, in the order typed, never on the event loop's thread.
     db_steps: Option<mpsc::UnboundedSender<DbStep>>,
@@ -856,6 +862,7 @@ impl App {
             jobs,
             job_events,
             active_jobs: Vec::new(),
+            picker: None,
             db_steps: None,
             pending_db: 0,
             switching: None,
@@ -1036,12 +1043,20 @@ impl App {
                 self.handle_paste(text);
                 true
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => {
+            Event::Mouse(mouse) => match (mouse.kind, &mut self.picker) {
+                (MouseEventKind::ScrollUp, Some(picker)) => {
+                    picker.up(1);
+                    true
+                }
+                (MouseEventKind::ScrollDown, Some(picker)) => {
+                    picker.down(1);
+                    true
+                }
+                (MouseEventKind::ScrollUp, None) => {
                     self.scroll_up(3);
                     true
                 }
-                MouseEventKind::ScrollDown => {
+                (MouseEventKind::ScrollDown, None) => {
                     self.scroll_down(3);
                     true
                 }
@@ -1056,7 +1071,7 @@ impl App {
     /// a paste into an empty input that names only loadable files loads
     /// them at once; any other is typed in.
     fn handle_paste(&mut self, text: &str) {
-        if self.awaiting_permission() {
+        if self.awaiting_permission() || self.picker.is_some() {
             return;
         }
         if self.textarea.is_empty()
@@ -1192,12 +1207,15 @@ impl App {
         &mut self,
         _event: &std::result::Result<JobInfo, broadcast::error::RecvError>,
     ) {
-        self.active_jobs = self
-            .jobs
-            .list()
-            .into_iter()
+        let jobs = self.jobs.list();
+        self.active_jobs = jobs
+            .iter()
             .filter(|j| !j.state.is_finished())
+            .cloned()
             .collect();
+        if let Some(picker) = &mut self.picker {
+            picker.follow_jobs(jobs);
+        }
         self.settle_turns();
     }
 
@@ -1430,21 +1448,55 @@ impl App {
         }
     }
 
-    /// `/jobs`: active jobs, then the most recent finished ones.
+    /// `/jobs`: every job on record in a box to move through, which
+    /// follows the queue while it is open.
     fn show_jobs(&mut self) {
         let jobs = self.jobs.list();
         if jobs.is_empty() {
             self.note(MessageKind::System, "No jobs yet.");
             return;
         }
-        let mut text = String::from("Jobs (newest last):");
-        let start = jobs.len().saturating_sub(20);
-        for job in jobs.iter().skip(start) {
-            text.push_str("\n  ");
-            text.push_str(&JobRow(job).listing());
+        self.picker = Some(Picker::jobs(jobs));
+    }
+
+    /// A key while the `/jobs` or `/sessions` box is open: move through
+    /// it, act on the highlighted row, or close it.
+    fn handle_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        match (code, modifiers) {
+            (KeyCode::Esc | KeyCode::Char('q'), _)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.picker = None;
+            }
+            (KeyCode::Up, _) => picker.up(1),
+            (KeyCode::Down, _) => picker.down(1),
+            (KeyCode::PageUp, _) => picker.up(10),
+            (KeyCode::PageDown, _) => picker.down(10),
+            (KeyCode::Home, _) => picker.first(),
+            (KeyCode::End, _) => picker.last(),
+            (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                if let Some(Picked::Job(job)) = picker.picked() {
+                    let number = job.number;
+                    self.cancel_job(number);
+                }
+            }
+            (KeyCode::Enter, _) => match picker.picked() {
+                Some(Picked::Job(job)) => {
+                    let details = JobRow(job).details();
+                    self.picker = None;
+                    self.note(MessageKind::System, details);
+                }
+                Some(Picked::Session(session)) => {
+                    let id = session.id.to_string();
+                    self.picker = None;
+                    self.switch_session(id);
+                }
+                None => self.picker = None,
+            },
+            _ => {}
         }
-        text.push_str("\n/cancel N stops a queued or running job.");
-        self.note(MessageKind::System, text);
     }
 
     /// Stop every job when the session ends: a running turn is recorded as
@@ -1477,6 +1529,10 @@ impl App {
         let ctrl_c = (code, modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL);
         if !ctrl_c && self.quit == Quit::Armed {
             self.quit = Quit::Stay;
+        }
+        if self.picker.is_some() && !self.awaiting_permission() {
+            self.handle_picker_key(code, modifiers);
+            return;
         }
         if ctrl_c {
             // The prompt on screen first, then this session's newest turn.
@@ -1892,32 +1948,18 @@ impl App {
         );
     }
 
+    /// `/sessions`: the most recent sessions in a box to move through;
+    /// Enter resumes the highlighted one.
     fn show_sessions(&mut self) {
         self.on_db_ok(
             Side::Read,
-            |db| sessions::list_sessions(db, 20),
+            |db| sessions::list_sessions(db, PICKER_SESSIONS),
             |app, rows| {
                 if rows.is_empty() {
                     app.note(MessageKind::System, "No sessions yet.");
                     return;
                 }
-                let mut text = String::from("Sessions (most recent first):");
-                for row in rows {
-                    let marker = if row.id == app.session_id { "*" } else { " " };
-                    let line = format!(
-                        "\n{marker} {}  {}  {:>3} msgs  {}",
-                        row.id,
-                        row.updated_at,
-                        row.message_count,
-                        row.title.as_deref().unwrap_or("(untitled)")
-                    );
-                    text.push_str(&line);
-                }
-                text.push_str(
-                    "\nUse /resume ID to switch (any unique prefix works; ids created close \
-                     together differ only near the end).",
-                );
-                app.note(MessageKind::System, text);
+                app.picker = Some(Picker::sessions(rows, app.session_id.clone()));
             },
         );
     }
@@ -2815,9 +2857,12 @@ mod tests {
 
         // Every job so far is on record.
         app.handle_slash_command("/jobs");
-        let listing = &last(&app).content;
+        let listing = screen(&app).join("\n");
+        assert!(listing.contains(" Jobs "), "{listing}");
         assert!(listing.contains("succeeded sql"), "{listing}");
         assert!(listing.contains("graph"), "{listing}");
+        app.handle_key_event(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.picker.is_none());
         app.handle_slash_command("/cancel 1");
         assert!(last(&app).content.contains("already succeeded"));
         app.handle_slash_command("/cancel x");
@@ -3411,6 +3456,96 @@ mod tests {
         assert!(sql_sink.send(()).is_ok());
         pump_until(&mut app, |app| app.active_jobs.is_empty()).await;
         assert_eq!(ui::JobStrip::of(&app).height(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_jobs_box_follows_the_queue_and_cancels_the_highlighted_job() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        app.handle_slash_command("/jobs");
+        assert!(app.picker.is_none(), "nothing to list");
+        assert_eq!(last(&app).content, "No jobs yet.");
+
+        let (_first_sink, first_rx) = tokio::sync::oneshot::channel::<()>();
+        app.jobs
+            .submit(JobSpec::new(JobKind::Sql, "first"), |_| async move {
+                drop(first_rx.await);
+                Ok(String::new())
+            });
+        pump_until(&mut app, |app| app.active_jobs.len() == 1).await;
+        app.handle_slash_command("/jobs");
+        let row_of = |app: &App, label: &str| {
+            screen(app)
+                .into_iter()
+                .find(|row| row.contains(label))
+                .unwrap_or_else(|| fail(&format!("no row for {label}")))
+        };
+        assert!(row_of(&app, "first").contains("\u{25B8} 1    running"));
+
+        // A job submitted while the box is open appears above, and the
+        // highlight stays on the job it was on.
+        app.jobs
+            .submit(JobSpec::new(JobKind::Sql, "second"), |ctx| async move {
+                ctx.cancel_token().cancelled().await;
+                Ok(String::new())
+            });
+        pump_until(&mut app, |app| app.active_jobs.len() == 2).await;
+        assert!(row_of(&app, "first").contains('\u{25B8}'));
+        assert!(!row_of(&app, "second").contains('\u{25B8}'));
+
+        // Keys go to the box, not the input; `c` cancels the highlighted job.
+        app.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
+        app.handle_key_event(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(app.textarea.is_empty());
+        assert!(last(&app).content.contains("Cancelling job #2"));
+        pump_until(&mut app, |app| app.active_jobs.len() == 1).await;
+        // The box follows the job to its end: this one's work returns
+        // as soon as it is cancelled.
+        let ended = row_of(&app, "second");
+        assert!(ended.contains("\u{25B8} 2    succeeded"), "{ended}");
+
+        // Enter posts the highlighted job's details and closes the box.
+        app.handle_key_event(KeyCode::End, KeyModifiers::NONE);
+        app.handle_key_event(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.picker.is_none());
+        assert_eq!(last(&app).content, "Job #1 running sql first");
+        app.handle_key_event(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            app.textarea.lines().join(""),
+            "x",
+            "the input has the keys again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sessions_box_resumes_the_highlighted_session() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let current = app.session_id.clone();
+        let newer = app
+            .db
+            .run_at(Priority::Interactive, |db| {
+                sessions::create_session(db, "m", ChatMode::Chat, None)
+            })
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+
+        app.handle_slash_command("/sessions");
+        db_settle(&mut app).await;
+        let drawn = screen(&app).join("\n");
+        assert!(drawn.contains(" Sessions "), "{drawn}");
+        assert!(drawn.contains("enter resume"), "{drawn}");
+        // The session on screen is marked and highlighted, under the
+        // newer one.
+        assert!(
+            drawn.contains(&format!("\u{25B8} * {}", current.short())),
+            "{drawn}"
+        );
+        app.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
+        app.handle_key_event(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.picker.is_none());
+        db_settle(&mut app).await;
+        assert_eq!(app.session_id, newer.id);
     }
 
     #[tokio::test(flavor = "multi_thread")]

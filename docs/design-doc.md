@@ -1834,8 +1834,11 @@ read at startup and again after a statement, an ingest, an import, or a turn.
 are each a job; the prompt takes the next line at once. A follow-up asked while an answer
 streams queues behind it in the session's lane and says so; SQL and file loads run
 alongside. A strip above the input shows running and queued jobs (spinner, number, kind,
-label, progress); the status line counts them; `/jobs` lists recent ones with outcomes;
-`/cancel N` stops one. Results land in the transcript as each job finishes. A turn's text
+label, progress); the status line counts them; `/jobs` opens a box over the transcript listing every job on
+record, newest first, which follows the queue while open (Up and Down move, `c` cancels the
+highlighted job, Enter posts its details, Esc closes); `/cancel N` stops one by number.
+`/sessions` opens the same box over the 200 most recent sessions, and Enter resumes the
+highlighted one. Results land in the transcript as each job finishes. A turn's text
 renders only while its session is on screen; switching sessions leaves it running, and a
 line reports its end. Write prompts from concurrent work queue and are answered one at a
 time.

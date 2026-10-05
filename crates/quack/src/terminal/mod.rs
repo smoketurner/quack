@@ -4,6 +4,7 @@ mod app;
 mod chart;
 mod commands;
 mod markdown;
+mod picker;
 mod sql;
 mod ui;
 
