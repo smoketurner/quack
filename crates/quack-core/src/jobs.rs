@@ -329,6 +329,15 @@ impl JobProgress {
             .saturating_mul(100)
             .checked_div(u64::from(self.total))
     }
+
+    /// The share done, from 0 to 1; 0 when there is nothing to count.
+    #[must_use]
+    pub fn ratio(self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        (f64::from(self.done) / f64::from(self.total)).min(1.0)
+    }
 }
 
 /// `1576/3835 (41%)`, or `0/0` when there is nothing to count.
@@ -962,6 +971,18 @@ mod tests {
             assert_eq!(key.to_string(), text);
             assert_eq!(Lane::serial(&key).key(), text);
         }
+    }
+
+    #[test]
+    fn progress_ratio_stays_between_zero_and_one() {
+        let ratio = |done, total| JobProgress { done, total }.ratio();
+        assert!(ratio(0, 0).abs() < f64::EPSILON, "nothing to count");
+        assert!((ratio(1, 4) - 0.25).abs() < f64::EPSILON);
+        assert!((ratio(4, 4) - 1.0).abs() < f64::EPSILON);
+        assert!(
+            (ratio(9, 4) - 1.0).abs() < f64::EPSILON,
+            "never past the end"
+        );
     }
 
     #[test]

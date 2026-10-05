@@ -2620,7 +2620,11 @@ mod tests {
     use quack_core::analysis::events::ToolStep;
 
     use super::*;
+    use crate::terminal::commands::Suggestion;
     use quack_core::ids::{ChunkId, DocumentId};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -3111,21 +3115,29 @@ mod tests {
         pending
     }
 
-    /// The input rows of a drawn frame: everything below the transcript's
-    /// last separator.
-    fn overlay(app: &App) -> String {
+    /// A buffer's rows as text.
+    fn rows_of(buffer: &Buffer) -> Vec<String> {
+        buffer
+            .content()
+            .chunks(usize::from(buffer.area.width).max(1))
+            .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
+            .collect()
+    }
+
+    /// The rows of a frame drawn 80 columns by 30 rows.
+    fn screen(app: &App) -> Vec<String> {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30))
             .unwrap_or_else(|e| fail(&e.to_string()));
         terminal
             .draw(|frame| ui::draw(frame, app))
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let buffer = terminal.backend().buffer();
-        let width = usize::from(buffer.area.width);
-        let rows: Vec<String> = buffer
-            .content()
-            .chunks(width)
-            .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
-            .collect();
+        rows_of(terminal.backend().buffer())
+    }
+
+    /// The input rows of a drawn frame: everything below the transcript's
+    /// last separator.
+    fn overlay(app: &App) -> String {
+        let rows = screen(app);
         let start = rows
             .iter()
             .rposition(|row| row.contains("Run this statement?"))
@@ -3390,7 +3402,7 @@ mod tests {
                 Ok(String::new())
             });
         pump_until(&mut app, |app| !app.active_jobs.is_empty()).await;
-        assert!(!ui::job_strip(&app).is_empty(), "the strip shows it");
+        assert_eq!(ui::JobStrip::of(&app).height(), 1, "the strip shows it");
         app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(app.quit, Quit::Armed);
         assert!(last(&app).content.contains("still running"));
@@ -3398,7 +3410,38 @@ mod tests {
         assert_eq!(app.quit, Quit::Now);
         assert!(sql_sink.send(()).is_ok());
         pump_until(&mut app, |app| app.active_jobs.is_empty()).await;
-        assert!(ui::job_strip(&app).is_empty());
+        assert_eq!(ui::JobStrip::of(&app).height(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_job_strip_draws_reported_progress_as_a_gauge() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let (sink, rx) = tokio::sync::oneshot::channel::<()>();
+        app.jobs
+            .submit(JobSpec::new(JobKind::Sql, "slow"), |ctx| async move {
+                ctx.progress(1, 4);
+                drop(rx.await);
+                Ok(String::new())
+            });
+        pump_until(&mut app, |app| {
+            app.active_jobs.iter().any(|job| job.progress.is_some())
+        })
+        .await;
+        let rows = screen(&app);
+        let row = rows
+            .iter()
+            .find(|row| row.contains("slow"))
+            .unwrap_or_else(|| fail(&rows.join("\n")));
+        // A quarter of the gauge's columns are filled.
+        let gauge = format!(
+            "slow  1/4 (25%) {}{} ",
+            "\u{2501}".repeat(4),
+            "\u{2500}".repeat(12)
+        );
+        assert!(row.contains(&gauge), "{row}");
+        assert!(sink.send(()).is_ok());
+        pump_until(&mut app, |app| app.active_jobs.is_empty()).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3478,10 +3521,12 @@ mod tests {
         let items = Completion::for_line("/mode ")
             .map(|c| c.items)
             .unwrap_or_default();
-        let rows: Vec<String> = ui::completion_lines(&items, 1)
-            .iter()
-            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
+        let popup = |items: &[Suggestion], selected| {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 60, 8));
+            (&ui::CompletionPopup::new(items, selected)).render(buffer.area, &mut buffer);
+            rows_of(&buffer)
+        };
+        let rows = popup(&items, 1);
         assert!(
             rows.first().is_some_and(|r| r.starts_with("  chat ")),
             "{rows:?}"
@@ -3491,6 +3536,20 @@ mod tests {
                 .is_some_and(|r| r.starts_with("\u{25B8} query ")),
             "{rows:?}"
         );
+
+        // More entries than rows: the list scrolls to the highlighted one.
+        let commands = Completion::for_line("/")
+            .map(|c| c.items)
+            .unwrap_or_default();
+        assert!(commands.len() > 10, "{}", commands.len());
+        let rows = popup(&commands, 10);
+        let label = commands.get(10).map_or("", |s| s.label.as_str());
+        assert!(
+            rows.last()
+                .is_some_and(|r| r.starts_with(&format!("\u{25B8} {label}"))),
+            "{rows:?}"
+        );
+        assert_eq!(rows.iter().filter(|r| r.starts_with('\u{25B8}')).count(), 1);
     }
 
     /// The words the popup offers for the input as it stands.
@@ -3874,6 +3933,35 @@ mod tests {
     }
 
     #[test]
+    fn a_scrollbar_follows_the_transcript_once_it_outgrows_the_screen() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        // The last column of the transcript's rows: its first and last.
+        let bar = |app: &App| {
+            let rows = screen(app);
+            let column = |row: usize| rows.get(row).and_then(|r| r.chars().last());
+            (column(2), column(25))
+        };
+        app.messages.clear();
+        app.note(MessageKind::System, "short");
+        assert_eq!(bar(&app), (Some(' '), Some(' ')), "nothing to scroll");
+        for n in 0..60 {
+            app.note(MessageKind::System, format!("line {n}"));
+        }
+        assert_eq!(
+            bar(&app),
+            (Some('\u{2502}'), Some('\u{2588}')),
+            "at the newest"
+        );
+        app.handle_key_event(KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(
+            bar(&app),
+            (Some('\u{2588}'), Some('\u{2502}')),
+            "at the top"
+        );
+    }
+
+    #[test]
     fn home_page_down_and_end_move_through_the_transcript() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
@@ -3882,13 +3970,11 @@ mod tests {
         assert_eq!(app.scroll, Scroll::Back(15));
         app.handle_key_event(KeyCode::Home, KeyModifiers::NONE);
         assert_eq!(app.scroll, Scroll::Top);
-        assert_eq!(app.scroll.to_string(), " \u{00B7} scroll: top");
         // From the top, PageDown moves down from the first line.
         app.handle_key_event(KeyCode::PageDown, KeyModifiers::NONE);
         assert_eq!(app.scroll, Scroll::Back(25));
         app.handle_key_event(KeyCode::End, KeyModifiers::NONE);
         assert_eq!(app.scroll, Scroll::Latest);
-        assert!(app.scroll.to_string().is_empty());
         app.handle_key_event(KeyCode::PageUp, KeyModifiers::NONE);
         app.handle_key_event(KeyCode::PageDown, KeyModifiers::NONE);
         assert_eq!(app.scroll, Scroll::Latest);
