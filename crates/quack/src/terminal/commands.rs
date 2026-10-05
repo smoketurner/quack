@@ -161,19 +161,13 @@ pub(crate) enum SlashCommand {
         #[arg(id = VERBATIM, value_name = "N")]
         job: JobNumber,
     },
-    /// Show the chart of the Nth chart-bearing answer (default: the last)
-    #[command(name = "/chart", disable_help_flag = true)]
-    Chart {
-        #[arg(value_name = "N")]
-        n: Option<usize>,
-    },
     /// Expand or collapse the tool call details
     #[command(name = "/steps")]
     Steps,
     /// Show the chat and embedding models in use
     #[command(name = "/model")]
     Model,
-    /// Clear messages and chart
+    /// Clear messages
     #[command(name = "/clear")]
     Clear,
     /// Show current workspace and session
@@ -915,10 +909,6 @@ mod tests {
             Ok(SlashCommand::Cancel { job }) if job.to_string() == "3"
         ));
         assert!(!parses("/cancel x"));
-        assert!(matches!(
-            SlashCommand::parse("/chart 2"),
-            Ok(SlashCommand::Chart { n: Some(2) })
-        ));
         assert!(matches!(
             SlashCommand::parse("/unknown 'quote"),
             Err(e) if e.kind() == ErrorKind::InvalidSubcommand

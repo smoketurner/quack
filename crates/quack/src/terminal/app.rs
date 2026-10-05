@@ -113,7 +113,7 @@ pub(crate) struct Message {
     pub(crate) kind: MessageKind,
     pub(crate) content: String,
     /// The chart an assistant answer produced (design doc 9: charts belong
-    /// to messages); `/chart N` brings it into the chart pane.
+    /// to messages), drawn in the transcript under its text.
     pub(crate) chart: Option<ChartData>,
     /// A step's full tool detail, shown whole when steps are expanded.
     pub(crate) detail: Option<String>,
@@ -841,7 +841,6 @@ pub(crate) struct App {
     pub(crate) workspace_name: String,
     pub(crate) provider_display: String,
     pub(crate) session_id: SessionId,
-    pub(crate) current_chart: Option<ChartData>,
     /// Decisions owed, oldest first; the front one is on screen.
     prompts: VecDeque<Prompt>,
     /// Agent turns queued or running, in submission order.
@@ -918,7 +917,6 @@ impl App {
             workspace_name,
             provider_display: config.chat_model_label(),
             session_id,
-            current_chart: None,
             prompts: VecDeque::new(),
             turns: Vec::new(),
             jobs,
@@ -1013,9 +1011,7 @@ impl App {
                     let meta = row.assistant().cloned().unwrap_or_default();
                     let mut message = Message::new(MessageKind::Assistant, row.content);
                     if let Some(spec) = &meta.chart {
-                        let chart = ChartData::from_spec(spec);
-                        self.current_chart = Some(chart.clone());
-                        message.chart = Some(chart);
+                        message.chart = Some(ChartData::from_spec(spec));
                     }
                     self.post(message);
                     if !meta.citations.is_empty() {
@@ -1428,17 +1424,14 @@ impl App {
         if !response.citations.is_empty() {
             self.post(Message::sources(&response.citations));
         }
-        if let Some(spec) = &response.chart {
-            let chart = ChartData::from_spec(spec);
-            self.current_chart = Some(chart.clone());
-            if let Some(last) = self
+        if let Some(spec) = &response.chart
+            && let Some(last) = self
                 .messages
                 .iter_mut()
                 .rev()
                 .find(|m| m.kind == MessageKind::Assistant)
-            {
-                last.chart = Some(chart);
-            }
+        {
+            last.chart = Some(ChartData::from_spec(spec));
         }
         for result in response.graph.iter().filter(|r| !r.is_empty()) {
             self.note(MessageKind::System, result.to_string());
@@ -1589,7 +1582,6 @@ impl App {
     /// Clear the transcript; streaming turns start a new message.
     fn clear_transcript(&mut self) {
         self.messages.clear();
-        self.current_chart = None;
         self.scroll = Scroll::Latest;
         for turn in &mut self.turns {
             turn.streaming = None;
@@ -1951,7 +1943,6 @@ impl App {
             SlashCommand::Export { flags, file } => self.export_session(flags.format(), file),
             SlashCommand::Okf { dir } => self.run_job(CliJob::Okf(dir)),
             SlashCommand::Embeddings { action } => self.run_job(CliJob::Embeddings(action)),
-            SlashCommand::Chart { n } => self.show_chart(n),
             SlashCommand::Steps => self.toggle_steps(),
             SlashCommand::Model => self.show_models(),
         }
@@ -2364,38 +2355,6 @@ impl App {
                 app.note(MessageKind::System, format!("{done} {}", id.short()));
             },
         );
-    }
-
-    /// `/chart [N]`: the Nth chart-bearing answer's chart into the pane
-    /// (the last one without N).
-    fn show_chart(&mut self, n: Option<usize>) {
-        let charts: Vec<ChartData> = self
-            .messages
-            .iter()
-            .filter_map(|m| m.chart.clone())
-            .collect();
-        if charts.is_empty() {
-            self.note(
-                MessageKind::System,
-                "No chart in this session yet; ask for one.",
-            );
-            return;
-        }
-        let wanted = n.unwrap_or(charts.len());
-        let Some(chart) = wanted.checked_sub(1).and_then(|at| charts.get(at)) else {
-            self.note(
-                MessageKind::Error,
-                format!("/chart takes a number from 1 to {}", charts.len()),
-            );
-            return;
-        };
-        let text = format!(
-            "Showing chart {wanted} of {}: {}",
-            charts.len(),
-            chart.title
-        );
-        self.current_chart = Some(chart.clone());
-        self.note(MessageKind::System, text);
     }
 
     /// Drop the session on screen if nothing was ever recorded in it,
@@ -3022,7 +2981,13 @@ mod tests {
             .find(|m| m.kind == MessageKind::Assistant)
             .unwrap_or_else(|| fail("no assistant message"));
         assert!(assistant.chart.is_some(), "the chart belongs to the answer");
-        assert!(app.current_chart.is_some());
+        let drawn: Vec<String> = ui::format_messages(&app, 80)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let at = |text: &str| drawn.iter().position(|l| l.contains(text));
+        let (answer, chart) = (at("Three rows"), at(" Rows by kind "));
+        assert!(answer.is_some() && answer < chart, "{drawn:?}");
         let step = app
             .messages
             .iter()
@@ -3050,11 +3015,6 @@ mod tests {
                 .iter()
                 .any(|l| l.spans.iter().any(|s| s.content.contains("line 6")))
         );
-        app.current_chart = None;
-        app.handle_slash_command("/chart 1");
-        assert!(app.current_chart.is_some());
-        app.handle_slash_command("/chart 9");
-        assert_eq!(last(&app).kind, MessageKind::Error);
 
         // Esc while a turn runs cancels it; typing goes on meanwhile.
         let job = turn.job.id;

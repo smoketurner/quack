@@ -1799,7 +1799,7 @@ Slash commands: `/help`, `/tables`, `/schema TABLE`, `/sql`, `/ingest PATH` (`/a
 `/import`, `/docs`, `/pin`, `/unpin`, `/delete`, `/ontology ...` and `/graph ...`, `/graph
 ENTITY`, `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/sessions`,
 `/resume`, `/new`, `/mode`, `/share`, `/unshare`, `/export [--sql|--markdown] [FILE]`,
-`/jobs`, `/cancel N`, `/chart [N]`, `/steps`, `/model`, `/workspace`, `/clear`, `/quit`.
+`/jobs`, `/cancel N`, `/steps`, `/model`, `/workspace`, `/clear`, `/quit`.
 `/model` shows the configured models, then lists each provider's models as a job
 (`llm::ModelCatalog`).
 `/ontology` and `/graph` are the `quack ontology` and `quack graph` verbs, parsed by the
@@ -1852,7 +1852,7 @@ a job is active. Every waiting message is applied before the next draw.
 
 **Rendering.** Answers render Markdown (headings, bullets, fences, inline marks). Tool steps
 show a three-line preview until `/steps` expands them (print mode folds the same way without
-`--verbose`). The pane shows the latest answer's chart; `/chart N` shows an earlier one.
+`--verbose`). An answer's chart is drawn in the transcript under its text and scrolls with it.
 Lines wrap to the terminal width before the scroll range is computed, so the end is always
 reachable. Typed input persists in `<data_dir>/terminal_history`. A relative path to an
 existing file ingests it. An embedding provider is optional (keyword search without one).

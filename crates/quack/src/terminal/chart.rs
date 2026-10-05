@@ -129,6 +129,36 @@ impl ChartData {
         Self { title, plot }
     }
 
+    /// The chart drawn `width` columns wide, a line per row, so the
+    /// transcript holds it and scrolls it like text.
+    pub(crate) fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        let area = Rect::new(0, 0, width, self.height());
+        let mut buf = Buffer::empty(area);
+        self.render(area, &mut buf);
+        area.rows()
+            .map(|row| {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                // Columns the buffer left blank under a wide symbol.
+                let mut covered = 0_usize;
+                for cell in row.positions().filter_map(|at| buf.cell(at)) {
+                    if covered > 0 {
+                        covered = covered.saturating_sub(1);
+                        continue;
+                    }
+                    let symbol = cell.symbol();
+                    covered = Span::raw(symbol).width().saturating_sub(1);
+                    match spans.last_mut() {
+                        Some(last) if last.style == cell.style() => {
+                            last.content.to_mut().push_str(symbol);
+                        }
+                        _ => spans.push(Span::styled(symbol.to_owned(), cell.style())),
+                    }
+                }
+                Line::from(spans)
+            })
+            .collect()
+    }
+
     pub(crate) fn height(&self) -> u16 {
         match &self.plot {
             Plot::Bars { values, .. } => {
@@ -634,6 +664,33 @@ mod tests {
             lines.last().map(ToString::to_string).as_deref(),
             Some("   and 26 more")
         );
+    }
+
+    #[test]
+    fn a_chart_becomes_transcript_lines_of_its_width() {
+        let data = ChartData::from_spec(&spec(
+            ChartKind::Pie,
+            &["\u{6771}\u{4EAC}", "B"],
+            &[("share", &[75.0, 25.0])],
+        ));
+        let lines = data.lines(60);
+        assert_eq!(lines.len(), usize::from(data.height()));
+        // A wide symbol takes two columns and one span's worth of text.
+        assert!(lines.iter().all(|line| line.width() == 60), "{lines:?}");
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert!(text.first().is_some_and(|top| top.contains(" t ")));
+        assert!(
+            text.iter()
+                .any(|row| row.contains("\u{6771}\u{4EAC}: 75 (75.0%)")),
+            "{text:?}"
+        );
+        // The slices keep their colours.
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::Cyan) && span.content.contains('\u{25A0}'))
+        }));
+        assert!(data.lines(0).iter().all(|line| line.width() == 0));
     }
 
     #[test]

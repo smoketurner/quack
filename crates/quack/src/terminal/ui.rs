@@ -15,7 +15,6 @@ use ratatui::widgets::{
 };
 
 use crate::terminal::app::{App, Message, MessageKind, PendingWrite};
-use crate::terminal::chart::ChartData;
 use crate::terminal::commands::Suggestion;
 use crate::terminal::markdown;
 use quack_core::analysis::events::DetailPreview;
@@ -216,7 +215,6 @@ pub(crate) fn one_line(text: &str) -> String {
 }
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
-    let chart_height = app.current_chart.as_ref().map_or(0, ChartData::height);
     let strip = JobStrip::of(app);
     let strip_height = strip.height();
     let screen = frame.area();
@@ -236,14 +234,12 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let [
         header_area,
         messages_area,
-        chart_area,
         jobs_area,
         input_area,
         status_area,
     ] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(3),
-        Constraint::Length(chart_height),
         Constraint::Length(strip_height),
         Constraint::Length(input_height),
         Constraint::Length(1),
@@ -252,11 +248,6 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
 
     draw_header(frame, header_area, app);
     draw_messages(frame, messages_area, app);
-    if let Some(chart) = &app.current_chart
-        && chart_height > 0
-    {
-        frame.render_widget(chart, chart_area);
-    }
     if strip_height > 0 {
         frame.render_widget(&strip, jobs_area);
     }
@@ -734,13 +725,10 @@ impl Message {
             }
         }
         if let Some(chart) = &self.chart {
-            let note = vec![Span::styled(
-                format!("[chart: {}; /chart shows it]", chart.title),
-                Style::default().fg(Color::Magenta),
-            )];
-            for row in wrap::wrap(&note, width.saturating_sub(3)) {
+            let chart_width = u16::try_from(width.saturating_sub(3)).unwrap_or(u16::MAX);
+            for row in chart.lines(chart_width) {
                 let mut with_prefix = vec![Span::raw("   ")];
-                with_prefix.extend(row);
+                with_prefix.extend(row.spans);
                 lines.push(Line::from(with_prefix));
             }
         }
