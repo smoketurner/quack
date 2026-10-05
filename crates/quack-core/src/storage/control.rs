@@ -23,6 +23,7 @@ use super::queries::{
     SealedColumns, UserTokens, Users, Workspaces,
 };
 use crate::config::{Config, ProviderName};
+use crate::crypto::sha256_hex;
 use crate::error::{Error, Result};
 use crate::ids::{AuditId, UserId, WorkspaceId};
 use crate::oidc::OidcSubject;
@@ -802,18 +803,6 @@ impl TryFrom<String> for AuditCursor {
     fn try_from(text: String) -> Result<Self> {
         text.parse()
     }
-}
-
-/// Lowercase hex SHA-256, the form tokens are stored in.
-#[must_use]
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
-    let mut out = String::with_capacity(64);
-    for b in digest.as_ref() {
-        out.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
-        out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
-    }
-    out
 }
 
 /// Fill `bytes` from the process's CSPRNG (aws-lc-rs).
@@ -3421,14 +3410,6 @@ mod tests {
         assert!(elsewhere.is_err_and(|e| e.to_string().contains("different filter")));
         assert!("not a cursor".parse::<AuditCursor>().is_err());
         assert!("bm90IGEgY3Vyc29y".parse::<AuditCursor>().is_err());
-    }
-
-    #[test]
-    fn sha256_hex_is_the_known_digest_of_abc() {
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
     }
 
     #[test]

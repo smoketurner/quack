@@ -6558,6 +6558,7 @@ async fn a_turn_that_read_a_document_asks_or_refuses_its_write_under_allow_write
     use futures::StreamExt;
 
     use crate::scripted_ollama::{self, ScriptedOllama};
+    use quack_core::analysis::policy::Hold;
     use quack_core::storage::workspace::WorkspaceDb;
 
     let mut script = ScriptedOllama::following_the_note();
@@ -6635,6 +6636,11 @@ async fn a_turn_that_read_a_document_asks_or_refuses_its_write_under_allow_write
         {
             assert_eq!(request["sql"], scripted_ollama::DICTATED, "{request}");
             assert_eq!(request["reason"], "read_documents", "{request}");
+            assert_eq!(
+                request["notice"],
+                Hold::ReadDocuments.notice().unwrap_or_default(),
+                "{request}"
+            );
             assert_eq!(
                 tables().await,
                 ["customers"],

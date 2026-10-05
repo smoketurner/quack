@@ -362,6 +362,7 @@ pub(crate) async fn stream(
                         "session_id": turn.session_id,
                         "sql": sql,
                         "reason": hold,
+                        "notice": hold.notice(),
                         "expires_at": held.expires_at.to_string(),
                     }))
                     .unwrap_or_default()

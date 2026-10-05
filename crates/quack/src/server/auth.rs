@@ -15,6 +15,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use quack_core::config::ServerConfig;
+use quack_core::crypto::sha256_hex;
 use quack_core::error::Error as CoreError;
 use quack_core::ids::{AuditId, UserId, WorkspaceId};
 use quack_core::llm::egress::Egress;
@@ -22,7 +23,7 @@ use quack_core::oidc::Origin;
 use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditResource, Channel, Outcome, Role, Scope, TokenRow, UserRow,
-    WorkspaceRow, sha256_hex,
+    WorkspaceRow,
 };
 use quack_core::storage::sessions::SessionViewer;
 use quack_core::web_sessions::{SessionLookup, SessionToken};

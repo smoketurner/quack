@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 use crate::embedding::EmbeddingModel;
 
 use crate::config::Config;
+use crate::crypto::sha256_hex;
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
 use crate::ids::{ChunkId, DocumentId};
 use crate::progress::{ChunkDone, RunControl};
-use crate::storage::control::sha256_hex;
 use crate::storage::workspace::{
     DocumentInfo, DocumentSource, DocumentStatus, NewChunk, NewDocument, WorkspaceDb, quote_ident,
 };

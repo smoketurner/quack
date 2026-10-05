@@ -1214,7 +1214,8 @@ terminal as a system line, SSE as a `status` event.
 and the owner-written workspace context carry instructions; text inside document markers,
 and anything else a tool returns, is data; a write a document asks for is reported to the
 person, not run. The markers come from one type, `text::Fenced`, which `search_documents`,
-the graph tools' source excerpts, and the pinned-document block all use:
+the graph tools' source excerpts, the pinned-document block, and the chunks `always_retrieve`
+adds all use:
 
 ```
 <<document 3f2a9c0b17d44e86a1c05b7e>>
@@ -1228,9 +1229,14 @@ computations to arrange. A closing line it writes with any other code, including
 from another block, does not match its opening line. The code needs no secret and no
 per-turn state, so the same text renders the same way every turn and the prompt stays
 byte-identical for the provider's prefix cache. One fixed sentence (`Fenced::NOTICE`)
-precedes the fenced text in each of the three places. Filenames, titles, headings, and
-entity labels are rendered through `text::OneLine`, which turns every line break and control
-character into a space, so none of them can start a line of its own.
+precedes the fenced text in the first three places. The fourth is different: rig prints each
+`always_retrieve` chunk as a JSON object inside its own `<file>` block, so the fenced text
+is the `content` string, its line breaks are `\n` escapes rather than lines, and no notice
+precedes it; the trust rule is what tells the model those markers hold data. The pinned
+block is headed as text that is always included for reference, not as instructions.
+Filenames, titles, headings, entity labels, and graph property names and values are rendered
+through `text::OneLine`, which turns every line break and control character into a space, so
+none of them can start a line of its own.
 
 The framing lowers the chance that a model follows a document. It is not the control: the
 write gate is (7.4).
@@ -1325,7 +1331,7 @@ write. Statements referencing `_quack_` tables are refused regardless.
 |-----------|------|-------|
 | TUI | run | prompt `y`/`n`/`a` showing the SQL; `a` covers the rest of the turn and the session, until a turn reads document text (below) |
 | Print mode | run | refuse unless `--allow-write`; the answer completes and the exit code is 3 |
-| Web / REST | run | `allow_write: true` from a member with the write scope runs every write (asked for without it, 403). Otherwise a streamed turn (`query/stream`) from someone who may write asks: the turn holds the write in memory (`server::permissions::Permissions`) and sends a `permission_required` event (`{request, session_id, sql, reason, expires_at}`, `reason` being `not_permitted` or `read_documents`); the person who asked answers with `POST .../sessions/{sid}/permissions/{request}` `{"decision": "allow" \| "deny" \| "allow_turn"}` (204; 404 unknown or expired; 409 already answered; 410 when the turn had already stopped waiting, its stream gone or cancelled, so nothing ran; 403 for anyone else or without write access), and the turn goes on. No answer within `[server].permission_timeout_seconds` (300) refuses the write; a restart ends the waiting turn. The web chat shows the statement with Run it, Don't run it, and Allow for this turn, and when the turn stops waiting; "Run changes without asking" sets `allow_write`. Each answer, refusal, and expiry writes an `audit_log` row (action `permission`) and a `_quack_audit` detail `{request, sql, decision}`; an allow that reached no turn is a denied row with `decision: "gone"` and the answer given, never an allowed one. A non-streamed `query`, or a caller who may not write, is refused as before: 200 with `write_refused: true` |
+| Web / REST | run | `allow_write: true` from a member with the write scope runs every write (asked for without it, 403). Otherwise a streamed turn (`query/stream`) from someone who may write asks: the turn holds the write in memory (`server::permissions::Permissions`) and sends a `permission_required` event (`{request, session_id, sql, reason, notice, expires_at}`, `reason` being `not_permitted` or `read_documents`, and `notice` the sentence to show the person for that reason, or `null`); the person who asked answers with `POST .../sessions/{sid}/permissions/{request}` `{"decision": "allow" \| "deny" \| "allow_turn"}` (204; 404 unknown or expired; 409 already answered; 410 when the turn had already stopped waiting, its stream gone or cancelled, so nothing ran; 403 for anyone else or without write access), and the turn goes on. No answer within `[server].permission_timeout_seconds` (300) refuses the write; a restart ends the waiting turn. The web chat shows the statement with Run it, Don't run it, and Allow for this turn, and when the turn stops waiting; "Run changes without asking" sets `allow_write`. Each answer, refusal, and expiry writes an `audit_log` row (action `permission`) and a `_quack_audit` detail `{request, sql, decision}`; an allow that reached no turn is a denied row with `decision: "gone"` and the answer given, never an allowed one. A non-streamed `query`, or a caller who may not write, is refused as before: 200 with `write_refused: true` |
 | MCP | run | refuse unless `quack mcp --allow-write` set the policy at launch (stdio has no tokens); `write_refused: true` in the structured content and a sentence in the text. Over HTTP the token's `write` scope decides |
 | Desktop | planned | native confirm dialog (section 11.6) |
 
@@ -1338,18 +1344,20 @@ text, each later write in that turn needs a person's approval, whatever was allo
 | Where the turn runs | A write after the turn read document text |
 |---------------------|-------------------------------------------|
 | TUI | asked `y`/`n`/`a`, with the reason shown; `a` covers the rest of that turn only, and the next turn that reads document text asks again |
-| Web / REST, streamed | asked through `permission_required` with `reason: "read_documents"`; the card shows the reason |
+| Web / REST, streamed | asked through `permission_required` with `reason: "read_documents"` and its `notice`; the card shows the notice |
 | Print mode, non-streamed `query`, MCP `query` (stdio and HTTP) | refused: `write_refused: true`, print exit 3; the step's summary is `refused: this turn read document text`, and the model is told why |
 
 What counts as reading document text: a `search_documents` call that returns chunks, or
 that names an `entity` (its resolution answers from the graph), `always_retrieve` when it
-puts chunks in the prompt, a `search_graph` or `find_path` result, and a graph lookup that
-fails or answers with the graph's closest labels. A turn that has done none of these behaves as before.
+puts chunks in the prompt, a `search_graph` or `find_path` result, a graph lookup that
+fails or answers with the graph's closest labels, and a `describe_class` result that names
+example entities. The rule is one: a tool result that carries document text or graph labels
+counts. A turn that has done none of these behaves as before.
 
 The rule does not cover text the turn did not retrieve from documents or the graph: pinned
 documents and the workspace context (the owner put them in the prompt), table rows from
-`run_sql`, and the output of `list_tables`, `describe_table`, `describe_class`, and
-`list_documents`. A pinned document or a table cell can therefore still dictate a write
+`run_sql`, and the output of `list_tables`, `describe_table`, `list_documents`, and a
+`describe_class` that names no entity. A pinned document or a table cell can therefore still dictate a write
 under allow-write. Earlier turns do not count either: the rule looks at the current turn.
 
 `WritePolicy::Allow` carries who can approve (`Approver::Person` where the interface answers

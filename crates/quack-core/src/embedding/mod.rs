@@ -30,9 +30,9 @@ pub use status::{EmbeddingStatus, StaleVectors};
 pub use vector::{Dimension, Fingerprint, Vector, WidthMismatch};
 
 use crate::config::Config;
+use crate::crypto::sha256_hex;
 use crate::error::{Error, Result};
 use crate::priority::Priority;
-use crate::storage::control::sha256_hex;
 use crate::text::NonBlankText;
 
 /// The placeholder a document prefix may carry for the chunk's title.

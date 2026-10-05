@@ -151,9 +151,10 @@ row is processing (marked `data-pending`).
   parses the SSE events, and renders the steps block, the answer, citations as links to the
   document list, and the chart spec as an ECharts option. A `permission_required` event
   becomes a card with the statement, Run it, Don't run it, and Allow for this turn, posted to
-  `.../sessions/{sid}/permissions/{request}`, and the time the turn stops waiting. When the event's `reason` is
-  `read_documents` (the turn read document text, so the write is asked for even under "Run changes
-  without asking"), the card says so. On page load it renders stored
+  `.../sessions/{sid}/permissions/{request}`, and the time the turn stops waiting. When the event carries a `notice`
+  (its `reason` is `read_documents`: the turn read document text, so the write is asked for even
+  under "Run changes without asking"), the card shows that sentence; the text lives in
+  `policy::Hold::notice` only. On page load it renders stored
   charts and draws the graph page's result as an ECharts force graph (nodes coloured by
   class; a click scrolls to the inspector entry).
 

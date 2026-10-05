@@ -451,9 +451,6 @@ impl JsonSchema for NonBlank {
 /// error instead of rows. The model reads what follows and retries.
 pub const SQL_ERROR_PREFIX: &str = "SQL error: ";
 
-/// Message returned to the model when a write is refused.
-pub const WRITE_REFUSED: &str = Hold::NotPermitted.refusal();
-
 /// Message returned to the model when a statement touches internal tables.
 pub const INTERNAL_TABLE_REFUSED: &str =
     "This statement references quack's internal tables, which are not available to queries.";
@@ -465,9 +462,10 @@ enum Gate {
     Read,
     /// Run it bare: a write the policy allowed.
     Write,
-    /// Do not run; hand this text back to the model.
+    /// Do not run a statement that is not a write the policy weighed;
+    /// hand this text back to the model.
     Reject(String),
-    /// A write the policy did not let run, and why.
+    /// A write that may not run, and why: the one shape of a refused write.
     Refused(Hold),
 }
 
@@ -496,7 +494,7 @@ impl SqlGate {
             StatementKind::Write => {
                 if creates_temp_object(sql) {
                     // A mutating statement the caller wanted to run did
-                    // not run, same as WRITE_REFUSED:
+                    // not run, as with a refused write:
                     // AgentResponse::write_refused should say so.
                     turn.refused.set();
                     tracing::info!(sql, "refused a statement that would create a temp object");
@@ -520,13 +518,13 @@ impl SqlGate {
     }
 
     /// Classify `sql` for a chart, which only reads: any write is
-    /// rejected, and that is not the turn's refused write.
+    /// refused as not permitted, and that is not the turn's refused write.
     async fn check_read_only(&self, sql: &str) -> Result<Gate, ToolError> {
         Ok(match self.classify(sql).await? {
             None => Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)),
             Some(StatementKind::Read) => Gate::Read,
             Some(StatementKind::Invalid(msg)) => Gate::Reject(format!("SQL syntax error: {msg}")),
-            Some(StatementKind::Write) => Gate::Reject(String::from(WRITE_REFUSED)),
+            Some(StatementKind::Write) => Gate::Refused(Hold::NotPermitted),
         })
     }
 
@@ -1353,7 +1351,12 @@ impl Tool for CreateChartTool {
     ) -> Result<Self::Output, Self::Error> {
         let turn = Turn::of(context)?;
         let step = turn.recorder.start(ToolName::CreateChart, args.sql.trim());
-        if let Gate::Reject(message) = self.gate.check_read_only(&args.sql).await? {
+        let rejected = match self.gate.check_read_only(&args.sql).await? {
+            Gate::Reject(message) => Some(message),
+            Gate::Refused(hold) => Some(String::from(hold.refusal())),
+            Gate::Read | Gate::Write => None,
+        };
+        if let Some(message) = rejected {
             step.finish("rejected");
             return Ok(format!("Chart query rejected. {message}"));
         }
@@ -2702,6 +2705,56 @@ mod tests {
         assert!(refused.was_refused());
     }
 
+    /// A class description counts as reading the graph once it names
+    /// entities: its example names are the labels a graph search returns.
+    #[tokio::test]
+    async fn a_class_description_that_names_entities_counts_as_reading_the_graph() {
+        let (sink, _rx) = events::channel();
+        let db = shared_db();
+        let seeded = db
+            .run(|db| {
+                ontology_store::save(
+                    db,
+                    &Ontology::builtin_default(),
+                    Revision::reviewed(Some("tester"), None),
+                )?;
+                graph::store::upsert_node(
+                    db,
+                    &NewNode {
+                        label: String::from("Acme"),
+                        class_id: ClassId::from("organization"),
+                        properties: Properties::default(),
+                        standing: Standing::Reviewed,
+                    },
+                )?;
+                Ok(())
+            })
+            .await;
+        assert!(seeded.is_ok(), "{seeded:?}");
+        let turn = Turn::new(
+            TurnRecorder::new(sink),
+            WritePolicy::Allow(Approver::Nobody),
+        );
+        let describe = |class: &str| DescribeClassArgs {
+            class_id: String::from(class),
+        };
+        let tool = DescribeClassTool(ReaderDb::new(Arc::clone(&db)));
+
+        let empty = tool
+            .call(&mut turn.context(), describe("person"))
+            .await
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
+        assert!(empty.contains("no entities of this class"), "{empty}");
+        assert_eq!(turn.exposure(), Exposure::None);
+
+        let named = tool
+            .call(&mut turn.context(), describe("organization"))
+            .await
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
+        assert!(named.contains("1 entities \u{2014} Acme"), "{named}");
+        assert_eq!(turn.exposure(), Exposure::Documents);
+    }
+
     /// Naming an entity resolves it against the graph, which answers with
     /// the entity's chunks or its closest labels, so the search counts
     /// even when it is refused.
@@ -2728,9 +2781,8 @@ mod tests {
         assert_eq!(turn.exposure(), Exposure::Documents);
     }
 
-    /// Table rows, the table and document listings, and a class
-    /// description are not retrieved document text: writes still run
-    /// unasked after them.
+    /// Table rows and the table and document listings are not retrieved
+    /// document text: writes still run unasked after them.
     #[tokio::test]
     async fn rows_and_listings_do_not_hold_a_write_under_allow_write() {
         let (sink, _rx) = events::channel();
@@ -3447,16 +3499,21 @@ impl Tool for DescribeClassTool {
                 };
                 let classes = ontology.class_and_descendants(&class_id);
                 let census = graph::store::class_census(db, &classes, CLASS_SAMPLES)?;
-                Ok(ClassDescription {
+                let text = ClassDescription {
                     ontology: &ontology,
                     class_id: &class_id,
                     census: &census,
                 }
-                .to_string())
+                .to_string();
+                Ok((text, census.samples.is_empty()))
             })
             .await;
         match text {
-            Ok(text) => {
+            Ok((text, unnamed)) => {
+                // Example names are graph labels, as a graph search's are.
+                if !unnamed {
+                    turn.read_documents();
+                }
                 step.finish(format!("{} lines", text.lines().count()));
                 Ok(text)
             }

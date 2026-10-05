@@ -457,7 +457,7 @@ impl SystemPrompt {
         let mut used = Tokens::default();
         writeln!(
             self.text,
-            "Pinned documents (full text, always in effect; cite them by filename). {}",
+            "Pinned documents (full text, always included for reference; cite them by filename). {}",
             Fenced::NOTICE
         )?;
         for PinnedDocument {

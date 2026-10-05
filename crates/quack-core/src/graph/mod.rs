@@ -228,7 +228,7 @@ impl fmt::Display for Properties {
                 dropped = dropped.saturating_add(1);
                 continue;
             }
-            parts.push(format!("{key}: {value}"));
+            parts.push(format!("{}: {}", OneLine(key), OneLine(&value)));
         }
         if parts.is_empty() {
             return Ok(());
