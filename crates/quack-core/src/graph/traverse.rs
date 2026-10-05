@@ -13,6 +13,7 @@ use crate::error::Result;
 use crate::ids::{ClassId, EdgeId, NodeId};
 use crate::ontology::Ontology;
 use crate::storage::workspace::WorkspaceDb;
+use crate::text::OneLine;
 
 /// How many relations a walk follows from its entry point: at least one,
 /// whatever was asked, and capped again by `[graph].max_traversal_depth`
@@ -494,7 +495,7 @@ impl<'a> TreeWriter<'a> {
                 Suffix(&edge.properties)
             )?;
             if self.visited.contains(other) {
-                writeln!(f, " {}", next.label)?;
+                writeln!(f, " {}", OneLine(&next.label))?;
                 continue;
             }
             writeln!(f)?;

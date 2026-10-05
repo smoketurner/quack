@@ -199,7 +199,18 @@ retried with the real names (twice at most), and an empty reply is asked for onc
 workspace and its settings; a turn's recorder, write policy, refusal flag, and chart and graph
 results are one `analysis::tools::Turn`, handed to every call as a runtime scope of rig's
 `ToolContext` (`.tool_context(turn.context())` on the run). `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
-prompts y/n/a and `-p` refuses and exits 3. Provider construction lives in `quack_core::llm`; interfaces never build rig
+prompts y/n/a and `-p` refuses and exits 3. Once a turn has retrieved document or graph text
+(`search_documents`, `search_graph`, `find_path`, `always_retrieve`; `Turn::read_documents`),
+no write of that turn runs unasked, whatever was allowed: `WritePolicy::decide` asks where the
+interface answers permission events (`Allow(Approver::Person)`: the terminal, a streamed turn)
+and refuses where it cannot (`Allow(Approver::Nobody)`: print mode, non-streamed REST, MCP), and
+the reason (`policy::Hold`) goes on the prompt, the `permission_required` event's `reason`, and
+the refused step. Pinned documents, the workspace context, table rows, and the listing tools do
+not count, so a pinned document or a table cell can still dictate a write under allow-write.
+Chunk bodies, graph source excerpts, and pinned text reach the model inside `text::Fenced`
+markers, whose code is a digest of the enclosed text (so the text cannot close its own block),
+after a fixed sentence that it is data; the system prompt's trust paragraph precedes the
+permission rules; filenames, titles, headings, and labels render through `text::OneLine`. Provider construction lives in `quack_core::llm`; interfaces never build rig
 clients themselves. Every chat model is wrapped in `llm::sampling::Sampled`: only Ollama's API
 gets a `temperature`, Claude gets `max_tokens` 64,000, and `[analysis].effort` /
 `background_effort` go out as each API's field (an unrecognized model id gets it on Chat

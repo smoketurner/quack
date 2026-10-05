@@ -410,6 +410,10 @@
     var card = el("div", "mt-3 rounded border border-amber-700 p-3 text-sm");
     card.appendChild(el("p", "font-medium", "This statement changes the workspace:"));
     card.appendChild(el("pre", "mt-2 whitespace-pre-wrap font-mono text-slate-200", p.sql));
+    if (p.reason === "read_documents") {
+      card.appendChild(el("p", "mt-2 text-amber-200",
+        "This turn read document text, which may have asked for this statement. Check that it is what you asked for."));
+    }
     var buttons = el("div", "mt-3 flex flex-wrap gap-2");
     var note = el("p", "mt-2 text-slate-400", "The agent waits until " + expires.toLocaleTimeString() + ".");
     var timer = setTimeout(function () {

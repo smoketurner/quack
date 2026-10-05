@@ -441,6 +441,7 @@ where
             window,
             rerank_model,
             reranker_call,
+            turn: turn.clone(),
         }
         .build_agent(completion_model, embedding_model, &read.system_prompt)?;
         let max_turns = usize::try_from(analysis_config.max_turns)
@@ -742,6 +743,9 @@ struct BuildContext<'a> {
     /// `dispatch`'s `schema_call`. `Some` only when `rerank = "model"`; the
     /// search tool wires it in, the other rerank modes ignore it.
     reranker_call: Option<SchemaCall<RerankAnswer>>,
+    /// The turn the agent runs: `always_retrieve` records on it that it
+    /// put chunk text in the prompt.
+    turn: Turn,
 }
 
 impl BuildContext<'_> {
@@ -822,7 +826,8 @@ impl BuildContext<'_> {
         {
             let samples = usize::try_from(ctx.retrieval_config.top_k)
                 .map_err(|e| Error::Analysis(format!("top_k overflow: {e}")))?;
-            let vector_index = DuckDbVectorIndex::new(ctx.reader_db.clone(), embedding_model);
+            let vector_index =
+                DuckDbVectorIndex::new(ctx.reader_db.clone(), embedding_model, ctx.turn);
             builder = builder.dynamic_context(samples, vector_index);
         }
 

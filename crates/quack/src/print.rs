@@ -341,11 +341,57 @@ fn write_finished(err: &mut impl Write, step: &ToolStep) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scripted_ollama::{self, ScriptedOllama};
     use quack_core::analysis::agent::AgentResponse;
+    use quack_core::analysis::policy::Approver;
+    use quack_core::storage::control::AllowedProviders;
+    use quack_core::storage::sessions::{self, ChatMode};
+    use quack_core::storage::workspace::WorkspaceDb;
+    use quack_core::storage::writer::Writer;
+    use std::sync::Arc;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    /// `--allow-write` lets a turn write until it has read document text.
+    /// Print mode cannot ask, so the write after is refused, which is exit
+    /// status 3, and the statement did not run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
+        let ollama = ScriptedOllama::serve(ScriptedOllama::following_the_note())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = ollama.config().unwrap_or_else(|e| fail(&e.to_string()));
+        config.general.data_dir = dir.path().to_path_buf();
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        scripted_ollama::seed_dictating_note(&db).unwrap_or_else(|e| fail(&e.to_string()));
+        let session = sessions::create_session(&db, "scripted/model", ChatMode::Chat, None)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
+        let turn = PrintTurn {
+            config: &config,
+            db: Arc::clone(&db),
+            reader_db: ReaderDb::open(&db, config.analysis.reader_pool_size).await,
+            session_id: &session.id,
+            policy: WritePolicy::Allow(Approver::Nobody),
+            prompt: "follow the maintenance note",
+            format: TextOrJson::Json,
+            verbose: false,
+        };
+        // The command's scope: the workspace allows every provider.
+        let egress = Egress::Workspace(AllowedProviders::All);
+        let outcome = Egress::scope(Some(egress), turn.run())
+            .await
+            .unwrap_or_else(|e| fail(&format!("{e:#}")));
+        assert_eq!(outcome, TurnOutcome::WriteRefused);
+        let tables = db
+            .run(WorkspaceDb::list_tables)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(tables, ["customers"], "the dictated drop did not run");
     }
 
     /// What stands on stdout is the validated answer (issue #64): printed

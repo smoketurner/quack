@@ -440,9 +440,14 @@ impl McpServer {
                     text.push_str(&sources);
                 }
                 if response.write_refused {
-                    text.push_str(
-                        "\n(A mutating statement was refused: this connection cannot write.)",
-                    );
+                    // With write access the refusal has another cause (the
+                    // turn read document text first, say), which its step
+                    // carries.
+                    text.push_str(if self.inner.policy.allows_unasked() {
+                        "\n(A mutating statement was refused; its step says why.)"
+                    } else {
+                        "\n(A mutating statement was refused: this connection cannot write.)"
+                    });
                 }
                 let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
                 result.structured_content = Some(response.to_json(&session_id));
@@ -579,7 +584,7 @@ impl McpServer {
                 .await?;
             return Ok(failure(TEMP_OBJECT_REFUSED));
         }
-        if is_write && self.inner.policy != WritePolicy::Allow {
+        if is_write && !self.inner.policy.allows_unasked() {
             caller
                 .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
                 .await?;
@@ -1044,6 +1049,8 @@ mod tests {
     use quack_core::config::Config;
 
     use super::*;
+    use crate::scripted_ollama::{self, ScriptedOllama};
+    use quack_core::analysis::policy::{Approver, Hold};
     use quack_core::ids::WorkspaceId;
     use quack_core::storage::control::AllowedProviders;
 
@@ -1092,6 +1099,74 @@ mod tests {
             .collect()
     }
 
+    /// `--allow-write` lets a turn write until it has read document text;
+    /// nobody can approve a write here, so the one after is refused, and the
+    /// result says so in its structured content and its text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
+        let ollama = ScriptedOllama::serve(ScriptedOllama::following_the_note())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = ollama.config().unwrap_or_else(|e| fail(&e.to_string()));
+        config.general.data_dir = dir.path().to_path_buf();
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        scripted_ollama::seed_dictating_note(&db).unwrap_or_else(|e| fail(&e.to_string()));
+        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
+        let reader = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
+        let server = McpServer::new(McpSetup {
+            config,
+            db: Arc::clone(&db),
+            reader,
+            workspace: WorkspaceRow {
+                id: WorkspaceId::from("ws"),
+                name: String::from("stdio"),
+                classification: String::from("internal"),
+                allowed_providers: AllowedProviders::All,
+            },
+            policy: WritePolicy::Allow(Approver::Nobody),
+            user_id: None,
+            auditor: Auditor::None,
+        });
+        let result = server
+            .query(
+                Parameters(QueryArgs {
+                    question: String::from("follow the maintenance note"),
+                    session_id: None,
+                    mode: None,
+                }),
+                Extensions::default(),
+            )
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(field(&result, "write_refused"), true, "{result:?}");
+        let refused = field(&result, "steps")
+            .pointer("/1")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            refused.get("detail").and_then(|d| d.as_str()),
+            Some(scripted_ollama::DICTATED),
+            "{refused}"
+        );
+        assert_eq!(
+            refused.get("summary").and_then(|s| s.as_str()),
+            Some(Hold::ReadDocuments.summary()),
+            "{refused}"
+        );
+        let text: String = result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect();
+        assert!(text.contains("was refused; its step says why"), "{text}");
+        let tables = db
+            .run(WorkspaceDb::list_tables)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(tables, ["customers"], "the dictated drop did not run");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn stdio_tools_gate_writes_and_serve_resources() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -1127,7 +1202,7 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.message));
         assert_eq!(bad.is_error, Some(true));
 
-        let writer = server(dir.path(), WritePolicy::Allow);
+        let writer = server(dir.path(), WritePolicy::Allow(Approver::Nobody));
         let created = writer
             .sql(
                 Parameters(SqlArgs {
@@ -1281,7 +1356,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn stdio_resources_render_tables_context_and_schemas() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let writer = server(dir.path(), WritePolicy::Allow);
+        let writer = server(dir.path(), WritePolicy::Allow(Approver::Nobody));
         let created = writer
             .sql(
                 Parameters(SqlArgs {

@@ -6393,9 +6393,14 @@ impl WaitingWrites {
     /// server holds the request: its id, and the turn waiting on it.
     async fn ask(&self, sql: &'static str) -> (String, tokio::task::JoinHandle<bool>) {
         use quack_core::analysis::events::{self, AgentEvent, TurnRecorder};
+        use quack_core::analysis::policy::Hold;
 
         let (sink, mut events) = events::channel();
-        let asked = tokio::spawn(async move { TurnRecorder::new(sink).ask_permission(sql).await });
+        let asked = tokio::spawn(async move {
+            TurnRecorder::new(sink)
+                .ask_permission(sql, Hold::NotPermitted)
+                .await
+        });
         let Some(AgentEvent::PermissionRequired(request)) = events.recv().await else {
             fail("no permission request")
         };
@@ -6510,6 +6515,116 @@ async fn a_waiting_write_is_answered_once_by_its_asker() {
         assert!(details.contains(decision), "{decision}: {details}");
     }
     assert!(details.contains("UPDATE t SET a = 1"), "{details}");
+}
+
+/// `allow_write` lets a turn write until it has read document text. A
+/// non-streamed turn cannot ask, so its write after a search is refused; a
+/// streamed one asks the person with the reason, and their answer runs it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_that_read_a_document_asks_or_refuses_its_write_under_allow_write() {
+    use futures::StreamExt;
+
+    use crate::scripted_ollama::{self, ScriptedOllama};
+    use quack_core::storage::workspace::WorkspaceDb;
+
+    let mut script = ScriptedOllama::following_the_note();
+    script.extend(ScriptedOllama::following_the_note());
+    let ollama = ScriptedOllama::serve(script)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let config = ollama.config().unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("notes", &owner).await;
+    let token = h.login("owner").await;
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    with_db(Arc::clone(&db), |db| {
+        scripted_ollama::seed_dictating_note(db)
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.message));
+    let tables = || async {
+        with_db(Arc::clone(&db), WorkspaceDb::list_tables)
+            .await
+            .unwrap_or_else(|e| fail(&e.message))
+    };
+    let body = serde_json::json!({ "prompt": "follow the maintenance note", "allow_write": true });
+    let path = format!("/api/v1/workspaces/{ws}/query");
+
+    let (status, answer) = h.post(&path, &token, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["write_refused"], true, "{answer}");
+    assert_eq!(
+        answer["steps"][1]["summary"], "refused: this turn read document text",
+        "{answer}"
+    );
+    assert_eq!(
+        tables().await,
+        ["customers"],
+        "the dictated drop did not run"
+    );
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("{path}/stream"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let response = h
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|e| fail(&format!("request failed: {e}")));
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut frames = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    // The data line of the first `event` in what has streamed so far.
+    let data_of = |seen: &str, event: &str| -> Option<serde_json::Value> {
+        let (_, rest) = seen.split_once(&format!("event: {event}\ndata: "))?;
+        let (data, _) = rest.split_once("\n\n")?;
+        serde_json::from_str(data).ok()
+    };
+    let mut asked = None;
+    let complete = loop {
+        let Some(frame) = frames.next().await else {
+            fail(&format!("the stream ended early: {seen}"));
+        };
+        let frame = frame.unwrap_or_else(|e| fail(&e.to_string()));
+        seen.push_str(&String::from_utf8_lossy(&frame));
+        if asked.is_none()
+            && let Some(request) = data_of(&seen, "permission_required")
+        {
+            assert_eq!(request["sql"], scripted_ollama::DICTATED, "{request}");
+            assert_eq!(request["reason"], "read_documents", "{request}");
+            assert_eq!(
+                tables().await,
+                ["customers"],
+                "nothing ran before the answer"
+            );
+            let decide = format!(
+                "/api/v1/workspaces/{ws}/sessions/{}/permissions/{}",
+                request["session_id"].as_str().unwrap_or_default(),
+                request["request"].as_str().unwrap_or_default()
+            );
+            let (status, body) = h
+                .post(&decide, &token, serde_json::json!({ "decision": "allow" }))
+                .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+            asked = Some(request);
+        }
+        if let Some(complete) = data_of(&seen, "complete") {
+            break complete;
+        }
+    };
+    assert!(asked.is_some(), "the write was asked for: {seen}");
+    assert_eq!(complete["write_refused"], false, "{complete}");
+    assert!(tables().await.is_empty(), "the approved drop ran");
 }
 
 /// Nobody answers a waiting write: it is refused when the time is up, the

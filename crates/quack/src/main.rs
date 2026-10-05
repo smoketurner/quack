@@ -12,6 +12,8 @@ mod mcp;
 mod ontology_cli;
 mod print;
 mod progress_line;
+#[cfg(test)]
+mod scripted_ollama;
 mod server;
 mod stdio;
 mod terminal;

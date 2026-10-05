@@ -287,6 +287,13 @@ impl Prompt {
             Self::Sql(sql) => sql,
         }
     }
+
+    fn notice(&self) -> Option<&'static str> {
+        match self {
+            Self::Agent { request, .. } => request.hold.notice(),
+            Self::Sql(_) => None,
+        }
+    }
 }
 
 /// What the permission overlay asks about: the front prompt, described when
@@ -295,6 +302,8 @@ pub(crate) struct PendingWrite<'a> {
     /// Who asks, named from the session on screen now.
     pub(crate) heading: String,
     pub(crate) sql: &'a str,
+    /// Why the write is held, when there is more to say than "this writes".
+    pub(crate) notice: Option<&'static str>,
     /// Prompts queued behind this one.
     pub(crate) waiting: usize,
 }
@@ -952,7 +961,7 @@ impl App {
             workspace_id,
             db,
             reader_db,
-            allow_write: Arc::new(AtomicBool::new(writes == WritePolicy::Allow)),
+            allow_write: Arc::new(AtomicBool::new(writes.allows_unasked())),
             expand_steps: false,
             wrap_cache: RefCell::new(Vec::new()),
             msg_rx,
@@ -1347,6 +1356,7 @@ impl App {
         Some(PendingWrite {
             heading,
             sql: prompt.sql(),
+            notice: prompt.notice(),
             waiting: self.prompts.len().saturating_sub(1),
         })
     }
@@ -1479,12 +1489,17 @@ impl App {
     }
 
     /// Queue a turn's write request as a prompt; one from a session not on
-    /// screen says whose it is.
+    /// screen says whose it is, and one held for more than being a write
+    /// says why.
     fn ask_for_turn(&mut self, turn: &Turn, request: PermissionRequest) {
+        let notice = request
+            .hold
+            .notice()
+            .map_or(String::new(), |notice| format!("{notice}\n"));
         self.note(
             MessageKind::System,
             format!(
-                "{} wants to run a statement that modifies the workspace:\n{}\n{RUN_IT}",
+                "{} wants to run a statement that modifies the workspace:\n{}\n{notice}{RUN_IT}",
                 turn.speaker(&self.session_id),
                 request.sql
             ),
@@ -2803,6 +2818,7 @@ mod tests {
     use quack_core::analysis::agent::AgentResponse;
     use quack_core::analysis::chart::ChartSpec;
     use quack_core::analysis::events::ToolStep;
+    use quack_core::analysis::policy::Hold;
 
     use super::*;
     use crate::terminal::commands::Suggestion;
@@ -3227,7 +3243,11 @@ mod tests {
         // oneshot is live and the terminal's `y` resolves it.
         let (sink, mut rx) = events::channel();
         let recorder = events::TurnRecorder::new(sink);
-        let pending = tokio::spawn(async move { recorder.ask_permission("DELETE FROM t").await });
+        let pending = tokio::spawn(async move {
+            recorder
+                .ask_permission("DELETE FROM t", Hold::NotPermitted)
+                .await
+        });
         let request = match rx
             .recv()
             .await
@@ -3289,9 +3309,19 @@ mod tests {
         job: JobId,
         sql: &'static str,
     ) -> tokio::task::JoinHandle<bool> {
+        ask_to_write_held(app, job, sql, Hold::NotPermitted).await
+    }
+
+    /// The same, for a write held for `hold`.
+    async fn ask_to_write_held(
+        app: &mut App,
+        job: JobId,
+        sql: &'static str,
+        hold: Hold,
+    ) -> tokio::task::JoinHandle<bool> {
         let (sink, mut rx) = events::channel();
         let recorder = events::TurnRecorder::new(sink);
-        let pending = tokio::spawn(async move { recorder.ask_permission(sql).await });
+        let pending = tokio::spawn(async move { recorder.ask_permission(sql, hold).await });
         let request = match rx.recv().await.unwrap_or_else(|| fail("no event")) {
             AgentEvent::PermissionRequired(request) => request,
             other => fail(&format!("expected PermissionRequired, got {other:?}")),
@@ -3359,6 +3389,41 @@ mod tests {
         app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
         assert!(!app.awaiting_permission());
         assert!(!pending.await.unwrap_or_else(|e| fail(&e.to_string())));
+    }
+
+    /// Writes allowed for the session (`a`, `--allow-write`) still ask once a
+    /// turn has read document text, and the prompt says why.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_held_for_document_text_asks_with_the_reason_though_writes_are_allowed() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        app.allow_write.store(true, Ordering::Relaxed);
+        let turn = waiting_turn(&app);
+        let job = turn.job.id;
+        app.turns.push(turn);
+        let pending = ask_to_write_held(&mut app, job, "DELETE FROM t", Hold::ReadDocuments).await;
+
+        assert!(app.awaiting_permission());
+        let notice = Hold::ReadDocuments
+            .notice()
+            .unwrap_or_else(|| fail("no notice"));
+        assert!(
+            app.messages.iter().any(|m| m.content.contains(notice)),
+            "{:?}",
+            app.messages
+        );
+        let drawn = overlay(&app);
+        assert!(drawn.contains("DELETE FROM t"), "{drawn}");
+        assert!(drawn.contains("This turn read document text"), "{drawn}");
+
+        app.handle_key_event(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(pending.await.unwrap_or_else(|e| fail(&e.to_string())));
+
+        // A write that is only a write carries no notice.
+        let plain = ask_to_write(&mut app, job, "DELETE FROM t").await;
+        assert!(!overlay(&app).contains("read document text"));
+        app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!plain.await.unwrap_or_else(|e| fail(&e.to_string())));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3465,6 +3530,7 @@ mod tests {
         let pending = PendingWrite {
             heading: String::from("The agent wants to run:"),
             sql: &sql,
+            notice: None,
             waiting: 0,
         };
         let lines: Vec<String> = pending

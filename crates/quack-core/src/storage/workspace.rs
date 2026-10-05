@@ -15,6 +15,7 @@ use crate::ids::{ChunkId, DocumentId, NodeId};
 use crate::ingestion::TableName;
 use crate::ingestion::parser::{FileType, Load, PageCounts};
 use crate::ontology::store::Acceptance;
+use crate::text::OneLine;
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
 const BM25_K1: f64 = 1.2;
@@ -3261,7 +3262,7 @@ impl ChunkScope {
             let Some(d) = found else {
                 let known: Vec<String> = documents
                     .iter()
-                    .map(|d| format!("{} ({})", d.id, d.filename))
+                    .map(|d| format!("{} ({})", d.id, OneLine(&d.filename)))
                     .collect();
                 return Err(Error::Analysis(format!(
                     "no document matches '{want}'; pass an id from list_documents or omit \

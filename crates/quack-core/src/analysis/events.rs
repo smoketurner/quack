@@ -6,14 +6,14 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot};
 
 use super::agent::AgentResponse;
 use super::citations::CitationRegistry;
+use super::policy::Hold;
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
 
@@ -117,6 +117,8 @@ pub struct ToolStep {
 #[derive(Debug)]
 pub struct PermissionRequest {
     pub sql: String,
+    /// Why the write waits for an answer; the interface shows its notice.
+    pub hold: Hold,
     reply: oneshot::Sender<Decision>,
 }
 
@@ -139,8 +141,8 @@ pub enum Decision {
     Deny,
     /// This statement only.
     Allow,
-    /// This statement and every later write in the same turn (the
-    /// terminal's `a`; issue #56). The interface keeps its own flag for
+    /// This statement and every later write in the same turn held for the
+    /// same reason (the terminal's `a`). The interface keeps its own flag for
     /// the turns after.
     AllowForTurn,
 }
@@ -266,9 +268,9 @@ pub struct TurnRecorder {
     sink: EventSink,
     steps: Arc<Mutex<Vec<ToolStep>>>,
     citations: CitationRegistry,
-    /// Set once the interface answered `AllowForTurn`: later writes in
-    /// this turn run without asking.
-    writes_granted: Arc<AtomicBool>,
+    /// The hold the interface answered `AllowForTurn` to: later writes in
+    /// this turn held for that reason, or one before it, run without asking.
+    writes_granted: Arc<Mutex<Option<Hold>>>,
     /// Embeddings computed so far this turn, by exact input text: more
     /// than one tool can resolve the same entity label (`search_documents`
     /// and `search_graph` on the same name, `find_path` reusing an entity
@@ -290,7 +292,7 @@ impl TurnRecorder {
             sink,
             steps: Arc::new(Mutex::new(Vec::new())),
             citations: CitationRegistry::default(),
-            writes_granted: Arc::new(AtomicBool::new(false)),
+            writes_granted: Arc::new(Mutex::new(None)),
             embedding_cache: Arc::new(Mutex::new(HashMap::new())),
             turn_limit: None,
         }
@@ -407,26 +409,40 @@ impl TurnRecorder {
         }
     }
 
-    /// Ask the interface whether a write may run, unless an earlier
-    /// answer this turn already granted every write. Resolves to `false`
-    /// when the interface drops the request.
-    pub async fn ask_permission(&self, sql: &str) -> bool {
-        if self.writes_granted.load(Ordering::Acquire) {
+    /// Ask the interface whether a write held for `hold` may run, unless an
+    /// earlier answer this turn already granted every write so held: a
+    /// grant given before the turn read document text does not cover a
+    /// write after it. Resolves to `false` when the interface drops the
+    /// request.
+    pub async fn ask_permission(&self, sql: &str, hold: Hold) -> bool {
+        if self.granted() >= Some(hold) {
             return true;
         }
         let (reply, answer) = oneshot::channel();
         self.emit(AgentEvent::PermissionRequired(PermissionRequest {
             sql: sql.to_owned(),
+            hold,
             reply,
         }));
         match answer.await.unwrap_or(Decision::Deny) {
             Decision::Deny => false,
             Decision::Allow => true,
             Decision::AllowForTurn => {
-                self.writes_granted.store(true, Ordering::Release);
+                *self
+                    .writes_granted
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(hold);
                 true
             }
         }
+    }
+
+    /// The hold an `AllowForTurn` answer has covered so far.
+    fn granted(&self) -> Option<Hold> {
+        *self
+            .writes_granted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The steps recorded so far, in order.
@@ -609,31 +625,73 @@ mod tests {
         let recorder = TurnRecorder::new(sink);
 
         let asker = recorder.clone();
-        let allowed = tokio::spawn(async move { asker.ask_permission("DROP TABLE t").await });
+        let allowed = tokio::spawn(async move {
+            asker
+                .ask_permission("DROP TABLE t", Hold::NotPermitted)
+                .await
+        });
         let req = permission_request(rx.recv().await).unwrap();
         assert_eq!(req.sql, "DROP TABLE t");
         assert_eq!(req.allow(), Delivery::Delivered);
         assert!(allowed.await.is_ok_and(|a| a));
 
         let asker = recorder.clone();
-        let denied = tokio::spawn(async move { asker.ask_permission("DELETE FROM t").await });
+        let denied = tokio::spawn(async move {
+            asker
+                .ask_permission("DELETE FROM t", Hold::NotPermitted)
+                .await
+        });
         let req = permission_request(rx.recv().await).unwrap();
         drop(req);
         assert!(denied.await.is_ok_and(|a| !a));
 
         // `a` grants the rest of the turn: the next write is not asked.
         let asker = recorder.clone();
-        let granted = tokio::spawn(async move { asker.ask_permission("UPDATE t SET a = 1").await });
+        let granted = tokio::spawn(async move {
+            asker
+                .ask_permission("UPDATE t SET a = 1", Hold::NotPermitted)
+                .await
+        });
         let req = permission_request(rx.recv().await).unwrap();
         assert_eq!(req.allow_for_turn(), Delivery::Delivered);
         assert!(granted.await.is_ok_and(|a| a));
-        assert!(recorder.ask_permission("DELETE FROM t").await);
+        assert!(
+            recorder
+                .ask_permission("DELETE FROM t", Hold::NotPermitted)
+                .await
+        );
+        assert!(rx.try_recv().is_err(), "no request was emitted");
+        // The grant was given before the turn read document text, so a
+        // write after it asks again, with the reason; granting that covers
+        // both.
+        let asker = recorder.clone();
+        let mut after_reading = tokio::spawn(async move {
+            asker
+                .ask_permission("DELETE FROM t", Hold::ReadDocuments)
+                .await
+        });
+        // Raced, so a grant that wrongly covered this fails, not hangs.
+        let req = tokio::select! {
+            event = rx.recv() => permission_request(event),
+            _ = &mut after_reading => None,
+        }
+        .unwrap();
+        assert_eq!(req.hold, Hold::ReadDocuments);
+        assert_eq!(req.allow_for_turn(), Delivery::Delivered);
+        assert!(after_reading.await.is_ok_and(|a| a));
+        for hold in [Hold::ReadDocuments, Hold::NotPermitted] {
+            assert!(recorder.ask_permission("DELETE FROM t", hold).await);
+        }
         assert!(rx.try_recv().is_err(), "no request was emitted");
         // A fresh recorder (the next turn) asks again.
         let (sink, mut rx) = channel();
         let next = TurnRecorder::new(sink);
         let asker = next.clone();
-        let pending = tokio::spawn(async move { asker.ask_permission("DELETE FROM t").await });
+        let pending = tokio::spawn(async move {
+            asker
+                .ask_permission("DELETE FROM t", Hold::NotPermitted)
+                .await
+        });
         assert!(permission_request(rx.recv().await).is_some());
         pending.abort();
     }
@@ -646,14 +704,22 @@ mod tests {
         let (sink, mut rx) = channel();
         let recorder = TurnRecorder::new(sink);
         let asker = recorder.clone();
-        let pending = tokio::spawn(async move { asker.ask_permission("DROP TABLE t").await });
+        let pending = tokio::spawn(async move {
+            asker
+                .ask_permission("DROP TABLE t", Hold::NotPermitted)
+                .await
+        });
         let req = permission_request(rx.recv().await).unwrap();
         pending.abort();
         assert!(pending.await.is_err_and(|e| e.is_cancelled()));
         assert_eq!(req.allow(), Delivery::TurnGone);
 
         let asker = recorder.clone();
-        let pending = tokio::spawn(async move { asker.ask_permission("DELETE FROM t").await });
+        let pending = tokio::spawn(async move {
+            asker
+                .ask_permission("DELETE FROM t", Hold::NotPermitted)
+                .await
+        });
         let req = permission_request(rx.recv().await).unwrap();
         pending.abort();
         assert!(pending.await.is_err_and(|e| e.is_cancelled()));

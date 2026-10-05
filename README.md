@@ -206,7 +206,10 @@ Exit codes: 0 ok, 1 error, 2 usage, 3 write refused, 4 auth required.
 - Retrieval combines vector search with quack's own BM25 index. No DuckDB extension is
   loaded at runtime, so the binary stays one file.
 - The agent asks before it writes. Print mode refuses writes without `--allow-write`, and
-  the API requires the write scope.
+  the API requires the write scope. Once a turn has read document or graph text, a write
+  needs a person's approval even with `--allow-write`, and is refused where nobody can be
+  asked, so a document cannot dictate a write. Pinned documents and table rows are not
+  covered by this rule.
 - quack proposes the ontology from your tables and documents, and a person accepts it.
   Extraction follows it, and every node and edge records where it came from.
 - Everything that could reveal workspace content stays in that workspace's file. The

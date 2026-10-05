@@ -351,7 +351,7 @@ pub(crate) async fn stream(
                 .json_data(&step)
                 .unwrap_or_default(),
             AgentEvent::PermissionRequired(request) => {
-                let sql = request.sql.clone();
+                let (sql, hold) = (request.sql.clone(), request.hold);
                 let held = app
                     .permissions
                     .hold(&app, &turn.access, &turn.session_id, request);
@@ -361,6 +361,7 @@ pub(crate) async fn stream(
                         "request": held.request,
                         "session_id": turn.session_id,
                         "sql": sql,
+                        "reason": hold,
                         "expires_at": held.expires_at.to_string(),
                     }))
                     .unwrap_or_default()

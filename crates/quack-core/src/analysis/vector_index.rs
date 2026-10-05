@@ -3,7 +3,7 @@ use rig::vector_store::{VectorSearchRequest, VectorStoreError, VectorStoreIndex}
 use serde::Deserialize;
 use serde_json::json;
 
-use super::tools::ReaderDb;
+use super::tools::{ReaderDb, Turn};
 use crate::embedding::{Embedder, EmbeddingModel, Input};
 use crate::storage::workspace::{ChunkScope, ChunkSearchResult};
 
@@ -13,11 +13,13 @@ const DEFAULT_SAMPLES: u32 = 5;
 pub struct DuckDbVectorIndex<M> {
     db: ReaderDb,
     embedder: Embedder<M>,
+    /// The turn whose prompt the chunks go into.
+    turn: Turn,
 }
 
 impl<M> DuckDbVectorIndex<M> {
-    pub fn new(db: ReaderDb, embedder: Embedder<M>) -> Self {
-        Self { db, embedder }
+    pub fn new(db: ReaderDb, embedder: Embedder<M>, turn: Turn) -> Self {
+        Self { db, embedder, turn }
     }
 }
 
@@ -30,7 +32,8 @@ impl<M> DuckDbVectorIndex<M>
 where
     M: EmbeddingModel + Send + Sync,
 {
-    /// The chunks nearest the request's query, across the workspace.
+    /// The chunks nearest the request's query, across the workspace. A
+    /// search that finds any records that the turn has read document text.
     #[expect(
         clippy::result_large_err,
         reason = "rig's VectorStoreError, which the VectorStoreIndex methods return"
@@ -45,10 +48,15 @@ where
             .await
             .map_err(store_error)?;
         let samples = u32::try_from(req.samples()).unwrap_or(DEFAULT_SAMPLES);
-        self.db
+        let chunks = self
+            .db
             .with_db(move |db| db.search_similar_chunks(&query_vec, samples, &ChunkScope::all()))
             .await
-            .map_err(store_error)
+            .map_err(store_error)?;
+        if !chunks.is_empty() {
+            self.turn.read_documents();
+        }
+        Ok(chunks)
     }
 }
 

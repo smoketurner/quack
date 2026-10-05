@@ -14,7 +14,7 @@ use crate::embedding::{Embedder, Vector};
 use crate::error::{Error, Result};
 use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::workspace::WorkspaceDb;
-use crate::text::NonBlankText;
+use crate::text::{NonBlankText, OneLine};
 
 /// Text a caller gave, trimmed, and absent when blank.
 fn given(text: Option<&str>) -> Option<String> {
@@ -226,7 +226,13 @@ impl fmt::Display for UnknownEntity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "no entity '{}' in the knowledge graph", self.name)?;
         if !self.closest.is_empty() {
-            write!(f, "; the closest labels are: {}", self.closest.join(", "))?;
+            f.write_str("; the closest labels are: ")?;
+            for (i, label) in self.closest.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", OneLine(label))?;
+            }
         }
         Ok(())
     }
