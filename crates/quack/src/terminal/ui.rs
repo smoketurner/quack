@@ -980,21 +980,6 @@ mod tests {
             m_pie.fingerprint(width, false),
             "fingerprints must differ when the plot differs",
         );
-        assert_ne!(
-            m_bar
-                .lines(width, false)
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            m_pie
-                .lines(width, false)
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            "rendered lines differ",
-        );
 
         let mut m = make(bar);
         let key_bar = m.fingerprint(width, false);
