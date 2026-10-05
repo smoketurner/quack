@@ -410,23 +410,6 @@ pub(crate) struct SqlOutcome {
     pub duration_ms: u64,
 }
 
-/// The part of a result the row cap let through.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Capped {
-    pub shown: usize,
-    pub total: usize,
-}
-
-impl SqlOutcome {
-    /// What the row cap left of the result; `None` when every row is here.
-    pub(crate) fn capped(&self) -> Option<Capped> {
-        self.truncated.then_some(Capped {
-            shown: self.rows.len(),
-            total: self.row_count,
-        })
-    }
-}
-
 /// Direct SQL. Reads need the viewer role; anything that mutates needs the
 /// member role and the write scope. `_quack_` tables are never reachable.
 pub(crate) async fn sql(

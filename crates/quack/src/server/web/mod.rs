@@ -58,7 +58,6 @@ use super::api::graph::ExtractionStarted;
 use super::api::import::ImportBody;
 use super::api::members::AddMember;
 use super::api::ontology::{DecideRequest, RenameRequest};
-use super::api::query::Capped;
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
     documents as docs_api, graph as graph_api, import as import_api, workspaces as workspaces_api,
@@ -688,9 +687,7 @@ struct SqlResult {
     headers: Vec<SortHeader>,
     rows: Vec<Vec<String>>,
     row_count: usize,
-    /// Set when the row cap cut the result, so the page and the download
-    /// both say how much of it they hold.
-    capped: Option<Capped>,
+    truncated: bool,
     duration_ms: u64,
     error: Option<String>,
 }
@@ -1562,7 +1559,7 @@ impl SqlResult {
                 sql,
                 sortable,
                 editor_swap: rewritten,
-                capped: outcome.capped(),
+                truncated: outcome.truncated,
                 headers: outcome
                     .columns
                     .into_iter()
@@ -1590,7 +1587,7 @@ impl SqlResult {
                 headers: Vec::new(),
                 rows: Vec::new(),
                 row_count: 0,
-                capped: None,
+                truncated: false,
                 duration_ms: 0,
                 error: Some(e.message),
             },
@@ -1632,9 +1629,14 @@ async fn sql_csv(
     let csv = writer
         .into_inner()
         .map_err(|e| CoreError::Io(e.into_error()))?;
-    let filename = match outcome.capped() {
-        Some(Capped { shown, total }) => format!("query-first-{shown}-of-{total}.csv"),
-        None => "query.csv".to_owned(),
+    let filename = if outcome.truncated {
+        format!(
+            "query-first-{}-of-{}.csv",
+            outcome.rows.len(),
+            outcome.row_count
+        )
+    } else {
+        "query.csv".to_owned()
     };
     Ok((
         [
