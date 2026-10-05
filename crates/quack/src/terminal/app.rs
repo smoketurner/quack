@@ -3501,7 +3501,14 @@ mod tests {
                 drop(first_rx.await);
                 Ok(String::new())
             });
-        pump_until(&mut app, |app| app.active_jobs.len() == 1).await;
+        // Running, not merely queued: the rows below name the state.
+        let running = |app: &App| {
+            app.active_jobs
+                .iter()
+                .filter(|job| job.state == JobState::Running)
+                .count()
+        };
+        pump_until(&mut app, |app| running(app) == 1).await;
         app.handle_slash_command("/jobs");
         let row_of = |app: &App, label: &str| {
             screen(app)
@@ -3518,7 +3525,7 @@ mod tests {
                 ctx.cancel_token().cancelled().await;
                 Ok(String::new())
             });
-        pump_until(&mut app, |app| app.active_jobs.len() == 2).await;
+        pump_until(&mut app, |app| running(app) == 2).await;
         assert!(row_of(&app, "first").contains('\u{25B8}'));
         assert!(!row_of(&app, "second").contains('\u{25B8}'));
 
