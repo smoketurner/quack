@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::storage::control::AllowedProviders;
+use crate::llm::egress::Refusal;
 use crate::storage::workspace::DuckDbMessage;
 
 #[derive(Debug, Error)]
@@ -64,26 +64,10 @@ pub enum Error {
         reason: AuthReason,
     },
 
-    /// The workspace's provider allow-list does not name the provider a
-    /// model request was for; nothing was sent.
-    #[error("provider '{provider}' is not allowed in this workspace, which allows {allowed}")]
-    ProviderNotAllowed {
-        provider: String,
-        allowed: AllowedProviders,
-    },
-
-    /// An Ollama model that Ollama serves from its own hosts, asked for in a
-    /// workspace restricted to some providers; nothing was sent.
-    #[error(
-        "model '{model}' of provider '{provider}' runs in Ollama's cloud, not on the Ollama \
-         server itself, and this workspace allows {allowed}; configure a model without the \
-         `cloud` tag"
-    )]
-    CloudModelNotAllowed {
-        provider: String,
-        model: String,
-        allowed: AllowedProviders,
-    },
+    /// The workspace's provider allow-list refused a model request;
+    /// nothing was sent.
+    #[error(transparent)]
+    ProviderRefused(#[from] Refusal),
 
     /// A model request made by work that entered no `llm::egress::Egress`
     /// scope, so no allow-list could be checked; nothing was sent.
@@ -206,6 +190,16 @@ pub enum Error {
 
     #[error("format error: {0}")]
     Fmt(#[from] fmt::Error),
+}
+
+impl Error {
+    /// Whether a workspace's provider allow-list refused the work: the one
+    /// place that decides it, for the audit outcome, a turn's failure kind,
+    /// and anything else that answers a refusal differently.
+    #[must_use]
+    pub const fn is_provider_refusal(&self) -> bool {
+        matches!(self, Self::ProviderRefused(_))
+    }
 }
 
 impl From<duckdb::Error> for Error {

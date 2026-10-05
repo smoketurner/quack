@@ -647,13 +647,13 @@ impl Outcome {
         }
     }
 
-    /// `Denied` for work the workspace's provider allow-list refused,
-    /// `Error` for any other failure.
+    /// `Denied` for work that was refused, `Error` for any other failure.
     #[must_use]
     pub const fn of_failure(error: &Error) -> Self {
-        match error {
-            Error::ProviderNotAllowed { .. } | Error::CloudModelNotAllowed { .. } => Self::Denied,
-            _ => Self::Error,
+        if error.is_provider_refusal() {
+            Self::Denied
+        } else {
+            Self::Error
         }
     }
 }

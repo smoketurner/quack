@@ -10,6 +10,7 @@ pub mod egress;
 pub mod memory;
 pub mod oauth;
 pub mod sampling;
+mod slot;
 
 use jiff::Timestamp;
 use rig::agent::OutputMode;

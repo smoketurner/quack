@@ -233,9 +233,7 @@ impl From<&Error> for TurnFailure {
             Error::AuthRequired { .. } => FailureKind::AuthRequired,
             Error::NoChatModel { .. } => FailureKind::NoChatModel,
             Error::NotFound { .. } => FailureKind::NotFound,
-            Error::ProviderNotAllowed { .. } | Error::CloudModelNotAllowed { .. } => {
-                FailureKind::ProviderNotAllowed
-            }
+            refused if refused.is_provider_refusal() => FailureKind::ProviderNotAllowed,
             _ => FailureKind::Other,
         };
         Self {
@@ -494,11 +492,14 @@ impl StepInProgress {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     use super::*;
     use crate::embedding::Dimension;
     use crate::error::{AuthReason, Record};
+    use crate::llm::egress::Refusal;
+    use crate::storage::control::AllowedProviders;
 
     /// Interfaces choose their answer from the kind, never the text.
     #[test]
@@ -518,6 +519,11 @@ mod tests {
             FailureKind::NoChatModel
         );
         assert_eq!(kind(Record::Session.missing("s1")), FailureKind::NotFound);
+        let refused = Refusal::Provider {
+            provider: String::from("hosted"),
+            allowed: AllowedProviders::Only(BTreeSet::new()),
+        };
+        assert_eq!(kind(Error::from(refused)), FailureKind::ProviderNotAllowed);
         assert_eq!(
             kind(Error::Llm(String::from("the model went away"))),
             FailureKind::Other

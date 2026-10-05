@@ -152,7 +152,8 @@ is a task-local scope (`Workspace(AllowedProviders)`, or `NoWorkspace` for `quac
 entered by `Access::resolve` in the server, `OpenedWorkspace` on the command line, and
 `McpServer::as_caller` per tool call, and carried into every job by `JobQueue::submit`.
 `Egress::permit` is the one check, called when a model client is built from a `ModelRef` (a typed
-`Error::ProviderNotAllowed` or `CloudModelNotAllowed`: 403 and a `denied` audit row through
+`Error::ProviderRefused` holding the `egress::Refusal`, and `Error::is_provider_refusal` is what
+the audit outcome and a turn's failure kind ask: 403 and a `denied` audit row through
 `Access::model`, exit 1 from the CLI) and again by `ProviderGates::permit` for every request,
 Bedrock's SDK requests included. A request with no scope is `Error::ModelRequestUnscoped`, never an
 allow, so a test that makes a model request enters a scope first. Under a restricted list an Ollama

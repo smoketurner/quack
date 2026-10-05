@@ -125,9 +125,7 @@ impl From<CoreError> for ApiError {
             CoreError::SignIn(_) | CoreError::Bearer(_) => StatusCode::UNAUTHORIZED,
             // The caller is known; this provider cannot act for them, or
             // the workspace's allow-list keeps its content from the provider.
-            CoreError::Delegation { .. }
-            | CoreError::ProviderNotAllowed { .. }
-            | CoreError::CloudModelNotAllowed { .. } => StatusCode::FORBIDDEN,
+            CoreError::Delegation { .. } | CoreError::ProviderRefused(_) => StatusCode::FORBIDDEN,
             CoreError::Config(_)
             | CoreError::Ambiguous { .. }
             | CoreError::NoChatModel { .. }

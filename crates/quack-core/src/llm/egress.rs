@@ -16,11 +16,34 @@
 //! fails instead of sending.
 
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
 
+use super::slot::Slot;
 use crate::config::{ProviderName, ProviderType};
 use crate::error::{Error, Result};
 use crate::storage::control::AllowedProviders;
+
+/// Why a workspace's provider allow-list refused a model request.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Refusal {
+    /// The list does not name the provider.
+    #[error("provider '{provider}' is not allowed in this workspace, which allows {allowed}")]
+    Provider {
+        provider: String,
+        allowed: AllowedProviders,
+    },
+    /// An Ollama model that Ollama serves from its own hosts, asked for in
+    /// a workspace restricted to some providers.
+    #[error(
+        "model '{model}' of provider '{provider}' runs in Ollama's cloud, not on the Ollama \
+         server itself, and this workspace allows {allowed}; configure a model without the \
+         `cloud` tag"
+    )]
+    CloudModel {
+        provider: String,
+        model: String,
+        allowed: AllowedProviders,
+    },
+}
 
 /// Where the current work's model requests may go.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,40 +55,32 @@ pub enum Egress {
     NoWorkspace,
 }
 
-/// The current work's scope, set at most once.
-#[derive(Clone, Default)]
-struct Slot(Arc<OnceLock<Egress>>);
-
 tokio::task_local! {
-    static SLOT: Slot;
+    static SLOT: Slot<Egress>;
 }
 
 impl Egress {
     /// Run `work` with an empty slot that [`Egress::enter`] fills once the
     /// workspace is known: a server request, a CLI command.
     pub async fn request<F: Future>(work: F) -> F::Output {
-        SLOT.scope(Slot::default(), work).await
+        Slot::request(&SLOT, work).await
     }
 
     /// Run `work` under `egress`; under `None` its model requests fail.
     pub async fn scope<F: Future>(egress: Option<Self>, work: F) -> F::Output {
-        let slot = Slot::default();
-        if let Some(egress) = egress {
-            drop(slot.0.set(egress));
-        }
-        SLOT.scope(slot, work).await
+        Slot::scope(&SLOT, egress, work).await
     }
 
     /// Make this the scope of the current request. The first caller wins;
     /// outside [`Egress::request`] it does nothing.
     pub fn enter(self) {
-        drop(SLOT.try_with(|slot| slot.0.set(self)));
+        Slot::enter(&SLOT, self);
     }
 
     /// The current work's scope, if it entered one.
     #[must_use]
     pub fn current() -> Option<Self> {
-        SLOT.try_with(|slot| slot.0.get().cloned()).ok().flatten()
+        Slot::current(&SLOT)
     }
 
     /// Whether the current work may send `model` (when the request names
@@ -75,10 +90,9 @@ impl Egress {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ProviderNotAllowed`] or
-    /// [`Error::CloudModelNotAllowed`] when the workspace's list refuses the
-    /// request, and [`Error::ModelRequestUnscoped`] when the work entered no
-    /// scope.
+    /// Returns [`Error::ProviderRefused`] when the workspace's list refuses
+    /// the request, and [`Error::ModelRequestUnscoped`] when the work
+    /// entered no scope.
     pub(crate) fn permit(
         provider: &ProviderName,
         kind: ProviderType,
@@ -93,21 +107,23 @@ impl Egress {
             return Ok(());
         };
         if !allowed.permits(provider.as_str()) {
-            return Err(Error::ProviderNotAllowed {
+            return Err(Refusal::Provider {
                 provider: provider.to_string(),
                 allowed,
-            });
+            }
+            .into());
         }
         match model {
             Some(model)
                 if kind == ProviderType::Ollama
                     && (model.ends_with("-cloud") || model.ends_with(":cloud")) =>
             {
-                Err(Error::CloudModelNotAllowed {
+                Err(Refusal::CloudModel {
                     provider: provider.to_string(),
                     model: model.to_owned(),
                     allowed,
-                })
+                }
+                .into())
             }
             _ => Ok(()),
         }
@@ -177,7 +193,7 @@ mod tests {
         assert!(
             matches!(
                 &refused,
-                Err(Error::ProviderNotAllowed { provider, allowed })
+                Err(Error::ProviderRefused(Refusal::Provider { provider, allowed }))
                     if provider == "hosted"
                         && allowed.names()
                             == Some(&BTreeSet::from(["local".to_owned(), "ollama".to_owned()]))
@@ -209,7 +225,7 @@ mod tests {
             assert!(
                 matches!(
                     &refused,
-                    Err(Error::CloudModelNotAllowed { provider, model: named, .. })
+                    Err(Error::ProviderRefused(Refusal::CloudModel { provider, model: named, .. }))
                         if provider == "ollama" && named == model
                 ),
                 "{refused:?}"
