@@ -100,14 +100,12 @@ impl ProxyUrl {
         }
     }
 
-    /// Neither HTTP client here speaks SOCKS.
-    fn unsupported(&self) -> Option<Problem> {
+    /// The scheme, when it is SOCKS: neither HTTP client here speaks it.
+    #[must_use]
+    pub fn unsupported_scheme(&self) -> Option<&str> {
         match self.url.scheme() {
             "http" | "https" => None,
-            scheme => Some(Problem::Socks {
-                variable: self.variable,
-                scheme: scheme.to_owned(),
-            }),
+            scheme => Some(scheme),
         }
     }
 }
@@ -245,9 +243,14 @@ impl Proxies {
         let http = http.or_else(|| all.clone());
         let https = https.or(all);
         for proxy in [&http, &https].into_iter().flatten() {
-            if let Some(problem) = proxy.unsupported()
-                && !problems.contains(&problem)
-            {
+            let Some(scheme) = proxy.unsupported_scheme() else {
+                continue;
+            };
+            let problem = Problem::Socks {
+                variable: proxy.variable,
+                scheme: scheme.to_owned(),
+            };
+            if !problems.contains(&problem) {
                 problems.push(problem);
             }
         }

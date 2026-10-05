@@ -339,11 +339,20 @@ fn check_proxy(report: &mut Report, proxies: &Proxies) {
         report.push(Check::new(Area::Proxy, status, problem.to_string()).fix(problem.fix()));
     }
     let mut through = Vec::new();
-    if let Some(proxy) = proxies.https() {
-        through.push(format!("HTTPS through {proxy}"));
-    }
-    if let Some(proxy) = proxies.http() {
-        through.push(format!("HTTP through {proxy}"));
+    let mut status = Status::Ok;
+    for (scheme, proxy) in [("HTTPS", proxies.https()), ("HTTP", proxies.http())] {
+        let Some(proxy) = proxy else {
+            continue;
+        };
+        match proxy.unsupported_scheme() {
+            Some(unsupported) => {
+                status = Status::Fail;
+                through.push(format!(
+                    "{scheme} through {proxy} (unsupported {unsupported}: these requests fail)"
+                ));
+            }
+            None => through.push(format!("{scheme} through {proxy}")),
+        }
     }
     if through.is_empty() {
         if proxies.problems().is_empty() {
@@ -362,7 +371,7 @@ fn check_proxy(report: &mut Report, proxies: &Proxies) {
     };
     report.push(Check::new(
         Area::Proxy,
-        Status::Ok,
+        status,
         format!(
             "{}; direct: loopback, 169.254.0.0/16{listed}",
             through.join(", ")
@@ -1615,6 +1624,16 @@ mod tests {
                 )
                 .fix("set HTTPS_PROXY to an http:// or https:// proxy URL, or unset it")
             )
+        );
+
+        assert_eq!(
+            socks.get(1).cloned(),
+            Some(Check::new(
+                Area::Proxy,
+                Status::Fail,
+                "HTTPS through 127.0.0.1:1080 (unsupported socks5: these requests fail); direct: \
+                 loopback, 169.254.0.0/16"
+            ))
         );
 
         let unusable = proxy_checks(Environment {
