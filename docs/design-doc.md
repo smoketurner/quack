@@ -233,7 +233,12 @@ next await.
   and the queue shutdown run side by side under that one grace. `GET .../jobs/stream` and
   the MCP event streams end when the token fires. A streamed turn ends as any cancelled
   turn does: `complete` with `cancelled: true`, or an `error` event ("the server is shutting
-  down; the turn ended without an answer") when the turn never ran. Then `AppState::close`
+  down; the turn ended without an answer") when the turn never ran. A non-streamed `query`
+  that never ran answers 503 with that sentence. An MCP `query` turn over HTTP runs under a
+  child of the same token, so it ends as a cancelled turn too: the session keeps the
+  question and the cancelled answer, and the turn is audited. The transport stops on the
+  same signal, so the client may not receive that reply. `quack mcp` on stdio has no stop
+  signal; it ends when its input closes. Then `AppState::close`
   drops every MCP transport and workspace handle, so each writer finishes its queued
   closures and checkpoints before the process exits. A supervisor's kill timeout must be
   longer than the grace: `docker-compose.yml` sets `stop_grace_period: 30s`.
@@ -1915,8 +1920,11 @@ fixed-set values, and paging. The request log records each request's route templ
   merge or candidate `action`, an extraction `source`) is refused while the request is
   read: 422 for a JSON body, 400 for a query string, listing the accepted values.
 - 404: a missing session, document, ontology version, merge proposal, or candidate.
-- 503: a provider that needs `quack auth login`, a workspace another process holds, or a
-  workspace file a newer quack upgraded (`docs/migrations.md`).
+- 503: a provider that needs `quack auth login`, a workspace another process holds, a
+  workspace file a newer quack upgraded (`docs/migrations.md`), or a `query` refused
+  because the server is stopping.
+- 409: a workspace name that is taken (`workspace 'NAME' already exists`, the same text
+  `quack workspace create` prints).
 - 400: a question with no chat model configured.
 
 ```

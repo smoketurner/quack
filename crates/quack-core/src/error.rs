@@ -26,6 +26,10 @@ pub enum Error {
     #[error("no workspace named '{0}'; create it with: quack workspace create {0}")]
     NoWorkspaceNamed(String),
 
+    /// A workspace by that name is already there; none was created.
+    #[error("workspace '{0}' already exists")]
+    WorkspaceExists(String),
+
     /// Text that cannot name a workspace.
     #[error("workspace name must be non-empty and contain no slashes or dots")]
     InvalidWorkspaceName,
@@ -107,10 +111,10 @@ pub enum Error {
     /// knows; it is left as it was.
     #[error(
         "workspace file {} has schema version {recorded}, written by {written_by}; this quack ({}) \
-         reads up to version {supported}. Run {written_by}, or restore the copy of the workspace \
-         made before the upgrade",
+         reads up to version {supported}: {}",
         path.display(),
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        written_by.advice()
     )]
     WorkspaceTooNew {
         path: PathBuf,
@@ -118,6 +122,15 @@ pub enum Error {
         supported: u32,
         written_by: WrittenBy,
     },
+
+    /// The workspace file's recorded schema version is not a number, so
+    /// nothing says which schema it holds; it is left as it was.
+    #[error(
+        "workspace file {} records schema version '{recorded}', which is not a number; it was \
+         left as it was",
+        path.display()
+    )]
+    WorkspaceSchemaUnreadable { path: PathBuf, recorded: String },
 
     /// The workspace's writer thread is gone, so no write can run.
     #[error("the workspace writer has stopped")]
@@ -238,11 +251,25 @@ impl fmt::Display for AuthReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrittenBy(pub Option<String>);
 
+/// Who wrote the file: that version exactly.
 impl fmt::Display for WrittenBy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
-            Some(version) => write!(f, "quack {version} or newer"),
+            Some(version) => write!(f, "quack {version}"),
             None => f.write_str("a newer quack"),
+        }
+    }
+}
+
+impl WrittenBy {
+    /// What to do about a file this quack is too old for: that version
+    /// or any newer one opens it.
+    #[must_use]
+    pub fn advice(&self) -> String {
+        const RESTORE: &str = "restore the copy of the workspace made before the upgrade";
+        match &self.0 {
+            Some(version) => format!("run quack {version} or newer, or {RESTORE}"),
+            None => format!("run a newer quack, or {RESTORE}"),
         }
     }
 }

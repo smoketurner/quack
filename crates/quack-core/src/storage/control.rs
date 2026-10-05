@@ -1102,12 +1102,13 @@ impl ControlPlane {
     }
 
     /// Create a new workspace, with `owner` as its owner when given, and
-    /// record `audit` in the same transaction.
+    /// record `audit` in the same transaction. The name's unique index
+    /// decides whether it is taken, so two callers cannot both create it.
     ///
     /// # Errors
     ///
-    /// Returns an error if the insert fails (a duplicate name included);
-    /// nothing is then written.
+    /// Returns [`Error::WorkspaceExists`] when the name is taken, or an
+    /// error if the insert fails; nothing is then written.
     pub async fn create_workspace(
         &self,
         name: &WorkspaceName,
@@ -1122,7 +1123,14 @@ impl ControlPlane {
         let audit = audit
             .in_workspace(&ws.id)
             .on(ResourceKind::Workspace.id(ws.id.as_str()));
-        self.commit_audited(change, audit).await?;
+        self.commit_audited(change, audit)
+            .await
+            .map_err(|e| match &e {
+                Error::Sqlite(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                    Error::WorkspaceExists(name.as_str().to_owned())
+                }
+                _ => e,
+            })?;
         tracing::info!(workspace_name = %name, workspace_id = %ws.id, "created workspace");
         Ok(ws)
     }
@@ -1142,7 +1150,8 @@ impl ControlPlane {
     /// The workspace a command line runs in: the one it `named`, which
     /// must exist, or `default`. The default is created, audited on the
     /// `cli` channel, the first time it is used, so a new install needs no
-    /// setup step.
+    /// setup step. When two processes use it first at once, one creates it
+    /// and the other opens that row.
     ///
     /// # Errors
     ///
@@ -1161,7 +1170,10 @@ impl ControlPlane {
             return Ok(ws);
         }
         let audit = AuditEntry::new(AuditAction::Workspace, Outcome::Allowed, Channel::Cli);
-        self.create_workspace(default, None, audit).await
+        match self.create_workspace(default, None, audit).await {
+            Err(Error::WorkspaceExists(_)) => self.workspace_named(name).await,
+            created => created,
+        }
     }
 
     fn new_workspace(name: &WorkspaceName) -> Result<(WorkspaceRow, Bound)> {
@@ -2550,10 +2562,16 @@ mod tests {
                 .is_err()
         );
         assert!(cp.get_workspace(&ws.id).await.is_ok_and(|w| w.is_some()));
+        let taken = cp
+            .create_workspace(&workspace_name("w"), None, setup_audit())
+            .await;
         assert!(
-            cp.create_workspace(&workspace_name("w"), None, setup_audit())
-                .await
-                .is_err()
+            matches!(&taken, Err(Error::WorkspaceExists(name)) if name == "w"),
+            "{taken:?}"
+        );
+        assert_eq!(
+            taken.err().map(|e| e.to_string()).unwrap_or_default(),
+            "workspace 'w' already exists"
         );
     }
 
@@ -3240,6 +3258,34 @@ mod tests {
             );
         }
         assert!(WorkspaceName::try_from(String::from("a.b/c")).is_err());
+    }
+
+    /// Commands that use the default workspace first at the same moment,
+    /// from separate processes, all get the one row: whoever loses the
+    /// insert opens the winner's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[expect(clippy::unwrap_used, reason = "test setup")]
+    async fn first_uses_of_the_default_workspace_that_race_share_one_row() {
+        let default = WorkspaceName::default();
+        let (dir, first) = open().await;
+        let mut config = Config::default();
+        config.general.data_dir = dir.path().to_path_buf();
+        let mut users = vec![first];
+        for _ in 0..7 {
+            users.push(ControlPlane::open(&config).await.unwrap());
+        }
+        let mut racing = tokio::task::JoinSet::new();
+        for cp in users {
+            let default = default.clone();
+            racing.spawn(async move { cp.workspace_or_default(None, &default).await });
+        }
+        let mut ids = BTreeSet::new();
+        while let Some(opened) = racing.join_next().await {
+            let opened = opened.unwrap();
+            assert!(opened.is_ok(), "{opened:?}");
+            ids.extend(opened.ok().map(|ws| ws.id.into_string()));
+        }
+        assert_eq!(ids.len(), 1, "{ids:?}");
     }
 
     /// A workspace a command names must exist, and nothing is created when

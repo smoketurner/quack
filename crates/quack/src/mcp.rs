@@ -113,6 +113,16 @@ impl Caller {
         }
     }
 
+    /// What cuts a `query` turn short: over HTTP, the server stopping.
+    /// `quack mcp` on stdio has no stop signal (it ends with its input),
+    /// so its token is never cancelled.
+    fn cancel(&self) -> llm::CancellationToken {
+        match self {
+            Self::Unaudited => llm::CancellationToken::new(),
+            Self::Audited { app, .. } => app.stopping.child_token(),
+        }
+    }
+
     /// Whom model requests are made for (over HTTP, the request's user at
     /// an on-behalf-of provider; over stdio, nobody).
     fn acting(&self) -> Option<Acting> {
@@ -418,7 +428,7 @@ impl McpServer {
             policy: self.inner.policy,
             message: &question,
             sink,
-            cancel: llm::CancellationToken::new(),
+            cancel: caller.cancel(),
         }
         .run(&self.inner.config)
         .await;

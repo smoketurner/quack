@@ -75,17 +75,15 @@ impl Exit {
     /// `None` is a plain runtime error. `main` applies this to every
     /// command's error, so no command maps it itself. An OAuth provider
     /// without a usable token is exit 4: no command but `quack auth login`
-    /// can run a login flow. A workspace that does not exist, or a name
-    /// none can take, is a usage error.
+    /// can run a login flow. A workspace that does not exist is a usage
+    /// error.
     fn of(err: &anyhow::Error) -> Option<Self> {
         err.chain()
             .find_map(|cause| match cause.downcast_ref::<CoreError>()? {
                 CoreError::AuthRequired { .. } | CoreError::Delegation { .. } => {
                     Some(Self::AuthRequired)
                 }
-                CoreError::NoWorkspaceNamed(_) | CoreError::InvalidWorkspaceName => {
-                    Some(Self::Usage)
-                }
+                CoreError::NoWorkspaceNamed(_) => Some(Self::Usage),
                 _ => None,
             })
     }
@@ -2017,8 +2015,7 @@ mod tests {
         assert_eq!(control.list_workspaces().await.unwrap().len(), 1);
     }
 
-    /// With no `-w`, a new data directory gets the default workspace, and a
-    /// default name no workspace may take is a usage error.
+    /// With no `-w`, a new data directory gets the default workspace.
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
     async fn no_workspace_flag_creates_the_default_on_a_fresh_data_dir() {
@@ -2032,9 +2029,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again.workspace.id, opened.workspace.id);
-
-        let invalid = anyhow::Error::from(CoreError::InvalidWorkspaceName);
-        assert_eq!(Exit::of(&invalid), Some(Exit::Usage));
     }
 
     #[test]

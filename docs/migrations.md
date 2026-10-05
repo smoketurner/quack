@@ -104,20 +104,22 @@ file: no table definition, no rebuild, no version write. The message names the f
 schema versions, and the quack that wrote it:
 
 ```
-workspace file .../data.duckdb has schema version 12, written by quack 2026.11.0 or newer;
-this quack (2026.10.3) reads up to version 11. Run quack 2026.11.0 or newer, or restore the
-copy of the workspace made before the upgrade
+workspace file .../data.duckdb has schema version 12, written by quack 2026.11.0; this quack
+(2026.10.3) reads up to version 11: run quack 2026.11.0 or newer, or restore the copy of the
+workspace made before the upgrade
 ```
 
 The CLI prints it and exits 1, the server answers 503, and `quack doctor` fails the
-workspace check with the same fix. Two ways out:
+workspace check with that advice as its fix. Two ways out:
 
 1. Run the quack version the message names, or a newer one.
 2. Restore the copy of the workspace directory made before the upgrade.
 
 So copy the data directory before upgrading quack if rolling back must stay possible. A
 file last written before `written_by_quack` existed names no version; the message then
-asks for "a newer quack".
+asks for "a newer quack". A `schema_version` that is not a number is refused the same way,
+before any statement runs (`Error::WorkspaceSchemaUnreadable`): quack does not guess which
+schema such a file holds.
 
 `control.db` has the same guard from sqlx: the migrator refuses a database that holds a
 migration the binary lacks.

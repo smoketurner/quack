@@ -5889,8 +5889,92 @@ async fn a_stopping_server_closes_its_runs_and_refuses_new_work_on_the_record() 
             serde_json::json!({ "prompt": "hi" }),
         )
         .await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(body.to_string().contains(stopping), "{body}");
+}
+
+/// An MCP `query` turn is cut short by the server stopping, like any other
+/// turn: the session keeps the question and the cancelled answer, and the
+/// turn is audited.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopping_server_cancels_an_mcp_query_turn_on_the_record() {
+    use quack_core::config::Config;
+    use quack_core::llm::CANCELLED_NOTE;
+
+    // A model that accepts the connection and never answers.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let address = silent.local_addr().unwrap_or_else(|e| fail(&e.to_string()));
+    let config = Config::parse(&format!(
+        "[general]\nchat_model = \"silent/model\"\n\
+         [providers.silent]\ntype = \"ollama\"\nbase_url = \"http://{address}\"\n"
+    ))
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("notes", &owner).await;
+    let token = h.login("owner").await;
+    let session = mcp_session(&h, &ws, &token).await;
+    let sessions = format!("/api/v1/workspaces/{ws}/sessions");
+
+    let asked = mcp_call(
+        &h,
+        &ws,
+        Some(&token),
+        Some(&session),
+        rpc(
+            2,
+            "tools/call",
+            &serde_json::json!({ "name": "query", "arguments": { "question": "how many?" } }),
+        ),
+    );
+    // Stop the server once the turn has its session and waits on the model.
+    let stopped = async {
+        loop {
+            let (_, body) = h.get(&sessions, &token).await;
+            if body["sessions"].as_array().is_some_and(|s| !s.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        h.app.stopping.cancel();
+    };
+    let within = std::time::Duration::from_secs(30);
+    let ended = tokio::time::timeout(within, async { tokio::join!(asked, stopped) }).await;
+    assert!(ended.is_ok(), "the stopping server did not end the turn");
+
+    // The call runs on a task of its own, which records the turn's end
+    // after the transport has let go of the request.
+    let (_, body) = h.get(&sessions, &token).await;
+    let sid = body["sessions"][0]["id"].as_str().unwrap_or_default();
+    let mut contents = Vec::new();
+    let mut queries = Vec::new();
+    for _ in 0..250 {
+        let (_, recorded) = h.get(&format!("{sessions}/{sid}"), &token).await;
+        contents = recorded["messages"]
+            .as_array()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter_map(|m| m["content"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        queries = h
+            .audit(AuditFilter {
+                workspace_id: Some(ws.clone()),
+                action: Some(String::from("query")),
+                ..AuditFilter::default()
+            })
+            .await;
+        if contents.len() == 2 && !queries.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(contents, ["how many?", CANCELLED_NOTE]);
+    assert_eq!(queries.len(), 1, "{queries:?}");
 }
 
 /// Closing the state closes each workspace file: the writer finishes and
@@ -6042,7 +6126,7 @@ async fn web_forms_follow_the_api_rules_and_say_why() {
     let (_, _, headers) = h.form("/workspaces", Some(&cookie), "name=team").await;
     let (to, html) = h.land(&headers, Some(&cookie)).await;
     assert_eq!(to, "/workspaces");
-    assert!(html.contains("workspace exists"), "{html}");
+    assert!(html.contains("already exists"), "{html}");
 
     // Removing someone who is not a member says so; it used to pass silently.
     let (status, _, headers) = h

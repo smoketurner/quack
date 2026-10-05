@@ -642,9 +642,16 @@ impl WorkspaceDb {
     /// it: this binary's table definitions and rebuilds do not know that
     /// schema, and recording its own lower version would hide the rollback.
     fn refuse_newer_schema(conn: &duckdb::Connection, path: &Path) -> Result<()> {
-        let recorded = Self::recorded(conn, MetaKey::SchemaVersion)?
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
+        // A file from before the version was recorded has none.
+        let recorded = match Self::recorded(conn, MetaKey::SchemaVersion)? {
+            None => 0,
+            Some(text) => text
+                .parse::<u32>()
+                .map_err(|_| Error::WorkspaceSchemaUnreadable {
+                    path: path.to_path_buf(),
+                    recorded: text,
+                })?,
+        };
         if recorded <= WORKSPACE_SCHEMA_VERSION {
             return Ok(());
         }
@@ -5552,7 +5559,11 @@ mod tests {
         assert_eq!((*recorded, *supported), (newer, WORKSPACE_SCHEMA_VERSION));
         assert_eq!(written_by, &WrittenBy(Some(String::from("9.9.9"))));
         let message = refused.to_string();
-        assert!(message.contains("Run quack 9.9.9 or newer"), "{message}");
+        assert!(
+            message.contains("written by quack 9.9.9; this quack"),
+            "{message}"
+        );
+        assert!(message.contains("run quack 9.9.9 or newer"), "{message}");
 
         let conn = duckdb::Connection::open(config.workspace_db_path("ws"))
             .unwrap_or_else(|e| fail(&e.to_string()));
@@ -5590,7 +5601,51 @@ mod tests {
             fail("a newer file opened")
         };
         let message = refused.to_string();
-        assert!(message.contains("Run a newer quack"), "{message}");
+        assert!(message.contains("written by a newer quack;"), "{message}");
+        assert!(message.contains("run a newer quack"), "{message}");
+    }
+
+    /// A schema version that is not a number says nothing about the
+    /// file's schema, so the file is refused before any statement changes
+    /// it, not read as version 0.
+    #[test]
+    fn a_schema_version_that_is_not_a_number_is_refused_and_left_as_it_was() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        {
+            let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+            db.execute_statement("DROP TABLE _quack_session_summaries")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            db.set_meta(MetaKey::SchemaVersion, "eleven")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        let Err(refused) = WorkspaceDb::open(&config, "ws") else {
+            fail("a file with an unreadable schema version opened")
+        };
+        assert!(
+            matches!(
+                &refused,
+                Error::WorkspaceSchemaUnreadable { recorded, .. } if recorded == "eleven"
+            ),
+            "{refused}"
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains("records schema version 'eleven', which is not a number"),
+            "{refused}"
+        );
+        let conn = duckdb::Connection::open(config.workspace_db_path("ws"))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let recreated: bool = conn
+            .query_row(
+                "SELECT count(*) > 0 FROM duckdb_tables() \
+                 WHERE table_name = '_quack_session_summaries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(!recreated, "the refusal ran table definitions");
     }
 
     /// Every open records the quack and `DuckDB` versions that wrote the file.

@@ -178,13 +178,6 @@ pub(crate) async fn run_workspace(config: &Config, action: WorkspaceAction) -> R
     let stdout = std::io::stdout();
     match action {
         WorkspaceAction::Create { name } => {
-            if control
-                .find_workspace_by_name(name.as_str())
-                .await?
-                .is_some()
-            {
-                anyhow::bail!("workspace '{name}' already exists");
-            }
             let entry = AuditEntry::new(AuditAction::Workspace, Outcome::Allowed, Channel::Cli);
             let ws = control.create_workspace(&name, None, entry).await?;
             let mut out = stdout.lock();

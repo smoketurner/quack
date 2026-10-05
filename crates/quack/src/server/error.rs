@@ -138,7 +138,9 @@ impl From<CoreError> for ApiError {
             | CoreError::QueryTimeout { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             // A request is never cancelled through its own handler today (only
             // background jobs are); should one be, it lost to a later action.
-            CoreError::TableTaken { .. } | CoreError::Cancelled => StatusCode::CONFLICT,
+            CoreError::TableTaken { .. } | CoreError::WorkspaceExists(_) | CoreError::Cancelled => {
+                StatusCode::CONFLICT
+            }
             CoreError::Sqlite(_)
             | CoreError::DuckDb(_)
             | CoreError::Embedding(_)
@@ -153,6 +155,7 @@ impl From<CoreError> for ApiError {
             | CoreError::Fmt(_)
             | CoreError::WriterStopped
             | CoreError::WritePanicked(_)
+            | CoreError::WorkspaceSchemaUnreadable { .. }
             | CoreError::ModelRequestUnscoped { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::new(status, err.to_string())

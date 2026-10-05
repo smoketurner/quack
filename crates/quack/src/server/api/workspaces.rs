@@ -98,14 +98,6 @@ impl Identity {
     pub(crate) async fn create_workspace(&self, app: &App, name: &str) -> ApiResult<WorkspaceRow> {
         self.require_admin()?;
         let name: WorkspaceName = name.parse()?;
-        if app
-            .control
-            .find_workspace_by_name(name.as_str())
-            .await?
-            .is_some()
-        {
-            return Err(ApiError::conflict("workspace exists"));
-        }
         let owner = (app.mode == ServeMode::Login).then_some(&self.user_id);
         let entry = self.audit(AuditAction::Workspace, Outcome::Allowed);
         Ok(app.control.create_workspace(&name, owner, entry).await?)

@@ -140,7 +140,8 @@ the one way a process stops its jobs: a later `submit` is recorded as cancelled 
 queued and running jobs are cancelled, and it waits up to the grace for them and for what
 `when_ended` records. The terminal's quit calls it; `quack serve` calls it on SIGTERM or Ctrl-C
 beside the HTTP drain under `[server].shutdown_grace_seconds` (20), after cancelling
-`AppState::stopping` (which ends `jobs/stream` and the MCP event streams), and then
+`AppState::stopping` (which ends `jobs/stream` and the MCP event streams, and cancels an MCP
+`query` turn, which runs under a child of it), and then
 `AppState::close` drops the workspace handles so each writer checkpoints. There is no job pool:
 resources are limited where they are used. Every rig HTTP client sends through
 `llm::LimitedHttp` (rig's reqwest transport, plus the provider's `headers`), which holds

@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
 use quack_core::analysis::agent::AgentResponse;
@@ -221,13 +222,17 @@ enum TurnEnd<'a> {
 
 impl Turn {
     /// What the caller is told when the events closed with neither an
-    /// answer nor a failure: the turn's job was cancelled while queued, or
-    /// a stopping server refused it.
-    fn unanswered(app: &App) -> &'static str {
+    /// answer nor a failure: 503 when a stopping server refused the turn
+    /// (the request is fine; another server can take it), 500 when its job
+    /// was cancelled while queued.
+    fn unanswered(app: &App) -> ApiError {
         if app.stopping.is_cancelled() {
-            "the server is shutting down; the turn ended without an answer"
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the server is shutting down; the turn ended without an answer",
+            )
         } else {
-            "the turn ended without an answer"
+            ApiError::internal("the turn ended without an answer")
         }
     }
 
@@ -299,10 +304,7 @@ pub(crate) async fn query(
         return Ok(Json(response.to_json(&turn.session_id)));
     }
     turn.record(&app, TurnEnd::Failed(failure.as_ref())).await;
-    Err(failure.map_or_else(
-        || ApiError::internal(Turn::unanswered(&app)),
-        ApiError::from,
-    ))
+    Err(failure.map_or_else(|| Turn::unanswered(&app), ApiError::from))
 }
 
 /// The same turn as SSE: `text`, `tool_started`, `tool_finished`, then
@@ -325,7 +327,9 @@ pub(crate) async fn stream(
                 return None;
             }
             turn.record(&app, TurnEnd::Failed(None)).await;
-            let out = StreamEvent::Error.event().data(Turn::unanswered(&app));
+            let out = StreamEvent::Error
+                .event()
+                .data(Turn::unanswered(&app).message);
             return Some((Ok(out), (turn, app, TurnStream::Ended)));
         };
         let state = match event {

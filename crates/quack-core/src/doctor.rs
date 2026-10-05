@@ -107,6 +107,24 @@ pub struct Check {
     pub fix: Option<String>,
 }
 
+/// What a workspace file records about what wrote it; a file from before
+/// a value was recorded has none.
+struct FileVersions {
+    schema: Option<String>,
+    quack: Option<String>,
+    duckdb: Option<String>,
+}
+
+impl FileVersions {
+    fn read(db: &WorkspaceDb) -> Result<Self, Error> {
+        Ok(Self {
+            schema: db.meta(MetaKey::SchemaVersion)?,
+            quack: db.meta(MetaKey::WrittenByQuack)?,
+            duckdb: db.meta(MetaKey::WrittenByDuckDb)?,
+        })
+    }
+}
+
 impl Check {
     fn new(area: Area, status: Status, summary: impl Into<String>) -> Self {
         Self {
@@ -133,6 +151,38 @@ impl Check {
             Error::NoWorkspaceNamed(name.to_owned()).to_string(),
         )
         .fix(format!("quack workspace create {name}"))
+    }
+
+    /// A workspace that opens (`opens` says so), with the versions its file
+    /// records. Versions that cannot be read fail the check: an open file
+    /// that does not answer for itself is not a healthy one.
+    fn recorded_versions(opens: &str, versions: Result<FileVersions, Error>) -> Self {
+        match versions {
+            Ok(FileVersions {
+                schema,
+                quack,
+                duckdb,
+            }) => {
+                let or_unrecorded =
+                    |v: Option<String>| v.unwrap_or_else(|| String::from("unrecorded"));
+                Self::new(
+                    Area::Workspace,
+                    Status::Ok,
+                    format!(
+                        "{opens}; schema version {}, written by quack {} with DuckDB {}",
+                        or_unrecorded(schema),
+                        or_unrecorded(quack),
+                        or_unrecorded(duckdb)
+                    ),
+                )
+            }
+            Err(e) => Self::new(
+                Area::Workspace,
+                Status::Fail,
+                format!("{opens}, but the versions its file records cannot be read: {e}"),
+            )
+            .fix("check the file under the data directory, or restore a backup"),
+        }
     }
 
     /// Whether a turn's budgets fit the context window the listing reports
@@ -570,24 +620,12 @@ async fn check_workspace(
         Ok(db) => {
             let tables = db.list_tables().map_or(0, |t| t.len());
             let documents = db.list_documents().map_or(0, |d| d.len());
-            let recorded = |key| {
-                db.meta(key)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| String::from("unrecorded"))
-            };
-            report.push(Check::new(
-                Area::Workspace,
-                Status::Ok,
-                format!(
-                    "'{name}' opens: {}, {}; schema version {}, written by quack {} with DuckDB {}",
-                    Count(tables, "table"),
-                    Count(documents, "document"),
-                    recorded(MetaKey::SchemaVersion),
-                    recorded(MetaKey::WrittenByQuack),
-                    recorded(MetaKey::WrittenByDuckDb)
-                ),
-            ));
+            let opens = format!(
+                "'{name}' opens: {}, {}",
+                Count(tables, "table"),
+                Count(documents, "document")
+            );
+            report.push(Check::recorded_versions(&opens, FileVersions::read(&db)));
             if let Some(note) = db.embedding_status().ok().and_then(|s| s.note()) {
                 report.push(
                     Check::new(Area::Workspace, Status::Warn, format!("'{name}': {note}"))
@@ -605,18 +643,24 @@ async fn check_workspace(
                 ),
             ));
         }
-        Err(ref e @ Error::WorkspaceTooNew { ref written_by, .. }) => {
-            let fix = format!(
-                "run {written_by}, or restore the copy of the workspace directory made before \
-                 the upgrade; this quack left the file as it was"
-            );
+        // The error's own text ends with the same advice; the fix says it once.
+        Err(Error::WorkspaceTooNew {
+            recorded,
+            supported,
+            written_by,
+            ..
+        }) => {
             report.push(
                 Check::new(
                     Area::Workspace,
                     Status::Fail,
-                    format!("'{name}' does not open: {e}"),
+                    format!(
+                        "'{name}' does not open: its file has schema version {recorded}, written \
+                         by {written_by}, and this quack reads up to version {supported}; the \
+                         file was left as it was"
+                    ),
                 )
-                .fix(fix),
+                .fix(written_by.advice()),
             );
         }
         Err(e) => {
@@ -2022,9 +2066,41 @@ mod tests {
         let check = checks.first().unwrap();
         assert_eq!(check.status, Status::Fail, "{check:?}");
         assert!(check.summary.contains("schema version 99"), "{check:?}");
+        assert!(
+            check.summary.contains("written by quack 9.9.9,"),
+            "{check:?}"
+        );
         let fix = check.fix.as_deref().unwrap();
         assert!(fix.contains("run quack 9.9.9 or newer"), "{fix}");
         assert!(fix.contains("restore the copy"), "{fix}");
+        // The advice is the fix alone, not the summary too.
+        assert!(!check.summary.contains("or newer"), "{check:?}");
+
+        // Versions that cannot be read fail the check instead of printing
+        // as unrecorded.
+        let unreadable = Check::recorded_versions(
+            "'ws' opens: 0 tables, 0 documents",
+            Err(Error::Config(String::from("the meta table did not answer"))),
+        );
+        assert_eq!(unreadable.status, Status::Fail, "{unreadable:?}");
+        assert!(
+            unreadable.summary.contains("cannot be read:")
+                && unreadable.summary.contains("the meta table did not answer"),
+            "{unreadable:?}"
+        );
+        assert!(unreadable.fix.is_some(), "{unreadable:?}");
+        let unrecorded = Check::recorded_versions(
+            "'ws' opens",
+            Ok(FileVersions {
+                schema: None,
+                quack: None,
+                duckdb: None,
+            }),
+        );
+        assert!(
+            unrecorded.summary.contains("schema version unrecorded"),
+            "{unrecorded:?}"
+        );
     }
 
     /// A named workspace that does not exist is a failure with the command
