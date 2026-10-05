@@ -1787,7 +1787,11 @@ permission prompts take `y`/`n`/`a`, one at a time, and the prompt itself shows 
 the statement, and how many more wait, so clearing or scrolling the transcript never hides
 what is being approved. Input starting with `SELECT`/`WITH`/`FROM`/
 `DESCRIBE`/`SHOW`/`PIVOT`/`SUMMARIZE` is direct SQL. Direct SQL and `/sql` pass the agent's
-gate: internal tables refused, writes ask `y`/`n`/`a`, `max_query_rows` rows shown.
+gate: internal tables refused, writes ask `y`/`n`/`a`, `max_query_rows` rows shown. A line that
+is the path of a loadable file (or several, shell-quoted) is loaded. The session turns on
+bracketed paste, so a file dropped on the terminal arrives as one paste of its path: into
+an empty input it loads at once, announced on a green `↑` line with its job number, and
+into text already typed it is inserted like any other paste.
 
 Slash commands: `/help`, `/tables`, `/schema TABLE`, `/sql`, `/ingest PATH` (`/attach`),
 `/import`, `/docs`, `/pin`, `/unpin`, `/delete`, `/ontology ...` and `/graph ...`, `/graph
