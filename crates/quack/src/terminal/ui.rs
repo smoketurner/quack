@@ -670,7 +670,7 @@ impl Message {
         self.detail.hash(&mut hasher);
         self.chart
             .as_ref()
-            .map(|c| c.title.as_str())
+            .map(|c| format!("{c:?}"))
             .hash(&mut hasher);
         width.hash(&mut hasher);
         (expand && self.kind == MessageKind::Step).hash(&mut hasher);
@@ -893,6 +893,93 @@ mod tests {
                 .first()
                 .and_then(|row| row.get(1))
                 .is_some_and(|span| span.style == bold)
+        );
+    }
+
+    #[test]
+    fn chart_fingerprint_covers_the_plot_not_just_the_title() {
+        use crate::terminal::chart::ChartData;
+        use quack_core::analysis::chart::{Axis as SpecAxis, ChartKind, ChartSpec, Series};
+
+        fn spec(kind: ChartKind) -> ChartSpec {
+            ChartSpec {
+                title: String::from("Sales"),
+                kind,
+                x: SpecAxis {
+                    label: String::from("x"),
+                    values: vec![String::from("A"), String::from("B")],
+                },
+                series: vec![Series {
+                    name: String::from("s"),
+                    values: vec![60.0, 40.0],
+                }],
+            }
+        }
+        let width = 60usize;
+        let chart_w = u16::try_from(width.saturating_sub(3)).unwrap_or(u16::MAX);
+        let bar = ChartData::from_spec(&spec(ChartKind::Bar));
+        let pie = ChartData::from_spec(&spec(ChartKind::Pie));
+        assert_eq!(bar.title, pie.title);
+        let bar_text: String = bar
+            .lines(chart_w)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pie_text: String = pie
+            .lines(chart_w)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(pie_text.contains('\u{25A0}'), "pie renders a legend square");
+        assert!(!bar_text.contains('\u{25A0}'), "bar does not render one");
+        assert_ne!(bar_text, pie_text);
+
+        let make = |chart| Message {
+            kind: MessageKind::Assistant,
+            content: String::from("Here is the chart."),
+            chart: Some(chart),
+            detail: None,
+        };
+        let m_bar = make(bar.clone());
+        let m_pie = make(pie.clone());
+        assert_ne!(
+            m_bar.fingerprint(width, false),
+            m_pie.fingerprint(width, false),
+            "fingerprints must differ when the plot differs",
+        );
+        assert_ne!(
+            m_bar
+                .lines(width, false)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            m_pie
+                .lines(width, false)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "rendered lines differ",
+        );
+
+        let mut m = make(bar);
+        let key_bar = m.fingerprint(width, false);
+        m.chart = Some(pie);
+        let key_pie = m.fingerprint(width, false);
+        assert_ne!(key_bar, key_pie);
+        assert_eq!(m_bar.fingerprint(width, false), key_bar);
+        assert_eq!(m_pie.fingerprint(width, false), key_pie);
+
+        let line = ChartData::from_spec(&spec(ChartKind::Line));
+        let scatter = ChartData::from_spec(&spec(ChartKind::Scatter));
+        assert_eq!(line.title, scatter.title);
+        assert_ne!(
+            make(line).fingerprint(width, false),
+            make(scatter).fingerprint(width, false),
+            "line and scatter differ only in graph_type",
         );
     }
 }
