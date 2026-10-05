@@ -47,12 +47,13 @@ nothing in it knows about HTTP, terminals, or windows.
 | `vault` | data at rest sealed with HPKE under one key in the OS keychain, per purpose and subject; callers store the `Sealed` value | 10.3, 12 |
 | `oidc` | server sign-in through an OpenID Connect issuer (`SignIn`), bearer verification of the issuer's access tokens (`SignIn::verify_bearer`), signed-in users' tokens sealed in `control.db` (`UserTokens`), each person's own token for session renewal and on-behalf-of exchanges, and the one place an issuer's refusal of it is handled (`SubjectTokens`) | 10.2, 12 |
 | `web_sessions` | `quack serve`'s browser and API-login sessions (`WebSessions`), in core so an issuer's refusal ends them where it is seen | 12 |
-| `doctor` | `quack doctor`'s checks over a `config::inspect` result: config file, crypto module, data directory mode, `control.db`, the workspace, each model's credential and a model-list probe of its provider, the server bind; creates nothing | 11.5 |
+| `doctor` | `quack doctor`'s checks over a `config::inspect` result: config file, crypto module, data directory mode, `control.db`, the workspace, the proxy variables, each model's credential and a model-list probe of its provider, the server bind; creates nothing | 11.5 |
 | `error` | the `thiserror` enum every layer returns | |
 | `storage::control` | `control.db` (SQLite, sea-query): users, workspaces, membership, tokens, the append-only access `audit_log` | 5.5, 12 |
 | `migrations/*.sql` | `control.db` schema versions | [migrations.md](migrations.md) |
 | `storage::workspace` | the workspace DuckDB file: open with confinement and limits, the `_quack_` tables, statement classification, hybrid retrieval (cosine scan plus BM25 over `_quack_terms`), the document registry, query execution with faithful JSON values | 5.4, 6.1, 7.4 |
 | `storage::writer` | the workspace's one writer connection as an actor: its own thread runs the closures sent to it, interactive before background; callers await `run` / `run_at` | 4.1, 7.4 |
+| `proxy` | `Proxies`: the forward proxy from `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, read once; every reqwest client starts from `Proxies::client` and the AWS SDK connector takes `Proxies::aws`, and loopback and `169.254.0.0/16` are never proxied | 6.2, 10.1 |
 | `priority` | the interactive/background task-local that the writer line and the model limiter read | 4.1 |
 | `storage::sessions`, `storage::context`, `storage::audit` | conversations, the versioned workspace context, the content half of the audit (`AuditLog`: the server's insert-only audit connection) | 5.3, 8 |
 | `embedding` | each text's embedding role (query, document, similarity), each model family's trained prefixes (`presets`) and their `[embedding]` overrides, the profile a vector is made under, the width check, `refresh` | 6.1, 5.4 |

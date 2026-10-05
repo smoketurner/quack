@@ -38,6 +38,7 @@ use crate::config::{BaseUrl, ProviderConfig, ProviderName, RequestLimit};
 use crate::error::{self, Error};
 
 use crate::priority::Priority;
+use crate::proxy::Proxies;
 
 /// Permits of one provider and model, handed to interactive waiters first.
 struct Gate {
@@ -283,7 +284,9 @@ impl LimitedHttp {
     #[must_use]
     pub fn for_provider(name: &ProviderName, provider: &ProviderConfig) -> Self {
         Self {
-            inner: ReqwestClient::from(reqwest::Client::default()),
+            // A client that cannot be built is a TLS setup failure, which
+            // reqwest's default client meets the same way.
+            inner: ReqwestClient::from(Proxies::from_env().client().build().unwrap_or_default()),
             gates: ProviderGates::for_provider(name, provider),
             headers: http::HeaderMap::new(),
             authorize: None,

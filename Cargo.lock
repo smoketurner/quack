@@ -4136,6 +4136,7 @@ dependencies = [
  "futures",
  "http",
  "http-body",
+ "hyper-util",
  "jiff",
  "jsonwebtoken",
  "keyring-core",

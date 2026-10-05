@@ -947,8 +947,9 @@ fn import(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
 
 impl EnvVar {
     /// The environment variables this configuration reads: the four that
-    /// override settings, and the ones the providers name for their
-    /// credentials. Only whether each is set, never what it holds.
+    /// override settings, the proxy variables (set under either case), and
+    /// the ones the providers name for their credentials. Only whether each
+    /// is set, never what it holds.
     fn read_by(config: &Config) -> Vec<Self> {
         let mut vars = vec![
             Self::new(ENV_CONFIG_DIR, "the directory holding config.toml"),
@@ -956,6 +957,26 @@ impl EnvVar {
             Self::new(ENV_MODEL, "overrides [general].chat_model"),
             Self::new(ENV_BIND, "overrides [server].bind"),
         ];
+        for (upper, lower, purpose) in [
+            (
+                "HTTPS_PROXY",
+                "https_proxy",
+                "the proxy for https:// requests",
+            ),
+            ("HTTP_PROXY", "http_proxy", "the proxy for http:// requests"),
+            (
+                "ALL_PROXY",
+                "all_proxy",
+                "the proxy for a scheme without its own variable",
+            ),
+            (
+                "NO_PROXY",
+                "no_proxy",
+                "hosts reached directly, beside loopback and 169.254.0.0/16",
+            ),
+        ] {
+            vars.push(Self::either_case(upper, lower, purpose));
+        }
         if let Some(secret) = config
             .server
             .oidc
@@ -997,6 +1018,17 @@ impl EnvVar {
             }
         }
         vars
+    }
+
+    /// A variable read under either case, listed by its upper-case name.
+    fn either_case(upper: &str, lower: &str, purpose: &str) -> Self {
+        Self {
+            name: upper.to_owned(),
+            set: [upper, lower]
+                .into_iter()
+                .any(|name| std::env::var_os(name).is_some()),
+            purpose: purpose.to_owned(),
+        }
     }
 
     fn new(name: &str, purpose: &str) -> Self {
@@ -1674,6 +1706,10 @@ top_k = 3
                 ENV_DATA_DIR,
                 ENV_MODEL,
                 ENV_BIND,
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "ALL_PROXY",
+                "NO_PROXY",
                 "QUACK_TEST_KEY"
             ]
         );

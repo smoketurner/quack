@@ -26,6 +26,7 @@ use crate::ids::DocumentId;
 use crate::ingestion::parser::{FileType, Load};
 use crate::ingestion::{self, IngestOutcome, NewFile, TableName};
 use crate::progress::RunControl;
+use crate::proxy::{Proxies, Route};
 use crate::storage::workspace::{DocumentSource, WorkspaceDb, quote_ident};
 use crate::storage::writer::Writer;
 
@@ -381,6 +382,7 @@ impl<M: EmbeddingModel> Importing<'_, M> {
                     timeout,
                     max_mb: config.import.max_download_mb,
                     hosts: policy.hosts,
+                    proxies: Proxies::from_env(),
                 };
                 control
                     .or_cancelled(download.fetch(&request.url, table.as_str()))
@@ -542,19 +544,22 @@ async fn fetch_rows(url: &str, inner: &str, limit: u64) -> Result<Fetched> {
 }
 
 /// How a download is bounded.
-struct Download {
+struct Download<'a> {
     timeout: Duration,
     max_mb: u64,
     hosts: HostReach,
+    proxies: &'a Proxies,
 }
 
-impl Download {
+impl Download<'_> {
     /// Download a data file; the workspace file name keeps the URL's
     /// extension so the usual reader loads it, under the requested table name.
     ///
     /// When only public hosts may be reached, the name is resolved first,
     /// every address is checked, and the connection is pinned to those
-    /// addresses so a second lookup cannot answer differently.
+    /// addresses so a second lookup cannot answer differently. Through a
+    /// proxy the proxy resolves the name, and may be the only resolver that
+    /// can, so only an address written in the URL is checked here.
     async fn fetch(&self, url: &SourceUrl, table: &str) -> Result<Pulled> {
         let download = self;
         let url = url.expose();
@@ -577,7 +582,7 @@ impl Download {
             })?;
         let parsed =
             reqwest::Url::parse(url).map_err(|e| Error::Ingestion(format!("bad URL: {e}")))?;
-        let mut builder = reqwest::Client::builder().timeout(download.timeout);
+        let mut builder = download.proxies.client().timeout(download.timeout);
         if download.hosts == HostReach::PublicOnly {
             let host = parsed
                 .host_str()
@@ -585,8 +590,19 @@ impl Download {
             let port = parsed
                 .port_or_known_default()
                 .ok_or_else(|| Error::Ingestion(String::from("the URL has no port")))?;
-            let addresses = public_addresses(host, port).await?;
-            builder = builder.resolve_to_addrs(host, &addresses);
+            match download.proxies.route(&parsed) {
+                Route::Direct => {
+                    let addresses = public_addresses(host, port).await?;
+                    builder = builder.resolve_to_addrs(host, &addresses);
+                }
+                Route::Proxied => {
+                    // An IPv6 host is bracketed in a URL.
+                    let literal = host.trim_start_matches('[').trim_end_matches(']');
+                    if let Ok(ip) = literal.parse::<IpAddr>() {
+                        refuse_private(host, ip)?;
+                    }
+                }
+            }
         }
         if download.hosts == HostReach::PublicOnly {
             builder = builder.redirect(reqwest::redirect::Policy::none());
@@ -654,14 +670,20 @@ async fn public_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     if addresses.is_empty() {
         return Err(Error::Ingestion(format!("cannot resolve {host}")));
     }
-    if let Some(private) = addresses.iter().find(|a| is_private_address(a.ip())) {
-        return Err(Error::Ingestion(format!(
-            "{host} resolves to {}, a private address; the server does not import from \
-             its own network (set [import].allow_private_hosts to allow it)",
-            private.ip()
-        )));
+    for address in &addresses {
+        refuse_private(host, address.ip())?;
     }
     Ok(addresses)
+}
+
+fn refuse_private(host: &str, ip: IpAddr) -> Result<()> {
+    if is_private_address(ip) {
+        return Err(Error::Ingestion(format!(
+            "{host} resolves to {ip}, a private address; the server does not import from \
+             its own network (set [import].allow_private_hosts to allow it)"
+        )));
+    }
+    Ok(())
 }
 
 /// Loopback, unspecified, link-local (cloud metadata lives at
@@ -696,6 +718,7 @@ fn is_private_address(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
     use crate::llm::Embeddings;
+    use crate::proxy::{Environment, Variable};
 
     #[test]
     fn urls_classify_and_redact() {
@@ -950,6 +973,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             max_mb: 1,
             hosts: HostReach::PublicOnly,
+            proxies: &Proxies::new(Environment::default()),
         };
         let err = download
             .fetch(&SourceUrl::from("http://127.0.0.1:9/x.csv"), "x")
@@ -976,6 +1000,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             max_mb: 1,
             hosts: HostReach::PublicOnly,
+            proxies: &Proxies::new(Environment::default()),
         };
         for accepted in [
             "http://127.0.0.1:9/book.ods",
@@ -1025,6 +1050,66 @@ mod tests {
         format!("http://127.0.0.1:{port}/data.csv")
     }
 
+    /// Through a proxy the import neither resolves the name nor pins an
+    /// address: the request for a name no resolver answers reaches the
+    /// proxy, which is what a network with no outside resolver needs.
+    #[tokio::test]
+    async fn a_public_only_download_through_a_proxy_leaves_the_name_to_the_proxy() {
+        let proxy = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\na,b\n1,2\n",
+        )
+        .await;
+        let proxy = proxy.trim_end_matches("/data.csv");
+        let proxies = Proxies::new(Environment {
+            http: Variable::named("HTTP_PROXY", proxy),
+            ..Environment::default()
+        });
+        let download = Download {
+            timeout: Duration::from_secs(5),
+            max_mb: 1,
+            hosts: HostReach::PublicOnly,
+            proxies: &proxies,
+        };
+        let pulled = download
+            .fetch(&SourceUrl::from("http://files.invalid/data.csv"), "t")
+            .await;
+        assert!(pulled.is_ok(), "{:?}", pulled.err().map(|e| e.to_string()));
+
+        for private in ["http://10.0.0.1/x.csv", "http://[fd00::1]/x.csv"] {
+            let err = download
+                .fetch(&SourceUrl::from(private), "t")
+                .await
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(err.contains("a private address"), "{private}: {err}");
+        }
+    }
+
+    /// Loopback is never proxied, so it still meets the address check.
+    #[tokio::test]
+    async fn a_proxy_does_not_open_this_machine_to_a_public_only_download() {
+        let proxies = Proxies::new(Environment {
+            http: Variable::named("HTTP_PROXY", "http://127.0.0.1:9"),
+            ..Environment::default()
+        });
+        let download = Download {
+            timeout: Duration::from_secs(5),
+            max_mb: 1,
+            hosts: HostReach::PublicOnly,
+            proxies: &proxies,
+        };
+        for local in ["http://127.0.0.1:9/x.csv", "http://localhost:9/x.csv"] {
+            let err = download
+                .fetch(&SourceUrl::from(local), "t")
+                .await
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(err.contains("a private address"), "{local}: {err}");
+        }
+    }
+
     #[expect(clippy::panic, reason = "test helper: a loopback port must bind")]
     fn unreachable_bind(msg: &str) -> tokio::net::TcpListener {
         panic!("cannot bind a loopback port: {msg}")
@@ -1036,6 +1121,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             max_mb: 0,
             hosts: HostReach::Any,
+            proxies: &Proxies::new(Environment::default()),
         };
         let url = serve_once(
             "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\na,b\n1,2\n3,4\n",

@@ -53,6 +53,7 @@ absolute-paths-allowed-crates = [
     "futures",
     "http",
     "http_body",
+    "hyper_util",
     "jiff",
     "jsonwebtoken",
     "keyring_core",
@@ -99,10 +100,15 @@ absolute-paths-allowed-crates = [
 
 # MSRV is read automatically from the workspace `rust-version` field.
 
+# Every reqwest client starts from `quack_core::proxy::Proxies::client`, so the
+# proxy variables apply to it and loopback is never proxied.
+#
 # Embedding goes through `quack_core::embedding::Embedder`, which names the
 # role each text is embedded in and checks the width of what comes back.
 # A direct call would skip the role's prefix and the check.
 disallowed-methods = [
+  { path = "reqwest::Client::builder", reason = "start from quack_core::proxy::Proxies::client, which applies the proxy variables and never proxies loopback" },
+  { path = "reqwest::Client::new", reason = "start from quack_core::proxy::Proxies::client, which applies the proxy variables and never proxies loopback" },
   { path = "quack_core::embedding::EmbeddingModel::embed_texts", reason = "embed through quack_core::embedding::Embedder, which applies the role's prefix" },
   { path = "rig::DynModel::call", reason = "embed through quack_core::embedding::Embedder, which applies the role's prefix" },
   { path = "rig::Model::call", reason = "embed through quack_core::embedding::Embedder, which applies the role's prefix" },
