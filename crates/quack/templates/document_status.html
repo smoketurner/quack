@@ -1,1 +1,1 @@
-<span class="whitespace-nowrap">{{ d.status }}</span>{% if let Some(err) = d.error_message %} <span class="text-red-400">{{ err }}</span>{% endif %}{% if let Some(note) = d.pages_note() %} <span class="text-amber-200">{{ note }}</span>{% endif %}
+<span class="whitespace-nowrap">{{ d.status }}</span>{% if let Some(err) = d.error_message %} <span class="text-red-400">{{ err }}</span>{% endif %}{% if let Some(pages) = d.pages %}{% if let Some(note) = pages.note() %} <span class="text-amber-200">{{ note }}</span>{% endif %}{% endif %}

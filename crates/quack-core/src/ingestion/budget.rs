@@ -7,8 +7,8 @@ use std::io::{self, Cursor, Read};
 use crate::error::Error;
 
 /// The decompressed bytes one file may still yield, shared by every part
-/// read from it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// read from it. Not `Clone`: a copy would count its bytes apart.
+#[derive(Debug, PartialEq, Eq)]
 pub struct DecompressionBudget {
     max_mb: u64,
     left: u64,

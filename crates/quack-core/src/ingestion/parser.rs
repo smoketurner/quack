@@ -260,6 +260,15 @@ impl PageCounts {
             )),
         }
     }
+
+    /// The note of `pages` after a comma, to end a one-line description
+    /// of a document; empty when every page was kept or there are none.
+    #[must_use]
+    pub fn suffix(pages: Option<Self>) -> String {
+        pages
+            .and_then(Self::note)
+            .map_or(String::new(), |note| format!(", {note}"))
+    }
 }
 
 impl Extracted {
@@ -755,6 +764,13 @@ mod tests {
             counts(3, 2).note().as_deref(),
             Some("3 of 40 pages unreadable, 2 without text")
         );
+        // After a comma in a one-line description, or nothing at all.
+        assert_eq!(
+            PageCounts::suffix(Some(counts(3, 0))),
+            ", 3 of 40 pages unreadable"
+        );
+        assert_eq!(PageCounts::suffix(Some(counts(0, 0))), "");
+        assert_eq!(PageCounts::suffix(None), "");
     }
 
     #[test]

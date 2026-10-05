@@ -2142,7 +2142,7 @@ async fn a_long_pdf_ingests_every_page_in_order() {
     .unwrap()
     .ingested()
     .unwrap();
-    assert_eq!(result.pages_note(), None);
+    assert_eq!(result.pages.and_then(PageCounts::note), None);
     assert!(result.chunks_stored > 0);
 
     let doc = db.document(&result.document_id).unwrap().unwrap();
@@ -2620,7 +2620,7 @@ async fn a_pdf_page_without_text_is_counted_on_the_document() {
     };
     assert_eq!(result.pages, Some(counts));
     assert_eq!(
-        result.pages_note().as_deref(),
+        result.pages.and_then(PageCounts::note).as_deref(),
         Some("1 of 3 pages without text")
     );
 
@@ -2628,7 +2628,7 @@ async fn a_pdf_page_without_text_is_counted_on_the_document() {
     assert_eq!(doc.status, DocumentStatus::Ready);
     assert_eq!(doc.pages, Some(counts));
     assert_eq!(
-        doc.pages_note().as_deref(),
+        doc.pages.and_then(PageCounts::note).as_deref(),
         Some("1 of 3 pages without text")
     );
 

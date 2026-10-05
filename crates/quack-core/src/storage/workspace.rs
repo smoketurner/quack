@@ -2830,13 +2830,6 @@ impl DocumentInfo {
         self.title.as_deref().unwrap_or(&self.filename)
     }
 
-    /// What a listing says when pages are missing from the text, as
-    /// `3 of 40 pages unreadable`; `None` when nothing is missing.
-    #[must_use]
-    pub fn pages_note(&self) -> Option<String> {
-        self.pages.and_then(PageCounts::note)
-    }
-
     /// The tables a row from before `tables` was recorded loaded into: the
     /// one named after the file, for a CSV, Parquet, or JSON file. Workbooks
     /// arrived with the `tables` column, so their rows always carry it.
@@ -5219,7 +5212,7 @@ mod tests {
         let pages = |db: &WorkspaceDb| {
             db.document(&id)
                 .unwrap_or_else(|e| fail(&e.to_string()))
-                .map(|doc| (doc.pages, doc.pages_note()))
+                .map(|doc| (doc.pages, doc.pages.and_then(PageCounts::note)))
         };
         assert_eq!(pages(&db), Some((None, None)));
 

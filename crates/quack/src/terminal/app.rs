@@ -30,6 +30,7 @@ use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery, UnknownEntity};
 use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
+use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::jobs::{
     JobContext, JobCounts, JobId, JobInfo, JobKind, JobNumber, JobQueue, JobResult, JobSpec,
@@ -768,9 +769,12 @@ impl CliJob {
         } else {
             String::new()
         };
-        let pages = result.pages_note().map_or(String::new(), |note| {
-            format!("\n{note}; the rest was kept.")
-        });
+        let pages = result
+            .pages
+            .and_then(PageCounts::note)
+            .map_or(String::new(), |note| {
+                format!("\n{note}; the rest was kept.")
+            });
         Ok(format!(
             "Loaded {} ({}){tables}{chunks}{pages}\nYou can now ask questions about this data.",
             result.filename, result.file_type
@@ -2429,7 +2433,8 @@ impl App {
             let mut text = String::from("Documents:");
             for doc in docs {
                 let pages = doc
-                    .pages_note()
+                    .pages
+                    .and_then(PageCounts::note)
                     .map_or(String::new(), |note| format!("  [{note}]"));
                 let line = format!(
                     "\n  {}  {:<10}  {}  {}{pages}",

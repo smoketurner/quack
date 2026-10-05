@@ -12,6 +12,7 @@ use std::sync::Arc;
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
 use quack_core::ids::{DocumentId, UserId, WorkspaceId};
+use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::{NewFile, Processing};
 use quack_core::jobs::{JobId, JobKind, JobResult, JobSpec, JobState, Lane, LaneKey};
 use quack_core::llm::Embeddings;
@@ -192,9 +193,7 @@ impl UploadJob {
         match result {
             Ok(r) => {
                 tracing::info!(document = %r.document_id, file = %r.filename, chunks = r.chunks_stored, "upload processed");
-                let pages = r
-                    .pages_note()
-                    .map_or(String::new(), |note| format!(", {note}"));
+                let pages = PageCounts::suffix(r.pages);
                 Ok(match r.tables.as_slice() {
                     [] => format!("{} chunks{pages}", r.chunks_stored),
                     tables => format!("tables {}", tables.join(", ")),

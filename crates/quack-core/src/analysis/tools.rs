@@ -26,6 +26,7 @@ use super::text_to_sql::Modeled;
 use crate::config::{RerankMode, RetrievalConfig};
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
+use crate::ingestion::parser::PageCounts;
 use crate::llm::{RerankModel, SchemaCall};
 use crate::ontology::{ClassRelations, Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
@@ -1245,9 +1246,7 @@ impl Tool for ListDocumentsTool {
                 .title
                 .as_deref()
                 .map_or(String::new(), |t| format!(", title: {}", OneLine(t)));
-            let pages = doc
-                .pages_note()
-                .map_or(String::new(), |note| format!(", {note}"));
+            let pages = PageCounts::suffix(doc.pages);
             writeln!(
                 output,
                 "- {} (id: {}, status: {}, type: {}, source: {}{title}{pages})",

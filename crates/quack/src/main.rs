@@ -30,6 +30,7 @@ use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Record};
 use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
+use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm::Embeddings;
 use quack_core::llm::egress::Egress;
@@ -1471,7 +1472,8 @@ fn list_documents(db: &WorkspaceDb, format: TextOrJson, out: &mut impl Write) ->
             .as_deref()
             .map_or(String::new(), |t| format!("  ({t})"));
         let pages = doc
-            .pages_note()
+            .pages
+            .and_then(PageCounts::note)
             .map_or(String::new(), |note| format!("  [{note}]"));
         writeln!(
             out,
@@ -1718,7 +1720,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     for table in &result.tables {
         writeln!(out, "  Table: {table}")?;
     }
-    if let Some(note) = result.pages_note() {
+    if let Some(note) = result.pages.and_then(PageCounts::note) {
         writeln!(
             out,
             "  Pages skipped: {note} (the rest of the document was kept)"

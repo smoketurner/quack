@@ -773,7 +773,7 @@ the document row records what is missing (`parser::PageCounts`): `page_count`,
 as a scanned image does). `DocumentInfo` carries them as `pages`
 (`{"total": 40, "unreadable": 3, "empty": 2}`, `null` for any other source), so REST, MCP
 `list_documents`, and `quack docs --format json` return them. Every listing a person or the
-agent reads shows one note from `DocumentInfo::pages_note`, such as `3 of 40 pages
+agent reads shows one note from `PageCounts::note`, such as `3 of 40 pages
 unreadable, 2 without text`: `quack ingest`, `quack docs`, the terminal's `/docs` and load
 message, the web Documents row, an upload job's result, the agent's `list_documents` output,
 and the documents block of the system prompt.

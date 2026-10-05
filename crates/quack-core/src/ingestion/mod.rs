@@ -41,15 +41,6 @@ pub struct IngestResult {
     pub embedding_time: Option<Duration>,
 }
 
-impl IngestResult {
-    /// What the person is told when pages are missing from the text, as
-    /// `3 of 40 pages unreadable`; `None` when nothing is missing.
-    #[must_use]
-    pub fn pages_note(&self) -> Option<String> {
-        self.pages.and_then(PageCounts::note)
-    }
-}
-
 /// What `ingest_file` did: stored the file, or skipped it because a
 /// document with identical bytes is already in the workspace.
 #[derive(Debug)]

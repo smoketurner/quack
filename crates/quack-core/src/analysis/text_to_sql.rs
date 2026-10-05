@@ -1,6 +1,7 @@
 use crate::analysis::policy::WritePolicy;
 use crate::error::Result;
 use crate::graph::{GraphStatus, store as graph_store};
+use crate::ingestion::parser::PageCounts;
 use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
 use crate::storage::workspace::{PinnedDocument, WorkspaceDb};
@@ -315,9 +316,7 @@ impl SystemPrompt {
             });
             // A partly read document says so, so the model can tell the
             // person why a search of it may miss.
-            let pages = doc
-                .pages_note()
-                .map_or(String::new(), |note| format!(", {note}"));
+            let pages = PageCounts::suffix(doc.pages);
             writeln!(
                 self.text,
                 "- {}{title} (status: {}, type: {}{pages})",
