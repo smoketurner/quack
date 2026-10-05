@@ -464,6 +464,11 @@ where
         let mut per_call = TokenUsage::default();
         // How the latest model call stopped, when it stopped short.
         let mut cutoff: Option<Cutoff> = None;
+        // Whether the model turn ending at the last `CompletionCall` committed
+        // a tool. rig emits `CompletionCall` before the turn's `ToolCall`, so at
+        // each `CompletionCall` this holds the *previous* turn's commit (see
+        // [`ModelOutput::end_turn`]).
+        let mut tool_committed_this_turn = false;
 
         while let Some(item) = stream.next().await {
             let item = match item {
@@ -498,13 +503,20 @@ where
                 MultiTurnStreamItem::CompletionCall(call) => {
                     per_call.add(call.usage);
                     cutoff = Cutoff::of(call.finish_reason.as_ref());
-                    output.call_ended();
+                    output.end_turn(mem::replace(&mut tool_committed_this_turn, false));
                 }
+                MultiTurnStreamItem::ToolCall { .. }
+                | MultiTurnStreamItem::ToolExecutionCommitted { .. } => {
+                    tool_committed_this_turn = true;
+                }
+                // rig's contract: the completed turn was rejected for retry, so
+                // its text and reasoning were provisional. Discard them. The
+                // turn's own `CompletionCall` (always emitted first) already
+                // did so and reset `tool_committed_this_turn`; `end_turn(false)`
+                // honors the contract directly and covers a future ordering.
+                MultiTurnStreamItem::ModelTurnRetried { .. } => output.end_turn(false),
                 MultiTurnStreamItem::StreamAssistantItem(_)
-                | MultiTurnStreamItem::StreamUserItem(_)
-                | MultiTurnStreamItem::ToolCall { .. }
-                | MultiTurnStreamItem::ToolExecutionCommitted { .. }
-                | MultiTurnStreamItem::ModelTurnRetried { .. } => {}
+                | MultiTurnStreamItem::StreamUserItem(_) => {}
             }
         }
 
@@ -623,7 +635,22 @@ impl ModelOutput {
         }
     }
 
-    fn call_ended(&mut self) {
+    /// Close the current model turn's accumulator and ready it for the next.
+    ///
+    /// `committed` is whether the *previous* model turn committed a tool: rig
+    /// emits `CompletionCall` before the turn's own `ToolCall`, so the commit
+    /// arrives on the next turn's `CompletionCall`. A turn whose predecessor
+    /// committed no tool left its streamed text as a provisional draft — a hook
+    /// rejected it for retry (`InvalidToolCalls` abandons the turn with no
+    /// `ToolCall`; a final text-only turn commits none either, but its
+    /// `FinalResponse.output` re-supplies the text) — so drop it, lest the
+    /// retry's answer be prefixed with the rejected turn's draft. A turn whose
+    /// predecessor did call a tool keeps its text. The reasoning flag resets so
+    /// the next call announces reasoning again.
+    fn end_turn(&mut self, committed: bool) {
+        if !committed {
+            self.text.clear();
+        }
         self.reasoning = false;
     }
 }
