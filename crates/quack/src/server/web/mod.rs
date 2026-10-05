@@ -57,6 +57,7 @@ use super::api::graph::ExtractionStarted;
 use super::api::import::ImportBody;
 use super::api::members::AddMember;
 use super::api::ontology::DecideRequest;
+use super::api::query::Capped;
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
     documents as docs_api, graph as graph_api, import as import_api, workspaces as workspaces_api,
@@ -685,7 +686,9 @@ struct SqlResult {
     headers: Vec<SortHeader>,
     rows: Vec<Vec<String>>,
     row_count: usize,
-    truncated: bool,
+    /// Set when the row cap cut the result, so the page and the download
+    /// both say how much of it they hold.
+    capped: Option<Capped>,
     duration_ms: u64,
     error: Option<String>,
 }
@@ -1554,6 +1557,7 @@ impl SqlResult {
                 sql,
                 sortable,
                 editor_swap: rewritten,
+                capped: outcome.capped(),
                 headers: outcome
                     .columns
                     .into_iter()
@@ -1570,7 +1574,6 @@ impl SqlResult {
                     .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
                     .collect(),
                 row_count: outcome.row_count,
-                truncated: outcome.truncated,
                 duration_ms: outcome.duration_ms,
                 error: None,
             },
@@ -1582,7 +1585,7 @@ impl SqlResult {
                 headers: Vec::new(),
                 rows: Vec::new(),
                 row_count: 0,
-                truncated: false,
+                capped: None,
                 duration_ms: 0,
                 error: Some(e.message),
             },
@@ -1602,7 +1605,8 @@ async fn sql_run(
 
 /// The rows as a CSV download. A POST, so the statement travels in the
 /// body: in a URL it would land in request logs, proxies, and browser
-/// history, and a long one would not fit.
+/// history, and a long one would not fit. A result the row cap cut says so
+/// in its filename; a marker inside the file would break its parsers.
 async fn sql_csv(
     State(app): State<App>,
     WebUser(identity): WebUser,
@@ -1623,12 +1627,16 @@ async fn sql_csv(
     let csv = writer
         .into_inner()
         .map_err(|e| CoreError::Io(e.into_error()))?;
+    let filename = match outcome.capped() {
+        Some(Capped { shown, total }) => format!("query-first-{shown}-of-{total}.csv"),
+        None => "query.csv".to_owned(),
+    };
     Ok((
         [
-            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_owned()),
             (
                 header::CONTENT_DISPOSITION,
-                "attachment; filename=\"query.csv\"",
+                format!("attachment; filename=\"{filename}\""),
             ),
         ],
         csv,

@@ -91,6 +91,10 @@ signed-in user and reads no workspace, so it writes no audit row.
   Without a click, rows come back in the statement's own order. Anything else (a write,
   several statements) runs as typed with plain headers. "Download CSV" is a `POST` of the
   same statement: SQL never travels in a URL, where request logs and proxies would keep it.
+  The file holds the rows the grid holds, at most `[analysis].max_query_rows`. When that cap
+  cut the result, the button reads "Download CSV (first 250 of 1000 rows)" and the file is
+  named `query-first-250-of-1000.csv`; a complete result downloads as `query.csv`. The file
+  itself carries no marker row, which would break a CSV parser.
 - **Accessibility.** Every page starts with a "Skip to content" link to `<main id="main">`;
   the workspace tabs and the admin links are named `<nav>` landmarks, and the current tab or
   chat session carries `aria-current="page"`. A control with only a placeholder has an

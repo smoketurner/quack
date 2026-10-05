@@ -5435,6 +5435,59 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
     assert!(closing("cancelled before it started"), "{details:?}");
 }
 
+/// A download the row cap cut says so in its filename and on its button;
+/// a complete one keeps the plain name, and neither file carries a marker.
+#[tokio::test]
+async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
+    let mut config = Config::default();
+    config.analysis.max_query_rows = 3;
+    let h = harness_with(ServeMode::Login, config).await;
+    let bob = h.user("bob", UserKind::Standard).await;
+    let ws = h.workspace("team", &bob).await;
+    let cookie = web_session(&h, "bob").await;
+    let disposition = |headers: &axum::http::HeaderMap| {
+        headers
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    let capped = "sql=SELECT+*+FROM+range(10)+t(n)";
+    let (status, html, _) = h.form(&format!("/w/{ws}/sql"), Some(&cookie), capped).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("10 rows (showing 3)")
+            && html.contains(">Download CSV (first 3 of 10 rows)</button>"),
+        "{html}"
+    );
+    let (status, csv, headers) = h
+        .form(&format!("/w/{ws}/sql.csv"), Some(&cookie), capped)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        disposition(&headers),
+        "attachment; filename=\"query-first-3-of-10.csv\""
+    );
+    assert_eq!(csv, "n\n0\n1\n2\n");
+
+    // A result of exactly the cap is complete.
+    let complete = "sql=SELECT+*+FROM+range(3)+t(n)";
+    let (_, html, _) = h
+        .form(&format!("/w/{ws}/sql"), Some(&cookie), complete)
+        .await;
+    assert!(
+        html.contains(">Download CSV</button>") && !html.contains("showing"),
+        "{html}"
+    );
+    let (status, csv, headers) = h
+        .form(&format!("/w/{ws}/sql.csv"), Some(&cookie), complete)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(disposition(&headers), "attachment; filename=\"query.csv\"");
+    assert_eq!(csv, "n\n0\n1\n2\n");
+}
+
 /// Log in through the web form and return the session cookie's value.
 async fn web_session(h: &Harness, username: &str) -> String {
     let (status, _, headers) = h

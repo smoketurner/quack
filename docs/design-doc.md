@@ -1668,6 +1668,8 @@ and ask again. The UI covers:
 - Documents: upload (multi-file), paste text, status with progress, pin, delete.
 - Tables: list with schema and sample rows, and the import form; a SQL page with an editor
   that highlights SQL and completes table and column names, a result grid, and download.
+  The download holds the grid's rows, at most `max_query_rows`; when that cut the result, the
+  button and the filename say so ("first 250 of 1000 rows", `query-first-250-of-1000.csv`).
 - Graph: search box, ECharts graph with class colors, node inspector with properties and
   provenance, merge review queue, provisional and stale banners.
 - Ontology: class, relation, property, and mapping editors with inline validation;
