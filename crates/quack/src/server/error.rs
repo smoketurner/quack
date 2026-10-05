@@ -114,26 +114,33 @@ impl From<CoreError> for ApiError {
     fn from(err: CoreError) -> Self {
         let status = match &err {
             // The request is fine; the server cannot serve it until a login
-            // happens or another process lets go of the workspace file.
-            CoreError::AuthRequired { .. } | CoreError::WorkspaceLocked { .. } => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
-            CoreError::WorkspaceNotFound(_) | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
+            // happens, another process lets go of the workspace file, or a
+            // quack new enough for the file runs.
+            CoreError::AuthRequired { .. }
+            | CoreError::WorkspaceLocked { .. }
+            | CoreError::WorkspaceTooNew { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            CoreError::WorkspaceNotFound(_)
+            | CoreError::NoWorkspaceNamed(_)
+            | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
             CoreError::SignIn(_) | CoreError::Bearer(_) => StatusCode::UNAUTHORIZED,
-            // The caller is known; this provider cannot act for them.
-            CoreError::Delegation { .. } => StatusCode::FORBIDDEN,
+            // The caller is known; this provider cannot act for them, or
+            // the workspace's allow-list keeps its content from the provider.
+            CoreError::Delegation { .. } | CoreError::ProviderRefused(_) => StatusCode::FORBIDDEN,
             CoreError::Config(_)
             | CoreError::Ambiguous { .. }
             | CoreError::NoChatModel { .. }
             | CoreError::UnsupportedFileType(_)
             | CoreError::EmptyFile(_)
+            | CoreError::InvalidWorkspaceName
             | CoreError::Ontology(_) => StatusCode::BAD_REQUEST,
             CoreError::Analysis(_)
             | CoreError::UnknownValue { .. }
             | CoreError::QueryTimeout { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             // A request is never cancelled through its own handler today (only
             // background jobs are); should one be, it lost to a later action.
-            CoreError::TableTaken { .. } | CoreError::Cancelled => StatusCode::CONFLICT,
+            CoreError::TableTaken { .. } | CoreError::WorkspaceExists(_) | CoreError::Cancelled => {
+                StatusCode::CONFLICT
+            }
             CoreError::Sqlite(_)
             | CoreError::DuckDb(_)
             | CoreError::Embedding(_)
@@ -147,7 +154,9 @@ impl From<CoreError> for ApiError {
             | CoreError::SeaQuery(_)
             | CoreError::Fmt(_)
             | CoreError::WriterStopped
-            | CoreError::WritePanicked(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            | CoreError::WritePanicked(_)
+            | CoreError::WorkspaceSchemaUnreadable { .. }
+            | CoreError::ModelRequestUnscoped { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::new(status, err.to_string())
     }
@@ -160,6 +169,7 @@ impl From<TurnFailure> for ApiError {
             FailureKind::AuthRequired => StatusCode::SERVICE_UNAVAILABLE,
             FailureKind::NoChatModel => StatusCode::BAD_REQUEST,
             FailureKind::NotFound => StatusCode::NOT_FOUND,
+            FailureKind::ProviderNotAllowed => StatusCode::FORBIDDEN,
             FailureKind::Other => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::new(status, failure.message)

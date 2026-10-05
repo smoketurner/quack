@@ -7,10 +7,11 @@ use std::time::Instant;
 
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
 use quack_core::analysis::agent::AgentResponse;
-use quack_core::analysis::events::{self, AgentEvent};
+use quack_core::analysis::events::{self, AgentEvent, FailureKind, TurnFailure};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::embedding::{Input, Vector};
@@ -52,7 +53,8 @@ struct PreparedTurn {
 
 impl PreparedTurn {
     /// Everything a turn needs before the model is called: the
-    /// authorization, the provider check, and the session (existing or new).
+    /// authorization and the session (existing or new). The turn itself
+    /// refuses a model the workspace's provider allow-list does not allow.
     /// `unasked` is the write policy without `allow_write`: `Ask` when the
     /// turn streams, so the person can answer, else `Deny`. A caller who
     /// may not write is never asked.
@@ -76,16 +78,6 @@ impl PreparedTurn {
             return Err(ApiError::bad_request("prompt must not be empty"));
         }
         let chat = app.config.chat_model_ref()?;
-        if !access
-            .workspace
-            .allowed_providers
-            .permits(chat.provider_name.as_str())
-        {
-            return Err(ApiError::forbidden(format!(
-                "provider '{}' is not allowed in this workspace",
-                chat.provider_name
-            )));
-        }
         let mode = body.mode;
         let db = app.workspace_db(workspace_id).await?;
         let reader = app.reader_db(workspace_id).await?;
@@ -214,13 +206,36 @@ struct Turn {
     prompt: String,
 }
 
+/// Whether a turn's stream has sent its `complete` or `error` event.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnStream {
+    Open,
+    Ended,
+}
+
 /// How a turn ended, for its audit row.
 enum TurnEnd<'a> {
     Answered(&'a AgentResponse),
-    Failed,
+    /// With the turn's own failure, or none when its events just closed.
+    Failed(Option<&'a TurnFailure>),
 }
 
 impl Turn {
+    /// What the caller is told when the events closed with neither an
+    /// answer nor a failure: 503 when a stopping server refused the turn
+    /// (the request is fine; another server can take it), 500 when its job
+    /// was cancelled while queued.
+    fn unanswered(app: &App) -> ApiError {
+        if app.stopping.is_cancelled() {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the server is shutting down; the turn ended without an answer",
+            )
+        } else {
+            ApiError::internal("the turn ended without an answer")
+        }
+    }
+
     /// Audit the turn. A failed turn that left the session without any
     /// message (a fresh session whose first turn never reached the model)
     /// is removed, as print mode does, so the session list shows no empty
@@ -228,9 +243,13 @@ impl Turn {
     async fn record(&self, app: &App, end: TurnEnd<'_>) {
         let (outcome, steps) = match end {
             TurnEnd::Answered(response) => (Outcome::Allowed, response.steps.clone()),
-            TurnEnd::Failed => (Outcome::Error, Vec::new()),
+            TurnEnd::Failed(Some(TurnFailure {
+                kind: FailureKind::ProviderNotAllowed,
+                ..
+            })) => (Outcome::Denied, Vec::new()),
+            TurnEnd::Failed(_) => (Outcome::Error, Vec::new()),
         };
-        if outcome == Outcome::Error
+        if outcome != Outcome::Allowed
             && let Ok(db) = app.workspace_db(&self.access.workspace.id).await
         {
             let sid = self.session_id.clone();
@@ -284,15 +303,14 @@ pub(crate) async fn query(
         turn.record(&app, TurnEnd::Answered(&response)).await;
         return Ok(Json(response.to_json(&turn.session_id)));
     }
-    turn.record(&app, TurnEnd::Failed).await;
-    Err(failure.map_or_else(
-        || ApiError::internal("the turn ended without an answer"),
-        ApiError::from,
-    ))
+    turn.record(&app, TurnEnd::Failed(failure.as_ref())).await;
+    Err(failure.map_or_else(|| Turn::unanswered(&app), ApiError::from))
 }
 
 /// The same turn as SSE: `text`, `tool_started`, `tool_finished`, then
-/// `complete` with the full response object, or `error`.
+/// `complete` with the full response object, or `error`. A stopping server
+/// cancels the turn's job, so the stream ends as any cancelled turn does:
+/// `complete` with `cancelled: true`, or `error` when the turn never ran.
 pub(crate) async fn stream(
     State(app): State<App>,
     identity: Identity,
@@ -302,8 +320,27 @@ pub(crate) async fn stream(
     let turn = PreparedTurn::prepare(&app, identity, &id, &body, WritePolicy::Ask)
         .await?
         .start(&app);
-    let stream = futures::stream::unfold((turn, app), |(mut turn, app)| async move {
-        let event = turn.events.recv().await?;
+    let state = (turn, app, TurnStream::Open);
+    let stream = futures::stream::unfold(state, |(mut turn, app, state)| async move {
+        let Some(event) = turn.events.recv().await else {
+            if state == TurnStream::Ended {
+                return None;
+            }
+            turn.record(&app, TurnEnd::Failed(None)).await;
+            let out = StreamEvent::Error
+                .event()
+                .data(Turn::unanswered(&app).message);
+            return Some((Ok(out), (turn, app, TurnStream::Ended)));
+        };
+        let state = match event {
+            AgentEvent::TurnComplete(_) | AgentEvent::Failed(_) => TurnStream::Ended,
+            AgentEvent::Status(_)
+            | AgentEvent::Reasoning
+            | AgentEvent::TextDelta(_)
+            | AgentEvent::ToolStarted { .. }
+            | AgentEvent::ToolFinished(_)
+            | AgentEvent::PermissionRequired(_) => state,
+        };
         let out = match event {
             // A comment line: clients skip it, and the stream stays in step.
             AgentEvent::Reasoning => Event::default().comment("reasoning"),
@@ -318,7 +355,7 @@ pub(crate) async fn stream(
                 .json_data(&step)
                 .unwrap_or_default(),
             AgentEvent::PermissionRequired(request) => {
-                let sql = request.sql.clone();
+                let (sql, hold) = (request.sql.clone(), request.hold);
                 let held = app
                     .permissions
                     .hold(&app, &turn.access, &turn.session_id, request);
@@ -328,6 +365,8 @@ pub(crate) async fn stream(
                         "request": held.request,
                         "session_id": turn.session_id,
                         "sql": sql,
+                        "reason": hold,
+                        "notice": hold.notice(),
                         "expires_at": held.expires_at.to_string(),
                     }))
                     .unwrap_or_default()
@@ -348,11 +387,11 @@ pub(crate) async fn stream(
                     .unwrap_or_default()
             }
             AgentEvent::Failed(failure) => {
-                turn.record(&app, TurnEnd::Failed).await;
+                turn.record(&app, TurnEnd::Failed(Some(&failure))).await;
                 StreamEvent::Error.event().data(failure.message)
             }
         };
-        Some((Ok(out), (turn, app)))
+        Some((Ok(out), (turn, app, state)))
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
@@ -477,10 +516,17 @@ pub(crate) async fn search(
     }
     let top_k = q.top_k.unwrap_or(app.config.retrieval.top_k).clamp(1, 100);
     let rrf_k = app.config.retrieval.rrf_k;
+    let model = access
+        .model(
+            &app,
+            AuditAction::Search,
+            Embeddings::from_config(&app.config).await,
+        )
+        .await?;
     // Run the search, audit its outcome, then propagate — the way `execute_sql`
     // does, so a post-authorization failure is recorded instead of dropped.
     let search_result: ApiResult<Vec<_>> = async {
-        let embedding: Option<Vector> = match Embeddings::from_config(&app.config).await? {
+        let embedding: Option<Vector> = match model {
             Some(model) => Some(
                 model
                     .embed_interactive(&Input::Query(query.clone()))

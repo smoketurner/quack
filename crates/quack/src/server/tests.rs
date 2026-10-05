@@ -21,6 +21,7 @@ use quack_core::config::{
 use quack_core::embedding::{Dimension, Vector};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::ids::{ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
+use quack_core::ingestion::parser::PageCounts;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -158,7 +159,13 @@ impl Harness {
         let ws = self
             .app
             .control
-            .create_workspace(name, None, setup_audit())
+            .create_workspace(
+                &name
+                    .parse()
+                    .unwrap_or_else(|e: CoreError| fail(&e.to_string())),
+                None,
+                setup_audit(),
+            )
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         self.app
@@ -179,6 +186,31 @@ impl Harness {
             .await
             .unwrap_or_else(|e| fail(&e.to_string()))
             .rows
+    }
+
+    /// What a request from the workspace's owner resolves to, for work the
+    /// test starts without a request.
+    async fn owner_access(&self, ws: &WorkspaceId, owner: &UserId) -> Access {
+        let workspace = self
+            .app
+            .control
+            .get_workspace(ws)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .unwrap_or_else(|| fail("the workspace was just created"));
+        Access {
+            identity: Identity {
+                user_id: owner.clone(),
+                username: String::from("owner"),
+                is_admin: false,
+                credential: Credential::Local,
+                client_addr: None,
+                request_id: None,
+                channel: None,
+            },
+            workspace,
+            role: Some(Role::Owner),
+        }
     }
 
     async fn wait_ready(&self, ws: &WorkspaceId, doc: &str, bearer: &str) -> serde_json::Value {
@@ -873,6 +905,80 @@ fn multipart(filename: &str, content_type: &str, data: &str) -> (String, Vec<u8>
         format!("multipart/form-data; boundary={boundary}"),
         body.into_bytes(),
     )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partly_read_document_says_so_over_rest_mcp_and_the_web() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("pages", &owner).await;
+    let token = h.login("owner").await;
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    db.run(|db| {
+        let id = DocumentId::from("d");
+        db.insert_document(
+            &NewDocument::new(&id, "scan.pdf", "application/pdf", 1)
+                .with_status(DocumentStatus::Ready),
+        )?;
+        db.set_document_pages(
+            &id,
+            Some(PageCounts {
+                total: 40,
+                unreadable: 3,
+                empty: 2,
+            }),
+        )
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let counts = serde_json::json!({ "total": 40, "unreadable": 3, "empty": 2 });
+
+    let base = format!("/api/v1/workspaces/{ws}/documents");
+    let (status, body) = h.get(&base, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["documents"][0]["pages"], counts, "{body}");
+    let (status, body) = h.get(&format!("{base}/d"), &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pages"], counts, "{body}");
+
+    let session = mcp_session(&h, &ws, &token).await;
+    let (status, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&token),
+        Some(&session),
+        rpc(
+            2,
+            "tools/call",
+            &serde_json::json!({ "name": "list_documents", "arguments": {} }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["structuredContent"]["documents"][0]["pages"], counts,
+        "{body}"
+    );
+
+    let (status, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| c.split(';').next())
+        .and_then(|c| c.strip_prefix("quack_session="))
+        .unwrap_or_default()
+        .to_owned();
+    let note = "3 of 40 pages unreadable, 2 without text";
+    for path in ["documents", "documents/rows", "documents/status"] {
+        let (status, html, _) = h.page(&format!("/w/{ws}/{path}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(html.contains(note), "{path}: {html}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2099,7 +2205,15 @@ async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(proposes.len(), 3);
+    // Three proposals, and the document pass that had no chat model.
+    assert_eq!(proposes.len(), 4);
+    assert_eq!(
+        proposes
+            .iter()
+            .filter(|r| r.outcome == Outcome::Error)
+            .count(),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3840,8 +3954,40 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
     assert_eq!(status, StatusCode::OK, "{body}");
     let (_, body) = h.get(&format!("{base}/status"), "").await;
     assert_eq!(body["stale"], true, "{body}");
+    // A POST without the preview's totals, or with totals the graph no
+    // longer matches, drops nothing and names the current ones.
+    let (_, preview) = h.get(&format!("{base}/revalidate"), "").await;
+    let stale_totals = serde_json::json!({ "dropped_nodes": 2, "dropped_edges": 1 });
+    for unconfirmed in [None, Some(serde_json::json!({})), Some(stale_totals)] {
+        let (status, body) = h
+            .call(
+                Method::POST,
+                &format!("{base}/revalidate"),
+                None,
+                unconfirmed.clone(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{unconfirmed:?}: {body}");
+        assert!(
+            body.to_string()
+                .contains("nothing dropped: revalidating now drops 2 nodes and 3 edges"),
+            "{unconfirmed:?}: {body}"
+        );
+        let (_, body) = h.get(&format!("{base}/status"), "").await;
+        assert_eq!(body["stale"], true, "{unconfirmed:?}: {body}");
+        assert_eq!(body["nodes"], 7, "{unconfirmed:?}: {body}");
+    }
+    let confirmed = serde_json::json!({
+        "dropped_nodes": preview["dropped_nodes"],
+        "dropped_edges": preview["dropped_edges"],
+    });
     let (status, body) = h
-        .call(Method::POST, &format!("{base}/revalidate"), None, None)
+        .call(
+            Method::POST,
+            &format!("{base}/revalidate"),
+            None,
+            Some(confirmed),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["dropped_nodes"], 2);
@@ -3919,6 +4065,279 @@ async fn graph_is_built_from_mapped_tables_and_explored_over_the_api_and_the_pag
         })
         .await;
     assert!(searches.len() >= 4, "{searches:?}");
+}
+
+/// A rename over the API and the ontology page moves the graph with the
+/// id, and a revalidation that would drop something says what and waits
+/// for the counts it showed.
+#[tokio::test(flavor = "multi_thread")]
+async fn renames_move_the_graph_and_revalidation_shows_what_it_drops_first() {
+    let h = harness(ServeMode::Local).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "r" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    for sql in [
+        "CREATE TABLE shipments (po TEXT, vendor TEXT, country TEXT)",
+        "INSERT INTO shipments VALUES ('PO-1', 'Orgenics', 'Kenya'), ('PO-2', 'Orgenics', 'Uganda'), ('PO-3', 'Aurobindo', 'Kenya')",
+    ] {
+        let (status, body) = h
+            .call(
+                Method::POST,
+                &format!("/api/v1/workspaces/{ws}/sql"),
+                None,
+                Some(serde_json::json!({ "sql": sql })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let ontology = serde_json::json!({
+        "classes": [
+            { "id": "vendor", "key": "name", "properties": ["name"] },
+            { "id": "country", "key": "name", "properties": ["name"] },
+            { "id": "shipment", "key": "po", "properties": ["po"] }
+        ],
+        "relations": [
+            { "id": "supplied_by", "domain": "shipment", "range": "vendor" },
+            { "id": "delivered_to", "domain": "shipment", "range": "country" }
+        ],
+        "properties": [
+            { "id": "name", "type": "string" },
+            { "id": "po", "type": "string" }
+        ],
+        "mappings": [{
+            "table": "shipments", "class": "shipment", "key": "po",
+            "relations": [
+                { "relation": "supplied_by", "column": "vendor", "target_class": "vendor", "target_key": "name" },
+                { "relation": "delivered_to", "column": "country", "target_class": "country", "target_key": "name" }
+            ]
+        }]
+    });
+    let ontology_api = format!("/api/v1/workspaces/{ws}/ontology");
+    let base = format!("/api/v1/workspaces/{ws}/graph");
+    let (status, body) = h
+        .call(Method::PUT, &ontology_api, None, Some(ontology))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/extract"),
+            None,
+            Some(serde_json::json!({ "source": "tables" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A class renamed over the API: the ontology's references and the
+    // graph's nodes follow, and nothing is stale or droppable.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{ontology_api}/rename"),
+            None,
+            Some(serde_json::json!({ "kind": "class", "from": "vendor", "to": "supplier" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], 2);
+    assert!(
+        body["classes"]
+            .as_array()
+            .is_some_and(|c| c.iter().any(|c| c["id"] == "supplier")
+                && !c.iter().any(|c| c["id"] == "vendor")),
+        "{body}"
+    );
+    assert_eq!(
+        body["mappings"][0]["relations"][0]["target_class"],
+        "supplier"
+    );
+    let (_, body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(body["stale"], false, "{body}");
+    assert_eq!(
+        (&body["nodes"], &body["edges"]),
+        (&serde_json::json!(7), &serde_json::json!(6))
+    );
+    let (_, body) = h
+        .post(
+            &format!("{base}/search"),
+            "",
+            serde_json::json!({ "class": "supplier" }),
+        )
+        .await;
+    assert_eq!(body["nodes"].as_array().map(Vec::len), Some(2), "{body}");
+    let (status, body) = h.get(&format!("{base}/revalidate"), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["dropped_nodes"], 0, "{body}");
+    assert_eq!(body["dropped_edges"], 0);
+
+    // An id that exists is refused, as is a kind that has no graph ids.
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{ontology_api}/rename"),
+            None,
+            Some(serde_json::json!({ "kind": "class", "from": "supplier", "to": "country" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string()
+            .contains("class 'country' is declared twice"),
+        "{body}"
+    );
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{ontology_api}/rename"),
+            None,
+            Some(serde_json::json!({ "kind": "property", "from": "name", "to": "title" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string()
+            .contains("only a class or a relation id can"),
+        "{body}"
+    );
+
+    // A relation renamed from the ontology page's form.
+    let (_, html, _) = h.page(&format!("/w/{ws}/ontology"), None).await;
+    assert!(
+        html.contains(&format!("action=\"/w/{ws}/ontology/rename\"")),
+        "{html}"
+    );
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/ontology/rename"),
+            None,
+            "kind=relation&from=supplied_by&to=sourced_from",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (to, html) = h.land(&headers, None).await;
+    assert_eq!(to, format!("/w/{ws}/ontology"));
+    assert!(
+        html.contains("renamed relation supplied_by to sourced_from")
+            && html.contains("sourced_from: shipment → supplier"),
+        "{html}"
+    );
+    let (_, _, headers) = h
+        .form(
+            &format!("/w/{ws}/ontology/rename"),
+            None,
+            "kind=class&from=nope&to=other",
+        )
+        .await;
+    let (_, html) = h.land(&headers, None).await;
+    assert!(
+        html.contains("role=\"alert\"") && html.contains("no class &#39;nope&#39; to rename"),
+        "{html}"
+    );
+    let (_, body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(body["stale"], false, "{body}");
+    assert_eq!(body["ontology_version"], 3);
+    let writes = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("ontology")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        writes.len(),
+        3,
+        "the import and the two renames: {writes:?}"
+    );
+
+    // The ontology loses a class: the preview says what a revalidation
+    // drops, and reading it drops nothing.
+    let (_, current) = h.get(&ontology_api, "").await;
+    let mut edited = current.clone();
+    if let Some(classes) = edited["classes"].as_array_mut() {
+        classes.retain(|c| c["id"] != "country");
+    }
+    if let Some(relations) = edited["relations"].as_array_mut() {
+        relations.retain(|r| r["id"] != "delivered_to");
+    }
+    if let Some(mapping_relations) = edited["mappings"][0]["relations"].as_array_mut() {
+        mapping_relations.retain(|r| r["target_class"] != "country");
+    }
+    let (status, body) = h.call(Method::PUT, &ontology_api, None, Some(edited)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h.get(&format!("{base}/revalidate"), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["dropped_nodes"], 2, "{body}");
+    assert_eq!(body["dropped_edges"], 3);
+    assert_eq!(body["classes"], serde_json::json!({ "country": 2 }));
+    assert_eq!(body["relations"], serde_json::json!({ "delivered_to": 3 }));
+    assert_eq!(body["version"], 4);
+    let (_, body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(body["nodes"], 7, "{body}");
+    assert_eq!(body["stale"], true);
+
+    // The graph page lists the same and its button carries the counts.
+    let (_, html, _) = h.page(&format!("/w/{ws}/graph"), None).await;
+    assert!(
+        html.contains("Revalidating drops <strong>2 nodes and 3 edges</strong>")
+            && html.contains(
+                "class <span class=\"font-mono\">country</span>, which the ontology no longer defines: 2 nodes"
+            )
+            && html.contains(
+                "relation <span class=\"font-mono\">delivered_to</span>, which the ontology no longer defines: 3 edges"
+            )
+            && html.contains("name=\"dropped_nodes\" value=\"2\"")
+            && html.contains("name=\"dropped_edges\" value=\"3\"")
+            && html.contains("Drop 2 nodes and 3 edges and revalidate"),
+        "{html}"
+    );
+
+    // A post that confirms nothing, or other counts, drops nothing.
+    for unconfirmed in ["", "dropped_nodes=2&dropped_edges=1"] {
+        let (status, _, headers) = h
+            .form(&format!("/w/{ws}/graph/revalidate"), None, unconfirmed)
+            .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let (to, html) = h.land(&headers, None).await;
+        assert_eq!(to, format!("/w/{ws}/graph"));
+        assert!(
+            html.contains("role=\"alert\"")
+                && html.contains("nothing dropped: revalidating now drops 2 nodes and 3 edges"),
+            "{unconfirmed:?}: {html}"
+        );
+        assert!(html.contains("7 nodes, 6 edges"), "{html}");
+    }
+    let (_, _, headers) = h
+        .form(
+            &format!("/w/{ws}/graph/revalidate"),
+            None,
+            "dropped_nodes=2&dropped_edges=3",
+        )
+        .await;
+    let (_, html) = h.land(&headers, None).await;
+    assert!(
+        html.contains("dropped 2 nodes and 3 edges") && html.contains("5 nodes, 3 edges"),
+        "{html}"
+    );
+    let (_, body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(body["stale"], false, "{body}");
+    let revalidations = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws),
+            action: Some(String::from("graph_revalidate")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        revalidations.len(),
+        1,
+        "refused posts drop and audit nothing"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5248,26 +5667,7 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
     let h = harness(ServeMode::Local).await;
     let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("runs", &owner).await;
-    let workspace = h
-        .app
-        .control
-        .get_workspace(&ws)
-        .await
-        .unwrap_or_else(|e| fail(&e.to_string()))
-        .unwrap_or_else(|| fail("the workspace was just created"));
-    let access = Access {
-        identity: Identity {
-            user_id: owner.clone(),
-            username: String::from("owner"),
-            is_admin: false,
-            credential: Credential::Local,
-            client_addr: None,
-            request_id: None,
-            channel: None,
-        },
-        workspace,
-        role: Some(Role::Owner),
-    };
+    let access = h.owner_access(&ws, &owner).await;
     let start = |detail: &'static str| {
         let (app, access) = (Arc::clone(&h.app), access.clone());
         async move {
@@ -5354,6 +5754,307 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
     assert!(closing("cancelled before it started"), "{details:?}");
 }
 
+/// The jobs stream never ends on its own, so a stopping server ends it:
+/// one open Jobs page cannot hold the process up.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_jobs_stream_ends_when_the_server_begins_to_stop() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("live", &owner).await;
+    let token = h.login("owner").await;
+    let request = Request::builder()
+        .uri(format!("/api/v1/workspaces/{ws}/jobs/stream"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let response = h
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(response.status(), StatusCode::OK);
+
+    h.app.stopping.cancel();
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .unwrap_or_else(|_| fail("the stream stayed open after the server began to stop"))
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.starts_with("event: jobs\n"), "{body}");
+}
+
+/// A stopping server closes what its background work opened: a running
+/// run and a queued one both have their closing audit row by the time the
+/// queue's shutdown returns, and work submitted afterwards is refused on
+/// the record instead of being left open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopping_server_closes_its_runs_and_refuses_new_work_on_the_record() {
+    let config = Config::parse(
+        "[general]\nchat_model = \"o/m\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("runs", &owner).await;
+    let token = h.login("owner").await;
+    let access = h.owner_access(&ws, &owner).await;
+    let start = || async {
+        BackgroundRun::start(&h.app, &access, RunKind::Graph, serde_json::json!({}))
+            .await
+            .unwrap_or_else(|e| fail(&e.message))
+    };
+    let (harness, workspace) = (&h, &ws);
+    let closing_rows = |run: RunId| async move {
+        harness
+            .audit(AuditFilter {
+                workspace_id: Some(workspace.clone()),
+                ..AuditFilter::default()
+            })
+            .await
+            .into_iter()
+            .filter(|r| r.resource_id.as_deref() == Some(run.as_str()))
+            .filter(|r| r.outcome == Outcome::Error)
+            .count()
+    };
+
+    let running = start().await;
+    let running_id = running.id().to_owned();
+    let (started, has_started) = tokio::sync::oneshot::channel::<()>();
+    running.submit(move |ctx| async move {
+        if started.send(()).is_err() {
+            return Err(String::from("nobody waited for the start"));
+        }
+        ctx.cancel_token().cancelled().await;
+        Err::<Done, _>(String::from("cancelled"))
+    });
+    let queued = start().await;
+    let queued_id = queued.id().to_owned();
+    queued.submit(|_| async { Ok(Done) });
+    assert!(has_started.await.is_ok(), "the first run holds the lane");
+
+    h.app.stopping.cancel();
+    let grace = std::time::Duration::from_secs(10);
+    let left = h.app.jobs.shutdown(grace).await;
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(closing_rows(running_id).await, 1, "the running run closed");
+    assert_eq!(closing_rows(queued_id).await, 1, "the queued run closed");
+
+    // A run and an upload that arrive now are taken, refused, and closed.
+    let late = start().await;
+    let late_id = late.id().to_owned();
+    late.submit(|_| async { Ok(Done) });
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/documents"),
+            &token,
+            serde_json::json!({ "text": "Flood damage is excluded.", "title": "policy" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let document = body["documents"][0]["id"].as_str().unwrap_or_default();
+    assert!(h.app.jobs.shutdown(grace).await.is_empty());
+    assert_eq!(closing_rows(late_id).await, 1, "the refused run closed");
+    let (_, body) = h
+        .get(
+            &format!("/api/v1/workspaces/{ws}/documents/{document}"),
+            &token,
+        )
+        .await;
+    assert_eq!(body["status"], "error", "{body}");
+    assert!(
+        body.to_string()
+            .contains("cancelled before processing started"),
+        "{body}"
+    );
+
+    // A turn asked now never runs, and both forms of the request say why.
+    let stopping = "the server is shutting down; the turn ended without an answer";
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/query/stream"),
+            &token,
+            serde_json::json!({ "prompt": "hi" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, format!("event: error\ndata: {stopping}\n\n"));
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/query"),
+            &token,
+            serde_json::json!({ "prompt": "hi" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.to_string().contains(stopping), "{body}");
+}
+
+/// An MCP `query` turn is cut short by the server stopping, like any other
+/// turn: the session keeps the question and the cancelled answer, and the
+/// turn is audited.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopping_server_cancels_an_mcp_query_turn_on_the_record() {
+    use quack_core::config::Config;
+    use quack_core::llm::CANCELLED_NOTE;
+
+    // A model that accepts the connection and never answers.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let address = silent.local_addr().unwrap_or_else(|e| fail(&e.to_string()));
+    let config = Config::parse(&format!(
+        "[general]\nchat_model = \"silent/model\"\n\
+         [providers.silent]\ntype = \"ollama\"\nbase_url = \"http://{address}\"\n"
+    ))
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("notes", &owner).await;
+    let token = h.login("owner").await;
+    let session = mcp_session(&h, &ws, &token).await;
+    let sessions = format!("/api/v1/workspaces/{ws}/sessions");
+
+    let asked = mcp_call(
+        &h,
+        &ws,
+        Some(&token),
+        Some(&session),
+        rpc(
+            2,
+            "tools/call",
+            &serde_json::json!({ "name": "query", "arguments": { "question": "how many?" } }),
+        ),
+    );
+    // Stop the server once the turn has its session and waits on the model.
+    let stopped = async {
+        loop {
+            let (_, body) = h.get(&sessions, &token).await;
+            if body["sessions"].as_array().is_some_and(|s| !s.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        h.app.stopping.cancel();
+    };
+    let within = std::time::Duration::from_secs(30);
+    let ended = tokio::time::timeout(within, async { tokio::join!(asked, stopped) }).await;
+    assert!(ended.is_ok(), "the stopping server did not end the turn");
+
+    // The call runs on a task of its own, which records the turn's end
+    // after the transport has let go of the request.
+    let (_, body) = h.get(&sessions, &token).await;
+    let sid = body["sessions"][0]["id"].as_str().unwrap_or_default();
+    let mut contents = Vec::new();
+    let mut queries = Vec::new();
+    for _ in 0..250 {
+        let (_, recorded) = h.get(&format!("{sessions}/{sid}"), &token).await;
+        contents = recorded["messages"]
+            .as_array()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter_map(|m| m["content"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        queries = h
+            .audit(AuditFilter {
+                workspace_id: Some(ws.clone()),
+                action: Some(String::from("query")),
+                ..AuditFilter::default()
+            })
+            .await;
+        if contents.len() == 2 && !queries.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(contents, ["how many?", CANCELLED_NOTE]);
+    assert_eq!(queries.len(), 1, "{queries:?}");
+}
+
+/// Closing the state closes each workspace file: the writer finishes and
+/// checkpoints, so no write-ahead log is left beside the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_the_state_checkpoints_each_workspace() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("closing", &owner).await;
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    db.run(|db| db.execute_query("CREATE TABLE t AS SELECT 1 AS n"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    drop(db);
+    let mut log = h.app.config.workspace_db_path(ws.as_str()).into_os_string();
+    log.push(".wal");
+    let log = std::path::PathBuf::from(log);
+    assert!(log.exists(), "the write is still in the log");
+
+    h.app.close().await;
+    assert!(!log.exists(), "the log was checkpointed into the file");
+}
+
+/// A download the row cap cut says so in its filename and on its button;
+/// a complete one keeps the plain name, and neither file carries a marker.
+#[tokio::test]
+async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
+    let mut config = Config::default();
+    config.analysis.max_query_rows = 3;
+    let h = harness_with(ServeMode::Login, config).await;
+    let bob = h.user("bob", UserKind::Standard).await;
+    let ws = h.workspace("team", &bob).await;
+    let cookie = web_session(&h, "bob").await;
+    let disposition = |headers: &axum::http::HeaderMap| {
+        headers
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    let capped = "sql=SELECT+*+FROM+range(10)+t(n)";
+    let (status, html, _) = h.form(&format!("/w/{ws}/sql"), Some(&cookie), capped).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("10 rows (showing 3)")
+            && html.contains(">Download CSV (first 3 of 10 rows)</button>"),
+        "{html}"
+    );
+    let (status, csv, headers) = h
+        .form(&format!("/w/{ws}/sql.csv"), Some(&cookie), capped)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        disposition(&headers),
+        "attachment; filename=\"query-first-3-of-10.csv\""
+    );
+    assert_eq!(csv, "n\n0\n1\n2\n");
+
+    // A result of exactly the cap is complete.
+    let complete = "sql=SELECT+*+FROM+range(3)+t(n)";
+    let (_, html, _) = h
+        .form(&format!("/w/{ws}/sql"), Some(&cookie), complete)
+        .await;
+    assert!(
+        html.contains(">Download CSV</button>") && !html.contains("showing"),
+        "{html}"
+    );
+    let (status, csv, headers) = h
+        .form(&format!("/w/{ws}/sql.csv"), Some(&cookie), complete)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(disposition(&headers), "attachment; filename=\"query.csv\"");
+    assert_eq!(csv, "n\n0\n1\n2\n");
+}
+
 /// Log in through the web form and return the session cookie's value.
 async fn web_session(h: &Harness, username: &str) -> String {
     let (status, _, headers) = h
@@ -5425,7 +6126,7 @@ async fn web_forms_follow_the_api_rules_and_say_why() {
     let (_, _, headers) = h.form("/workspaces", Some(&cookie), "name=team").await;
     let (to, html) = h.land(&headers, Some(&cookie)).await;
     assert_eq!(to, "/workspaces");
-    assert!(html.contains("workspace exists"), "{html}");
+    assert!(html.contains("already exists"), "{html}");
 
     // Removing someone who is not a member says so; it used to pass silently.
     let (status, _, headers) = h
@@ -5809,9 +6510,14 @@ impl WaitingWrites {
     /// server holds the request: its id, and the turn waiting on it.
     async fn ask(&self, sql: &'static str) -> (String, tokio::task::JoinHandle<bool>) {
         use quack_core::analysis::events::{self, AgentEvent, TurnRecorder};
+        use quack_core::analysis::policy::Hold;
 
         let (sink, mut events) = events::channel();
-        let asked = tokio::spawn(async move { TurnRecorder::new(sink).ask_permission(sql).await });
+        let asked = tokio::spawn(async move {
+            TurnRecorder::new(sink)
+                .ask_permission(sql, Hold::NotPermitted)
+                .await
+        });
         let Some(AgentEvent::PermissionRequired(request)) = events.recv().await else {
             fail("no permission request")
         };
@@ -5928,6 +6634,122 @@ async fn a_waiting_write_is_answered_once_by_its_asker() {
     assert!(details.contains("UPDATE t SET a = 1"), "{details}");
 }
 
+/// `allow_write` lets a turn write until it has read document text. A
+/// non-streamed turn cannot ask, so its write after a search is refused; a
+/// streamed one asks the person with the reason, and their answer runs it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_that_read_a_document_asks_or_refuses_its_write_under_allow_write() {
+    use futures::StreamExt;
+
+    use crate::scripted_ollama::{self, ScriptedOllama};
+    use quack_core::analysis::policy::Hold;
+    use quack_core::storage::workspace::WorkspaceDb;
+
+    let mut script = ScriptedOllama::following_the_note();
+    script.extend(ScriptedOllama::following_the_note());
+    let ollama = ScriptedOllama::serve(script)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let config = ollama.config().unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("notes", &owner).await;
+    let token = h.login("owner").await;
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    with_db(Arc::clone(&db), |db| {
+        scripted_ollama::seed_dictating_note(db)
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.message));
+    let tables = || async {
+        with_db(Arc::clone(&db), WorkspaceDb::list_tables)
+            .await
+            .unwrap_or_else(|e| fail(&e.message))
+    };
+    let body = serde_json::json!({ "prompt": "follow the maintenance note", "allow_write": true });
+    let path = format!("/api/v1/workspaces/{ws}/query");
+
+    let (status, answer) = h.post(&path, &token, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["write_refused"], true, "{answer}");
+    assert_eq!(
+        answer["steps"][1]["summary"], "refused: this turn read document text",
+        "{answer}"
+    );
+    assert_eq!(
+        tables().await,
+        ["customers"],
+        "the dictated drop did not run"
+    );
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("{path}/stream"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let response = h
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|e| fail(&format!("request failed: {e}")));
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut frames = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    // The data line of the first `event` in what has streamed so far.
+    let data_of = |seen: &str, event: &str| -> Option<serde_json::Value> {
+        let (_, rest) = seen.split_once(&format!("event: {event}\ndata: "))?;
+        let (data, _) = rest.split_once("\n\n")?;
+        serde_json::from_str(data).ok()
+    };
+    let mut asked = None;
+    let complete = loop {
+        let Some(frame) = frames.next().await else {
+            fail(&format!("the stream ended early: {seen}"));
+        };
+        let frame = frame.unwrap_or_else(|e| fail(&e.to_string()));
+        seen.push_str(&String::from_utf8_lossy(&frame));
+        if asked.is_none()
+            && let Some(request) = data_of(&seen, "permission_required")
+        {
+            assert_eq!(request["sql"], scripted_ollama::DICTATED, "{request}");
+            assert_eq!(request["reason"], "read_documents", "{request}");
+            assert_eq!(
+                request["notice"],
+                Hold::ReadDocuments.notice().unwrap_or_default(),
+                "{request}"
+            );
+            assert_eq!(
+                tables().await,
+                ["customers"],
+                "nothing ran before the answer"
+            );
+            let decide = format!(
+                "/api/v1/workspaces/{ws}/sessions/{}/permissions/{}",
+                request["session_id"].as_str().unwrap_or_default(),
+                request["request"].as_str().unwrap_or_default()
+            );
+            let (status, body) = h
+                .post(&decide, &token, serde_json::json!({ "decision": "allow" }))
+                .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+            asked = Some(request);
+        }
+        if let Some(complete) = data_of(&seen, "complete") {
+            break complete;
+        }
+    };
+    assert!(asked.is_some(), "the write was asked for: {seen}");
+    assert_eq!(complete["write_refused"], false, "{complete}");
+    assert!(tables().await.is_empty(), "the approved drop ran");
+}
+
 /// Nobody answers a waiting write: it is refused when the time is up, the
 /// refusal is audited, and the request is then unknown.
 #[tokio::test(flavor = "multi_thread")]
@@ -5954,4 +6776,205 @@ async fn an_unanswered_write_expires() {
     );
     assert!(details.contains("\"expired\""), "{details}");
     assert!(details.contains("DROP TABLE t"), "{details}");
+}
+
+/// A workspace restricted to one provider, on a server whose embedding
+/// model is on another: every path that would embed is refused before
+/// anything is sent, and each refusal is a denied audit row for its action.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restricted_workspace_refuses_every_path_to_a_disallowed_provider() {
+    // Both providers are unreachable: a request that got past the check
+    // would fail as a 5xx, not as the 403 asserted below.
+    let config = Config::parse(
+        "[general]\nchat_model = \"local/chat\"\n\
+         [embedding]\nmodel = \"hosted/embed\"\ndimension = 768\n\
+         [providers.local]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n\
+         [providers.hosted]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("kept", &owner).await;
+    let token = h.login("owner").await;
+    let base = format!("/api/v1/workspaces/{ws}");
+    let (status, body) = h
+        .post(
+            &format!("{base}/ontology/init"),
+            &token,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &base,
+            Some(&token),
+            Some(serde_json::json!({ "allowed_providers": ["local"] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A login session's rows are on the web channel.
+    let refusal = "provider 'hosted' is not allowed in this workspace, which allows only: local";
+    let denied = async |action: &str, channel: Channel| {
+        let rows = h
+            .audit(AuditFilter {
+                workspace_id: Some(ws.clone()),
+                action: Some(action.to_owned()),
+                ..AuditFilter::default()
+            })
+            .await;
+        rows.iter()
+            .filter(|r| r.outcome == Outcome::Denied && r.channel == channel)
+            .count()
+    };
+    for (path, request, action) in [
+        (
+            "documents",
+            serde_json::json!({ "text": "Flood damage is excluded.", "title": "policy" }),
+            "ingest",
+        ),
+        ("search", serde_json::json!({ "query": "flood" }), "search"),
+        (
+            "graph/search",
+            serde_json::json!({ "entity": "Kenya" }),
+            "graph",
+        ),
+        (
+            "graph/path",
+            serde_json::json!({ "from": "Kenya", "to": "Uganda" }),
+            "graph",
+        ),
+        ("graph/extract", serde_json::json!({}), "graph_extract"),
+        (
+            "ontology/propose",
+            serde_json::json!({ "documents": true }),
+            "propose",
+        ),
+        (
+            "embeddings/refresh",
+            serde_json::json!({}),
+            "embeddings_refresh",
+        ),
+        (
+            "import",
+            serde_json::json!({ "url": "https://example.com/rows.csv", "table": "rows" }),
+            "import",
+        ),
+        (
+            "query",
+            serde_json::json!({ "prompt": "what is excluded?" }),
+            "query",
+        ),
+    ] {
+        let before = denied(action, Channel::Web).await;
+        let (status, body) = h.post(&format!("{base}/{path}"), &token, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+        assert_eq!(body["error"], refusal, "{path}");
+        assert_eq!(
+            denied(action, Channel::Web).await,
+            before.saturating_add(1),
+            "{path} writes one denied {action} row"
+        );
+    }
+    // Nothing was registered, and the refused turn left no session behind.
+    let (_, documents) = h.get(&format!("{base}/documents"), &token).await;
+    assert_eq!(documents["documents"], serde_json::json!([]), "{documents}");
+    let (_, sessions) = h.get(&format!("{base}/sessions"), &token).await;
+    assert_eq!(sessions["sessions"], serde_json::json!([]), "{sessions}");
+
+    // The same turn as a stream ends in an `error` event and a denied row.
+    let before = denied("query", Channel::Web).await;
+    let (status, events) = h
+        .post(
+            &format!("{base}/query/stream"),
+            &token,
+            serde_json::json!({ "prompt": "what is excluded?" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{events}");
+    let events = events.as_str().unwrap_or_default();
+    assert!(
+        events.contains("event: error") && events.contains(refusal),
+        "{events}"
+    );
+    assert_eq!(
+        denied("query", Channel::Web).await,
+        before.saturating_add(1)
+    );
+
+    // MCP over HTTP: the tools answer with the refusal as a tool error.
+    let session = mcp_session(&h, &ws, &token).await;
+    for (id, tool, arguments, action) in [
+        (
+            2,
+            "query",
+            serde_json::json!({ "question": "what is excluded?" }),
+            "query",
+        ),
+        (
+            3,
+            "search",
+            serde_json::json!({ "query": "flood" }),
+            "search",
+        ),
+        (
+            4,
+            "search_graph",
+            serde_json::json!({ "entity": "Kenya" }),
+            "graph",
+        ),
+        (
+            5,
+            "find_path",
+            serde_json::json!({ "from": "Kenya", "to": "Uganda" }),
+            "graph",
+        ),
+    ] {
+        let before = denied(action, Channel::Mcp).await;
+        let (status, body, _) = mcp_call(
+            &h,
+            &ws,
+            Some(&token),
+            Some(&session),
+            rpc(
+                id,
+                "tools/call",
+                &serde_json::json!({ "name": tool, "arguments": arguments }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tool}: {body}");
+        assert_eq!(body["result"]["isError"], true, "{tool}: {body}");
+        let text = body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains(refusal), "{tool}: {text}");
+        assert_eq!(
+            denied(action, Channel::Mcp).await,
+            before.saturating_add(1),
+            "MCP {tool} writes one denied {action} row"
+        );
+    }
+
+    // Lifting the restriction lets the same search through to the provider,
+    // which is unreachable here: a failure, no longer a refusal.
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &base,
+            Some(&token),
+            Some(serde_json::json!({ "allowed_providers": [] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .post(
+            &format!("{base}/search"),
+            &token,
+            serde_json::json!({ "query": "flood" }),
+        )
+        .await;
+    assert!(status.is_server_error(), "{status}: {body}");
 }

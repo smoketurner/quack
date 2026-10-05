@@ -36,7 +36,7 @@ pub fn html(text: &str) -> Result<Extracted> {
         title,
         sections,
         flow: Flow::Sectioned,
-        pages_skipped: 0,
+        pages: None,
     })
 }
 

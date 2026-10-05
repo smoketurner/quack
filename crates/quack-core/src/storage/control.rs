@@ -23,6 +23,7 @@ use super::queries::{
     SealedColumns, UserTokens, Users, Workspaces,
 };
 use crate::config::{Config, ProviderName};
+use crate::crypto::sha256_hex;
 use crate::error::{Error, Result};
 use crate::ids::{AuditId, UserId, WorkspaceId};
 use crate::oidc::OidcSubject;
@@ -37,6 +38,52 @@ use crate::vault::Sealed;
 /// `storage::queries`, because those track the current schema, not history
 /// (`docs/migrations.md`).
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// A name a new workspace may take: trimmed, non-empty, and without `/`,
+/// `\`, or `.`. Lookups take plain text, since older rows predate the rule.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub struct WorkspaceName(String);
+
+impl WorkspaceName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for WorkspaceName {
+    type Err = Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        let name = name.trim();
+        if name.is_empty() || name.contains(['/', '\\', '.']) {
+            return Err(Error::InvalidWorkspaceName);
+        }
+        Ok(Self(name.to_owned()))
+    }
+}
+
+impl TryFrom<String> for WorkspaceName {
+    type Error = Error;
+
+    fn try_from(name: String) -> Result<Self> {
+        name.parse()
+    }
+}
+
+/// The name `[general].default_workspace` takes when unset.
+impl Default for WorkspaceName {
+    fn default() -> Self {
+        Self(String::from("default"))
+    }
+}
+
+impl fmt::Display for WorkspaceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// A workspace row from the control plane.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -114,6 +161,26 @@ impl AllowedProviders {
         match self {
             Self::All => None,
             Self::Only(names) => Some(names),
+        }
+    }
+}
+
+/// As a refusal names it: `every provider`, `no provider`, or `only: a, b`.
+impl fmt::Display for AllowedProviders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::All => f.write_str("every provider"),
+            Self::Only(names) if names.is_empty() => f.write_str("no provider"),
+            Self::Only(names) => {
+                f.write_str("only: ")?;
+                for (i, name) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(name)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -580,6 +647,16 @@ impl Outcome {
             Err(_) => Self::Error,
         }
     }
+
+    /// `Denied` for work that was refused, `Error` for any other failure.
+    #[must_use]
+    pub const fn of_failure(error: &Error) -> Self {
+        if error.is_provider_refusal() {
+            Self::Denied
+        } else {
+            Self::Error
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -726,18 +803,6 @@ impl TryFrom<String> for AuditCursor {
     fn try_from(text: String) -> Result<Self> {
         text.parse()
     }
-}
-
-/// Lowercase hex SHA-256, the form tokens are stored in.
-#[must_use]
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
-    let mut out = String::with_capacity(64);
-    for b in digest.as_ref() {
-        out.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
-        out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
-    }
-    out
 }
 
 /// Fill `bytes` from the process's CSPRNG (aws-lc-rs).
@@ -1037,15 +1102,16 @@ impl ControlPlane {
     }
 
     /// Create a new workspace, with `owner` as its owner when given, and
-    /// record `audit` in the same transaction.
+    /// record `audit` in the same transaction. The name's unique index
+    /// decides whether it is taken, so two callers cannot both create it.
     ///
     /// # Errors
     ///
-    /// Returns an error if the insert fails (a duplicate name included);
-    /// nothing is then written.
+    /// Returns [`Error::WorkspaceExists`] when the name is taken, or an
+    /// error if the insert fails; nothing is then written.
     pub async fn create_workspace(
         &self,
-        name: &str,
+        name: &WorkspaceName,
         owner: Option<&UserId>,
         audit: AuditEntry,
     ) -> Result<WorkspaceRow> {
@@ -1057,38 +1123,70 @@ impl ControlPlane {
         let audit = audit
             .in_workspace(&ws.id)
             .on(ResourceKind::Workspace.id(ws.id.as_str()));
-        self.commit_audited(change, audit).await?;
-        tracing::info!(workspace_name = name, workspace_id = %ws.id, "created workspace");
+        self.commit_audited(change, audit)
+            .await
+            .map_err(|e| match &e {
+                Error::Sqlite(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                    Error::WorkspaceExists(name.as_str().to_owned())
+                }
+                _ => e,
+            })?;
+        tracing::info!(workspace_name = %name, workspace_id = %ws.id, "created workspace");
         Ok(ws)
     }
 
-    /// Find a workspace by name, creating it if it does not exist. The CLI's
-    /// own workspaces, which it does not audit.
+    /// The workspace called `name`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the lookup or creation fails.
-    pub async fn find_or_create_workspace(&self, name: &str) -> Result<WorkspaceRow> {
+    /// Returns [`Error::NoWorkspaceNamed`] when there is none, or an error
+    /// if the query fails.
+    pub async fn workspace_named(&self, name: &str) -> Result<WorkspaceRow> {
+        self.find_workspace_by_name(name)
+            .await?
+            .ok_or_else(|| Error::NoWorkspaceNamed(name.to_owned()))
+    }
+
+    /// The workspace a command line runs in: the one it `named`, which
+    /// must exist, or `default`. The default is created, audited on the
+    /// `cli` channel, the first time it is used, so a new install needs no
+    /// setup step. When two processes use it first at once, one creates it
+    /// and the other opens that row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NoWorkspaceNamed`] for a named workspace other than
+    /// the default that does not exist, or an error if a query fails.
+    pub async fn workspace_or_default(
+        &self,
+        named: Option<&str>,
+        default: &WorkspaceName,
+    ) -> Result<WorkspaceRow> {
+        let name = named.unwrap_or(default.as_str());
+        if name != default.as_str() {
+            return self.workspace_named(name).await;
+        }
         if let Some(ws) = self.find_workspace_by_name(name).await? {
             return Ok(ws);
         }
-        let (ws, insert) = Self::new_workspace(name)?;
-        insert.query().execute(&self.pool).await?;
-        tracing::info!(workspace_name = name, workspace_id = %ws.id, "created workspace");
-        Ok(ws)
+        let audit = AuditEntry::new(AuditAction::Workspace, Outcome::Allowed, Channel::Cli);
+        match self.create_workspace(default, None, audit).await {
+            Err(Error::WorkspaceExists(_)) => self.workspace_named(name).await,
+            created => created,
+        }
     }
 
-    fn new_workspace(name: &str) -> Result<(WorkspaceRow, Bound)> {
+    fn new_workspace(name: &WorkspaceName) -> Result<(WorkspaceRow, Bound)> {
         let id = WorkspaceId::generate();
         let insert = Bound::new(
             Query::insert()
                 .into_table(Workspaces::Table)
                 .columns([Workspaces::Id, Workspaces::Name, Workspaces::Classification])
-                .values([id.clone().into(), name.into(), "internal".into()])?,
+                .values([id.clone().into(), name.as_str().into(), "internal".into()])?,
         )?;
         let ws = WorkspaceRow {
             id,
-            name: name.to_owned(),
+            name: name.as_str().to_owned(),
             classification: String::from("internal"),
             allowed_providers: AllowedProviders::All,
         };
@@ -2250,6 +2348,10 @@ mod tests {
     }
 
     /// The audit row a test's own setup writes.
+    fn workspace_name(name: &str) -> WorkspaceName {
+        name.parse().unwrap_or_else(|e: Error| fail(&e.to_string()))
+    }
+
     fn setup_audit() -> AuditEntry {
         AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli)
     }
@@ -2304,7 +2406,7 @@ mod tests {
         let (_dir, cp) = open().await;
         let name = "o'brien\"; DROP TABLE users; --";
         let created = cp
-            .create_workspace(name, None, setup_audit())
+            .create_workspace(&workspace_name(name), None, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let found = cp
@@ -2419,7 +2521,7 @@ mod tests {
     async fn workspace_updates_keep_unset_fields() {
         let (_dir, cp) = open().await;
         let ws = cp
-            .create_workspace("w", None, setup_audit())
+            .create_workspace(&workspace_name("w"), None, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let changed = cp
@@ -2460,7 +2562,17 @@ mod tests {
                 .is_err()
         );
         assert!(cp.get_workspace(&ws.id).await.is_ok_and(|w| w.is_some()));
-        assert!(cp.create_workspace("w", None, setup_audit()).await.is_err());
+        let taken = cp
+            .create_workspace(&workspace_name("w"), None, setup_audit())
+            .await;
+        assert!(
+            matches!(&taken, Err(Error::WorkspaceExists(name)) if name == "w"),
+            "{taken:?}"
+        );
+        assert_eq!(
+            taken.err().map(|e| e.to_string()).unwrap_or_default(),
+            "workspace 'w' already exists"
+        );
     }
 
     #[tokio::test]
@@ -2815,7 +2927,7 @@ mod tests {
     async fn members_need_a_user_and_a_workspace() {
         let (_dir, cp) = open().await;
         let ws = cp
-            .create_workspace("w", None, setup_audit())
+            .create_workspace(&workspace_name("w"), None, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let bob = cp
@@ -2875,7 +2987,7 @@ mod tests {
     async fn an_audited_change_names_what_it_changed_and_a_no_op_is_an_error() {
         let (_dir, cp) = open().await;
         let ws = cp
-            .create_workspace("w", None, setup_audit())
+            .create_workspace(&workspace_name("w"), None, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let bob = cp
@@ -2922,7 +3034,7 @@ mod tests {
     async fn an_audited_change_does_not_stand_without_its_audit_row() {
         let (_dir, cp) = open().await;
         let ws = cp
-            .create_workspace("w", None, setup_audit())
+            .create_workspace(&workspace_name("w"), None, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let bob = cp
@@ -2942,7 +3054,7 @@ mod tests {
             .unwrap_or_else(|e| fail(&e.to_string()));
 
         assert!(
-            cp.create_workspace("w2", Some(&bob.id), setup_audit())
+            cp.create_workspace(&workspace_name("w2"), Some(&bob.id), setup_audit())
                 .await
                 .is_err()
         );
@@ -2997,7 +3109,7 @@ mod tests {
     async fn tokens_are_stored_hashed_with_scopes_and_expiry() {
         let (_dir, cp) = open().await;
         let ws = cp
-            .create_workspace("w", None, setup_audit())
+            .create_workspace(&workspace_name("w"), None, setup_audit())
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         let bob = cp
@@ -3131,15 +3243,134 @@ mod tests {
         assert!(none.is_ok_and(|r| r.is_empty()));
     }
 
+    /// A new workspace's name is trimmed, and refused when empty or when it
+    /// holds a slash, a backslash, or a dot.
+    #[test]
+    fn a_workspace_name_is_trimmed_and_refuses_empty_slashes_and_dots() {
+        assert!(matches!(" sales ".parse::<WorkspaceName>(), Ok(name) if name.as_str() == "sales"));
+        for refused in ["", "   ", "a/b", "a\\b", "a.b", ".."] {
+            assert!(
+                matches!(
+                    refused.parse::<WorkspaceName>(),
+                    Err(Error::InvalidWorkspaceName)
+                ),
+                "{refused:?}"
+            );
+        }
+        assert!(WorkspaceName::try_from(String::from("a.b/c")).is_err());
+    }
+
+    /// Commands that use the default workspace first at the same moment,
+    /// from separate processes, all get the one row: whoever loses the
+    /// insert opens the winner's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[expect(clippy::unwrap_used, reason = "test setup")]
+    async fn first_uses_of_the_default_workspace_that_race_share_one_row() {
+        let default = WorkspaceName::default();
+        let (dir, first) = open().await;
+        let mut config = Config::default();
+        config.general.data_dir = dir.path().to_path_buf();
+        let mut users = vec![first];
+        for _ in 0..7 {
+            users.push(ControlPlane::open(&config).await.unwrap());
+        }
+        let mut racing = tokio::task::JoinSet::new();
+        for cp in users {
+            let default = default.clone();
+            racing.spawn(async move { cp.workspace_or_default(None, &default).await });
+        }
+        let mut ids = BTreeSet::new();
+        while let Some(opened) = racing.join_next().await {
+            let opened = opened.unwrap();
+            assert!(opened.is_ok(), "{opened:?}");
+            ids.extend(opened.ok().map(|ws| ws.id.into_string()));
+        }
+        assert_eq!(ids.len(), 1, "{ids:?}");
+    }
+
+    /// A workspace a command names must exist, and nothing is created when
+    /// it does not; the default one is created, audited, by its first use,
+    /// whether or not the command names it.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test setup")]
+    async fn a_named_workspace_must_exist_and_the_default_is_created_on_first_use() {
+        let default = WorkspaceName::default();
+        let entry = || AuditEntry::new(AuditAction::Workspace, Outcome::Allowed, Channel::Cli);
+
+        let (_dir, cp) = open().await;
+        let refused = cp
+            .workspace_or_default(Some("slaes"), &default)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "no workspace named 'slaes'; create it with: quack workspace create slaes"
+        );
+        assert!(matches!(refused, Error::NoWorkspaceNamed(_)));
+        assert!(cp.list_workspaces().await.unwrap().is_empty());
+        assert!(matches!(
+            cp.workspace_named("slaes").await,
+            Err(Error::NoWorkspaceNamed(_))
+        ));
+
+        let created = cp.workspace_or_default(None, &default).await.unwrap();
+        assert_eq!(created.name, "default");
+        let audited = cp
+            .query_audit(&AuditFilter {
+                workspace_id: Some(created.id.clone()),
+                limit: 10,
+                ..AuditFilter::default()
+            })
+            .await
+            .unwrap()
+            .rows;
+        assert!(
+            matches!(audited.as_slice(), [row] if row.channel == Channel::Cli),
+            "{audited:?}"
+        );
+        let again = cp
+            .workspace_or_default(Some("default"), &default)
+            .await
+            .unwrap();
+        assert_eq!(again.id, created.id);
+
+        let sales = cp
+            .create_workspace(&workspace_name("sales"), None, entry())
+            .await
+            .unwrap();
+        let found = cp
+            .workspace_or_default(Some("sales"), &default)
+            .await
+            .unwrap();
+        assert_eq!(found.id, sales.id);
+        assert_eq!(cp.list_workspaces().await.unwrap().len(), 2);
+
+        // Naming the default explicitly creates it too.
+        let (_dir, fresh) = open().await;
+        let named = fresh
+            .workspace_or_default(Some("default"), &default)
+            .await
+            .unwrap();
+        assert_eq!(named.name, "default");
+    }
+
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test setup")]
     async fn workspace_times_carry_the_newest_access_of_each_workspace() {
         let (_dir, cp) = open().await;
         let used = cp
-            .create_workspace("used", None, setup_audit())
+            .create_workspace(&workspace_name("used"), None, setup_audit())
             .await
             .unwrap();
-        let idle = cp.find_or_create_workspace("idle").await.unwrap();
+        // A workspace from before every creation was audited has no rows.
+        let idle = WorkspaceId::generate();
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, classification) VALUES (?, 'idle', 'internal')",
+        )
+        .bind(idle.as_str())
+        .execute(&cp.pool)
+        .await
+        .unwrap();
         let denied = AuditEntry::new(AuditAction::Open, Outcome::Denied, Channel::Api)
             .in_workspace(&used.id);
         cp.record_audit(&denied).await.unwrap();
@@ -3160,7 +3391,7 @@ mod tests {
             newest.first().map(|r| r.timestamp.as_str())
         );
         assert!(!used.created_at.is_empty());
-        let idle = times.remove(&idle.id).unwrap();
+        let idle = times.remove(&idle).unwrap();
         assert_eq!(idle.last_accessed_at, None);
         assert!(!idle.created_at.is_empty());
     }
@@ -3225,14 +3456,6 @@ mod tests {
         assert!(elsewhere.is_err_and(|e| e.to_string().contains("different filter")));
         assert!("not a cursor".parse::<AuditCursor>().is_err());
         assert!("bm90IGEgY3Vyc29y".parse::<AuditCursor>().is_err());
-    }
-
-    #[test]
-    fn sha256_hex_is_the_known_digest_of_abc() {
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
     }
 
     #[test]

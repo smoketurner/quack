@@ -39,6 +39,7 @@ use tower_http::trace::TraceLayer;
 
 use oidc::Oidc;
 use quack_core::llm::acting::Acting;
+use quack_core::llm::egress::Egress;
 use quack_core::llm::oauth::KeySource;
 use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::llm::oauth::registration::{ClientSection, registered_sections};
@@ -184,8 +185,10 @@ pub(crate) fn router(app: App) -> Router {
         ))
         .layer(axum::middleware::map_response(no_store))
         // Every request gets an empty acting slot, which the identity
-        // extractor fills once it knows the caller.
-        .layer(axum::middleware::from_fn(acting_slot));
+        // extractor fills once it knows the caller, and an empty egress
+        // slot, which `Access::resolve` fills with the workspace's
+        // provider allow-list.
+        .layer(axum::middleware::from_fn(request_slots));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .merge(web::assets())
@@ -330,12 +333,13 @@ impl fmt::Display for Banner<'_> {
     }
 }
 
-/// Run the rest of the request with an acting slot of its own.
-async fn acting_slot(
+/// Run the rest of the request with an acting slot and an egress slot of
+/// its own.
+async fn request_slots(
     request: Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    Acting::request(next.run(request)).await
+    Acting::request(Egress::request(next.run(request))).await
 }
 
 /// Bind and serve until Ctrl-C.
@@ -416,19 +420,26 @@ pub(crate) async fn serve(
         .await
         .with_context(|| format!("cannot listen on {addr}"))?;
     tracing::info!(%addr, ?mode, "quack serve listening");
-    axum::serve(
-        listener,
-        router(app).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("server error")?;
+    let mut server = Box::pin(
+        axum::serve(
+            listener,
+            router(Arc::clone(&app)).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(app.stopping.clone().cancelled_owned())
+        .into_future(),
+    );
+    tokio::select! {
+        served = &mut server => return served.context("server error"),
+        () = shutdown_signal() => {}
+    }
+    let served = app.stop(server).await;
     tracing::info!("stopped");
-    Ok(())
+    served.context("server error")
 }
 
 /// Resolve on Ctrl-C or, on Unix, SIGTERM (what containers and systemd
-/// send). In-flight requests finish; new connections are refused.
+/// send). The server then stops: new connections are refused, jobs are
+/// cancelled, and in-flight requests get `[server].shutdown_grace_seconds`.
 async fn shutdown_signal() {
     let ctrl_c = async {
         drop(tokio::signal::ctrl_c().await);
@@ -448,7 +459,7 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! {
-        () = ctrl_c => tracing::info!("received Ctrl-C; finishing in-flight requests"),
-        () = terminate => tracing::info!("received SIGTERM; finishing in-flight requests"),
+        () = ctrl_c => tracing::info!("received Ctrl-C; cancelling jobs and finishing in-flight requests"),
+        () = terminate => tracing::info!("received SIGTERM; cancelling jobs and finishing in-flight requests"),
     }
 }

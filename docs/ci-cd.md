@@ -255,7 +255,9 @@ by: `reusable-build.yml` uses no Actions cache, and `release.yml`'s gates job ru
 
 `docker-compose.yml` runs `quack serve` beside `ollama/ollama`. It mounts
 `deploy/config.toml` at `/config` (chat and embedding models on the `ollama` service) and
-uses named volumes for `/data` and the models. First run:
+uses named volumes for `/data` and the models. `stop_grace_period` is 30 seconds, above
+`[server].shutdown_grace_seconds` (20), so `docker compose stop` lets quack cancel its jobs
+and checkpoint each workspace before Docker sends SIGKILL. First run:
 
 ```bash
 docker compose up -d

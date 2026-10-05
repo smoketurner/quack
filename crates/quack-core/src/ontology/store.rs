@@ -4,16 +4,17 @@
 //! `save` writes a new version: a snapshot row, then the live tables
 //! rewritten from it with `since_version` carried over for items that
 //! already existed. `current` reads the live tables; `version` reads a
-//! snapshot; `restore` saves an old snapshot as the newest version.
+//! snapshot; `restore` saves an old snapshot as the newest version;
+//! `rename` saves one with ids renamed and moves the graph with them.
 
 use std::collections::BTreeMap;
 
 use super::{
-    Class, Mapping, MappingRelation, Ontology, OntologyVersion, Property, PropertyType, ROOT_CLASS,
-    Relation,
+    Class, IdRenames, Mapping, MappingRelation, Ontology, OntologyVersion, Property, PropertyType,
+    ROOT_CLASS, Relation, candidates,
 };
 use crate::error::{Error, Record, Result};
-use crate::graph::Standing;
+use crate::graph::{Standing, store as graph_store};
 use crate::ids::ClassId;
 use crate::storage::workspace::WorkspaceDb;
 
@@ -35,12 +36,17 @@ text_enum!(Acceptance, "acceptance", {
 });
 text_enum_sql!(Acceptance);
 
-/// Who saved a version, why, and whether anyone reviewed it.
+/// Who saved a version, why, whether anyone reviewed it, and the ids it
+/// renames.
 #[derive(Debug, Clone, Copy)]
 pub struct Revision<'a> {
     pub author: Option<&'a str>,
     pub note: Option<&'a str>,
     pub acceptance: Acceptance,
+    /// Ids to rename in the ontology being saved: the save applies them
+    /// and moves `since_version`, pending candidates, and the graph's
+    /// nodes and edges to the new ids.
+    pub renames: Option<&'a IdRenames>,
 }
 
 impl<'a> Revision<'a> {
@@ -50,6 +56,7 @@ impl<'a> Revision<'a> {
             author,
             note,
             acceptance: Acceptance::Reviewed,
+            renames: None,
         }
     }
 
@@ -59,7 +66,15 @@ impl<'a> Revision<'a> {
             author,
             note,
             acceptance: Acceptance::Auto,
+            renames: None,
         }
+    }
+
+    /// The same revision, renaming ids as it saves.
+    #[must_use]
+    pub fn renaming(mut self, renames: &'a IdRenames) -> Self {
+        self.renames = Some(renames);
+        self
     }
 }
 
@@ -246,11 +261,22 @@ pub fn versions(db: &WorkspaceDb, limit: u32) -> Result<Vec<VersionRow>> {
 /// Validate, check mapped tables and columns against the workspace, and
 /// write the ontology as the next version. Returns the stored ontology.
 ///
+/// With `revision.renames`, the ontology is saved with those ids renamed,
+/// and the same transaction moves everything keyed by the old ids:
+/// `since_version`, pending candidates, and the graph's nodes and edges.
+///
 /// # Errors
 ///
 /// Returns an error when the ontology is invalid, a mapping names a table
-/// or column the workspace lacks, or a write fails.
+/// or column the workspace lacks, a rename's old id is not defined or its
+/// new id already is (in the ontology or on graph rows left from an
+/// earlier one), or a write fails.
 pub fn save(db: &WorkspaceDb, ontology: &Ontology, revision: Revision<'_>) -> Result<Ontology> {
+    let renamed = revision
+        .renames
+        .map(|renames| ontology.renamed(renames))
+        .transpose()?;
+    let ontology = renamed.as_ref().unwrap_or(ontology);
     ontology.validate()?;
     check_mappings(db, ontology)?;
     let previous = current(db)?;
@@ -264,6 +290,10 @@ pub fn save(db: &WorkspaceDb, ontology: &Ontology, revision: Revision<'_>) -> Re
     db.write_transaction(|db| {
         let conn = db.connection();
         write_version(conn, next, &stored, previous.as_ref(), &snapshot, revision)?;
+        if let Some(renames) = revision.renames {
+            candidates::rename_ids(db, renames)?;
+            graph_store::rename_ids(db, renames, next)?;
+        }
         Ok(stored)
     })
 }
@@ -289,6 +319,9 @@ fn write_version(
     )?;
     let prior_since = read_since(conn)?;
     let prior_since_property = read_since_property(conn)?;
+    // A renamed id carries over what its old id had.
+    let none = IdRenames::default();
+    let renames = revision.renames.unwrap_or(&none);
     // An item that already existed keeps the version it first appeared in.
     let since = |existed: bool, kind: &'static str, id: &str| -> i64 {
         let kept = existed
@@ -305,7 +338,8 @@ fn write_version(
         conn.execute(&format!("DELETE FROM {table}"), [])?;
     }
     for class in &stored.classes {
-        let existed = previous.is_some_and(|p| p.class(class.id.as_str()).is_some());
+        let before = renames.class_before(class.id.as_str());
+        let existed = previous.is_some_and(|p| p.class(before).is_some());
         conn.execute(
             "INSERT INTO _quack_ontology_classes (id, parent_id, label, description, key_property, since_version) \
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -315,15 +349,23 @@ fn write_version(
                 class.label.clone().unwrap_or_else(|| class.id.to_string()),
                 class.description,
                 class.key,
-                since(existed, "class", class.id.as_str())
+                since(existed, "class", before)
             ],
         )?;
     }
     // Properties have a composite `(id, class_id)` key and a per-membership
     // `since_version`, so they carry over per row in their own helper.
-    write_property_rows(conn, version, stored, previous, &prior_since_property)?;
+    write_property_rows(
+        conn,
+        version,
+        stored,
+        previous,
+        renames,
+        &prior_since_property,
+    )?;
     for relation in &stored.relations {
-        let existed = previous.is_some_and(|p| p.relation(relation.id.as_str()).is_some());
+        let before = renames.relation_before(relation.id.as_str());
+        let existed = previous.is_some_and(|p| p.relation(before).is_some());
         conn.execute(
             "INSERT INTO _quack_ontology_relations (id, label, description, domain_class, range_class, since_version) \
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -333,7 +375,7 @@ fn write_version(
                 relation.description,
                 relation.domain,
                 relation.range,
-                since(existed, "relation", relation.id.as_str())
+                since(existed, "relation", before)
             ],
         )?;
     }
@@ -368,27 +410,30 @@ fn write_version(
 /// membership row carries its own first-appearance version — never a global
 /// minimum across the classes that share the property id, which would
 /// silently overwrite a later membership's true first-appearance with an
-/// older one.
+/// older one. A renamed class's memberships are looked up under the id it
+/// had before.
 fn write_property_rows(
     conn: &duckdb::Connection,
     version: OntologyVersion,
     stored: &Ontology,
     previous: Option<&Ontology>,
+    renames: &IdRenames,
     prior_since: &BTreeMap<(String, String), u32>,
 ) -> Result<()> {
     for class in &stored.classes {
+        let before = renames.class_before(class.id.as_str());
         for property_id in &class.properties {
             let Some(property) = stored.property(property_id) else {
                 continue;
             };
             let existed = previous.is_some_and(|p| {
-                p.class(class.id.as_str())
+                p.class(before)
                     .is_some_and(|c| c.properties.contains(property_id))
             });
             let kept = existed
                 .then(|| {
                     prior_since
-                        .get(&(class.id.to_string(), property.id.clone()))
+                        .get(&(before.to_owned(), property.id.clone()))
                         .copied()
                 })
                 .flatten();
@@ -517,6 +562,35 @@ pub fn restore(
         db,
         &snapshot,
         Revision::reviewed(author, Some(&format!("restored version {target}"))),
+    )
+}
+
+/// Rename class and relation ids as the next version: the ontology's own
+/// references, pending candidates, and the graph's nodes and edges follow
+/// in one transaction. The version keeps the acceptance of the one before
+/// it, since renaming an id reviews nothing.
+///
+/// # Errors
+///
+/// Returns an error when there is no ontology, an old id is not defined, a
+/// new id already is (in the ontology or on graph rows left from an earlier
+/// one), or the save fails.
+pub fn rename(db: &WorkspaceDb, renames: &IdRenames, author: Option<&str>) -> Result<Ontology> {
+    let ontology =
+        current(db)?.ok_or_else(|| Error::Ontology(String::from("no ontology to rename in")))?;
+    let acceptance = versions(db, 1)?
+        .first()
+        .map(|v| v.acceptance)
+        .unwrap_or_default();
+    save(
+        db,
+        &ontology,
+        Revision {
+            author,
+            note: Some(&format!("renamed {renames}")),
+            acceptance,
+            renames: Some(renames),
+        },
     )
 }
 

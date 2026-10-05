@@ -11,15 +11,19 @@ use quack_core::error::Error;
 use quack_core::extraction::{Extract, ExtractFuture, ExtractionRun};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::resolve::MergeDecision;
-use quack_core::graph::store::NewNode;
+use quack_core::graph::store::{NewNode, Revalidation};
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
     GraphOptions, GraphResult, Node, Origin, Properties, Standing, extract, resolve,
     store as graph_store, tables, traverse,
 };
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
+use quack_core::ontology::candidates::{self, Queue};
+use quack_core::ontology::induction::{Candidate, ItemKind, Proposal};
 use quack_core::ontology::store::Revision;
-use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
+use quack_core::ontology::{
+    self, Class, IdRenames, Mapping, MappingRelation, Ontology, OntologyVersion, Relation, store,
+};
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::{
     DocumentStatus, NewChunk, NewDocument, SamplePool, WorkspaceDb,
@@ -908,9 +912,34 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
             .contains("stale: run `quack graph revalidate` or `quack graph extract`"),
         "a genuinely stale graph keeps the stale suffix: {status}"
     );
+    let preview = Revalidation::preview(&db).unwrap();
+    assert_eq!(
+        preview.classes,
+        BTreeMap::from([(String::from("country"), 2)])
+    );
+    assert_eq!(
+        preview.relations,
+        BTreeMap::from([(String::from("delivered_to"), 3)])
+    );
+    assert_eq!(preview.misfit_edges(), 0);
+    let shown = preview.to_string();
+    assert!(
+        shown.contains("drops 2 nodes and 3 edges")
+            && shown.contains("class country, which the ontology no longer defines: 2 nodes")
+            && shown
+                .contains("relation delivered_to, which the ontology no longer defines: 3 edges"),
+        "{shown}"
+    );
+    assert_eq!(
+        graph_store::status(&db).unwrap().nodes,
+        7,
+        "a preview drops nothing"
+    );
     let outcome = graph_store::revalidate(&db).unwrap();
     assert_eq!(outcome.dropped_nodes, 2, "Kenya and Uganda");
-    assert_eq!(outcome.dropped_edges, 0, "their edges went with them");
+    assert_eq!(outcome.dropped_edges, 3, "their edges went with them");
+    assert_eq!(preview, outcome, "the preview counted what the run dropped");
+    assert!(Revalidation::preview(&db).unwrap().is_empty());
     assert_eq!(Some(outcome.version), saved.version);
     let status = graph_store::status(&db).unwrap();
     assert_eq!(status.nodes, 5);
@@ -964,12 +993,22 @@ fn revalidation_drops_edges_that_no_longer_fit_and_dangling_ones() {
     )
     .unwrap();
 
+    let preview = Revalidation::preview(&db).unwrap();
+    assert!(preview.classes.is_empty() && preview.relations.is_empty());
+    assert_eq!(preview.misfit_edges(), 4);
+    assert!(
+        preview.to_string().contains(
+            "4 edges that lose an end or no longer fit their relation's domain and range"
+        ),
+        "{preview}"
+    );
     let outcome = graph_store::revalidate(&db).unwrap();
     assert_eq!(outcome.dropped_nodes, 0);
     assert_eq!(
         outcome.dropped_edges, 4,
         "three supplied_by edges and the dangling one"
     );
+    assert_eq!(preview, outcome, "the preview counted what the run dropped");
     let after = graph_store::status(&db).unwrap();
     assert_eq!(after.nodes, before.nodes);
     assert_eq!(after.edges, before.edges - 3);
@@ -1397,4 +1436,476 @@ fn aliases_resolve_case_and_whitespace_insensitively_like_primary_labels() {
         traverse::suggest_entities(&db, "Ibm", None, None).unwrap(),
         ["IBM (vendor)"]
     );
+}
+
+/// `since_version` of one live ontology row.
+fn since_version(db: &WorkspaceDb, table: &str, id: &str) -> Option<i64> {
+    db.connection()
+        .query_row(
+            &format!("SELECT since_version FROM {table} WHERE id = ?"),
+            [id],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+/// How many edges carry each relation id.
+fn edges_by_relation(db: &WorkspaceDb) -> BTreeMap<String, u64> {
+    let mut stmt = db
+        .connection()
+        .prepare("SELECT relation_id, count(*) FROM _quack_graph_edges GROUP BY relation_id")
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// A workspace whose `shipment` class has a subclass, a mapping, two
+/// relations it is the domain of, undecided candidates that name it, and
+/// nodes from table rows and from a document chunk; the graph matches the
+/// auto-accepted version 2.
+fn shipments_with_a_subclass_and_candidates() -> WorkspaceDb {
+    let db = workspace();
+    let mut with_subclass = store::current(&db).unwrap().unwrap();
+    with_subclass.classes.push(Class {
+        id: ClassId::from("air_shipment"),
+        parent: ClassId::from("shipment"),
+        label: None,
+        description: None,
+        key: None,
+        properties: Vec::new(),
+    });
+    let current = store::save(&db, &with_subclass, Revision::auto(None, Some("subclass"))).unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    // One node from a document chunk, beside the three from table rows.
+    let from_chunk = graph_store::upsert_node(
+        &db,
+        &NewNode {
+            label: String::from("PO-9"),
+            class_id: ClassId::from("shipment"),
+            properties: Properties::default(),
+            standing: Standing::Reviewed,
+        },
+    )
+    .unwrap();
+    graph_store::add_provenance(
+        &db,
+        &from_chunk,
+        &graph_store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from("c1"), 0.9),
+    )
+    .unwrap();
+    graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
+    candidates::store_run(
+        &db,
+        &[
+            Candidate {
+                proposal: Proposal::Property {
+                    class: String::from("shipment"),
+                    property: ontology::Property {
+                        id: String::from("weight"),
+                        label: None,
+                        kind: ontology::PropertyType::Number,
+                        values: Vec::new(),
+                    },
+                },
+                evidence: serde_json::Value::Null,
+                confidence: 0.9,
+                low_support: false,
+            },
+            Candidate {
+                proposal: Proposal::Relation(Relation {
+                    id: RelationId::from("routed_via"),
+                    label: None,
+                    description: None,
+                    domain: ClassId::from("shipment"),
+                    range: ClassId::from("country"),
+                }),
+                evidence: serde_json::Value::Null,
+                confidence: 0.4,
+                low_support: true,
+            },
+        ],
+    )
+    .unwrap();
+    db
+}
+
+/// Renaming a class moves everything in the ontology that names it: its
+/// subclass, the relations it is the domain of, its mapping, its own and
+/// its property memberships' `since_version`, and undecided candidates.
+/// Earlier snapshots keep the old id.
+#[test]
+fn renaming_a_class_moves_everything_in_the_ontology_that_names_it() {
+    let db = shipments_with_a_subclass_and_candidates();
+    let renames = IdRenames::one(ItemKind::Class, "shipment", "consignment").unwrap();
+    let renamed = store::rename(&db, &renames, Some("alice")).unwrap();
+
+    assert_eq!(renamed.version, OntologyVersion::new(3));
+    assert!(renamed.class("shipment").is_none());
+    assert_eq!(
+        renamed.class("air_shipment").map(|c| c.parent.as_str()),
+        Some("consignment"),
+        "the subclass follows"
+    );
+    for relation in ["supplied_by", "delivered_to"] {
+        assert_eq!(
+            renamed.relation(relation).map(|r| r.domain.as_str()),
+            Some("consignment"),
+            "{relation}'s domain follows"
+        );
+    }
+    assert_eq!(
+        renamed
+            .mapping_for_table("shipments")
+            .map(|m| m.class.as_str()),
+        Some("consignment"),
+        "the mapping follows"
+    );
+    assert_eq!(store::current(&db).unwrap().unwrap(), renamed);
+    assert_eq!(
+        since_version(&db, "_quack_ontology_classes", "consignment"),
+        Some(1),
+        "the class keeps the version its old id first appeared in"
+    );
+    let membership: i64 = db
+        .connection()
+        .query_row(
+            "SELECT since_version FROM _quack_ontology_properties \
+             WHERE id = 'po' AND class_id = 'consignment'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(membership, 1, "and so does each of its properties");
+    let header = store::versions(&db, 1).unwrap().remove(0);
+    assert_eq!(
+        header.note.as_deref(),
+        Some("renamed class shipment to consignment")
+    );
+    assert_eq!(header.author.as_deref(), Some("alice"));
+    assert_eq!(
+        store::current_standing(&db).unwrap(),
+        Standing::Provisional,
+        "a rename reviews nothing: the version keeps the acceptance before it"
+    );
+    let history = store::version(&db, OntologyVersion::new(2).unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(
+        history.class("shipment").is_some() && history.class("consignment").is_none(),
+        "earlier snapshots are history and keep the old id"
+    );
+
+    // Undecided candidates name the class by its new id.
+    let pending = candidates::queue(&db, Queue::Pending).unwrap();
+    assert!(
+        matches!(
+            pending.first().map(|c| &c.proposal),
+            Some(Proposal::Property { class, .. }) if class == "consignment"
+        ),
+        "{pending:?}"
+    );
+    let aside = candidates::queue(&db, Queue::LowSupport).unwrap();
+    assert!(
+        matches!(
+            aside.first().map(|c| &c.proposal),
+            Some(Proposal::Relation(r)) if r.domain == "consignment" && r.range == "country"
+        ),
+        "{aside:?}"
+    );
+}
+
+/// Renaming a class moves its nodes with their edges and provenance, and
+/// the graph still matches the ontology: a revalidation afterwards has
+/// nothing to drop.
+#[test]
+fn renaming_a_class_moves_its_nodes_and_a_revalidation_drops_nothing() {
+    let db = shipments_with_a_subclass_and_candidates();
+    let before = graph_store::status(&db).unwrap();
+    let shipments = graph_store::class_count(&db, &[ClassId::from("shipment")]).unwrap();
+    assert_eq!(shipments, 4);
+    let mut node_ids = graph_store::all_node_ids(&db).unwrap();
+    node_ids.sort();
+    let provenance = graph_store::provenance_of(&db, &node_ids).unwrap().len();
+
+    let renames = IdRenames::one(ItemKind::Class, "shipment", "consignment").unwrap();
+    let renamed = store::rename(&db, &renames, None).unwrap();
+
+    // Same size, every shipment node now a consignment.
+    assert_eq!(
+        graph_store::class_count(&db, &[ClassId::from("consignment")]).unwrap(),
+        shipments
+    );
+    assert_eq!(
+        graph_store::class_count(&db, &[ClassId::from("shipment")]).unwrap(),
+        0
+    );
+    let after = graph_store::status(&db).unwrap();
+    assert_eq!((after.nodes, after.edges), (before.nodes, before.edges));
+    let mut kept = graph_store::all_node_ids(&db).unwrap();
+    kept.sort();
+    assert_eq!(kept, node_ids, "no node was replaced");
+    assert_eq!(
+        graph_store::provenance_of(&db, &node_ids).unwrap().len(),
+        provenance
+    );
+    assert!(
+        !after.stale && after.built_with_version == renamed.version,
+        "a graph that matched the version before matches the renamed one: {after}"
+    );
+    assert!(Revalidation::preview(&db).unwrap().is_empty());
+    let outcome = graph_store::revalidate(&db).unwrap();
+    assert_eq!((outcome.dropped_nodes, outcome.dropped_edges), (0, 0));
+    let unchanged = graph_store::status(&db).unwrap();
+    assert_eq!(
+        (unchanged.nodes, unchanged.edges),
+        (before.nodes, before.edges)
+    );
+}
+
+/// Renaming a relation moves its mapping, its `since_version`, and every
+/// edge that carries it; a revalidation afterwards has nothing to drop.
+#[test]
+fn renaming_a_relation_moves_its_mapping_and_its_edges() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    store::save(&db, &current, Revision::reviewed(None, Some("again"))).unwrap();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
+    let before = graph_store::status(&db).unwrap();
+    let edges = edges_by_relation(&db);
+    assert_eq!(edges.get("supplied_by"), Some(&3));
+    let node_ids = graph_store::all_node_ids(&db).unwrap();
+    let edge_ids: Vec<_> = graph_store::edges(&db, &node_ids, graph_store::EdgeScope::Touching)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    let provenance = graph_store::provenance_of(&db, &edge_ids).unwrap().len();
+    assert!(provenance > 0);
+
+    let renames = IdRenames::one(ItemKind::Relation, "supplied_by", "sourced_from").unwrap();
+    let renamed = store::rename(&db, &renames, None).unwrap();
+
+    assert!(renamed.relation("supplied_by").is_none());
+    assert_eq!(
+        renamed
+            .relation("sourced_from")
+            .map(|r| (r.domain.as_str(), r.range.as_str())),
+        Some(("shipment", "vendor"))
+    );
+    let mapped: Vec<&str> = renamed
+        .mapping_for_table("shipments")
+        .map(|m| m.relations.iter().map(|r| r.relation.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(mapped, ["sourced_from", "delivered_to"]);
+    assert_eq!(
+        since_version(&db, "_quack_ontology_relations", "sourced_from"),
+        Some(1)
+    );
+    assert_eq!(
+        store::versions(&db, 1).unwrap().remove(0).note.as_deref(),
+        Some("renamed relation supplied_by to sourced_from")
+    );
+
+    let moved = edges_by_relation(&db);
+    assert_eq!(moved.get("sourced_from"), Some(&3));
+    assert_eq!(moved.get("supplied_by"), None);
+    assert_eq!(moved.get("delivered_to"), edges.get("delivered_to"));
+    assert_eq!(
+        graph_store::provenance_of(&db, &edge_ids).unwrap().len(),
+        provenance
+    );
+    let after = graph_store::status(&db).unwrap();
+    assert!(!after.stale, "{after}");
+    assert!(Revalidation::preview(&db).unwrap().is_empty());
+    let outcome = graph_store::revalidate(&db).unwrap();
+    assert_eq!((outcome.dropped_nodes, outcome.dropped_edges), (0, 0));
+    let unchanged = graph_store::status(&db).unwrap();
+    assert_eq!(
+        (unchanged.nodes, unchanged.edges),
+        (before.nodes, before.edges)
+    );
+    // The mapped table extracts onto the renamed relation's edges.
+    tables::extract(&db, &renamed, Standing::Reviewed).unwrap();
+    assert_eq!(graph_store::status(&db).unwrap().edges, before.edges);
+}
+
+/// A rename is refused, and writes nothing, when the old id is not
+/// defined, the new id already is, or the new id is not a valid id.
+#[test]
+fn a_rename_onto_an_existing_id_is_refused_and_writes_nothing() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
+    let refused = |kind: ItemKind, old: &str, new: &str| {
+        store::rename(&db, &IdRenames::one(kind, old, new).unwrap(), None)
+            .unwrap_err()
+            .to_string()
+    };
+    for (kind, old, new, why) in [
+        (
+            ItemKind::Class,
+            "vendor",
+            "country",
+            "class 'country' is declared twice",
+        ),
+        (
+            ItemKind::Class,
+            "vendor",
+            "vendor",
+            "class 'vendor' already has that id",
+        ),
+        (
+            ItemKind::Class,
+            "supplier",
+            "partner",
+            "no class 'supplier' to rename",
+        ),
+        (
+            ItemKind::Class,
+            "entity",
+            "thing",
+            "no class 'entity' to rename",
+        ),
+        (ItemKind::Class, "vendor", "entity", "implicit root"),
+        (ItemKind::Class, "vendor", "Not An Id", "snake_case"),
+        (
+            ItemKind::Relation,
+            "supplied_by",
+            "ships_to",
+            "relation 'ships_to' is declared twice",
+        ),
+        (
+            ItemKind::Relation,
+            "sold_by",
+            "sourced_from",
+            "no relation 'sold_by' to rename",
+        ),
+        (ItemKind::Relation, "supplied_by", "mentions", "implicit"),
+    ] {
+        let error = refused(kind, old, new);
+        assert!(error.contains(why), "{kind} {old} -> {new}: {error}");
+    }
+    assert_eq!(store::latest_version(&db).unwrap(), OntologyVersion::new(1));
+}
+
+/// Graph rows left from an earlier ontology keep their id taken: a rename
+/// onto it is refused and its version rolled back. A rename elsewhere goes
+/// through and leaves the graph as stale as it was.
+#[test]
+fn a_rename_onto_an_id_left_in_the_graph_is_refused_and_rolled_back() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
+    let refused = |kind: ItemKind, old: &str, new: &str| {
+        store::rename(&db, &IdRenames::one(kind, old, new).unwrap(), None)
+            .unwrap_err()
+            .to_string()
+    };
+
+    // The ontology drops `country` and nobody revalidates: its two nodes
+    // stay in the graph, so `vendor` cannot take that id.
+    let mut edited = current;
+    edited.classes.retain(|c| c.id != "country");
+    edited
+        .relations
+        .retain(|r| r.id != "delivered_to" && r.id != "ships_to");
+    if let Some(mapping) = edited.mappings.first_mut() {
+        mapping.relations.retain(|r| r.target_class != "country");
+    }
+    store::save(
+        &db,
+        &edited,
+        Revision::reviewed(None, Some("drop countries")),
+    )
+    .unwrap();
+    let error = refused(ItemKind::Class, "vendor", "country");
+    assert!(
+        error.contains("the graph still holds 2 nodes of a class 'country'"),
+        "{error}"
+    );
+    let error = refused(ItemKind::Relation, "supplied_by", "delivered_to");
+    assert!(
+        error.contains("the graph still holds 3 edges of a relation 'delivered_to'"),
+        "{error}"
+    );
+    assert_eq!(
+        store::latest_version(&db).unwrap(),
+        OntologyVersion::new(2),
+        "a refused rename rolls its version back"
+    );
+    assert!(
+        store::current(&db)
+            .unwrap()
+            .unwrap()
+            .class("vendor")
+            .is_some()
+    );
+    assert_eq!(
+        graph_store::class_count(&db, &[ClassId::from("vendor")]).unwrap(),
+        2
+    );
+
+    // A graph that was already stale stays stale after a rename: the
+    // rename moved ids, it did not revalidate.
+    store::rename(
+        &db,
+        &IdRenames::one(ItemKind::Class, "vendor", "supplier").unwrap(),
+        None,
+    )
+    .unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert!(status.stale, "{status}");
+    assert_eq!(status.built_with_version, OntologyVersion::new(1));
+    let preview = Revalidation::preview(&db).unwrap();
+    assert_eq!(
+        preview.classes,
+        BTreeMap::from([(String::from("country"), 2)])
+    );
+}
+
+/// `save` applies the renames its revision carries to the ontology it is
+/// given, and only class and relation ids rename.
+#[test]
+fn a_save_applies_its_renames_and_refuses_ids_its_ontology_lacks() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    let renames = IdRenames::one(ItemKind::Class, "vendor", "supplier").unwrap();
+    let saved = store::save(
+        &db,
+        &current,
+        Revision::reviewed(None, None).renaming(&renames),
+    )
+    .unwrap();
+    assert!(saved.class("supplier").is_some() && saved.class("vendor").is_none());
+    let error = store::save(
+        &db,
+        &saved,
+        Revision::reviewed(None, None).renaming(&renames),
+    )
+    .map(|_| ())
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("no class 'vendor' to rename"), "{error}");
+    assert_eq!(store::latest_version(&db).unwrap(), OntologyVersion::new(2));
+
+    let empty = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
+    let error = store::rename(&empty, &renames, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no ontology to rename in"), "{error}");
+    for kind in [ItemKind::Property, ItemKind::Mapping] {
+        let error = IdRenames::one(kind, "name", "title")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot be renamed: only a class or a relation id can"),
+            "{error}"
+        );
+    }
 }

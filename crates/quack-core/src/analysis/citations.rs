@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::ids::{ChunkId, DocumentId};
 use crate::storage::workspace::ChunkSearchResult;
+use crate::text::OneLine;
 
 /// One retrievable source the model may cite by its marker.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -65,12 +66,12 @@ impl<'a> From<&'a ChunkSearchResult> for ChunkLocation<'a> {
 
 impl fmt::Display for ChunkLocation<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.filename)?;
+        write!(f, "{}", OneLine(self.filename))?;
         if let Some(page) = self.page {
             write!(f, ", page {page}")?;
         }
         if let Some(heading) = self.heading {
-            write!(f, ", under \"{heading}\"")?;
+            write!(f, ", under \"{}\"", OneLine(heading))?;
         }
         Ok(())
     }

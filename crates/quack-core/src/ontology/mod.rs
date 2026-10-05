@@ -339,6 +339,149 @@ pub struct ClassRelations<'a> {
     pub to: Vec<&'a Relation>,
 }
 
+/// Class and relation ids to rename, each old id to its new one: what an
+/// accepted candidate's rename or merge decision gives the proposals after
+/// it, and what a save carries to move the graph's nodes and edges with
+/// the ids (design doc 6.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdRenames {
+    pub classes: BTreeMap<ClassId, ClassId>,
+    pub relations: BTreeMap<RelationId, RelationId>,
+}
+
+impl IdRenames {
+    /// One id of `kind`, from `old` to `new`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Ontology` error for a property or a mapping: the graph
+    /// is keyed by class and relation ids only.
+    pub fn one(kind: ItemKind, old: &str, new: &str) -> Result<Self> {
+        let mut renames = Self::default();
+        match kind {
+            ItemKind::Class => {
+                renames
+                    .classes
+                    .insert(ClassId::from(old), ClassId::from(new));
+            }
+            ItemKind::Relation => {
+                renames
+                    .relations
+                    .insert(RelationId::from(old), RelationId::from(new));
+            }
+            ItemKind::Property | ItemKind::Mapping => {
+                return Err(Error::Ontology(format!(
+                    "a {kind} cannot be renamed: only a {} or a {} id can",
+                    ItemKind::Class,
+                    ItemKind::Relation
+                )));
+            }
+        }
+        Ok(renames)
+    }
+
+    /// The id a class had before these renames: its own unless it is the
+    /// new id of one.
+    pub(crate) fn class_before<'a>(&'a self, id: &'a str) -> &'a str {
+        self.classes
+            .iter()
+            .find(|(_, new)| new.as_str() == id)
+            .map_or(id, |(old, _)| old.as_str())
+    }
+
+    /// The id a relation had before these renames.
+    pub(crate) fn relation_before<'a>(&'a self, id: &'a str) -> &'a str {
+        self.relations
+            .iter()
+            .find(|(_, new)| new.as_str() == id)
+            .map_or(id, |(old, _)| old.as_str())
+    }
+
+    fn move_class(&self, id: &mut ClassId) {
+        if let Some(new) = self.classes.get(id.as_str()) {
+            id.clone_from(new);
+        }
+    }
+
+    fn move_relation(&self, id: &mut RelationId) {
+        if let Some(new) = self.relations.get(id.as_str()) {
+            id.clone_from(new);
+        }
+    }
+
+    pub(crate) fn rename_class(&self, class: &mut Class) {
+        self.move_class(&mut class.id);
+        self.move_class(&mut class.parent);
+    }
+
+    pub(crate) fn rename_relation(&self, relation: &mut Relation) {
+        self.move_relation(&mut relation.id);
+        self.move_class(&mut relation.domain);
+        self.move_class(&mut relation.range);
+    }
+
+    pub(crate) fn rename_mapping(&self, mapping: &mut Mapping) {
+        self.move_class(&mut mapping.class);
+        for link in &mut mapping.relations {
+            self.move_relation(&mut link.relation);
+            self.move_class(&mut link.target_class);
+        }
+    }
+
+    /// The new id of the class named `owner`, for the places that hold a
+    /// class id as plain text.
+    pub(crate) fn rename_owner(&self, owner: &mut String) {
+        if let Some(new) = self.classes.get(owner.as_str()) {
+            new.as_str().clone_into(owner);
+        }
+    }
+
+    /// Every old id must be one `ontology` defines, renamed to another
+    /// id. A new id the ontology already has is left to
+    /// [`Ontology::validate`], which refuses the renamed ontology for
+    /// declaring it twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Ontology` error naming the first id that breaks this.
+    pub(crate) fn check(&self, ontology: &Ontology) -> Result<()> {
+        let classes = self.classes.iter().map(|(old, new)| {
+            let defined = ontology.class(old.as_str()).is_some();
+            (ItemKind::Class, old.as_str(), new.as_str(), defined)
+        });
+        let relations = self.relations.iter().map(|(old, new)| {
+            let defined = ontology.relation(old.as_str()).is_some();
+            (ItemKind::Relation, old.as_str(), new.as_str(), defined)
+        });
+        for (kind, old, new, defined) in classes.chain(relations) {
+            if !defined {
+                return Err(Error::Ontology(format!("no {kind} '{old}' to rename")));
+            }
+            if old == new {
+                return Err(Error::Ontology(format!(
+                    "{kind} '{old}' already has that id"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `class vendor to supplier, relation ships_to to delivers_to`.
+impl std::fmt::Display for IdRenames {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let classes = self
+            .classes
+            .iter()
+            .map(|(old, new)| format!("{} {old} to {new}", ItemKind::Class));
+        let relations = self
+            .relations
+            .iter()
+            .map(|(old, new)| format!("{} {old} to {new}", ItemKind::Relation));
+        f.write_str(&classes.chain(relations).collect::<Vec<_>>().join(", "))
+    }
+}
+
 impl Ontology {
     /// Parse the JSON interchange form and validate it.
     ///
@@ -814,6 +957,30 @@ impl Ontology {
             }
         }
         out
+    }
+
+    /// This ontology, unsaved and not yet validated, with `renames`
+    /// applied to every place it names a class or a relation: ids,
+    /// parents, domains and ranges, and table mappings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Ontology` error when an old id is not defined or is
+    /// renamed to itself.
+    pub(crate) fn renamed(&self, renames: &IdRenames) -> Result<Self> {
+        renames.check(self)?;
+        let mut out = self.clone();
+        out.version = None;
+        for class in &mut out.classes {
+            renames.rename_class(class);
+        }
+        for relation in &mut out.relations {
+            renames.rename_relation(relation);
+        }
+        for mapping in &mut out.mappings {
+            renames.rename_mapping(mapping);
+        }
+        Ok(out)
     }
 
     /// What changed from `older` to `self`, by id, comparing canonical forms.

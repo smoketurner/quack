@@ -9,12 +9,13 @@ use crate::config::Config;
 use crate::embedding::{
     Dimension, EmbeddingStatus, Fingerprint, Input, Profile, Prompts, StaleVectors, Vector,
 };
-use crate::error::{Error, Record, Result};
+use crate::error::{Error, Record, Result, WrittenBy};
 use crate::graph;
 use crate::ids::{ChunkId, DocumentId, NodeId};
 use crate::ingestion::TableName;
-use crate::ingestion::parser::{FileType, Load};
+use crate::ingestion::parser::{FileType, Load, PageCounts};
 use crate::ontology::store::Acceptance;
+use crate::text::OneLine;
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
 const BM25_K1: f64 = 1.2;
@@ -47,6 +48,38 @@ const ONTOLOGY_ACCEPTANCE: u32 = 10;
 /// row, keeping the more-decided one so a reviewer's rejection is not lost.
 const MERGE_DEDUP: u32 = 11;
 
+/// The documents table, and the columns older files gain on open.
+const DOCUMENTS_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS _quack_documents (
+        id TEXT PRIMARY KEY,
+        filename TEXT NOT NULL,
+        title TEXT,
+        mime_type TEXT,
+        size_bytes BIGINT,
+        sha256 TEXT,
+        source TEXT,
+        ingested_at TIMESTAMP DEFAULT now(),
+        status TEXT DEFAULT 'queued',
+        error_message TEXT,
+        pinned BOOLEAN NOT NULL DEFAULT false,
+        chunk_count INTEGER,
+        ingested_by TEXT,
+        tables JSON,
+        page_count INTEGER,
+        pages_unreadable INTEGER,
+        pages_empty INTEGER
+    );
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS title TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS sha256 TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS chunk_count INTEGER;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS ingested_by TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS tables JSON;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_unreadable INTEGER;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_empty INTEGER;";
+
 /// Summaries of the turns a session's history window leaves out
 /// (`[analysis].compact_history`), each with how many replayable messages,
 /// oldest first, it covers.
@@ -61,6 +94,13 @@ const SESSION_SUMMARIES_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_session_s
 /// Schema version of the internal tables, recorded in `_quack_meta`: the
 /// newest step above.
 const WORKSPACE_SCHEMA_VERSION: u32 = MERGE_DEDUP;
+
+/// The oldest `DuckDB` that must read a file created here, given to `DuckDB`
+/// when the file is opened. It is the bundled library's own default, named so
+/// that a `duckdb` upgrade cannot change the format of new files unnoticed.
+/// `DuckDB` uses it only when it creates a file; an existing one keeps its
+/// format.
+const STORAGE_COMPATIBILITY_VERSION: &str = "v0.10.2";
 
 /// The tables that hold embedding vectors, with the same `embedding` and
 /// `embedding_profile` columns.
@@ -100,6 +140,10 @@ pub enum MetaKey {
     GraphBuiltWithOntologyVersion,
     /// Extraction's unknown classes and relations, as a JSON count map.
     GraphDrift,
+    /// The quack version that last opened the file for writing.
+    WrittenByQuack,
+    /// The `DuckDB` library version that quack was built with.
+    WrittenByDuckDb,
 }
 
 text_enum!(MetaKey, "meta key", {
@@ -108,6 +152,8 @@ text_enum!(MetaKey, "meta key", {
     EmbeddingModel => "embedding_model",
     GraphBuiltWithOntologyVersion => "graph_built_with_ontology_version",
     GraphDrift => "graph_drift",
+    WrittenByQuack => "written_by_quack",
+    WrittenByDuckDb => "written_by_duckdb",
 });
 text_enum_sql!(MetaKey);
 
@@ -560,9 +606,9 @@ impl WorkspaceDb {
         self
     }
 
-    /// The vector width a workspace file recorded, before anything else runs
-    /// on it: `None` for a new file.
-    fn recorded_dimension(conn: &duckdb::Connection) -> Result<Option<Dimension>> {
+    /// A `_quack_meta` value as a workspace file recorded it, before anything
+    /// else runs on it: `None` for a new file or a key it never set.
+    fn recorded(conn: &duckdb::Connection, key: MetaKey) -> Result<Option<String>> {
         let has_meta: bool = conn.query_row(
         "SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = '_quack_meta' AND NOT temporary",
         [],
@@ -574,7 +620,7 @@ impl WorkspaceDb {
         let value: Option<String> = conn
             .query_row(
                 "SELECT value FROM _quack_meta WHERE key = ?",
-                duckdb::params![MetaKey::EmbeddingDimension],
+                duckdb::params![key],
                 |row| row.get(0),
             )
             .map(Some)
@@ -582,7 +628,39 @@ impl WorkspaceDb {
                 duckdb::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        Ok(value.and_then(|v| v.parse().ok()).map(Dimension::new))
+        Ok(value)
+    }
+
+    /// The vector width a workspace file recorded: `None` for a new file.
+    fn recorded_dimension(conn: &duckdb::Connection) -> Result<Option<Dimension>> {
+        Ok(Self::recorded(conn, MetaKey::EmbeddingDimension)?
+            .and_then(|v| v.parse().ok())
+            .map(Dimension::new))
+    }
+
+    /// Refuse a file a newer quack upgraded, before any statement changes
+    /// it: this binary's table definitions and rebuilds do not know that
+    /// schema, and recording its own lower version would hide the rollback.
+    fn refuse_newer_schema(conn: &duckdb::Connection, path: &Path) -> Result<()> {
+        // A file from before the version was recorded has none.
+        let recorded = match Self::recorded(conn, MetaKey::SchemaVersion)? {
+            None => 0,
+            Some(text) => text
+                .parse::<u32>()
+                .map_err(|_| Error::WorkspaceSchemaUnreadable {
+                    path: path.to_path_buf(),
+                    recorded: text,
+                })?,
+        };
+        if recorded <= WORKSPACE_SCHEMA_VERSION {
+            return Ok(());
+        }
+        Err(Error::WorkspaceTooNew {
+            path: path.to_path_buf(),
+            recorded,
+            supported: WORKSPACE_SCHEMA_VERSION,
+            written_by: WrittenBy(Self::recorded(conn, MetaKey::WrittenByQuack)?),
+        })
     }
 
     /// Open (or create) the `DuckDB` database for a workspace.
@@ -607,7 +685,11 @@ impl WorkspaceDb {
         // DuckDB reports a file held by another process only in its message
         // text ("Could not set lock on file ..."); it is classified here, once,
         // so callers match a variant instead.
-        let conn = duckdb::Connection::open(&db_path).map_err(|e| {
+        let storage = duckdb::Config::default().with(
+            "storage_compatibility_version",
+            STORAGE_COMPATIBILITY_VERSION,
+        )?;
+        let conn = duckdb::Connection::open_with_flags(&db_path, storage).map_err(|e| {
             if e.to_string().contains("Could not set lock") {
                 Error::WorkspaceLocked {
                     path: db_path.clone(),
@@ -616,6 +698,7 @@ impl WorkspaceDb {
                 Error::from(e)
             }
         })?;
+        Self::refuse_newer_schema(&conn, &db_path)?;
         // The columns keep the width they were created with until the
         // reconciliation below decides otherwise.
         let column_dimension = Self::recorded_dimension(&conn)?
@@ -915,22 +998,6 @@ impl WorkspaceDb {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS _quack_documents (
-                id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                title TEXT,
-                mime_type TEXT,
-                size_bytes BIGINT,
-                sha256 TEXT,
-                source TEXT,
-                ingested_at TIMESTAMP DEFAULT now(),
-                status TEXT DEFAULT 'queued',
-                error_message TEXT,
-                pinned BOOLEAN NOT NULL DEFAULT false,
-                chunk_count INTEGER,
-                ingested_by TEXT,
-                tables JSON
-            );
             CREATE TABLE IF NOT EXISTS _quack_chunks (
                 id TEXT PRIMARY KEY,
                 document_id TEXT NOT NULL,
@@ -941,13 +1008,6 @@ impl WorkspaceDb {
                 embedding FLOAT[{dim}],
                 token_count INTEGER
             );
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS title TEXT;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS sha256 TEXT;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source TEXT;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS chunk_count INTEGER;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS ingested_by TEXT;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS tables JSON;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS heading TEXT;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS page INTEGER;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS embedding_profile TEXT;
@@ -998,12 +1058,15 @@ impl WorkspaceDb {
                 detail JSON
             );"
         );
+        self.conn.execute_batch(DOCUMENTS_DDL)?;
         self.conn.execute_batch(&sql)?;
         self.conn.execute_batch(SESSION_SUMMARIES_DDL)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&graph::ddl(dim))?;
         self.upgrade_data(dim)?;
         self.set_meta(MetaKey::EmbeddingDimension, &dim.to_string())?;
+        self.set_meta(MetaKey::WrittenByQuack, env!("CARGO_PKG_VERSION"))?;
+        self.set_meta(MetaKey::WrittenByDuckDb, &self.duckdb_version()?)?;
         // DuckDB cannot replay an `ADD COLUMN` from the write-ahead log (an
         // internal error on the next open), so a column added to an older
         // file goes into the database file before anything else runs.
@@ -1012,7 +1075,8 @@ impl WorkspaceDb {
     }
 
     /// The data rebuilds a schema version asks of a workspace recorded
-    /// under an older one, then the version it now matches.
+    /// under an older one, then the version it now matches. A file recorded
+    /// under a newer one never gets here: [`Self::open`] refuses it first.
     fn upgrade_data(&self, dim: Dimension) -> Result<()> {
         let recorded = self
             .meta(MetaKey::SchemaVersion)?
@@ -1510,6 +1574,26 @@ impl WorkspaceDb {
         self.conn.execute(
             "UPDATE _quack_documents SET chunk_count = ? WHERE id = ?",
             duckdb::params![count, id],
+        )?;
+        Ok(())
+    }
+
+    /// Record how a processed document's pages read; `None` for a source
+    /// without pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn set_document_pages(&self, id: &DocumentId, pages: Option<PageCounts>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _quack_documents SET page_count = ?, pages_unreadable = ?, pages_empty = ? \
+             WHERE id = ?",
+            duckdb::params![
+                pages.map(|p| p.total),
+                pages.map(|p| p.unreadable),
+                pages.map(|p| p.empty),
+                id
+            ],
         )?;
         Ok(())
     }
@@ -2733,6 +2817,9 @@ pub struct DocumentInfo {
     /// Tables a structured document loaded into; `None` until processed
     /// and for rows written before this was recorded.
     pub tables: Option<Vec<String>>,
+    /// How a PDF's pages read; `None` for other sources, until processed,
+    /// and for rows written before this was recorded.
+    pub pages: Option<PageCounts>,
     pub ingested_at: String,
 }
 
@@ -2837,7 +2924,8 @@ impl<'a> NewDocument<'a> {
 
 const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, status, error_message, \
      COALESCE(pinned, false), CAST(ingested_at AS VARCHAR), title, sha256, source, chunk_count, \
-     ingested_by, CAST(tables AS VARCHAR) FROM _quack_documents";
+     ingested_by, CAST(tables AS VARCHAR), page_count, pages_unreadable, pages_empty \
+     FROM _quack_documents";
 
 /// A row selected with [`DOCUMENT_SELECT`].
 impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
@@ -2861,6 +2949,14 @@ impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
             tables: row
                 .get::<_, Option<String>>(13)?
                 .and_then(|json| serde_json::from_str(&json).ok()),
+            pages: match row.get::<_, Option<u32>>(14)? {
+                Some(total) => Some(PageCounts {
+                    total,
+                    unreadable: row.get::<_, Option<u32>>(15)?.unwrap_or(0),
+                    empty: row.get::<_, Option<u32>>(16)?.unwrap_or(0),
+                }),
+                None => None,
+            },
         })
     }
 }
@@ -3166,7 +3262,7 @@ impl ChunkScope {
             let Some(d) = found else {
                 let known: Vec<String> = documents
                     .iter()
-                    .map(|d| format!("{} ({})", d.id, d.filename))
+                    .map(|d| format!("{} ({})", d.id, OneLine(&d.filename)))
                     .collect();
                 return Err(Error::Analysis(format!(
                     "no document matches '{want}'; pass an id from list_documents or omit \
@@ -5107,6 +5203,41 @@ mod tests {
         assert_eq!(seen, ["c0", "c1", "c2", "c3", "c4", "c5", "c6"]);
     }
 
+    #[test]
+    fn page_counts_are_stored_on_the_document_and_cleared_with_none() {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "doc1");
+        let id = DocumentId::from("doc1");
+        let pages = |db: &WorkspaceDb| {
+            db.document(&id)
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .map(|doc| (doc.pages, doc.pages.and_then(PageCounts::note)))
+        };
+        assert_eq!(pages(&db), Some((None, None)));
+
+        let counts = PageCounts {
+            total: 40,
+            unreadable: 3,
+            empty: 2,
+        };
+        db.set_document_pages(&id, Some(counts))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            pages(&db),
+            Some((
+                Some(counts),
+                Some(String::from("3 of 40 pages unreadable, 2 without text"))
+            ))
+        );
+        let listed = db.list_documents().unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(listed.first().and_then(|doc| doc.pages), Some(counts));
+
+        db.set_document_pages(&id, None)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(pages(&db), Some((None, None)));
+    }
+
     fn insert_ready_document(db: &WorkspaceDb, id: &str) {
         db.insert_document(
             &NewDocument::new(&DocumentId::from(id), "doc.txt", "text/plain", 10)
@@ -5375,6 +5506,218 @@ mod tests {
             .map(|v| v.acceptance)
             .collect();
         assert_eq!(acceptance, [Acceptance::Auto, Acceptance::Reviewed]);
+    }
+
+    /// The `storage_version` tag `DuckDB` reports for the file `conn` has open.
+    fn storage_version(conn: &duckdb::Connection, database: &str) -> String {
+        conn.query_row(
+            "SELECT tags['storage_version']::VARCHAR FROM duckdb_databases() \
+             WHERE database_name = ?",
+            duckdb::params![database],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()))
+    }
+
+    /// A file recorded under a newer schema version is refused before any
+    /// statement changes it: the versions it recorded stay, and a table
+    /// this binary would create is not created.
+    #[test]
+    fn a_file_from_a_newer_quack_is_refused_and_left_as_it_was() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        let newer = WORKSPACE_SCHEMA_VERSION.saturating_add(1);
+        {
+            let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+            db.execute_statement("DROP TABLE _quack_session_summaries")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            db.set_meta(MetaKey::SchemaVersion, &newer.to_string())
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            db.set_meta(MetaKey::WrittenByQuack, "9.9.9")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+
+        let Err(refused) = WorkspaceDb::open(&config, "ws") else {
+            fail("a newer file opened")
+        };
+        let Error::WorkspaceTooNew {
+            recorded,
+            supported,
+            written_by,
+            ..
+        } = &refused
+        else {
+            fail(&refused.to_string())
+        };
+        assert_eq!((*recorded, *supported), (newer, WORKSPACE_SCHEMA_VERSION));
+        assert_eq!(written_by, &WrittenBy(Some(String::from("9.9.9"))));
+        let message = refused.to_string();
+        assert!(
+            message.contains("written by quack 9.9.9; this quack"),
+            "{message}"
+        );
+        assert!(message.contains("run quack 9.9.9 or newer"), "{message}");
+
+        let conn = duckdb::Connection::open(config.workspace_db_path("ws"))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let recorded =
+            |key| WorkspaceDb::recorded(&conn, key).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(recorded(MetaKey::SchemaVersion), Some(newer.to_string()));
+        assert_eq!(
+            recorded(MetaKey::WrittenByQuack),
+            Some(String::from("9.9.9"))
+        );
+        let recreated: bool = conn
+            .query_row(
+                "SELECT count(*) > 0 FROM duckdb_tables() \
+                 WHERE table_name = '_quack_session_summaries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(!recreated, "the refusal ran table definitions");
+    }
+
+    /// A file from before the writer was recorded names no version to run.
+    #[test]
+    fn a_newer_file_with_no_recorded_writer_asks_for_a_newer_quack() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        {
+            let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+            db.set_meta(MetaKey::SchemaVersion, "99")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            db.delete_meta(MetaKey::WrittenByQuack)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        let Err(refused) = WorkspaceDb::open(&config, "ws") else {
+            fail("a newer file opened")
+        };
+        let message = refused.to_string();
+        assert!(message.contains("written by a newer quack;"), "{message}");
+        assert!(message.contains("run a newer quack"), "{message}");
+    }
+
+    /// A schema version that is not a number says nothing about the
+    /// file's schema, so the file is refused before any statement changes
+    /// it, not read as version 0.
+    #[test]
+    fn a_schema_version_that_is_not_a_number_is_refused_and_left_as_it_was() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        {
+            let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+            db.execute_statement("DROP TABLE _quack_session_summaries")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            db.set_meta(MetaKey::SchemaVersion, "eleven")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        let Err(refused) = WorkspaceDb::open(&config, "ws") else {
+            fail("a file with an unreadable schema version opened")
+        };
+        assert!(
+            matches!(
+                &refused,
+                Error::WorkspaceSchemaUnreadable { recorded, .. } if recorded == "eleven"
+            ),
+            "{refused}"
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains("records schema version 'eleven', which is not a number"),
+            "{refused}"
+        );
+        let conn = duckdb::Connection::open(config.workspace_db_path("ws"))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let recreated: bool = conn
+            .query_row(
+                "SELECT count(*) > 0 FROM duckdb_tables() \
+                 WHERE table_name = '_quack_session_summaries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(!recreated, "the refusal ran table definitions");
+    }
+
+    /// Every open records the quack and `DuckDB` versions that wrote the file.
+    #[test]
+    fn opening_a_workspace_records_its_writer() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        {
+            let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+            db.set_meta(MetaKey::WrittenByQuack, "0.0.1")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            db.set_meta(MetaKey::WrittenByDuckDb, "v0.0.1")
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        let meta = |key| db.meta(key).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            meta(MetaKey::WrittenByQuack).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            meta(MetaKey::WrittenByDuckDb),
+            Some(db.duckdb_version().unwrap_or_else(|e| fail(&e.to_string())))
+        );
+    }
+
+    /// The storage compatibility version quack names is the bundled
+    /// `DuckDB`'s own default, so naming it changes nothing: a new workspace
+    /// file gets the format a plain `DuckDB` open gives one, and a file
+    /// created in another format keeps it through an open that writes.
+    #[test]
+    fn naming_the_storage_compatibility_version_changes_no_file() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let config = config_in(dir.path());
+        let plain_path = dir.path().join("plain.duckdb");
+        let plain = duckdb::Connection::open(&plain_path).unwrap_or_else(|e| fail(&e.to_string()));
+        let default: String = plain
+            .query_row(
+                "SELECT current_setting('storage_compatibility_version')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            default, STORAGE_COMPATIBILITY_VERSION,
+            "the bundled DuckDB's default changed: decide the format of new workspace files \
+             and document the step in docs/migrations.md"
+        );
+
+        let new = WorkspaceDb::open(&config, "new").unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            storage_version(&new.conn, "data"),
+            storage_version(&plain, "plain")
+        );
+
+        // A file in the newest format this DuckDB writes, where a workspace
+        // file would be.
+        let newest_path = config.workspace_db_path("newest");
+        std::fs::create_dir_all(config.workspace_dir("newest"))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        plain
+            .execute_batch(&format!(
+                "ATTACH '{}' AS newest (STORAGE_VERSION 'latest'); \
+                 CREATE TABLE newest.t AS SELECT 1 AS a; CHECKPOINT newest;",
+                newest_path.display()
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let created_as = storage_version(&plain, "newest");
+        assert_ne!(created_as, storage_version(&plain, "plain"));
+        plain
+            .execute_batch("DETACH newest")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+
+        let opened = WorkspaceDb::open(&config, "newest").unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(storage_version(&opened.conn, "data"), created_as);
+        drop(opened);
+        let reopened =
+            duckdb::Connection::open(&newest_path).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(storage_version(&reopened, "data"), created_as);
     }
 
     /// Version 7 added joined identifier terms, so a workspace still

@@ -1,7 +1,8 @@
 //! The one yes/no prompt the CLI puts before work that spends model calls
 //! or changes the workspace. A terminal answers it; anything else is a no,
 //! so a pipe or a script never approves spending by accident — `--yes`
-//! does that explicitly.
+//! does that explicitly. Work that drops data asks more: only its own
+//! `--yes` or a yes typed at the prompt goes ahead.
 
 use std::io::{BufRead, IsTerminal, Write};
 
@@ -53,6 +54,29 @@ impl Confirm {
     }
 }
 
+impl Confirm {
+    /// Ask before dropping data. Only `yes`, the command's own `--yes`,
+    /// skips the question: a terminal-session job's `Assume` covers
+    /// spending, not deletion. With nobody to ask, the command fails with
+    /// the question, so a script cannot take silence for work done.
+    pub(crate) fn ask_to_drop(
+        self,
+        yes: bool,
+        out: &mut impl Write,
+        question: &str,
+    ) -> Result<bool> {
+        if yes {
+            return Ok(true);
+        }
+        if self == Self::Assume || !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "{question} Nobody to ask here, so nothing was dropped; --yes goes ahead."
+            );
+        }
+        self.ask(out, question, Some("--yes"))
+    }
+}
+
 fn is_yes(answer: &str) -> bool {
     let answer = answer.trim();
     answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
@@ -84,5 +108,25 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(Confirm::Ask.or_yes(false), Confirm::Ask);
         assert_eq!(Confirm::Assume.or_yes(false), Confirm::Assume);
+    }
+
+    #[test]
+    fn dropping_needs_its_own_yes_where_nobody_can_be_asked() {
+        let mut out = Vec::new();
+        assert!(
+            Confirm::Assume
+                .ask_to_drop(true, &mut out, "Drop them?")
+                .is_ok_and(|yes| yes)
+        );
+        let refused = Confirm::Assume
+            .ask_to_drop(false, &mut out, "Drop them?")
+            .map_err(|e| e.to_string());
+        assert_eq!(
+            refused,
+            Err(String::from(
+                "Drop them? Nobody to ask here, so nothing was dropped; --yes goes ahead."
+            ))
+        );
+        assert!(out.is_empty());
     }
 }

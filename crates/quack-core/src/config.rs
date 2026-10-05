@@ -9,8 +9,10 @@ use std::time::Duration;
 use crate::embedding::Dimension;
 use crate::error::{Error, Result};
 use crate::graph::GraphOptions;
+use crate::ingestion::budget::DecompressionBudget;
 use crate::ontology::documents::DocumentEvidenceOptions;
 use crate::ontology::induction::TableEvidenceOptions;
+use crate::storage::control::WorkspaceName;
 use crate::text::Tokens;
 
 pub mod bedrock;
@@ -51,7 +53,7 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct GeneralConfig {
     pub data_dir: PathBuf,
-    pub default_workspace: String,
+    pub default_workspace: WorkspaceName,
     /// `PROVIDER/MODEL` used for chat and tool calling. Override: `QUACK_MODEL`.
     pub chat_model: Option<ModelSpec>,
 }
@@ -115,7 +117,7 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
-            default_workspace: String::from("default"),
+            default_workspace: WorkspaceName::default(),
             chat_model: None,
         }
     }
@@ -986,6 +988,18 @@ pub struct IngestionConfig {
     pub tokenizer_encoding: String,
     /// Largest upload the server accepts, in megabytes.
     pub upload_max_mb: u32,
+    /// Megabytes a compressed file (DOCX, PPTX, a zipped workbook) may
+    /// inflate to while it is parsed. The upload limit counts compressed
+    /// bytes only.
+    pub max_decompressed_mb: u64,
+}
+
+impl IngestionConfig {
+    /// What one file's archive parts may inflate to, together.
+    #[must_use]
+    pub const fn decompression_budget(&self) -> DecompressionBudget {
+        DecompressionBudget::megabytes(self.max_decompressed_mb)
+    }
 }
 
 impl Default for IngestionConfig {
@@ -997,6 +1011,9 @@ impl Default for IngestionConfig {
             embedding_concurrency: 2,
             tokenizer_encoding: String::from("cl100k_base"),
             upload_max_mb: 512,
+            // Twice the upload limit: a package of stored media at that
+            // limit still has as much again for its XML.
+            max_decompressed_mb: 1024,
         }
     }
 }
@@ -1169,6 +1186,9 @@ pub struct ServerConfig {
     /// How long a streamed turn waits for a person to decide a write the
     /// agent wants to run before it goes on without it.
     pub permission_timeout_seconds: u32,
+    /// How long a stopping server waits for its jobs to end and its
+    /// requests to finish before it exits anyway.
+    pub shutdown_grace_seconds: u32,
     /// Sign-in through the organization's `OpenID` Connect issuer, beside
     /// password login.
     pub oidc: Option<OidcConfig>,
@@ -1339,6 +1359,7 @@ impl Default for ServerConfig {
             session_idle_minutes: 120,
             secure_cookies: SecureCookies::Auto,
             permission_timeout_seconds: 300,
+            shutdown_grace_seconds: 20,
             oidc: None,
         }
     }
@@ -1355,6 +1376,12 @@ impl ServerConfig {
     #[must_use]
     pub fn permission_timeout(&self) -> Duration {
         Duration::from_secs(u64::from(self.permission_timeout_seconds.max(1)))
+    }
+
+    /// How long a stopping server waits for jobs and requests to end.
+    #[must_use]
+    pub fn shutdown_grace(&self) -> Duration {
+        Duration::from_secs(u64::from(self.shutdown_grace_seconds))
     }
 
     /// How long a session may sit unused before it is dropped.
@@ -1972,10 +1999,27 @@ always_retrieve = true
 rerank = "model"
 "#;
 
+    /// `default_workspace` takes only a name a workspace may have.
+    #[test]
+    fn a_default_workspace_no_workspace_may_take_is_refused() {
+        let named = |name: &str| {
+            toml::from_str::<Config>(&format!("[general]\ndefault_workspace = \"{name}\"\n"))
+        };
+        assert!(named(" sales ").is_ok_and(|c| c.general.default_workspace.as_str() == "sales"));
+        let refused = named("a.b/c")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            refused.contains(&Error::InvalidWorkspaceName.to_string()),
+            "{refused}"
+        );
+    }
+
     #[test]
     fn default_config_values() {
         let config = Config::default();
-        assert_eq!(config.general.default_workspace, "default");
+        assert_eq!(config.general.default_workspace.as_str(), "default");
         assert!(config.general.chat_model.is_none());
         assert_eq!(config.ingestion.chunk_size_tokens, 512);
         assert_eq!(config.retrieval.top_k, 8);
@@ -1989,6 +2033,7 @@ rerank = "model"
         assert_eq!(config.analysis.max_turns, 15);
         assert_eq!(config.analysis.history_token_budget, Tokens::new(32_000));
         assert_eq!(config.ingestion.upload_max_mb, 512);
+        assert_eq!(config.ingestion.max_decompressed_mb, 1024);
         assert_eq!(config.ingestion.embedding_concurrency, 2);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert!(!config.server.local);

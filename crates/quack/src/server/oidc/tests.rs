@@ -27,6 +27,7 @@ use quack_core::llm::oauth::{CachedToken, KeySource, TokenManager};
 use quack_core::oidc::{OidcSubject, Origin};
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, SealedOwner, UserKind,
+    WorkspaceName,
 };
 use quack_core::vault::Vault;
 use quack_core::web_sessions::WebSessions;
@@ -1075,7 +1076,7 @@ async fn an_mcp_client_with_the_issuers_token_opens_a_session_once_a_member() {
     let ws = h
         .app
         .control
-        .create_workspace("w", None, setup_audit())
+        .create_workspace(&WorkspaceName::default(), None, setup_audit())
         .await
         .unwrap_or_else(|e| fail(&e.to_string()))
         .id;
@@ -1204,7 +1205,7 @@ impl Harness {
             .route("/probe", get(probe))
             .route("/probe-job", get(probe_job))
             .route("/probe-key", get(probe_key))
-            .layer(axum::middleware::from_fn(server::acting_slot))
+            .layer(axum::middleware::from_fn(server::request_slots))
             .with_state(Arc::clone(&self.app));
         let request = Request::get(uri)
             .header(credential.0, credential.1)

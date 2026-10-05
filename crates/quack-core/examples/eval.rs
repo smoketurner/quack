@@ -39,6 +39,7 @@ use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
 use quack_core::ontology::store::{self as ontology_store, Revision};
 use quack_core::progress::RunControl;
+use quack_core::storage::control::WorkspaceName;
 use quack_core::storage::workspace::{ChunkScope, ChunkSearchResult, HybridLimits, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use rig::ProviderError;
@@ -142,7 +143,7 @@ fn eval_config(data_dir: &Path) -> Result<Config> {
     Ok(Config {
         general: GeneralConfig {
             data_dir: data_dir.to_path_buf(),
-            default_workspace: String::from("eval"),
+            default_workspace: WorkspaceName::default(),
             chat_model: None,
         },
         providers,

@@ -63,7 +63,13 @@ pub(crate) async fn run_import(
         .kind()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let db = app.workspace_db(&access.workspace.id).await?;
-    let embeddings = Embeddings::from_config(&app.config).await?;
+    let embeddings = access
+        .model(
+            app,
+            AuditAction::Import,
+            Embeddings::from_config(&app.config).await,
+        )
+        .await?;
     // `--local` is the owner at a keyboard; anyone else is held to
     // `[import]`: no files from the server's disk, no private hosts.
     let policy = if app.mode == ServeMode::Local {

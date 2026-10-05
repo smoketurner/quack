@@ -18,7 +18,9 @@ section 17 for where the code still lags. The chosen stack:
 - **Workspace** of crates under `crates/` (edition 2024, resolver 3, MSRV 1.99.0)
 - **DuckDB** (via `duckdb-rs`), one file per workspace, holding everything classified
   about that workspace: user tables, chunks, graph, ontology, context, sessions, audit
-  detail (all internal tables prefixed `_quack_`)
+  detail (all internal tables prefixed `_quack_`); the file records its schema version and
+  the quack and DuckDB versions that wrote it, and a quack older than the file refuses it
+  untouched (`Error::WorkspaceTooNew`, `docs/migrations.md`)
 - **SQLite** (via `sqlx`) for `control.db` in server mode: users, workspaces, membership,
   tokens, and the mandatory append-only access audit log; nothing workspace-revealing
 - **sea-query** for type-safe SQL generation against `control.db`; bound parameters for
@@ -88,14 +90,16 @@ data-layer, crypto, or dependency change:
 ```bash
 cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # SQL, no agent
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
+cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use
 cargo run --bin quack -- ingest sales.csv -w ws                                # file -> table(s) or chunks
 #   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX
 cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
+cargo run --bin quack -- ontology rename class|relation OLD NEW                   # a new id as a new version; the graph's nodes and edges move with it
 cargo run --bin quack -- ontology propose [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
-cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] | revalidate | review | merges | merge ID..
+cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] | revalidate [-y] | review | merges | merge ID..
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
 cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
@@ -131,13 +135,30 @@ Background work is asynchronous everywhere (design doc 4.1): `quack_core::jobs::
 runs submitted jobs with optional lanes that keep submission order (a chat session is a
 serial lane, so a follow-up waits for the answer before it; a workspace's uploads, graph
 extraction, and document pass have their own), cancel tokens, per-chunk progress, and a
-broadcast of `JobInfo` snapshots every interface reports from. There is no job pool:
+broadcast of `JobInfo` snapshots every interface reports from. `JobQueue::shutdown(grace)` is
+the one way a process stops its jobs: a later `submit` is recorded as cancelled and never runs,
+queued and running jobs are cancelled, and it waits up to the grace for them and for what
+`when_ended` records. The terminal's quit calls it; `quack serve` calls it on SIGTERM or Ctrl-C
+beside the HTTP drain under `[server].shutdown_grace_seconds` (20), after cancelling
+`AppState::stopping` (which ends `jobs/stream` and the MCP event streams, and cancels an MCP
+`query` turn, which runs under a child of it), and then
+`AppState::close` drops the workspace handles so each writer checkpoints. There is no job pool:
 resources are limited where they are used. Every rig HTTP client sends through
 `llm::LimitedHttp` (rig's reqwest transport, plus the provider's `headers`), which holds
 one permit of the process-wide gate for the provider and the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
 for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
 requests (`TurnRequest::run`, `Embedder::embed_interactive`, via the `quack_core::priority` task-local) before
-background ones. Every outbound HTTP client takes its proxy from `quack_core::proxy::Proxies`
+background ones. The same gate enforces a workspace's `allowed_providers`: `llm::egress::Egress`
+is a task-local scope (`Workspace(AllowedProviders)`, or `NoWorkspace` for `quack doctor`'s probes),
+entered by `Access::resolve` in the server, `OpenedWorkspace` on the command line, and
+`McpServer::as_caller` per tool call, and carried into every job by `JobQueue::submit`.
+`Egress::permit` is the one check, called when a model client is built from a `ModelRef` (a typed
+`Error::ProviderRefused` holding the `egress::Refusal`, and `Error::is_provider_refusal` is what
+the audit outcome and a turn's failure kind ask: 403 and a `denied` audit row through
+`Access::model`, exit 1 from the CLI) and again by `ProviderGates::permit` for every request,
+Bedrock's SDK requests included. A request with no scope is `Error::ModelRequestUnscoped`, never an
+allow, so a test that makes a model request enters a scope first. Under a restricted list an Ollama
+model whose id ends in `-cloud` or `:cloud` is refused. Every outbound HTTP client takes its proxy from `quack_core::proxy::Proxies`
 (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, read once; loopback and `169.254.0.0/16`
 are never proxied): reqwest clients start from `Proxies::client` (`.clippy.toml` disallows
 `reqwest::Client::builder` and `new`), and the AWS SDK connector takes `Proxies::aws`
@@ -180,7 +201,22 @@ retried with the real names (twice at most), and an empty reply is asked for onc
 workspace and its settings; a turn's recorder, write policy, refusal flag, and chart and graph
 results are one `analysis::tools::Turn`, handed to every call as a runtime scope of rig's
 `ToolContext` (`.tool_context(turn.context())` on the run). `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
-prompts y/n/a and `-p` refuses and exits 3. Provider construction lives in `quack_core::llm`; interfaces never build rig
+prompts y/n/a and `-p` refuses and exits 3. Once a turn has retrieved document or graph text
+(`search_documents`, `search_graph`, `find_path`, `always_retrieve`, a `describe_class` that names
+example entities; `Turn::read_documents`),
+no write of that turn runs unasked, whatever was allowed: `WritePolicy::decide` asks where the
+interface answers permission events (`Allow(Approver::Person)`: the terminal, a streamed turn)
+and refuses where it cannot (`Allow(Approver::Nobody)`: print mode, non-streamed REST, MCP), and
+the reason (`policy::Hold`) goes on the prompt, the `permission_required` event's `reason` (with
+`Hold::notice`, the sentence the card shows, as `notice`), and
+the refused step. Pinned documents, the workspace context, table rows, and the listing tools do
+not count, so a pinned document or a table cell can still dictate a write under allow-write.
+Chunk bodies, graph source excerpts, and pinned text reach the model inside `text::Fenced`
+markers, whose code is a digest of the enclosed text (so the text cannot close its own block),
+after a fixed sentence that it is data; an `always_retrieve` chunk is fenced too, as the `content`
+string of the JSON object rig prints, with no sentence before it; the system prompt's trust
+paragraph precedes the permission rules; filenames, titles, headings, labels, and graph property
+values render through `text::OneLine`. Provider construction lives in `quack_core::llm`; interfaces never build rig
 clients themselves. Every chat model is wrapped in `llm::sampling::Sampled`: only Ollama's API
 gets a `temperature`, Claude gets `max_tokens` 64,000, and `[analysis].effort` /
 `background_effort` go out as each API's field (an unrecognized model id gets it on Chat
@@ -232,6 +268,12 @@ It lives in the `_quack_ontology_*` tables; `ontology::store::save` validates, c
 mapped tables and columns against the workspace, and writes a new version with a JSON
 snapshot, `since_version` carried over for items that already existed. JSON is the only
 interchange form (export, import, `PUT /ontology`); a file is never the source of truth.
+A class or relation id changes only through `ontology::store::rename` (`quack ontology rename`,
+`POST .../ontology/rename`, the ontology page's Rename form): `IdRenames` on the save's
+`Revision` moves, in the save's transaction, the ontology's own references, `since_version`,
+undecided candidates, and the graph's `class_id` and `relation_id`; an id that already exists
+is refused, and earlier snapshots keep the old id. An import that swaps one id for another is
+a removal plus an addition; `Ontology::diff` does not guess renames.
 The system prompt carries a compact rendering when an ontology exists
 (`Ontology::render_capped`, 30 items per section with the rest counted; extraction still
 gets `render_for_prompt` in full, since the model may only answer with ids it was shown),
@@ -269,7 +311,13 @@ trims and defaults the caller's fields, `run` checks class and relation ids agai
 ontology and resolves the entry points, and an unresolved path end is an `UnknownEntity`
 naming the closest labels. `graph::store::status` reports size, `provisional` (the newest ontology version
 was auto-accepted), `stale` (`graph_built_with_ontology_version` lags), pending merges,
-and drift; `revalidate` drops what the current ontology no longer allows. The agent
+and drift; `revalidate` drops what the current ontology no longer allows, and
+`Revalidation::preview` counts that first (totals, per class id, per relation id) so
+`quack graph revalidate` asks before dropping (`-y` skips; with nobody to ask it fails,
+`Confirm::ask_to_drop`), and the graph page and `POST .../graph/revalidate` send back the
+preview's totals (`api::graph::DropApproval`; 409 with the current totals when they are absent or
+stale). `GET .../graph/revalidate` serves the preview, and the run deletes what the preview
+counted, since both start from `Revalidation::find`. The agent
 registers `search_graph` and `find_path` only when the graph has nodes, query mode drops
 provisional results, and every response shape carries the turn's `graph` results. Their
 rendering (`Display for GraphResult` in `graph::traverse`, shared with `quack graph` and the terminal)
@@ -310,6 +358,12 @@ entity that exists only in mapped table rows says so instead of returning nothin
 like the graph tools themselves. Ollama embedding requests go through `llm::OllamaEmbedder`,
 not rig's client, so they carry `keep_alive` and a chunk-sized `num_ctx`.
 
+Every command resolves its workspace through `ControlPlane::workspace_or_default`: `-w NAME`
+must name a workspace that exists (`Error::NoWorkspaceNamed`, exit 2, nothing created), and
+with no `-w` the `[general].default_workspace` is created, audited, on first use. A new
+workspace's name is a `storage::control::WorkspaceName` (trimmed, non-empty, no `/`, `\`, or
+`.`), the one rule `quack workspace create`, the API, the web console, and the config key share.
+
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with
 `Scope`s, and the append-only access `audit_log` (`AuditEntry`, `query_audit`); a change to
@@ -319,7 +373,9 @@ half of each audit row is `storage::audit` (`_quack_audit`) inside the workspace
 same UUID v7. Ingestion is `register_document` (status `queued`, or `Registration::Duplicate` when the
 bytes' SHA-256 already belong to a non-failed document whose table or chunks still exist;
 `Error::TableTaken` when the file's table belongs to another live document) plus `Processing::run`
-(`processing` to `ready` or `error`, recording `chunk_count` and the parsed title);
+(`processing` to `ready` or `error`, recording `chunk_count`, the parsed title, and a PDF's
+`parser::PageCounts`: pages in the file, pages whose extraction failed, pages without text;
+`PageCounts::note` is the one wording every interface shows, as `3 of 40 pages unreadable`);
 `ingest_file` does both and takes a `NewFile` (name, bytes, `DocumentSource`, optional
 title and uploader, and its `RunControl`).
 

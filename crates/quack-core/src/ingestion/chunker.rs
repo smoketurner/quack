@@ -472,7 +472,7 @@ mod section_tests {
                         title: None,
                         sections: sections.clone(),
                         flow: Flow::Sectioned,
-                        pages_skipped: 0,
+                        pages: None,
                     },
                     Some("file"),
                 )
@@ -488,7 +488,7 @@ mod section_tests {
                         title: None,
                         sections,
                         flow: Flow::Continuous,
-                        pages_skipped: 0,
+                        pages: None,
                     },
                     Some("file"),
                 )

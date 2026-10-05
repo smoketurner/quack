@@ -49,11 +49,15 @@ signed-in user and reads no workspace, so it writes no audit row.
   the newest `audit_log` row naming it, allowed or denied; "never used" for a workspace
   the CLI made and nothing has opened through the server), one column each.
 - **`ontology.html`** shows the class tree, relations, properties, and mappings; the JSON
-  editor; the version list with the diff to the previous version; the propose form; and the
-  paged review queue with bulk accept and reject.
+  editor; the version list with the diff to the previous version; the propose form; the
+  Rename form, which gives a class or relation a new id and moves the graph's nodes and
+  edges with it; and the paged review queue with bulk accept and reject.
 - **`graph.html`** shows status banners (provisional, stale, missing mapped tables,
   drift), the search and path forms, the ECharts result with a node inspector, the merge
-  queue, and the extract, revalidate, and review buttons.
+  queue, and the extract, revalidate, and review buttons. The stale banner lists what a
+  revalidation would drop (totals, per class id, per relation id). Its button names those
+  totals and posts them, and the server drops only when they still match what it counts.
+  When the preview cannot be counted, the banner says why and offers no drop.
 - **Dark only.** `styles/input.css` sets `color-scheme: dark`, so native controls and the
   file picker follow; panels are `slate-900` on a `slate-950` page and primary buttons are
   `blue-600`. Charts and the graph use ECharts' built-in `dark` theme.
@@ -91,6 +95,10 @@ signed-in user and reads no workspace, so it writes no audit row.
   Without a click, rows come back in the statement's own order. Anything else (a write,
   several statements) runs as typed with plain headers. "Download CSV" is a `POST` of the
   same statement: SQL never travels in a URL, where request logs and proxies would keep it.
+  The file holds the rows the grid holds, at most `[analysis].max_query_rows`. When that cap
+  cut the result, the button reads "Download CSV (first 250 of 1000 rows)" and the file is
+  named `query-first-250-of-1000.csv`; a complete result downloads as `query.csv`. The file
+  itself carries no marker row, which would break a CSV parser.
 - **Accessibility.** Every page starts with a "Skip to content" link to `<main id="main">`;
   the workspace tabs and the admin links are named `<nav>` landmarks, and the current tab or
   chat session carries `aria-current="page"`. A control with only a placeholder has an
@@ -143,7 +151,10 @@ row is processing (marked `data-pending`).
   parses the SSE events, and renders the steps block, the answer, citations as links to the
   document list, and the chart spec as an ECharts option. A `permission_required` event
   becomes a card with the statement, Run it, Don't run it, and Allow for this turn, posted to
-  `.../sessions/{sid}/permissions/{request}`, and the time the turn stops waiting. On page load it renders stored
+  `.../sessions/{sid}/permissions/{request}`, and the time the turn stops waiting. When the event carries a `notice`
+  (its `reason` is `read_documents`: the turn read document text, so the write is asked for even
+  under "Run changes without asking"), the card shows that sentence; the text lives in
+  `policy::Hold::notice` only. On page load it renders stored
   charts and draws the graph page's result as an ECharts force graph (nodes coloured by
   class; a click scrolls to the inspector entry).
 

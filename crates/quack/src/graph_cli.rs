@@ -10,6 +10,7 @@ use quack_core::config::Config;
 use quack_core::extraction::ExtractionRun;
 use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::query::{GraphQuery, PathQuery, UnknownEntity};
+use quack_core::graph::store::Revalidation;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{ExtractSource, extract, resolve, store as graph_store, tables};
 use quack_core::llm::{self, Embeddings};
@@ -38,8 +39,15 @@ pub(crate) enum GraphAction {
     /// chunk through the chat model (one call per chunk; asks first)
     Extract(ExtractArgs),
     /// Drop nodes and edges the current ontology no longer allows (no
-    /// model calls) and record the version the graph now matches
-    Revalidate,
+    /// model calls) and record the version the graph now matches; says
+    /// what would go and asks first
+    Revalidate {
+        /// Do not ask before dropping
+        // Not the id `yes`: the terminal session hides that flag as one it
+        // supplies itself, and this one only the person may give.
+        #[arg(id = "drop", long = "yes", short = 'y')]
+        yes: bool,
+    },
     /// Mark a provisional graph reviewed
     Review,
     /// List pending merge proposals
@@ -149,18 +157,7 @@ pub(crate) async fn run(
             })
             .await?;
         }
-        GraphAction::Revalidate => {
-            db.render(out, |db, out| {
-                let outcome = graph_store::revalidate(db)?;
-                writeln!(
-                    out,
-                    "Dropped {} nodes and {} edges; the graph now matches ontology version {}.",
-                    outcome.dropped_nodes, outcome.dropped_edges, outcome.version
-                )?;
-                Ok(())
-            })
-            .await?;
-        }
+        GraphAction::Revalidate { yes } => run_revalidate(db, out, yes, confirm).await?,
         GraphAction::Review => {
             db.render(out, |db, out| {
                 graph_store::mark_reviewed(db)?;
@@ -274,6 +271,37 @@ async fn run_path(
     format.write(out, &result)
 }
 
+/// `quack graph revalidate`: with something to drop, say what and ask.
+async fn run_revalidate(
+    db: &Writer,
+    out: &mut impl Write,
+    yes: bool,
+    confirm: Confirm,
+) -> Result<()> {
+    let preview = db.run(Revalidation::preview).await?;
+    if !preview.is_empty() {
+        let question = format!(
+            "{preview}If a class or relation was renamed, restore the earlier ontology version and \
+             use `quack ontology rename`, which moves its nodes and edges. Dropped document \
+             nodes come back only with `quack graph extract --reset`.\nDrop them?"
+        );
+        if !confirm.ask_to_drop(yes, out, &question)? {
+            writeln!(out, "Nothing dropped; the graph is still stale.")?;
+            return Ok(());
+        }
+    }
+    db.render(out, |db, out| {
+        let outcome = graph_store::revalidate(db)?;
+        writeln!(
+            out,
+            "Dropped {} nodes and {} edges; the graph now matches ontology version {}.",
+            outcome.dropped_nodes, outcome.dropped_edges, outcome.version
+        )?;
+        Ok(())
+    })
+    .await
+}
+
 async fn run_extract(
     config: &Config,
     db: &Writer,
@@ -380,4 +408,107 @@ async fn run_extract(
         .await?;
     write!(out, "{}", db.run(graph_store::status).await?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use quack_core::embedding::Dimension;
+    use quack_core::graph::store::NewNode;
+    use quack_core::graph::{Properties, Standing};
+    use quack_core::ids::ClassId;
+    use quack_core::ontology::Ontology;
+    use quack_core::ontology::store::Revision;
+
+    use super::*;
+
+    #[expect(clippy::panic, reason = "test failure path")]
+    fn fail(msg: &str) -> ! {
+        panic!("{msg}")
+    }
+
+    /// A graph of one person and one place, built with version 1, under
+    /// an ontology whose version 2 no longer defines `place`.
+    fn stale_graph() -> Writer {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        let mut ontology = Ontology::builtin_default();
+        let built = ontology_store::save(&db, &ontology, Revision::reviewed(None, None))
+            .and_then(|stored| stored.saved_version())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        for (label, class) in [("Ada", "person"), ("Nairobi", "place")] {
+            graph_store::upsert_node(
+                &db,
+                &NewNode {
+                    label: String::from(label),
+                    class_id: ClassId::from(class),
+                    properties: Properties::default(),
+                    standing: Standing::Reviewed,
+                },
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        graph_store::set_built_with(&db, built).unwrap_or_else(|e| fail(&e.to_string()));
+        ontology.classes.retain(|c| c.id != "place");
+        ontology
+            .relations
+            .retain(|r| r.domain != "place" && r.range != "place");
+        ontology_store::save(&db, &ontology, Revision::reviewed(None, None))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string()))
+    }
+
+    async fn revalidate(db: &Writer, yes: bool) -> Result<String> {
+        let mut out = Vec::new();
+        run(
+            &Config::default(),
+            db,
+            GraphAction::Revalidate { yes },
+            Confirm::Assume,
+            &mut out,
+            RunControl::unobserved(),
+        )
+        .await?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// Where nobody can be asked, a revalidation that would drop
+    /// something says what and stops; `--yes` drops it; and with nothing
+    /// to drop it runs unasked.
+    #[tokio::test]
+    async fn revalidate_says_what_it_drops_and_needs_yes_to_drop_it() {
+        let db = stale_graph();
+        let refused = revalidate(&db, false)
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        for part in [
+            "Revalidating against ontology version 2 drops 1 nodes and 0 edges:",
+            "class place, which the ontology no longer defines: 1 nodes",
+            "`quack ontology rename`",
+            "Drop them? Nobody to ask here, so nothing was dropped; --yes goes ahead.",
+        ] {
+            assert!(refused.contains(part), "{part:?} missing from {refused}");
+        }
+        let status = db
+            .run(graph_store::status)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(status.stale && status.nodes == 2, "{status}");
+
+        let dropped = revalidate(&db, true)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            dropped,
+            "Dropped 1 nodes and 0 edges; the graph now matches ontology version 2.\n"
+        );
+        let again = revalidate(&db, false)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            again,
+            "Dropped 0 nodes and 0 edges; the graph now matches ontology version 2.\n"
+        );
+    }
 }

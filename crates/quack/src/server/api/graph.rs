@@ -1,6 +1,6 @@
 //! The knowledge graph over REST: search and path (read), status, extract
-//! (202, background, cost in the response), revalidate, review, and the
-//! merge queue. Design doc 6.4 and 11.2.
+//! (202, background, cost in the response), revalidate with its preview,
+//! review, and the merge queue. Design doc 6.4 and 11.2.
 
 use std::sync::Arc;
 
@@ -57,10 +57,16 @@ pub(crate) async fn search(
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let options = app.config.graph.options();
     let detail = serde_json::to_value(&query)?;
+    let model = access
+        .model(
+            &app,
+            AuditAction::Graph,
+            Embeddings::from_config(&app.config).await,
+        )
+        .await?;
     // Run, audit the outcome, then propagate, so a failure after
     // authorization is recorded as an error rather than dropped.
     let result: ApiResult<_> = async {
-        let model = Embeddings::from_config(&app.config).await?;
         let embedding = query.embedding(model.as_ref()).await?;
         app.read(&id, move |db| query.run(db, embedding.as_ref(), &options))
             .await
@@ -97,9 +103,15 @@ pub(crate) async fn path(
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let options = app.config.graph.options();
     let detail = serde_json::to_value(&query)?;
+    let model = access
+        .model(
+            &app,
+            AuditAction::Graph,
+            Embeddings::from_config(&app.config).await,
+        )
+        .await?;
     // Run, audit the outcome, then propagate (see `search`).
     let result: ApiResult<_> = async {
-        let model = Embeddings::from_config(&app.config).await?;
         let ends = query.embeddings(model.as_ref()).await?;
         app.read(&id, move |db| query.run(db, &ends, &options))
             .await
@@ -230,7 +242,13 @@ impl Access {
         let ontology = ontology.ok_or_else(|| ApiError::bad_request("no ontology yet"))?;
         let version = ontology.saved_version()?;
         let options = app.config.graph.options();
-        let embeddings = Embeddings::from_config(&app.config).await?;
+        let embeddings = access
+            .model(
+                app,
+                AuditAction::GraphExtract,
+                Embeddings::from_config(&app.config).await,
+            )
+            .await?;
         if reset {
             with_db(Arc::clone(&db), graph_store::clear).await?;
         }
@@ -265,7 +283,13 @@ impl Access {
             });
         }
         // Fail now, not in the background, when no model can be built.
-        let extractor = llm::graph_extractor(&app.config, &ontology).await?;
+        let extractor = access
+            .model(
+                app,
+                AuditAction::GraphExtract,
+                llm::graph_extractor(&app.config, &ontology).await,
+            )
+            .await?;
         let cost = ExtractionCost {
             chunks: chunks.len(),
             model: app.config.chat_model_ref()?.to_string(),
@@ -415,15 +439,65 @@ impl DocumentJob {
     }
 }
 
+/// What a revalidation would drop, per class and relation id the
+/// ontology no longer defines; nothing changes.
+pub(crate) async fn revalidation_preview(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+) -> ApiResult<Json<Revalidation>> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access
+        .audit_read(&app, AuditAction::List, "graph_revalidation")
+        .await?;
+    Ok(Json(app.read(&id, Revalidation::preview).await?))
+}
+
+/// Drop what the preview counted. The body carries the preview's totals;
+/// with none, or with totals the graph no longer matches, nothing is
+/// dropped and the answer is 409 with the current totals.
 pub(crate) async fn revalidate(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
+    approval: Option<Json<DropApproval>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let approval = approval.map(|Json(approval)| approval).unwrap_or_default();
     Ok(Json(serde_json::to_value(
-        access.revalidate_graph(&app).await?,
+        access.revalidate_graph(&app, approval).await?,
     )?))
+}
+
+/// The totals the caller saw in the preview and agreed to drop: the API's
+/// body and the graph page's form. Totals left out are zero, which
+/// approves only a revalidation that drops nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct DropApproval {
+    #[serde(default)]
+    pub dropped_nodes: u64,
+    #[serde(default)]
+    pub dropped_edges: u64,
+}
+
+impl DropApproval {
+    /// `None` when `preview` drops what was approved, else what to tell
+    /// the caller.
+    fn refusal(self, preview: &Revalidation) -> Option<String> {
+        let Self {
+            dropped_nodes,
+            dropped_edges,
+        } = self;
+        if (preview.dropped_nodes, preview.dropped_edges) == (dropped_nodes, dropped_edges) {
+            return None;
+        }
+        Some(format!(
+            "nothing dropped: revalidating now drops {} nodes and {} edges, not the \
+             {dropped_nodes} and {dropped_edges} confirmed; check the preview and confirm its \
+             totals",
+            preview.dropped_nodes, preview.dropped_edges
+        ))
+    }
 }
 
 pub(crate) async fn review(
@@ -469,12 +543,23 @@ pub(crate) async fn decide_merge(
 
 /// The graph writes the API and the web console share.
 impl Access {
-    /// Drop what the current ontology no longer allows.
-    pub(crate) async fn revalidate_graph(&self, app: &App) -> ApiResult<Revalidation> {
+    /// Drop what the current ontology no longer allows, when that is
+    /// what `approval` covers; 409 with the current totals when it is not.
+    pub(crate) async fn revalidate_graph(
+        &self,
+        app: &App,
+        approval: DropApproval,
+    ) -> ApiResult<Revalidation> {
         let db = app.workspace_db(&self.workspace.id).await?;
-        let outcome = with_db(db, graph_store::revalidate)
-            .await
-            .map_err(|e| ApiError::bad_request(e.message))?;
+        let outcome = with_db(db, move |db| {
+            if let Some(refusal) = approval.refusal(&Revalidation::preview(db)?) {
+                return Ok(Err(refusal));
+            }
+            graph_store::revalidate(db).map(Ok)
+        })
+        .await
+        .map_err(|e| ApiError::bad_request(e.message))?
+        .map_err(ApiError::conflict)?;
         self.audit(
             app,
             AuditAction::GraphRevalidate,

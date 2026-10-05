@@ -352,6 +352,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "embedding_concurrency",
             "tokenizer_encoding",
             "upload_max_mb",
+            "max_decompressed_mb",
         ],
     ),
     (
@@ -405,6 +406,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "session_idle_minutes",
             "secure_cookies",
             "permission_timeout_seconds",
+            "shutdown_grace_seconds",
         ],
     ),
     (
@@ -525,8 +527,8 @@ fn general(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     );
     s.text(
         "default_workspace",
-        &general.default_workspace,
-        &default.default_workspace,
+        general.default_workspace.as_str(),
+        default.default_workspace.as_str(),
         None,
     );
     let chat_model = general.chat_model.as_ref().map(ModelSpec::to_string);
@@ -671,6 +673,11 @@ fn ingestion(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) 
         "upload_max_mb",
         ingestion.upload_max_mb,
         default.upload_max_mb,
+    );
+    s.literal(
+        "max_decompressed_mb",
+        ingestion.max_decompressed_mb,
+        default.max_decompressed_mb,
     );
 }
 
@@ -838,6 +845,11 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "permission_timeout_seconds",
         server.permission_timeout_seconds,
         default.permission_timeout_seconds,
+    );
+    s.literal(
+        "shutdown_grace_seconds",
+        server.shutdown_grace_seconds,
+        default.shutdown_grace_seconds,
     );
     let Some(oidc) = &server.oidc else {
         return;

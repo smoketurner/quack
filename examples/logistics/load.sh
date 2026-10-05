@@ -59,6 +59,11 @@ if [ ! -s "$cache/shipments.csv" ]; then
        { print }' "$cache/shipments-raw.csv" >"$cache/shipments.csv"
 fi
 
+# -w names a workspace that exists, so the first run creates it.
+if ! "$quack" workspace list --format json | grep -q "\"name\":\"$workspace\""; then
+  "$quack" workspace create "$workspace"
+fi
+
 present="$("$quack" docs -w "$workspace" --format json 2>/dev/null || true)"
 
 if [ "$reset" = 1 ] && [ -n "$present" ]; then

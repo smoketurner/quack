@@ -25,6 +25,7 @@ use crate::embedding::{Dimension, Input};
 use crate::extraction::Tally;
 use crate::ids::{ChunkId, ClassId, DocumentId, EdgeId, NodeId, RelationId};
 use crate::ontology::OntologyVersion;
+use crate::text::OneLine;
 
 /// Whether a graph write rests on a reviewed ontology, or on one that was
 /// auto-accepted and so is provisional until someone reviews it. Binds
@@ -52,7 +53,7 @@ pub struct Node {
 /// `label (class)`, how every listing names a node.
 impl fmt::Display for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({})", self.label, self.class_id)
+        write!(f, "{} ({})", OneLine(&self.label), self.class_id)
     }
 }
 
@@ -227,7 +228,7 @@ impl fmt::Display for Properties {
                 dropped = dropped.saturating_add(1);
                 continue;
             }
-            parts.push(format!("{key}: {value}"));
+            parts.push(format!("{}: {}", OneLine(key), OneLine(&value)));
         }
         if parts.is_empty() {
             return Ok(());

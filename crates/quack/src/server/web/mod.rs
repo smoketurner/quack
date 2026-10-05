@@ -53,10 +53,11 @@ use super::api::auth::LoginRequest;
 use super::api::context::ReplaceContext;
 use super::api::documents::{Enqueued, IncomingFile, UploadForm};
 use super::api::embeddings::RefreshStarted;
+use super::api::graph::DropApproval;
 use super::api::graph::ExtractionStarted;
 use super::api::import::ImportBody;
 use super::api::members::AddMember;
-use super::api::ontology::DecideRequest;
+use super::api::ontology::{DecideRequest, RenameRequest};
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
     documents as docs_api, graph as graph_api, import as import_api, workspaces as workspaces_api,
@@ -70,6 +71,7 @@ use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery};
 use quack_core::graph::resolve::MergeDecision;
+use quack_core::graph::store::Revalidation;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
     ExtractSource, GraphOptions, GraphResult, GraphStatus, Origin, resolve, store as graph_store,
@@ -803,6 +805,9 @@ struct GraphPage {
     drift: Vec<String>,
     has_ontology: bool,
     chunk_count: usize,
+    /// What revalidating a stale graph would drop, or why that could not
+    /// be counted.
+    revalidation: Option<Result<Revalidation, String>>,
     merges: Vec<resolve::MergeProposal>,
     query: GraphQueryView,
     result: Option<GraphResultView>,
@@ -900,6 +905,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/context", get(context_page).post(context_save))
         .route("/w/{id}/ontology", get(ontology_page).post(ontology_import))
         .route("/w/{id}/ontology/init", post(ontology_init))
+        .route("/w/{id}/ontology/rename", post(ontology_rename))
         .route("/w/{id}/ontology/propose", post(ontology_propose))
         .route("/w/{id}/ontology/candidates", post(ontology_decide_many))
         .route("/w/{id}/ontology/candidates/{cid}", post(ontology_decide))
@@ -1554,6 +1560,7 @@ impl SqlResult {
                 sql,
                 sortable,
                 editor_swap: rewritten,
+                truncated: outcome.truncated,
                 headers: outcome
                     .columns
                     .into_iter()
@@ -1570,7 +1577,6 @@ impl SqlResult {
                     .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
                     .collect(),
                 row_count: outcome.row_count,
-                truncated: outcome.truncated,
                 duration_ms: outcome.duration_ms,
                 error: None,
             },
@@ -1602,7 +1608,8 @@ async fn sql_run(
 
 /// The rows as a CSV download. A POST, so the statement travels in the
 /// body: in a URL it would land in request logs, proxies, and browser
-/// history, and a long one would not fit.
+/// history, and a long one would not fit. A result the row cap cut says so
+/// in its filename; a marker inside the file would break its parsers.
 async fn sql_csv(
     State(app): State<App>,
     WebUser(identity): WebUser,
@@ -1623,12 +1630,21 @@ async fn sql_csv(
     let csv = writer
         .into_inner()
         .map_err(|e| CoreError::Io(e.into_error()))?;
+    let filename = if outcome.truncated {
+        format!(
+            "query-first-{}-of-{}.csv",
+            outcome.rows.len(),
+            outcome.row_count
+        )
+    } else {
+        "query.csv".to_owned()
+    };
     Ok((
         [
-            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_owned()),
             (
                 header::CONTENT_DISPOSITION,
-                "attachment; filename=\"query.csv\"",
+                format!("attachment; filename=\"{filename}\""),
             ),
         ],
         csv,
@@ -1977,6 +1993,23 @@ async fn ontology_init(
     Ok(Flash::after(format!("/w/{id}/ontology"), stored, |_| None).into_response())
 }
 
+async fn ontology_rename(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(form): Form<RenameRequest>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let stored = access.rename_ontology_id(&app, &form).await;
+    Ok(Flash::after(format!("/w/{id}/ontology"), stored, |_| {
+        Some(format!(
+            "renamed {} {} to {}; the graph's nodes and edges moved with it",
+            form.kind, form.from, form.to
+        ))
+    })
+    .into_response())
+}
+
 async fn ontology_restore(
     State(app): State<App>,
     WebUser(identity): WebUser,
@@ -2297,6 +2330,52 @@ mod tests {
 
     use super::*;
 
+    /// A stale graph whose preview could not be counted still gets its
+    /// page: the banner carries the reason and offers no drop.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn a_failed_revalidation_preview_is_shown_in_the_stale_banner() {
+        let page = GraphPage {
+            page: Page {
+                title: String::from("Graph"),
+                tab: Tab::Graph,
+                username: String::from("ada"),
+                is_admin: false,
+                local: false,
+                workspace: Some(WsNav {
+                    id: String::from("w1"),
+                    name: String::from("sales"),
+                    role: Standing::Member(Role::Owner),
+                    can_write: true,
+                    can_manage: true,
+                }),
+            },
+            status: GraphStatus {
+                nodes: 7,
+                stale: true,
+                ..GraphStatus::default()
+            },
+            drift: Vec::new(),
+            has_ontology: true,
+            chunk_count: 0,
+            revalidation: Some(Err(String::from("no ontology to validate against"))),
+            merges: Vec::new(),
+            query: GraphQueryView::default(),
+            result: None,
+            error: None,
+            notice: None,
+        };
+        let html = page.render().unwrap();
+        assert!(html.contains("7 nodes"), "{html}");
+        assert!(
+            html.contains(
+                "What revalidating would drop could not be counted: no ontology to validate against"
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("graph/revalidate"), "{html}");
+    }
+
     #[test]
     fn cells_render_strings_bare_and_null_empty() {
         let text = |v: &serde_json::Value| JsonText(v).to_string();
@@ -2524,7 +2603,7 @@ async fn render_graph(
     access.audit_read(app, AuditAction::Page, "graph").await?;
     let options = app.config.graph.options();
     let query = GraphQueryView::from_query(q);
-    let ask = GraphAsk::of(q, app).await?;
+    let ask = GraphAsk::of(q, app, &access).await?;
     let data = app
         .read(id, move |db| GraphPageData::read(db, &ask, &options))
         .await?;
@@ -2562,6 +2641,9 @@ async fn render_graph(
         drift,
         has_ontology: data.has_ontology,
         chunk_count: data.chunk_count,
+        revalidation: data
+            .revalidation
+            .map(|preview| preview.map_err(|e| e.to_string())),
         merges: data.merges,
         query,
         result,
@@ -2581,7 +2663,7 @@ enum GraphAsk {
 impl GraphAsk {
     /// A path when both ends are given, else a search when an entity or a
     /// class is.
-    async fn of(q: &GraphSearch, app: &App) -> WebResult<Self> {
+    async fn of(q: &GraphSearch, app: &App, access: &Access) -> WebResult<Self> {
         let path = PathQuery::new(
             q.from.as_deref().unwrap_or_default(),
             q.to.as_deref().unwrap_or_default(),
@@ -2596,7 +2678,13 @@ impl GraphAsk {
         if path.is_err() && search.is_err() {
             return Ok(Self::Nothing);
         }
-        let model = Embeddings::from_config(&app.config).await?;
+        let model = access
+            .model(
+                app,
+                AuditAction::Graph,
+                Embeddings::from_config(&app.config).await,
+            )
+            .await?;
         Ok(match (path, search) {
             (Ok(path), _) => {
                 let ends = path.embeddings(model.as_ref()).await?;
@@ -2639,6 +2727,9 @@ struct GraphPageData {
     has_ontology: bool,
     /// Chunks not yet sent to extraction.
     chunk_count: usize,
+    /// What revalidating would drop, or why that could not be counted;
+    /// read only while the graph is stale.
+    revalidation: Option<CoreResult<Revalidation>>,
     merges: Vec<resolve::MergeProposal>,
     /// The query's answer, when it asked for anything.
     result: Option<GraphAnswer>,
@@ -2656,12 +2747,14 @@ impl GraphPageData {
         let ontology = ontology_store::current(db)?;
         let chunk_count =
             usize::try_from(db.pool_size(SamplePool::NotGraphExtracted)?).unwrap_or(0);
+        let revalidation = status.stale.then(|| Revalidation::preview(db));
         let merges = resolve::pending(db)?;
         let result = ask.run(db, options);
         Ok(Self {
             status,
             has_ontology: ontology.is_some(),
             chunk_count,
+            revalidation,
             merges,
             result,
         })
@@ -2778,13 +2871,16 @@ async fn graph_extract(
     )
 }
 
+/// The counts the graph page showed beside its revalidate button; a
+/// button shown with nothing to drop sends none.
 async fn graph_revalidate(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
+    Form(approval): Form<DropApproval>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let revalidated = access.revalidate_graph(&app).await;
+    let revalidated = access.revalidate_graph(&app, approval).await;
     Ok(Flash::after(format!("/w/{id}/graph"), revalidated, |r| {
         Some(format!(
             "dropped {} nodes and {} edges",

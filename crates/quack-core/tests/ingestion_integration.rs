@@ -14,10 +14,10 @@ use quack_core::error::Error;
 use quack_core::graph::{Properties, Standing, store as graph_store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId};
 use quack_core::import::{HostReach, ImportPolicy, ImportRequest};
-use quack_core::ingestion::parser::FileType;
+use quack_core::ingestion::parser::{FileType, PageCounts};
 use quack_core::llm::CancellationToken;
 use quack_core::progress::{ChunkDone, RunControl};
-use quack_core::storage::control::ControlPlane;
+use quack_core::storage::control::{ControlPlane, WorkspaceName};
 use quack_core::storage::workspace::{
     ChunkScope, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk, NewDocument,
     Pinning, StatementKind, WorkspaceDb,
@@ -124,7 +124,7 @@ fn test_config(data_dir: &Path) -> Config {
     Config {
         general: GeneralConfig {
             data_dir: data_dir.to_path_buf(),
-            default_workspace: "test".into(),
+            default_workspace: WorkspaceName::default(),
             chat_model: None,
         },
         providers,
@@ -135,6 +135,7 @@ fn test_config(data_dir: &Path) -> Config {
             embedding_concurrency: 2,
             tokenizer_encoding: String::from("cl100k_base"),
             upload_max_mb: 512,
+            max_decompressed_mb: 1024,
         },
         embedding: EmbeddingConfig {
             model: Some("mock/mock-model".parse().unwrap()),
@@ -156,7 +157,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
     Config {
         general: GeneralConfig {
             data_dir: data_dir.to_path_buf(),
-            default_workspace: "test".into(),
+            default_workspace: WorkspaceName::default(),
             chat_model: None,
         },
         providers: BTreeMap::new(),
@@ -1616,6 +1617,8 @@ fn legacy_unprefixed_tables_are_renamed_on_open() {
             .as_deref()
             .is_some_and(|m| m.contains("upload it again"))
     );
+    // A row from before page counts were recorded carries none.
+    assert_eq!(old.pages, None);
     assert!(db.list_tables().unwrap().is_empty());
 }
 
@@ -2139,7 +2142,7 @@ async fn a_long_pdf_ingests_every_page_in_order() {
     .unwrap()
     .ingested()
     .unwrap();
-    assert_eq!(result.pages_skipped, 0);
+    assert_eq!(result.pages.and_then(PageCounts::note), None);
     assert!(result.chunks_stored > 0);
 
     let doc = db.document(&result.document_id).unwrap().unwrap();
@@ -2584,6 +2587,179 @@ async fn office_and_html_documents_are_chunked_with_titles() {
             .error_message
             .is_some_and(|m| m.contains("not a PowerPoint file"))
     );
+}
+
+#[tokio::test]
+async fn a_pdf_page_without_text_is_counted_on_the_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-pages").unwrap();
+    let writer = writer_of(&db);
+    // Three pages; the second carries no text, as a scanned image would.
+    let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Mixed");
+    pdf.letter_page().at(72.0, 720.0).text("First page").done();
+    pdf.letter_page().done();
+    pdf.letter_page().at(72.0, 720.0).text("Third page").done();
+    let bytes = pdf.build().unwrap();
+
+    let result = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-pages",
+        &ingestion::NewFile::new("mixed.pdf", &bytes),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    let counts = PageCounts {
+        total: 3,
+        unreadable: 0,
+        empty: 1,
+    };
+    assert_eq!(result.pages, Some(counts));
+    assert_eq!(
+        result.pages.and_then(PageCounts::note).as_deref(),
+        Some("1 of 3 pages without text")
+    );
+
+    let doc = db.document(&result.document_id).unwrap().unwrap();
+    assert_eq!(doc.status, DocumentStatus::Ready);
+    assert_eq!(doc.pages, Some(counts));
+    assert_eq!(
+        doc.pages.and_then(PageCounts::note).as_deref(),
+        Some("1 of 3 pages without text")
+    );
+
+    // A source without pages records none.
+    let text = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-pages",
+        &ingestion::NewFile::new("notes.md", b"# Notes\n\nNo pages here.\n"),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(text.pages, None);
+    let doc = db.document(&text.document_id).unwrap().unwrap();
+    assert_eq!(doc.pages, None);
+}
+
+/// `tiny_xlsx` with one more sheet part of `megabytes` of spaces: a few
+/// kilobytes more on disk.
+fn padded_xlsx(megabytes: usize) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new_append(std::io::Cursor::new(tiny_xlsx())).unwrap();
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    writer
+        .start_file("xl/worksheets/sheet3.xml", options)
+        .unwrap();
+    writer
+        .write_all(" ".repeat(megabytes.saturating_mul(1024 * 1024)).as_bytes())
+        .unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+/// A Word or `PowerPoint` package of one part: a word, then `megabytes` of
+/// spaces.
+fn padded_package(part: &str, megabytes: usize) -> Vec<u8> {
+    use std::io::Write as _;
+    let padding = " ".repeat(megabytes.saturating_mul(1024 * 1024));
+    let xml = format!(
+        r#"<w:document xmlns:w="x" xmlns:a="y"><w:body><w:p><w:r><w:t>Padded{padding}</w:t></w:r></w:p><a:p><a:r><a:t>Padded</a:t></a:r></a:p></w:body></w:document>"#
+    );
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    writer.start_file(part, options).unwrap();
+    writer.write_all(xml.as_bytes()).unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+#[tokio::test]
+async fn a_file_that_inflates_past_the_limit_ends_in_error_and_a_normal_one_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config_no_provider(dir.path());
+    config.ingestion.max_decompressed_mb = 1;
+    let db = WorkspaceDb::open(&config, "ws-bomb").unwrap();
+    let writer = writer_of(&db);
+
+    let bombs = [
+        ("bomb.docx", padded_package("word/document.xml", 2)),
+        ("bomb.pptx", padded_package("ppt/slides/slide1.xml", 2)),
+        ("bomb.xlsx", padded_xlsx(2)),
+    ];
+    for (filename, bytes) in &bombs {
+        assert!(bytes.len() < 64 * 1024, "{filename}: {} bytes", bytes.len());
+        let err = ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-bomb",
+            &ingestion::NewFile::new(filename, bytes),
+            None::<&Embedder<MockEmbeddingModel>>,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(matches!(&err, Error::Ingestion(_)), "{filename}: {err}");
+        let doc = db
+            .list_documents()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.filename == *filename)
+            .unwrap();
+        assert_eq!(doc.status, DocumentStatus::Error, "{filename}");
+        let message = doc.error_message.unwrap();
+        assert!(
+            message.contains("more than [ingestion].max_decompressed_mb (1 MB)"),
+            "{filename}: {message}"
+        );
+    }
+    assert!(db.list_tables().unwrap().is_empty());
+
+    // Under the same limit, files that fit still load.
+    let normal = [
+        ("fits.docx", padded_package("word/document.xml", 0)),
+        ("fits.pptx", padded_package("ppt/slides/slide1.xml", 0)),
+        ("fits.xlsx", tiny_xlsx()),
+    ];
+    for (filename, bytes) in &normal {
+        let loaded = ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-bomb",
+            &ingestion::NewFile::new(filename, bytes),
+            None::<&Embedder<MockEmbeddingModel>>,
+        )
+        .await
+        .unwrap()
+        .ingested()
+        .unwrap();
+        assert!(
+            loaded.chunks_stored > 0 || !loaded.tables.is_empty(),
+            "{filename}"
+        );
+    }
+
+    // The padded workbook is a workbook: a limit above its size loads it.
+    config.ingestion.max_decompressed_mb = 4;
+    let loaded = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-bomb",
+        &ingestion::NewFile::new("padded.xlsx", &padded_xlsx(2)),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(loaded.tables.len(), 2);
 }
 
 #[tokio::test]

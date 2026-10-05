@@ -8,6 +8,7 @@ use std::io::{Cursor, Read};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
+use super::budget::DecompressionBudget;
 use super::parser::{Extracted, FileType, Flow, Section, SectionBuilder};
 use crate::error::{Error, Result};
 
@@ -15,16 +16,18 @@ use crate::error::{Error, Result};
 ///
 /// # Errors
 ///
-/// Returns an error when the bytes are not a Word package or hold no text.
-pub fn docx(data: &[u8]) -> Result<Extracted> {
-    let mut archive = open(data, FileType::Docx)?;
-    let document = part(&mut archive, "word/document.xml")?.ok_or_else(|| {
+/// Returns an error when the bytes are not a Word package, hold no text,
+/// or inflate past `budget`.
+pub fn docx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
+    let mut package = Package::open(data, FileType::Docx, budget)?;
+    let document = package.part("word/document.xml")?.ok_or_else(|| {
         Error::Ingestion(String::from(
             "not a Word file: word/document.xml is missing",
         ))
     })?;
     let paragraphs = word_paragraphs(&document)?;
-    let core_title = part(&mut archive, "docProps/core.xml")?
+    let core_title = package
+        .part("docProps/core.xml")?
         .as_deref()
         .and_then(core_title);
 
@@ -52,7 +55,7 @@ pub fn docx(data: &[u8]) -> Result<Extracted> {
         title: core_title.or(style_title),
         sections,
         flow: Flow::Sectioned,
-        pages_skipped: 0,
+        pages: None,
     })
 }
 
@@ -60,18 +63,14 @@ pub fn docx(data: &[u8]) -> Result<Extracted> {
 ///
 /// # Errors
 ///
-/// Returns an error when the bytes are not a `PowerPoint` package or hold no
-/// text.
-pub fn pptx(data: &[u8]) -> Result<Extracted> {
-    let mut archive = open(data, FileType::Pptx)?;
+/// Returns an error when the bytes are not a `PowerPoint` package, hold no
+/// text, or inflate past `budget`.
+pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
+    let mut package = Package::open(data, FileType::Pptx, budget)?;
     let mut slide_names: Vec<(u32, String)> = Vec::new();
-    for i in 0..archive.len() {
-        let Ok(entry) = archive.by_index(i) else {
-            continue;
-        };
-        let name = entry.name().to_owned();
-        if let Some(number) = slide_number(&name) {
-            slide_names.push((number, name));
+    for name in package.archive.file_names() {
+        if let Some(number) = slide_number(name) {
+            slide_names.push((number, name.to_owned()));
         }
     }
     if slide_names.is_empty() {
@@ -80,13 +79,14 @@ pub fn pptx(data: &[u8]) -> Result<Extracted> {
         )));
     }
     slide_names.sort();
-    let core_title = part(&mut archive, "docProps/core.xml")?
+    let core_title = package
+        .part("docProps/core.xml")?
         .as_deref()
         .and_then(core_title);
 
     let mut sections = Vec::new();
     for (number, name) in slide_names {
-        let Some(xml) = part(&mut archive, &name)? else {
+        let Some(xml) = package.part(&name)? else {
             continue;
         };
         let slide = slide_text(&xml)?;
@@ -117,27 +117,37 @@ pub fn pptx(data: &[u8]) -> Result<Extracted> {
         title: core_title.or(first_title),
         sections,
         flow: Flow::Sectioned,
-        pages_skipped: 0,
+        pages: None,
     })
 }
 
-/// The package's zip archive, or an error naming the type expected.
-fn open(data: &[u8], file_type: FileType) -> Result<zip::ZipArchive<Cursor<&[u8]>>> {
-    zip::ZipArchive::new(Cursor::new(data))
-        .map_err(|e| Error::Ingestion(format!("not a {file_type} file: {e}")))
+/// An Office package: its zip archive, and the bytes its parts may still
+/// inflate to.
+struct Package<'a> {
+    archive: zip::ZipArchive<Cursor<&'a [u8]>>,
+    budget: DecompressionBudget,
 }
 
-fn part(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Option<String>> {
-    let mut entry = match archive.by_name(name) {
-        Ok(entry) => entry,
-        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
-        Err(e) => return Err(Error::Ingestion(format!("cannot read {name}: {e}"))),
-    };
-    let mut xml = String::new();
-    entry
-        .read_to_string(&mut xml)
-        .map_err(|e| Error::Ingestion(format!("cannot read {name}: {e}")))?;
-    Ok(Some(xml))
+impl<'a> Package<'a> {
+    /// The package, or an error naming the type expected.
+    fn open(data: &'a [u8], file_type: FileType, budget: DecompressionBudget) -> Result<Self> {
+        let archive = zip::ZipArchive::new(Cursor::new(data))
+            .map_err(|e| Error::Ingestion(format!("not a {file_type} file: {e}")))?;
+        Ok(Self { archive, budget })
+    }
+
+    /// One part's XML, `None` when the package has no such part.
+    fn part(&mut self, name: &str) -> Result<Option<String>> {
+        let entry = match self.archive.by_name(name) {
+            Ok(entry) => entry,
+            Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+            Err(e) => return Err(Error::Ingestion(format!("cannot read {name}: {e}"))),
+        };
+        let mut xml = String::new();
+        let read = self.budget.reader(entry).read_to_string(&mut xml);
+        read.map_err(|e| self.budget.read_error(name, &e))?;
+        Ok(Some(xml))
+    }
 }
 
 /// The text of an entity reference: a character reference or one of the
@@ -389,6 +399,8 @@ pub(crate) mod tests {
 
     use super::*;
 
+    const BUDGET: DecompressionBudget = DecompressionBudget::megabytes(64);
+
     /// A minimal Office package with the given parts.
     pub(crate) fn package(parts: &[(&str, &str)]) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::new());
@@ -431,7 +443,7 @@ pub(crate) mod tests {
     #[test]
     fn docx_splits_at_heading_styles_and_reads_core_title() {
         let bytes = package(&[("word/document.xml", DOCUMENT), ("docProps/core.xml", CORE)]);
-        let extracted = docx(&bytes).unwrap_or_else(|e| fail(&e.to_string()));
+        let extracted = docx(&bytes, BUDGET).unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(extracted.title.as_deref(), Some("Core Title"));
         let headings: Vec<Option<&str>> = extracted
             .sections
@@ -452,20 +464,22 @@ pub(crate) mod tests {
     #[test]
     fn docx_title_style_is_the_title_when_core_has_none() {
         let bytes = package(&[("word/document.xml", DOCUMENT)]);
-        let extracted = docx(&bytes).unwrap_or_else(|e| fail(&e.to_string()));
+        let extracted = docx(&bytes, BUDGET).unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(extracted.title.as_deref(), Some("Renewal Playbook"));
     }
 
     #[test]
     fn docx_errors_are_specific() {
-        assert!(docx(b"not a zip").is_err_and(|e| e.to_string().contains("not a Word file")));
+        assert!(
+            docx(b"not a zip", BUDGET).is_err_and(|e| e.to_string().contains("not a Word file"))
+        );
         let no_part = package(&[("other.xml", "<a/>")]);
-        assert!(docx(&no_part).is_err_and(|e| e.to_string().contains("word/document.xml")));
+        assert!(docx(&no_part, BUDGET).is_err_and(|e| e.to_string().contains("word/document.xml")));
         let empty = package(&[(
             "word/document.xml",
             r#"<w:document xmlns:w="x"><w:body/></w:document>"#,
         )]);
-        assert!(docx(&empty).is_err_and(|e| e.to_string().contains("no extractable text")));
+        assert!(docx(&empty, BUDGET).is_err_and(|e| e.to_string().contains("no extractable text")));
     }
 
     fn slide(title: Option<&str>, lines: &[&str]) -> String {
@@ -500,7 +514,7 @@ pub(crate) mod tests {
             ("ppt/slides/slide1.xml", &s1),
             ("ppt/slides/_rels/slide1.xml.rels", "<x/>"),
         ]);
-        let extracted = pptx(&bytes).unwrap_or_else(|e| fail(&e.to_string()));
+        let extracted = pptx(&bytes, BUDGET).unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(extracted.title.as_deref(), Some("Agenda"));
         let pages: Vec<Option<u32>> = extracted.sections.iter().map(|s| s.page).collect();
         assert_eq!(pages, [Some(1), Some(2), Some(10)]);
@@ -523,12 +537,85 @@ pub(crate) mod tests {
 
     #[test]
     fn pptx_without_slides_or_text_is_an_error() {
-        assert!(pptx(b"zip? no").is_err());
+        assert!(pptx(b"zip? no", BUDGET).is_err());
         let none = package(&[("ppt/presentation.xml", "<p/>")]);
-        assert!(pptx(&none).is_err_and(|e| e.to_string().contains("no ppt/slides")));
+        assert!(pptx(&none, BUDGET).is_err_and(|e| e.to_string().contains("no ppt/slides")));
         let blank = slide(None, &["   "]);
         let empty = package(&[("ppt/slides/slide1.xml", &blank)]);
-        assert!(pptx(&empty).is_err_and(|e| e.to_string().contains("no extractable text")));
+        assert!(pptx(&empty, BUDGET).is_err_and(|e| e.to_string().contains("no extractable text")));
+    }
+
+    /// A Word body whose one paragraph is `megabytes` of spaces after a
+    /// word: a few kilobytes deflated.
+    fn padded_document(megabytes: usize) -> String {
+        format!(
+            r#"<w:document xmlns:w="x"><w:body><w:p><w:r><w:t>Padded{}</w:t></w:r></w:p></w:body></w:document>"#,
+            " ".repeat(megabytes.saturating_mul(1024 * 1024))
+        )
+    }
+
+    #[test]
+    fn docx_that_inflates_past_the_budget_is_refused() {
+        let bytes = package(&[("word/document.xml", &padded_document(2))]);
+        assert!(bytes.len() < 16 * 1024, "{} bytes", bytes.len());
+        let refused = docx(&bytes, DecompressionBudget::megabytes(1))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            refused.contains("more than [ingestion].max_decompressed_mb (1 MB)"),
+            "{refused}"
+        );
+        let read = docx(&bytes, DecompressionBudget::megabytes(3))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            read.sections.first().map(|s| s.text.as_str()),
+            Some("Padded")
+        );
+    }
+
+    #[test]
+    fn docx_parts_share_one_budget() {
+        // The body fits; the core properties after it do not.
+        let core = format!("{CORE}{}", " ".repeat(1024 * 1024));
+        let bytes = package(&[
+            ("word/document.xml", DOCUMENT),
+            ("docProps/core.xml", &core),
+        ]);
+        let refused = docx(&bytes, DecompressionBudget::megabytes(1));
+        assert!(refused.is_err_and(|e| e.to_string().contains("max_decompressed_mb")));
+    }
+
+    #[test]
+    fn pptx_slides_share_one_budget() {
+        // Each slide is under the budget; together they are over it.
+        let padding = " ".repeat(600 * 1024);
+        let slides: Vec<String> = ["One", "Two", "Three"]
+            .iter()
+            .map(|title| slide(Some(title), &[&padding]))
+            .collect();
+        let parts: Vec<(String, &str)> = slides
+            .iter()
+            .zip(1..)
+            .map(|(xml, number)| (format!("ppt/slides/slide{number}.xml"), xml.as_str()))
+            .collect();
+        let parts: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(name, xml)| (name.as_str(), *xml))
+            .collect();
+        let bytes = package(&parts);
+        assert!(bytes.len() < 16 * 1024, "{} bytes", bytes.len());
+        let refused = pptx(&bytes, DecompressionBudget::megabytes(1))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            refused.contains("more than [ingestion].max_decompressed_mb (1 MB)"),
+            "{refused}"
+        );
+        let read = pptx(&bytes, DecompressionBudget::megabytes(2))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(read.sections.len(), 3);
     }
 
     #[test]

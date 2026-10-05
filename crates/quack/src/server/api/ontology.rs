@@ -1,4 +1,5 @@
-//! The ontology: read, replace (a new version), versions, diff, restore.
+//! The ontology: read, replace (a new version), versions, diff, restore,
+//! and rename an id with the graph following.
 //! Members write; viewers read; every write is audited as `ontology`.
 
 use axum::Json;
@@ -7,7 +8,7 @@ use axum::http::StatusCode;
 use quack_core::extraction::ExtractionRun;
 use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::ontology::candidates::{CandidateAction, Queue};
-use quack_core::ontology::induction::{Decision, propose_from_tables};
+use quack_core::ontology::induction::{Decision, ItemKind, propose_from_tables};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +20,7 @@ use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::OntologyVersion;
 use quack_core::ontology::documents::{self, DocumentProposal};
 use quack_core::ontology::store::Revision;
-use quack_core::ontology::{Ontology, candidates, store};
+use quack_core::ontology::{IdRenames, Ontology, candidates, store};
 use quack_core::progress::{ChunkDone, RunControl};
 
 pub(crate) async fn show(
@@ -118,6 +119,28 @@ impl Access {
         Ok(stored)
     }
 
+    /// Rename a class or relation id as the next version, moving the
+    /// graph's nodes and edges with it.
+    pub(crate) async fn rename_ontology_id(
+        &self,
+        app: &App,
+        rename: &RenameRequest,
+    ) -> ApiResult<Ontology> {
+        let renames = IdRenames::one(rename.kind, &rename.from, &rename.to)?;
+        let db = app.workspace_db(&self.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let stored = with_db(db, move |db| store::rename(db, &renames, Some(&author))).await?;
+        self.audit(
+            app,
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "renamed": rename, "version": stored.version })),
+        )
+        .await?;
+        Ok(stored)
+    }
+
     /// Store version `version` again as the newest.
     pub(crate) async fn restore_ontology(
         &self,
@@ -211,6 +234,29 @@ pub(crate) async fn restore(
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.restore_ontology(&app, v).await?;
+    Ok(Json(serde_json::to_value(stored)?))
+}
+
+/// One id to rename, in the body or the ontology page's form.
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct RenameRequest {
+    /// `class` or `relation`.
+    pub kind: ItemKind,
+    /// The id as the ontology has it now.
+    pub from: String,
+    /// The id to give it; one the ontology does not have yet.
+    pub to: String,
+}
+
+/// Rename a class or relation id; the stored ontology comes back.
+pub(crate) async fn rename(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+    Json(body): Json<RenameRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let stored = access.rename_ontology_id(&app, &body).await?;
     Ok(Json(serde_json::to_value(stored)?))
 }
 
@@ -515,8 +561,20 @@ impl Access {
             options.sample_chunks = n;
         }
         // Fail now, not in the background, when no model can be built.
-        let extractor = llm::chat_extractor(&app.config).await?;
-        let embeddings = Embeddings::from_config(&app.config).await?;
+        let extractor = access
+            .model(
+                app,
+                AuditAction::Propose,
+                llm::chat_extractor(&app.config).await,
+            )
+            .await?;
+        let embeddings = access
+            .model(
+                app,
+                AuditAction::Propose,
+                Embeddings::from_config(&app.config).await,
+            )
+            .await?;
         let (cost, chunks, current) = app
             .read(id, move |db| {
                 let cost = documents::estimate(db, &options)?;

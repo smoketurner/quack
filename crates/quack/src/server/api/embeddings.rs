@@ -77,7 +77,13 @@ impl Access {
     /// The refresh the API and the web page share.
     pub(crate) async fn refresh_embeddings(&self, app: &App) -> ApiResult<RefreshStarted> {
         // Fail now, not in the background, when no model can be built.
-        let embedder = Embeddings::require(&app.config).await?;
+        let embedder = self
+            .model(
+                app,
+                AuditAction::EmbeddingsRefresh,
+                Embeddings::require(&app.config).await,
+            )
+            .await?;
         let status = app
             .read(&self.workspace.id, WorkspaceDb::embedding_status)
             .await?;

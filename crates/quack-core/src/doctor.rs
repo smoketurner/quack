@@ -24,6 +24,7 @@ use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::{Error, Result as CoreResult};
 use crate::llm::bedrock;
+use crate::llm::egress::Egress;
 use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
@@ -32,7 +33,7 @@ use crate::llm::{ChatClient, ProviderModels, RerankModel};
 use crate::oidc::SignIn;
 use crate::proxy::Proxies;
 use crate::storage::control::ControlPlane;
-use crate::storage::workspace::WorkspaceDb;
+use crate::storage::workspace::{MetaKey, WorkspaceDb};
 use crate::text::Count;
 use rig::ProviderError;
 use rig::error::ErrorKind;
@@ -106,6 +107,24 @@ pub struct Check {
     pub fix: Option<String>,
 }
 
+/// What a workspace file records about what wrote it; a file from before
+/// a value was recorded has none.
+struct FileVersions {
+    schema: Option<String>,
+    quack: Option<String>,
+    duckdb: Option<String>,
+}
+
+impl FileVersions {
+    fn read(db: &WorkspaceDb) -> Result<Self, Error> {
+        Ok(Self {
+            schema: db.meta(MetaKey::SchemaVersion)?,
+            quack: db.meta(MetaKey::WrittenByQuack)?,
+            duckdb: db.meta(MetaKey::WrittenByDuckDb)?,
+        })
+    }
+}
+
 impl Check {
     fn new(area: Area, status: Status, summary: impl Into<String>) -> Self {
         Self {
@@ -113,6 +132,56 @@ impl Check {
             status,
             summary: summary.into(),
             fix: None,
+        }
+    }
+
+    /// A workspace with no row: only the default one is created by using
+    /// it, so any other name is a failure.
+    fn missing_workspace(name: &str, default: &str) -> Self {
+        if name == default {
+            return Self::new(
+                Area::Workspace,
+                Status::Ok,
+                format!("'{name}' does not exist yet; the first command that uses it creates it"),
+            );
+        }
+        Self::new(
+            Area::Workspace,
+            Status::Fail,
+            Error::NoWorkspaceNamed(name.to_owned()).to_string(),
+        )
+        .fix(format!("quack workspace create {name}"))
+    }
+
+    /// A workspace that opens (`opens` says so), with the versions its file
+    /// records. Versions that cannot be read fail the check: an open file
+    /// that does not answer for itself is not a healthy one.
+    fn recorded_versions(opens: &str, versions: Result<FileVersions, Error>) -> Self {
+        match versions {
+            Ok(FileVersions {
+                schema,
+                quack,
+                duckdb,
+            }) => {
+                let or_unrecorded =
+                    |v: Option<String>| v.unwrap_or_else(|| String::from("unrecorded"));
+                Self::new(
+                    Area::Workspace,
+                    Status::Ok,
+                    format!(
+                        "{opens}; schema version {}, written by quack {} with DuckDB {}",
+                        or_unrecorded(schema),
+                        or_unrecorded(quack),
+                        or_unrecorded(duckdb)
+                    ),
+                )
+            }
+            Err(e) => Self::new(
+                Area::Workspace,
+                Status::Fail,
+                format!("{opens}, but the versions its file records cannot be read: {e}"),
+            )
+            .fix("check the file under the data directory, or restore a backup"),
         }
     }
 
@@ -242,32 +311,37 @@ impl Probing {
 
 /// Run every check against the configuration `inspection` found.
 pub async fn run(inspection: &Inspection, options: &Options) -> Report {
-    let mut report = Report::default();
-    check_config(&mut report, inspection);
-    let config = &inspection.config;
-    check_crypto(&mut report);
-    check_proxy(&mut report, Proxies::from_env());
-    let data_ready = check_data_dir(&mut report, config.data_dir());
-    let control = if data_ready {
-        check_control(&mut report, config).await
-    } else {
-        None
-    };
-    check_workspace(&mut report, config, control.as_ref(), options).await;
-    check_chat_model(&mut report, config, options.probing).await;
-    check_embedding_model(&mut report, config, options.probing).await;
-    check_reranker(&mut report, config, options.probing).await;
-    check_server(&mut report, config, control.as_ref()).await;
-    check_sign_in(&mut report, config, options.probing).await;
-    check_registrations(
-        &mut report,
-        config,
-        control.as_ref(),
-        options.probing,
-        KeySource::Keychain,
-    )
-    .await;
-    report
+    // The probes reach every configured provider and send no workspace's
+    // content, so no workspace's allow-list applies to them.
+    Egress::scope(Some(Egress::NoWorkspace), async {
+        let mut report = Report::default();
+        check_config(&mut report, inspection);
+        let config = &inspection.config;
+        check_crypto(&mut report);
+        check_proxy(&mut report, Proxies::from_env());
+        let data_ready = check_data_dir(&mut report, config.data_dir());
+        let control = if data_ready {
+            check_control(&mut report, config).await
+        } else {
+            None
+        };
+        check_workspace(&mut report, config, control.as_ref(), options).await;
+        check_chat_model(&mut report, config, options.probing).await;
+        check_embedding_model(&mut report, config, options.probing).await;
+        check_reranker(&mut report, config, options.probing).await;
+        check_server(&mut report, config, control.as_ref()).await;
+        check_sign_in(&mut report, config, options.probing).await;
+        check_registrations(
+            &mut report,
+            config,
+            control.as_ref(),
+            options.probing,
+            KeySource::Keychain,
+        )
+        .await;
+        report
+    })
+    .await
 }
 
 fn check_config(report: &mut Report, inspection: &Inspection) {
@@ -514,10 +588,8 @@ async fn check_workspace(
     control: Option<&ControlPlane>,
     options: &Options,
 ) {
-    let name = options
-        .workspace
-        .as_deref()
-        .unwrap_or(&config.general.default_workspace);
+    let default = config.general.default_workspace.as_str();
+    let name = options.workspace.as_deref().unwrap_or(default);
     let row = match control {
         Some(control) => match control.find_workspace_by_name(name).await {
             Ok(row) => row,
@@ -533,11 +605,7 @@ async fn check_workspace(
         None => None,
     };
     let Some(row) = row else {
-        report.push(Check::new(
-            Area::Workspace,
-            Status::Ok,
-            format!("'{name}' does not exist yet; the first command that uses it creates it"),
-        ));
+        report.push(Check::missing_workspace(name, default));
         return;
     };
     if !config.workspace_db_path(row.id.as_str()).exists() {
@@ -552,15 +620,12 @@ async fn check_workspace(
         Ok(db) => {
             let tables = db.list_tables().map_or(0, |t| t.len());
             let documents = db.list_documents().map_or(0, |d| d.len());
-            report.push(Check::new(
-                Area::Workspace,
-                Status::Ok,
-                format!(
-                    "'{name}' opens: {}, {}",
-                    Count(tables, "table"),
-                    Count(documents, "document")
-                ),
-            ));
+            let opens = format!(
+                "'{name}' opens: {}, {}",
+                Count(tables, "table"),
+                Count(documents, "document")
+            );
+            report.push(Check::recorded_versions(&opens, FileVersions::read(&db)));
             if let Some(note) = db.embedding_status().ok().and_then(|s| s.note()) {
                 report.push(
                     Check::new(Area::Workspace, Status::Warn, format!("'{name}': {note}"))
@@ -577,6 +642,26 @@ async fn check_workspace(
                      so it was not checked"
                 ),
             ));
+        }
+        // The error's own text ends with the same advice; the fix says it once.
+        Err(Error::WorkspaceTooNew {
+            recorded,
+            supported,
+            written_by,
+            ..
+        }) => {
+            report.push(
+                Check::new(
+                    Area::Workspace,
+                    Status::Fail,
+                    format!(
+                        "'{name}' does not open: its file has schema version {recorded}, written \
+                         by {written_by}, and this quack reads up to version {supported}; the \
+                         file was left as it was"
+                    ),
+                )
+                .fix(written_by.advice()),
+            );
         }
         Err(e) => {
             report.push(
@@ -1606,6 +1691,7 @@ impl std::fmt::Display for ErrorChain<'_> {
 mod tests {
     use super::*;
     use crate::proxy::{Environment, Variable};
+    use crate::storage::control::{AuditAction, AuditEntry, Channel, Outcome};
 
     fn proxy_checks(environment: Environment) -> Vec<Check> {
         let mut report = Report::default();
@@ -1941,6 +2027,111 @@ mod tests {
         );
     }
 
+    /// The workspace check names the versions the file records, and a file
+    /// a newer quack upgraded is a failure whose fix names that quack.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn the_workspace_check_reports_versions_and_fails_on_a_newer_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let inspection = inspection(dir.path(), None);
+        let config = &inspection.config;
+        let control = ControlPlane::open(config).await.unwrap();
+        let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli);
+        let workspace = control
+            .create_workspace(&config.general.default_workspace, None, entry)
+            .await
+            .unwrap();
+        drop(control);
+        let db = WorkspaceDb::open(config, workspace.id.as_str()).unwrap();
+        let schema = db.meta(MetaKey::SchemaVersion).unwrap().unwrap();
+        drop(db);
+
+        let report = run(&inspection, &offline()).await;
+        let checks = find(&report, Area::Workspace);
+        let check = checks.first().unwrap();
+        assert_eq!(check.status, Status::Ok, "{check:?}");
+        let versions = format!(
+            "schema version {schema}, written by quack {} with DuckDB v",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(check.summary.contains(&versions), "{check:?}");
+
+        let db = WorkspaceDb::open(config, workspace.id.as_str()).unwrap();
+        db.set_meta(MetaKey::SchemaVersion, "99").unwrap();
+        db.set_meta(MetaKey::WrittenByQuack, "9.9.9").unwrap();
+        drop(db);
+
+        let report = run(&inspection, &offline()).await;
+        let checks = find(&report, Area::Workspace);
+        let check = checks.first().unwrap();
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        assert!(check.summary.contains("schema version 99"), "{check:?}");
+        assert!(
+            check.summary.contains("written by quack 9.9.9,"),
+            "{check:?}"
+        );
+        let fix = check.fix.as_deref().unwrap();
+        assert!(fix.contains("run quack 9.9.9 or newer"), "{fix}");
+        assert!(fix.contains("restore the copy"), "{fix}");
+        // The advice is the fix alone, not the summary too.
+        assert!(!check.summary.contains("or newer"), "{check:?}");
+
+        // Versions that cannot be read fail the check instead of printing
+        // as unrecorded.
+        let unreadable = Check::recorded_versions(
+            "'ws' opens: 0 tables, 0 documents",
+            Err(Error::Config(String::from("the meta table did not answer"))),
+        );
+        assert_eq!(unreadable.status, Status::Fail, "{unreadable:?}");
+        assert!(
+            unreadable.summary.contains("cannot be read:")
+                && unreadable.summary.contains("the meta table did not answer"),
+            "{unreadable:?}"
+        );
+        assert!(unreadable.fix.is_some(), "{unreadable:?}");
+        let unrecorded = Check::recorded_versions(
+            "'ws' opens",
+            Ok(FileVersions {
+                schema: None,
+                quack: None,
+                duckdb: None,
+            }),
+        );
+        assert!(
+            unrecorded.summary.contains("schema version unrecorded"),
+            "{unrecorded:?}"
+        );
+    }
+
+    /// A named workspace that does not exist is a failure with the command
+    /// that creates it; the default one is created by its first use.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn a_missing_workspace_fails_unless_it_is_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let inspection = inspection(dir.path(), None);
+        drop(ControlPlane::open(&inspection.config).await.unwrap());
+        let named = |name: &str| Options {
+            workspace: Some(name.to_owned()),
+            ..offline()
+        };
+
+        let report = run(&inspection, &named("slaes")).await;
+        let checks = find(&report, Area::Workspace);
+        let check = checks.first().unwrap();
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        assert!(check.summary.contains("no workspace named 'slaes'"));
+        assert_eq!(check.fix.as_deref(), Some("quack workspace create slaes"));
+
+        for options in [offline(), named("default")] {
+            let report = run(&inspection, &options).await;
+            let checks = find(&report, Area::Workspace);
+            let check = checks.first().unwrap();
+            assert_eq!(check.status, Status::Ok, "{check:?}");
+            assert!(check.summary.contains("does not exist yet"), "{check:?}");
+        }
+    }
+
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
     async fn a_fresh_install_has_no_failures_and_says_what_needs_a_model() {
@@ -2096,23 +2287,26 @@ mod tests {
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
     async fn the_listing_probe_sends_provider_headers_beside_its_credential() {
-        let (base, seen) = one_listing().await;
-        let provider = ProviderConfig {
-            headers: Some(BTreeMap::from([(
-                String::from("X-Gateway-Team"),
-                String::from("quack"),
-            )])),
-            base_url: Some(base),
-            ..ProviderConfig::new(ProviderType::Openai)
-        };
-        let name: ProviderName = "gateway".parse().unwrap();
-        let client = ChatClient::connect(&name, &provider, Some("key"));
-        let listing = Probe::listing(client, Duration::from_secs(5)).await;
-        assert!(matches!(&listing, Ok(models) if models.get("m").is_some()));
-        let request = seen.await.unwrap();
-        assert!(request.starts_with("get /models "), "{request}");
-        assert!(request.contains("x-gateway-team: quack"), "{request}");
-        assert!(request.contains("authorization: bearer key"), "{request}");
+        Egress::scope(Some(Egress::NoWorkspace), async {
+            let (base, seen) = one_listing().await;
+            let provider = ProviderConfig {
+                headers: Some(BTreeMap::from([(
+                    String::from("X-Gateway-Team"),
+                    String::from("quack"),
+                )])),
+                base_url: Some(base),
+                ..ProviderConfig::new(ProviderType::Openai)
+            };
+            let name: ProviderName = "gateway".parse().unwrap();
+            let client = ChatClient::connect(&name, &provider, Some("key"));
+            let listing = Probe::listing(client, Duration::from_secs(5)).await;
+            assert!(matches!(&listing, Ok(models) if models.get("m").is_some()));
+            let request = seen.await.unwrap();
+            assert!(request.starts_with("get /models "), "{request}");
+            assert!(request.contains("x-gateway-team: quack"), "{request}");
+            assert!(request.contains("authorization: bearer key"), "{request}");
+        })
+        .await;
     }
 
     /// An Anthropic provider's probe sends its credential where completions
@@ -2120,34 +2314,37 @@ mod tests {
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
     async fn the_anthropic_probe_sends_an_oauth_token_as_a_bearer() {
-        let oauth = "auth = \"oauth\"\n[providers.p.oauth]\n\
+        Egress::scope(Some(Egress::NoWorkspace), async {
+            let oauth = "auth = \"oauth\"\n[providers.p.oauth]\n\
                      issuer_url = \"http://127.0.0.1:9\"\nclient_id = \"c\"\n";
-        let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
-        for (auth, bearer) in [(oauth, true), (keyed, false)] {
-            let (base, seen) = one_listing().await;
-            let config: Config = toml::from_str(&format!(
-                "[general]\nchat_model = \"p/m\"\n[providers.p]\n\
+            let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
+            for (auth, bearer) in [(oauth, true), (keyed, false)] {
+                let (base, seen) = one_listing().await;
+                let config: Config = toml::from_str(&format!(
+                    "[general]\nchat_model = \"p/m\"\n[providers.p]\n\
                  type = \"anthropic\"\nbase_url = \"{base}\"\n{auth}"
-            ))
-            .unwrap();
-            let chat = config.chat_model_ref().unwrap();
-            let client = ChatClient::connect(chat.provider_name, chat.provider, Some("tok-1"));
-            let listing = Probe::listing(client, Duration::from_secs(5)).await;
-            assert!(matches!(&listing, Ok(models) if models.get("m").is_some()));
-            let request = seen.await.unwrap();
-            assert!(request.starts_with("get /v1/models "), "{request}");
-            assert!(request.contains("anthropic-version: "), "{request}");
-            assert_eq!(
-                request.contains("authorization: bearer tok-1\r\n"),
-                bearer,
-                "{request}"
-            );
-            assert_eq!(
-                request.contains("x-api-key: tok-1\r\n"),
-                !bearer,
-                "{request}"
-            );
-        }
+                ))
+                .unwrap();
+                let chat = config.chat_model_ref().unwrap();
+                let client = ChatClient::connect(chat.provider_name, chat.provider, Some("tok-1"));
+                let listing = Probe::listing(client, Duration::from_secs(5)).await;
+                assert!(matches!(&listing, Ok(models) if models.get("m").is_some()));
+                let request = seen.await.unwrap();
+                assert!(request.starts_with("get /v1/models "), "{request}");
+                assert!(request.contains("anthropic-version: "), "{request}");
+                assert_eq!(
+                    request.contains("authorization: bearer tok-1\r\n"),
+                    bearer,
+                    "{request}"
+                );
+                assert_eq!(
+                    request.contains("x-api-key: tok-1\r\n"),
+                    !bearer,
+                    "{request}"
+                );
+            }
+        })
+        .await;
     }
 
     fn listed(models: &[(&str, Option<u32>)]) -> ProviderModels {
@@ -2251,50 +2448,53 @@ mod tests {
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
     async fn the_rerank_model_is_listed_and_answers_a_probe() {
-        let config = |base: &str, model: &str| -> Config {
-            toml::from_str(&format!(
-                "[retrieval]\nrerank = \"reranker\"\nrerank_model = \"tei/{model}\"\n\
+        Egress::scope(Some(Egress::NoWorkspace), async {
+            let config = |base: &str, model: &str| -> Config {
+                toml::from_str(&format!(
+                    "[retrieval]\nrerank = \"reranker\"\nrerank_model = \"tei/{model}\"\n\
                  [providers.tei]\ntype = \"openai\"\nbase_url = \"{base}\"\n"
-            ))
-            .unwrap()
-        };
-        let probing = Probing::Online {
-            timeout: Duration::from_secs(5),
-        };
-        let base = rerank_server(2).await;
-        let mut report = Report::default();
-        check_reranker(&mut report, &config(&base, "bge-reranker"), probing).await;
-        let checks = find(&report, Area::Reranker);
-        let summaries: Vec<(Status, &str)> = checks
-            .iter()
-            .map(|c| (c.status, c.summary.as_str()))
-            .collect();
-        assert_eq!(
-            summaries,
-            [
-                (
-                    Status::Ok,
-                    "tei/bge-reranker: reachable, credential accepted, model listed"
-                ),
-                (Status::Ok, "tei/bge-reranker: a rerank call was answered"),
-            ]
-        );
+                ))
+                .unwrap()
+            };
+            let probing = Probing::Online {
+                timeout: Duration::from_secs(5),
+            };
+            let base = rerank_server(2).await;
+            let mut report = Report::default();
+            check_reranker(&mut report, &config(&base, "bge-reranker"), probing).await;
+            let checks = find(&report, Area::Reranker);
+            let summaries: Vec<(Status, &str)> = checks
+                .iter()
+                .map(|c| (c.status, c.summary.as_str()))
+                .collect();
+            assert_eq!(
+                summaries,
+                [
+                    (
+                        Status::Ok,
+                        "tei/bge-reranker: reachable, credential accepted, model listed"
+                    ),
+                    (Status::Ok, "tei/bge-reranker: a rerank call was answered"),
+                ]
+            );
 
-        // A model the server does not list is named with what it does.
-        let base = rerank_server(2).await;
-        let mut report = Report::default();
-        check_reranker(&mut report, &config(&base, "bge-rerank"), probing).await;
-        let listing = find(&report, Area::Reranker);
-        assert!(
-            listing.first().is_some_and(|c| c.status == Status::Warn
-                && c.summary.ends_with("the closest it lists: bge-reranker")),
-            "{listing:?}"
-        );
+            // A model the server does not list is named with what it does.
+            let base = rerank_server(2).await;
+            let mut report = Report::default();
+            check_reranker(&mut report, &config(&base, "bge-rerank"), probing).await;
+            let listing = find(&report, Area::Reranker);
+            assert!(
+                listing.first().is_some_and(|c| c.status == Status::Warn
+                    && c.summary.ends_with("the closest it lists: bge-reranker")),
+                "{listing:?}"
+            );
 
-        // Nothing to check in another mode.
-        let mut report = Report::default();
-        check_reranker(&mut report, &Config::default(), probing).await;
-        assert!(find(&report, Area::Reranker).is_empty());
+            // Nothing to check in another mode.
+            let mut report = Report::default();
+            check_reranker(&mut report, &Config::default(), probing).await;
+            assert!(find(&report, Area::Reranker).is_empty());
+        })
+        .await;
     }
 
     /// A mock issuer for the doctor: its discovery document lists `grants`,

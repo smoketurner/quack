@@ -8,10 +8,11 @@
 //! nothing else sets one, so the CLI and the terminal act for nobody.
 
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use secrecy::SecretString;
 
+use super::slot::Slot;
 use crate::ids::UserId;
 use crate::oidc::{Origin, Revocations, SubjectTokens};
 
@@ -40,12 +41,8 @@ impl std::fmt::Debug for Acting {
     }
 }
 
-/// The current work's acting person, set at most once.
-#[derive(Clone, Default)]
-struct Slot(Arc<OnceLock<Acting>>);
-
 tokio::task_local! {
-    static SLOT: Slot;
+    static SLOT: Slot<Acting>;
 }
 
 impl Acting {
@@ -101,28 +98,24 @@ impl Acting {
     /// Run `work` with an empty slot that [`Acting::enter`] fills once the
     /// caller is known: a server request.
     pub async fn request<F: Future>(work: F) -> F::Output {
-        SLOT.scope(Slot::default(), work).await
+        Slot::request(&SLOT, work).await
     }
 
     /// Run `work` acting for `acting`, or for nobody.
     pub async fn scope<F: Future>(acting: Option<Self>, work: F) -> F::Output {
-        let slot = Slot::default();
-        if let Some(acting) = acting {
-            drop(slot.0.set(acting));
-        }
-        SLOT.scope(slot, work).await
+        Slot::scope(&SLOT, acting, work).await
     }
 
     /// Make this person the one the current request acts for. The first
     /// caller wins; outside [`Acting::request`] it does nothing.
     pub fn enter(self) {
-        drop(SLOT.try_with(|slot| slot.0.set(self)));
+        Slot::enter(&SLOT, self);
     }
 
     /// Who the current work acts for, if anyone.
     #[must_use]
     pub fn current() -> Option<Self> {
-        SLOT.try_with(|slot| slot.0.get().cloned()).ok().flatten()
+        Slot::current(&SLOT)
     }
 }
 

@@ -50,6 +50,47 @@ Three settings apply to every type:
 `"chat-completions"` (the default with a `base_url`, since many compatible servers offer
 nothing else).
 
+## Restricting a workspace to some providers
+
+A workspace's owner can limit which configured providers receive its content: the
+**Allowed providers** setting on the workspace's settings page, or `allowed_providers` in
+`PATCH /api/v1/workspaces/{id}`. An empty list allows every provider. The list names
+`[providers.NAME]` entries, so it applies to the chat model, the embedding model, and the
+rerank model alike.
+
+quack enforces the list on every model request from every interface: questions, search,
+uploads, imports, graph extraction, the ontology's document pass, embeddings refresh, MCP, the
+command line, and the terminal. It checks twice, with one function
+(`quack_core::llm::egress::Egress::permit`):
+
+1. When it builds a model's client, so the work is refused before it starts.
+2. When each request passes the provider's concurrency gate
+   (`llm::limit::ProviderGates::permit`). Every HTTP request quack sends to a provider goes
+   through that gate, Bedrock's AWS SDK requests included, so no request goes around it.
+
+A refused request is never sent. The error names the provider and the list:
+
+```
+provider 'hosted' is not allowed in this workspace, which allows only: local
+```
+
+The server answers `403` and writes a `denied` row to the audit log for the action that was
+refused. An MCP tool returns the same text as a tool error. The command line prints it and
+exits 1.
+
+The models are set once for the whole installation, so restrict a workspace only to providers
+that serve every model it needs. If `[embedding].model` is on a provider the list leaves out,
+that workspace refuses uploads, search, and questions until the list or the configuration
+changes.
+
+Ollama serves some models from its own hosts through the local API; their ids carry a `cloud`
+tag (`NAME:cloud` or `NAME:SIZE-cloud`). In a workspace with a restricted list, quack refuses
+those models on a `type = "ollama"` provider, so a list of local providers keeps content on
+the machine. A workspace that allows every provider is not affected.
+
+`quack doctor` and the model listings carry no workspace content. `quack doctor` probes every
+configured provider whatever any workspace allows.
+
 ## Temperature and reasoning effort
 
 quack sends `temperature` only through Ollama's own API (`type = "ollama"`). Current Claude
@@ -586,6 +627,11 @@ advertised grants when `actor = false`. `--offline` skips network checks.
 - **`invalid_client` with `private_key_jwt`**: the issuer does not hold quack's current key.
   Register the output of `quack auth jwks NAME`, and restart `quack serve` after
   `--activate`.
+- **"provider 'X' is not allowed in this workspace"** (`403` from the server, exit code 1):
+  the workspace's allowed providers leave out the provider of a configured model. Add the
+  provider on the workspace's settings page, or move the model to an allowed provider.
+- **"model 'M' of provider 'X' runs in Ollama's cloud"**: the workspace restricts its
+  providers and the model has a `cloud` tag. Configure a local model, or allow every provider.
 - **A Bedrock credential error at the first request**: the AWS SDK found no valid
   credentials. Run `aws sso login` for the profile, or check `aws_profile` and `AWS_PROFILE`.
 

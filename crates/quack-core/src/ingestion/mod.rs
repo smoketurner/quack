@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod chunker;
 pub mod html;
 pub mod office;
@@ -11,18 +12,19 @@ use std::time::{Duration, Instant};
 use crate::embedding::EmbeddingModel;
 
 use crate::config::Config;
+use crate::crypto::sha256_hex;
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
 use crate::ids::{ChunkId, DocumentId};
 use crate::progress::{ChunkDone, RunControl};
-use crate::storage::control::sha256_hex;
 use crate::storage::workspace::{
     DocumentInfo, DocumentSource, DocumentStatus, NewChunk, NewDocument, WorkspaceDb, quote_ident,
 };
 use crate::storage::writer::Writer;
 use crate::text::NonBlankText;
+use budget::DecompressionBudget;
 use chunker::Chunker;
-use parser::{FileType, Load, Reader, Separator, TextFormat};
+use parser::{FileType, Load, PageCounts, Reader, Separator, TextFormat};
 
 /// Result of ingesting a single file into a workspace.
 #[derive(Debug)]
@@ -33,8 +35,8 @@ pub struct IngestResult {
     pub chunks_stored: u32,
     /// Tables a structured file loaded into: one, or one per workbook sheet.
     pub tables: Vec<String>,
-    /// Pages the parser could not read and skipped (PDF only).
-    pub pages_skipped: u32,
+    /// How the pages read (PDF only).
+    pub pages: Option<PageCounts>,
     /// How long embedding the chunks took, when a model ran.
     pub embedding_time: Option<Duration>,
 }
@@ -267,8 +269,10 @@ impl<M: EmbeddingModel> Processing<'_, M> {
         match &outcome {
             Ok(result) => {
                 let (chunks, tables) = (result.chunks_stored, result.tables.clone());
+                let pages = result.pages;
                 db.run(move |db| {
                     db.set_document_chunk_count(&id, chunks)?;
+                    db.set_document_pages(&id, pages)?;
                     db.set_document_tables(&id, &tables)?;
                     db.update_document_status(&id, DocumentStatus::Ready)
                 })
@@ -317,7 +321,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     file_type,
                     chunks_stored: 0,
                     tables: vec![table_name],
-                    pages_skipped: 0,
+                    pages: None,
                     embedding_time: None,
                 })
             }
@@ -325,7 +329,8 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 // Parsing the workbook is the slow part: off the runtime's
                 // workers, and not on the writer.
                 let bytes = data.to_vec();
-                let sheets = parse_off_runtime(move || xlsx::sheets(&bytes)).await?;
+                let budget = config.ingestion.decompression_budget();
+                let sheets = parse_off_runtime(move || xlsx::sheets(&bytes, budget)).await?;
                 let load = WorkbookLoad {
                     files_dir: config.workspace_files_dir(workspace_id),
                     doc_id: doc_id.clone(),
@@ -339,7 +344,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     file_type,
                     chunks_stored: 0,
                     tables,
-                    pages_skipped: 0,
+                    pages: None,
                     embedding_time: None,
                 })
             }
@@ -349,7 +354,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 let parsing = Parsing::new(config, format, filename, data);
                 let Parsed {
                     title,
-                    pages_skipped,
+                    pages,
                     chunks,
                 } = parse_off_runtime(move || parsing.run()).await?;
                 if let Some(title) = title {
@@ -357,12 +362,12 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     db.run(move |db| db.set_document_title_if_empty(&id, &title))
                         .await?;
                 }
-                if pages_skipped > 0 {
+                if let Some(note) = pages.and_then(PageCounts::note) {
                     tracing::warn!(
                         document = %doc_id,
                         file = %filename,
-                        pages_skipped,
-                        "ingested with unreadable pages skipped"
+                        pages = %note,
+                        "ingested with pages missing from the text"
                     );
                 }
                 control.check()?;
@@ -384,7 +389,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     file_type,
                     chunks_stored: stored.chunks,
                     tables: Vec::new(),
-                    pages_skipped,
+                    pages,
                     embedding_time: stored.embedding_time,
                 })
             }
@@ -397,6 +402,7 @@ struct Parsing {
     format: TextFormat,
     stem: Option<String>,
     data: Vec<u8>,
+    budget: DecompressionBudget,
     chunk_size: u32,
     chunk_overlap: u32,
     encoding: String,
@@ -405,7 +411,7 @@ struct Parsing {
 /// What parsing a document found.
 struct Parsed {
     title: Option<String>,
-    pages_skipped: u32,
+    pages: Option<PageCounts>,
     chunks: Vec<chunker::Chunk>,
 }
 
@@ -418,6 +424,7 @@ impl Parsing {
                 .and_then(|s| s.to_str())
                 .map(str::to_owned),
             data: data.to_vec(),
+            budget: config.ingestion.decompression_budget(),
             chunk_size: config.ingestion.chunk_size_tokens,
             chunk_overlap: config.ingestion.chunk_overlap_tokens,
             encoding: config.ingestion.tokenizer_encoding.clone(),
@@ -425,12 +432,12 @@ impl Parsing {
     }
 
     fn run(self) -> Result<Parsed> {
-        let extracted = self.format.extract(&self.data)?;
+        let extracted = self.format.extract(&self.data, self.budget)?;
         let chunks = Chunker::new(self.chunk_size, self.chunk_overlap, &self.encoding)?
             .document(&extracted, self.stem.as_deref())?;
         Ok(Parsed {
             title: extracted.title().map(str::to_owned),
-            pages_skipped: extracted.pages_skipped,
+            pages: extracted.pages,
             chunks,
         })
     }

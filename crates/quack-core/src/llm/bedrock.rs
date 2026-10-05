@@ -48,6 +48,7 @@ use aws_smithy_runtime_api::client::http::{
 };
 use aws_smithy_runtime_api::client::identity::Identity;
 use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+use aws_smithy_runtime_api::client::result::ConnectorError;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::error::display::DisplayErrorContext;
@@ -577,7 +578,7 @@ impl HttpConnector for LimitedConnector {
         };
         let permit = self.gates.permit(Some(model));
         HttpConnectorFuture::new(async move {
-            let permit = permit.await;
+            let permit = permit.await.map_err(|e| ConnectorError::user(e.into()))?;
             let mut response = inner.call(request).await?;
             let body = std::mem::replace(response.body_mut(), SdkBody::taken());
             *response.body_mut() = SdkBody::from_body_1_x(Holding {
@@ -642,7 +643,9 @@ mod tests {
 
     use super::*;
     use crate::config::{ProviderType, RequestLimit};
+    use crate::llm::egress::Egress;
     use crate::proxy::{Environment, Variable};
+    use crate::storage::control::AllowedProviders;
     use aws_types::service_config::{LoadServiceConfig, ServiceConfigKey};
 
     #[expect(clippy::panic, reason = "test failure path")]
@@ -703,13 +706,13 @@ mod tests {
         let calls: Vec<_> = (0..5)
             .map(|_| {
                 let (connector, uri) = (Arc::clone(connector), uri.to_owned());
-                tokio::spawn(async move {
+                tokio::spawn(Egress::scope(Some(Egress::NoWorkspace), async move {
                     let response = connector
                         .call(request(&uri))
                         .await
                         .unwrap_or_else(|e| fail(&format!("{e:?}")));
                     drain(response.into_body()).await
-                })
+                }))
             })
             .collect();
         for call in calls {
@@ -739,6 +742,46 @@ mod tests {
         assert_eq!(peak_of(&connector, &peak, model).await, 2);
         let sso = "https://portal.sso.us-east-1.amazonaws.com/federation/credentials";
         assert_eq!(peak_of(&connector, &peak, sso).await, 5);
+    }
+
+    #[tokio::test]
+    async fn a_model_call_the_scope_refuses_never_reaches_the_endpoint() {
+        let endpoint = SlowEndpoint::default();
+        let peak = Arc::clone(&endpoint.peak);
+        let name: ProviderName = "bedrock-egress-test"
+            .parse()
+            .unwrap_or_else(|e: Error| fail(&e.to_string()));
+        let connector = LimitedConnector {
+            inner: SharedHttpConnector::new(endpoint),
+            gates: ProviderGates::for_provider(&name, &ProviderConfig::new(ProviderType::Bedrock)),
+        };
+        let model = "https://bedrock-runtime.us-east-1.amazonaws.com/model/m/converse";
+        let call = |egress: Option<Egress>| {
+            let call = async { connector.call(request(model)).await };
+            async move {
+                match Egress::scope(egress, call).await {
+                    Ok(_) => String::from("sent"),
+                    Err(e) => DisplayErrorContext(&e).to_string(),
+                }
+            }
+        };
+        let elsewhere = AllowedProviders::Only([String::from("ollama")].into());
+        let refused = call(Some(Egress::Workspace(elsewhere))).await;
+        assert!(
+            refused.contains("provider 'bedrock-egress-test' is not allowed"),
+            "{refused}"
+        );
+        let unscoped = call(None).await;
+        assert!(
+            unscoped.contains("outside any workspace scope"),
+            "{unscoped}"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            0,
+            "nothing reached the endpoint"
+        );
+        assert_eq!(call(Some(Egress::NoWorkspace)).await, "sent");
     }
 
     fn static_signer(service: &'static str) -> Signer {

@@ -15,13 +15,15 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use quack_core::config::ServerConfig;
+use quack_core::crypto::sha256_hex;
 use quack_core::error::Error as CoreError;
 use quack_core::ids::{AuditId, UserId, WorkspaceId};
+use quack_core::llm::egress::Egress;
 use quack_core::oidc::Origin;
 use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditResource, Channel, Outcome, Role, Scope, TokenRow, UserRow,
-    WorkspaceRow, sha256_hex,
+    WorkspaceRow,
 };
 use quack_core::storage::sessions::SessionViewer;
 use quack_core::web_sessions::{SessionLookup, SessionToken};
@@ -636,7 +638,34 @@ impl Access {
             };
             access.identity.deny(app, &access.workspace, reason).await?;
         }
+        // From here on the request, and every job it submits, sends only
+        // to the model providers the workspace allows.
+        Egress::Workspace(access.workspace.allowed_providers.clone()).enter();
         Ok(access)
+    }
+
+    /// The model `built` for work on this workspace, or why not: a provider
+    /// the workspace's allow-list refuses is 403 and a denied row for
+    /// `action`, any other failure an error row, and the detail says which.
+    pub(crate) async fn model<T>(
+        &self,
+        app: &App,
+        action: AuditAction,
+        built: Result<T, CoreError>,
+    ) -> ApiResult<T> {
+        let error = match built {
+            Ok(model) => return Ok(model),
+            Err(error) => error,
+        };
+        self.audit(
+            app,
+            action,
+            None,
+            Outcome::of_failure(&error),
+            Some(serde_json::json!({ "error": error.to_string() })),
+        )
+        .await?;
+        Err(ApiError::from(error))
     }
 }
 

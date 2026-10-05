@@ -226,6 +226,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::ids::{ChunkId, DocumentId};
+    use crate::llm::egress::Egress;
     use schemars::schema_for;
 
     fn hit(n: u32) -> ChunkSearchResult {
@@ -334,6 +335,7 @@ mod tests {
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
     async fn a_rerank_model_scores_the_candidates_and_its_order_is_kept() {
+        Egress::scope(Some(Egress::NoWorkspace), async {
         let (base, seen) = answer_once(
             r#"{"results":[{"index":0,"relevance_score":0.2},{"index":2,"relevance_score":0.9},{"index":1,"relevance_score":-1.5}]}"#,
         )
@@ -369,6 +371,8 @@ mod tests {
                 "documents": ["passage 1", "passage 2", "passage 3"],
             })
         );
+        })
+        .await;
     }
 
     #[test]

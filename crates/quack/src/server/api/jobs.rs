@@ -134,7 +134,8 @@ pub(crate) async fn cancel(
 
 /// Every change to the workspace's jobs as SSE `job` events (a `JobInfo`
 /// each), starting with the current list as one `jobs` event. A client
-/// that falls behind gets a fresh `jobs` event rather than a gap.
+/// that falls behind gets a fresh `jobs` event rather than a gap. The
+/// stream ends when the server begins to stop.
 pub(crate) async fn stream(
     State(app): State<App>,
     identity: Identity,
@@ -153,7 +154,12 @@ pub(crate) async fn stream(
             return Some((Ok(event), (receiver, app, access, None)));
         }
         loop {
-            match receiver.recv().await {
+            let received = tokio::select! {
+                biased;
+                () = app.stopping.cancelled() => return None,
+                received = receiver.recv() => received,
+            };
+            match received {
                 Ok(job) if job.workspace_id.as_ref() == Some(&access.workspace.id) => {
                     let event = StreamEvent::Job
                         .event()

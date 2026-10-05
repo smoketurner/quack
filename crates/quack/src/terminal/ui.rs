@@ -642,6 +642,17 @@ impl PendingWrite<'_> {
                 Style::default().fg(Color::DarkGray),
             ));
         }
+        if let Some(notice) = self.notice {
+            lines.extend(
+                wrap::wrap(&[Span::raw(notice)], width.saturating_sub(3))
+                    .into_iter()
+                    .map(|row| {
+                        let mut spans = vec![Span::raw("   ")];
+                        spans.extend(row);
+                        Line::from(spans).style(Style::default().fg(Color::Yellow))
+                    }),
+            );
+        }
         lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(
