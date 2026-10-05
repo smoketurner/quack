@@ -17,7 +17,7 @@ use quack_core::import::{HostReach, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::{FileType, PageCounts};
 use quack_core::llm::CancellationToken;
 use quack_core::progress::{ChunkDone, RunControl};
-use quack_core::storage::control::ControlPlane;
+use quack_core::storage::control::{ControlPlane, WorkspaceName};
 use quack_core::storage::workspace::{
     ChunkScope, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk, NewDocument,
     Pinning, StatementKind, WorkspaceDb,
@@ -124,7 +124,7 @@ fn test_config(data_dir: &Path) -> Config {
     Config {
         general: GeneralConfig {
             data_dir: data_dir.to_path_buf(),
-            default_workspace: "test".into(),
+            default_workspace: WorkspaceName::default(),
             chat_model: None,
         },
         providers,
@@ -157,7 +157,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
     Config {
         general: GeneralConfig {
             data_dir: data_dir.to_path_buf(),
-            default_workspace: "test".into(),
+            default_workspace: WorkspaceName::default(),
             chat_model: None,
         },
         providers: BTreeMap::new(),

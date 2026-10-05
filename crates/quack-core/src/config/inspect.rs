@@ -526,8 +526,8 @@ fn general(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     );
     s.text(
         "default_workspace",
-        &general.default_workspace,
-        &default.default_workspace,
+        general.default_workspace.as_str(),
+        default.default_workspace.as_str(),
         None,
     );
     let chat_model = general.chat_model.as_ref().map(ModelSpec::to_string);

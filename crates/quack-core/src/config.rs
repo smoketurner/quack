@@ -12,6 +12,7 @@ use crate::graph::GraphOptions;
 use crate::ingestion::budget::DecompressionBudget;
 use crate::ontology::documents::DocumentEvidenceOptions;
 use crate::ontology::induction::TableEvidenceOptions;
+use crate::storage::control::WorkspaceName;
 use crate::text::Tokens;
 
 pub mod bedrock;
@@ -52,7 +53,7 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct GeneralConfig {
     pub data_dir: PathBuf,
-    pub default_workspace: String,
+    pub default_workspace: WorkspaceName,
     /// `PROVIDER/MODEL` used for chat and tool calling. Override: `QUACK_MODEL`.
     pub chat_model: Option<ModelSpec>,
 }
@@ -116,7 +117,7 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
-            default_workspace: String::from("default"),
+            default_workspace: WorkspaceName::default(),
             chat_model: None,
         }
     }
@@ -1988,10 +1989,27 @@ always_retrieve = true
 rerank = "model"
 "#;
 
+    /// `default_workspace` takes only a name a workspace may have.
+    #[test]
+    fn a_default_workspace_no_workspace_may_take_is_refused() {
+        let named = |name: &str| {
+            toml::from_str::<Config>(&format!("[general]\ndefault_workspace = \"{name}\"\n"))
+        };
+        assert!(named(" sales ").is_ok_and(|c| c.general.default_workspace.as_str() == "sales"));
+        let refused = named("a.b/c")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            refused.contains(&Error::InvalidWorkspaceName.to_string()),
+            "{refused}"
+        );
+    }
+
     #[test]
     fn default_config_values() {
         let config = Config::default();
-        assert_eq!(config.general.default_workspace, "default");
+        assert_eq!(config.general.default_workspace.as_str(), "default");
         assert!(config.general.chat_model.is_none());
         assert_eq!(config.ingestion.chunk_size_tokens, 512);
         assert_eq!(config.retrieval.top_k, 8);

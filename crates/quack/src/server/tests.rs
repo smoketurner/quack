@@ -159,7 +159,13 @@ impl Harness {
         let ws = self
             .app
             .control
-            .create_workspace(name, None, setup_audit())
+            .create_workspace(
+                &name
+                    .parse()
+                    .unwrap_or_else(|e: CoreError| fail(&e.to_string())),
+                None,
+                setup_audit(),
+            )
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         self.app

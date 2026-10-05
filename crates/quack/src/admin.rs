@@ -1,5 +1,5 @@
-//! Server administration from the command line: users, tokens, members,
-//! and the access audit log. Every mutation is itself audited on the `cli`
+//! Server administration from the command line: workspaces, users, tokens,
+//! members, and the access audit log. Every mutation is itself audited on the `cli`
 //! channel with no user, because the operator at the shell is implicit.
 
 use std::io::{IsTerminal, Write};
@@ -12,14 +12,19 @@ use quack_core::ids::WorkspaceId;
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, Expiry, IssuedToken,
-    Outcome, Role, Scope, UserKind, WorkspaceRow,
+    Outcome, Role, Scope, UserKind, WorkspaceName, WorkspaceRow,
 };
 
 use crate::text_or_json::TextOrJson;
 
-/// Server administration: users, tokens, membership, and the audit log.
+/// Server administration: workspaces, users, tokens, membership, and the
+/// audit log.
 #[derive(Subcommand)]
 pub(crate) enum AdminCommand {
+    /// Workspaces: create one or list them
+    #[command(subcommand)]
+    Workspace(WorkspaceAction),
+
     /// Server users: create one or list them
     #[command(subcommand)]
     User(UserAction),
@@ -41,12 +46,28 @@ impl AdminCommand {
     /// act on `workspace`.
     pub(crate) async fn run(self, config: &Config, workspace: Option<&str>) -> Result<()> {
         match self {
+            Self::Workspace(action) => run_workspace(config, action).await,
             Self::User(action) => run_user(config, action).await,
             Self::Token(action) => run_token(config, workspace, action).await,
             Self::Member(action) => run_member(config, workspace, action).await,
             Self::Audit(args) => run_audit(config, args).await,
         }
     }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WorkspaceAction {
+    /// Create a workspace; `-w NAME` then names it on every command
+    Create {
+        /// Non-empty, with no slashes or dots
+        name: WorkspaceName,
+    },
+    /// List workspaces
+    List {
+        /// `json` prints one JSON object per row
+        #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+        format: TextOrJson,
+    },
 }
 
 #[derive(Subcommand)]
@@ -152,6 +173,39 @@ enum AuditFormat {
     Ocsf,
 }
 
+pub(crate) async fn run_workspace(config: &Config, action: WorkspaceAction) -> Result<()> {
+    let control = ControlPlane::open(config).await?;
+    let stdout = std::io::stdout();
+    match action {
+        WorkspaceAction::Create { name } => {
+            if control
+                .find_workspace_by_name(name.as_str())
+                .await?
+                .is_some()
+            {
+                anyhow::bail!("workspace '{name}' already exists");
+            }
+            let entry = AuditEntry::new(AuditAction::Workspace, Outcome::Allowed, Channel::Cli);
+            let ws = control.create_workspace(&name, None, entry).await?;
+            let mut out = stdout.lock();
+            writeln!(out, "Created workspace '{}' ({})", ws.name, ws.id)?;
+            out.flush()?;
+        }
+        WorkspaceAction::List { format } => {
+            let workspaces = control.list_workspaces().await?;
+            let mut out = std::io::BufWriter::new(stdout.lock());
+            format.write_rows(
+                &mut out,
+                &workspaces,
+                "No workspaces yet. Run `quack workspace create NAME`.",
+                |out, ws| writeln!(out, "{}  {:<24} {}", ws.id, ws.name, ws.classification),
+            )?;
+            out.flush()?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> {
     let control = ControlPlane::open(config).await?;
     let stdout = std::io::stdout();
@@ -202,7 +256,9 @@ pub(crate) async fn run_token(
     action: TokenAction,
 ) -> Result<()> {
     let control = ControlPlane::open(config).await?;
-    let ws = existing_workspace(&control, config, workspace).await?;
+    let ws = control
+        .workspace_or_default(workspace, &config.general.default_workspace)
+        .await?;
     match action {
         TokenAction::Create {
             user,
@@ -304,7 +360,9 @@ pub(crate) async fn run_member(
     action: MemberAction,
 ) -> Result<()> {
     let control = ControlPlane::open(config).await?;
-    let ws = existing_workspace(&control, config, workspace).await?;
+    let ws = control
+        .workspace_or_default(workspace, &config.general.default_workspace)
+        .await?;
     let stdout = std::io::stdout();
     match action {
         MemberAction::Add { username, role } => {
@@ -380,13 +438,7 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
         None => None,
     };
     let workspace_id = match args.workspace.as_deref() {
-        Some(name) => Some(
-            control
-                .find_workspace_by_name(name)
-                .await?
-                .with_context(|| format!("no workspace named '{name}'"))?
-                .id,
-        ),
+        Some(name) => Some(control.workspace_named(name).await?.id),
         None => None,
     };
     let mut filter = AuditFilter {
@@ -498,20 +550,6 @@ impl<W: Write> AuditOutput<W> {
     }
 }
 
-/// The named workspace, or the default one, which must already exist: an
-/// admin command never creates one by mistyping it.
-async fn existing_workspace(
-    control: &ControlPlane,
-    config: &Config,
-    name: Option<&str>,
-) -> Result<WorkspaceRow> {
-    let name = name.unwrap_or(&config.general.default_workspace);
-    control
-        .find_workspace_by_name(name)
-        .await?
-        .with_context(|| format!("no workspace named '{name}'; create it by opening it once"))
-}
-
 /// Read a password: without echo from a terminal, else one line from stdin.
 fn read_password(prompt: &str) -> Result<String> {
     let stdin = std::io::stdin();
@@ -583,10 +621,13 @@ where
 mod tests {
     use super::*;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use quack_core::error::Error as CoreError;
 
     #[derive(clap::Parser)]
     #[command(no_binary_name = true)]
     enum Line {
+        #[command(subcommand)]
+        Workspace(WorkspaceAction),
         #[command(subcommand)]
         Token(TokenAction),
         #[command(subcommand)]
@@ -633,6 +674,27 @@ mod tests {
             .is_err()
         );
         assert!(parse(&["audit", "--outcome", "maybe"]).is_err());
+    }
+
+    /// `workspace create` takes only a name the API would accept, and
+    /// refuses any other with the same message.
+    #[test]
+    fn workspace_create_refuses_a_name_the_api_would() {
+        let parse = |args: &[&str]| <Line as clap::Parser>::try_parse_from(args);
+        assert!(matches!(
+            parse(&["workspace", "create", "sales"]),
+            Ok(Line::Workspace(WorkspaceAction::Create { name })) if name.as_str() == "sales"
+        ));
+        for refused in ["a.b/c", "a\\b", ""] {
+            let message = parse(&["workspace", "create", refused])
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(
+                message.contains(&CoreError::InvalidWorkspaceName.to_string()),
+                "{refused:?}: {message}"
+            );
+        }
     }
 
     // --- read_hidden_line: control-key handling --------------------------------

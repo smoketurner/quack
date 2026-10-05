@@ -90,6 +90,7 @@ data-layer, crypto, or dependency change:
 ```bash
 cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # SQL, no agent
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
+cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use
 cargo run --bin quack -- ingest sales.csv -w ws                                # file -> table(s) or chunks
 #   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX
 cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
@@ -311,6 +312,12 @@ entity that exists only in mapped table rows says so instead of returning nothin
 `entity` argument is offered only while the graph has nodes (`SearchDocumentsTool::with_model`, `text_to_sql::Modeled`),
 like the graph tools themselves. Ollama embedding requests go through `llm::OllamaEmbedder`,
 not rig's client, so they carry `keep_alive` and a chunk-sized `num_ctx`.
+
+Every command resolves its workspace through `ControlPlane::workspace_or_default`: `-w NAME`
+must name a workspace that exists (`Error::NoWorkspaceNamed`, exit 2, nothing created), and
+with no `-w` the `[general].default_workspace` is created, audited, on first use. A new
+workspace's name is a `storage::control::WorkspaceName` (trimmed, non-empty, no `/`, `\`, or
+`.`), the one rule `quack workspace create`, the API, the web console, and the config key share.
 
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with

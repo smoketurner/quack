@@ -10,7 +10,8 @@ use axum::response::IntoResponse;
 use quack_core::ids::WorkspaceId;
 use quack_core::storage::audit;
 use quack_core::storage::control::{
-    AuditAction, Outcome, ProviderAllowList, ResourceKind, Role, WorkspaceChanges, WorkspaceRow,
+    AuditAction, Outcome, ProviderAllowList, ResourceKind, Role, WorkspaceChanges, WorkspaceName,
+    WorkspaceRow,
 };
 use serde::{Deserialize, Serialize};
 
@@ -92,22 +93,22 @@ pub(crate) async fn create(
 
 impl Identity {
     /// Create a workspace, from the API or the web console: admins only, a
-    /// name without slashes or dots that is not taken; the creator becomes
-    /// its owner (in local mode everyone already is).
+    /// [`WorkspaceName`] that is not taken; the creator becomes its owner
+    /// (in local mode everyone already is).
     pub(crate) async fn create_workspace(&self, app: &App, name: &str) -> ApiResult<WorkspaceRow> {
         self.require_admin()?;
-        let name = name.trim();
-        if name.is_empty() || name.contains(['/', '\\', '.']) {
-            return Err(ApiError::bad_request(
-                "workspace name must be non-empty and contain no slashes or dots",
-            ));
-        }
-        if app.control.find_workspace_by_name(name).await?.is_some() {
+        let name: WorkspaceName = name.parse()?;
+        if app
+            .control
+            .find_workspace_by_name(name.as_str())
+            .await?
+            .is_some()
+        {
             return Err(ApiError::conflict("workspace exists"));
         }
         let owner = (app.mode == ServeMode::Login).then_some(&self.user_id);
         let entry = self.audit(AuditAction::Workspace, Outcome::Allowed);
-        Ok(app.control.create_workspace(name, owner, entry).await?)
+        Ok(app.control.create_workspace(&name, owner, entry).await?)
     }
 }
 

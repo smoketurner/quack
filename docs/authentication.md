@@ -47,6 +47,7 @@ An administrator creates password users and API tokens from the command line:
 ```bash
 quack user add alice            # prompts for the password
 quack user add admin --admin
+quack workspace create sales    # or create it in the web console
 quack token create -w sales --user alice --name reporting --scopes read,write --expires 90
 quack token list -w sales
 quack token revoke -w sales HASH          # a prefix of the hash is enough

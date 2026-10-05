@@ -67,6 +67,27 @@ enum Exit {
     AuthRequired,
 }
 
+impl Exit {
+    /// The exit a failure asks for, found anywhere in the error's chain;
+    /// `None` is a plain runtime error. `main` applies this to every
+    /// command's error, so no command maps it itself. An OAuth provider
+    /// without a usable token is exit 4: no command but `quack auth login`
+    /// can run a login flow. A workspace that does not exist, or a name
+    /// none can take, is a usage error.
+    fn of(err: &anyhow::Error) -> Option<Self> {
+        err.chain()
+            .find_map(|cause| match cause.downcast_ref::<CoreError>()? {
+                CoreError::AuthRequired { .. } | CoreError::Delegation { .. } => {
+                    Some(Self::AuthRequired)
+                }
+                CoreError::NoWorkspaceNamed(_) | CoreError::InvalidWorkspaceName => {
+                    Some(Self::Usage)
+                }
+                _ => None,
+            })
+    }
+}
+
 impl From<Exit> for ExitCode {
     fn from(exit: Exit) -> Self {
         Self::from(match exit {
@@ -557,12 +578,12 @@ async fn main() -> Result<ExitCode> {
         // The reader closed the pipe (`quack ... | head -1`): the command
         // did its job, so stop quietly like `git` and `ls` do (issue #68).
         Err(e) if is_broken_pipe(&e) => Ok(ExitCode::SUCCESS),
-        // Any command that reached a provider without a usable token exits
-        // 4, so scripts can tell "run `quack auth login`" from a failure.
-        Err(e) => match auth_exit_code(&e) {
-            Some(code) => {
+        // A missing login exits 4 and a workspace that does not exist
+        // exits 2, so scripts can tell either from a failure.
+        Err(e) => match Exit::of(&e) {
+            Some(exit) => {
                 tracing::error!("{e:#}");
-                Ok(code)
+                Ok(ExitCode::from(exit))
             }
             None => Err(e),
         },
@@ -1023,21 +1044,6 @@ async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     let policy = WritePolicy::Deny.allowed_if(allow_write);
     mcp::serve_stdio(config, db, reader_db, workspace, policy).await?;
     Ok(ExitCode::SUCCESS)
-}
-
-/// Exit 4 when the failure is an OAuth provider without a usable token,
-/// found anywhere in the error's chain: no command but `quack auth login`
-/// can run a login flow, so the message names it. `main` applies this to
-/// every command's error, so no command maps it itself.
-fn auth_exit_code(err: &anyhow::Error) -> Option<ExitCode> {
-    err.chain()
-        .any(|cause| {
-            matches!(
-                cause.downcast_ref::<CoreError>(),
-                Some(CoreError::AuthRequired { .. } | CoreError::Delegation { .. })
-            )
-        })
-        .then_some(ExitCode::from(Exit::AuthRequired))
 }
 
 /// `quack auth register`, signing the person in on this terminal when it
@@ -1540,8 +1546,8 @@ fn init_logging_at(default: &str) {
     CryptoModule::linked().log();
 }
 
-/// The configuration and the workspace a command runs in: the named one,
-/// or the default, created on first use.
+/// The configuration and the workspace a command runs in: the one `-w`
+/// names, which must exist, or the default, created on first use.
 struct OpenedWorkspace {
     config: Config,
     workspace: WorkspaceRow,
@@ -1551,15 +1557,18 @@ struct OpenedWorkspace {
 impl OpenedWorkspace {
     async fn resolve(workspace_name: Option<&str>) -> Result<Self> {
         let config = Config::load().context("failed to load configuration")?;
+        Self::in_config(config, workspace_name).await
+    }
+
+    /// The workspace `workspace_name` selects under `config`.
+    async fn in_config(config: Config, workspace_name: Option<&str>) -> Result<Self> {
         let control = ControlPlane::open(&config)
             .await
             .context("failed to open control plane")?;
-        let name =
-            workspace_name.map_or_else(|| config.general.default_workspace.clone(), str::to_owned);
         let workspace = control
-            .find_or_create_workspace(&name)
-            .await
-            .context("failed to resolve workspace")?;
+            .workspace_or_default(workspace_name, &config.general.default_workspace)
+            .await?;
+        let name = workspace.name.clone();
         Ok(Self {
             config,
             workspace,
@@ -1942,10 +1951,83 @@ mod tests {
             provider: String::from("corp"),
             reason: AuthReason::NoToken,
         };
-        assert!(auth_exit_code(&anyhow::Error::from(auth())).is_some());
-        assert!(auth_exit_code(&anyhow::Error::from(auth()).context("import failed")).is_some());
-        assert!(auth_exit_code(&anyhow::anyhow!(auth().to_string())).is_none());
-        assert!(auth_exit_code(&anyhow::anyhow!("something else")).is_none());
+        let exit = Some(Exit::AuthRequired);
+        assert_eq!(Exit::of(&anyhow::Error::from(auth())), exit);
+        assert_eq!(
+            Exit::of(&anyhow::Error::from(auth()).context("import failed")),
+            exit
+        );
+        assert_eq!(Exit::of(&anyhow::anyhow!(auth().to_string())), None);
+        assert_eq!(Exit::of(&anyhow::anyhow!("something else")), None);
+    }
+
+    fn config_in(dir: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.general.data_dir = dir.join("data");
+        config
+    }
+
+    /// `-w` with a name no workspace has is a usage error that says how to
+    /// create it, and it creates nothing.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn an_unknown_workspace_is_a_usage_error_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_in(dir.path());
+        let refused = OpenedWorkspace::in_config(config.clone(), Some("slaes"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            format!("{refused:#}"),
+            "no workspace named 'slaes'; create it with: quack workspace create slaes"
+        );
+        assert_eq!(Exit::of(&refused), Some(Exit::Usage));
+        let control = ControlPlane::open(&config).await.unwrap();
+        assert!(control.list_workspaces().await.unwrap().is_empty());
+    }
+
+    /// A workspace made with `quack workspace create` is the one `-w` then
+    /// opens, and creating it twice is refused.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn a_created_workspace_opens_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_in(dir.path());
+        let create = || admin::WorkspaceAction::Create {
+            name: "sales".parse().unwrap(),
+        };
+        admin::run_workspace(&config, create()).await.unwrap();
+        let opened = OpenedWorkspace::in_config(config.clone(), Some("sales"))
+            .await
+            .unwrap();
+        assert_eq!(opened.name, "sales");
+        opened.open_db().unwrap();
+
+        let again = admin::run_workspace(&config, create()).await.unwrap_err();
+        assert_eq!(again.to_string(), "workspace 'sales' already exists");
+        let control = ControlPlane::open(&config).await.unwrap();
+        assert_eq!(control.list_workspaces().await.unwrap().len(), 1);
+    }
+
+    /// With no `-w`, a new data directory gets the default workspace, and a
+    /// default name no workspace may take is a usage error.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn no_workspace_flag_creates_the_default_on_a_fresh_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_in(dir.path());
+        let opened = OpenedWorkspace::in_config(config.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(opened.name, "default");
+        let again = OpenedWorkspace::in_config(config, Some("default"))
+            .await
+            .unwrap();
+        assert_eq!(again.workspace.id, opened.workspace.id);
+
+        let invalid = anyhow::Error::from(CoreError::InvalidWorkspaceName);
+        assert_eq!(Exit::of(&invalid), Some(Exit::Usage));
     }
 
     #[test]

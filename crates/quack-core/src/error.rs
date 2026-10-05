@@ -21,6 +21,14 @@ pub enum Error {
     #[error("workspace not found: {0}")]
     WorkspaceNotFound(String),
 
+    /// A command named a workspace that does not exist.
+    #[error("no workspace named '{0}'; create it with: quack workspace create {0}")]
+    NoWorkspaceNamed(String),
+
+    /// Text that cannot name a workspace.
+    #[error("workspace name must be non-empty and contain no slashes or dots")]
+    InvalidWorkspaceName,
+
     #[error("embedding error: {0}")]
     Embedding(String),
 

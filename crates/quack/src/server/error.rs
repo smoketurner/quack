@@ -119,7 +119,9 @@ impl From<CoreError> for ApiError {
             CoreError::AuthRequired { .. }
             | CoreError::WorkspaceLocked { .. }
             | CoreError::WorkspaceTooNew { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            CoreError::WorkspaceNotFound(_) | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
+            CoreError::WorkspaceNotFound(_)
+            | CoreError::NoWorkspaceNamed(_)
+            | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
             CoreError::SignIn(_) | CoreError::Bearer(_) => StatusCode::UNAUTHORIZED,
             // The caller is known; this provider cannot act for them.
             CoreError::Delegation { .. } => StatusCode::FORBIDDEN,
@@ -128,6 +130,7 @@ impl From<CoreError> for ApiError {
             | CoreError::NoChatModel { .. }
             | CoreError::UnsupportedFileType(_)
             | CoreError::EmptyFile(_)
+            | CoreError::InvalidWorkspaceName
             | CoreError::Ontology(_) => StatusCode::BAD_REQUEST,
             CoreError::Analysis(_)
             | CoreError::UnknownValue { .. }

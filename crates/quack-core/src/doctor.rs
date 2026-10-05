@@ -116,6 +116,24 @@ impl Check {
         }
     }
 
+    /// A workspace with no row: only the default one is created by using
+    /// it, so any other name is a failure.
+    fn missing_workspace(name: &str, default: &str) -> Self {
+        if name == default {
+            return Self::new(
+                Area::Workspace,
+                Status::Ok,
+                format!("'{name}' does not exist yet; the first command that uses it creates it"),
+            );
+        }
+        Self::new(
+            Area::Workspace,
+            Status::Fail,
+            Error::NoWorkspaceNamed(name.to_owned()).to_string(),
+        )
+        .fix(format!("quack workspace create {name}"))
+    }
+
     /// Whether a turn's budgets fit the context window the listing reports
     /// for the chat model: the replayed history, the pinned documents, and
     /// the workspace context are each capped, and together they can fill it.
@@ -514,10 +532,8 @@ async fn check_workspace(
     control: Option<&ControlPlane>,
     options: &Options,
 ) {
-    let name = options
-        .workspace
-        .as_deref()
-        .unwrap_or(&config.general.default_workspace);
+    let default = config.general.default_workspace.as_str();
+    let name = options.workspace.as_deref().unwrap_or(default);
     let row = match control {
         Some(control) => match control.find_workspace_by_name(name).await {
             Ok(row) => row,
@@ -533,11 +549,7 @@ async fn check_workspace(
         None => None,
     };
     let Some(row) = row else {
-        report.push(Check::new(
-            Area::Workspace,
-            Status::Ok,
-            format!("'{name}' does not exist yet; the first command that uses it creates it"),
-        ));
+        report.push(Check::missing_workspace(name, default));
         return;
     };
     if !config.workspace_db_path(row.id.as_str()).exists() {
@@ -2007,6 +2019,35 @@ mod tests {
         let fix = check.fix.as_deref().unwrap();
         assert!(fix.contains("run quack 9.9.9 or newer"), "{fix}");
         assert!(fix.contains("restore the copy"), "{fix}");
+    }
+
+    /// A named workspace that does not exist is a failure with the command
+    /// that creates it; the default one is created by its first use.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn a_missing_workspace_fails_unless_it_is_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let inspection = inspection(dir.path(), None);
+        drop(ControlPlane::open(&inspection.config).await.unwrap());
+        let named = |name: &str| Options {
+            workspace: Some(name.to_owned()),
+            ..offline()
+        };
+
+        let report = run(&inspection, &named("slaes")).await;
+        let checks = find(&report, Area::Workspace);
+        let check = checks.first().unwrap();
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        assert!(check.summary.contains("no workspace named 'slaes'"));
+        assert_eq!(check.fix.as_deref(), Some("quack workspace create slaes"));
+
+        for options in [offline(), named("default")] {
+            let report = run(&inspection, &options).await;
+            let checks = find(&report, Area::Workspace);
+            let check = checks.first().unwrap();
+            assert_eq!(check.status, Status::Ok, "{check:?}");
+            assert!(check.summary.contains("does not exist yet"), "{check:?}");
+        }
     }
 
     #[tokio::test]

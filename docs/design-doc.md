@@ -1913,6 +1913,7 @@ cancellation token in its `TurnRequest`.
 quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query]
       [--allow-write] [-c | -r SESSION] [--stdin] [--verbose]
 quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
+quack workspace create NAME | list [--format json]
 quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed]
 quack docs [--format json] [--pin ID | --unpin ID | --delete ID]
 quack embeddings refresh [-w NAME] [-y]
@@ -1951,8 +1952,24 @@ and `-f ndjson`, same-named columns keep every value under suffixed keys (`a`, `
 Print mode streams text only on a terminal, and reprints the validated answer when
 validation changed what streamed; a pipeline gets the validated answer alone.
 
-**Exit codes:** 0 ok, 1 runtime error, 2 usage, 3 write refused, 4 auth required. A reader
-that closes stdout early (`| head`) ends the command quietly with 0.
+**Workspaces.** `-w NAME` names a workspace that exists. Any command given a name no
+workspace has stops with exit 2 and creates nothing:
+
+```
+no workspace named 'slaes'; create it with: quack workspace create slaes
+```
+
+`quack workspace create NAME` creates one and writes an audit row on the `cli` channel, as
+`quack user add` does; `quack workspace list` prints them. With no `-w`, a command uses
+`[general].default_workspace`, and the first command to use it creates it (audited the same
+way), so a new install needs no setup step. Naming the default with `-w` does the same.
+`ControlPlane::workspace_or_default` is the one place this is decided. A new workspace's
+name is a `WorkspaceName`: trimmed, non-empty, and without `/`, `\`, or `.`. The CLI verb,
+`POST /api/v1/workspaces`, the web console, and `default_workspace` in `config.toml` all go
+through that type. Workspaces created before the rule keep their names and still open.
+
+**Exit codes:** 0 ok, 1 runtime error, 2 usage (an unknown `-w` included), 3 write refused,
+4 auth required. A reader that closes stdout early (`| head`) ends the command quietly with 0.
 
 **`quack config`** and `quack doctor` are the only commands that skip `Config::load`.
 `config` reads the file itself, so it describes even a configuration every other command

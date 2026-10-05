@@ -164,6 +164,7 @@ supply chain shipments.
 ## Use it
 
 ```bash
+quack workspace create sales             # -w names a workspace that exists; with no -w, commands use "default"
 quack ingest sales.csv -w sales          # CSV, Parquet, JSON, and XLSX become tables
 quack ingest policy.pdf -w sales --pin   # PDF, DOCX, PPTX, HTML, Markdown, and text become chunks; --pin puts the full text in every prompt
 quack import postgres://u:p@host/db --table orders --from public.orders   # snapshot a Postgres or SQLite query, or an https file
@@ -185,6 +186,7 @@ quack graph extract -y                   # build the knowledge graph
 quack serve --local                      # web UI, REST API, and MCP on http://127.0.0.1:8080
 quack mcp -w sales                       # MCP over stdio for Claude Code and editors
 quack user add alice --admin             # users, tokens, members, and the audit log for `quack serve`
+quack workspace list                     # every workspace in the data directory
 ```
 
 ```bash
