@@ -1230,16 +1230,18 @@ impl App {
         if self.awaiting_permission() || self.picker.is_some() {
             return;
         }
+        // Terminals paste a line break as a bare carriage return; normalize
+        // it once, up front, so the file-loading and typed-in branches see
+        // the same input (shlex split on '\n', not '\r').
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if self.textarea.is_empty()
-            && let Some(paths) = Input::files(text)
+            && let Some(paths) = Input::files(&text)
         {
             self.scroll = Scroll::Latest;
             self.load_files(paths);
             return;
         }
-        // Terminals paste a line break as a bare carriage return.
-        self.textarea
-            .insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
+        self.textarea.insert_str(&text);
         self.reset_completion();
         self.history.leave();
     }
@@ -3507,6 +3509,59 @@ mod tests {
             "{}",
             last(&app).content
         );
+
+        // A drop of several files whose paths the terminal joins with a
+        // carriage return (CRLF or a bare CR) loads them at once too: both
+        // branches agree '\r' is a line break. Before the fix, the raw paste
+        // reached shlex, which splits only on ' ' | '\t' | '\n', so an
+        // internal '\r'/'\r\n' kept the paths stuck together and the drop was
+        // misrouted to the typed-in branch — escaped paths sat in the input
+        // and no Upload was announced until the user pressed Enter.
+        let more = dir.path().join("more notes.md");
+        std::fs::write(&more, "# More notes.").unwrap_or_else(|e| fail(&e.to_string()));
+        let more_dropped = more.display().to_string().replace(' ', "\\ ");
+        for sep in ["\r\n", "\r"] {
+            let before = app.messages.len();
+            assert!(
+                app.handle_terminal_event(&Event::Paste(format!("{dropped}{sep}{more_dropped}")))
+            );
+            assert!(
+                app.textarea.is_empty(),
+                "drop joined by {sep:?} was typed in, not loaded"
+            );
+            assert_eq!(
+                app.messages.len(),
+                before + 2,
+                "a {sep:?}-separated drop announces one Upload per file"
+            );
+            let first = app
+                .messages
+                .get(before)
+                .unwrap_or_else(|| fail("no first upload"));
+            assert_eq!(first.kind, MessageKind::Upload);
+            assert!(
+                first.content.contains("team notes.md (job #"),
+                "{}",
+                first.content
+            );
+            let second = app
+                .messages
+                .get(before + 1)
+                .unwrap_or_else(|| fail("no second upload"));
+            assert_eq!(second.kind, MessageKind::Upload);
+            assert!(
+                second.content.contains("more notes.md (job #"),
+                "{}",
+                second.content
+            );
+            settle(&mut app).await;
+            assert_ne!(
+                last(&app).kind,
+                MessageKind::Error,
+                "{}",
+                last(&app).content
+            );
+        }
 
         // Any other paste is typed in, line breaks kept.
         app.handle_terminal_event(&Event::Paste(String::from("SELECT 1\rFROM t\r\nLIMIT 1")));
