@@ -84,7 +84,9 @@ temperature = false                      # use the model's own sampling defaults
 `temperature = true` sends quack's temperature (0.1 for chat turns, 0.0 for extraction). If only
 some of a gateway's models reason, set `effort` on those models rather than in `[analysis]`,
 because a model that does not reason rejects the field. `quack config` lists every key, and
-`quack doctor` shows what the chat model is sent.
+`quack doctor` shows what the chat model is sent. It checks `background_effort` too when that differs from
+`effort`. A level the model refuses fails graph extraction and the ontology's document pass;
+a chat turn still answers, without model reranking and history summaries, and logs a warning.
 
 ## Credentials
 
