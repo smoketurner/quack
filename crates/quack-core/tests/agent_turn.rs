@@ -317,6 +317,49 @@ async fn a_tool_name_in_the_wrong_case_is_repaired() {
     assert_eq!(model.request_count(), 2, "repaired without another try");
 }
 
+/// The answer keeps what a call said before its tools ran and drops what
+/// a rejected call said, wherever in the turn the rejection falls.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_calls_text_is_left_out_of_the_answer() {
+    let tool = || call("t", "list_tables", serde_json::json!({}));
+    let unknown = || call("x", "default_api", serde_json::json!({}));
+    for (turns, answer) in [
+        (
+            vec![
+                turn(vec![text("Let me look into that. "), unknown()]),
+                turn(vec![text("There is one table, sales.")]),
+            ],
+            "There is one table, sales.",
+        ),
+        (
+            vec![turn(vec![text("   ")]), turn(vec![text("Two regions.")])],
+            "Two regions.",
+        ),
+        (
+            vec![
+                turn(vec![text("A. "), tool()]),
+                turn(vec![text("B. "), tool()]),
+                turn(vec![text("C.")]),
+            ],
+            "A. B. C.",
+        ),
+        (
+            vec![
+                turn(vec![text("A. "), tool()]),
+                turn(vec![text("Draft. "), unknown()]),
+                turn(vec![text("B. "), tool()]),
+                turn(vec![text("Final.")]),
+            ],
+            "A. B. Final.",
+        ),
+    ] {
+        let db = workspace();
+        let model = MockCompletionModel::from_stream_turns(turns);
+        let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "tables?").await;
+        assert_eq!(ran.answer().content, answer);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_tool_past_the_retry_budget_stops_with_the_note() {
     let db = workspace();
