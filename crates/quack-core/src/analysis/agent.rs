@@ -500,11 +500,11 @@ where
                     cutoff = Cutoff::of(call.finish_reason.as_ref());
                     output.call_ended();
                 }
+                MultiTurnStreamItem::ToolCall { .. }
+                | MultiTurnStreamItem::ToolExecutionCommitted { .. } => output.call_kept(),
+                MultiTurnStreamItem::ModelTurnRetried { .. } => output.call_rejected(),
                 MultiTurnStreamItem::StreamAssistantItem(_)
-                | MultiTurnStreamItem::StreamUserItem(_)
-                | MultiTurnStreamItem::ToolCall { .. }
-                | MultiTurnStreamItem::ToolExecutionCommitted { .. }
-                | MultiTurnStreamItem::ModelTurnRetried { .. } => {}
+                | MultiTurnStreamItem::StreamUserItem(_) => {}
             }
         }
 
@@ -594,9 +594,17 @@ fn turn_text(
 
 /// What the model has streamed this turn: its answer so far, and whether
 /// the model call under way has been reported as reasoning.
+///
+/// A call's text is provisional until rig runs a tool it asked for: a call
+/// rig rejects and asks again is left out of its final text, so it is left
+/// out here too.
 #[derive(Default)]
 struct ModelOutput {
     text: String,
+    /// How much of `text` came from calls whose tools ran.
+    kept: usize,
+    /// The last call ended and none of its tools has run yet.
+    ended: bool,
     reasoning: bool,
 }
 
@@ -604,6 +612,10 @@ impl ModelOutput {
     /// Keep answer text and pass it on, and tell the interface once per
     /// model call that the model is reasoning.
     fn take(&mut self, event: StreamEvent, recorder: &TurnRecorder) {
+        // Another call starting after one that ran no tool: rig rejected it.
+        if mem::take(&mut self.ended) {
+            self.text.truncate(self.kept);
+        }
         match event {
             StreamEvent::Text { text, .. } => {
                 self.text.push_str(&text);
@@ -624,7 +636,20 @@ impl ModelOutput {
     }
 
     fn call_ended(&mut self) {
+        self.ended = true;
         self.reasoning = false;
+    }
+
+    /// A tool the last call asked for ran, so its text stays.
+    const fn call_kept(&mut self) {
+        self.kept = self.text.len();
+        self.ended = false;
+    }
+
+    /// A hook rejected the last call for another try.
+    fn call_rejected(&mut self) {
+        self.text.truncate(self.kept);
+        self.ended = false;
     }
 }
 
