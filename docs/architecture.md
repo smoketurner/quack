@@ -75,7 +75,7 @@ nothing in it knows about HTTP, terminals, or windows.
 |---|---|
 | `main` | the clap command tree, print mode entry, the workspace-local subcommands (`ingest`, `docs`, `sessions`, `export`, `context`, `import`, `okf`, `auth`) |
 | `print` | `-p`: one turn, answer to stdout, steps to stderr, text or JSON |
-| `terminal` | the interactive session (ratatui): every submission a job on the work queue, the job strip, streaming per turn, inline steps, queued permission prompts, slash commands, charts |
+| `terminal` | the interactive session (ratatui): every submission a job on the work queue, the job strip, streaming per turn, inline steps, queued permission prompts, slash commands, charts, mouse selection copied to the clipboard (`selection`, `clipboard`) |
 | `ontology_cli`, `graph_cli`, `embeddings_cli`, `admin` | `quack ontology`, `quack graph`, `quack embeddings`, and the server administration commands |
 | `mcp` | the MCP server (rmcp) shared by `quack mcp` on stdio and `/mcp/v1/{workspace}` |
 | `server` | `quack serve`: `auth` (identity and `Access::resolve`), `api` (REST handlers), `web` (askama pages calling the same `Access` operations as the API, [web-ui.md](web-ui.md)), `run` (the audited background runs: embeddings refresh, graph and ontology document passes), `queue` (uploads and cancel bookkeeping on the work queue), `api::jobs` (the jobs API and stream), `state`, `mcp_http` |

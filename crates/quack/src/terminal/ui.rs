@@ -15,8 +15,10 @@ use ratatui::widgets::{
 };
 
 use crate::terminal::app::{App, Message, MessageKind, PendingWrite};
+use crate::terminal::clipboard::CopyStatus;
 use crate::terminal::commands::Suggestion;
 use crate::terminal::markdown;
+use crate::terminal::selection::{Row, TranscriptView, Wrap};
 use quack_core::analysis::events::DetailPreview;
 use quack_core::jobs::{JobCounts, JobInfo, JobState};
 
@@ -471,14 +473,29 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Lines are wrapped here, to the real width, so the scroll range is
     // computed on what is drawn and the newest content is reachable
     // (issue #49); the paragraph itself does no wrapping.
-    let lines = format_messages(app, usize::from(text_area.width));
-    let total_lines = lines.len();
+    let rows = format_messages(app, usize::from(text_area.width));
+    let total_lines = rows.len();
     let visible = usize::from(text_area.height);
     let max_scroll = total_lines.saturating_sub(visible);
     app.scroll_limit.set(max_scroll);
     let effective_scroll = max_scroll.saturating_sub(app.scroll.lines_back(max_scroll));
     let scroll_u16 = u16::try_from(effective_scroll).unwrap_or(u16::MAX);
+    app.view.set(TranscriptView {
+        area: text_area,
+        top: effective_scroll,
+        lines: total_lines,
+    });
 
+    let lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, row)| match app.selection.and_then(|selection| selection.columns(index)) {
+                Some(columns) => row.highlighted(columns),
+                None => row.line,
+            },
+        )
+        .collect();
     let text = Text::from(lines);
     let paragraph = Paragraph::new(text).scroll((scroll_u16, 0));
 
@@ -527,6 +544,15 @@ fn draw_input(
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if let Some(copy) = &app.copy_status {
+        let color = match copy {
+            CopyStatus::Copied(_) | CopyStatus::Sent(_) => Color::DarkGray,
+            CopyStatus::Failed(_) => Color::Red,
+        };
+        let line = Line::styled(format!(" {copy}"), Style::default().fg(color));
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let status = Line::from(vec![
         Span::styled(
             " enter",
@@ -565,11 +591,11 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(status), area);
 }
 
-/// A message's rendered lines and the fingerprint they were rendered from.
+/// A message's rendered rows and the fingerprint they were rendered from.
 #[derive(Debug, Clone)]
 pub(crate) struct Wrapped {
     pub(crate) key: u64,
-    lines: Vec<Line<'static>>,
+    rows: Vec<Row>,
 }
 
 impl PendingWrite<'_> {
@@ -633,32 +659,32 @@ impl PendingWrite<'_> {
     }
 }
 
-/// Every message's lines, wrapped to `width`. Each message's lines are
+/// Every message's rows, wrapped to `width`. Each message's rows are
 /// cached on the app by a fingerprint of what it shows, so a redraw
 /// re-renders only the messages that changed (the one streaming, as a
 /// rule), not the Markdown and wrapping of the whole transcript.
-pub(crate) fn format_messages(app: &App, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn format_messages(app: &App, width: usize) -> Vec<Row> {
     let mut cache = app.wrap_cache.borrow_mut();
     // Messages are appended, edited in place, or cleared; never removed
     // from the middle, so the cache stays aligned by index.
     cache.truncate(app.messages.len());
     cache.resize(app.messages.len(), None);
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
     for (msg, slot) in app.messages.iter().zip(cache.iter_mut()) {
         let key = msg.fingerprint(width, app.expand_steps);
         match slot {
-            Some(cached) if cached.key == key => lines.extend(cached.lines.iter().cloned()),
+            Some(cached) if cached.key == key => rows.extend(cached.rows.iter().cloned()),
             _ => {
-                let rendered = msg.lines(width, app.expand_steps);
-                lines.extend(rendered.iter().cloned());
+                let rendered = msg.rows(width, app.expand_steps);
+                rows.extend(rendered.iter().cloned());
                 *slot = Some(Wrapped {
                     key,
-                    lines: rendered,
+                    rows: rendered,
                 });
             }
         }
     }
-    lines
+    rows
 }
 
 impl Message {
@@ -677,8 +703,8 @@ impl Message {
         hasher.finish()
     }
 
-    /// Its lines, wrapped to `width`, with the blank line after it.
-    fn lines(&self, width: usize, expand_steps: bool) -> Vec<Line<'static>> {
+    /// Its rows, wrapped to `width`, with the blank line after it.
+    fn rows(&self, width: usize, expand_steps: bool) -> Vec<Row> {
         let (prefix, style) = match self.kind {
             MessageKind::User => (" > ", Style::default().fg(Color::Cyan)),
             MessageKind::Assistant => ("   ", Style::default()),
@@ -709,7 +735,7 @@ impl Message {
                 .map(|l| vec![Span::styled(l.to_owned(), style)])
                 .collect(),
         };
-        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut rows: Vec<Row> = Vec::new();
         let mut first = true;
         for spans in body {
             let p = if first {
@@ -718,10 +744,15 @@ impl Message {
             } else {
                 "   "
             };
+            let mut wrap = Wrap::Start;
             for row in wrap::wrap(&spans, width.saturating_sub(p.chars().count())) {
                 let mut with_prefix = vec![Span::styled(p.to_owned(), prompt_style)];
                 with_prefix.extend(row);
-                lines.push(Line::from(with_prefix));
+                rows.push(Row {
+                    line: Line::from(with_prefix),
+                    wrap,
+                });
+                wrap = Wrap::Continued;
             }
         }
         if let Some(chart) = &self.chart {
@@ -729,11 +760,11 @@ impl Message {
             for row in chart.lines(chart_width) {
                 let mut with_prefix = vec![Span::raw("   ")];
                 with_prefix.extend(row.spans);
-                lines.push(Line::from(with_prefix));
+                rows.push(Row::start(Line::from(with_prefix)));
             }
         }
-        lines.push(Line::from(""));
-        lines
+        rows.push(Row::start(Line::from("")));
+        rows
     }
 
     /// A step: its header and outcome, then the detail in full when
@@ -826,7 +857,7 @@ pub(crate) mod wrap {
     }
 
     /// Consecutive graphemes of one style back into spans.
-    fn regroup(cells: &[StyledGrapheme<'_>]) -> Vec<Span<'static>> {
+    pub(crate) fn regroup(cells: &[StyledGrapheme<'_>]) -> Vec<Span<'static>> {
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut current = String::new();
         let mut current_style: Option<Style> = None;
