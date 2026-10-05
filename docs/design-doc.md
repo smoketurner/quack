@@ -304,7 +304,8 @@ which rebuilds DuckDB's "Did you mean" and "Candidate bindings" suggestions from
 -- workspace metadata
 CREATE TABLE _quack_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   -- schema_version, embedding_dimension (the width of the vector columns),
-  -- graph_built_with_ontology_version, graph_drift
+  -- graph_built_with_ontology_version, graph_drift,
+  -- written_by_quack, written_by_duckdb (the versions that last opened the file)
 
 -- every embedding profile a stored vector was made under (section 6.1)
 CREATE TABLE _quack_embedding_profiles (
@@ -1770,7 +1771,8 @@ fixed-set values, and paging. The request log records each request's route templ
   merge or candidate `action`, an extraction `source`) is refused while the request is
   read: 422 for a JSON body, 400 for a query string, listing the accepted values.
 - 404: a missing session, document, ontology version, merge proposal, or candidate.
-- 503: a provider that needs `quack auth login`, or a workspace another process holds.
+- 503: a provider that needs `quack auth login`, a workspace another process holds, or a
+  workspace file a newer quack upgraded (`docs/migrations.md`).
 - 400: a question with no chat model configured.
 
 ```
@@ -1968,7 +1970,9 @@ needs one:
 - crypto module: a Linux build without FIPS warns;
 - data directory: writable; warns when group or others can read it;
 - `control.db`: opens and migrates;
-- workspace: opens; embedding dimension agrees;
+- workspace: opens, with the schema version and the quack and DuckDB versions the file
+  records; a file a newer quack upgraded fails, and the fix names the quack to run;
+  embedding dimension agrees;
 - each configured model: credential present; plain HTTP off this machine with a credential
   warns; the provider's model list, fetched through the rig client a turn uses
   (`llm::ChatClient::models`, so the same `LimitedHttp`, headers, and bearer), proves it is

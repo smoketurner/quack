@@ -81,6 +81,22 @@ pub enum Error {
     #[error("workspace file {} is open in another quack process", path.display())]
     WorkspaceLocked { path: PathBuf },
 
+    /// A newer quack upgraded the workspace file past the schema this one
+    /// knows; it is left as it was.
+    #[error(
+        "workspace file {} has schema version {recorded}, written by {written_by}; this quack ({}) \
+         reads up to version {supported}. Run {written_by}, or restore the copy of the workspace \
+         made before the upgrade",
+        path.display(),
+        env!("CARGO_PKG_VERSION")
+    )]
+    WorkspaceTooNew {
+        path: PathBuf,
+        recorded: u32,
+        supported: u32,
+        written_by: WrittenBy,
+    },
+
     /// The workspace's writer thread is gone, so no write can run.
     #[error("the workspace writer has stopped")]
     WriterStopped,
@@ -181,6 +197,20 @@ impl fmt::Display for AuthReason {
                 f.write_str("the token expired and the issuer gave no refresh token")
             }
             Self::RefreshFailed(e) => write!(f, "refresh failed: {e}"),
+        }
+    }
+}
+
+/// The quack version a workspace file says last wrote it; files from before
+/// the version was recorded have none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrittenBy(pub Option<String>);
+
+impl fmt::Display for WrittenBy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(version) => write!(f, "quack {version} or newer"),
+            None => f.write_str("a newer quack"),
         }
     }
 }

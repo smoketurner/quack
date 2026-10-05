@@ -32,7 +32,7 @@ use crate::llm::{ChatClient, ProviderModels, RerankModel};
 use crate::oidc::SignIn;
 use crate::proxy::Proxies;
 use crate::storage::control::ControlPlane;
-use crate::storage::workspace::WorkspaceDb;
+use crate::storage::workspace::{MetaKey, WorkspaceDb};
 use crate::text::Count;
 use rig::ProviderError;
 use rig::error::ErrorKind;
@@ -552,13 +552,22 @@ async fn check_workspace(
         Ok(db) => {
             let tables = db.list_tables().map_or(0, |t| t.len());
             let documents = db.list_documents().map_or(0, |d| d.len());
+            let recorded = |key| {
+                db.meta(key)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| String::from("unrecorded"))
+            };
             report.push(Check::new(
                 Area::Workspace,
                 Status::Ok,
                 format!(
-                    "'{name}' opens: {}, {}",
+                    "'{name}' opens: {}, {}; schema version {}, written by quack {} with DuckDB {}",
                     Count(tables, "table"),
-                    Count(documents, "document")
+                    Count(documents, "document"),
+                    recorded(MetaKey::SchemaVersion),
+                    recorded(MetaKey::WrittenByQuack),
+                    recorded(MetaKey::WrittenByDuckDb)
                 ),
             ));
             if let Some(note) = db.embedding_status().ok().and_then(|s| s.note()) {
@@ -577,6 +586,20 @@ async fn check_workspace(
                      so it was not checked"
                 ),
             ));
+        }
+        Err(ref e @ Error::WorkspaceTooNew { ref written_by, .. }) => {
+            let fix = format!(
+                "run {written_by}, or restore the copy of the workspace directory made before \
+                 the upgrade; this quack left the file as it was"
+            );
+            report.push(
+                Check::new(
+                    Area::Workspace,
+                    Status::Fail,
+                    format!("'{name}' does not open: {e}"),
+                )
+                .fix(fix),
+            );
         }
         Err(e) => {
             report.push(
@@ -1606,6 +1629,7 @@ impl std::fmt::Display for ErrorChain<'_> {
 mod tests {
     use super::*;
     use crate::proxy::{Environment, Variable};
+    use crate::storage::control::{AuditAction, AuditEntry, Channel, Outcome};
 
     fn proxy_checks(environment: Environment) -> Vec<Check> {
         let mut report = Report::default();
@@ -1939,6 +1963,50 @@ mod tests {
             matches!(local.as_slice(), [(Status::Warn, s)] if s.contains("ignored")),
             "{local:?}"
         );
+    }
+
+    /// The workspace check names the versions the file records, and a file
+    /// a newer quack upgraded is a failure whose fix names that quack.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn the_workspace_check_reports_versions_and_fails_on_a_newer_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let inspection = inspection(dir.path(), None);
+        let config = &inspection.config;
+        let control = ControlPlane::open(config).await.unwrap();
+        let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli);
+        let workspace = control
+            .create_workspace(&config.general.default_workspace, None, entry)
+            .await
+            .unwrap();
+        drop(control);
+        let db = WorkspaceDb::open(config, workspace.id.as_str()).unwrap();
+        let schema = db.meta(MetaKey::SchemaVersion).unwrap().unwrap();
+        drop(db);
+
+        let report = run(&inspection, &offline()).await;
+        let checks = find(&report, Area::Workspace);
+        let check = checks.first().unwrap();
+        assert_eq!(check.status, Status::Ok, "{check:?}");
+        let versions = format!(
+            "schema version {schema}, written by quack {} with DuckDB v",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(check.summary.contains(&versions), "{check:?}");
+
+        let db = WorkspaceDb::open(config, workspace.id.as_str()).unwrap();
+        db.set_meta(MetaKey::SchemaVersion, "99").unwrap();
+        db.set_meta(MetaKey::WrittenByQuack, "9.9.9").unwrap();
+        drop(db);
+
+        let report = run(&inspection, &offline()).await;
+        let checks = find(&report, Area::Workspace);
+        let check = checks.first().unwrap();
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        assert!(check.summary.contains("schema version 99"), "{check:?}");
+        let fix = check.fix.as_deref().unwrap();
+        assert!(fix.contains("run quack 9.9.9 or newer"), "{fix}");
+        assert!(fix.contains("restore the copy"), "{fix}");
     }
 
     #[tokio::test]

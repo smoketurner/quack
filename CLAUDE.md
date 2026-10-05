@@ -18,7 +18,9 @@ section 17 for where the code still lags. The chosen stack:
 - **Workspace** of crates under `crates/` (edition 2024, resolver 3, MSRV 1.99.0)
 - **DuckDB** (via `duckdb-rs`), one file per workspace, holding everything classified
   about that workspace: user tables, chunks, graph, ontology, context, sessions, audit
-  detail (all internal tables prefixed `_quack_`)
+  detail (all internal tables prefixed `_quack_`); the file records its schema version and
+  the quack and DuckDB versions that wrote it, and a quack older than the file refuses it
+  untouched (`Error::WorkspaceTooNew`, `docs/migrations.md`)
 - **SQLite** (via `sqlx`) for `control.db` in server mode: users, workspaces, membership,
   tokens, and the mandatory append-only access audit log; nothing workspace-revealing
 - **sea-query** for type-safe SQL generation against `control.db`; bound parameters for

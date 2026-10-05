@@ -114,10 +114,11 @@ impl From<CoreError> for ApiError {
     fn from(err: CoreError) -> Self {
         let status = match &err {
             // The request is fine; the server cannot serve it until a login
-            // happens or another process lets go of the workspace file.
-            CoreError::AuthRequired { .. } | CoreError::WorkspaceLocked { .. } => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            // happens, another process lets go of the workspace file, or a
+            // quack new enough for the file runs.
+            CoreError::AuthRequired { .. }
+            | CoreError::WorkspaceLocked { .. }
+            | CoreError::WorkspaceTooNew { .. } => StatusCode::SERVICE_UNAVAILABLE,
             CoreError::WorkspaceNotFound(_) | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
             CoreError::SignIn(_) | CoreError::Bearer(_) => StatusCode::UNAUTHORIZED,
             // The caller is known; this provider cannot act for them.
