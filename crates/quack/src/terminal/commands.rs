@@ -328,11 +328,92 @@ impl Input {
         if let Some(path) = Self::file(text.trim_matches('\'').trim_matches('"')) {
             return Some(vec![path]);
         }
-        let paths: Vec<PathBuf> = shlex::split(text)?
+        let paths: Vec<PathBuf> = Self::shell_words(text)?
             .iter()
             .map(|word| Self::file(word))
             .collect::<Option<_>>()?;
         (!paths.is_empty()).then_some(paths)
+    }
+
+    /// The shell words in `text`, with the same quoting and escaping as
+    /// `shlex::split` — a backslash escapes the next character, and single and
+    /// double quotes group a word — but a `#` at the start of a word is a
+    /// literal `#`, not a comment to end of line.
+    ///
+    /// `shlex` (the workspace `=2.0.1` pin) treats a leading `#` as a comment,
+    /// so a bare, working-directory-relative file whose name begins with `#`
+    /// (an Emacs auto-save such as `#notes.md#`, for instance) — and every
+    /// file named after it — would vanish from a multi-file line, loading
+    /// only the earlier names with no error. `/ingest`'s `path` is captured
+    /// as `VERBATIM` to avoid exactly that, and `files` re-splits verbatim
+    /// text through here, so the comment rule must stay out. Returns `None`
+    /// for an unterminated quote or a trailing backslash, as `shlex::split`
+    /// does.
+    fn shell_words(text: &str) -> Option<Vec<String>> {
+        fn parse_double<I: Iterator<Item = char>>(iter: &mut I, out: &mut String) -> bool {
+            loop {
+                match iter.next() {
+                    Some('\\') => match iter.next() {
+                        Some(c @ ('$' | '`' | '"' | '\\')) => out.push(c),
+                        Some('\n') => {}
+                        Some(c) => {
+                            out.push('\\');
+                            out.push(c);
+                        }
+                        None => return false,
+                    },
+                    Some('"') => return true,
+                    Some(c) => out.push(c),
+                    None => return false,
+                }
+            }
+        }
+        fn parse_single<I: Iterator<Item = char>>(iter: &mut I, out: &mut String) -> bool {
+            loop {
+                match iter.next() {
+                    Some('\'') => return true,
+                    Some(c) => out.push(c),
+                    None => return false,
+                }
+            }
+        }
+
+        let mut iter = text.chars();
+        let mut words = Vec::new();
+        loop {
+            // Skip whitespace between words; unlike shlex, `#` starts a word.
+            let Some(mut ch) = iter.find(|c| !matches!(*c, ' ' | '\t' | '\n')) else {
+                return Some(words);
+            };
+            let mut word = String::new();
+            loop {
+                match ch {
+                    '"' => {
+                        if !parse_double(&mut iter, &mut word) {
+                            return None;
+                        }
+                    }
+                    '\'' => {
+                        if !parse_single(&mut iter, &mut word) {
+                            return None;
+                        }
+                    }
+                    '\\' => {
+                        let c = iter.next()?;
+                        if c != '\n' {
+                            word.push(c);
+                        }
+                    }
+                    ' ' | '\t' | '\n' => break,
+                    c => word.push(c),
+                }
+                match iter.next() {
+                    Some(c) => ch = c,
+                    None => break,
+                }
+            }
+            words.push(word);
+        }
     }
 
     /// `name` as a path, when it is a file quack can load: `~/` for the
@@ -1001,5 +1082,127 @@ mod tests {
         // One name that is not a file makes the whole line something else.
         assert!(Input::files(&format!("{escaped} /nowhere/notes.md")).is_none());
         assert!(Input::files(&format!("summarize {escaped}")).is_none());
+    }
+
+    #[test]
+    fn shell_words_keeps_a_hash_at_the_start_of_a_word() {
+        // A bare `#` at the start of a shell word is a file name (`#drafts.md`,
+        // an Emacs auto-save, ...) — not a comment to end of line. `shlex::split`
+        // would drop the `#word` and everything after it; `shell_words` keeps it.
+        assert_eq!(
+            Input::shell_words("notes.md #drafts.md"),
+            Some(vec![String::from("notes.md"), String::from("#drafts.md")])
+        );
+        assert_eq!(
+            Input::shell_words("#drafts.md notes.md"),
+            Some(vec![String::from("#drafts.md"), String::from("notes.md")])
+        );
+        // Everything after a mid-line `#`-word survives too.
+        assert_eq!(
+            Input::shell_words("a.md b.md #c.md d.md"),
+            Some(vec![
+                String::from("a.md"),
+                String::from("b.md"),
+                String::from("#c.md"),
+                String::from("d.md"),
+            ])
+        );
+        // A `#` mid-word is already literal in shlex and stays so here.
+        assert_eq!(
+            Input::shell_words("foo#bar baz.md"),
+            Some(vec![String::from("foo#bar"), String::from("baz.md")])
+        );
+        assert_eq!(
+            Input::shell_words("/abs/notes.md /abs/#drafts.md"),
+            Some(vec![
+                String::from("/abs/notes.md"),
+                String::from("/abs/#drafts.md"),
+            ])
+        );
+        // A `#` inside quotes is literal, as in shlex; it is not escaped.
+        assert_eq!(
+            Input::shell_words("\"#drafts.md\" notes.md"),
+            Some(vec![String::from("#drafts.md"), String::from("notes.md")])
+        );
+        assert_eq!(
+            Input::shell_words("'#drafts.md' notes.md"),
+            Some(vec![String::from("#drafts.md"), String::from("notes.md")])
+        );
+        // The shell quoting a terminal writes on drop is still split apart.
+        assert_eq!(
+            Input::shell_words("q3\\ review\\ \\(final\\).md draft.md"),
+            Some(vec![
+                String::from("q3 review (final).md"),
+                String::from("draft.md"),
+            ])
+        );
+        assert_eq!(
+            Input::shell_words("'q3 review (final).md' draft.md"),
+            Some(vec![
+                String::from("q3 review (final).md"),
+                String::from("draft.md"),
+            ])
+        );
+        // Malformed input matches shlex::split, returning None.
+        assert_eq!(Input::shell_words("'unclosed"), None);
+        assert_eq!(Input::shell_words("\"unclosed"), None);
+        assert_eq!(Input::shell_words("trailing\\"), None);
+        // Empty and whitespace-only input yield no words.
+        assert_eq!(Input::shell_words(""), Some(Vec::new()));
+        assert_eq!(Input::shell_words("   "), Some(Vec::new()));
+    }
+
+    /// Borrow the process working directory for a test that resolves relative
+    /// file names, and restore it on drop — even if an assertion unwinds.
+    struct RestoredCwd(PathBuf);
+    impl Drop for RestoredCwd {
+        fn drop(&mut self) {
+            // Best effort: the test only borrows the cwd; a failed restore
+            // cannot change the assertions already run.
+            let _restore = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn files_ingest_a_hash_prefix_in_a_line_of_files() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let first = dir.path().join("notes.md");
+        let hash = dir.path().join("#drafts.md");
+        let after = dir.path().join("after.md");
+        std::fs::write(&first, "a").unwrap_or_else(|e| fail(&e.to_string()));
+        std::fs::write(&hash, "b").unwrap_or_else(|e| fail(&e.to_string()));
+        std::fs::write(&after, "c").unwrap_or_else(|e| fail(&e.to_string()));
+
+        let saved = std::env::current_dir().unwrap_or_else(|e| fail(&e.to_string()));
+        let _guard = RestoredCwd(saved);
+        std::env::set_current_dir(dir.path()).unwrap_or_else(|e| fail(&e.to_string()));
+
+        // A bare, working-directory-relative `#`-name mid-line is kept, not
+        // dropped as a shell comment: both files load, with no error.
+        assert_eq!(
+            Input::files("notes.md #drafts.md"),
+            Some(vec![PathBuf::from("notes.md"), PathBuf::from("#drafts.md")])
+        );
+        // Leading `#`-name now loads too: the whole line is files, not a
+        // comment that `shlex::split` would discard.
+        assert_eq!(
+            Input::files("#drafts.md notes.md"),
+            Some(vec![PathBuf::from("#drafts.md"), PathBuf::from("notes.md")])
+        );
+        // Everything after a mid-line `#`-name survives, not just the first.
+        assert_eq!(
+            Input::files("notes.md #drafts.md after.md"),
+            Some(vec![
+                PathBuf::from("notes.md"),
+                PathBuf::from("#drafts.md"),
+                PathBuf::from("after.md"),
+            ])
+        );
+        // Absolute paths with a mid-word `#` still load both (drift check
+        // against the safe absolute-path path drag-and-drop produces).
+        assert_eq!(
+            Input::files(&format!("{} {}", first.display(), hash.display())),
+            Some(vec![first, hash])
+        );
     }
 }
