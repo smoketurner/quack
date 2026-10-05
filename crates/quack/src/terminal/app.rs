@@ -16,6 +16,7 @@ use ratatui::style::{Color, Style};
 use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::{broadcast, mpsc};
 
+use jiff::Timestamp;
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::citations::{Citation, Sources};
 use quack_core::analysis::events::{
@@ -326,6 +327,58 @@ struct Turn {
     /// Index into `messages` of the step line being filled in.
     open_step: Option<usize>,
     progress: TurnProgress,
+    phase: Phase,
+}
+
+/// What a running turn is doing, for its row in the job strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// No output from the model yet: since the job started, or since
+    /// the tool before this model call finished.
+    Waiting {
+        since: Option<Timestamp>,
+    },
+    /// The model is reasoning, which the transcript does not show.
+    Thinking {
+        since: Timestamp,
+    },
+    Answering,
+    Tool(ToolName),
+}
+
+impl Phase {
+    /// The phase `event` leaves the turn in, at `now`.
+    fn after(self, event: &AgentEvent, now: Timestamp) -> Self {
+        match event {
+            AgentEvent::Reasoning => match self {
+                // More reasoning in one model call keeps its start.
+                Self::Thinking { .. } => self,
+                Self::Waiting { .. } | Self::Answering | Self::Tool(_) => {
+                    Self::Thinking { since: now }
+                }
+            },
+            AgentEvent::TextDelta(_) => Self::Answering,
+            AgentEvent::ToolStarted { tool, .. } => Self::Tool(*tool),
+            AgentEvent::ToolFinished(_) => Self::Waiting { since: Some(now) },
+            AgentEvent::Status(_)
+            | AgentEvent::PermissionRequired(_)
+            | AgentEvent::TurnComplete(_)
+            | AgentEvent::Failed(_) => self,
+        }
+    }
+
+    /// `thinking 41s`, as of `now`, for a job that started at `started`.
+    pub(crate) fn note(self, started: Option<Timestamp>, now: Timestamp) -> String {
+        let seconds = |since: Option<Timestamp>| {
+            since.map_or(0, |since| now.duration_since(since).as_secs().max(0))
+        };
+        match self {
+            Self::Waiting { since } => format!("waiting {}s", seconds(since.or(started))),
+            Self::Thinking { since } => format!("thinking {}s", seconds(Some(since))),
+            Self::Answering => String::from("answering"),
+            Self::Tool(tool) => format!("running {tool}"),
+        }
+    }
 }
 
 /// Where a turn is. Its end (`TurnComplete` or `Failed`) and the close of
@@ -927,6 +980,14 @@ impl App {
     }
 
     /// Queued and running jobs, for the status line.
+    /// What the turn running as `job` is doing, if it is a turn.
+    pub(crate) fn phase_of(&self, job: &JobInfo) -> Option<Phase> {
+        self.turns
+            .iter()
+            .find(|turn| turn.job.id == job.id)
+            .map(|turn| turn.phase)
+    }
+
     pub(crate) fn job_counts(&self) -> JobCounts {
         self.jobs.counts(None)
     }
@@ -1264,6 +1325,7 @@ impl App {
 
     fn handle_turn_event(&mut self, turn: &mut Turn, event: AgentEvent) {
         let visible = turn.session_id == self.session_id;
+        turn.phase = turn.phase.after(&event, Timestamp::now());
         match event {
             AgentEvent::Status(status) if visible => self.note(MessageKind::System, status),
             AgentEvent::TextDelta(text) if visible => {
@@ -1292,6 +1354,7 @@ impl App {
                 }
             }
             AgentEvent::Status(_)
+            | AgentEvent::Reasoning
             | AgentEvent::TextDelta(_)
             | AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolFinished(_) => {}
@@ -2621,6 +2684,7 @@ impl App {
             streaming: None,
             open_step: None,
             progress: TurnProgress::Streaming,
+            phase: Phase::Waiting { since: None },
         });
         if let Some(previous) = behind {
             self.note(
@@ -2788,6 +2852,7 @@ mod tests {
             streaming: None,
             open_step: None,
             progress: TurnProgress::Streaming,
+            phase: Phase::Waiting { since: None },
         }
     }
 
@@ -3584,6 +3649,99 @@ mod tests {
         assert_eq!(app.session_id, newer.id);
     }
 
+    #[test]
+    fn a_turns_phase_follows_its_events_and_counts_seconds() {
+        let at = |second: i64| {
+            Timestamp::from_second(1_000_000 + second).unwrap_or_else(|e| fail(&e.to_string()))
+        };
+        let started = Some(at(0));
+        let phase = Phase::Waiting { since: None };
+        assert_eq!(phase.note(started, at(3)), "waiting 3s");
+        assert_eq!(phase.note(None, at(3)), "waiting 0s", "not started yet");
+
+        let phase = phase.after(&AgentEvent::Reasoning, at(3));
+        assert_eq!(phase.note(started, at(44)), "thinking 41s");
+        // More reasoning in the same model call keeps counting from its start.
+        let phase = phase.after(&AgentEvent::Reasoning, at(20));
+        assert_eq!(phase.note(started, at(44)), "thinking 41s");
+        // A status line says nothing about the phase.
+        let phase = phase.after(&AgentEvent::Status(String::from("loading")), at(21));
+        assert_eq!(phase, Phase::Thinking { since: at(3) });
+
+        let phase = phase.after(
+            &AgentEvent::ToolStarted {
+                tool: ToolName::RunSql,
+                detail: String::new(),
+            },
+            at(50),
+        );
+        assert_eq!(phase.note(started, at(51)), "running run_sql");
+        // After a tool the model is called again, and the wait starts over.
+        let phase = Phase::Waiting {
+            since: Some(at(52)),
+        };
+        assert_eq!(phase.note(started, at(59)), "waiting 7s");
+        let phase = phase.after(&AgentEvent::TextDelta(String::from("Hi")), at(60));
+        assert_eq!(phase.note(started, at(61)), "answering");
+        // A clock that steps back never shows a negative count.
+        assert_eq!(
+            Phase::Thinking { since: at(9) }.note(started, at(5)),
+            "thinking 0s"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_job_strip_says_what_a_running_turn_is_doing() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let turn = waiting_turn(&app);
+        let job = turn.job.id;
+        app.turns.push(turn);
+        pump_until(&mut app, |app| {
+            app.active_jobs
+                .iter()
+                .any(|info| info.id == job && info.state == JobState::Running)
+        })
+        .await;
+        let strip = |app: &App| {
+            screen(app)
+                .into_iter()
+                .find(|row| row.contains("chat question"))
+                .unwrap_or_else(|| fail("no strip row"))
+        };
+        assert!(
+            strip(&app).contains("question  waiting "),
+            "{}",
+            strip(&app)
+        );
+
+        let event = |app: &mut App, event: AgentEvent| {
+            let at = app
+                .turns
+                .iter()
+                .position(|t| t.job.id == job)
+                .unwrap_or_else(|| fail("no turn"));
+            let mut turn = app.turns.remove(at);
+            app.handle_turn_event(&mut turn, event);
+            app.turns.insert(at, turn);
+        };
+        event(&mut app, AgentEvent::Reasoning);
+        assert!(
+            strip(&app).contains("question  thinking 0s"),
+            "{}",
+            strip(&app)
+        );
+        event(&mut app, AgentEvent::TextDelta(String::from("The answer")));
+        assert!(
+            strip(&app).contains("question  answering"),
+            "{}",
+            strip(&app)
+        );
+        // Reasoning itself adds nothing to the transcript.
+        assert_eq!(last(&app).content, "The answer");
+        app.cancel_all_jobs();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn the_job_strip_draws_reported_progress_as_a_gauge() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -3915,7 +4073,7 @@ mod tests {
                     db,
                     &session,
                     "how many storms?",
-                    jiff::Timestamp::now(),
+                    Timestamp::now(),
                     &AgentResponse {
                         content: String::from("Twelve storms."),
                         ..AgentResponse::default()

@@ -182,6 +182,9 @@ pub enum AgentEvent {
     /// Ollama has to load first), in one line. Informational: an
     /// interface that shows nothing but the answer may drop it.
     Status(String),
+    /// The model began reasoning before its next output: once per model
+    /// call, without the reasoning text. Informational, like `Status`.
+    Reasoning,
     /// A piece of the assistant's answer, as it streams.
     TextDelta(String),
     ToolStarted {

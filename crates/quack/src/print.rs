@@ -135,6 +135,7 @@ impl PrintTurn<'_> {
             spinner.clear(&mut err)?;
             match event {
                 AgentEvent::Status(status) => spinner.set(&status),
+                AgentEvent::Reasoning => spinner.set("thinking"),
                 AgentEvent::TextDelta(text) => {
                     if stream_live && !searched {
                         write!(out, "{text}")?;

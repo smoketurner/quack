@@ -161,6 +161,35 @@ async fn run_turn(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn reasoning_is_announced_once_per_model_call_and_never_as_text() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![
+            MockStreamEvent::reasoning_delta("The user wants tables. "),
+            MockStreamEvent::reasoning_delta("I should list them."),
+            call("t1", "list_tables", serde_json::json!({})),
+        ]),
+        turn(vec![
+            MockStreamEvent::reasoning_delta("Now I can answer."),
+            text("There is one table."),
+        ]),
+    ]);
+    let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "tables?").await;
+    let order: Vec<&str> = ran
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Reasoning => Some("reasoning"),
+            AgentEvent::ToolStarted { .. } => Some("tool"),
+            AgentEvent::TextDelta(_) => Some("text"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, ["reasoning", "tool", "reasoning", "text"]);
+    assert_eq!(ran.answer().content, "There is one table.");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_turn_streams_its_tools_in_order_and_records_the_session() {
     let db = workspace();
     let model = MockCompletionModel::from_stream_turns([

@@ -2,6 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use jiff::Timestamp;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -138,8 +139,9 @@ impl JobRow<'_> {
     }
 
     /// Its strip row: a spinner while it runs, its number, kind, and label,
-    /// a gauge of its progress, and its status.
-    fn render_strip(&self, spinner: Spinner, area: Rect, buf: &mut Buffer) {
+    /// a gauge of its progress, its status, and `phase`, what a running
+    /// turn is doing.
+    fn render_strip(&self, spinner: Spinner, phase: Option<&str>, area: Rect, buf: &mut Buffer) {
         let job = self.0;
         let dim = Style::default().fg(Color::DarkGray);
         let (marker, style) = if job.state == JobState::Running {
@@ -156,6 +158,10 @@ impl JobRow<'_> {
         if let Some(status) = job.status.as_deref() {
             detail.push_str("  ");
             detail.push_str(status);
+        }
+        if let Some(phase) = phase.filter(|_| job.state == JobState::Running) {
+            detail.push_str("  ");
+            detail.push_str(phase);
         }
         if job.state == JobState::Queued {
             detail.push_str("  queued");
@@ -384,7 +390,8 @@ impl Widget for &CompletionPopup<'_> {
 /// with a spinner, its number, kind, label, and progress, and a count of
 /// any beyond [`STRIP_JOBS`]. No rows when nothing is queued or running.
 pub(crate) struct JobStrip<'a> {
-    jobs: Vec<&'a JobInfo>,
+    /// Each job with what its turn is doing, when it is one.
+    jobs: Vec<(&'a JobInfo, Option<String>)>,
     spinner: Spinner,
 }
 
@@ -392,8 +399,15 @@ impl<'a> JobStrip<'a> {
     pub(crate) fn of(app: &'a App) -> Self {
         let mut jobs: Vec<&JobInfo> = app.active_jobs.iter().collect();
         jobs.sort_by_key(|j| (j.state != JobState::Running, j.number));
+        let now = Timestamp::now();
         Self {
-            jobs,
+            jobs: jobs
+                .into_iter()
+                .map(|job| {
+                    let phase = app.phase_of(job).map(|p| p.note(job.started_at, now));
+                    (job, phase)
+                })
+                .collect(),
             spinner: app.spinner,
         }
     }
@@ -412,8 +426,8 @@ impl<'a> JobStrip<'a> {
 impl Widget for &JobStrip<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let mut rows = area.rows();
-        for (job, row) in self.jobs.iter().take(STRIP_JOBS).zip(rows.by_ref()) {
-            JobRow(job).render_strip(self.spinner, row, buf);
+        for ((job, phase), row) in self.jobs.iter().take(STRIP_JOBS).zip(rows.by_ref()) {
+            JobRow(job).render_strip(self.spinner, phase.as_deref(), row, buf);
         }
         let more = self.more();
         if more > 0

@@ -1,9 +1,10 @@
+use std::mem;
 use std::sync::{Arc, PoisonError};
 use std::time::Instant;
 
 use futures::StreamExt;
 use rig::prelude::*;
-use rig::streaming::{Item, StreamEvent};
+use rig::streaming::{Item, PartKind, StreamEvent};
 
 use crate::config::{AnalysisConfig, RetrievalConfig};
 use crate::embedding::{Embedder, EmbeddingModel};
@@ -453,7 +454,7 @@ where
             .tool_context(turn.context())
             .stream();
 
-        let mut streamed = String::new();
+        let mut output = ModelOutput::default();
         let mut final_text: Option<String> = None;
         let mut stopped: Option<String> = None;
         // The final response carries rig's aggregate for the whole run; the
@@ -473,24 +474,20 @@ where
                     // a turn: keep the text, say what happened, record it. A
                     // model that could not be reached at all stays an error.
                     let stop = StreamStop(&e);
-                    if streamed.trim().is_empty() && !stop.by_agent_loop() {
+                    if output.text.trim().is_empty() && !stop.by_agent_loop() {
                         return Err(Error::Analysis(e.to_string()));
                     }
                     tracing::warn!(error = %e, "agent turn stopped early");
                     stopped = Some(cutoff.map_or_else(
                         || stop.explain(analysis_config.max_turns, window),
-                        |cut| cut.note(!streamed.trim().is_empty(), window),
+                        |cut| cut.note(!output.text.trim().is_empty(), window),
                     ));
                     break;
                 }
             };
             match item {
-                MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
-                    text,
-                    ..
-                })) => {
-                    streamed.push_str(&text);
-                    recorder.emit(AgentEvent::TextDelta(text));
+                MultiTurnStreamItem::StreamAssistantItem(Item::Event(event)) => {
+                    output.take(event, recorder);
                 }
                 MultiTurnStreamItem::FinalResponse(response) => {
                     if response.usage.is_reported() {
@@ -501,6 +498,7 @@ where
                 MultiTurnStreamItem::CompletionCall(call) => {
                     per_call.add(call.usage);
                     cutoff = Cutoff::of(call.finish_reason.as_ref());
+                    output.call_ended();
                 }
                 MultiTurnStreamItem::StreamAssistantItem(_)
                 | MultiTurnStreamItem::StreamUserItem(_)
@@ -513,7 +511,7 @@ where
         // A turn that answered but was cut short says so; rig counts a
         // partial answer as a valid one.
         let stopped = stopped.or_else(|| cutoff.map(|cut| cut.note(true, window)));
-        let mut answer = turn_text(streamed, final_text, stopped, window, |text| {
+        let mut answer = turn_text(output.text, final_text, stopped, window, |text| {
             recorder.citations().validate(text)
         });
         if let Some(note) = dropped {
@@ -594,6 +592,42 @@ fn turn_text(
     answer
 }
 
+/// What the model has streamed this turn: its answer so far, and whether
+/// the model call under way has been reported as reasoning.
+#[derive(Default)]
+struct ModelOutput {
+    text: String,
+    reasoning: bool,
+}
+
+impl ModelOutput {
+    /// Keep answer text and pass it on, and tell the interface once per
+    /// model call that the model is reasoning.
+    fn take(&mut self, event: StreamEvent, recorder: &TurnRecorder) {
+        match event {
+            StreamEvent::Text { text, .. } => {
+                self.text.push_str(&text);
+                recorder.emit(AgentEvent::TextDelta(text));
+            }
+            StreamEvent::Reasoning { .. }
+            | StreamEvent::Start {
+                kind: PartKind::Reasoning,
+                ..
+            } => {
+                if !mem::replace(&mut self.reasoning, true) {
+                    recorder.emit(AgentEvent::Reasoning);
+                }
+            }
+            StreamEvent::Start { .. } | StreamEvent::Arguments { .. } | StreamEvent::End { .. } => {
+            }
+        }
+    }
+
+    fn call_ended(&mut self) {
+        self.reasoning = false;
+    }
+}
+
 /// Why a turn's stream ended early.
 struct StreamStop<'a>(&'a rig::agent::StreamingError);
 
@@ -651,7 +685,7 @@ impl Turn {
         usage: Option<TokenUsage>,
         asked: Instant,
     ) -> AgentResponse {
-        let graph = std::mem::take(&mut *self.graph.lock().unwrap_or_else(PoisonError::into_inner));
+        let graph = mem::take(&mut *self.graph.lock().unwrap_or_else(PoisonError::into_inner));
         AgentResponse {
             content: answer.text,
             steps: self.recorder.steps(),
