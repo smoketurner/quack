@@ -610,6 +610,9 @@ async fn check_chat_model(report: &mut Report, config: &Config, probing: Probing
         Ok(model) => {
             check_model(report, Area::ChatModel, config, model, probing).await;
             report.push(sampling_check(config, model));
+            if let Some(check) = background_check(config, model) {
+                report.push(check);
+            }
         }
         Err(e) => report.push(Check::new(
             Area::ChatModel,
@@ -638,6 +641,48 @@ fn sampling_check(config: &Config, model: ModelRef<'_>) -> Check {
             model.provider_name, model.model, model.provider_name
         )),
     }
+}
+
+/// What a background call (reranking, history summaries, graph extraction,
+/// the ontology's document pass) sends, when its effort is not the turn's.
+fn background_check(config: &Config, model: ModelRef<'_>) -> Option<Check> {
+    let settings = config.model_settings(model);
+    if settings.background_effort == settings.effort {
+        return None;
+    }
+    let sampling = Sampling::new(
+        model.model,
+        Wire::of(model.provider),
+        settings.background_effort,
+        settings.temperature,
+    );
+    Some(match sampling {
+        Ok(sampling) => match sampling.unsent_effort() {
+            Some(why) => Check::new(
+                Area::ChatModel,
+                Status::Warn,
+                format!("{model}, background calls: {why}"),
+            ),
+            None => Check::new(
+                Area::ChatModel,
+                Status::Ok,
+                format!("{model}, background calls: {sampling}"),
+            ),
+        },
+        Err(e) => Check::new(
+            Area::ChatModel,
+            Status::Fail,
+            format!(
+                "{model}, background calls: {e}; graph extraction and the ontology's document \
+                 pass fail, and chat turns run without model reranking and history summaries"
+            ),
+        )
+        .fix(format!(
+            "set background_effort to a level it takes under [providers.{}.models.\"{}\"], \
+             [providers.{}], or [analysis]",
+            model.provider_name, model.model, model.provider_name
+        )),
+    })
 }
 
 async fn check_embedding_model(report: &mut Report, config: &Config, probing: Probing) {
@@ -1799,6 +1844,49 @@ mod tests {
             let check = sampling_check(&config, config.chat_model_ref().unwrap());
             assert_eq!(check.status, status, "{toml}: {}", check.summary);
         }
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn the_background_effort_is_checked_when_it_is_not_the_turns() {
+        let gateway = "[providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n";
+        for (analysis, status) in [
+            ("effort = \"none\"\n", Some(Status::Ok)),
+            ("effort = \"none\"\nbackground_effort = \"none\"\n", None),
+            (
+                "effort = \"none\"\nbackground_effort = \"max\"\n",
+                Some(Status::Fail),
+            ),
+        ] {
+            let toml = format!(
+                "[general]\nchat_model = \"gw/gpt-5.6-sol\"\n{gateway}[analysis]\n{analysis}"
+            );
+            let config = Config::parse(&toml).unwrap();
+            let model = config.chat_model_ref().unwrap();
+            assert_eq!(sampling_check(&config, model).status, Status::Ok, "{toml}");
+            let check = background_check(&config, model);
+            assert_eq!(check.as_ref().map(|c| c.status), status, "{toml}");
+            if let Some(check) = check {
+                assert!(
+                    check.summary.contains("background calls"),
+                    "{}",
+                    check.summary
+                );
+                assert_eq!(
+                    check.summary.contains("\"max\""),
+                    check.status == Status::Fail,
+                    "{}",
+                    check.summary
+                );
+            }
+        }
+        let toml = format!(
+            "[general]\nchat_model = \"gw/gpt-5.6-sol\"\n{gateway}api = \"responses\"\n\
+             [analysis]\nbackground_effort = \"low\"\n"
+        );
+        let config = Config::parse(&toml).unwrap();
+        let check = background_check(&config, config.chat_model_ref().unwrap()).unwrap();
+        assert_eq!(check.status, Status::Ok, "{}", check.summary);
     }
 
     fn inspection(dir: &Path, toml: Option<&str>) -> Inspection {
