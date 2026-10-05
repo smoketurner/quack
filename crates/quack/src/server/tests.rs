@@ -188,6 +188,31 @@ impl Harness {
             .rows
     }
 
+    /// What a request from the workspace's owner resolves to, for work the
+    /// test starts without a request.
+    async fn owner_access(&self, ws: &WorkspaceId, owner: &UserId) -> Access {
+        let workspace = self
+            .app
+            .control
+            .get_workspace(ws)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .unwrap_or_else(|| fail("the workspace was just created"));
+        Access {
+            identity: Identity {
+                user_id: owner.clone(),
+                username: String::from("owner"),
+                is_admin: false,
+                credential: Credential::Local,
+                client_addr: None,
+                request_id: None,
+                channel: None,
+            },
+            workspace,
+            role: Some(Role::Owner),
+        }
+    }
+
     async fn wait_ready(&self, ws: &WorkspaceId, doc: &str, bearer: &str) -> serde_json::Value {
         for _ in 0..100 {
             let (status, body) = self
@@ -5329,26 +5354,7 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
     let h = harness(ServeMode::Local).await;
     let owner = h.user("owner", UserKind::Standard).await;
     let ws = h.workspace("runs", &owner).await;
-    let workspace = h
-        .app
-        .control
-        .get_workspace(&ws)
-        .await
-        .unwrap_or_else(|e| fail(&e.to_string()))
-        .unwrap_or_else(|| fail("the workspace was just created"));
-    let access = Access {
-        identity: Identity {
-            user_id: owner.clone(),
-            username: String::from("owner"),
-            is_admin: false,
-            credential: Credential::Local,
-            client_addr: None,
-            request_id: None,
-            channel: None,
-        },
-        workspace,
-        role: Some(Role::Owner),
-    };
+    let access = h.owner_access(&ws, &owner).await;
     let start = |detail: &'static str| {
         let (app, access) = (Arc::clone(&h.app), access.clone());
         async move {
@@ -5433,6 +5439,170 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
     assert!(closing("all of it"), "{details:?}");
     assert!(closing("the model went away"), "{details:?}");
     assert!(closing("cancelled before it started"), "{details:?}");
+}
+
+/// The jobs stream never ends on its own, so a stopping server ends it:
+/// one open Jobs page cannot hold the process up.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_jobs_stream_ends_when_the_server_begins_to_stop() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("live", &owner).await;
+    let token = h.login("owner").await;
+    let request = Request::builder()
+        .uri(format!("/api/v1/workspaces/{ws}/jobs/stream"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let response = h
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(response.status(), StatusCode::OK);
+
+    h.app.stopping.cancel();
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .unwrap_or_else(|_| fail("the stream stayed open after the server began to stop"))
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.starts_with("event: jobs\n"), "{body}");
+}
+
+/// A stopping server closes what its background work opened: a running
+/// run and a queued one both have their closing audit row by the time the
+/// queue's shutdown returns, and work submitted afterwards is refused on
+/// the record instead of being left open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopping_server_closes_its_runs_and_refuses_new_work_on_the_record() {
+    let config = Config::parse(
+        "[general]\nchat_model = \"o/m\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("runs", &owner).await;
+    let token = h.login("owner").await;
+    let access = h.owner_access(&ws, &owner).await;
+    let start = || async {
+        BackgroundRun::start(&h.app, &access, RunKind::Graph, serde_json::json!({}))
+            .await
+            .unwrap_or_else(|e| fail(&e.message))
+    };
+    let (harness, workspace) = (&h, &ws);
+    let closing_rows = |run: RunId| async move {
+        harness
+            .audit(AuditFilter {
+                workspace_id: Some(workspace.clone()),
+                ..AuditFilter::default()
+            })
+            .await
+            .into_iter()
+            .filter(|r| r.resource_id.as_deref() == Some(run.as_str()))
+            .filter(|r| r.outcome == Outcome::Error)
+            .count()
+    };
+
+    let running = start().await;
+    let running_id = running.id().to_owned();
+    let (started, has_started) = tokio::sync::oneshot::channel::<()>();
+    running.submit(move |ctx| async move {
+        if started.send(()).is_err() {
+            return Err(String::from("nobody waited for the start"));
+        }
+        ctx.cancel_token().cancelled().await;
+        Err::<Done, _>(String::from("cancelled"))
+    });
+    let queued = start().await;
+    let queued_id = queued.id().to_owned();
+    queued.submit(|_| async { Ok(Done) });
+    assert!(has_started.await.is_ok(), "the first run holds the lane");
+
+    h.app.stopping.cancel();
+    let grace = std::time::Duration::from_secs(10);
+    let left = h.app.jobs.shutdown(grace).await;
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(closing_rows(running_id).await, 1, "the running run closed");
+    assert_eq!(closing_rows(queued_id).await, 1, "the queued run closed");
+
+    // A run and an upload that arrive now are taken, refused, and closed.
+    let late = start().await;
+    let late_id = late.id().to_owned();
+    late.submit(|_| async { Ok(Done) });
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/documents"),
+            &token,
+            serde_json::json!({ "text": "Flood damage is excluded.", "title": "policy" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let document = body["documents"][0]["id"].as_str().unwrap_or_default();
+    assert!(h.app.jobs.shutdown(grace).await.is_empty());
+    assert_eq!(closing_rows(late_id).await, 1, "the refused run closed");
+    let (_, body) = h
+        .get(
+            &format!("/api/v1/workspaces/{ws}/documents/{document}"),
+            &token,
+        )
+        .await;
+    assert_eq!(body["status"], "error", "{body}");
+    assert!(
+        body.to_string()
+            .contains("cancelled before processing started"),
+        "{body}"
+    );
+
+    // A turn asked now never runs, and both forms of the request say why.
+    let stopping = "the server is shutting down; the turn ended without an answer";
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/query/stream"),
+            &token,
+            serde_json::json!({ "prompt": "hi" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, format!("event: error\ndata: {stopping}\n\n"));
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/query"),
+            &token,
+            serde_json::json!({ "prompt": "hi" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.to_string().contains(stopping), "{body}");
+}
+
+/// Closing the state closes each workspace file: the writer finishes and
+/// checkpoints, so no write-ahead log is left beside the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_the_state_checkpoints_each_workspace() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("closing", &owner).await;
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    db.run(|db| db.execute_query("CREATE TABLE t AS SELECT 1 AS n"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    drop(db);
+    let mut log = h.app.config.workspace_db_path(ws.as_str()).into_os_string();
+    log.push(".wal");
+    let log = std::path::PathBuf::from(log);
+    assert!(log.exists(), "the write is still in the log");
+
+    h.app.close().await;
+    assert!(!log.exists(), "the log was checkpointed into the file");
 }
 
 /// A download the row cap cut says so in its filename and on its button;

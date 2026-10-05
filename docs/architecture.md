@@ -66,7 +66,7 @@ nothing in it knows about HTTP, terminals, or windows.
 | `okf` | Open Knowledge Format bundles in and out | 17 |
 | `extraction` | what both extraction runs share: the `Extract` trait, lenient JSON answers, concurrent calls with per-chunk progress (`RunProgress`), even sampling across documents, name counts (`Tally`) | 6.4, 6.5 |
 | `progress` | the per-chunk progress report the extraction runs make to their caller | 6.5 |
-| `jobs` | the work queue every interface submits background work to: ordered lanes, cancel, progress, a broadcast of job snapshots | 4.1 |
+| `jobs` | the work queue every interface submits background work to: ordered lanes, cancel, progress, a broadcast of job snapshots, and `shutdown(grace)`, the one way the terminal and `quack serve` stop their jobs | 4.1 |
 | `llm` | rig provider construction over `limit::LimitedHttp` (each provider's process-wide request limit), `TurnRequest` (one agent turn), `SchemaCall` (one tool-less prompt whose answer a JSON schema shapes, sent as the provider's structured output and parsed whole: graph extraction against `Ontology::extraction_schema`, the ontology's document pass, the model reranker, and history summaries), OAuth token management (`oauth`), the person an on-behalf-of provider acts for (`acting`, a task-local), Amazon Bedrock over the AWS SDK's credential chain with the same limits (`bedrock`) | 4.1, 10 |
 
 ## `quack`

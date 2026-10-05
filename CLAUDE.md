@@ -134,7 +134,13 @@ Background work is asynchronous everywhere (design doc 4.1): `quack_core::jobs::
 runs submitted jobs with optional lanes that keep submission order (a chat session is a
 serial lane, so a follow-up waits for the answer before it; a workspace's uploads, graph
 extraction, and document pass have their own), cancel tokens, per-chunk progress, and a
-broadcast of `JobInfo` snapshots every interface reports from. There is no job pool:
+broadcast of `JobInfo` snapshots every interface reports from. `JobQueue::shutdown(grace)` is
+the one way a process stops its jobs: a later `submit` is recorded as cancelled and never runs,
+queued and running jobs are cancelled, and it waits up to the grace for them and for what
+`when_ended` records. The terminal's quit calls it; `quack serve` calls it on SIGTERM or Ctrl-C
+beside the HTTP drain under `[server].shutdown_grace_seconds` (20), after cancelling
+`AppState::stopping` (which ends `jobs/stream` and the MCP event streams), and then
+`AppState::close` drops the workspace handles so each writer checkpoints. There is no job pool:
 resources are limited where they are used. Every rig HTTP client sends through
 `llm::LimitedHttp` (rig's reqwest transport, plus the provider's `headers`), which holds
 one permit of the process-wide gate for the provider and the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1

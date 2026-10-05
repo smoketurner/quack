@@ -1186,6 +1186,9 @@ pub struct ServerConfig {
     /// How long a streamed turn waits for a person to decide a write the
     /// agent wants to run before it goes on without it.
     pub permission_timeout_seconds: u32,
+    /// How long a stopping server waits for its jobs to end and its
+    /// requests to finish before it exits anyway.
+    pub shutdown_grace_seconds: u32,
     /// Sign-in through the organization's `OpenID` Connect issuer, beside
     /// password login.
     pub oidc: Option<OidcConfig>,
@@ -1356,6 +1359,7 @@ impl Default for ServerConfig {
             session_idle_minutes: 120,
             secure_cookies: SecureCookies::Auto,
             permission_timeout_seconds: 300,
+            shutdown_grace_seconds: 20,
             oidc: None,
         }
     }
@@ -1372,6 +1376,12 @@ impl ServerConfig {
     #[must_use]
     pub fn permission_timeout(&self) -> Duration {
         Duration::from_secs(u64::from(self.permission_timeout_seconds.max(1)))
+    }
+
+    /// How long a stopping server waits for jobs and requests to end.
+    #[must_use]
+    pub fn shutdown_grace(&self) -> Duration {
+        Duration::from_secs(u64::from(self.shutdown_grace_seconds))
     }
 
     /// How long a session may sit unused before it is dropped.

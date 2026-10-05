@@ -28,6 +28,9 @@ services:
     depends_on:
       - ollama
     restart: unless-stopped
+    # Above [server].shutdown_grace_seconds (20), so quack ends its jobs and
+    # checkpoints each workspace before Docker sends SIGKILL.
+    stop_grace_period: 30s
 
   ollama:
     image: ollama/ollama:0.12.3

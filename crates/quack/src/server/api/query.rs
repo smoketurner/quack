@@ -214,6 +214,13 @@ struct Turn {
     prompt: String,
 }
 
+/// Whether a turn's stream has sent its `complete` or `error` event.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnStream {
+    Open,
+    Ended,
+}
+
 /// How a turn ended, for its audit row.
 enum TurnEnd<'a> {
     Answered(&'a AgentResponse),
@@ -221,6 +228,17 @@ enum TurnEnd<'a> {
 }
 
 impl Turn {
+    /// What the caller is told when the events closed with neither an
+    /// answer nor a failure: the turn's job was cancelled while queued, or
+    /// a stopping server refused it.
+    fn unanswered(app: &App) -> &'static str {
+        if app.stopping.is_cancelled() {
+            "the server is shutting down; the turn ended without an answer"
+        } else {
+            "the turn ended without an answer"
+        }
+    }
+
     /// Audit the turn. A failed turn that left the session without any
     /// message (a fresh session whose first turn never reached the model)
     /// is removed, as print mode does, so the session list shows no empty
@@ -286,13 +304,15 @@ pub(crate) async fn query(
     }
     turn.record(&app, TurnEnd::Failed).await;
     Err(failure.map_or_else(
-        || ApiError::internal("the turn ended without an answer"),
+        || ApiError::internal(Turn::unanswered(&app)),
         ApiError::from,
     ))
 }
 
 /// The same turn as SSE: `text`, `tool_started`, `tool_finished`, then
-/// `complete` with the full response object, or `error`.
+/// `complete` with the full response object, or `error`. A stopping server
+/// cancels the turn's job, so the stream ends as any cancelled turn does:
+/// `complete` with `cancelled: true`, or `error` when the turn never ran.
 pub(crate) async fn stream(
     State(app): State<App>,
     identity: Identity,
@@ -302,8 +322,25 @@ pub(crate) async fn stream(
     let turn = PreparedTurn::prepare(&app, identity, &id, &body, WritePolicy::Ask)
         .await?
         .start(&app);
-    let stream = futures::stream::unfold((turn, app), |(mut turn, app)| async move {
-        let event = turn.events.recv().await?;
+    let state = (turn, app, TurnStream::Open);
+    let stream = futures::stream::unfold(state, |(mut turn, app, state)| async move {
+        let Some(event) = turn.events.recv().await else {
+            if state == TurnStream::Ended {
+                return None;
+            }
+            turn.record(&app, TurnEnd::Failed).await;
+            let out = StreamEvent::Error.event().data(Turn::unanswered(&app));
+            return Some((Ok(out), (turn, app, TurnStream::Ended)));
+        };
+        let state = match event {
+            AgentEvent::TurnComplete(_) | AgentEvent::Failed(_) => TurnStream::Ended,
+            AgentEvent::Status(_)
+            | AgentEvent::Reasoning
+            | AgentEvent::TextDelta(_)
+            | AgentEvent::ToolStarted { .. }
+            | AgentEvent::ToolFinished(_)
+            | AgentEvent::PermissionRequired(_) => state,
+        };
         let out = match event {
             // A comment line: clients skip it, and the stream stays in step.
             AgentEvent::Reasoning => Event::default().comment("reasoning"),
@@ -352,7 +389,7 @@ pub(crate) async fn stream(
                 StreamEvent::Error.event().data(failure.message)
             }
         };
-        Some((Ok(out), (turn, app)))
+        Some((Ok(out), (turn, app, state)))
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }

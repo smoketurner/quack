@@ -26,11 +26,13 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use jiff::Timestamp;
 use serde::Serialize;
 use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 use crate::config::JobsConfig;
@@ -442,6 +444,8 @@ struct Registry {
     /// Cleanup waiters for [`JobQueue::when_ended`], present only while the
     /// job is active: `finish` takes them as it ends the job.
     ended_waiters: HashMap<JobId, Vec<oneshot::Sender<JobInfo>>>,
+    /// Set by [`JobQueue::shutdown`]: nothing submitted after it runs.
+    closed: bool,
 }
 
 impl Registry {
@@ -473,6 +477,9 @@ struct Inner {
     registry: Mutex<Registry>,
     history: usize,
     events: broadcast::Sender<JobInfo>,
+    /// The [`JobQueue::when_ended`] tasks, so a shutdown can wait for what
+    /// they record.
+    recorders: TaskTracker,
 }
 
 impl Inner {
@@ -621,6 +628,7 @@ impl JobQueue {
                 registry: Mutex::new(Registry::default()),
                 history: usize::try_from(history.max(1)).unwrap_or(usize::MAX),
                 events,
+                recorders: TaskTracker::new(),
             }),
         }
     }
@@ -646,7 +654,8 @@ impl JobQueue {
 
     /// Queue `work` and return its id at once. It starts at once, or when
     /// its lane has room; a panic inside it is a failed job, not a lost
-    /// one.
+    /// one. After [`Self::shutdown`] the job is recorded as cancelled and
+    /// `work` never runs.
     ///
     /// Must be called inside a Tokio runtime.
     pub fn submit<F, Fut>(&self, spec: JobSpec, work: F) -> JobInfo
@@ -660,7 +669,7 @@ impl JobQueue {
         let snapshot = {
             let mut registry = self.inner.registry();
             registry.last_number = registry.last_number.next();
-            let info = JobInfo {
+            let mut info = JobInfo {
                 id,
                 number: registry.last_number,
                 kind: spec.kind,
@@ -677,6 +686,13 @@ impl JobQueue {
                 finished_at: None,
                 cancel_requested: false,
             };
+            let refused = registry.closed;
+            if refused {
+                info.state = JobState::Cancelled;
+                info.outcome = Some(String::from(REFUSED_BY_SHUTDOWN));
+                info.finished_at = Some(info.queued_at);
+                info.cancel_requested = true;
+            }
             registry.order.push_back(id);
             registry.jobs.insert(
                 id,
@@ -686,6 +702,10 @@ impl JobQueue {
                 },
             );
             drop(self.inner.events.send(info.clone()));
+            if refused {
+                registry.evict_past(self.inner.history);
+                return info;
+            }
             info
         };
 
@@ -767,6 +787,52 @@ impl JobQueue {
         true
     }
 
+    /// Stop the queue for good. From here on a submitted job is recorded as
+    /// cancelled without running. Every queued job is cancelled, every
+    /// running job sees its token cancelled, and this waits up to `grace`
+    /// for them to end and for what [`Self::when_ended`] records about
+    /// them. Returns the jobs still active when the grace ran out, which
+    /// the runtime drops at their next await.
+    pub async fn shutdown(&self, grace: Duration) -> Vec<JobInfo> {
+        let mut events = self.subscribe();
+        let tokens: Vec<CancellationToken> = {
+            let mut registry = self.inner.registry();
+            registry.closed = true;
+            registry
+                .jobs
+                .values_mut()
+                .filter(|entry| !entry.info.state.is_finished())
+                .map(|entry| {
+                    entry.info.cancel_requested = true;
+                    drop(self.inner.events.send(entry.info.clone()));
+                    entry.cancel.clone()
+                })
+                .collect()
+        };
+        for token in tokens {
+            token.cancel();
+        }
+        self.inner.recorders.close();
+        let settled = async {
+            while self.counts(None).active() > 0 {
+                if events.recv().await == Err(broadcast::error::RecvError::Closed) {
+                    break;
+                }
+            }
+            self.inner.recorders.wait().await;
+        };
+        if tokio::time::timeout(grace, settled).await.is_err() {
+            tracing::warn!(
+                recording = self.inner.recorders.len(),
+                "the job queue's shutdown grace ran out"
+            );
+        }
+        self.list()
+            .into_iter()
+            .filter(|job| !job.state.is_finished())
+            .collect()
+    }
+
     /// Queued and running counts, optionally for one workspace.
     #[must_use]
     pub fn counts(&self, workspace_id: Option<&WorkspaceId>) -> JobCounts {
@@ -830,13 +896,16 @@ impl JobQueue {
                 registry.ended_waiters.entry(id).or_default().push(tx);
             }
         }
-        tokio::spawn(async move {
+        self.inner.recorders.spawn(async move {
             if let Ok(ended) = rx.await {
                 record(ended).await;
             }
         });
     }
 }
+
+/// The outcome of a job submitted after [`JobQueue::shutdown`].
+const REFUSED_BY_SHUTDOWN: &str = "refused: the queue is shutting down";
 
 impl JobInfo {
     /// Cancelled while still queued: its work never ran.
@@ -915,6 +984,13 @@ impl Inner {
             },
             None => None,
         };
+        // Cancelled before its task first ran: still queued, so it never starts.
+        if cancel.is_cancelled() {
+            return Ended {
+                held: lane_permit,
+                ..cancelled_while_queued()
+            };
+        }
         let id = ctx.id;
         self.update(id, |info| {
             info.state = JobState::Running;
@@ -948,7 +1024,6 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
 
     use super::*;
 
@@ -1744,5 +1819,137 @@ mod tests {
             fail("job forgotten")
         };
         assert!(!info.cancel_requested);
+    }
+
+    /// Shutdown ends every job: a queued one without running, a running
+    /// one through its token, and it waits for what their ends record.
+    #[tokio::test]
+    async fn shutdown_cancels_queued_jobs_unrun_and_waits_for_their_records() {
+        let queue = JobQueue::new(10);
+        let lane = || Lane::serial(&LaneKey::Graph(WorkspaceId::from("ws")));
+        let running = queue
+            .submit(
+                JobSpec::new(JobKind::Graph, "running").lane(lane()),
+                |ctx| async move {
+                    ctx.cancel_token().cancelled().await;
+                    Err(String::from("stopped"))
+                },
+            )
+            .id;
+        let ran = Arc::new(AtomicBool::new(false));
+        let queued: Vec<JobId> = (0..2)
+            .map(|n| {
+                let ran = Arc::clone(&ran);
+                queue
+                    .submit(
+                        JobSpec::new(JobKind::Graph, format!("queued {n}")).lane(lane()),
+                        move |_| async move {
+                            ran.store(true, Ordering::SeqCst);
+                            Ok(String::new())
+                        },
+                    )
+                    .id
+            })
+            .collect();
+        let recorded = Arc::new(AtomicUsize::new(0));
+        for id in &queued {
+            let recorded = Arc::clone(&recorded);
+            queue.when_ended(*id, move |ended| async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if ended.never_started() {
+                    recorded.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(queue.counts(None).running, 1);
+
+        let left = queue.shutdown(Duration::from_secs(5)).await;
+        assert!(left.is_empty(), "{left:?}");
+        assert_eq!(recorded.load(Ordering::SeqCst), 2, "records were awaited");
+        assert!(!ran.load(Ordering::SeqCst), "a queued job never ran");
+        let state = |id| {
+            queue
+                .get(id)
+                .map(|job| (job.state, job.started_at.is_some()))
+        };
+        assert_eq!(state(running), Some((JobState::Cancelled, true)));
+        for id in queued {
+            assert_eq!(state(id), Some((JobState::Cancelled, false)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_job_submitted_after_shutdown_is_recorded_as_cancelled_and_never_runs() {
+        let queue = JobQueue::new(10);
+        assert!(queue.shutdown(Duration::ZERO).await.is_empty());
+        let mut events = queue.subscribe();
+        let ran = Arc::new(AtomicBool::new(false));
+        let work_ran = Arc::clone(&ran);
+        let refused = queue.submit(
+            JobSpec::new(JobKind::Ingest, "late.pdf")
+                .lane(Lane::serial(&LaneKey::Ingest(WorkspaceId::from("ws")))),
+            move |_| async move {
+                work_ran.store(true, Ordering::SeqCst);
+                Ok(String::new())
+            },
+        );
+        assert_eq!(refused.state, JobState::Cancelled);
+        assert!(refused.never_started() && refused.finished_at.is_some());
+        assert_eq!(refused.outcome.as_deref(), Some(REFUSED_BY_SHUTDOWN));
+        assert_eq!(queue.get(refused.id), Some(refused.clone()));
+        assert_eq!(events.try_recv().ok(), Some(refused.clone()));
+        assert_eq!(queue.counts(None).active(), 0);
+        assert!(lanes_drained(&queue).await, "a refused job takes no lane");
+
+        // Its end is recorded like any other job cancelled while queued.
+        let (told, record) = oneshot::channel();
+        queue.when_ended(refused.id, move |ended| async move {
+            assert!(told.send(ended.never_started()).is_ok());
+        });
+        assert_eq!(record.await.ok(), Some(true));
+        assert!(queue.shutdown(Duration::from_secs(5)).await.is_empty());
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_the_jobs_still_active_when_its_grace_runs_out() {
+        let queue = JobQueue::new(10);
+        let (release, released) = oneshot::channel::<()>();
+        let deaf = queue
+            .submit(JobSpec::new(JobKind::Ingest, "deaf"), |_| async move {
+                drop(released.await);
+                Ok(String::from("finished anyway"))
+            })
+            .id;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let left = queue.shutdown(Duration::from_millis(50)).await;
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(
+            left.iter().all(|job| job.id == deaf
+                && job.state == JobState::Running
+                && job.cancel_requested)
+        );
+        assert!(release.send(()).is_ok());
+        assert_eq!(finished(&queue, deaf).await.state, JobState::Succeeded);
+    }
+
+    /// A job cancelled before its task first ran is still queued, so its
+    /// work never starts.
+    #[tokio::test]
+    async fn a_job_cancelled_before_its_task_first_runs_never_starts() {
+        let queue = JobQueue::new(10);
+        let ran = Arc::new(AtomicBool::new(false));
+        let work_ran = Arc::clone(&ran);
+        let id = queue
+            .submit(JobSpec::new(JobKind::Sql, "select"), move |_| async move {
+                work_ran.store(true, Ordering::SeqCst);
+                Ok(String::new())
+            })
+            .id;
+        assert!(queue.cancel(id));
+        let ended = finished(&queue, id).await;
+        assert!(ended.never_started(), "{ended:?}");
+        assert!(!ran.load(Ordering::SeqCst));
     }
 }

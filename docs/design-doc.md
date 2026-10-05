@@ -210,14 +210,39 @@ status line, and outcome (a one-line summary or the error). Each change is broad
 snapshot; the terminal's job strip and `/jobs`, the web console's Jobs page, and
 `GET .../jobs/stream` all read it.
 
-Cancelling a queued job ends it without running. A running job sees its cancel token and
+Cancelling a queued job ends it without running, including one whose task has not yet
+run for the first time. A running job sees its cancel token and
 stops at its next checkpoint, or finishes if its work has none (an ingest mid-embedding).
 A cancelled agent turn is recorded as cancelled, as with `Esc`. A statement is interrupted
 through `storage::workspace::QueryCanceller`, which interrupts the connection only while that
-job's statement holds it. Quitting the terminal cancels every job and waits a few seconds;
-work without a checkpoint runs on a detached thread and never holds the process open. Work
-whose end records something (an upload's document status, an extraction's closing audit
-row) records it for a job cancelled while queued too, so nothing is left `queued`.
+job's statement holds it. Work whose end records something (an upload's document status,
+an extraction's closing audit row) records it for a job cancelled while queued too, so
+nothing is left `queued`.
+
+**Stopping.** `JobQueue::shutdown(grace)` is the one way a process stops its jobs. It
+closes the queue, so a job submitted afterwards is recorded as `cancelled` ("refused: the
+queue is shutting down") and never runs. It cancels every queued and running job, then
+waits up to `grace` for them to end and for what their ends record (`when_ended`). It
+returns the jobs still active when the grace ran out; the runtime drops those at their
+next await.
+
+- The terminal calls it on quit with a 3-second grace. Work without a checkpoint runs on a
+  detached thread and never holds the process open.
+- `quack serve` calls it on SIGTERM or Ctrl-C with `[server].shutdown_grace_seconds` (20).
+  The signal cancels `AppState::stopping`. New connections are refused, and the HTTP drain
+  and the queue shutdown run side by side under that one grace. `GET .../jobs/stream` and
+  the MCP event streams end when the token fires. A streamed turn ends as any cancelled
+  turn does: `complete` with `cancelled: true`, or an `error` event ("the server is shutting
+  down; the turn ended without an answer") when the turn never ran. Then `AppState::close`
+  drops every MCP transport and workspace handle, so each writer finishes its queued
+  closures and checkpoints before the process exits. A supervisor's kill timeout must be
+  longer than the grace: `docker-compose.yml` sets `stop_grace_period: 30s`.
+- A background run that wrote its opening audit row writes its closing one before the
+  shutdown returns: a running graph extraction, document pass, or embeddings refresh
+  returns `Error::Cancelled` and closes inside its job, and a queued or refused one closes
+  through `when_ended` ("cancelled before it started"). An upload's document ends `error`
+  the same way. A run that ignores its cancel token past the grace is logged by job id and
+  leaves no closing row.
 
 The registry is in memory only. A job's label can name a file or quote a question, which is
 workspace content (section 5), so it never reaches `control.db`. A restart forgets it; the
@@ -1711,7 +1736,8 @@ GET    /api/v1/workspaces/{id}
 PATCH  /api/v1/workspaces/{id}                    settings
 POST   /api/v1/auth/login  POST /api/v1/auth/logout  GET /api/v1/auth/me
 POST   /api/v1/workspaces/{id}/query              {prompt, session_id?, mode?, allow_write?}
-POST   /api/v1/workspaces/{id}/query/stream       same, SSE agent events; closing the stream cancels the turn
+POST   /api/v1/workspaces/{id}/query/stream       same, SSE agent events; closing the stream cancels the turn;
+                                                  a turn whose job never ran ends with an `error` event
 POST   /api/v1/workspaces/{id}/sessions/{sid}/permissions/{request}  {decision}: answer a write the turn waits on
 POST   /api/v1/workspaces/{id}/sql                {sql}
 POST   /api/v1/workspaces/{id}/search         {query, top_k?}: hybrid retrieval, no LLM (the MCP `search` tool's names)
@@ -1780,7 +1806,7 @@ fixed-set values, and paging. The request log records each request's route templ
 ```
 GET    /api/v1/workspaces/{id}/jobs               queued, running, and recent jobs, newest first,
                                                   with counts and the worker total (viewer)
-GET    /api/v1/workspaces/{id}/jobs/stream        SSE: `jobs` (the list) then `job` per change
+GET    /api/v1/workspaces/{id}/jobs/stream        SSE: `jobs` (the list) then `job` per change; ends when the server stops
 GET    /api/v1/workspaces/{id}/jobs/{job}         one job
 POST   /api/v1/workspaces/{id}/jobs/{job}/cancel  its submitter, or a workspace owner or admin
 ```
@@ -2294,6 +2320,7 @@ workers_per_workspace = 1               # uploads processed at once per workspac
 session_max_age_hours = 12              # a browser session dies this long after login
 session_idle_minutes = 120              # ... or this long after its last request
 permission_timeout_seconds = 300        # how long a streamed turn waits for a person to approve a write
+shutdown_grace_seconds = 20             # how long SIGTERM or Ctrl-C waits for jobs and requests to end; keep the supervisor's kill timeout above it
 secure_cookies = "auto"                 # "always": Secure cookies on loopback too (same-host TLS proxy)
 
 [server.oidc]            # optional: "Sign in with <issuer>" beside the password form

@@ -406,6 +406,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "session_idle_minutes",
             "secure_cookies",
             "permission_timeout_seconds",
+            "shutdown_grace_seconds",
         ],
     ),
     (
@@ -844,6 +845,11 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "permission_timeout_seconds",
         server.permission_timeout_seconds,
         default.permission_timeout_seconds,
+    );
+    s.literal(
+        "shutdown_grace_seconds",
+        server.shutdown_grace_seconds,
+        default.shutdown_grace_seconds,
     );
     let Some(oidc) = &server.oidc else {
         return;

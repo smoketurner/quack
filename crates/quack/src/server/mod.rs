@@ -416,19 +416,26 @@ pub(crate) async fn serve(
         .await
         .with_context(|| format!("cannot listen on {addr}"))?;
     tracing::info!(%addr, ?mode, "quack serve listening");
-    axum::serve(
-        listener,
-        router(app).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("server error")?;
+    let mut server = Box::pin(
+        axum::serve(
+            listener,
+            router(Arc::clone(&app)).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(app.stopping.clone().cancelled_owned())
+        .into_future(),
+    );
+    tokio::select! {
+        served = &mut server => return served.context("server error"),
+        () = shutdown_signal() => {}
+    }
+    let served = app.stop(server).await;
     tracing::info!("stopped");
-    Ok(())
+    served.context("server error")
 }
 
 /// Resolve on Ctrl-C or, on Unix, SIGTERM (what containers and systemd
-/// send). In-flight requests finish; new connections are refused.
+/// send). The server then stops: new connections are refused, jobs are
+/// cancelled, and in-flight requests get `[server].shutdown_grace_seconds`.
 async fn shutdown_signal() {
     let ctrl_c = async {
         drop(tokio::signal::ctrl_c().await);
@@ -448,7 +455,7 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! {
-        () = ctrl_c => tracing::info!("received Ctrl-C; finishing in-flight requests"),
-        () = terminate => tracing::info!("received SIGTERM; finishing in-flight requests"),
+        () = ctrl_c => tracing::info!("received Ctrl-C; cancelling jobs and finishing in-flight requests"),
+        () = terminate => tracing::info!("received SIGTERM; cancelling jobs and finishing in-flight requests"),
     }
 }

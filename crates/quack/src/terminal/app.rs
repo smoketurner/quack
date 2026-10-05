@@ -1115,8 +1115,7 @@ impl App {
             }
         }
 
-        self.cancel_all_jobs();
-        self.wait_for_jobs(QUIT_GRACE).await;
+        self.stop_jobs().await;
         if let Some((db, session)) = self.session_to_forget() {
             drop(
                 db.run(move |db| sessions::delete_if_empty(db, &session))
@@ -1268,22 +1267,6 @@ impl App {
 
     fn scroll_down(&mut self, lines: usize) {
         self.scroll = self.scroll.down(lines, self.scroll_limit.get());
-    }
-
-    /// After cancelling everything, give the jobs up to `grace` to stop:
-    /// a turn records its cancellation, a statement is interrupted, an
-    /// ingest drops its embedding requests. Whatever is still running
-    /// after that is dropped with the runtime at its next await.
-    async fn wait_for_jobs(&mut self, grace: Duration) {
-        let expiry = tokio::time::sleep(grace);
-        tokio::pin!(expiry);
-        while self.jobs.counts(None).active() > 0 {
-            tokio::select! {
-                () = &mut expiry => return,
-                Some(msg) = self.msg_rx.recv() => self.handle_msg(msg),
-                job = self.job_events.recv() => self.handle_job_event(&job),
-            }
-        }
     }
 
     /// Apply every message already waiting, without waiting for more.
@@ -1666,19 +1649,21 @@ impl App {
         }
     }
 
-    /// Stop every job when the session ends: a running turn is recorded as
-    /// cancelled rather than cut off mid-write.
-    fn cancel_all_jobs(&mut self) {
+    /// Stop every job when the session ends and give them `QUIT_GRACE` to
+    /// do it: a turn records its cancellation, a statement is interrupted,
+    /// an ingest drops its embedding requests. Whatever is still running
+    /// after that is dropped with the runtime at its next await.
+    async fn stop_jobs(&mut self) {
         for prompt in self.prompts.drain(..) {
             if let Prompt::Agent { request, .. } = prompt {
                 request.deny();
             }
         }
-        for job in self.jobs.list() {
-            if !job.state.is_finished() {
-                self.jobs.cancel(job.id);
-            }
+        let left = self.jobs.shutdown(QUIT_GRACE).await;
+        if !left.is_empty() {
+            tracing::warn!(jobs = left.len(), "quit with jobs still running");
         }
+        self.pump();
     }
 
     /// Clear the transcript; streaming turns start a new message.
@@ -3874,7 +3859,7 @@ mod tests {
         );
         // Reasoning itself adds nothing to the transcript.
         assert_eq!(last(&app).content, "The answer");
-        app.cancel_all_jobs();
+        app.stop_jobs().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4373,7 +4358,9 @@ mod tests {
         app.submit_message();
         db_settle(&mut app).await;
         assert_eq!(chat_jobs(&app), 1, "it became a turn");
-        app.cancel_all_jobs();
+        for job in app.jobs.list() {
+            app.jobs.cancel(job.id);
+        }
         assert!(
             app.messages
                 .iter()

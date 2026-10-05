@@ -5,6 +5,7 @@ use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::storage::writer::Writer;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
@@ -25,6 +26,7 @@ use crate::mcp::McpServer;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::storage::control::ControlPlane;
 use quack_core::web_sessions::WebSessions;
+use tokio_util::sync::CancellationToken;
 
 /// A workspace's writer connection plus its reader pool and its audit
 /// connection, opened together so each is built once per workspace handle
@@ -79,6 +81,9 @@ pub(crate) struct AppState {
     pub flashes: Flashes,
     /// Writes streamed turns are waiting on a person to decide.
     pub permissions: Permissions,
+    /// Cancelled when the server begins to stop: long-lived streams end on
+    /// it, so a connection left open cannot hold the process up.
+    pub stopping: CancellationToken,
 }
 
 /// Holds a workspace's extraction slot; dropping it frees the slot.
@@ -130,6 +135,65 @@ impl AppState {
             extractions: Mutex::new(HashSet::new()),
             flashes: Flashes::default(),
             permissions: Permissions::default(),
+            stopping: CancellationToken::new(),
+        }
+    }
+
+    /// Stop the server whose HTTP drain is `server`: streams end and the
+    /// job queue shuts down beside the drain, under one grace of
+    /// `[server].shutdown_grace_seconds`, and the workspaces close last.
+    ///
+    /// # Errors
+    ///
+    /// Returns the drain's own error.
+    pub(crate) async fn stop<S>(self: Arc<Self>, mut server: S) -> std::io::Result<()>
+    where
+        S: Future<Output = std::io::Result<()>> + Unpin,
+    {
+        self.stopping.cancel();
+        let grace = self.config.server.shutdown_grace();
+        let deadline = Instant::now().checked_add(grace);
+        let drain = async {
+            let (served, _) = tokio::join!(&mut server, self.jobs.shutdown(grace));
+            served
+        };
+        let served = tokio::time::timeout(grace, drain)
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    grace_seconds = grace.as_secs(),
+                    "requests were still open when the shutdown grace ran out"
+                );
+                Ok(())
+            });
+        drop(server);
+        // A request that ended during the drain may have been refused a job;
+        // what that job's end records is awaited in what is left of the grace.
+        let left = deadline.map_or(Duration::ZERO, |at| {
+            at.saturating_duration_since(Instant::now())
+        });
+        for job in self.jobs.shutdown(left).await {
+            tracing::warn!(job = %job.id, kind = %job.kind, state = %job.state, "job still active at exit");
+        }
+        self.close().await;
+        served
+    }
+
+    /// Let go of every MCP transport and workspace, once requests and jobs
+    /// have ended: each workspace's writer finishes its queued closures and
+    /// checkpoints as its last handle drops. The transports go explicitly
+    /// because their servers hold this state, which would otherwise never
+    /// drop.
+    pub(crate) async fn close(&self) {
+        let transports = std::mem::take(&mut *self.mcp.lock().await);
+        let workspaces = std::mem::take(&mut *self.workspaces.lock().await);
+        // A writer's drop joins its thread.
+        let closed = tokio::task::spawn_blocking(move || {
+            drop(transports);
+            drop(workspaces);
+        });
+        if let Err(e) = closed.await {
+            tracing::error!(error = %e, "closing the workspaces failed");
         }
     }
 
@@ -167,7 +231,9 @@ impl AppState {
                 // The server may sit behind any host name; bearer auth,
                 // not the Host header, is what guards it.
                 .with_allowed_hosts(Vec::<String>::new())
-                .with_json_response(true),
+                .with_json_response(true)
+                // Its standalone event streams end when the server stops.
+                .with_cancellation_token(self.stopping.child_token()),
         );
         open.insert(key, transport.clone());
         transport
