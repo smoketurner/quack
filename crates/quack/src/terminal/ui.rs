@@ -2,15 +2,21 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use jiff::Timestamp;
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, HighlightSpacing, LineGauge, List, ListItem, ListState, Paragraph,
+    Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
+};
 
 use crate::terminal::app::{App, Message, MessageKind, PendingWrite};
-use crate::terminal::chart::ChartData;
 use crate::terminal::commands::Suggestion;
+use crate::terminal::markdown;
 use quack_core::analysis::events::DetailPreview;
 use quack_core::jobs::{JobCounts, JobInfo, JobState};
 
@@ -22,6 +28,12 @@ const POPUP_ROWS: usize = 8;
 
 /// The widest a popup entry's label column grows before its description.
 const POPUP_LABEL_WIDTH: usize = 28;
+
+/// The marker beside the popup's highlighted entry.
+const POPUP_MARKER: &str = "\u{25B8} ";
+
+/// Columns of the progress line in a job's strip row.
+const GAUGE_WIDTH: u16 = 16;
 
 const SPINNER: &[&str] = &[
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
@@ -83,17 +95,6 @@ impl Scroll {
     }
 }
 
-/// ` · scroll: +N` for the status line, or nothing while following.
-impl fmt::Display for Scroll {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Latest => Ok(()),
-            Self::Back(back) => write!(f, " \u{00B7} scroll: +{back}"),
-            Self::Top => write!(f, " \u{00B7} scroll: top"),
-        }
-    }
-}
-
 /// ` · 2 running, 1 queued · /jobs`, or nothing when idle.
 struct JobsIndicator(JobCounts);
 
@@ -116,40 +117,50 @@ impl fmt::Display for JobsIndicator {
 pub(crate) struct JobRow<'a>(pub(crate) &'a JobInfo);
 
 impl JobRow<'_> {
-    /// `/jobs`: number, state, kind, label, progress, and how it ended.
-    pub(crate) fn listing(&self) -> String {
+    /// Everything on record about it: number, state, kind, label, and
+    /// progress, then its latest status and how it ended.
+    pub(crate) fn details(&self) -> String {
         let job = self.0;
         let progress = job.progress.map(|p| format!(" {p}")).unwrap_or_default();
-        let outcome = match (&job.outcome, job.state) {
-            (Some(text), JobState::Succeeded | JobState::Failed | JobState::Cancelled)
-                if !text.is_empty() =>
-            {
-                format!(" \u{2014} {}", one_line(text))
-            }
-            _ => String::new(),
-        };
-        format!(
-            "#{:<3} {:<9} {:<8} {}{progress}{outcome}",
-            job.number,
-            job.state.as_str(),
-            job.kind.as_str(),
-            job.label
-        )
+        let mut text = format!(
+            "Job #{} {} {} {}{progress}",
+            job.number, job.state, job.kind, job.label
+        );
+        for extra in [job.status.as_deref(), job.outcome.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|extra| !extra.trim().is_empty())
+        {
+            text.push('\n');
+            text.push_str(extra);
+        }
+        text
     }
 
-    /// The strip: a spinner while it runs, its number, kind, label,
-    /// progress, and status.
-    fn strip(&self, spinner: Spinner) -> Line<'static> {
+    /// Its strip row: a spinner while it runs, its number, kind, and label,
+    /// a gauge of its progress, its status, and `phase`, what a running
+    /// turn is doing.
+    fn render_strip(&self, spinner: Spinner, phase: Option<&str>, area: Rect, buf: &mut Buffer) {
         let job = self.0;
+        let dim = Style::default().fg(Color::DarkGray);
         let (marker, style) = if job.state == JobState::Running {
             (spinner.symbol(), Style::default().fg(Color::Yellow))
         } else {
-            ("\u{00B7}", Style::default().fg(Color::DarkGray))
+            ("\u{00B7}", dim)
         };
-        let mut detail = job.progress.map_or_else(String::new, |p| format!("  {p}"));
+        let head = Line::from(vec![
+            Span::styled(format!(" {marker} #{} ", job.number), style),
+            Span::styled(format!("{} ", job.kind), dim),
+            Span::raw(job.label.clone()),
+        ]);
+        let mut detail = String::new();
         if let Some(status) = job.status.as_deref() {
             detail.push_str("  ");
             detail.push_str(status);
+        }
+        if let Some(phase) = phase.filter(|_| job.state == JobState::Running) {
+            detail.push_str("  ");
+            detail.push_str(phase);
         }
         if job.state == JobState::Queued {
             detail.push_str("  queued");
@@ -157,15 +168,33 @@ impl JobRow<'_> {
         if job.cancel_requested {
             detail.push_str("  cancelling");
         }
-        Line::from(vec![
-            Span::styled(format!(" {marker} #{} ", job.number), style),
-            Span::styled(
-                format!("{} ", job.kind),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw(job.label.clone()),
-            Span::styled(detail, Style::default().fg(Color::DarkGray)),
+        let gauge = job.progress.map(|progress| {
+            LineGauge::default()
+                .ratio(progress.ratio())
+                .label(Line::styled(format!("  {progress}"), dim))
+                .filled_symbol(symbols::line::THICK.horizontal)
+                .unfilled_symbol(symbols::line::NORMAL.horizontal)
+                .filled_style(style)
+                .unfilled_style(dim)
+        });
+        let gauge_width = job.progress.map_or(0, |progress| {
+            // Its label, the gap `LineGauge` leaves after it, and the line.
+            u16::try_from(progress.to_string().len())
+                .unwrap_or(u16::MAX)
+                .saturating_add(3)
+                .saturating_add(GAUGE_WIDTH)
+        });
+        let [head_area, gauge_area, detail_area] = Layout::horizontal([
+            Constraint::Length(u16::try_from(head.width()).unwrap_or(u16::MAX)),
+            Constraint::Length(gauge_width),
+            Constraint::Fill(1),
         ])
+        .areas(area);
+        head.render(head_area, buf);
+        if let Some(gauge) = gauge {
+            gauge.render(gauge_area, buf);
+        }
+        Line::styled(detail, dim).render(detail_area, buf);
     }
 }
 
@@ -186,9 +215,8 @@ pub(crate) fn one_line(text: &str) -> String {
 }
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
-    let chart_height = app.current_chart.as_ref().map_or(0, ChartData::height);
-    let strip = job_strip(app);
-    let strip_height = u16::try_from(strip.len()).unwrap_or(u16::MAX);
+    let strip = JobStrip::of(app);
+    let strip_height = strip.height();
     let screen = frame.area();
     let permission = app.pending_write().map(|pending| {
         pending.lines(
@@ -206,14 +234,12 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let [
         header_area,
         messages_area,
-        chart_area,
         jobs_area,
         input_area,
         status_area,
     ] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(3),
-        Constraint::Length(chart_height),
         Constraint::Length(strip_height),
         Constraint::Length(input_height),
         Constraint::Length(1),
@@ -222,17 +248,29 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
 
     draw_header(frame, header_area, app);
     draw_messages(frame, messages_area, app);
-    if let Some(chart) = &app.current_chart
-        && chart_height > 0
-    {
-        frame.render_widget(chart, chart_area);
-    }
     if strip_height > 0 {
-        frame.render_widget(Paragraph::new(Text::from(strip)), jobs_area);
+        frame.render_widget(&strip, jobs_area);
     }
     draw_input(frame, input_area, app, permission);
     draw_status(frame, status_area, app);
     draw_completion(frame, messages_area, jobs_area.y, app);
+    draw_picker(frame, messages_area, jobs_area.y, app);
+}
+
+/// The `/jobs` or `/sessions` box, drawn over `area` so its last row sits
+/// just above `bottom`, like the command popup.
+fn draw_picker(frame: &mut Frame<'_>, area: Rect, bottom: u16, app: &App) {
+    let Some(picker) = &app.picker else {
+        return;
+    };
+    let height = picker.height().min(bottom.saturating_sub(area.y));
+    let outer = Rect {
+        x: area.x,
+        y: bottom.saturating_sub(height),
+        width: area.width,
+        height,
+    };
+    frame.render_widget(picker, outer);
 }
 
 /// The command popup, drawn over the bottom of `area` so its last row sits
@@ -241,88 +279,158 @@ fn draw_completion(frame: &mut Frame<'_>, area: Rect, bottom: u16, app: &App) {
     let Some(completion) = app.completion() else {
         return;
     };
-    let lines = completion_lines(&completion.items, app.completion_selected());
-    let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let height = rows.saturating_add(2).min(bottom.saturating_sub(area.y));
+    let popup = CompletionPopup::new(&completion.items, app.completion_selected());
+    let height = popup
+        .rows()
+        .saturating_add(2)
+        .min(bottom.saturating_sub(area.y));
     if height < 3 {
         return;
     }
-    let width = lines
-        .iter()
-        .map(Line::width)
-        .max()
-        .and_then(|w| u16::try_from(w).ok())
-        .unwrap_or(u16::MAX)
-        .saturating_add(2)
-        .min(area.width.saturating_sub(2));
-    let popup = Rect {
+    let outer = Rect {
         x: area.x.saturating_add(1),
         y: bottom.saturating_sub(height),
-        width,
+        width: popup
+            .width()
+            .saturating_add(2)
+            .min(area.width.saturating_sub(2)),
         height,
     };
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        ),
-        popup,
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(outer);
+    frame.render_widget(Clear, outer);
+    frame.render_widget(block, outer);
+    frame.render_widget(&popup, inner);
 }
 
-/// The popup's visible rows: a window of [`POPUP_ROWS`] that keeps the
-/// highlighted entry in view, each a label column and a dim description.
-pub(crate) fn completion_lines(items: &[Suggestion], selected: usize) -> Vec<Line<'static>> {
-    let selected = selected.min(items.len().saturating_sub(1));
-    let first = selected.saturating_sub(POPUP_ROWS.saturating_sub(1));
-    let label_width = items
-        .iter()
-        .map(|item| item.label.chars().count())
-        .max()
-        .unwrap_or(0)
-        .min(POPUP_LABEL_WIDTH);
-    let mut lines = Vec::new();
-    for (index, item) in items.iter().enumerate().skip(first).take(POPUP_ROWS) {
-        let (marker, label_style) = if index == selected {
-            (
-                "\u{25B8} ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+/// The command popup's entries, each a label column and a dim description,
+/// the highlighted one marked. It shows [`POPUP_ROWS`] at once and scrolls
+/// to keep the highlighted one in view.
+pub(crate) struct CompletionPopup<'a> {
+    items: &'a [Suggestion],
+    selected: usize,
+}
+
+impl<'a> CompletionPopup<'a> {
+    pub(crate) fn new(items: &'a [Suggestion], selected: usize) -> Self {
+        Self {
+            items,
+            selected: selected.min(items.len().saturating_sub(1)),
+        }
+    }
+
+    fn label_width(&self) -> usize {
+        self.items
+            .iter()
+            .map(|item| item.label.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(POPUP_LABEL_WIDTH)
+    }
+
+    fn entry(&self, index: usize, item: &Suggestion) -> Line<'static> {
+        let label_width = self.label_width();
+        let label_style = if index == self.selected {
+            Self::highlight()
         } else {
-            ("  ", Style::default())
+            Style::default()
         };
-        lines.push(Line::from(vec![
-            Span::styled(marker, label_style),
+        Line::from(vec![
             Span::styled(format!("{:<label_width$}  ", item.label), label_style),
             Span::styled(item.about.clone(), Style::default().fg(Color::DarkGray)),
-        ]));
+        ])
     }
-    lines
+
+    fn highlight() -> Style {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn entries(&self) -> impl Iterator<Item = Line<'static>> {
+        self.items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| self.entry(index, item))
+    }
+
+    /// Columns its widest entry takes, marker included.
+    fn width(&self) -> u16 {
+        let widest = self.entries().map(|line| line.width()).max().unwrap_or(0);
+        u16::try_from(widest.saturating_add(Span::raw(POPUP_MARKER).width())).unwrap_or(u16::MAX)
+    }
+
+    fn rows(&self) -> u16 {
+        u16::try_from(self.items.len().min(POPUP_ROWS)).unwrap_or(u16::MAX)
+    }
 }
 
-/// The strip above the input: one line per active job (running first),
-/// with a spinner, its number, kind, label, and progress, and a count of
-/// any beyond [`STRIP_JOBS`]. Empty when nothing is queued or running.
-pub(crate) fn job_strip(app: &App) -> Vec<Line<'static>> {
-    let mut jobs: Vec<&JobInfo> = app.active_jobs.iter().collect();
-    jobs.sort_by_key(|j| (j.state != JobState::Running, j.number));
-    let mut lines: Vec<Line<'static>> = jobs
-        .iter()
-        .take(STRIP_JOBS)
-        .map(|job| JobRow(job).strip(app.spinner))
-        .collect();
-    let more = jobs.len().saturating_sub(STRIP_JOBS);
-    if more > 0 {
-        lines.push(Line::styled(
-            format!("   and {more} more (/jobs)"),
-            Style::default().fg(Color::DarkGray),
-        ));
+impl Widget for &CompletionPopup<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let list = List::new(self.entries().map(ListItem::new))
+            .highlight_symbol(Line::styled(POPUP_MARKER, CompletionPopup::highlight()))
+            .highlight_spacing(HighlightSpacing::Always);
+        let mut state = ListState::default().with_selected(Some(self.selected));
+        StatefulWidget::render(list, area, buf, &mut state);
     }
-    lines
+}
+
+/// The strip above the input: one row per active job (running first),
+/// with a spinner, its number, kind, label, and progress, and a count of
+/// any beyond [`STRIP_JOBS`]. No rows when nothing is queued or running.
+pub(crate) struct JobStrip<'a> {
+    /// Each job with what its turn is doing, when it is one.
+    jobs: Vec<(&'a JobInfo, Option<String>)>,
+    spinner: Spinner,
+}
+
+impl<'a> JobStrip<'a> {
+    pub(crate) fn of(app: &'a App) -> Self {
+        let mut jobs: Vec<&JobInfo> = app.active_jobs.iter().collect();
+        jobs.sort_by_key(|j| (j.state != JobState::Running, j.number));
+        let now = Timestamp::now();
+        Self {
+            jobs: jobs
+                .into_iter()
+                .map(|job| {
+                    let phase = app.phase_of(job).map(|p| p.note(job.started_at, now));
+                    (job, phase)
+                })
+                .collect(),
+            spinner: app.spinner,
+        }
+    }
+
+    /// Jobs beyond the ones listed.
+    fn more(&self) -> usize {
+        self.jobs.len().saturating_sub(STRIP_JOBS)
+    }
+
+    pub(crate) fn height(&self) -> u16 {
+        let listed = self.jobs.len().min(STRIP_JOBS);
+        u16::try_from(listed.saturating_add(usize::from(self.more() > 0))).unwrap_or(u16::MAX)
+    }
+}
+
+impl Widget for &JobStrip<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let mut rows = area.rows();
+        for ((job, phase), row) in self.jobs.iter().take(STRIP_JOBS).zip(rows.by_ref()) {
+            JobRow(job).render_strip(self.spinner, phase.as_deref(), row, buf);
+        }
+        let more = self.more();
+        if more > 0
+            && let Some(row) = rows.next()
+        {
+            Line::styled(
+                format!("   and {more} more (/jobs)"),
+                Style::default().fg(Color::DarkGray),
+            )
+            .render(row, buf);
+        }
+    }
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -356,12 +464,16 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // The scrollbar's column is always kept, so the transcript does not
+    // re-wrap when it first outgrows the screen.
+    let [text_area, bar_area] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     // Lines are wrapped here, to the real width, so the scroll range is
     // computed on what is drawn and the newest content is reachable
     // (issue #49); the paragraph itself does no wrapping.
-    let lines = format_messages(app, usize::from(area.width));
+    let lines = format_messages(app, usize::from(text_area.width));
     let total_lines = lines.len();
-    let visible = usize::from(area.height);
+    let visible = usize::from(text_area.height);
     let max_scroll = total_lines.saturating_sub(visible);
     app.scroll_limit.set(max_scroll);
     let effective_scroll = max_scroll.saturating_sub(app.scroll.lines_back(max_scroll));
@@ -370,7 +482,19 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let text = Text::from(lines);
     let paragraph = Paragraph::new(text).scroll((scroll_u16, 0));
 
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, text_area);
+    if max_scroll > 0 {
+        // `ScrollbarState` counts positions, and the last one is `max_scroll`.
+        let mut state = ScrollbarState::new(max_scroll.saturating_add(1))
+            .position(effective_scroll)
+            .viewport_content_length(visible);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .symbols(symbols::scrollbar::VERTICAL)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_stateful_widget(bar, bar_area, &mut state);
+    }
 }
 
 fn draw_input(
@@ -432,7 +556,6 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" quit", Style::default().fg(Color::DarkGray)),
-        Span::styled(app.scroll.to_string(), Style::default().fg(Color::DarkGray)),
         Span::styled(
             JobsIndicator(app.job_counts()).to_string(),
             Style::default().fg(Color::DarkGray),
@@ -573,7 +696,8 @@ impl Message {
             style
         };
         let body: Vec<Vec<Span<'static>>> = match self.kind {
-            MessageKind::Assistant => markdown::render(&self.content),
+            // Every row gets a three-column prefix below.
+            MessageKind::Assistant => markdown::render(&self.content, width.saturating_sub(3)),
             MessageKind::Step => self.step_rows(expand_steps, style),
             MessageKind::User
             | MessageKind::Sql
@@ -601,13 +725,10 @@ impl Message {
             }
         }
         if let Some(chart) = &self.chart {
-            let note = vec![Span::styled(
-                format!("[chart: {}; /chart shows it]", chart.title),
-                Style::default().fg(Color::Magenta),
-            )];
-            for row in wrap::wrap(&note, width.saturating_sub(3)) {
+            let chart_width = u16::try_from(width.saturating_sub(3)).unwrap_or(u16::MAX);
+            for row in chart.lines(chart_width) {
                 let mut with_prefix = vec![Span::raw("   ")];
-                with_prefix.extend(row);
+                with_prefix.extend(row.spans);
                 lines.push(Line::from(with_prefix));
             }
         }
@@ -656,62 +777,69 @@ fn separator_line(width: u16) -> Line<'static> {
     Line::styled("\u{2500}".repeat(w), Style::default().fg(Color::DarkGray))
 }
 
-/// Wrapping of styled spans to a width, by characters, breaking at the
-/// last space when one is near.
+/// Wrapping of styled spans to a width in terminal columns, breaking at
+/// the last space when one is near.
 pub(crate) mod wrap {
     use ratatui::style::Style;
-    use ratatui::text::Span;
+    use ratatui::text::{Span, StyledGrapheme};
 
     pub(crate) fn wrap(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
         let width = width.max(1);
-        let chars: Vec<(char, Style)> = spans
+        // Graphemes, not characters: a wide one takes two columns and a
+        // combining mark none, and neither may be split across rows.
+        let cells: Vec<StyledGrapheme<'_>> = spans
             .iter()
-            .flat_map(|s| {
-                let style = s.style;
-                s.content
-                    .chars()
-                    .map(move |c| (c, style))
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|s| s.styled_graphemes(Style::default()))
             .collect();
-        if chars.is_empty() {
+        if cells.is_empty() {
             return vec![Vec::new()];
         }
         let mut rows = Vec::new();
         let mut start = 0;
-        while start < chars.len() {
-            let mut end = start.saturating_add(width).min(chars.len());
-            if end < chars.len() {
-                // Prefer the last space in the row, if it is not too early.
-                if let Some(space) = chars
-                    .get(start..end)
-                    .and_then(|row| row.iter().rposition(|(c, _)| *c == ' '))
-                    .filter(|pos| pos.saturating_mul(2) > width)
-                {
-                    end = start.saturating_add(space).saturating_add(1);
+        while start < cells.len() {
+            let mut end = start;
+            let mut used = 0_usize;
+            // The row's last space and the columns before it.
+            let mut space = None;
+            for (at, cell) in cells.iter().enumerate().skip(start) {
+                let next = used.saturating_add(Span::raw(cell.symbol).width());
+                // A grapheme wider than the row still takes one.
+                if next > width && at > start {
+                    break;
                 }
+                if cell.symbol == " " {
+                    space = Some((at, used));
+                }
+                used = next;
+                end = at.saturating_add(1);
             }
-            rows.push(regroup(chars.get(start..end).unwrap_or(&[])));
+            if end < cells.len()
+                // Prefer the last space in the row, if it is not too early.
+                && let Some((at, _)) = space.filter(|(_, column)| column.saturating_mul(2) > width)
+            {
+                end = at.saturating_add(1);
+            }
+            rows.push(regroup(cells.get(start..end).unwrap_or(&[])));
             start = end;
         }
         rows
     }
 
-    /// Consecutive characters of one style back into spans.
-    fn regroup(chars: &[(char, Style)]) -> Vec<Span<'static>> {
+    /// Consecutive graphemes of one style back into spans.
+    fn regroup(cells: &[StyledGrapheme<'_>]) -> Vec<Span<'static>> {
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut current = String::new();
         let mut current_style: Option<Style> = None;
-        for (c, style) in chars {
-            if current_style != Some(*style) {
+        for cell in cells {
+            if current_style != Some(cell.style) {
                 if let Some(s) = current_style
                     && !current.is_empty()
                 {
                     spans.push(Span::styled(std::mem::take(&mut current), s));
                 }
-                current_style = Some(*style);
+                current_style = Some(cell.style);
             }
-            current.push(*c);
+            current.push_str(cell.symbol);
         }
         if let Some(s) = current_style
             && !current.is_empty()
@@ -719,116 +847,6 @@ pub(crate) mod wrap {
             spans.push(Span::styled(current, s));
         }
         spans
-    }
-}
-
-/// A light Markdown rendering for the transcript: headings bold, bullets
-/// as dots, fenced code dim and verbatim, `**bold**`, `*italic*`, and
-/// `` `code` `` inline. Tables pass through as their source lines.
-pub(crate) mod markdown {
-    use ratatui::style::{Color, Modifier, Style};
-    use ratatui::text::Span;
-
-    pub(crate) fn render(content: &str) -> Vec<Vec<Span<'static>>> {
-        let mut rows = Vec::new();
-        let mut in_fence = false;
-        for line in content.lines() {
-            if line.trim_start().starts_with("```") {
-                in_fence = !in_fence;
-                continue;
-            }
-            if in_fence {
-                rows.push(vec![Span::styled(
-                    format!("  {line}"),
-                    Style::default().fg(Color::Cyan),
-                )]);
-                continue;
-            }
-            let trimmed = line.trim_start();
-            if let Some(heading) = trimmed.strip_prefix('#') {
-                let text = heading.trim_start_matches('#').trim();
-                rows.push(vec![Span::styled(
-                    text.to_owned(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )]);
-                continue;
-            }
-            let indent = line.len().saturating_sub(trimmed.len());
-            let (bullet, rest) = match trimmed
-                .strip_prefix("- ")
-                .or_else(|| trimmed.strip_prefix("* "))
-            {
-                Some(rest) => ("\u{2022} ", rest),
-                None => ("", trimmed),
-            };
-            let mut spans = Vec::new();
-            if indent > 0 || !bullet.is_empty() {
-                spans.push(Span::raw(format!("{}{bullet}", " ".repeat(indent))));
-            }
-            spans.extend(inline(rest));
-            rows.push(spans);
-        }
-        if rows.is_empty() {
-            rows.push(Vec::new());
-        }
-        rows
-    }
-
-    /// Inline `**bold**`, `*italic*`, and `` `code` `` runs.
-    fn inline(text: &str) -> Vec<Span<'static>> {
-        let mut spans = Vec::new();
-        let mut plain = String::new();
-        let mut rest = text;
-        while !rest.is_empty() {
-            if let Some(after) = rest.strip_prefix("**")
-                && let Some(end) = after.find("**")
-            {
-                flush(&mut spans, &mut plain, Style::default());
-                spans.push(Span::styled(
-                    after.get(..end).unwrap_or("").to_owned(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
-                rest = after.get(end.saturating_add(2)..).unwrap_or("");
-                continue;
-            }
-            if let Some(after) = rest.strip_prefix('`')
-                && let Some(end) = after.find('`')
-            {
-                flush(&mut spans, &mut plain, Style::default());
-                spans.push(Span::styled(
-                    after.get(..end).unwrap_or("").to_owned(),
-                    Style::default().fg(Color::Cyan),
-                ));
-                rest = after.get(end.saturating_add(1)..).unwrap_or("");
-                continue;
-            }
-            if let Some(after) = rest.strip_prefix('*')
-                && !after.starts_with(' ')
-                && let Some(end) = after.find('*')
-                && end > 0
-            {
-                flush(&mut spans, &mut plain, Style::default());
-                spans.push(Span::styled(
-                    after.get(..end).unwrap_or("").to_owned(),
-                    Style::default().add_modifier(Modifier::ITALIC),
-                ));
-                rest = after.get(end.saturating_add(1)..).unwrap_or("");
-                continue;
-            }
-            let mut chars = rest.chars();
-            if let Some(c) = chars.next() {
-                plain.push(c);
-            }
-            rest = chars.as_str();
-        }
-        flush(&mut spans, &mut plain, Style::default());
-        spans
-    }
-
-    fn flush(spans: &mut Vec<Span<'static>>, plain: &mut String, style: Style) {
-        if !plain.is_empty() {
-            spans.push(Span::styled(std::mem::take(plain), style));
-        }
     }
 }
 
@@ -853,29 +871,28 @@ mod tests {
     }
 
     #[test]
-    fn markdown_renders_headings_bullets_fences_and_inline_marks() {
-        let rows = markdown::render(
-            "## Deadliest\n- **Tornado** in `Texas`\n```sql\nSELECT 1\n```\n| a | b |",
-        );
-        let lines = text_of(&rows);
+    fn wrapping_counts_columns_and_keeps_graphemes_whole() {
+        // Each of these takes two columns, so two fit in four.
+        let wide = wrap::wrap(&[Span::raw("\u{65E5}\u{672C}\u{8A9E}\u{65E5}\u{672C}")], 4);
         assert_eq!(
-            lines,
-            [
-                "Deadliest",
-                "\u{2022} Tornado in Texas",
-                "  SELECT 1",
-                "| a | b |"
-            ]
+            text_of(&wide),
+            ["\u{65E5}\u{672C}", "\u{8A9E}\u{65E5}", "\u{672C}"]
         );
+        // A combining accent takes no column and stays with its letter.
+        let accented = wrap::wrap(&[Span::raw("e\u{301}e\u{301}e\u{301}")], 2);
+        assert_eq!(text_of(&accented), ["e\u{301}e\u{301}", "e\u{301}"]);
+        // A grapheme wider than the row still takes one, so wrapping ends.
+        let narrow = wrap::wrap(&[Span::raw("\u{65E5}\u{672C}")], 1);
+        assert_eq!(text_of(&narrow), ["\u{65E5}", "\u{672C}"]);
+        // A style change inside a row keeps both spans.
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let styled = wrap::wrap(&[Span::raw("ab"), Span::styled("cd", bold)], 3);
+        assert_eq!(text_of(&styled), ["abc", "d"]);
         assert!(
-            rows.first()
-                .and_then(|r| r.first())
-                .is_some_and(|s| s.style.add_modifier.contains(Modifier::BOLD))
-        );
-        assert!(
-            rows.get(1)
-                .and_then(|r| r.get(1))
-                .is_some_and(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            styled
+                .first()
+                .and_then(|row| row.get(1))
+                .is_some_and(|span| span.style == bold)
         );
     }
 }

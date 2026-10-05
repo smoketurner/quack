@@ -722,7 +722,7 @@ struct EmbedPlan<'a> {
     batch_size: u32,
     concurrency: u32,
     /// Checked while each batch is in flight (a cancel drops the
-    /// requests), and told as each batch is stored.
+    /// requests), and told the total, then as each batch is stored.
     control: RunControl<'a>,
 }
 
@@ -770,6 +770,17 @@ impl EmbedPlan<'_> {
             let vectors = embedder.embed(&inputs).await?;
             Ok::<_, Error>((ids, vectors))
         });
+        // The total, before the first batch returns: until then there
+        // would be nothing to show.
+        if stored > 0 {
+            (control.progress)(ChunkDone {
+                done: 0,
+                total: stored,
+                failed: 0,
+                took: Duration::ZERO,
+                elapsed: started.elapsed(),
+            });
+        }
         let mut batches: u32 = 0;
         let mut embedded: u32 = 0;
         let mut batch_started = Instant::now();

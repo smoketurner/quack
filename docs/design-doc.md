@@ -1056,7 +1056,7 @@ drift, propose again.
    b. check permission (7.4); emit PermissionRequired and await the interface's answer
    c. execute; emit ToolFinished { tool, detail, summary, duration_ms }
    d. append the result to history; go to 2
-4. On text: emit TextDelta as it streams; validate citations; emit
+4. On reasoning: emit Reasoning once per model call, without its text. On text: emit TextDelta as it streams; validate citations; emit
    TurnComplete { AgentResponse }; then persist the turn
 0. Before 2, when the model has to be loaded first (Ollama, cold): emit Status { line }
 ```
@@ -1786,7 +1786,9 @@ shows streaming answers, inline steps, citations as footnotes, and ratatui chart
 permission prompts take `y`/`n`/`a`, one at a time, and the prompt itself shows who asks,
 the statement, and how many more wait, so clearing or scrolling the transcript never hides
 what is being approved. Input starting with `SELECT`/`WITH`/`FROM`/
-`DESCRIBE`/`SHOW`/`PIVOT`/`SUMMARIZE` is direct SQL. Direct SQL and `/sql` pass the agent's
+`DESCRIBE`/`SHOW`/`PIVOT`/`SUMMARIZE` is direct SQL when `DuckDB` can parse it; a line it
+cannot parse ("show me the first rows") is asked as a question when a chat model is set,
+with a note saying so, and `/sql` always runs its line as a statement. Direct SQL and `/sql` pass the agent's
 gate: internal tables refused, writes ask `y`/`n`/`a`, `max_query_rows` rows shown. A line that
 is the path of a loadable file (or several, shell-quoted) is loaded. The session turns on
 bracketed paste, so a file dropped on the terminal arrives as one paste of its path: into
@@ -1797,7 +1799,7 @@ Slash commands: `/help`, `/tables`, `/schema TABLE`, `/sql`, `/ingest PATH` (`/a
 `/import`, `/docs`, `/pin`, `/unpin`, `/delete`, `/ontology ...` and `/graph ...`, `/graph
 ENTITY`, `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/sessions`,
 `/resume`, `/new`, `/mode`, `/share`, `/unshare`, `/export [--sql|--markdown] [FILE]`,
-`/jobs`, `/cancel N`, `/chart [N]`, `/steps`, `/model`, `/workspace`, `/clear`, `/quit`.
+`/jobs`, `/cancel N`, `/steps`, `/model`, `/workspace`, `/clear`, `/quit`.
 `/model` shows the configured models, then lists each provider's models as a job
 (`llm::ModelCatalog`).
 `/ontology` and `/graph` are the `quack ontology` and `quack graph` verbs, parsed by the
@@ -1834,8 +1836,12 @@ read at startup and again after a statement, an ingest, an import, or a turn.
 are each a job; the prompt takes the next line at once. A follow-up asked while an answer
 streams queues behind it in the session's lane and says so; SQL and file loads run
 alongside. A strip above the input shows running and queued jobs (spinner, number, kind,
-label, progress); the status line counts them; `/jobs` lists recent ones with outcomes;
-`/cancel N` stops one. Results land in the transcript as each job finishes. A turn's text
+label, progress, and for a running question what it is doing: `waiting 3s`, `thinking 41s`
+once the model reports reasoning, `running run_sql`, `answering`); the status line counts them; `/jobs` opens a box over the transcript listing every job on
+record, newest first, which follows the queue while open (Up and Down move, `c` cancels the
+highlighted job, Enter posts its details, Esc closes); `/cancel N` stops one by number.
+`/sessions` opens the same box over the 200 most recent sessions, and Enter resumes the
+highlighted one. Results land in the transcript as each job finishes. A turn's text
 renders only while its session is on screen; switching sessions leaves it running, and a
 line reports its end. Write prompts from concurrent work queue and are answered one at a
 time.
@@ -1846,7 +1852,7 @@ a job is active. Every waiting message is applied before the next draw.
 
 **Rendering.** Answers render Markdown (headings, bullets, fences, inline marks). Tool steps
 show a three-line preview until `/steps` expands them (print mode folds the same way without
-`--verbose`). The pane shows the latest answer's chart; `/chart N` shows an earlier one.
+`--verbose`). An answer's chart is drawn in the transcript under its text and scrolls with it.
 Lines wrap to the terminal width before the scroll range is computed, so the end is always
 reachable. Typed input persists in `<data_dir>/terminal_history`. A relative path to an
 existing file ingests it. An embedding provider is optional (keyword search without one).

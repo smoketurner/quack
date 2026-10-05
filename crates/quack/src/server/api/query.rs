@@ -274,6 +274,7 @@ pub(crate) async fn query(
             AgentEvent::TurnComplete(response) => complete = Some(response),
             AgentEvent::Failed(message) => failure = Some(message),
             AgentEvent::Status(_)
+            | AgentEvent::Reasoning
             | AgentEvent::TextDelta(_)
             | AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolFinished(_) => {}
@@ -304,6 +305,8 @@ pub(crate) async fn stream(
     let stream = futures::stream::unfold((turn, app), |(mut turn, app)| async move {
         let event = turn.events.recv().await?;
         let out = match event {
+            // A comment line: clients skip it, and the stream stays in step.
+            AgentEvent::Reasoning => Event::default().comment("reasoning"),
             AgentEvent::Status(status) => StreamEvent::Status.event().data(status),
             AgentEvent::TextDelta(text) => StreamEvent::Text.event().data(text),
             AgentEvent::ToolStarted { tool, detail } => StreamEvent::ToolStarted

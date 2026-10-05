@@ -1,8 +1,11 @@
+use std::f64::consts::TAU;
+
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::canvas::{Canvas, Painter, Shape};
 use ratatui::widgets::{
     Axis, Bar, BarChart, BarGroup, Block, Borders, Chart, Dataset, GraphType, Paragraph, Widget,
 };
@@ -19,7 +22,16 @@ const COLORS: &[Color] = &[
     Color::Red,
     Color::White,
     Color::LightGreen,
+    Color::LightCyan,
+    Color::LightYellow,
+    Color::LightMagenta,
+    Color::LightBlue,
+    Color::LightRed,
+    Color::Gray,
 ];
+
+/// Rows a pie's panel takes at least, so its circle is not a smudge.
+const PIE_MIN_HEIGHT: u16 = 12;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SeriesData {
@@ -117,6 +129,36 @@ impl ChartData {
         Self { title, plot }
     }
 
+    /// The chart drawn `width` columns wide, a line per row, so the
+    /// transcript holds it and scrolls it like text.
+    pub(crate) fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        let area = Rect::new(0, 0, width, self.height());
+        let mut buf = Buffer::empty(area);
+        self.render(area, &mut buf);
+        area.rows()
+            .map(|row| {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                // Columns the buffer left blank under a wide symbol.
+                let mut covered = 0_usize;
+                for cell in row.positions().filter_map(|at| buf.cell(at)) {
+                    if covered > 0 {
+                        covered = covered.saturating_sub(1);
+                        continue;
+                    }
+                    let symbol = cell.symbol();
+                    covered = Span::raw(symbol).width().saturating_sub(1);
+                    match spans.last_mut() {
+                        Some(last) if last.style == cell.style() => {
+                            last.content.to_mut().push_str(symbol);
+                        }
+                        _ => spans.push(Span::styled(symbol.to_owned(), cell.style())),
+                    }
+                }
+                Line::from(spans)
+            })
+            .collect()
+    }
+
     pub(crate) fn height(&self) -> u16 {
         match &self.plot {
             Plot::Bars { values, .. } => {
@@ -135,8 +177,13 @@ impl ChartData {
             }
             Plot::Line(_) => 12,
             Plot::Pie(slices) => {
-                let lines = u16::try_from(slices.len()).unwrap_or(u16::MAX);
-                lines.saturating_add(4).min(20)
+                if Pie(slices).total() == 0 {
+                    3
+                } else {
+                    // A legend row per slice, and the border.
+                    let lines = u16::try_from(slices.len()).unwrap_or(u16::MAX);
+                    lines.saturating_add(2).clamp(PIE_MIN_HEIGHT, 20)
+                }
             }
         }
     }
@@ -220,33 +267,156 @@ impl LineData {
     }
 }
 
-/// Each slice as a bar of up to twenty cells, its value, and its share.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    reason = "a slice's share of the total as a percentage and a bar length"
-)]
-fn pie_lines(slices: &[Slice]) -> Vec<Line<'_>> {
-    let total: u64 = slices.iter().map(|s| s.value).sum();
-    if total == 0 {
-        return Vec::new();
+/// A pie's slices: the circle and the legend beside it.
+struct Pie<'a>(&'a [Slice]);
+
+impl Pie<'_> {
+    fn total(&self) -> u64 {
+        self.0.iter().map(|slice| slice.value).sum()
     }
-    slices
-        .iter()
-        .zip(COLORS.iter().cycle())
-        .map(|(slice, &color)| {
-            let pct = (slice.value as f64 / total as f64) * 100.0;
-            let bar = "\u{2588}".repeat((pct / 100.0 * 20.0) as usize);
-            Line::from(vec![
-                Span::styled(format!(" {bar:<20} "), Style::default().fg(color)),
-                Span::styled(
-                    format!("{}: {} ({pct:.1}%)", slice.name, slice.value),
-                    Style::default().fg(Color::White),
-                ),
-            ])
-        })
-        .collect()
+
+    /// The slice's share of the whole, from 0 to 1; 0 for an empty pie.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a slice's share of the total, for an angle and a percentage"
+    )]
+    fn share(&self, slice: &Slice) -> f64 {
+        match self.total() {
+            0 => 0.0,
+            total => slice.value as f64 / total as f64,
+        }
+    }
+
+    /// The colours in turn, except that a last slice which would wrap
+    /// round to the first one's takes the next, since the two touch.
+    fn color(&self, index: usize) -> Color {
+        let turn = index.checked_rem(COLORS.len()).unwrap_or(0);
+        let wraps_onto_first = index > 0 && turn == 0 && index.saturating_add(1) == self.0.len();
+        COLORS
+            .get(if wraps_onto_first { 1 } else { turn })
+            .copied()
+            .unwrap_or(Color::Green)
+    }
+
+    /// The slice that holds `turn`, a share of the full circle clockwise
+    /// from twelve o'clock.
+    fn slice_at(&self, turn: f64) -> Option<usize> {
+        let mut end = 0.0;
+        let mut last = None;
+        for (index, slice) in self.0.iter().enumerate() {
+            if slice.value == 0 {
+                continue;
+            }
+            end += self.share(slice);
+            if turn < end {
+                return Some(index);
+            }
+            last = Some(index);
+        }
+        // Rounding can leave the last sliver past every end.
+        last
+    }
+
+    /// One row per slice: its colour, name, value, and share. With more
+    /// slices than `rows`, the last row counts the rest.
+    fn legend(&self, rows: usize) -> Vec<Line<'static>> {
+        let shown = if self.0.len() > rows {
+            rows.saturating_sub(1)
+        } else {
+            self.0.len()
+        };
+        let mut lines: Vec<Line<'static>> = self
+            .0
+            .iter()
+            .enumerate()
+            .take(shown)
+            .map(|(index, slice)| {
+                Line::from(vec![
+                    Span::styled(" \u{25A0} ", Style::default().fg(self.color(index))),
+                    Span::styled(
+                        format!(
+                            "{}: {} ({:.1}%)",
+                            slice.name,
+                            slice.value,
+                            self.share(slice) * 100.0
+                        ),
+                        Style::default().fg(Color::White),
+                    ),
+                ])
+            })
+            .collect();
+        if shown < self.0.len() {
+            lines.push(Line::styled(
+                format!("   and {} more", self.0.len().saturating_sub(shown)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines
+    }
+}
+
+impl Widget for &Pie<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if self.total() == 0 {
+            return;
+        }
+        // A half block is one column wide and half a row high, which is
+        // square in a terminal's two-to-one cells.
+        let diameter = area
+            .width
+            .saturating_sub(1)
+            .min(area.height.saturating_mul(2));
+        let [_, circle, legend] = Layout::horizontal([
+            Constraint::Length(1),
+            Constraint::Length(diameter),
+            Constraint::Fill(1),
+        ])
+        .areas(area);
+        let disc = Disc {
+            pie: self,
+            across: circle.width,
+            down: circle.height.saturating_mul(2),
+        };
+        Canvas::default()
+            .marker(symbols::Marker::HalfBlock)
+            // One canvas unit per point, so each point is painted once.
+            .x_bounds([0.0, f64::from(disc.across.saturating_sub(1))])
+            .y_bounds([0.0, f64::from(disc.down.saturating_sub(1))])
+            .paint(|ctx| ctx.draw(&disc))
+            .render(circle, buf);
+        Paragraph::new(self.legend(usize::from(legend.height))).render(legend, buf);
+    }
+}
+
+/// A pie as a filled circle on a canvas of `across` by `down` points.
+struct Disc<'a> {
+    pie: &'a Pie<'a>,
+    across: u16,
+    down: u16,
+}
+
+impl Shape for Disc<'_> {
+    fn draw(&self, painter: &mut Painter<'_, '_>) {
+        let (across, down) = (f64::from(self.across), f64::from(self.down));
+        let radius = across.min(down) / 2.0;
+        let (center_x, center_y) = ((across - 1.0) / 2.0, (down - 1.0) / 2.0);
+        for row in 0..self.down {
+            for column in 0..self.across {
+                let (x, y) = (f64::from(column), f64::from(row));
+                // `up` grows towards the top, as the canvas's y does.
+                let (right, up) = (x - center_x, center_y - y);
+                if right.hypot(up) > radius {
+                    continue;
+                }
+                let turn = right.atan2(up).rem_euclid(TAU) / TAU;
+                if let Some(index) = self.pie.slice_at(turn)
+                    && let Some((px, py)) = painter.get_point(x, down - 1.0 - y)
+                {
+                    painter.paint(px, py, self.pie.color(index));
+                }
+            }
+        }
+    }
 }
 
 impl Widget for &ChartData {
@@ -311,7 +481,7 @@ impl Widget for &ChartData {
             Plot::Pie(slices) => {
                 let inner = block.inner(area);
                 block.render(area, buf);
-                Paragraph::new(pie_lines(slices)).render(inner, buf);
+                Pie(slices).render(inner, buf);
             }
         }
     }
@@ -399,7 +569,128 @@ mod tests {
                 Slice { name: String::from("B"), value: 40 },
             ]
         ));
-        assert_eq!(data.height(), 6);
+        assert_eq!(data.height(), PIE_MIN_HEIGHT);
+    }
+
+    fn slices(values: &[u64]) -> Vec<Slice> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| Slice {
+                name: format!("s{index}"),
+                value: *value,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_turn_of_the_circle_falls_in_the_slice_that_covers_it() {
+        let parts = slices(&[60, 0, 40]);
+        let pie = Pie(&parts);
+        assert_eq!(pie.slice_at(0.0), Some(0));
+        assert_eq!(pie.slice_at(0.59), Some(0));
+        // The empty slice between them takes none of the circle.
+        assert_eq!(pie.slice_at(0.61), Some(2));
+        assert_eq!(pie.slice_at(0.999_999), Some(2));
+        // Past every end by rounding: the last slice that has any.
+        assert_eq!(pie.slice_at(1.0), Some(2));
+        assert_eq!(Pie(&slices(&[0, 0])).slice_at(0.5), None);
+        assert_eq!(Pie(&[]).slice_at(0.5), None);
+    }
+
+    #[test]
+    fn a_last_slice_never_takes_the_first_slices_colour() {
+        let wrapped = slices(&vec![1; COLORS.len() + 1]);
+        let pie = Pie(&wrapped);
+        assert_eq!(pie.color(0), Color::Green);
+        assert_ne!(pie.color(COLORS.len()), pie.color(0));
+        assert_ne!(pie.color(COLORS.len()), pie.color(COLORS.len() - 1));
+        // Away from the wrap the colours just come in turn.
+        let longer = slices(&vec![1; COLORS.len() + 2]);
+        assert_eq!(Pie(&longer).color(COLORS.len()), Color::Green);
+    }
+
+    #[test]
+    fn a_pie_is_a_filled_circle_beside_its_legend() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let data = ChartData::from_spec(&spec(
+            ChartKind::Pie,
+            &["A", "B"],
+            &[("share", &[75.0, 25.0])],
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(60, data.height())).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(&data, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        // The colours a cell shows: a half block's own, and the half
+        // behind it.
+        let colors = |x: u16, y: u16| {
+            buffer
+                .cell((x, y))
+                .map(|cell| (cell.symbol().to_owned(), cell.fg, cell.bg))
+                .unwrap_or_default()
+        };
+        // Inside the border and a column's margin the circle is 20
+        // columns by 10 rows. A fills
+        // three quarters clockwise from the top, so B is the upper left.
+        let (symbol, fg, _) = colors(16, 3);
+        assert_ne!(symbol, " ");
+        assert_eq!(fg, Color::Green, "upper right is A");
+        let (symbol, fg, _) = colors(7, 3);
+        assert_ne!(symbol, " ");
+        assert_eq!(fg, Color::Cyan, "upper left is B");
+        let (_, fg, _) = colors(7, 8);
+        assert_eq!(fg, Color::Green, "lower left is A");
+        // The corner of the square is outside the circle.
+        assert_eq!(colors(2, 1).0, " ");
+        let text = render_to_string(&data);
+        assert!(text.contains("\u{25A0} A: 75 (75.0%)"), "{text}");
+        assert!(text.contains("\u{25A0} B: 25 (25.0%)"), "{text}");
+    }
+
+    #[test]
+    fn a_pie_with_nothing_in_it_and_a_crowded_legend_still_render() {
+        let empty = ChartData::from_spec(&spec(ChartKind::Pie, &["A"], &[("y", &[0.0])]));
+        assert_eq!(empty.height(), 3);
+        render_to_string(&empty);
+        // More slices than rows: the legend counts the rest.
+        let many = slices(&[1; 30]);
+        let lines = Pie(&many).legend(5);
+        assert_eq!(lines.len(), 5);
+        assert_eq!(
+            lines.last().map(ToString::to_string).as_deref(),
+            Some("   and 26 more")
+        );
+    }
+
+    #[test]
+    fn a_chart_becomes_transcript_lines_of_its_width() {
+        let data = ChartData::from_spec(&spec(
+            ChartKind::Pie,
+            &["\u{6771}\u{4EAC}", "B"],
+            &[("share", &[75.0, 25.0])],
+        ));
+        let lines = data.lines(60);
+        assert_eq!(lines.len(), usize::from(data.height()));
+        // A wide symbol takes two columns and one span's worth of text.
+        assert!(lines.iter().all(|line| line.width() == 60), "{lines:?}");
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert!(text.first().is_some_and(|top| top.contains(" t ")));
+        assert!(
+            text.iter()
+                .any(|row| row.contains("\u{6771}\u{4EAC}: 75 (75.0%)")),
+            "{text:?}"
+        );
+        // The slices keep their colours.
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::Cyan) && span.content.contains('\u{25A0}'))
+        }));
+        assert!(data.lines(0).iter().all(|line| line.width() == 0));
     }
 
     #[test]

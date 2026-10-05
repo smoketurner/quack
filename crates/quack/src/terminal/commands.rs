@@ -125,7 +125,7 @@ pub(crate) enum SlashCommand {
         #[command(subcommand)]
         action: EmbeddingsAction,
     },
-    /// List recent sessions
+    /// Pick a recent session to resume
     #[command(name = "/sessions")]
     Sessions,
     /// Switch to a session (id prefix accepted) and replay it
@@ -150,7 +150,7 @@ pub(crate) enum SlashCommand {
         flags: ExportFlags,
         file: Option<String>,
     },
-    /// List running, queued, and recent jobs
+    /// Show running, queued, and recent jobs; c cancels one
     #[command(name = "/jobs")]
     Jobs,
     /// Cancel job N from /jobs (queued or running)
@@ -161,19 +161,13 @@ pub(crate) enum SlashCommand {
         #[arg(id = VERBATIM, value_name = "N")]
         job: JobNumber,
     },
-    /// Show the chart of the Nth chart-bearing answer (default: the last)
-    #[command(name = "/chart", disable_help_flag = true)]
-    Chart {
-        #[arg(value_name = "N")]
-        n: Option<usize>,
-    },
     /// Expand or collapse the tool call details
     #[command(name = "/steps")]
     Steps,
     /// Show the chat and embedding models in use
     #[command(name = "/model")]
     Model,
-    /// Clear messages and chart
+    /// Clear messages
     #[command(name = "/clear")]
     Clear,
     /// Show current workspace and session
@@ -364,6 +358,7 @@ in one session are answered in order; other work runs alongside, up to
 
 Shortcuts:
   /                 List commands; Up/Down pick, Tab fills in, Enter runs, Esc hides
+  /jobs, /sessions  Open a list; Up/Down move, Enter picks, Esc closes
   Enter             Send message
   Up/Down           Browse input history (kept across sessions)
   PageUp/PageDown, mouse wheel   Scroll messages; Home/End jump
@@ -914,10 +909,6 @@ mod tests {
             Ok(SlashCommand::Cancel { job }) if job.to_string() == "3"
         ));
         assert!(!parses("/cancel x"));
-        assert!(matches!(
-            SlashCommand::parse("/chart 2"),
-            Ok(SlashCommand::Chart { n: Some(2) })
-        ));
         assert!(matches!(
             SlashCommand::parse("/unknown 'quote"),
             Err(e) if e.kind() == ErrorKind::InvalidSubcommand

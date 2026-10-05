@@ -16,6 +16,7 @@ use ratatui::style::{Color, Style};
 use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::{broadcast, mpsc};
 
+use jiff::Timestamp;
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::citations::{Citation, Sources};
 use quack_core::analysis::events::{
@@ -54,6 +55,7 @@ use crate::ontology_cli::{self, OntologyAction};
 use crate::terminal::SessionSetup;
 use crate::terminal::chart::ChartData;
 use crate::terminal::commands::{Completion, ContextAction, GraphWalk, Input, Route, SlashCommand};
+use crate::terminal::picker::{Picked, Picker};
 use crate::terminal::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
 
 /// The spinner's frame interval; it ticks only while a job is active.
@@ -64,6 +66,9 @@ const QUIT_GRACE: Duration = Duration::from_secs(3);
 
 /// Lines typed before, newest last; kept per data directory.
 const HISTORY_LINES: usize = 500;
+
+/// Sessions `/sessions` lists at most, newest first.
+const PICKER_SESSIONS: u32 = 200;
 
 const WELCOME_TEXT: &str = "\
 Welcome to quack!
@@ -108,7 +113,7 @@ pub(crate) struct Message {
     pub(crate) kind: MessageKind,
     pub(crate) content: String,
     /// The chart an assistant answer produced (design doc 9: charts belong
-    /// to messages); `/chart N` brings it into the chart pane.
+    /// to messages), drawn in the transcript under its text.
     pub(crate) chart: Option<ChartData>,
     /// A step's full tool detail, shown whole when steps are expanded.
     pub(crate) detail: Option<String>,
@@ -322,6 +327,58 @@ struct Turn {
     /// Index into `messages` of the step line being filled in.
     open_step: Option<usize>,
     progress: TurnProgress,
+    phase: Phase,
+}
+
+/// What a running turn is doing, for its row in the job strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// No output from the model yet: since the job started, or since
+    /// the tool before this model call finished.
+    Waiting {
+        since: Option<Timestamp>,
+    },
+    /// The model is reasoning, which the transcript does not show.
+    Thinking {
+        since: Timestamp,
+    },
+    Answering,
+    Tool(ToolName),
+}
+
+impl Phase {
+    /// The phase `event` leaves the turn in, at `now`.
+    fn after(self, event: &AgentEvent, now: Timestamp) -> Self {
+        match event {
+            AgentEvent::Reasoning => match self {
+                // More reasoning in one model call keeps its start.
+                Self::Thinking { .. } => self,
+                Self::Waiting { .. } | Self::Answering | Self::Tool(_) => {
+                    Self::Thinking { since: now }
+                }
+            },
+            AgentEvent::TextDelta(_) => Self::Answering,
+            AgentEvent::ToolStarted { tool, .. } => Self::Tool(*tool),
+            AgentEvent::ToolFinished(_) => Self::Waiting { since: Some(now) },
+            AgentEvent::Status(_)
+            | AgentEvent::PermissionRequired(_)
+            | AgentEvent::TurnComplete(_)
+            | AgentEvent::Failed(_) => self,
+        }
+    }
+
+    /// `thinking 41s`, as of `now`, for a job that started at `started`.
+    pub(crate) fn note(self, started: Option<Timestamp>, now: Timestamp) -> String {
+        let seconds = |since: Option<Timestamp>| {
+            since.map_or(0, |since| now.duration_since(since).as_secs().max(0))
+        };
+        match self {
+            Self::Waiting { since } => format!("waiting {}s", seconds(since.or(started))),
+            Self::Thinking { since } => format!("thinking {}s", seconds(Some(since))),
+            Self::Answering => String::from("answering"),
+            Self::Tool(tool) => format!("running {tool}"),
+        }
+    }
 }
 
 /// Where a turn is. Its end (`TurnComplete` or `Failed`) and the close of
@@ -370,6 +427,15 @@ impl Turn {
             self.whose()
         }
     }
+}
+
+/// Why a line is run as SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlIntent {
+    /// `/sql` said so.
+    Stated,
+    /// It starts with a SQL keyword, as a question can.
+    Guessed,
 }
 
 /// The command popup's state while a slash command is typed.
@@ -775,7 +841,6 @@ pub(crate) struct App {
     pub(crate) workspace_name: String,
     pub(crate) provider_display: String,
     pub(crate) session_id: SessionId,
-    pub(crate) current_chart: Option<ChartData>,
     /// Decisions owed, oldest first; the front one is on screen.
     prompts: VecDeque<Prompt>,
     /// Agent turns queued or running, in submission order.
@@ -785,6 +850,8 @@ pub(crate) struct App {
     job_events: broadcast::Receiver<JobInfo>,
     /// Jobs still queued or running, for the strip above the input.
     pub(crate) active_jobs: Vec<JobInfo>,
+    /// The `/jobs` or `/sessions` box, while it is open (and takes the keys).
+    pub(crate) picker: Option<Picker>,
     /// The session's database worker: every command's database step runs
     /// there, in the order typed, never on the event loop's thread.
     db_steps: Option<mpsc::UnboundedSender<DbStep>>,
@@ -850,12 +917,12 @@ impl App {
             workspace_name,
             provider_display: config.chat_model_label(),
             session_id,
-            current_chart: None,
             prompts: VecDeque::new(),
             turns: Vec::new(),
             jobs,
             job_events,
             active_jobs: Vec::new(),
+            picker: None,
             db_steps: None,
             pending_db: 0,
             switching: None,
@@ -911,6 +978,14 @@ impl App {
     }
 
     /// Queued and running jobs, for the status line.
+    /// What the turn running as `job` is doing, if it is a turn.
+    pub(crate) fn phase_of(&self, job: &JobInfo) -> Option<Phase> {
+        self.turns
+            .iter()
+            .find(|turn| turn.job.id == job.id)
+            .map(|turn| turn.phase)
+    }
+
     pub(crate) fn job_counts(&self) -> JobCounts {
         self.jobs.counts(None)
     }
@@ -936,9 +1011,7 @@ impl App {
                     let meta = row.assistant().cloned().unwrap_or_default();
                     let mut message = Message::new(MessageKind::Assistant, row.content);
                     if let Some(spec) = &meta.chart {
-                        let chart = ChartData::from_spec(spec);
-                        self.current_chart = Some(chart.clone());
-                        message.chart = Some(chart);
+                        message.chart = Some(ChartData::from_spec(spec));
                     }
                     self.post(message);
                     if !meta.citations.is_empty() {
@@ -1036,12 +1109,20 @@ impl App {
                 self.handle_paste(text);
                 true
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => {
+            Event::Mouse(mouse) => match (mouse.kind, &mut self.picker) {
+                (MouseEventKind::ScrollUp, Some(picker)) => {
+                    picker.up(1);
+                    true
+                }
+                (MouseEventKind::ScrollDown, Some(picker)) => {
+                    picker.down(1);
+                    true
+                }
+                (MouseEventKind::ScrollUp, None) => {
                     self.scroll_up(3);
                     true
                 }
-                MouseEventKind::ScrollDown => {
+                (MouseEventKind::ScrollDown, None) => {
                     self.scroll_down(3);
                     true
                 }
@@ -1056,7 +1137,7 @@ impl App {
     /// a paste into an empty input that names only loadable files loads
     /// them at once; any other is typed in.
     fn handle_paste(&mut self, text: &str) {
-        if self.awaiting_permission() {
+        if self.awaiting_permission() || self.picker.is_some() {
             return;
         }
         if self.textarea.is_empty()
@@ -1192,12 +1273,15 @@ impl App {
         &mut self,
         _event: &std::result::Result<JobInfo, broadcast::error::RecvError>,
     ) {
-        self.active_jobs = self
-            .jobs
-            .list()
-            .into_iter()
+        let jobs = self.jobs.list();
+        self.active_jobs = jobs
+            .iter()
             .filter(|j| !j.state.is_finished())
+            .cloned()
             .collect();
+        if let Some(picker) = &mut self.picker {
+            picker.follow_jobs(jobs);
+        }
         self.settle_turns();
     }
 
@@ -1237,6 +1321,7 @@ impl App {
 
     fn handle_turn_event(&mut self, turn: &mut Turn, event: AgentEvent) {
         let visible = turn.session_id == self.session_id;
+        turn.phase = turn.phase.after(&event, Timestamp::now());
         match event {
             AgentEvent::Status(status) if visible => self.note(MessageKind::System, status),
             AgentEvent::TextDelta(text) if visible => {
@@ -1265,6 +1350,7 @@ impl App {
                 }
             }
             AgentEvent::Status(_)
+            | AgentEvent::Reasoning
             | AgentEvent::TextDelta(_)
             | AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolFinished(_) => {}
@@ -1338,17 +1424,14 @@ impl App {
         if !response.citations.is_empty() {
             self.post(Message::sources(&response.citations));
         }
-        if let Some(spec) = &response.chart {
-            let chart = ChartData::from_spec(spec);
-            self.current_chart = Some(chart.clone());
-            if let Some(last) = self
+        if let Some(spec) = &response.chart
+            && let Some(last) = self
                 .messages
                 .iter_mut()
                 .rev()
                 .find(|m| m.kind == MessageKind::Assistant)
-            {
-                last.chart = Some(chart);
-            }
+        {
+            last.chart = Some(ChartData::from_spec(spec));
         }
         for result in response.graph.iter().filter(|r| !r.is_empty()) {
             self.note(MessageKind::System, result.to_string());
@@ -1430,21 +1513,55 @@ impl App {
         }
     }
 
-    /// `/jobs`: active jobs, then the most recent finished ones.
+    /// `/jobs`: every job on record in a box to move through, which
+    /// follows the queue while it is open.
     fn show_jobs(&mut self) {
         let jobs = self.jobs.list();
         if jobs.is_empty() {
             self.note(MessageKind::System, "No jobs yet.");
             return;
         }
-        let mut text = String::from("Jobs (newest last):");
-        let start = jobs.len().saturating_sub(20);
-        for job in jobs.iter().skip(start) {
-            text.push_str("\n  ");
-            text.push_str(&JobRow(job).listing());
+        self.picker = Some(Picker::jobs(jobs));
+    }
+
+    /// A key while the `/jobs` or `/sessions` box is open: move through
+    /// it, act on the highlighted row, or close it.
+    fn handle_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        match (code, modifiers) {
+            (KeyCode::Esc | KeyCode::Char('q'), _)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.picker = None;
+            }
+            (KeyCode::Up, _) => picker.up(1),
+            (KeyCode::Down, _) => picker.down(1),
+            (KeyCode::PageUp, _) => picker.up(10),
+            (KeyCode::PageDown, _) => picker.down(10),
+            (KeyCode::Home, _) => picker.first(),
+            (KeyCode::End, _) => picker.last(),
+            (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                if let Some(Picked::Job(job)) = picker.picked() {
+                    let number = job.number;
+                    self.cancel_job(number);
+                }
+            }
+            (KeyCode::Enter, _) => match picker.picked() {
+                Some(Picked::Job(job)) => {
+                    let details = JobRow(job).details();
+                    self.picker = None;
+                    self.note(MessageKind::System, details);
+                }
+                Some(Picked::Session(session)) => {
+                    let id = session.id.to_string();
+                    self.picker = None;
+                    self.switch_session(id);
+                }
+                None => self.picker = None,
+            },
+            _ => {}
         }
-        text.push_str("\n/cancel N stops a queued or running job.");
-        self.note(MessageKind::System, text);
     }
 
     /// Stop every job when the session ends: a running turn is recorded as
@@ -1465,7 +1582,6 @@ impl App {
     /// Clear the transcript; streaming turns start a new message.
     fn clear_transcript(&mut self) {
         self.messages.clear();
-        self.current_chart = None;
         self.scroll = Scroll::Latest;
         for turn in &mut self.turns {
             turn.streaming = None;
@@ -1477,6 +1593,10 @@ impl App {
         let ctrl_c = (code, modifiers) == (KeyCode::Char('c'), KeyModifiers::CONTROL);
         if !ctrl_c && self.quit == Quit::Armed {
             self.quit = Quit::Stay;
+        }
+        if self.picker.is_some() && !self.awaiting_permission() {
+            self.handle_picker_key(code, modifiers);
+            return;
         }
         if ctrl_c {
             // The prompt on screen first, then this session's newest turn.
@@ -1816,14 +1936,13 @@ impl App {
             SlashCommand::Path { route } => self.show_path(&route),
             SlashCommand::Sql {
                 statement: Some(sql),
-            } => self.run_direct_sql(sql),
+            } => self.run_direct_sql(sql, SqlIntent::Stated),
             SlashCommand::Sql { statement: None } => self.edit_last_sql(),
             SlashCommand::Share => self.set_sharing(Sharing::Shared),
             SlashCommand::Unshare => self.set_sharing(Sharing::Private),
             SlashCommand::Export { flags, file } => self.export_session(flags.format(), file),
             SlashCommand::Okf { dir } => self.run_job(CliJob::Okf(dir)),
             SlashCommand::Embeddings { action } => self.run_job(CliJob::Embeddings(action)),
-            SlashCommand::Chart { n } => self.show_chart(n),
             SlashCommand::Steps => self.toggle_steps(),
             SlashCommand::Model => self.show_models(),
         }
@@ -1892,32 +2011,18 @@ impl App {
         );
     }
 
+    /// `/sessions`: the most recent sessions in a box to move through;
+    /// Enter resumes the highlighted one.
     fn show_sessions(&mut self) {
         self.on_db_ok(
             Side::Read,
-            |db| sessions::list_sessions(db, 20),
+            |db| sessions::list_sessions(db, PICKER_SESSIONS),
             |app, rows| {
                 if rows.is_empty() {
                     app.note(MessageKind::System, "No sessions yet.");
                     return;
                 }
-                let mut text = String::from("Sessions (most recent first):");
-                for row in rows {
-                    let marker = if row.id == app.session_id { "*" } else { " " };
-                    let line = format!(
-                        "\n{marker} {}  {}  {:>3} msgs  {}",
-                        row.id,
-                        row.updated_at,
-                        row.message_count,
-                        row.title.as_deref().unwrap_or("(untitled)")
-                    );
-                    text.push_str(&line);
-                }
-                text.push_str(
-                    "\nUse /resume ID to switch (any unique prefix works; ids created close \
-                     together differ only near the end).",
-                );
-                app.note(MessageKind::System, text);
+                app.picker = Some(Picker::sessions(rows, app.session_id.clone()));
             },
         );
     }
@@ -2252,38 +2357,6 @@ impl App {
         );
     }
 
-    /// `/chart [N]`: the Nth chart-bearing answer's chart into the pane
-    /// (the last one without N).
-    fn show_chart(&mut self, n: Option<usize>) {
-        let charts: Vec<ChartData> = self
-            .messages
-            .iter()
-            .filter_map(|m| m.chart.clone())
-            .collect();
-        if charts.is_empty() {
-            self.note(
-                MessageKind::System,
-                "No chart in this session yet; ask for one.",
-            );
-            return;
-        }
-        let wanted = n.unwrap_or(charts.len());
-        let Some(chart) = wanted.checked_sub(1).and_then(|at| charts.get(at)) else {
-            self.note(
-                MessageKind::Error,
-                format!("/chart takes a number from 1 to {}", charts.len()),
-            );
-            return;
-        };
-        let text = format!(
-            "Showing chart {wanted} of {}: {}",
-            charts.len(),
-            chart.title
-        );
-        self.current_chart = Some(chart.clone());
-        self.note(MessageKind::System, text);
-    }
-
     /// Drop the session on screen if nothing was ever recorded in it,
     /// unless a turn of it is still queued or running (a database step, in
     /// order with the rest).
@@ -2417,7 +2490,7 @@ impl App {
         match Input::classify(line) {
             Input::Command(command) => self.handle_slash_command(&command),
             Input::Files(paths) => self.load_files(paths),
-            Input::Sql(sql) => self.run_direct_sql(sql),
+            Input::Sql(sql) => self.run_direct_sql(sql, SqlIntent::Guessed),
             Input::Question(question) if self.config.general.chat_model.is_none() => {
                 self.note(MessageKind::User, question);
                 self.note(MessageKind::System, NO_CHAT_MODEL_TEXT);
@@ -2426,23 +2499,38 @@ impl App {
         }
     }
 
-    /// `/sql`: the same gate the agent's statements pass. Internal tables
-    /// are refused, an invalid statement is reported, and a write asks
-    /// y/n/a unless writes are already allowed for the session.
-    fn run_direct_sql(&mut self, sql: String) {
+    /// `/sql`, or a line that starts like a statement: the same gate the
+    /// agent's statements pass. Internal tables are refused, an invalid
+    /// statement is reported (or asked as a question, when it was only
+    /// guessed to be SQL), and a write asks y/n/a unless writes are
+    /// already allowed for the session.
+    fn run_direct_sql(&mut self, sql: String, intent: SqlIntent) {
         self.note(MessageKind::User, sql.clone());
-        self.last_sql = Some(sql.clone());
         // Classifying is a parse: the reader pool does it, off the loop.
         let statement = sql.clone();
         self.on_db(
             Side::Read,
             move |db| db.classify_user_statement(&statement),
-            move |app, kind| app.gate_direct_sql(sql, kind),
+            move |app, kind| app.gate_direct_sql(sql, kind, intent),
         );
     }
 
     /// Run a classified statement, or ask before a write.
-    fn gate_direct_sql(&mut self, sql: String, kind: CoreResult<StatementKind>) {
+    fn gate_direct_sql(&mut self, sql: String, kind: CoreResult<StatementKind>, intent: SqlIntent) {
+        // DuckDB could not parse it, so a question that happens to start
+        // with a keyword goes to the model after all.
+        if let Ok(StatementKind::Invalid(message)) = &kind
+            && intent == SqlIntent::Guessed
+            && self.config.general.chat_model.is_some()
+        {
+            self.note(
+                MessageKind::System,
+                format!("Not SQL ({message}), so asked as a question. /sql runs a line as typed."),
+            );
+            self.submit_turn(sql);
+            return;
+        }
+        self.last_sql = Some(sql.clone());
         match kind {
             Ok(StatementKind::Read) => self.execute_direct_sql(sql, Side::Read),
             Ok(StatementKind::Write) if self.writes_allowed() => {
@@ -2494,6 +2582,11 @@ impl App {
     /// everything else stays usable.
     fn start_agent_turn(&mut self, message: String) {
         self.note(MessageKind::User, message.clone());
+        self.submit_turn(message);
+    }
+
+    /// [`Self::start_agent_turn`] for a message already in the transcript.
+    fn submit_turn(&mut self, message: String) {
         let behind = self.current_turn();
 
         let (sink, rx) = events::channel();
@@ -2550,6 +2643,7 @@ impl App {
             streaming: None,
             open_step: None,
             progress: TurnProgress::Streaming,
+            phase: Phase::Waiting { since: None },
         });
         if let Some(previous) = behind {
             self.note(
@@ -2620,7 +2714,11 @@ mod tests {
     use quack_core::analysis::events::ToolStep;
 
     use super::*;
+    use crate::terminal::commands::Suggestion;
     use quack_core::ids::{ChunkId, DocumentId};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
@@ -2713,6 +2811,7 @@ mod tests {
             streaming: None,
             open_step: None,
             progress: TurnProgress::Streaming,
+            phase: Phase::Waiting { since: None },
         }
     }
 
@@ -2811,9 +2910,12 @@ mod tests {
 
         // Every job so far is on record.
         app.handle_slash_command("/jobs");
-        let listing = &last(&app).content;
+        let listing = screen(&app).join("\n");
+        assert!(listing.contains(" Jobs "), "{listing}");
         assert!(listing.contains("succeeded sql"), "{listing}");
         assert!(listing.contains("graph"), "{listing}");
+        app.handle_key_event(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.picker.is_none());
         app.handle_slash_command("/cancel 1");
         assert!(last(&app).content.contains("already succeeded"));
         app.handle_slash_command("/cancel x");
@@ -2879,7 +2981,13 @@ mod tests {
             .find(|m| m.kind == MessageKind::Assistant)
             .unwrap_or_else(|| fail("no assistant message"));
         assert!(assistant.chart.is_some(), "the chart belongs to the answer");
-        assert!(app.current_chart.is_some());
+        let drawn: Vec<String> = ui::format_messages(&app, 80)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let at = |text: &str| drawn.iter().position(|l| l.contains(text));
+        let (answer, chart) = (at("Three rows"), at(" Rows by kind "));
+        assert!(answer.is_some() && answer < chart, "{drawn:?}");
         let step = app
             .messages
             .iter()
@@ -2907,11 +3015,6 @@ mod tests {
                 .iter()
                 .any(|l| l.spans.iter().any(|s| s.content.contains("line 6")))
         );
-        app.current_chart = None;
-        app.handle_slash_command("/chart 1");
-        assert!(app.current_chart.is_some());
-        app.handle_slash_command("/chart 9");
-        assert_eq!(last(&app).kind, MessageKind::Error);
 
         // Esc while a turn runs cancels it; typing goes on meanwhile.
         let job = turn.job.id;
@@ -3111,21 +3214,29 @@ mod tests {
         pending
     }
 
-    /// The input rows of a drawn frame: everything below the transcript's
-    /// last separator.
-    fn overlay(app: &App) -> String {
+    /// A buffer's rows as text.
+    fn rows_of(buffer: &Buffer) -> Vec<String> {
+        buffer
+            .content()
+            .chunks(usize::from(buffer.area.width).max(1))
+            .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
+            .collect()
+    }
+
+    /// The rows of a frame drawn 80 columns by 30 rows.
+    fn screen(app: &App) -> Vec<String> {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30))
             .unwrap_or_else(|e| fail(&e.to_string()));
         terminal
             .draw(|frame| ui::draw(frame, app))
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let buffer = terminal.backend().buffer();
-        let width = usize::from(buffer.area.width);
-        let rows: Vec<String> = buffer
-            .content()
-            .chunks(width)
-            .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
-            .collect();
+        rows_of(terminal.backend().buffer())
+    }
+
+    /// The input rows of a drawn frame: everything below the transcript's
+    /// last separator.
+    fn overlay(app: &App) -> String {
+        let rows = screen(app);
         let start = rows
             .iter()
             .rposition(|row| row.contains("Run this statement?"))
@@ -3390,7 +3501,7 @@ mod tests {
                 Ok(String::new())
             });
         pump_until(&mut app, |app| !app.active_jobs.is_empty()).await;
-        assert!(!ui::job_strip(&app).is_empty(), "the strip shows it");
+        assert_eq!(ui::JobStrip::of(&app).height(), 1, "the strip shows it");
         app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(app.quit, Quit::Armed);
         assert!(last(&app).content.contains("still running"));
@@ -3398,7 +3509,228 @@ mod tests {
         assert_eq!(app.quit, Quit::Now);
         assert!(sql_sink.send(()).is_ok());
         pump_until(&mut app, |app| app.active_jobs.is_empty()).await;
-        assert!(ui::job_strip(&app).is_empty());
+        assert_eq!(ui::JobStrip::of(&app).height(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_jobs_box_follows_the_queue_and_cancels_the_highlighted_job() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        app.handle_slash_command("/jobs");
+        assert!(app.picker.is_none(), "nothing to list");
+        assert_eq!(last(&app).content, "No jobs yet.");
+
+        let (_first_sink, first_rx) = tokio::sync::oneshot::channel::<()>();
+        app.jobs
+            .submit(JobSpec::new(JobKind::Sql, "first"), |_| async move {
+                drop(first_rx.await);
+                Ok(String::new())
+            });
+        // Running, not merely queued: the rows below name the state.
+        let running = |app: &App| {
+            app.active_jobs
+                .iter()
+                .filter(|job| job.state == JobState::Running)
+                .count()
+        };
+        pump_until(&mut app, |app| running(app) == 1).await;
+        app.handle_slash_command("/jobs");
+        let row_of = |app: &App, label: &str| {
+            screen(app)
+                .into_iter()
+                .find(|row| row.contains(label))
+                .unwrap_or_else(|| fail(&format!("no row for {label}")))
+        };
+        assert!(row_of(&app, "first").contains("\u{25B8} 1    running"));
+
+        // A job submitted while the box is open appears above, and the
+        // highlight stays on the job it was on.
+        app.jobs
+            .submit(JobSpec::new(JobKind::Sql, "second"), |ctx| async move {
+                ctx.cancel_token().cancelled().await;
+                Ok(String::new())
+            });
+        pump_until(&mut app, |app| running(app) == 2).await;
+        assert!(row_of(&app, "first").contains('\u{25B8}'));
+        assert!(!row_of(&app, "second").contains('\u{25B8}'));
+
+        // Keys go to the box, not the input; `c` cancels the highlighted job.
+        app.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
+        app.handle_key_event(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(app.textarea.is_empty());
+        assert!(last(&app).content.contains("Cancelling job #2"));
+        pump_until(&mut app, |app| app.active_jobs.len() == 1).await;
+        // The box follows the job to its end: this one's work returns
+        // as soon as it is cancelled.
+        let ended = row_of(&app, "second");
+        assert!(ended.contains("\u{25B8} 2    succeeded"), "{ended}");
+
+        // Enter posts the highlighted job's details and closes the box.
+        app.handle_key_event(KeyCode::End, KeyModifiers::NONE);
+        app.handle_key_event(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.picker.is_none());
+        assert_eq!(last(&app).content, "Job #1 running sql first");
+        app.handle_key_event(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            app.textarea.lines().join(""),
+            "x",
+            "the input has the keys again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sessions_box_resumes_the_highlighted_session() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let current = app.session_id.clone();
+        let newer = app
+            .db
+            .run_at(Priority::Interactive, |db| {
+                sessions::create_session(db, "m", ChatMode::Chat, None)
+            })
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+
+        app.handle_slash_command("/sessions");
+        db_settle(&mut app).await;
+        let drawn = screen(&app).join("\n");
+        assert!(drawn.contains(" Sessions "), "{drawn}");
+        assert!(drawn.contains("enter resume"), "{drawn}");
+        // The session on screen is marked and highlighted, under the
+        // newer one.
+        assert!(
+            drawn.contains(&format!("\u{25B8} * {}", current.short())),
+            "{drawn}"
+        );
+        app.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
+        app.handle_key_event(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.picker.is_none());
+        db_settle(&mut app).await;
+        assert_eq!(app.session_id, newer.id);
+    }
+
+    #[test]
+    fn a_turns_phase_follows_its_events_and_counts_seconds() {
+        let at = |second: i64| {
+            Timestamp::from_second(1_000_000 + second).unwrap_or_else(|e| fail(&e.to_string()))
+        };
+        let started = Some(at(0));
+        let phase = Phase::Waiting { since: None };
+        assert_eq!(phase.note(started, at(3)), "waiting 3s");
+        assert_eq!(phase.note(None, at(3)), "waiting 0s", "not started yet");
+
+        let phase = phase.after(&AgentEvent::Reasoning, at(3));
+        assert_eq!(phase.note(started, at(44)), "thinking 41s");
+        // More reasoning in the same model call keeps counting from its start.
+        let phase = phase.after(&AgentEvent::Reasoning, at(20));
+        assert_eq!(phase.note(started, at(44)), "thinking 41s");
+        // A status line says nothing about the phase.
+        let phase = phase.after(&AgentEvent::Status(String::from("loading")), at(21));
+        assert_eq!(phase, Phase::Thinking { since: at(3) });
+
+        let phase = phase.after(
+            &AgentEvent::ToolStarted {
+                tool: ToolName::RunSql,
+                detail: String::new(),
+            },
+            at(50),
+        );
+        assert_eq!(phase.note(started, at(51)), "running run_sql");
+        // After a tool the model is called again, and the wait starts over.
+        let phase = Phase::Waiting {
+            since: Some(at(52)),
+        };
+        assert_eq!(phase.note(started, at(59)), "waiting 7s");
+        let phase = phase.after(&AgentEvent::TextDelta(String::from("Hi")), at(60));
+        assert_eq!(phase.note(started, at(61)), "answering");
+        // A clock that steps back never shows a negative count.
+        assert_eq!(
+            Phase::Thinking { since: at(9) }.note(started, at(5)),
+            "thinking 0s"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_job_strip_says_what_a_running_turn_is_doing() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let turn = waiting_turn(&app);
+        let job = turn.job.id;
+        app.turns.push(turn);
+        pump_until(&mut app, |app| {
+            app.active_jobs
+                .iter()
+                .any(|info| info.id == job && info.state == JobState::Running)
+        })
+        .await;
+        let strip = |app: &App| {
+            screen(app)
+                .into_iter()
+                .find(|row| row.contains("chat question"))
+                .unwrap_or_else(|| fail("no strip row"))
+        };
+        assert!(
+            strip(&app).contains("question  waiting "),
+            "{}",
+            strip(&app)
+        );
+
+        let event = |app: &mut App, event: AgentEvent| {
+            let at = app
+                .turns
+                .iter()
+                .position(|t| t.job.id == job)
+                .unwrap_or_else(|| fail("no turn"));
+            let mut turn = app.turns.remove(at);
+            app.handle_turn_event(&mut turn, event);
+            app.turns.insert(at, turn);
+        };
+        event(&mut app, AgentEvent::Reasoning);
+        assert!(
+            strip(&app).contains("question  thinking 0s"),
+            "{}",
+            strip(&app)
+        );
+        event(&mut app, AgentEvent::TextDelta(String::from("The answer")));
+        assert!(
+            strip(&app).contains("question  answering"),
+            "{}",
+            strip(&app)
+        );
+        // Reasoning itself adds nothing to the transcript.
+        assert_eq!(last(&app).content, "The answer");
+        app.cancel_all_jobs();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_job_strip_draws_reported_progress_as_a_gauge() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let (sink, rx) = tokio::sync::oneshot::channel::<()>();
+        app.jobs
+            .submit(JobSpec::new(JobKind::Sql, "slow"), |ctx| async move {
+                ctx.progress(1, 4);
+                drop(rx.await);
+                Ok(String::new())
+            });
+        pump_until(&mut app, |app| {
+            app.active_jobs.iter().any(|job| job.progress.is_some())
+        })
+        .await;
+        let rows = screen(&app);
+        let row = rows
+            .iter()
+            .find(|row| row.contains("slow"))
+            .unwrap_or_else(|| fail(&rows.join("\n")));
+        // A quarter of the gauge's columns are filled.
+        let gauge = format!(
+            "slow  1/4 (25%) {}{} ",
+            "\u{2501}".repeat(4),
+            "\u{2500}".repeat(12)
+        );
+        assert!(row.contains(&gauge), "{row}");
+        assert!(sink.send(()).is_ok());
+        pump_until(&mut app, |app| app.active_jobs.is_empty()).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3478,10 +3810,12 @@ mod tests {
         let items = Completion::for_line("/mode ")
             .map(|c| c.items)
             .unwrap_or_default();
-        let rows: Vec<String> = ui::completion_lines(&items, 1)
-            .iter()
-            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
+        let popup = |items: &[Suggestion], selected| {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 60, 8));
+            (&ui::CompletionPopup::new(items, selected)).render(buffer.area, &mut buffer);
+            rows_of(&buffer)
+        };
+        let rows = popup(&items, 1);
         assert!(
             rows.first().is_some_and(|r| r.starts_with("  chat ")),
             "{rows:?}"
@@ -3491,6 +3825,20 @@ mod tests {
                 .is_some_and(|r| r.starts_with("\u{25B8} query ")),
             "{rows:?}"
         );
+
+        // More entries than rows: the list scrolls to the highlighted one.
+        let commands = Completion::for_line("/")
+            .map(|c| c.items)
+            .unwrap_or_default();
+        assert!(commands.len() > 10, "{}", commands.len());
+        let rows = popup(&commands, 10);
+        let label = commands.get(10).map_or("", |s| s.label.as_str());
+        assert!(
+            rows.last()
+                .is_some_and(|r| r.starts_with(&format!("\u{25B8} {label}"))),
+            "{rows:?}"
+        );
+        assert_eq!(rows.iter().filter(|r| r.starts_with('\u{25B8}')).count(), 1);
     }
 
     /// The words the popup offers for the input as it stands.
@@ -3685,7 +4033,7 @@ mod tests {
                     db,
                     &session,
                     "how many storms?",
-                    jiff::Timestamp::now(),
+                    Timestamp::now(),
                     &AgentResponse {
                         content: String::from("Twelve storms."),
                         ..AgentResponse::default()
@@ -3832,6 +4180,67 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_question_that_starts_like_sql_is_asked_when_it_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = Config::default();
+        config.general.chat_model = "ollama/llama3".parse().ok();
+        assert!(config.general.chat_model.is_some());
+        let mut app = app_with(dir.path(), config);
+        let chat_jobs = |app: &App| {
+            app.jobs
+                .list()
+                .iter()
+                .filter(|job| job.kind == JobKind::Chat)
+                .count()
+        };
+
+        app.set_input("show me the first five rows");
+        app.submit_message();
+        db_settle(&mut app).await;
+        assert_eq!(chat_jobs(&app), 1, "it became a turn");
+        app.cancel_all_jobs();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.kind == MessageKind::System && m.content.starts_with("Not SQL (")),
+        );
+        // Shown once, and not remembered as the last statement.
+        let shown = app
+            .messages
+            .iter()
+            .filter(|m| m.kind == MessageKind::User)
+            .count();
+        assert_eq!(shown, 1);
+        assert!(app.last_sql.is_none());
+
+        // `/sql` says it is a statement, so its syntax error is reported.
+        app.handle_slash_command("/sql show me the first five rows");
+        db_settle(&mut app).await;
+        assert_eq!(last(&app).kind, MessageKind::Error);
+        assert_eq!(chat_jobs(&app), 1);
+
+        // A statement that parses runs as SQL, even when it then fails.
+        app.set_input("SELECT * FROM no_such_table");
+        app.submit_message();
+        settle(&mut app).await;
+        assert_eq!(last(&app).kind, MessageKind::Error);
+        assert!(last(&app).content.contains("no_such_table"));
+        assert_eq!(chat_jobs(&app), 1);
+        assert_eq!(app.last_sql.as_deref(), Some("SELECT * FROM no_such_table"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_chat_model_a_line_that_starts_like_sql_reports_its_syntax_error() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        app.set_input("show me the first five rows");
+        app.submit_message();
+        db_settle(&mut app).await;
+        assert_eq!(last(&app).kind, MessageKind::Error);
+        assert!(app.jobs.list().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn typed_input_is_kept_across_sessions_and_browsed_with_up_and_down() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         {
@@ -3874,6 +4283,35 @@ mod tests {
     }
 
     #[test]
+    fn a_scrollbar_follows_the_transcript_once_it_outgrows_the_screen() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        // The last column of the transcript's rows: its first and last.
+        let bar = |app: &App| {
+            let rows = screen(app);
+            let column = |row: usize| rows.get(row).and_then(|r| r.chars().last());
+            (column(2), column(25))
+        };
+        app.messages.clear();
+        app.note(MessageKind::System, "short");
+        assert_eq!(bar(&app), (Some(' '), Some(' ')), "nothing to scroll");
+        for n in 0..60 {
+            app.note(MessageKind::System, format!("line {n}"));
+        }
+        assert_eq!(
+            bar(&app),
+            (Some('\u{2502}'), Some('\u{2588}')),
+            "at the newest"
+        );
+        app.handle_key_event(KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(
+            bar(&app),
+            (Some('\u{2588}'), Some('\u{2502}')),
+            "at the top"
+        );
+    }
+
+    #[test]
     fn home_page_down_and_end_move_through_the_transcript() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut app = app(dir.path());
@@ -3882,13 +4320,11 @@ mod tests {
         assert_eq!(app.scroll, Scroll::Back(15));
         app.handle_key_event(KeyCode::Home, KeyModifiers::NONE);
         assert_eq!(app.scroll, Scroll::Top);
-        assert_eq!(app.scroll.to_string(), " \u{00B7} scroll: top");
         // From the top, PageDown moves down from the first line.
         app.handle_key_event(KeyCode::PageDown, KeyModifiers::NONE);
         assert_eq!(app.scroll, Scroll::Back(25));
         app.handle_key_event(KeyCode::End, KeyModifiers::NONE);
         assert_eq!(app.scroll, Scroll::Latest);
-        assert!(app.scroll.to_string().is_empty());
         app.handle_key_event(KeyCode::PageUp, KeyModifiers::NONE);
         app.handle_key_event(KeyCode::PageDown, KeyModifiers::NONE);
         assert_eq!(app.scroll, Scroll::Latest);
