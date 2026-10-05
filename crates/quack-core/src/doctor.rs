@@ -24,6 +24,7 @@ use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::{Error, Result as CoreResult};
 use crate::llm::bedrock;
+use crate::llm::egress::Egress;
 use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
@@ -260,32 +261,37 @@ impl Probing {
 
 /// Run every check against the configuration `inspection` found.
 pub async fn run(inspection: &Inspection, options: &Options) -> Report {
-    let mut report = Report::default();
-    check_config(&mut report, inspection);
-    let config = &inspection.config;
-    check_crypto(&mut report);
-    check_proxy(&mut report, Proxies::from_env());
-    let data_ready = check_data_dir(&mut report, config.data_dir());
-    let control = if data_ready {
-        check_control(&mut report, config).await
-    } else {
-        None
-    };
-    check_workspace(&mut report, config, control.as_ref(), options).await;
-    check_chat_model(&mut report, config, options.probing).await;
-    check_embedding_model(&mut report, config, options.probing).await;
-    check_reranker(&mut report, config, options.probing).await;
-    check_server(&mut report, config, control.as_ref()).await;
-    check_sign_in(&mut report, config, options.probing).await;
-    check_registrations(
-        &mut report,
-        config,
-        control.as_ref(),
-        options.probing,
-        KeySource::Keychain,
-    )
-    .await;
-    report
+    // The probes reach every configured provider and send no workspace's
+    // content, so no workspace's allow-list applies to them.
+    Egress::scope(Some(Egress::NoWorkspace), async {
+        let mut report = Report::default();
+        check_config(&mut report, inspection);
+        let config = &inspection.config;
+        check_crypto(&mut report);
+        check_proxy(&mut report, Proxies::from_env());
+        let data_ready = check_data_dir(&mut report, config.data_dir());
+        let control = if data_ready {
+            check_control(&mut report, config).await
+        } else {
+            None
+        };
+        check_workspace(&mut report, config, control.as_ref(), options).await;
+        check_chat_model(&mut report, config, options.probing).await;
+        check_embedding_model(&mut report, config, options.probing).await;
+        check_reranker(&mut report, config, options.probing).await;
+        check_server(&mut report, config, control.as_ref()).await;
+        check_sign_in(&mut report, config, options.probing).await;
+        check_registrations(
+            &mut report,
+            config,
+            control.as_ref(),
+            options.probing,
+            KeySource::Keychain,
+        )
+        .await;
+        report
+    })
+    .await
 }
 
 fn check_config(report: &mut Report, inspection: &Inspection) {
@@ -2205,23 +2211,26 @@ mod tests {
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
     async fn the_listing_probe_sends_provider_headers_beside_its_credential() {
-        let (base, seen) = one_listing().await;
-        let provider = ProviderConfig {
-            headers: Some(BTreeMap::from([(
-                String::from("X-Gateway-Team"),
-                String::from("quack"),
-            )])),
-            base_url: Some(base),
-            ..ProviderConfig::new(ProviderType::Openai)
-        };
-        let name: ProviderName = "gateway".parse().unwrap();
-        let client = ChatClient::connect(&name, &provider, Some("key"));
-        let listing = Probe::listing(client, Duration::from_secs(5)).await;
-        assert!(matches!(&listing, Ok(models) if models.get("m").is_some()));
-        let request = seen.await.unwrap();
-        assert!(request.starts_with("get /models "), "{request}");
-        assert!(request.contains("x-gateway-team: quack"), "{request}");
-        assert!(request.contains("authorization: bearer key"), "{request}");
+        Egress::scope(Some(Egress::NoWorkspace), async {
+            let (base, seen) = one_listing().await;
+            let provider = ProviderConfig {
+                headers: Some(BTreeMap::from([(
+                    String::from("X-Gateway-Team"),
+                    String::from("quack"),
+                )])),
+                base_url: Some(base),
+                ..ProviderConfig::new(ProviderType::Openai)
+            };
+            let name: ProviderName = "gateway".parse().unwrap();
+            let client = ChatClient::connect(&name, &provider, Some("key"));
+            let listing = Probe::listing(client, Duration::from_secs(5)).await;
+            assert!(matches!(&listing, Ok(models) if models.get("m").is_some()));
+            let request = seen.await.unwrap();
+            assert!(request.starts_with("get /models "), "{request}");
+            assert!(request.contains("x-gateway-team: quack"), "{request}");
+            assert!(request.contains("authorization: bearer key"), "{request}");
+        })
+        .await;
     }
 
     /// An Anthropic provider's probe sends its credential where completions
@@ -2229,34 +2238,37 @@ mod tests {
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
     async fn the_anthropic_probe_sends_an_oauth_token_as_a_bearer() {
-        let oauth = "auth = \"oauth\"\n[providers.p.oauth]\n\
+        Egress::scope(Some(Egress::NoWorkspace), async {
+            let oauth = "auth = \"oauth\"\n[providers.p.oauth]\n\
                      issuer_url = \"http://127.0.0.1:9\"\nclient_id = \"c\"\n";
-        let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
-        for (auth, bearer) in [(oauth, true), (keyed, false)] {
-            let (base, seen) = one_listing().await;
-            let config: Config = toml::from_str(&format!(
-                "[general]\nchat_model = \"p/m\"\n[providers.p]\n\
+            let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
+            for (auth, bearer) in [(oauth, true), (keyed, false)] {
+                let (base, seen) = one_listing().await;
+                let config: Config = toml::from_str(&format!(
+                    "[general]\nchat_model = \"p/m\"\n[providers.p]\n\
                  type = \"anthropic\"\nbase_url = \"{base}\"\n{auth}"
-            ))
-            .unwrap();
-            let chat = config.chat_model_ref().unwrap();
-            let client = ChatClient::connect(chat.provider_name, chat.provider, Some("tok-1"));
-            let listing = Probe::listing(client, Duration::from_secs(5)).await;
-            assert!(matches!(&listing, Ok(models) if models.get("m").is_some()));
-            let request = seen.await.unwrap();
-            assert!(request.starts_with("get /v1/models "), "{request}");
-            assert!(request.contains("anthropic-version: "), "{request}");
-            assert_eq!(
-                request.contains("authorization: bearer tok-1\r\n"),
-                bearer,
-                "{request}"
-            );
-            assert_eq!(
-                request.contains("x-api-key: tok-1\r\n"),
-                !bearer,
-                "{request}"
-            );
-        }
+                ))
+                .unwrap();
+                let chat = config.chat_model_ref().unwrap();
+                let client = ChatClient::connect(chat.provider_name, chat.provider, Some("tok-1"));
+                let listing = Probe::listing(client, Duration::from_secs(5)).await;
+                assert!(matches!(&listing, Ok(models) if models.get("m").is_some()));
+                let request = seen.await.unwrap();
+                assert!(request.starts_with("get /v1/models "), "{request}");
+                assert!(request.contains("anthropic-version: "), "{request}");
+                assert_eq!(
+                    request.contains("authorization: bearer tok-1\r\n"),
+                    bearer,
+                    "{request}"
+                );
+                assert_eq!(
+                    request.contains("x-api-key: tok-1\r\n"),
+                    !bearer,
+                    "{request}"
+                );
+            }
+        })
+        .await;
     }
 
     fn listed(models: &[(&str, Option<u32>)]) -> ProviderModels {
@@ -2360,50 +2372,53 @@ mod tests {
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
     async fn the_rerank_model_is_listed_and_answers_a_probe() {
-        let config = |base: &str, model: &str| -> Config {
-            toml::from_str(&format!(
-                "[retrieval]\nrerank = \"reranker\"\nrerank_model = \"tei/{model}\"\n\
+        Egress::scope(Some(Egress::NoWorkspace), async {
+            let config = |base: &str, model: &str| -> Config {
+                toml::from_str(&format!(
+                    "[retrieval]\nrerank = \"reranker\"\nrerank_model = \"tei/{model}\"\n\
                  [providers.tei]\ntype = \"openai\"\nbase_url = \"{base}\"\n"
-            ))
-            .unwrap()
-        };
-        let probing = Probing::Online {
-            timeout: Duration::from_secs(5),
-        };
-        let base = rerank_server(2).await;
-        let mut report = Report::default();
-        check_reranker(&mut report, &config(&base, "bge-reranker"), probing).await;
-        let checks = find(&report, Area::Reranker);
-        let summaries: Vec<(Status, &str)> = checks
-            .iter()
-            .map(|c| (c.status, c.summary.as_str()))
-            .collect();
-        assert_eq!(
-            summaries,
-            [
-                (
-                    Status::Ok,
-                    "tei/bge-reranker: reachable, credential accepted, model listed"
-                ),
-                (Status::Ok, "tei/bge-reranker: a rerank call was answered"),
-            ]
-        );
+                ))
+                .unwrap()
+            };
+            let probing = Probing::Online {
+                timeout: Duration::from_secs(5),
+            };
+            let base = rerank_server(2).await;
+            let mut report = Report::default();
+            check_reranker(&mut report, &config(&base, "bge-reranker"), probing).await;
+            let checks = find(&report, Area::Reranker);
+            let summaries: Vec<(Status, &str)> = checks
+                .iter()
+                .map(|c| (c.status, c.summary.as_str()))
+                .collect();
+            assert_eq!(
+                summaries,
+                [
+                    (
+                        Status::Ok,
+                        "tei/bge-reranker: reachable, credential accepted, model listed"
+                    ),
+                    (Status::Ok, "tei/bge-reranker: a rerank call was answered"),
+                ]
+            );
 
-        // A model the server does not list is named with what it does.
-        let base = rerank_server(2).await;
-        let mut report = Report::default();
-        check_reranker(&mut report, &config(&base, "bge-rerank"), probing).await;
-        let listing = find(&report, Area::Reranker);
-        assert!(
-            listing.first().is_some_and(|c| c.status == Status::Warn
-                && c.summary.ends_with("the closest it lists: bge-reranker")),
-            "{listing:?}"
-        );
+            // A model the server does not list is named with what it does.
+            let base = rerank_server(2).await;
+            let mut report = Report::default();
+            check_reranker(&mut report, &config(&base, "bge-rerank"), probing).await;
+            let listing = find(&report, Area::Reranker);
+            assert!(
+                listing.first().is_some_and(|c| c.status == Status::Warn
+                    && c.summary.ends_with("the closest it lists: bge-reranker")),
+                "{listing:?}"
+            );
 
-        // Nothing to check in another mode.
-        let mut report = Report::default();
-        check_reranker(&mut report, &Config::default(), probing).await;
-        assert!(find(&report, Area::Reranker).is_empty());
+            // Nothing to check in another mode.
+            let mut report = Report::default();
+            check_reranker(&mut report, &Config::default(), probing).await;
+            assert!(find(&report, Area::Reranker).is_empty());
+        })
+        .await;
     }
 
     /// A mock issuer for the doctor: its discovery document lists `grants`,

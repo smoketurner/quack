@@ -561,8 +561,20 @@ impl Access {
             options.sample_chunks = n;
         }
         // Fail now, not in the background, when no model can be built.
-        let extractor = llm::chat_extractor(&app.config).await?;
-        let embeddings = Embeddings::from_config(&app.config).await?;
+        let extractor = access
+            .model(
+                app,
+                AuditAction::Propose,
+                llm::chat_extractor(&app.config).await,
+            )
+            .await?;
+        let embeddings = access
+            .model(
+                app,
+                AuditAction::Propose,
+                Embeddings::from_config(&app.config).await,
+            )
+            .await?;
         let (cost, chunks, current) = app
             .read(id, move |db| {
                 let cost = documents::estimate(db, &options)?;

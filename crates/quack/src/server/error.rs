@@ -123,8 +123,11 @@ impl From<CoreError> for ApiError {
             | CoreError::NoWorkspaceNamed(_)
             | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
             CoreError::SignIn(_) | CoreError::Bearer(_) => StatusCode::UNAUTHORIZED,
-            // The caller is known; this provider cannot act for them.
-            CoreError::Delegation { .. } => StatusCode::FORBIDDEN,
+            // The caller is known; this provider cannot act for them, or
+            // the workspace's allow-list keeps its content from the provider.
+            CoreError::Delegation { .. }
+            | CoreError::ProviderNotAllowed { .. }
+            | CoreError::CloudModelNotAllowed { .. } => StatusCode::FORBIDDEN,
             CoreError::Config(_)
             | CoreError::Ambiguous { .. }
             | CoreError::NoChatModel { .. }
@@ -151,7 +154,8 @@ impl From<CoreError> for ApiError {
             | CoreError::SeaQuery(_)
             | CoreError::Fmt(_)
             | CoreError::WriterStopped
-            | CoreError::WritePanicked(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            | CoreError::WritePanicked(_)
+            | CoreError::ModelRequestUnscoped { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::new(status, err.to_string())
     }
@@ -164,6 +168,7 @@ impl From<TurnFailure> for ApiError {
             FailureKind::AuthRequired => StatusCode::SERVICE_UNAVAILABLE,
             FailureKind::NoChatModel => StatusCode::BAD_REQUEST,
             FailureKind::NotFound => StatusCode::NOT_FOUND,
+            FailureKind::ProviderNotAllowed => StatusCode::FORBIDDEN,
             FailureKind::Other => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::new(status, failure.message)

@@ -16,6 +16,7 @@ use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::ids::SessionId;
 use quack_core::llm;
+use quack_core::llm::egress::Egress;
 
 use crate::text_or_json::TextOrJson;
 
@@ -86,7 +87,8 @@ impl PrintTurn<'_> {
             let config = config.clone();
             let prompt = prompt.to_owned();
             let session_id = session_id.to_owned();
-            async move {
+            // The turn's own task sends where the command may.
+            Egress::scope(Egress::current(), async move {
                 llm::TurnRequest {
                     db,
                     reader_db,
@@ -98,7 +100,7 @@ impl PrintTurn<'_> {
                 }
                 .run(&config)
                 .await
-            }
+            })
         });
 
         // Never hold the stdout or stderr locks across an await: the tracing

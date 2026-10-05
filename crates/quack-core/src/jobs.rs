@@ -38,6 +38,7 @@ use uuid::Uuid;
 use crate::config::JobsConfig;
 use crate::ids::{SessionId, UserId, WorkspaceId};
 use crate::llm::acting::Acting;
+use crate::llm::egress::Egress;
 use crate::priority::Priority;
 
 /// Snapshots the broadcast channel holds for a slow subscriber before it
@@ -713,8 +714,10 @@ impl JobQueue {
         let ticket = spec.lane.as_ref().map(|lane| self.inner.enter_lane(lane));
         // The job acts for whoever submitted it: its model requests reach an
         // on-behalf-of provider as that person, not as whoever runs next.
-        let acting = Acting::current();
-        let work = move |ctx: JobContext| Acting::scope(acting, work(ctx));
+        // It sends where its submitter may: the workspace's provider
+        // allow-list goes with it, and a job submitted under none sends nothing.
+        let (acting, egress) = (Acting::current(), Egress::current());
+        let work = move |ctx: JobContext| Acting::scope(acting, Egress::scope(egress, work(ctx)));
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
             let ctx = JobContext {
@@ -1126,6 +1129,30 @@ mod tests {
         assert_eq!(
             finished(&queue, anonymous.id).await.outcome.as_deref(),
             Some("nobody")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_sends_where_its_submitter_may() {
+        let queue = JobQueue::new(10);
+        let submit = |label: &str| {
+            queue.submit(JobSpec::new(JobKind::Ingest, label), |_| async {
+                Ok(format!("{:?}", Egress::current()))
+            })
+        };
+        let scoped = Egress::request(async {
+            Egress::NoWorkspace.enter();
+            submit("scoped")
+        })
+        .await;
+        let unscoped = submit("unscoped");
+        assert_eq!(
+            finished(&queue, scoped.id).await.outcome.as_deref(),
+            Some("Some(NoWorkspace)")
+        );
+        assert_eq!(
+            finished(&queue, unscoped.id).await.outcome.as_deref(),
+            Some("None")
         );
     }
 

@@ -24,6 +24,7 @@ use quack_core::config::Config;
 use quack_core::embedding::Input;
 use quack_core::ids::{SessionId, UserId};
 use quack_core::llm::acting::Acting;
+use quack_core::llm::egress::Egress;
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::context;
@@ -48,7 +49,7 @@ use serde::Deserialize;
 
 use crate::server::auth::Access;
 use crate::server::state::{App, with_db};
-use quack_core::error::Result as CoreResult;
+use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathQuery};
 
 /// Where audit rows go: nowhere for stdio (the CLI is unaudited), or the
@@ -119,6 +120,20 @@ impl Caller {
             Self::Unaudited => None,
             Self::Audited { caller, .. } => caller.acting.clone(),
         }
+    }
+
+    /// The tool result when `error` kept a model from being built, recorded
+    /// as denied when the workspace's provider allow-list refused it and as
+    /// an error otherwise.
+    async fn unbuilt(
+        &self,
+        action: AuditAction,
+        detail: serde_json::Value,
+        error: &CoreError,
+    ) -> Result<CallToolResult, McpError> {
+        self.record(action, None, Outcome::of_failure(error), Some(detail))
+            .await?;
+        Ok(failure(error.to_string()))
     }
 }
 
@@ -368,11 +383,12 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
         // Boxed: an agent turn's future is large (clippy::large_futures).
-        Box::pin(Acting::scope(caller.acting(), self.ask(args, &caller))).await
+        Box::pin(self.as_caller(&caller, self.ask(args, &caller))).await
     }
 
-    /// `query`, acting for the request's user: its model requests reach an
-    /// on-behalf-of provider as them.
+    /// `query`, as its caller: its model requests reach an on-behalf-of
+    /// provider as the request's user, and only providers the workspace
+    /// allows.
     async fn ask(&self, args: QueryArgs, caller: &Caller) -> Result<CallToolResult, McpError> {
         let question = args.question.trim().to_owned();
         if question.is_empty() {
@@ -437,7 +453,7 @@ impl McpServer {
                     .record(
                         AuditAction::Query,
                         Some(ResourceKind::Session.id(&session_id)),
-                        Outcome::Error,
+                        Outcome::of_failure(&e),
                         Some(detail),
                     )
                     .await?;
@@ -463,11 +479,11 @@ impl McpServer {
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
-        Acting::scope(caller.acting(), self.retrieve(args, &caller)).await
+        // Boxed: building the model makes the future large.
+        Box::pin(self.as_caller(&caller, self.retrieve(args, &caller))).await
     }
 
-    /// `search`, acting for the request's user: embedding the query is a
-    /// model request too.
+    /// `search`, as its caller: embedding the query is a model request too.
     async fn retrieve(
         &self,
         args: SearchArgs,
@@ -482,19 +498,21 @@ impl McpServer {
             .unwrap_or(self.inner.config.retrieval.top_k)
             .clamp(1, 100);
         let rrf_k = self.inner.config.retrieval.rrf_k;
+        let detail = serde_json::json!({ "q": query });
+        let model = match Embeddings::from_config(&self.inner.config).await {
+            Ok(model) => model,
+            Err(e) => return caller.unbuilt(AuditAction::Search, detail, &e).await,
+        };
         // Run the search, audit its outcome, then answer — the way the `sql`
         // tool does, so a post-authorization failure is recorded instead of
         // dropped, while tool failures stay normal tool results.
         let result: Result<Vec<_>, McpError> = async {
-            let embedding = match Embeddings::from_config(&self.inner.config).await {
-                Ok(Some(model)) => {
-                    match model.embed_interactive(&Input::Query(query.clone())).await {
-                        Ok(vector) => Some(vector),
-                        Err(e) => return Err(internal(format!("embedding failed: {e}"))),
-                    }
-                }
-                Ok(None) => None,
-                Err(e) => return Err(internal(format!("embedding provider unavailable: {e}"))),
+            let embedding = match model {
+                Some(model) => match model.embed_interactive(&Input::Query(query.clone())).await {
+                    Ok(vector) => Some(vector),
+                    Err(e) => return Err(internal(format!("embedding failed: {e}"))),
+                },
+                None => None,
             };
             let text = query.clone();
             self.reader_db(move |db| {
@@ -518,12 +536,7 @@ impl McpServer {
             Outcome::Error
         };
         caller
-            .record(
-                AuditAction::Search,
-                None,
-                outcome,
-                Some(serde_json::json!({ "q": query })),
-            )
+            .record(AuditAction::Search, None, outcome, Some(detail))
             .await?;
         let hits = match result {
             Ok(hits) => hits,
@@ -671,6 +684,16 @@ impl McpServer {
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
+        Box::pin(self.as_caller(&caller, self.neighborhood(args, &caller))).await
+    }
+
+    /// `search_graph`, as its caller: embedding the entity's name is a
+    /// model request.
+    async fn neighborhood(
+        &self,
+        args: SearchGraphArgs,
+        caller: &Caller,
+    ) -> Result<CallToolResult, McpError> {
         let query = match GraphQuery::new(
             args.entity.as_deref(),
             args.class.as_deref(),
@@ -682,13 +705,14 @@ impl McpServer {
         };
         let options = self.inner.config.graph.options();
         let detail = serde_json::to_value(&query).map_err(internal)?;
+        let model = match Embeddings::from_config(&self.inner.config).await {
+            Ok(model) => model,
+            Err(e) => return caller.unbuilt(AuditAction::Graph, detail, &e).await,
+        };
         // Run, audit the outcome, then answer, the way `sql` does, so a
         // failure after authorization is recorded rather than dropped.
         let result = async {
-            let embedding = query
-                .embedding(self.embedder().await?.as_ref())
-                .await
-                .map_err(internal)?;
+            let embedding = query.embedding(model.as_ref()).await.map_err(internal)?;
             // An unknown class or relation id names the real ones.
             self.reader_db(move |db| query.run(db, embedding.as_ref(), &options))
                 .await
@@ -716,6 +740,12 @@ impl McpServer {
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
+        Box::pin(self.as_caller(&caller, self.path(args, &caller))).await
+    }
+
+    /// `find_path`, as its caller: embedding each end's name is a model
+    /// request.
+    async fn path(&self, args: FindPathArgs, caller: &Caller) -> Result<CallToolResult, McpError> {
         let query = match PathQuery::new(&args.from, &args.to, args.max_hops) {
             Ok(query) => query,
             Err(e) => return Ok(failure(e.to_string())),
@@ -723,12 +753,13 @@ impl McpServer {
         let options = self.inner.config.graph.options();
         let detail = serde_json::to_value(&query).map_err(internal)?;
         let PathQuery { from, to, max_hops } = query.clone();
+        let model = match Embeddings::from_config(&self.inner.config).await {
+            Ok(model) => model,
+            Err(e) => return caller.unbuilt(AuditAction::Graph, detail, &e).await,
+        };
         // Run, audit the outcome, then answer (see `search_graph`).
         let result = async {
-            let ends = query
-                .embeddings(self.embedder().await?.as_ref())
-                .await
-                .map_err(internal)?;
+            let ends = query.embeddings(model.as_ref()).await.map_err(internal)?;
             // An end that names no entity comes back with the closest labels.
             self.reader_db(move |db| query.run(db, &ends, &options))
                 .await
@@ -774,11 +805,18 @@ impl McpServer {
 }
 
 impl McpServer {
-    /// The embedding model, for fuzzy entity resolution; `None` without one.
-    async fn embedder(&self) -> Result<Option<Embeddings>, McpError> {
-        Embeddings::from_config(&self.inner.config)
-            .await
-            .map_err(internal)
+    /// Run a tool's `work` as its caller: acting for the request's user,
+    /// and sending only to the model providers the workspace allows (over
+    /// HTTP, as the request found the workspace; over stdio, as the command
+    /// opened it). rmcp runs each call on a task of its own, so neither
+    /// scope reaches it from the request.
+    async fn as_caller<F: Future>(&self, caller: &Caller, work: F) -> F::Output {
+        let workspace = match caller {
+            Caller::Unaudited => &self.inner.workspace,
+            Caller::Audited { caller, .. } => &caller.access.workspace,
+        };
+        let egress = Egress::Workspace(workspace.allowed_providers.clone());
+        Acting::scope(caller.acting(), Egress::scope(Some(egress), work)).await
     }
 
     /// The session a `query` call appends to: the requested one when it

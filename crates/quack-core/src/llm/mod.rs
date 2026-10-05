@@ -6,6 +6,7 @@
 
 pub mod acting;
 pub mod bedrock;
+pub mod egress;
 pub mod memory;
 pub mod oauth;
 pub mod sampling;
@@ -44,12 +45,26 @@ use crate::ontology::Ontology;
 use crate::ontology::documents::{self, OpenExtraction};
 use crate::priority::Priority;
 use crate::storage::{context, sessions};
+use egress::Egress;
 use sampling::{Sampled, Wire};
 pub use tokio_util::sync::CancellationToken;
 
 pub mod limit;
 
 pub use limit::LimitedHttp;
+
+impl ModelRef<'_> {
+    /// Whether the current work may send to this model, asked before its
+    /// client is built so a refusal is typed and comes before any request;
+    /// the provider's gates ask again for every request.
+    fn permitted(&self) -> Result<()> {
+        Egress::permit(
+            self.provider_name,
+            self.provider.provider_type,
+            Some(self.model),
+        )
+    }
+}
 
 /// A chat model with its wire and transport erased: what the agent and the
 /// one-shot calls run on. Every one quack builds is [`Sampled`], and every
@@ -84,6 +99,7 @@ impl RerankModel {
 
     /// `model` with `key`, already resolved, on [`ChatClient::rerank_server`].
     pub(crate) fn with_key(model: ModelRef<'_>, key: Option<&str>) -> Result<Self> {
+        model.permitted()?;
         Ok(Self(
             ChatClient::rerank_server(model.provider_name, model.provider, key)?
                 .rerank(model.model)
@@ -311,6 +327,7 @@ impl OAuthEmbedding {
 impl EmbedModel {
     /// The client for `model`, whose provider must serve embeddings.
     async fn build(config: &Config, model: ModelRef<'_>) -> Result<Self> {
+        model.permitted()?;
         let ndims = usize::try_from(config.embedding_dimension()?.get())
             .map_err(|e| Error::Config(format!("[embedding].dimension overflow: {e}")))?;
         let (name, provider) = (model.provider_name, model.provider);
@@ -427,6 +444,7 @@ pub(crate) enum ChatClient {
 
 impl ChatClient {
     async fn build(config: &Config, chat: &ModelRef<'_>) -> Result<Self> {
+        chat.permitted()?;
         Self::for_provider(config, chat.provider_name, chat.provider).await
     }
 
@@ -1474,6 +1492,7 @@ mod tests {
     /// ids: Ollama's `format`, Chat Completions' strict `response_format`.
     #[tokio::test]
     async fn graph_extraction_sends_the_ontology_schema() {
+        Egress::scope(Some(Egress::NoWorkspace), async {
         let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
         for (provider, field) in [
             ("type = \"ollama\"\n", r#""format":{"#),
@@ -1511,6 +1530,8 @@ mod tests {
                 "{provider}: {request}"
             );
         }
+        })
+        .await;
     }
 
     /// A small schema the wire tests send.
@@ -1588,6 +1609,7 @@ mod tests {
     /// so the divergent `background_effort` reaches the rerank request.
     #[tokio::test]
     async fn the_model_reranker_uses_background_effort_not_turn_effort() {
+        Egress::scope(Some(Egress::NoWorkspace), async {
         let (root, seen) = capture_one().await;
         let config = parse(&format!(
             "[general]\nchat_model = \"p/gpt-5.6-sol\"\n\
@@ -1642,6 +1664,8 @@ mod tests {
             !body.contains("xhigh"),
             "the turn effort leaked into the rerank call: {request}"
         );
+        })
+        .await;
     }
 
     /// A loopback Ollama that answers every request with `stream`, an
@@ -1711,6 +1735,7 @@ mod tests {
     /// quack has no setting for.
     #[tokio::test]
     async fn a_one_shot_answer_cut_at_the_output_limit_is_refused() {
+        Egress::scope(Some(Egress::NoWorkspace), async {
         for stream in [THOUGHT_ONLY, CUT_SHORT] {
             let root = scripted_ollama(stream).await;
             let config = parse(&format!(
@@ -1745,6 +1770,8 @@ mod tests {
                 "{message}"
             );
         }
+        })
+        .await;
     }
 
     /// An agent turn the output limit stopped says so in quack's words: no
@@ -1752,6 +1779,7 @@ mod tests {
     /// is kept with a note that it was cut off.
     #[tokio::test]
     async fn a_turn_cut_at_the_output_limit_says_so() {
+        Box::pin(Egress::scope(Some(Egress::NoWorkspace), async {
         for (stream, kept, note) in [
             (
                 THOUGHT_ONLY,
@@ -1797,6 +1825,8 @@ mod tests {
                 response.content
             );
         }
+        }))
+        .await;
     }
 
     /// The whole chat path for Bedrock's OpenAI-compatible APIs, up to the
@@ -1804,137 +1834,143 @@ mod tests {
     /// of rig's bearer, and, for Responses, `store: false`.
     #[tokio::test]
     async fn bedrock_openai_apis_send_signed_requests_to_the_endpoint_path() {
-        for (provider_type, api, path, service) in [
-            (
-                ProviderType::BedrockMantle,
-                BedrockApi::Responses,
-                "POST /v1/responses ",
-                "/bedrock-mantle/aws4_request",
-            ),
-            (
-                ProviderType::BedrockMantle,
-                BedrockApi::ChatCompletions,
-                "POST /v1/chat/completions ",
-                "/bedrock-mantle/aws4_request",
-            ),
-            (
-                ProviderType::Bedrock,
-                BedrockApi::Responses,
-                "POST /openai/v1/responses ",
-                "/us-west-2/bedrock/aws4_request",
-            ),
-        ] {
-            let (root, seen) = capture_one().await;
-            let bedrock = BedrockConfig { api, region: None };
-            let provider = ProviderConfig {
-                bedrock: Some(bedrock.clone()),
-                headers: Some(std::collections::BTreeMap::from([(
-                    String::from("X-Gateway-Team"),
-                    String::from("quack"),
-                )])),
-                ..ProviderConfig::new(provider_type)
-            };
-            let Some(endpoint) = provider_type.bedrock_endpoint() else {
-                fail("a Bedrock type")
-            };
-            let name: ProviderName = "wire-test"
-                .parse()
-                .unwrap_or_else(|e: Error| fail(&e.to_string()));
-            let session = bedrock::Session::for_test(endpoint, bedrock, &root, "us-west-2");
-            let client = ChatClient::bedrock(&session, &name, &provider)
-                .unwrap_or_else(|e| fail(&e.to_string()));
-            let answer = client
-                .schema_call::<serde_json::Value>(
-                    "openai.gpt-oss-120b",
-                    ModelSettings::default(),
-                    Task {
-                        preamble: "Answer.",
-                        timeout: Duration::from_secs(10),
-                        label: "wire test",
-                    },
-                    test_schema(),
-                )
-                .unwrap_or_else(|e| fail(&e.to_string()))
-                .answer("hello")
-                .await;
-            assert!(answer.is_err(), "the server answers 400");
-            let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
-            assert!(request.starts_with(path), "{api}: {request}");
-            let lower = request.to_ascii_lowercase();
-            assert!(
-                lower.contains("authorization: aws4-hmac-sha256 credential=akidexample/"),
-                "{request}"
-            );
-            assert!(request.contains(service), "{request}");
-            assert!(!lower.contains("bearer"), "{request}");
-            assert!(lower.contains("x-gateway-team: quack"), "{request}");
-            assert!(request.contains("openai.gpt-oss-120b"), "{request}");
-            if api == BedrockApi::Responses {
-                assert!(request.contains(r#""store":false"#), "{request}");
+        Egress::scope(Some(Egress::NoWorkspace), async {
+            for (provider_type, api, path, service) in [
+                (
+                    ProviderType::BedrockMantle,
+                    BedrockApi::Responses,
+                    "POST /v1/responses ",
+                    "/bedrock-mantle/aws4_request",
+                ),
+                (
+                    ProviderType::BedrockMantle,
+                    BedrockApi::ChatCompletions,
+                    "POST /v1/chat/completions ",
+                    "/bedrock-mantle/aws4_request",
+                ),
+                (
+                    ProviderType::Bedrock,
+                    BedrockApi::Responses,
+                    "POST /openai/v1/responses ",
+                    "/us-west-2/bedrock/aws4_request",
+                ),
+            ] {
+                let (root, seen) = capture_one().await;
+                let bedrock = BedrockConfig { api, region: None };
+                let provider = ProviderConfig {
+                    bedrock: Some(bedrock.clone()),
+                    headers: Some(std::collections::BTreeMap::from([(
+                        String::from("X-Gateway-Team"),
+                        String::from("quack"),
+                    )])),
+                    ..ProviderConfig::new(provider_type)
+                };
+                let Some(endpoint) = provider_type.bedrock_endpoint() else {
+                    fail("a Bedrock type")
+                };
+                let name: ProviderName = "wire-test"
+                    .parse()
+                    .unwrap_or_else(|e: Error| fail(&e.to_string()));
+                let session = bedrock::Session::for_test(endpoint, bedrock, &root, "us-west-2");
+                let client = ChatClient::bedrock(&session, &name, &provider)
+                    .unwrap_or_else(|e| fail(&e.to_string()));
+                let answer = client
+                    .schema_call::<serde_json::Value>(
+                        "openai.gpt-oss-120b",
+                        ModelSettings::default(),
+                        Task {
+                            preamble: "Answer.",
+                            timeout: Duration::from_secs(10),
+                            label: "wire test",
+                        },
+                        test_schema(),
+                    )
+                    .unwrap_or_else(|e| fail(&e.to_string()))
+                    .answer("hello")
+                    .await;
+                assert!(answer.is_err(), "the server answers 400");
+                let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
+                assert!(request.starts_with(path), "{api}: {request}");
+                let lower = request.to_ascii_lowercase();
+                assert!(
+                    lower.contains("authorization: aws4-hmac-sha256 credential=akidexample/"),
+                    "{request}"
+                );
+                assert!(request.contains(service), "{request}");
+                assert!(!lower.contains("bearer"), "{request}");
+                assert!(lower.contains("x-gateway-team: quack"), "{request}");
+                assert!(request.contains("openai.gpt-oss-120b"), "{request}");
+                if api == BedrockApi::Responses {
+                    assert!(request.contains(r#""store":false"#), "{request}");
+                }
             }
-        }
+        })
+        .await;
     }
 
     /// A provider's `headers` reach the wire on every chat client, beside
     /// the credential.
     #[tokio::test]
     async fn provider_headers_are_sent_beside_the_credential() {
-        // Cargo sets this variable for every test run.
-        let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
-        // Anthropic calls need a Claude model, which gets `max_tokens`.
-        for (provider, auth, model, path) in [
-            ("type = \"ollama\"\n", "", "m", "POST /api/chat "),
-            (
-                "type = \"openai\"\napi = \"chat-completions\"\n",
-                keyed,
-                "m",
-                "POST /chat/completions ",
-            ),
-            (
-                "type = \"openai\"\napi = \"responses\"\n",
-                keyed,
-                "m",
-                "POST /responses ",
-            ),
-            (
-                "type = \"anthropic\"\n",
-                keyed,
-                "claude-sonnet-5",
-                "POST /v1/messages ",
-            ),
-        ] {
-            let (root, seen) = capture_one().await;
-            let config = parse(&format!(
-                "[general]\nchat_model = \"p/{model}\"\n[providers.p]\n{provider}{auth}\
+        Egress::scope(Some(Egress::NoWorkspace), async {
+            // Cargo sets this variable for every test run.
+            let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
+            // Anthropic calls need a Claude model, which gets `max_tokens`.
+            for (provider, auth, model, path) in [
+                ("type = \"ollama\"\n", "", "m", "POST /api/chat "),
+                (
+                    "type = \"openai\"\napi = \"chat-completions\"\n",
+                    keyed,
+                    "m",
+                    "POST /chat/completions ",
+                ),
+                (
+                    "type = \"openai\"\napi = \"responses\"\n",
+                    keyed,
+                    "m",
+                    "POST /responses ",
+                ),
+                (
+                    "type = \"anthropic\"\n",
+                    keyed,
+                    "claude-sonnet-5",
+                    "POST /v1/messages ",
+                ),
+            ] {
+                let (root, seen) = capture_one().await;
+                let config = parse(&format!(
+                    "[general]\nchat_model = \"p/{model}\"\n[providers.p]\n{provider}{auth}\
                  base_url = \"{root}\"\nheaders = {{ \"X-Gateway-Team\" = \"quack\" }}\n"
-            ));
-            let chat = config
-                .chat_model_ref()
-                .unwrap_or_else(|e| fail(&e.to_string()));
-            let client = ChatClient::build(&config, &chat)
-                .await
-                .unwrap_or_else(|e| fail(&e.to_string()));
-            let answer = client
-                .schema_call::<serde_json::Value>(
-                    model,
-                    ModelSettings::default(),
-                    Task {
-                        preamble: "Answer.",
-                        timeout: Duration::from_secs(10),
-                        label: "wire test",
-                    },
-                    test_schema(),
-                )
-                .unwrap_or_else(|e| fail(&e.to_string()))
-                .answer("hello")
-                .await;
-            assert!(answer.is_err(), "the server answers 400");
-            let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
-            let lower = request.to_ascii_lowercase();
-            assert!(request.starts_with(path), "{provider}: {request}");
-            assert!(lower.contains("x-gateway-team: quack"), "{request}");
-            assert_eq!(lower.contains("quack-core"), !auth.is_empty(), "{request}");
-        }
+                ));
+                let chat = config
+                    .chat_model_ref()
+                    .unwrap_or_else(|e| fail(&e.to_string()));
+                let client = ChatClient::build(&config, &chat)
+                    .await
+                    .unwrap_or_else(|e| fail(&e.to_string()));
+                let answer = client
+                    .schema_call::<serde_json::Value>(
+                        model,
+                        ModelSettings::default(),
+                        Task {
+                            preamble: "Answer.",
+                            timeout: Duration::from_secs(10),
+                            label: "wire test",
+                        },
+                        test_schema(),
+                    )
+                    .unwrap_or_else(|e| fail(&e.to_string()))
+                    .answer("hello")
+                    .await;
+                assert!(answer.is_err(), "the server answers 400");
+                let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
+                let lower = request.to_ascii_lowercase();
+                assert!(request.starts_with(path), "{provider}: {request}");
+                assert!(lower.contains("x-gateway-team: quack"), "{request}");
+                assert_eq!(lower.contains("quack-core"), !auth.is_empty(), "{request}");
+            }
+        })
+        .await;
     }
 
     /// With `auth = "oauth"`, the request carries `Authorization: Bearer
@@ -1942,47 +1978,50 @@ mod tests {
     /// carries `x-api-key` and no `Authorization` header.
     #[tokio::test]
     async fn anthropic_sends_an_oauth_token_as_a_bearer() {
-        let oauth = "auth = \"oauth\"\n[providers.p.oauth]\n\
+        Egress::scope(Some(Egress::NoWorkspace), async {
+            let oauth = "auth = \"oauth\"\n[providers.p.oauth]\n\
                      issuer_url = \"http://127.0.0.1:9\"\nclient_id = \"c\"\n";
-        let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
-        for (auth, bearer) in [(oauth, true), (keyed, false)] {
-            let (root, seen) = capture_one().await;
-            let config = parse(&format!(
-                "[general]\nchat_model = \"p/claude-sonnet-5\"\n[providers.p]\n\
+            let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
+            for (auth, bearer) in [(oauth, true), (keyed, false)] {
+                let (root, seen) = capture_one().await;
+                let config = parse(&format!(
+                    "[general]\nchat_model = \"p/claude-sonnet-5\"\n[providers.p]\n\
                  type = \"anthropic\"\nbase_url = \"{root}\"\n{auth}"
-            ));
-            let chat = config
-                .chat_model_ref()
-                .unwrap_or_else(|e| fail(&e.to_string()));
-            let client = anthropic_client(chat.provider_name, chat.provider, "tok-1")
-                .unwrap_or_else(|e| fail(&e.to_string()));
-            let answer = ChatClient::Anthropic(client)
-                .schema_call::<serde_json::Value>(
-                    "claude-sonnet-5",
-                    ModelSettings::default(),
-                    Task {
-                        preamble: "Answer.",
-                        timeout: Duration::from_secs(10),
-                        label: "wire test",
-                    },
-                    test_schema(),
-                )
-                .unwrap_or_else(|e| fail(&e.to_string()))
-                .answer("hello")
-                .await;
-            assert!(answer.is_err(), "the server answers 400");
-            let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
-            let lower = request.to_ascii_lowercase();
-            assert!(request.starts_with("POST /v1/messages "), "{request}");
-            assert_eq!(lower.contains("authorization: "), bearer, "{request}");
-            assert_eq!(
-                lower.contains("authorization: bearer tok-1\r\n"),
-                bearer,
-                "{request}"
-            );
-            assert_eq!(lower.contains("x-api-key"), !bearer, "{request}");
-            assert!(lower.contains("anthropic-version: "), "{request}");
-        }
+                ));
+                let chat = config
+                    .chat_model_ref()
+                    .unwrap_or_else(|e| fail(&e.to_string()));
+                let client = anthropic_client(chat.provider_name, chat.provider, "tok-1")
+                    .unwrap_or_else(|e| fail(&e.to_string()));
+                let answer = ChatClient::Anthropic(client)
+                    .schema_call::<serde_json::Value>(
+                        "claude-sonnet-5",
+                        ModelSettings::default(),
+                        Task {
+                            preamble: "Answer.",
+                            timeout: Duration::from_secs(10),
+                            label: "wire test",
+                        },
+                        test_schema(),
+                    )
+                    .unwrap_or_else(|e| fail(&e.to_string()))
+                    .answer("hello")
+                    .await;
+                assert!(answer.is_err(), "the server answers 400");
+                let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
+                let lower = request.to_ascii_lowercase();
+                assert!(request.starts_with("POST /v1/messages "), "{request}");
+                assert_eq!(lower.contains("authorization: "), bearer, "{request}");
+                assert_eq!(
+                    lower.contains("authorization: bearer tok-1\r\n"),
+                    bearer,
+                    "{request}"
+                );
+                assert_eq!(lower.contains("x-api-key"), !bearer, "{request}");
+                assert!(lower.contains("anthropic-version: "), "{request}");
+            }
+        })
+        .await;
     }
 
     #[test]
@@ -2037,24 +2076,31 @@ mod tests {
 
     #[tokio::test]
     async fn api_key_mode_requires_the_env_var_to_be_set() {
+        Egress::scope(Some(Egress::NoWorkspace), async {
         let config = parse(
             "[embedding]\nmodel = \"o/e\"\ndimension = 4\n[providers.o]\ntype = \"openai\"\nauth = \"api-key\"\napi_key_env = \"QUACK_TEST_KEY_THAT_IS_UNSET\"\n",
         );
         let err = Embeddings::require(&config).await.err();
         assert!(err.is_some_and(|e| e.to_string().contains("QUACK_TEST_KEY_THAT_IS_UNSET")));
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn ollama_embedding_model_builds_without_a_key() {
+        Egress::scope(Some(Egress::NoWorkspace), async {
         let config = parse(
             "[embedding]\nmodel = \"o/nomic\"\ndimension = 4\n[providers.o]\ntype = \"ollama\"\n",
         );
         let model = Embeddings::require(&config).await;
         assert!(model.is_ok_and(|m| m.profile().dimension == Dimension::new(4)));
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn ollama_embed_requests_carry_a_bounded_window_and_keep_alive() {
+        Egress::scope(Some(Egress::NoWorkspace), async {
         let config = parse(
             "[embedding]\nmodel = \"o/nomic\"\ndimension = 4\n[providers.o]\ntype = \"ollama\"\n[ingestion]\nchunk_size_tokens = 3000\n",
         );
@@ -2074,6 +2120,8 @@ mod tests {
             body.pointer("/options/num_ctx"),
             Some(&serde_json::json!(8192))
         );
+        })
+        .await;
     }
 
     #[test]
@@ -2102,6 +2150,7 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_provider_without_a_login_needs_auth_for_embeddings_and_chat() {
+        Egress::scope(Some(Egress::NoWorkspace), async {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut config = parse(
             "[embedding]\nmodel = \"az/emb\"\ndimension = 4\n[general]\nchat_model = \"az/gpt\"\n[providers.az]\ntype = \"openai\"\nauth = \"oauth\"\n[providers.az.oauth]\nissuer_url = \"http://127.0.0.1:9\"\nclient_id = \"c\"\n",
@@ -2117,6 +2166,8 @@ mod tests {
             .await
             .err();
         assert!(err.is_some_and(|e| matches!(e, Error::AuthRequired { .. })));
+        })
+        .await;
     }
 
     /// A cancelled turn is still a turn (issue #45): the session records
@@ -2125,6 +2176,7 @@ mod tests {
     /// starts, and the provider address is unreachable anyway).
     #[tokio::test]
     async fn cancelled_turns_are_recorded_and_completed() {
+        Box::pin(Egress::scope(Some(Egress::NoWorkspace), async {
         let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
         let mut config = parse(
             "[embedding]\nmodel = \"o/e\"\ndimension = 4\n[general]\nchat_model = \"o/m\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
@@ -2180,5 +2232,7 @@ mod tests {
                 .is_some_and(|m| m.content.contains("Cancelled by the user")
                     && m.assistant().and_then(|a| a.duration_ms).is_some())
         );
+        }))
+        .await;
     }
 }

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::storage::control::AllowedProviders;
 use crate::storage::workspace::DuckDbMessage;
 
 #[derive(Debug, Error)]
@@ -62,6 +63,35 @@ pub enum Error {
         provider: String,
         reason: AuthReason,
     },
+
+    /// The workspace's provider allow-list does not name the provider a
+    /// model request was for; nothing was sent.
+    #[error("provider '{provider}' is not allowed in this workspace, which allows {allowed}")]
+    ProviderNotAllowed {
+        provider: String,
+        allowed: AllowedProviders,
+    },
+
+    /// An Ollama model that Ollama serves from its own hosts, asked for in a
+    /// workspace restricted to some providers; nothing was sent.
+    #[error(
+        "model '{model}' of provider '{provider}' runs in Ollama's cloud, not on the Ollama \
+         server itself, and this workspace allows {allowed}; configure a model without the \
+         `cloud` tag"
+    )]
+    CloudModelNotAllowed {
+        provider: String,
+        model: String,
+        allowed: AllowedProviders,
+    },
+
+    /// A model request made by work that entered no `llm::egress::Egress`
+    /// scope, so no allow-list could be checked; nothing was sent.
+    #[error(
+        "a model request to provider '{provider}' was made outside any workspace scope and was \
+         not sent; this is a bug in quack"
+    )]
+    ModelRequestUnscoped { provider: String },
 
     /// No `[general].chat_model` (nor `QUACK_MODEL`) is set, so nothing can
     /// answer a question.

@@ -13,6 +13,7 @@ use quack_core::error::Record;
 use quack_core::ids::{DocumentId, WorkspaceId};
 use quack_core::ingestion;
 use quack_core::jobs::JobId;
+use quack_core::llm::Embeddings;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::text::NonBlankText;
 use serde::{Deserialize, Serialize};
@@ -281,6 +282,14 @@ pub(crate) async fn enqueue(
         return Err(ApiError::bad_request("no file or text in the request"));
     }
     let id = access.workspace.id.clone();
+    // Fail now, not in the background, when no model can be built.
+    let embedder = access
+        .model(
+            app,
+            AuditAction::Ingest,
+            Embeddings::from_config(&app.config).await,
+        )
+        .await?;
     let db = app.workspace_db(&id).await?;
     let mut queued = Vec::new();
     for IncomingFile {
@@ -357,6 +366,7 @@ pub(crate) async fn enqueue(
                 &id,
                 Some(access.identity.user_id.clone()),
                 Arc::clone(&db),
+                embedder.clone(),
             );
         queued.push(Enqueued::Queued {
             id: document_id,

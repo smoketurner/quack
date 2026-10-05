@@ -1205,7 +1205,7 @@ impl Harness {
             .route("/probe", get(probe))
             .route("/probe-job", get(probe_job))
             .route("/probe-key", get(probe_key))
-            .layer(axum::middleware::from_fn(server::acting_slot))
+            .layer(axum::middleware::from_fn(server::request_slots))
             .with_state(Arc::clone(&self.app));
         let request = Request::get(uri)
             .header(credential.0, credential.1)

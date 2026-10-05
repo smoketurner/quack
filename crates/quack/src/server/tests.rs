@@ -2205,7 +2205,15 @@ async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(proposes.len(), 3);
+    // Three proposals, and the document pass that had no chat model.
+    assert_eq!(proposes.len(), 4);
+    assert_eq!(
+        proposes
+            .iter()
+            .filter(|r| r.outcome == Outcome::Error)
+            .count(),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -6530,4 +6538,205 @@ async fn an_unanswered_write_expires() {
     );
     assert!(details.contains("\"expired\""), "{details}");
     assert!(details.contains("DROP TABLE t"), "{details}");
+}
+
+/// A workspace restricted to one provider, on a server whose embedding
+/// model is on another: every path that would embed is refused before
+/// anything is sent, and each refusal is a denied audit row for its action.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restricted_workspace_refuses_every_path_to_a_disallowed_provider() {
+    // Both providers are unreachable: a request that got past the check
+    // would fail as a 5xx, not as the 403 asserted below.
+    let config = Config::parse(
+        "[general]\nchat_model = \"local/chat\"\n\
+         [embedding]\nmodel = \"hosted/embed\"\ndimension = 768\n\
+         [providers.local]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n\
+         [providers.hosted]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("kept", &owner).await;
+    let token = h.login("owner").await;
+    let base = format!("/api/v1/workspaces/{ws}");
+    let (status, body) = h
+        .post(
+            &format!("{base}/ontology/init"),
+            &token,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &base,
+            Some(&token),
+            Some(serde_json::json!({ "allowed_providers": ["local"] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A login session's rows are on the web channel.
+    let refusal = "provider 'hosted' is not allowed in this workspace, which allows only: local";
+    let denied = async |action: &str, channel: Channel| {
+        let rows = h
+            .audit(AuditFilter {
+                workspace_id: Some(ws.clone()),
+                action: Some(action.to_owned()),
+                ..AuditFilter::default()
+            })
+            .await;
+        rows.iter()
+            .filter(|r| r.outcome == Outcome::Denied && r.channel == channel)
+            .count()
+    };
+    for (path, request, action) in [
+        (
+            "documents",
+            serde_json::json!({ "text": "Flood damage is excluded.", "title": "policy" }),
+            "ingest",
+        ),
+        ("search", serde_json::json!({ "query": "flood" }), "search"),
+        (
+            "graph/search",
+            serde_json::json!({ "entity": "Kenya" }),
+            "graph",
+        ),
+        (
+            "graph/path",
+            serde_json::json!({ "from": "Kenya", "to": "Uganda" }),
+            "graph",
+        ),
+        ("graph/extract", serde_json::json!({}), "graph_extract"),
+        (
+            "ontology/propose",
+            serde_json::json!({ "documents": true }),
+            "propose",
+        ),
+        (
+            "embeddings/refresh",
+            serde_json::json!({}),
+            "embeddings_refresh",
+        ),
+        (
+            "import",
+            serde_json::json!({ "url": "https://example.com/rows.csv", "table": "rows" }),
+            "import",
+        ),
+        (
+            "query",
+            serde_json::json!({ "prompt": "what is excluded?" }),
+            "query",
+        ),
+    ] {
+        let before = denied(action, Channel::Web).await;
+        let (status, body) = h.post(&format!("{base}/{path}"), &token, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+        assert_eq!(body["error"], refusal, "{path}");
+        assert_eq!(
+            denied(action, Channel::Web).await,
+            before.saturating_add(1),
+            "{path} writes one denied {action} row"
+        );
+    }
+    // Nothing was registered, and the refused turn left no session behind.
+    let (_, documents) = h.get(&format!("{base}/documents"), &token).await;
+    assert_eq!(documents["documents"], serde_json::json!([]), "{documents}");
+    let (_, sessions) = h.get(&format!("{base}/sessions"), &token).await;
+    assert_eq!(sessions["sessions"], serde_json::json!([]), "{sessions}");
+
+    // The same turn as a stream ends in an `error` event and a denied row.
+    let before = denied("query", Channel::Web).await;
+    let (status, events) = h
+        .post(
+            &format!("{base}/query/stream"),
+            &token,
+            serde_json::json!({ "prompt": "what is excluded?" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{events}");
+    let events = events.as_str().unwrap_or_default();
+    assert!(
+        events.contains("event: error") && events.contains(refusal),
+        "{events}"
+    );
+    assert_eq!(
+        denied("query", Channel::Web).await,
+        before.saturating_add(1)
+    );
+
+    // MCP over HTTP: the tools answer with the refusal as a tool error.
+    let session = mcp_session(&h, &ws, &token).await;
+    for (id, tool, arguments, action) in [
+        (
+            2,
+            "query",
+            serde_json::json!({ "question": "what is excluded?" }),
+            "query",
+        ),
+        (
+            3,
+            "search",
+            serde_json::json!({ "query": "flood" }),
+            "search",
+        ),
+        (
+            4,
+            "search_graph",
+            serde_json::json!({ "entity": "Kenya" }),
+            "graph",
+        ),
+        (
+            5,
+            "find_path",
+            serde_json::json!({ "from": "Kenya", "to": "Uganda" }),
+            "graph",
+        ),
+    ] {
+        let before = denied(action, Channel::Mcp).await;
+        let (status, body, _) = mcp_call(
+            &h,
+            &ws,
+            Some(&token),
+            Some(&session),
+            rpc(
+                id,
+                "tools/call",
+                &serde_json::json!({ "name": tool, "arguments": arguments }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tool}: {body}");
+        assert_eq!(body["result"]["isError"], true, "{tool}: {body}");
+        let text = body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains(refusal), "{tool}: {text}");
+        assert_eq!(
+            denied(action, Channel::Mcp).await,
+            before.saturating_add(1),
+            "MCP {tool} writes one denied {action} row"
+        );
+    }
+
+    // Lifting the restriction lets the same search through to the provider,
+    // which is unreachable here: a failure, no longer a refusal.
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &base,
+            Some(&token),
+            Some(serde_json::json!({ "allowed_providers": [] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .post(
+            &format!("{base}/search"),
+            &token,
+            serde_json::json!({ "query": "flood" }),
+        )
+        .await;
+    assert!(status.is_server_error(), "{status}: {body}");
 }

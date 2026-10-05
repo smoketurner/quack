@@ -113,6 +113,7 @@ impl UploadJob {
         workspace_id: &WorkspaceId,
         owner: Option<UserId>,
         db: SharedDb,
+        embedder: Option<Embeddings>,
     ) -> JobId {
         let spec = JobSpec::new(JobKind::Ingest, self.filename.clone())
             .workspace(workspace_id.clone())
@@ -135,7 +136,8 @@ impl UploadJob {
                     progress: &progress,
                     cancel: Some(&cancel),
                 };
-                self.process(&config, &workspace, &worker_db, control).await
+                self.process(&config, &workspace, &worker_db, embedder.as_ref(), control)
+                    .await
             })
             .id;
         // The work records its own outcome; a job that ends without running
@@ -164,16 +166,9 @@ impl UploadJob {
         config: &Config,
         workspace_id: &str,
         db: &SharedDb,
+        embedder: Option<&Embeddings>,
         control: RunControl<'_>,
     ) -> JobResult {
-        let model = match Embeddings::from_config(config).await {
-            Ok(model) => model,
-            Err(e) => {
-                tracing::warn!(error = %e, document = %self.document_id, "upload fails: no embedding model");
-                Self::mark_error(db, &self.document_id, &e.to_string()).await;
-                return Err(e.to_string());
-            }
-        };
         let data = match self.spool.read().await {
             Ok(data) => data,
             Err(e) => {
@@ -190,7 +185,7 @@ impl UploadJob {
             workspace_id,
             document_id: &self.document_id,
             file: &file,
-            embedder: model.as_ref(),
+            embedder,
         }
         .run()
         .await;

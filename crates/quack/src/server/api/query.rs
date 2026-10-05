@@ -10,7 +10,7 @@ use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
 use quack_core::analysis::agent::AgentResponse;
-use quack_core::analysis::events::{self, AgentEvent};
+use quack_core::analysis::events::{self, AgentEvent, FailureKind, TurnFailure};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::embedding::{Input, Vector};
@@ -52,7 +52,8 @@ struct PreparedTurn {
 
 impl PreparedTurn {
     /// Everything a turn needs before the model is called: the
-    /// authorization, the provider check, and the session (existing or new).
+    /// authorization and the session (existing or new). The turn itself
+    /// refuses a model the workspace's provider allow-list does not allow.
     /// `unasked` is the write policy without `allow_write`: `Ask` when the
     /// turn streams, so the person can answer, else `Deny`. A caller who
     /// may not write is never asked.
@@ -76,16 +77,6 @@ impl PreparedTurn {
             return Err(ApiError::bad_request("prompt must not be empty"));
         }
         let chat = app.config.chat_model_ref()?;
-        if !access
-            .workspace
-            .allowed_providers
-            .permits(chat.provider_name.as_str())
-        {
-            return Err(ApiError::forbidden(format!(
-                "provider '{}' is not allowed in this workspace",
-                chat.provider_name
-            )));
-        }
         let mode = body.mode;
         let db = app.workspace_db(workspace_id).await?;
         let reader = app.reader_db(workspace_id).await?;
@@ -224,7 +215,8 @@ enum TurnStream {
 /// How a turn ended, for its audit row.
 enum TurnEnd<'a> {
     Answered(&'a AgentResponse),
-    Failed,
+    /// With the turn's own failure, or none when its events just closed.
+    Failed(Option<&'a TurnFailure>),
 }
 
 impl Turn {
@@ -246,9 +238,13 @@ impl Turn {
     async fn record(&self, app: &App, end: TurnEnd<'_>) {
         let (outcome, steps) = match end {
             TurnEnd::Answered(response) => (Outcome::Allowed, response.steps.clone()),
-            TurnEnd::Failed => (Outcome::Error, Vec::new()),
+            TurnEnd::Failed(Some(TurnFailure {
+                kind: FailureKind::ProviderNotAllowed,
+                ..
+            })) => (Outcome::Denied, Vec::new()),
+            TurnEnd::Failed(_) => (Outcome::Error, Vec::new()),
         };
-        if outcome == Outcome::Error
+        if outcome != Outcome::Allowed
             && let Ok(db) = app.workspace_db(&self.access.workspace.id).await
         {
             let sid = self.session_id.clone();
@@ -302,7 +298,7 @@ pub(crate) async fn query(
         turn.record(&app, TurnEnd::Answered(&response)).await;
         return Ok(Json(response.to_json(&turn.session_id)));
     }
-    turn.record(&app, TurnEnd::Failed).await;
+    turn.record(&app, TurnEnd::Failed(failure.as_ref())).await;
     Err(failure.map_or_else(
         || ApiError::internal(Turn::unanswered(&app)),
         ApiError::from,
@@ -328,7 +324,7 @@ pub(crate) async fn stream(
             if state == TurnStream::Ended {
                 return None;
             }
-            turn.record(&app, TurnEnd::Failed).await;
+            turn.record(&app, TurnEnd::Failed(None)).await;
             let out = StreamEvent::Error.event().data(Turn::unanswered(&app));
             return Some((Ok(out), (turn, app, TurnStream::Ended)));
         };
@@ -385,7 +381,7 @@ pub(crate) async fn stream(
                     .unwrap_or_default()
             }
             AgentEvent::Failed(failure) => {
-                turn.record(&app, TurnEnd::Failed).await;
+                turn.record(&app, TurnEnd::Failed(Some(&failure))).await;
                 StreamEvent::Error.event().data(failure.message)
             }
         };
@@ -531,10 +527,17 @@ pub(crate) async fn search(
     }
     let top_k = q.top_k.unwrap_or(app.config.retrieval.top_k).clamp(1, 100);
     let rrf_k = app.config.retrieval.rrf_k;
+    let model = access
+        .model(
+            &app,
+            AuditAction::Search,
+            Embeddings::from_config(&app.config).await,
+        )
+        .await?;
     // Run the search, audit its outcome, then propagate — the way `execute_sql`
     // does, so a post-authorization failure is recorded instead of dropped.
     let search_result: ApiResult<Vec<_>> = async {
-        let embedding: Option<Vector> = match Embeddings::from_config(&app.config).await? {
+        let embedding: Option<Vector> = match model {
             Some(model) => Some(
                 model
                     .embed_interactive(&Input::Query(query.clone()))

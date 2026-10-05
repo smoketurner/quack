@@ -59,10 +59,16 @@ pub(crate) async fn search(
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let options = app.config.graph.options();
     let detail = serde_json::to_value(&query)?;
+    let model = access
+        .model(
+            &app,
+            AuditAction::Graph,
+            Embeddings::from_config(&app.config).await,
+        )
+        .await?;
     // Run, audit the outcome, then propagate, so a failure after
     // authorization is recorded as an error rather than dropped.
     let result: ApiResult<_> = async {
-        let model = Embeddings::from_config(&app.config).await?;
         let embedding = query.embedding(model.as_ref()).await?;
         app.read(&id, move |db| query.run(db, embedding.as_ref(), &options))
             .await
@@ -99,9 +105,15 @@ pub(crate) async fn path(
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let options = app.config.graph.options();
     let detail = serde_json::to_value(&query)?;
+    let model = access
+        .model(
+            &app,
+            AuditAction::Graph,
+            Embeddings::from_config(&app.config).await,
+        )
+        .await?;
     // Run, audit the outcome, then propagate (see `search`).
     let result: ApiResult<_> = async {
-        let model = Embeddings::from_config(&app.config).await?;
         let ends = query.embeddings(model.as_ref()).await?;
         app.read(&id, move |db| query.run(db, &ends, &options))
             .await
@@ -232,7 +244,13 @@ impl Access {
         let ontology = ontology.ok_or_else(|| ApiError::bad_request("no ontology yet"))?;
         let version = ontology.saved_version()?;
         let options = app.config.graph.options();
-        let embeddings = Embeddings::from_config(&app.config).await?;
+        let embeddings = access
+            .model(
+                app,
+                AuditAction::GraphExtract,
+                Embeddings::from_config(&app.config).await,
+            )
+            .await?;
         if reset {
             with_db(Arc::clone(&db), graph_store::clear).await?;
         }
@@ -267,7 +285,13 @@ impl Access {
             });
         }
         // Fail now, not in the background, when no model can be built.
-        let extractor = llm::graph_extractor(&app.config, &ontology).await?;
+        let extractor = access
+            .model(
+                app,
+                AuditAction::GraphExtract,
+                llm::graph_extractor(&app.config, &ontology).await,
+            )
+            .await?;
         let cost = ExtractionCost {
             chunks: chunks.len(),
             model: app.config.chat_model_ref()?.to_string(),

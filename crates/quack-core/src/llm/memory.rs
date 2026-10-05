@@ -231,6 +231,7 @@ mod tests {
     use super::*;
     use crate::analysis::agent::AgentResponse;
     use crate::embedding::Dimension;
+    use crate::llm::egress::Egress;
     use crate::storage::sessions::ChatMode;
     use crate::storage::workspace::WorkspaceDb;
     use jiff::Timestamp;
@@ -478,21 +479,24 @@ mod tests {
     /// replay; the turn is not refused for its summary call.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_summary_call_the_model_refuses_leaves_the_window_alone() {
-        let (db, _id) = session().await;
-        for (background_effort, compacts) in [("none", true), ("max", false)] {
-            let config = Config::parse(&format!(
-                "[general]\nchat_model = \"p/gpt-5.6-sol\"\n\
+        Egress::scope(Some(Egress::NoWorkspace), async {
+            let (db, _id) = session().await;
+            for (background_effort, compacts) in [("none", true), ("max", false)] {
+                let config = Config::parse(&format!(
+                    "[general]\nchat_model = \"p/gpt-5.6-sol\"\n\
                  [analysis]\ncompact_history = true\neffort = \"none\"\n\
                  background_effort = \"{background_effort}\"\n\
                  [providers.p]\ntype = \"openai\"\napi = \"chat-completions\"\n\
                  auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n\
                  base_url = \"http://127.0.0.1:9\"\n"
-            ))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-            let history = History::from_config(&config, Arc::clone(&db))
-                .await
+                ))
                 .unwrap_or_else(|e| fail(&e.to_string()));
-            assert_eq!(history.compactor.is_some(), compacts, "{background_effort}");
-        }
+                let history = History::from_config(&config, Arc::clone(&db))
+                    .await
+                    .unwrap_or_else(|e| fail(&e.to_string()));
+                assert_eq!(history.compactor.is_some(), compacts, "{background_effort}");
+            }
+        })
+        .await;
     }
 }

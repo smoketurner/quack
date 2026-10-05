@@ -283,7 +283,17 @@ directory alone, turns off `enable_external_access` and `allow_persistent_secret
 the `memory_limit` and `threads` caps, then sets `lock_configuration` before any user or
 agent statement runs. External data arrives through `quack import`, which snapshots rows
 into an ordinary table (section 6.2). A workspace's `allowed_providers` limits which LLM
-providers see its data, so a `restricted` workspace can be pinned to local Ollama. In server
+providers see its data, so a workspace can be pinned to local Ollama. Every model request
+is checked against the list by one function, `llm::egress::Egress::permit`: when a model's
+client is built, and again as each request passes its provider's gate
+(`llm::limit::ProviderGates::permit`), which every request to a provider goes through. The
+list reaches the check as a task-local scope (`Egress`), entered where work learns its
+workspace (`Access::resolve` in the server, the opened workspace on the command line, each
+MCP tool call) and carried into every job by the queue. A request made with no scope is an
+error, never an allow. A refusal sends nothing, names the provider and the list, and is `403`
+with a `denied` audit row in the server. Under a restricted list, an Ollama model with a
+`cloud` tag is refused too, since Ollama serves it from its own hosts. The `classification`
+label is display only; no policy reads it. In server
 mode, opening a workspace file requires membership in `control.db` (section 5.5).
 
 ### 5.3 Workspace context
@@ -1421,7 +1431,8 @@ assistant message that produced it and appears there in every rendering.
 | `bedrock-mantle` | yes | no | Amazon Bedrock's `bedrock-mantle` endpoint: `api = "responses"` (default) or `"chat-completions"` (`/v1`). Same `region`, `aws_profile`, `base_url` |
 
 `[general].chat_model` and `[embedding].model` each name `PROVIDER/MODEL`. A workspace's
-`allowed_providers` filters the choice; the session records the model it used. Changing the
+`allowed_providers` refuses a model on any other provider (section 5.2); the session records
+the model it used. Changing the
 embedding model, width, or prefixes leaves a workspace's vectors stale, not wrong: they are
 not searched, and their chunks are found by keyword. `quack embeddings refresh` shows what
 it will refresh, asks, and updates them in place (section 5.4).

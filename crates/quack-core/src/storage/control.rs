@@ -164,6 +164,26 @@ impl AllowedProviders {
     }
 }
 
+/// As a refusal names it: `every provider`, `no provider`, or `only: a, b`.
+impl fmt::Display for AllowedProviders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::All => f.write_str("every provider"),
+            Self::Only(names) if names.is_empty() => f.write_str("no provider"),
+            Self::Only(names) => {
+                f.write_str("only: ")?;
+                for (i, name) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(name)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl Serialize for AllowedProviders {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         self.names().serialize(serializer)
@@ -624,6 +644,16 @@ impl Outcome {
         match result {
             Ok(_) => Self::Allowed,
             Err(_) => Self::Error,
+        }
+    }
+
+    /// `Denied` for work the workspace's provider allow-list refused,
+    /// `Error` for any other failure.
+    #[must_use]
+    pub const fn of_failure(error: &Error) -> Self {
+        match error {
+            Error::ProviderNotAllowed { .. } | Error::CloudModelNotAllowed { .. } => Self::Denied,
+            _ => Self::Error,
         }
     }
 }

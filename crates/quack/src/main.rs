@@ -30,6 +30,7 @@ use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::llm::Embeddings;
+use quack_core::llm::egress::Egress;
 use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt, TokenManager, TokenStatus};
 use quack_core::okf::{self, Bundle, DirSink, TarSink};
 use quack_core::ontology::store::Revision;
@@ -574,7 +575,9 @@ async fn main() -> Result<ExitCode> {
     crypto::install_default_provider()
         .context("failed to install the aws-lc-rs crypto provider")?;
 
-    match run().await {
+    // One egress slot for the command, which opening its workspace fills
+    // with that workspace's provider allow-list.
+    match Box::pin(Egress::request(run())).await {
         // The reader closed the pipe (`quack ... | head -1`): the command
         // did its job, so stop quietly like `git` and `ls` do (issue #68).
         Err(e) if is_broken_pipe(&e) => Ok(ExitCode::SUCCESS),
@@ -1569,6 +1572,8 @@ impl OpenedWorkspace {
             .workspace_or_default(workspace_name, &config.general.default_workspace)
             .await?;
         let name = workspace.name.clone();
+        // The command sends only to the model providers the workspace allows.
+        Egress::Workspace(workspace.allowed_providers.clone()).enter();
         Ok(Self {
             config,
             workspace,

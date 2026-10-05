@@ -219,6 +219,8 @@ pub enum FailureKind {
     NoChatModel,
     /// The session (or another named record) does not exist.
     NotFound,
+    /// The workspace's provider allow-list refused a model the turn needs.
+    ProviderNotAllowed,
     /// A model, tool, or storage failure.
     Other,
 }
@@ -229,6 +231,9 @@ impl From<&Error> for TurnFailure {
             Error::AuthRequired { .. } => FailureKind::AuthRequired,
             Error::NoChatModel { .. } => FailureKind::NoChatModel,
             Error::NotFound { .. } => FailureKind::NotFound,
+            Error::ProviderNotAllowed { .. } | Error::CloudModelNotAllowed { .. } => {
+                FailureKind::ProviderNotAllowed
+            }
             _ => FailureKind::Other,
         };
         Self {

@@ -34,7 +34,8 @@ use rig::http_client::{
 use tokio::sync::oneshot;
 
 use super::bedrock::Signer;
-use crate::config::{BaseUrl, ProviderConfig, ProviderName, RequestLimit};
+use super::egress::Egress;
+use crate::config::{BaseUrl, ProviderConfig, ProviderName, ProviderType, RequestLimit};
 use crate::error::{self, Error};
 
 use crate::priority::Priority;
@@ -176,17 +177,27 @@ impl GateKey {
 }
 
 /// A provider's gates, one per model, shared process-wide by every client
-/// built for it. `Default` is unlimited.
+/// built for it. Every model request quack sends passes [`Self::permit`],
+/// so it is also where the workspace's provider allow-list is enforced.
+/// `Default` names no provider: unlimited and unchecked.
 #[derive(Clone, Default)]
 pub(crate) struct ProviderGates {
-    /// The provider and its limit, or `None` for the unlimited default.
-    provider: Option<(ProviderKey, RequestLimit)>,
+    /// The provider, or `None` for the default.
+    provider: Option<Gated>,
+}
+
+/// The provider a set of gates belongs to.
+#[derive(Clone)]
+struct Gated {
+    key: ProviderKey,
+    kind: ProviderType,
+    limit: RequestLimit,
 }
 
 impl std::fmt::Debug for ProviderGates {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderGates")
-            .field("limit", &self.provider.as_ref().map(|(_, limit)| *limit))
+            .field("limit", &self.provider.as_ref().map(|gated| gated.limit))
             .finish_non_exhaustive()
     }
 }
@@ -195,28 +206,40 @@ impl ProviderGates {
     /// The gates of provider `name`.
     pub(crate) fn for_provider(name: &ProviderName, provider: &ProviderConfig) -> Self {
         Self {
-            provider: Some((
-                ProviderKey {
+            provider: Some(Gated {
+                key: ProviderKey {
                     name: name.clone(),
                     base_url: provider.base_url.clone(),
                 },
-                provider.request_limit(),
-            )),
+                kind: provider.provider_type,
+                limit: provider.request_limit(),
+            }),
         }
     }
 
-    /// Wait for a permit of `model`'s gate at the calling task's priority
-    /// (read now, not when the future first runs); `None` when unlimited.
+    /// Check the request against the calling task's [`Egress`], then wait
+    /// for a permit of `model`'s gate at its priority (both read now, not
+    /// when the future first runs); `None` when unlimited.
+    ///
+    /// # Errors
+    ///
+    /// The future returns [`Egress::permit`]'s refusal, and the request must
+    /// not be sent.
     pub(crate) fn permit(
         &self,
         model: Option<String>,
-    ) -> impl Future<Output = Option<GatePermit>> + Send + 'static {
+    ) -> impl Future<Output = error::Result<Option<GatePermit>>> + Send + 'static {
+        let permitted = match &self.provider {
+            Some(gated) => Egress::permit(&gated.key.name, gated.kind, model.as_deref()),
+            None => Ok(()),
+        };
         let gate = self.gate(model);
         let priority = Priority::current();
         async move {
+            permitted?;
             match gate {
-                Some(gate) => Some(gate.acquire(priority).await),
-                None => None,
+                Some(gate) => Ok(Some(gate.acquire(priority).await)),
+                None => Ok(None),
             }
         }
     }
@@ -224,11 +247,12 @@ impl ProviderGates {
     /// The gate for `model`, created with this client's limit on first use;
     /// a later config for the same provider in one process keeps the first.
     fn gate(&self, model: Option<String>) -> Option<Arc<Gate>> {
-        let (provider, limit) = self.provider.as_ref()?;
+        let gated = self.provider.as_ref()?;
         let key = GateKey {
-            provider: provider.clone(),
+            provider: gated.key.clone(),
             model,
         };
+        let limit = gated.limit;
         let mut map = GateKey::registry()
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -402,7 +426,7 @@ impl HttpClientExt for LimitedHttp {
         let authorize = self.authorize.clone();
         let headers = self.headers.clone();
         async move {
-            let permit = permit.await;
+            let permit = permit.await.map_err(http_client::Error::instance)?;
             let request =
                 Self::prepare(authorize, &headers, Request::from_parts(parts, body)).await?;
             let response = inner.send(request).await?;
@@ -434,7 +458,7 @@ impl HttpClientExt for LimitedHttp {
                 }
                 None => {}
             }
-            let permit = permit.await;
+            let permit = permit.await.map_err(http_client::Error::instance)?;
             let response = inner.send_multipart(req).await?;
             Ok(body_holding(response, permit))
         }
@@ -454,7 +478,7 @@ impl HttpClientExt for LimitedHttp {
         let authorize = self.authorize.clone();
         let headers = self.headers.clone();
         async move {
-            let permit = permit.await;
+            let permit = permit.await.map_err(http_client::Error::instance)?;
             let request =
                 Self::prepare(authorize, &headers, Request::from_parts(parts, body)).await?;
             let response = inner.send_streaming(request).await?;
@@ -533,13 +557,15 @@ mod tests {
         (format!("http://{addr}/"), seen)
     }
 
-    /// Send `body` (JSON naming a model, or empty) and read the answer.
+    /// Send `body` (JSON naming a model, or empty) as work outside any
+    /// workspace and read the answer.
     async fn call(client: LimitedHttp, url: String, body: &'static str) -> Bytes {
         let request = Request::post(url)
             .body(Bytes::from_static(body.as_bytes()))
             .unwrap_or_else(|e| fail(&e.to_string()));
-        let response = client
-            .send::<_, Bytes>(request)
+        // The gates read the scope when `send` is called, so call it inside.
+        let sent = async { client.send::<_, Bytes>(request).await };
+        let response = Egress::scope(Some(Egress::NoWorkspace), sent)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         response
@@ -595,6 +621,60 @@ mod tests {
                 .get(),
             8
         );
+    }
+
+    #[tokio::test]
+    async fn a_request_the_scope_refuses_is_never_sent() {
+        use std::sync::atomic::Ordering;
+
+        use crate::storage::control::AllowedProviders;
+
+        let (url, peak) = slow_server(Duration::ZERO).await;
+        let send = |egress: Option<Egress>, kind: ProviderType, body: &'static str| {
+            let client = LimitedHttp::for_provider(&name("hosted"), &provider(kind, None, &url));
+            let request = Request::post(url.clone())
+                .body(Bytes::from_static(body.as_bytes()))
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            async move {
+                let sent = async { client.send::<_, Bytes>(request).await };
+                match Egress::scope(egress, sent).await {
+                    Ok(_) => String::from("sent"),
+                    Err(e) => e.to_string(),
+                }
+            }
+        };
+        let only = |names: &[&str]| {
+            Some(Egress::Workspace(AllowedProviders::Only(
+                names.iter().map(|n| (*n).to_owned()).collect(),
+            )))
+        };
+        let model = r#"{"model":"m"}"#;
+        // Work that entered no scope sends nothing.
+        let unscoped = send(None, ProviderType::Openai, model).await;
+        assert!(
+            unscoped.contains("outside any workspace scope"),
+            "{unscoped}"
+        );
+        // Nor does work on a workspace whose list leaves the provider out.
+        let refused = send(only(&["ollama"]), ProviderType::Openai, model).await;
+        assert!(
+            refused.contains("provider 'hosted' is not allowed in this workspace"),
+            "{refused}"
+        );
+        // An allowed Ollama server is still refused a model it serves from the cloud.
+        let cloud = send(
+            only(&["hosted"]),
+            ProviderType::Ollama,
+            r#"{"model":"big:120b-cloud"}"#,
+        )
+        .await;
+        assert!(cloud.contains("model 'big:120b-cloud'"), "{cloud}");
+        assert_eq!(peak.load(Ordering::SeqCst), 0, "nothing reached the server");
+        assert_eq!(
+            send(only(&["hosted"]), ProviderType::Openai, model).await,
+            "sent"
+        );
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

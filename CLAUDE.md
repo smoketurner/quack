@@ -147,7 +147,16 @@ resources are limited where they are used. Every rig HTTP client sends through
 one permit of the process-wide gate for the provider and the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
 for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
 requests (`TurnRequest::run`, `Embedder::embed_interactive`, via the `quack_core::priority` task-local) before
-background ones. Every outbound HTTP client takes its proxy from `quack_core::proxy::Proxies`
+background ones. The same gate enforces a workspace's `allowed_providers`: `llm::egress::Egress`
+is a task-local scope (`Workspace(AllowedProviders)`, or `NoWorkspace` for `quack doctor`'s probes),
+entered by `Access::resolve` in the server, `OpenedWorkspace` on the command line, and
+`McpServer::as_caller` per tool call, and carried into every job by `JobQueue::submit`.
+`Egress::permit` is the one check, called when a model client is built from a `ModelRef` (a typed
+`Error::ProviderNotAllowed` or `CloudModelNotAllowed`: 403 and a `denied` audit row through
+`Access::model`, exit 1 from the CLI) and again by `ProviderGates::permit` for every request,
+Bedrock's SDK requests included. A request with no scope is `Error::ModelRequestUnscoped`, never an
+allow, so a test that makes a model request enters a scope first. Under a restricted list an Ollama
+model whose id ends in `-cloud` or `:cloud` is refused. Every outbound HTTP client takes its proxy from `quack_core::proxy::Proxies`
 (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, read once; loopback and `169.254.0.0/16`
 are never proxied): reqwest clients start from `Proxies::client` (`.clippy.toml` disallows
 `reqwest::Client::builder` and `new`), and the AWS SDK connector takes `Proxies::aws`

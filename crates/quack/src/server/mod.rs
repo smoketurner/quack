@@ -39,6 +39,7 @@ use tower_http::trace::TraceLayer;
 
 use oidc::Oidc;
 use quack_core::llm::acting::Acting;
+use quack_core::llm::egress::Egress;
 use quack_core::llm::oauth::KeySource;
 use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::llm::oauth::registration::{ClientSection, registered_sections};
@@ -184,8 +185,10 @@ pub(crate) fn router(app: App) -> Router {
         ))
         .layer(axum::middleware::map_response(no_store))
         // Every request gets an empty acting slot, which the identity
-        // extractor fills once it knows the caller.
-        .layer(axum::middleware::from_fn(acting_slot));
+        // extractor fills once it knows the caller, and an empty egress
+        // slot, which `Access::resolve` fills with the workspace's
+        // provider allow-list.
+        .layer(axum::middleware::from_fn(request_slots));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .merge(web::assets())
@@ -330,12 +333,13 @@ impl fmt::Display for Banner<'_> {
     }
 }
 
-/// Run the rest of the request with an acting slot of its own.
-async fn acting_slot(
+/// Run the rest of the request with an acting slot and an egress slot of
+/// its own.
+async fn request_slots(
     request: Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    Acting::request(next.run(request)).await
+    Acting::request(Egress::request(next.run(request))).await
 }
 
 /// Bind and serve until Ctrl-C.

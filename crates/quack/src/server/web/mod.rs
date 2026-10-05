@@ -2554,7 +2554,7 @@ async fn render_graph(
     access.audit_read(app, AuditAction::Page, "graph").await?;
     let options = app.config.graph.options();
     let query = GraphQueryView::from_query(q);
-    let ask = GraphAsk::of(q, app).await?;
+    let ask = GraphAsk::of(q, app, &access).await?;
     let data = app
         .read(id, move |db| GraphPageData::read(db, &ask, &options))
         .await?;
@@ -2612,7 +2612,7 @@ enum GraphAsk {
 impl GraphAsk {
     /// A path when both ends are given, else a search when an entity or a
     /// class is.
-    async fn of(q: &GraphSearch, app: &App) -> WebResult<Self> {
+    async fn of(q: &GraphSearch, app: &App, access: &Access) -> WebResult<Self> {
         let path = PathQuery::new(
             q.from.as_deref().unwrap_or_default(),
             q.to.as_deref().unwrap_or_default(),
@@ -2627,7 +2627,13 @@ impl GraphAsk {
         if path.is_err() && search.is_err() {
             return Ok(Self::Nothing);
         }
-        let model = Embeddings::from_config(&app.config).await?;
+        let model = access
+            .model(
+                app,
+                AuditAction::Graph,
+                Embeddings::from_config(&app.config).await,
+            )
+            .await?;
         Ok(match (path, search) {
             (Ok(path), _) => {
                 let ends = path.embeddings(model.as_ref()).await?;
