@@ -6,6 +6,7 @@ use std::io::Cursor;
 
 use calamine::{Data, Reader};
 
+use super::budget::DecompressionBudget;
 use crate::error::{Error, Result};
 
 /// One sheet of a workbook as CSV bytes, with its name.
@@ -19,10 +20,16 @@ pub struct SheetCsv {
 /// Every non-empty sheet as CSV, in workbook order. The first row is the
 /// header (as `DuckDB`'s reader sniffs it).
 ///
+/// `calamine` inflates a zipped workbook (XLSX, XLSM, XLSB, ODS) itself, so
+/// its entries are inflated against `budget` first. An XLS file is not
+/// compressed and passes untouched.
+///
 /// # Errors
 ///
-/// Returns an error when the bytes are not a workbook or no sheet has data.
-pub fn sheets(data: &[u8]) -> Result<Vec<SheetCsv>> {
+/// Returns an error when the bytes are not a workbook, no sheet has data,
+/// or the workbook inflates past `budget`.
+pub fn sheets(data: &[u8], mut budget: DecompressionBudget) -> Result<Vec<SheetCsv>> {
+    budget.admit_zip(data)?;
     let mut workbook = calamine::open_workbook_auto_from_rs(Cursor::new(data))
         .map_err(|e| Error::Ingestion(format!("not a spreadsheet: {e}")))?;
     let names = workbook.sheet_names();
@@ -149,6 +156,6 @@ mod tests {
 
     #[test]
     fn not_a_workbook_is_an_error() {
-        assert!(sheets(b"definitely not xlsx").is_err());
+        assert!(sheets(b"definitely not xlsx", DecompressionBudget::megabytes(64)).is_err());
     }
 }

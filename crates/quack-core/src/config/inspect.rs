@@ -352,6 +352,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "embedding_concurrency",
             "tokenizer_encoding",
             "upload_max_mb",
+            "max_decompressed_mb",
         ],
     ),
     (
@@ -671,6 +672,11 @@ fn ingestion(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) 
         "upload_max_mb",
         ingestion.upload_max_mb,
         default.upload_max_mb,
+    );
+    s.literal(
+        "max_decompressed_mb",
+        ingestion.max_decompressed_mb,
+        default.max_decompressed_mb,
     );
 }
 

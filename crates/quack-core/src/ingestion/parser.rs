@@ -3,6 +3,7 @@ use std::path::Path;
 use pdf_oxide::PdfDocument;
 use pdf_oxide::editor::DocumentInfo;
 
+use super::budget::DecompressionBudget;
 use super::{html, office};
 use crate::error::{Error, Result};
 use crate::okf::{WithFrontMatter, parse_front_matter};
@@ -286,8 +287,8 @@ impl TextFormat {
     ///
     /// Returns an error if the file cannot be parsed, or if it has no text
     /// at all (a scanned PDF without a text layer needs OCR, which is not
-    /// supported).
-    pub fn extract(self, data: &[u8]) -> Result<Extracted> {
+    /// supported), or if a DOCX or PPTX inflates past `budget`.
+    pub fn extract(self, data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         match self {
             Self::Pdf => extract_pdf(data),
             Self::Markdown => {
@@ -313,8 +314,8 @@ impl TextFormat {
                 pages_skipped: 0,
             }),
             Self::Html => html::html(&utf8(data)?),
-            Self::Docx => office::docx(data),
-            Self::Pptx => office::pptx(data),
+            Self::Docx => office::docx(data, budget),
+            Self::Pptx => office::pptx(data, budget),
         }
     }
 }
@@ -517,10 +518,15 @@ fn is_setext_underline(line: &str) -> bool {
 mod tests {
     use super::*;
 
+    const BUDGET: DecompressionBudget = DecompressionBudget::megabytes(64);
+
     #[test]
     fn markdown_front_matter_gives_the_title_and_is_not_chunked() {
         let extracted = TextFormat::Markdown
-            .extract(b"---\ntitle: Renewal Guide\ntags: [a]\n---\n\n# Terms\n\nThirty days.\n")
+            .extract(
+                b"---\ntitle: Renewal Guide\ntags: [a]\n---\n\n# Terms\n\nThirty days.\n",
+                BUDGET,
+            )
             .unwrap_or_else(|_| Extracted {
                 title: None,
                 sections: Vec::new(),
@@ -585,7 +591,7 @@ mod tests {
     fn extracts_plain_text() {
         let data = b"Hello, world!";
         let text = TextFormat::Text
-            .extract(data)
+            .extract(data, BUDGET)
             .ok()
             .and_then(|e| e.sections.into_iter().next())
             .map(|s| s.text);
@@ -628,7 +634,7 @@ mod tests {
 
     #[test]
     fn pdf_without_text_layer_is_an_error() {
-        let err = TextFormat::Pdf.extract(b"%PDF-1.4\n%%EOF").err();
+        let err = TextFormat::Pdf.extract(b"%PDF-1.4\n%%EOF", BUDGET).err();
         assert!(err.is_some());
     }
 
@@ -648,7 +654,7 @@ mod tests {
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn every_page_of_a_long_pdf_is_kept_with_its_number_and_title() {
         let extracted = TextFormat::Pdf
-            .extract(&long_pdf(60, "Long Report"))
+            .extract(&long_pdf(60, "Long Report"), BUDGET)
             .unwrap();
         assert_eq!(extracted.title.as_deref(), Some("Long Report"));
         assert_eq!(extracted.pages_skipped, 0);

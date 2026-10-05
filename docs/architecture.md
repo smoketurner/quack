@@ -57,7 +57,7 @@ nothing in it knows about HTTP, terminals, or windows.
 | `priority` | the interactive/background task-local that the writer line and the model limiter read | 4.1 |
 | `storage::sessions`, `storage::context`, `storage::audit` | conversations, the versioned workspace context, the content half of the audit (`AuditLog`: the server's insert-only audit connection) | 5.3, 8 |
 | `embedding` | each text's embedding role (query, document, similarity), each model family's trained prefixes (`presets`) and their `[embedding]` overrides, the profile a vector is made under, the width check, `refresh` | 6.1, 5.4 |
-| `ingestion` | registration with SHA-256 dedup, parsers (`parser`, `html`, `office`, `xlsx`), chunking, embedding, tables from structured files, piped stdin | 6.1, 6.2 |
+| `ingestion` | registration with SHA-256 dedup, parsers (`parser`, `html`, `office`, `xlsx`), the decompression limit on zipped uploads (`budget`), chunking, embedding, tables from structured files, piped stdin | 6.1, 6.2 |
 | `import` | rows from Postgres, SQLite, or an HTTP data file as a workspace table | 6.2 |
 | `analysis` | the agent loop as an event stream (`agent`, `events`), the tools (`tools`: plain values over the workspace and its settings, the turn's state, `tools::Turn`, reaching each call as a runtime scope of rig's `ToolContext`), the system prompt (`text_to_sql`), write policy, citations, the chart spec, the reranking hook (`rerank`) | 7, 9 |
 | `ontology` | the model, validation, versions (`store`), induction from tables and documents (`induction`, `documents`), the review queue (`candidates`) | 6.3, 6.5 |

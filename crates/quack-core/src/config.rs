@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::embedding::Dimension;
 use crate::error::{Error, Result};
 use crate::graph::GraphOptions;
+use crate::ingestion::budget::DecompressionBudget;
 use crate::ontology::documents::DocumentEvidenceOptions;
 use crate::ontology::induction::TableEvidenceOptions;
 use crate::text::Tokens;
@@ -986,6 +987,18 @@ pub struct IngestionConfig {
     pub tokenizer_encoding: String,
     /// Largest upload the server accepts, in megabytes.
     pub upload_max_mb: u32,
+    /// Megabytes a compressed file (DOCX, PPTX, a zipped workbook) may
+    /// inflate to while it is parsed. The upload limit counts compressed
+    /// bytes only.
+    pub max_decompressed_mb: u64,
+}
+
+impl IngestionConfig {
+    /// What one file's archive parts may inflate to, together.
+    #[must_use]
+    pub const fn decompression_budget(&self) -> DecompressionBudget {
+        DecompressionBudget::megabytes(self.max_decompressed_mb)
+    }
 }
 
 impl Default for IngestionConfig {
@@ -997,6 +1010,9 @@ impl Default for IngestionConfig {
             embedding_concurrency: 2,
             tokenizer_encoding: String::from("cl100k_base"),
             upload_max_mb: 512,
+            // Twice the upload limit: a package of stored media at that
+            // limit still has as much again for its XML.
+            max_decompressed_mb: 1024,
         }
     }
 }
@@ -1989,6 +2005,7 @@ rerank = "model"
         assert_eq!(config.analysis.max_turns, 15);
         assert_eq!(config.analysis.history_token_budget, Tokens::new(32_000));
         assert_eq!(config.ingestion.upload_max_mb, 512);
+        assert_eq!(config.ingestion.max_decompressed_mb, 1024);
         assert_eq!(config.ingestion.embedding_concurrency, 2);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert!(!config.server.local);

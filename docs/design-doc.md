@@ -723,6 +723,17 @@ extract` rebuilds the graph once the tables and documents are back.
 
 A scanned PDF (no text layer) is reported as `error: no extractable text`. OCR is deferred.
 
+**Decompression limit.** `[ingestion].upload_max_mb` counts compressed bytes. A DOCX, a PPTX,
+and a zipped workbook (XLSX, XLSM, XLSB, ODS) are zip archives, so a second limit,
+`[ingestion].max_decompressed_mb` (default 1024), bounds what one file may inflate to. Every
+part is read through one `ingestion::budget::DecompressionBudget` for the file. DOCX and PPTX
+count the parts the parser reads. A workbook counts every entry, because `calamine` inflates
+the archive itself: `DecompressionBudget::admit_zip` inflates the entries first and keeps
+nothing. A file over the limit ends in status `error`, naming the setting. An XLS file is not
+compressed and is bounded by the upload limit. `pdf_oxide` applies its own limit to each PDF
+stream (100 MB and a 100:1 ratio). The limit covers bytes inflated, not the cell grid
+`calamine` builds from them.
+
 **Chunking.** A fixed token window: 512-token target, 64-token overlap, stepping by the
 difference; token counts via `tiktoken` (`cl100k_base`). A sectioned source (Markdown, HTML,
 DOCX headings, PPTX slides, plain text) splits at section boundaries first, so no chunk spans
@@ -2197,6 +2208,7 @@ embedding_batch_size = 64
 embedding_concurrency = 2     # requests in flight; Ollama needs OLLAMA_NUM_PARALLEL to use more than 1
 tokenizer_encoding = "cl100k_base"
 upload_max_mb = 512
+max_decompressed_mb = 1024      # what a DOCX, PPTX, or zipped workbook may inflate to while parsed
 
 [context]
 max_tokens = 4000

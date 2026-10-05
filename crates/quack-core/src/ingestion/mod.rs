@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod chunker;
 pub mod html;
 pub mod office;
@@ -21,6 +22,7 @@ use crate::storage::workspace::{
 };
 use crate::storage::writer::Writer;
 use crate::text::NonBlankText;
+use budget::DecompressionBudget;
 use chunker::Chunker;
 use parser::{FileType, Load, Reader, Separator, TextFormat};
 
@@ -325,7 +327,8 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 // Parsing the workbook is the slow part: off the runtime's
                 // workers, and not on the writer.
                 let bytes = data.to_vec();
-                let sheets = parse_off_runtime(move || xlsx::sheets(&bytes)).await?;
+                let budget = config.ingestion.decompression_budget();
+                let sheets = parse_off_runtime(move || xlsx::sheets(&bytes, budget)).await?;
                 let load = WorkbookLoad {
                     files_dir: config.workspace_files_dir(workspace_id),
                     doc_id: doc_id.clone(),
@@ -397,6 +400,7 @@ struct Parsing {
     format: TextFormat,
     stem: Option<String>,
     data: Vec<u8>,
+    budget: DecompressionBudget,
     chunk_size: u32,
     chunk_overlap: u32,
     encoding: String,
@@ -418,6 +422,7 @@ impl Parsing {
                 .and_then(|s| s.to_str())
                 .map(str::to_owned),
             data: data.to_vec(),
+            budget: config.ingestion.decompression_budget(),
             chunk_size: config.ingestion.chunk_size_tokens,
             chunk_overlap: config.ingestion.chunk_overlap_tokens,
             encoding: config.ingestion.tokenizer_encoding.clone(),
@@ -425,7 +430,7 @@ impl Parsing {
     }
 
     fn run(self) -> Result<Parsed> {
-        let extracted = self.format.extract(&self.data)?;
+        let extracted = self.format.extract(&self.data, self.budget)?;
         let chunks = Chunker::new(self.chunk_size, self.chunk_overlap, &self.encoding)?
             .document(&extracted, self.stem.as_deref())?;
         Ok(Parsed {
