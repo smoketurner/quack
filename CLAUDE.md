@@ -319,7 +319,9 @@ half of each audit row is `storage::audit` (`_quack_audit`) inside the workspace
 same UUID v7. Ingestion is `register_document` (status `queued`, or `Registration::Duplicate` when the
 bytes' SHA-256 already belong to a non-failed document whose table or chunks still exist;
 `Error::TableTaken` when the file's table belongs to another live document) plus `Processing::run`
-(`processing` to `ready` or `error`, recording `chunk_count` and the parsed title);
+(`processing` to `ready` or `error`, recording `chunk_count`, the parsed title, and a PDF's
+`parser::PageCounts`: pages in the file, pages whose extraction failed, pages without text;
+`DocumentInfo::pages_note` is the one wording every interface shows, as `3 of 40 pages unreadable`);
 `ingest_file` does both and takes a `NewFile` (name, bytes, `DocumentSource`, optional
 title and uploader, and its `RunControl`).
 

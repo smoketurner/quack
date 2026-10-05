@@ -1461,9 +1461,12 @@ fn list_documents(db: &WorkspaceDb, format: TextOrJson, out: &mut impl Write) ->
             .title
             .as_deref()
             .map_or(String::new(), |t| format!("  ({t})"));
+        let pages = doc
+            .pages_note()
+            .map_or(String::new(), |note| format!("  [{note}]"));
         writeln!(
             out,
-            "{}  {:<10}  {:<6}  {}  {}{title}",
+            "{}  {:<10}  {:<6}  {}  {}{title}{pages}",
             doc.id,
             doc.status,
             doc.source,
@@ -1701,11 +1704,10 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     for table in &result.tables {
         writeln!(out, "  Table: {table}")?;
     }
-    if result.pages_skipped > 0 {
+    if let Some(note) = result.pages_note() {
         writeln!(
             out,
-            "  Pages skipped: {} (unreadable; the rest of the document was kept)",
-            result.pages_skipped
+            "  Pages skipped: {note} (the rest of the document was kept)"
         )?;
     }
     if result.chunks_stored > 0 {
@@ -1836,6 +1838,7 @@ mod tests {
     use super::*;
     use quack_core::embedding::Dimension;
     use quack_core::error::AuthReason;
+    use quack_core::ingestion::parser::PageCounts;
     use quack_core::llm::oauth::Renewal;
     use quack_core::storage::workspace::NewDocument;
 
@@ -1885,9 +1888,49 @@ mod tests {
         let row: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(row.get("status").unwrap(), "error", "{row}");
         assert_eq!(row.get("error_message").unwrap(), "no text layer", "{row}");
-        for key in ["ingested_by", "tables", "filename", "sha256", "source"] {
+        for key in [
+            "ingested_by",
+            "tables",
+            "filename",
+            "sha256",
+            "source",
+            "pages",
+        ] {
             assert!(row.get(key).is_some(), "{key} missing: {row}");
         }
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn docs_show_the_pages_missing_from_a_document() {
+        let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
+        let id = DocumentId::from("d1");
+        db.insert_document(&NewDocument::new(&id, "scan.pdf", "application/pdf", 3))
+            .unwrap();
+        db.set_document_pages(
+            &id,
+            Some(PageCounts {
+                total: 40,
+                unreadable: 3,
+                empty: 2,
+            }),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        list_documents(&db, TextOrJson::Json, &mut out).unwrap();
+        let row: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            row.get("pages").unwrap(),
+            &serde_json::json!({ "total": 40, "unreadable": 3, "empty": 2 }),
+            "{row}"
+        );
+        let mut out = Vec::new();
+        list_documents(&db, TextOrJson::Text, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("scan.pdf  [3 of 40 pages unreadable, 2 without text]"),
+            "{text}"
+        );
     }
 
     /// A missing login is recognised through the context a command adds

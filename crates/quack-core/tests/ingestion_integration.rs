@@ -14,7 +14,7 @@ use quack_core::error::Error;
 use quack_core::graph::{Properties, Standing, store as graph_store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId};
 use quack_core::import::{HostReach, ImportPolicy, ImportRequest};
-use quack_core::ingestion::parser::FileType;
+use quack_core::ingestion::parser::{FileType, PageCounts};
 use quack_core::llm::CancellationToken;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::ControlPlane;
@@ -1617,6 +1617,8 @@ fn legacy_unprefixed_tables_are_renamed_on_open() {
             .as_deref()
             .is_some_and(|m| m.contains("upload it again"))
     );
+    // A row from before page counts were recorded carries none.
+    assert_eq!(old.pages, None);
     assert!(db.list_tables().unwrap().is_empty());
 }
 
@@ -2140,7 +2142,7 @@ async fn a_long_pdf_ingests_every_page_in_order() {
     .unwrap()
     .ingested()
     .unwrap();
-    assert_eq!(result.pages_skipped, 0);
+    assert_eq!(result.pages_note(), None);
     assert!(result.chunks_stored > 0);
 
     let doc = db.document(&result.document_id).unwrap().unwrap();
@@ -2585,6 +2587,66 @@ async fn office_and_html_documents_are_chunked_with_titles() {
             .error_message
             .is_some_and(|m| m.contains("not a PowerPoint file"))
     );
+}
+
+#[tokio::test]
+async fn a_pdf_page_without_text_is_counted_on_the_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-pages").unwrap();
+    let writer = writer_of(&db);
+    // Three pages; the second carries no text, as a scanned image would.
+    let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Mixed");
+    pdf.letter_page().at(72.0, 720.0).text("First page").done();
+    pdf.letter_page().done();
+    pdf.letter_page().at(72.0, 720.0).text("Third page").done();
+    let bytes = pdf.build().unwrap();
+
+    let result = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-pages",
+        &ingestion::NewFile::new("mixed.pdf", &bytes),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    let counts = PageCounts {
+        total: 3,
+        unreadable: 0,
+        empty: 1,
+    };
+    assert_eq!(result.pages, Some(counts));
+    assert_eq!(
+        result.pages_note().as_deref(),
+        Some("1 of 3 pages without text")
+    );
+
+    let doc = db.document(&result.document_id).unwrap().unwrap();
+    assert_eq!(doc.status, DocumentStatus::Ready);
+    assert_eq!(doc.pages, Some(counts));
+    assert_eq!(
+        doc.pages_note().as_deref(),
+        Some("1 of 3 pages without text")
+    );
+
+    // A source without pages records none.
+    let text = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-pages",
+        &ingestion::NewFile::new("notes.md", b"# Notes\n\nNo pages here.\n"),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(text.pages, None);
+    let doc = db.document(&text.document_id).unwrap().unwrap();
+    assert_eq!(doc.pages, None);
 }
 
 /// `tiny_xlsx` with one more sheet part of `megabytes` of spaces: a few

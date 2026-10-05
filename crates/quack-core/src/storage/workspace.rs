@@ -13,7 +13,7 @@ use crate::error::{Error, Record, Result};
 use crate::graph;
 use crate::ids::{ChunkId, DocumentId, NodeId};
 use crate::ingestion::TableName;
-use crate::ingestion::parser::{FileType, Load};
+use crate::ingestion::parser::{FileType, Load, PageCounts};
 use crate::ontology::store::Acceptance;
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
@@ -46,6 +46,38 @@ const ONTOLOGY_ACCEPTANCE: u32 = 10;
 /// as `(keep, drop)` and once as `(drop, keep)`; collapse each pair to one
 /// row, keeping the more-decided one so a reviewer's rejection is not lost.
 const MERGE_DEDUP: u32 = 11;
+
+/// The documents table, and the columns older files gain on open.
+const DOCUMENTS_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS _quack_documents (
+        id TEXT PRIMARY KEY,
+        filename TEXT NOT NULL,
+        title TEXT,
+        mime_type TEXT,
+        size_bytes BIGINT,
+        sha256 TEXT,
+        source TEXT,
+        ingested_at TIMESTAMP DEFAULT now(),
+        status TEXT DEFAULT 'queued',
+        error_message TEXT,
+        pinned BOOLEAN NOT NULL DEFAULT false,
+        chunk_count INTEGER,
+        ingested_by TEXT,
+        tables JSON,
+        page_count INTEGER,
+        pages_unreadable INTEGER,
+        pages_empty INTEGER
+    );
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS title TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS sha256 TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS chunk_count INTEGER;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS ingested_by TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS tables JSON;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_unreadable INTEGER;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_empty INTEGER;";
 
 /// Summaries of the turns a session's history window leaves out
 /// (`[analysis].compact_history`), each with how many replayable messages,
@@ -915,22 +947,6 @@ impl WorkspaceDb {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS _quack_documents (
-                id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                title TEXT,
-                mime_type TEXT,
-                size_bytes BIGINT,
-                sha256 TEXT,
-                source TEXT,
-                ingested_at TIMESTAMP DEFAULT now(),
-                status TEXT DEFAULT 'queued',
-                error_message TEXT,
-                pinned BOOLEAN NOT NULL DEFAULT false,
-                chunk_count INTEGER,
-                ingested_by TEXT,
-                tables JSON
-            );
             CREATE TABLE IF NOT EXISTS _quack_chunks (
                 id TEXT PRIMARY KEY,
                 document_id TEXT NOT NULL,
@@ -941,13 +957,6 @@ impl WorkspaceDb {
                 embedding FLOAT[{dim}],
                 token_count INTEGER
             );
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS title TEXT;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS sha256 TEXT;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source TEXT;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS chunk_count INTEGER;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS ingested_by TEXT;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS tables JSON;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS heading TEXT;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS page INTEGER;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS embedding_profile TEXT;
@@ -998,6 +1007,7 @@ impl WorkspaceDb {
                 detail JSON
             );"
         );
+        self.conn.execute_batch(DOCUMENTS_DDL)?;
         self.conn.execute_batch(&sql)?;
         self.conn.execute_batch(SESSION_SUMMARIES_DDL)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;
@@ -1510,6 +1520,26 @@ impl WorkspaceDb {
         self.conn.execute(
             "UPDATE _quack_documents SET chunk_count = ? WHERE id = ?",
             duckdb::params![count, id],
+        )?;
+        Ok(())
+    }
+
+    /// Record how a processed document's pages read; `None` for a source
+    /// without pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn set_document_pages(&self, id: &DocumentId, pages: Option<PageCounts>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _quack_documents SET page_count = ?, pages_unreadable = ?, pages_empty = ? \
+             WHERE id = ?",
+            duckdb::params![
+                pages.map(|p| p.total),
+                pages.map(|p| p.unreadable),
+                pages.map(|p| p.empty),
+                id
+            ],
         )?;
         Ok(())
     }
@@ -2733,6 +2763,9 @@ pub struct DocumentInfo {
     /// Tables a structured document loaded into; `None` until processed
     /// and for rows written before this was recorded.
     pub tables: Option<Vec<String>>,
+    /// How a PDF's pages read; `None` for other sources, until processed,
+    /// and for rows written before this was recorded.
+    pub pages: Option<PageCounts>,
     pub ingested_at: String,
 }
 
@@ -2741,6 +2774,13 @@ impl DocumentInfo {
     #[must_use]
     pub fn display_name(&self) -> &str {
         self.title.as_deref().unwrap_or(&self.filename)
+    }
+
+    /// What a listing says when pages are missing from the text, as
+    /// `3 of 40 pages unreadable`; `None` when nothing is missing.
+    #[must_use]
+    pub fn pages_note(&self) -> Option<String> {
+        self.pages.and_then(PageCounts::note)
     }
 
     /// The tables a row from before `tables` was recorded loaded into: the
@@ -2837,7 +2877,8 @@ impl<'a> NewDocument<'a> {
 
 const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, status, error_message, \
      COALESCE(pinned, false), CAST(ingested_at AS VARCHAR), title, sha256, source, chunk_count, \
-     ingested_by, CAST(tables AS VARCHAR) FROM _quack_documents";
+     ingested_by, CAST(tables AS VARCHAR), page_count, pages_unreadable, pages_empty \
+     FROM _quack_documents";
 
 /// A row selected with [`DOCUMENT_SELECT`].
 impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
@@ -2861,6 +2902,14 @@ impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
             tables: row
                 .get::<_, Option<String>>(13)?
                 .and_then(|json| serde_json::from_str(&json).ok()),
+            pages: match row.get::<_, Option<u32>>(14)? {
+                Some(total) => Some(PageCounts {
+                    total,
+                    unreadable: row.get::<_, Option<u32>>(15)?.unwrap_or(0),
+                    empty: row.get::<_, Option<u32>>(16)?.unwrap_or(0),
+                }),
+                None => None,
+            },
         })
     }
 }
@@ -5105,6 +5154,41 @@ mod tests {
             seen.extend(page.into_iter().map(|c| c.id.into_string()));
         }
         assert_eq!(seen, ["c0", "c1", "c2", "c3", "c4", "c5", "c6"]);
+    }
+
+    #[test]
+    fn page_counts_are_stored_on_the_document_and_cleared_with_none() {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        insert_ready_document(&db, "doc1");
+        let id = DocumentId::from("doc1");
+        let pages = |db: &WorkspaceDb| {
+            db.document(&id)
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .map(|doc| (doc.pages, doc.pages_note()))
+        };
+        assert_eq!(pages(&db), Some((None, None)));
+
+        let counts = PageCounts {
+            total: 40,
+            unreadable: 3,
+            empty: 2,
+        };
+        db.set_document_pages(&id, Some(counts))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            pages(&db),
+            Some((
+                Some(counts),
+                Some(String::from("3 of 40 pages unreadable, 2 without text"))
+            ))
+        );
+        let listed = db.list_documents().unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(listed.first().and_then(|doc| doc.pages), Some(counts));
+
+        db.set_document_pages(&id, None)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(pages(&db), Some((None, None)));
     }
 
     fn insert_ready_document(db: &WorkspaceDb, id: &str) {

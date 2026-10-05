@@ -1179,7 +1179,9 @@ impl Tool for ListDocumentsTool {
         String::from(
             "List every ingested document with its id, file name, status (queued, processing, \
              ready, or error), MIME type, source, and title when it has one. A document's text is \
-             searchable once its status is ready; a tabular file is loaded as a table instead. To \
+             searchable once its status is ready; a tabular file is loaded as a table instead. A \
+             document marked with unreadable pages or pages without text was only partly read: \
+             those pages are not searchable. To \
              search within particular documents, pass their ids (a prefix is enough) or exact \
              file names as search_documents' document_ids. Takes no arguments.",
         )
@@ -1207,9 +1209,12 @@ impl Tool for ListDocumentsTool {
                 .title
                 .as_deref()
                 .map_or(String::new(), |t| format!(", title: {t}"));
+            let pages = doc
+                .pages_note()
+                .map_or(String::new(), |note| format!(", {note}"));
             writeln!(
                 output,
-                "- {} (id: {}, status: {}, type: {}, source: {}{title})",
+                "- {} (id: {}, status: {}, type: {}, source: {}{title}{pages})",
                 doc.filename,
                 doc.id,
                 doc.status,
@@ -1365,6 +1370,7 @@ mod tests {
     use crate::graph::store::NewNode;
     use crate::graph::{Properties, Standing};
     use crate::ids::{ClassId, DocumentId};
+    use crate::ingestion::parser::PageCounts;
     use crate::llm::EmbedModel;
     use crate::ontology::Mapping;
     use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
@@ -1878,6 +1884,39 @@ mod tests {
             rrf_k: 60,
             ..RetrievalConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn list_documents_names_the_pages_missing_from_a_document() {
+        let db = shared_db();
+        let seeded = db
+            .run(|db| {
+                let id = DocumentId::from("d1");
+                db.insert_document(
+                    &NewDocument::new(&id, "scan.pdf", "application/pdf", 1)
+                        .with_status(DocumentStatus::Ready),
+                )?;
+                db.set_document_pages(
+                    &id,
+                    Some(PageCounts {
+                        total: 40,
+                        unreadable: 3,
+                        empty: 2,
+                    }),
+                )
+            })
+            .await;
+        assert!(seeded.is_ok(), "{seeded:?}");
+        let (sink, _rx) = events::channel();
+        let turn = Turn::new(TurnRecorder::new(sink), WritePolicy::Deny);
+        let listed = ListDocumentsTool(ReaderDb::new(db))
+            .call(&mut turn.context(), NoArgs)
+            .await
+            .unwrap_or_else(|e| fail_test(&e.to_string()));
+        assert!(
+            listed.contains("source: upload, 3 of 40 pages unreadable, 2 without text)"),
+            "{listed}"
+        );
     }
 
     /// A tool reads its turn from the context rig hands each call; without

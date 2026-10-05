@@ -197,8 +197,11 @@ impl UploadJob {
         match result {
             Ok(r) => {
                 tracing::info!(document = %r.document_id, file = %r.filename, chunks = r.chunks_stored, "upload processed");
+                let pages = r
+                    .pages_note()
+                    .map_or(String::new(), |note| format!(", {note}"));
                 Ok(match r.tables.as_slice() {
-                    [] => format!("{} chunks", r.chunks_stored),
+                    [] => format!("{} chunks{pages}", r.chunks_stored),
                     tables => format!("tables {}", tables.join(", ")),
                 })
             }

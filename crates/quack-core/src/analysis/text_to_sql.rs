@@ -304,9 +304,14 @@ impl SystemPrompt {
                 }
                 format!(" \"{cut}\"")
             });
+            // A partly read document says so, so the model can tell the
+            // person why a search of it may miss.
+            let pages = doc
+                .pages_note()
+                .map_or(String::new(), |note| format!(", {note}"));
             writeln!(
                 self.text,
-                "- {}{title} (status: {}, type: {})",
+                "- {}{title} (status: {}, type: {}{pages})",
                 doc.filename,
                 doc.status,
                 doc.mime_type.as_deref().unwrap_or("unknown"),
@@ -475,6 +480,7 @@ mod tests {
     use crate::graph::store::NewNode;
     use crate::graph::{Properties, Standing};
     use crate::ids::{ChunkId, ClassId, DocumentId};
+    use crate::ingestion::parser::PageCounts;
     use crate::ontology::Ontology;
     use crate::ontology::store::Revision;
     use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument, Pinning};
@@ -651,6 +657,48 @@ mod tests {
             prompt.contains(&format!(
                 "... and {extra} older documents; list_documents lists them all"
             )),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn a_partly_read_document_says_so_in_the_inventory() {
+        let db = db();
+        for (id, name) in [("d1", "partial.pdf"), ("d2", "whole.pdf")] {
+            db.insert_document(
+                &NewDocument::new(&DocumentId::from(id), name, "application/pdf", 1)
+                    .with_status(DocumentStatus::Ready),
+            )
+            .unwrap();
+        }
+        db.set_document_pages(
+            &DocumentId::from("d1"),
+            Some(PageCounts {
+                total: 40,
+                unreadable: 3,
+                empty: 0,
+            }),
+        )
+        .unwrap();
+        db.set_document_pages(
+            &DocumentId::from("d2"),
+            Some(PageCounts {
+                total: 12,
+                unreadable: 0,
+                empty: 0,
+            }),
+        )
+        .unwrap();
+        let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
+        assert!(
+            prompt.contains(
+                "- partial.pdf (status: ready, type: application/pdf, 3 of 40 pages unreadable)"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("- whole.pdf (status: ready, type: application/pdf)"),
             "{prompt}"
         );
     }

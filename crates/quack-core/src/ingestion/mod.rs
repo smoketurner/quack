@@ -24,7 +24,7 @@ use crate::storage::writer::Writer;
 use crate::text::NonBlankText;
 use budget::DecompressionBudget;
 use chunker::Chunker;
-use parser::{FileType, Load, Reader, Separator, TextFormat};
+use parser::{FileType, Load, PageCounts, Reader, Separator, TextFormat};
 
 /// Result of ingesting a single file into a workspace.
 #[derive(Debug)]
@@ -35,10 +35,19 @@ pub struct IngestResult {
     pub chunks_stored: u32,
     /// Tables a structured file loaded into: one, or one per workbook sheet.
     pub tables: Vec<String>,
-    /// Pages the parser could not read and skipped (PDF only).
-    pub pages_skipped: u32,
+    /// How the pages read (PDF only).
+    pub pages: Option<PageCounts>,
     /// How long embedding the chunks took, when a model ran.
     pub embedding_time: Option<Duration>,
+}
+
+impl IngestResult {
+    /// What the person is told when pages are missing from the text, as
+    /// `3 of 40 pages unreadable`; `None` when nothing is missing.
+    #[must_use]
+    pub fn pages_note(&self) -> Option<String> {
+        self.pages.and_then(PageCounts::note)
+    }
 }
 
 /// What `ingest_file` did: stored the file, or skipped it because a
@@ -269,8 +278,10 @@ impl<M: EmbeddingModel> Processing<'_, M> {
         match &outcome {
             Ok(result) => {
                 let (chunks, tables) = (result.chunks_stored, result.tables.clone());
+                let pages = result.pages;
                 db.run(move |db| {
                     db.set_document_chunk_count(&id, chunks)?;
+                    db.set_document_pages(&id, pages)?;
                     db.set_document_tables(&id, &tables)?;
                     db.update_document_status(&id, DocumentStatus::Ready)
                 })
@@ -319,7 +330,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     file_type,
                     chunks_stored: 0,
                     tables: vec![table_name],
-                    pages_skipped: 0,
+                    pages: None,
                     embedding_time: None,
                 })
             }
@@ -342,7 +353,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     file_type,
                     chunks_stored: 0,
                     tables,
-                    pages_skipped: 0,
+                    pages: None,
                     embedding_time: None,
                 })
             }
@@ -352,7 +363,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 let parsing = Parsing::new(config, format, filename, data);
                 let Parsed {
                     title,
-                    pages_skipped,
+                    pages,
                     chunks,
                 } = parse_off_runtime(move || parsing.run()).await?;
                 if let Some(title) = title {
@@ -360,12 +371,12 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     db.run(move |db| db.set_document_title_if_empty(&id, &title))
                         .await?;
                 }
-                if pages_skipped > 0 {
+                if let Some(note) = pages.and_then(PageCounts::note) {
                     tracing::warn!(
                         document = %doc_id,
                         file = %filename,
-                        pages_skipped,
-                        "ingested with unreadable pages skipped"
+                        pages = %note,
+                        "ingested with pages missing from the text"
                     );
                 }
                 control.check()?;
@@ -387,7 +398,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     file_type,
                     chunks_stored: stored.chunks,
                     tables: Vec::new(),
-                    pages_skipped,
+                    pages,
                     embedding_time: stored.embedding_time,
                 })
             }
@@ -409,7 +420,7 @@ struct Parsing {
 /// What parsing a document found.
 struct Parsed {
     title: Option<String>,
-    pages_skipped: u32,
+    pages: Option<PageCounts>,
     chunks: Vec<chunker::Chunk>,
 }
 
@@ -435,7 +446,7 @@ impl Parsing {
             .document(&extracted, self.stem.as_deref())?;
         Ok(Parsed {
             title: extracted.title().map(str::to_owned),
-            pages_skipped: extracted.pages_skipped,
+            pages: extracted.pages,
             chunks,
         })
     }

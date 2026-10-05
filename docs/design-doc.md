@@ -334,6 +334,9 @@ CREATE TABLE _quack_documents (
     pinned        BOOLEAN NOT NULL DEFAULT false,
     chunk_count   INTEGER,
     tables        JSON,                    -- tables a structured document created
+    page_count       INTEGER,              -- a PDF's pages; NULL for other sources
+    pages_unreadable INTEGER,              -- pages whose extraction failed
+    pages_empty      INTEGER,              -- pages that read and held no text
     ingested_by   TEXT,
     ingested_at   TIMESTAMP DEFAULT now()
 );
@@ -714,7 +717,7 @@ extract` rebuilds the graph once the tables and documents are back.
 
 | Type | Parser | Extracted metadata |
 |------|--------|--------------------|
-| PDF | `pdf_oxide` | page numbers, Info title; an unreadable page is skipped and counted, never the rest of the file |
+| PDF | `pdf_oxide` | page numbers, Info title; a page that fails to read or holds no text is left out and counted, never the rest of the file |
 | Markdown, plain text | direct | headings (ATX and setext) |
 | HTML | `scraper` (html5ever) | headings, `<title>` |
 | DOCX | `zip` + `quick-xml` | headings from `Heading N` and `Title` styles, core title |
@@ -722,6 +725,17 @@ extract` rebuilds the graph once the tables and documents are back.
 | CSV, Parquet, JSON, JSONL, XLSX | DuckDB (section 6.2) | become tables, not chunks |
 
 A scanned PDF (no text layer) is reported as `error: no extractable text`. OCR is deferred.
+
+**Partly read PDFs.** A PDF with some pages missing from its text still becomes `ready`, and
+the document row records what is missing (`parser::PageCounts`): `page_count`,
+`pages_unreadable` (extraction failed), and `pages_empty` (the page read and held no text,
+as a scanned image does). `DocumentInfo` carries them as `pages`
+(`{"total": 40, "unreadable": 3, "empty": 2}`, `null` for any other source), so REST, MCP
+`list_documents`, and `quack docs --format json` return them. Every listing a person or the
+agent reads shows one note from `DocumentInfo::pages_note`, such as `3 of 40 pages
+unreadable, 2 without text`: `quack ingest`, `quack docs`, the terminal's `/docs` and load
+message, the web Documents row, an upload job's result, the agent's `list_documents` output,
+and the documents block of the system prompt.
 
 **Decompression limit.** `[ingestion].upload_max_mb` counts compressed bytes. A DOCX, a PPTX,
 and a zipped workbook (XLSX, XLSM, XLSB, ODS) are zip archives, so a second limit,

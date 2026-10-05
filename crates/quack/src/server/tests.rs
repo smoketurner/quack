@@ -21,6 +21,7 @@ use quack_core::config::{
 use quack_core::embedding::{Dimension, Vector};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::ids::{ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
+use quack_core::ingestion::parser::PageCounts;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -873,6 +874,80 @@ fn multipart(filename: &str, content_type: &str, data: &str) -> (String, Vec<u8>
         format!("multipart/form-data; boundary={boundary}"),
         body.into_bytes(),
     )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partly_read_document_says_so_over_rest_mcp_and_the_web() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("pages", &owner).await;
+    let token = h.login("owner").await;
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    db.run(|db| {
+        let id = DocumentId::from("d");
+        db.insert_document(
+            &NewDocument::new(&id, "scan.pdf", "application/pdf", 1)
+                .with_status(DocumentStatus::Ready),
+        )?;
+        db.set_document_pages(
+            &id,
+            Some(PageCounts {
+                total: 40,
+                unreadable: 3,
+                empty: 2,
+            }),
+        )
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let counts = serde_json::json!({ "total": 40, "unreadable": 3, "empty": 2 });
+
+    let base = format!("/api/v1/workspaces/{ws}/documents");
+    let (status, body) = h.get(&base, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["documents"][0]["pages"], counts, "{body}");
+    let (status, body) = h.get(&format!("{base}/d"), &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pages"], counts, "{body}");
+
+    let session = mcp_session(&h, &ws, &token).await;
+    let (status, body, _) = mcp_call(
+        &h,
+        &ws,
+        Some(&token),
+        Some(&session),
+        rpc(
+            2,
+            "tools/call",
+            &serde_json::json!({ "name": "list_documents", "arguments": {} }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["structuredContent"]["documents"][0]["pages"], counts,
+        "{body}"
+    );
+
+    let (status, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| c.split(';').next())
+        .and_then(|c| c.strip_prefix("quack_session="))
+        .unwrap_or_default()
+        .to_owned();
+    let note = "3 of 40 pages unreadable, 2 without text";
+    for path in ["documents", "documents/rows", "documents/status"] {
+        let (status, html, _) = h.page(&format!("/w/{ws}/{path}"), Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(html.contains(note), "{path}: {html}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

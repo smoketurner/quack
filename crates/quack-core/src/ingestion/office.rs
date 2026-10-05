@@ -55,7 +55,7 @@ pub fn docx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         title: core_title.or(style_title),
         sections,
         flow: Flow::Sectioned,
-        pages_skipped: 0,
+        pages: None,
     })
 }
 
@@ -117,7 +117,7 @@ pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         title: core_title.or(first_title),
         sections,
         flow: Flow::Sectioned,
-        pages_skipped: 0,
+        pages: None,
     })
 }
 

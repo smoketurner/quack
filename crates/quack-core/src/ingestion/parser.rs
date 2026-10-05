@@ -218,16 +218,48 @@ pub enum Flow {
 
 /// What a parse yields: the document's own title when the format carries
 /// one (`<title>`, Office core properties, a PDF's Info dictionary), its
-/// sections and how they relate, and how many pages the parser had to
-/// skip.
+/// sections and how they relate, and how its pages read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extracted {
     pub title: Option<String>,
     pub sections: Vec<Section>,
     pub flow: Flow,
-    /// Pages whose text could not be read; only a paginated source (PDF)
-    /// ever reports any, and the document keeps every other page.
-    pub pages_skipped: u32,
+    /// How the pages read; `None` for a source without pages (only a PDF
+    /// has them).
+    pub pages: Option<PageCounts>,
+}
+
+/// How a paginated document's pages read. A page left out of the text is
+/// one of two kinds, which mean different things to the person: its
+/// extraction failed, or it holds no text (a scanned image).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PageCounts {
+    pub total: u32,
+    /// Pages whose extraction failed.
+    pub unreadable: u32,
+    /// Pages that read without error and yielded no text.
+    pub empty: u32,
+}
+
+impl PageCounts {
+    /// What a person is told when pages are missing from the text, as
+    /// `3 of 40 pages unreadable`; `None` when every page was kept.
+    #[must_use]
+    pub fn note(self) -> Option<String> {
+        let Self {
+            total,
+            unreadable,
+            empty,
+        } = self;
+        match (unreadable, empty) {
+            (0, 0) => None,
+            (_, 0) => Some(format!("{unreadable} of {total} pages unreadable")),
+            (0, _) => Some(format!("{empty} of {total} pages without text")),
+            (_, _) => Some(format!(
+                "{unreadable} of {total} pages unreadable, {empty} without text"
+            )),
+        }
+    }
 }
 
 impl Extracted {
@@ -300,7 +332,7 @@ impl TextFormat {
                     title: front.get("title").map(str::to_owned),
                     sections: markdown_sections(body),
                     flow: Flow::Sectioned,
-                    pages_skipped: 0,
+                    pages: None,
                 })
             }
             Self::Text => Ok(Extracted {
@@ -311,7 +343,7 @@ impl TextFormat {
                     text: utf8(data)?,
                 }],
                 flow: Flow::Sectioned,
-                pages_skipped: 0,
+                pages: None,
             }),
             Self::Html => html::html(&utf8(data)?),
             Self::Docx => office::docx(data, budget),
@@ -348,28 +380,25 @@ fn extract_pdf(data: &[u8]) -> Result<Extracted> {
     let page_count = doc
         .page_count()
         .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))?;
-    let PdfPages {
-        sections,
-        skipped: pages_skipped,
-    } = extract_pdf_pages(page_count, |index| {
+    let PdfPages { sections, counts } = extract_pdf_pages(page_count, |index| {
         doc.extract_text(index).map_err(|e| e.to_string())
     })?;
     Ok(Extracted {
         title: pdf_title(&doc),
         sections,
         flow: Flow::Continuous,
-        pages_skipped,
+        pages: Some(counts),
     })
 }
 
-/// A PDF's pages as sections, and how many pages failed to read.
+/// A PDF's pages as sections, and how the pages read.
 struct PdfPages {
     sections: Vec<Section>,
-    skipped: u32,
+    counts: PageCounts,
 }
 
 /// Read `page_count` pages with `read`, one section per page that has
-/// text, skipping and counting the pages that fail.
+/// text, counting the pages that fail and the pages that hold none.
 ///
 /// # Errors
 ///
@@ -380,7 +409,11 @@ fn extract_pdf_pages(
     read: impl Fn(usize) -> std::result::Result<String, String>,
 ) -> Result<PdfPages> {
     let mut sections = Vec::new();
-    let mut skipped: u32 = 0;
+    let mut counts = PageCounts {
+        total: u32::try_from(page_count).unwrap_or(u32::MAX),
+        unreadable: 0,
+        empty: 0,
+    };
     for index in 0..page_count {
         let page = u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX);
         match read(index) {
@@ -389,24 +422,25 @@ fn extract_pdf_pages(
                 page: Some(page),
                 text,
             }),
-            Ok(_) => {}
+            Ok(_) => counts.empty = counts.empty.saturating_add(1),
             Err(error) => {
                 tracing::warn!(page, error = %error, "skipping an unreadable PDF page");
-                skipped = skipped.saturating_add(1);
+                counts.unreadable = counts.unreadable.saturating_add(1);
             }
         }
     }
     if sections.is_empty() {
-        if skipped > 0 {
+        if counts.unreadable > 0 {
             return Err(Error::Ingestion(format!(
-                "no readable text: {skipped} of {page_count} pages failed to parse"
+                "no readable text: {} of {page_count} pages failed to parse",
+                counts.unreadable
             )));
         }
         return Err(Error::Ingestion(String::from(
             "no extractable text: the PDF has no text layer (scanned pages need OCR)",
         )));
     }
-    Ok(PdfPages { sections, skipped })
+    Ok(PdfPages { sections, counts })
 }
 
 /// The Info dictionary's `/Title`, when the file carries one.
@@ -531,7 +565,7 @@ mod tests {
                 title: None,
                 sections: Vec::new(),
                 flow: Flow::Sectioned,
-                pages_skipped: 0,
+                pages: None,
             });
         assert_eq!(extracted.title(), Some("Renewal Guide"));
         assert_eq!(extracted.sections.len(), 1);
@@ -657,7 +691,15 @@ mod tests {
             .extract(&long_pdf(60, "Long Report"), BUDGET)
             .unwrap();
         assert_eq!(extracted.title.as_deref(), Some("Long Report"));
-        assert_eq!(extracted.pages_skipped, 0);
+        assert_eq!(
+            extracted.pages,
+            Some(PageCounts {
+                total: 60,
+                unreadable: 0,
+                empty: 0
+            })
+        );
+        assert_eq!(extracted.pages.and_then(PageCounts::note), None);
         assert_eq!(extracted.sections.len(), 60);
         let pages: Vec<Option<u32>> = extracted.sections.iter().map(|s| s.page).collect();
         assert_eq!(pages, (1..=60).map(Some).collect::<Vec<_>>());
@@ -674,16 +716,45 @@ mod tests {
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
     fn a_page_that_fails_to_read_is_skipped_and_counted_not_the_rest() {
-        let PdfPages { sections, skipped } = extract_pdf_pages(4, |index| match index {
+        let PdfPages { sections, counts } = extract_pdf_pages(4, |index| match index {
             1 => Err(String::from("bad font")),
             2 => Ok(String::from("   ")),
             _ => Ok(format!("text {index}")),
         })
         .unwrap();
-        assert_eq!(skipped, 1);
+        assert_eq!(
+            counts,
+            PageCounts {
+                total: 4,
+                unreadable: 1,
+                empty: 1
+            }
+        );
         let pages: Vec<Option<u32>> = sections.iter().map(|s| s.page).collect();
         assert_eq!(pages, vec![Some(1), Some(4)]);
         assert_eq!(sections.get(1).map(|s| s.text.as_str()), Some("text 3"));
+    }
+
+    #[test]
+    fn the_page_note_names_each_kind_of_missing_page() {
+        let counts = |unreadable, empty| PageCounts {
+            total: 40,
+            unreadable,
+            empty,
+        };
+        assert_eq!(counts(0, 0).note(), None);
+        assert_eq!(
+            counts(3, 0).note().as_deref(),
+            Some("3 of 40 pages unreadable")
+        );
+        assert_eq!(
+            counts(0, 2).note().as_deref(),
+            Some("2 of 40 pages without text")
+        );
+        assert_eq!(
+            counts(3, 2).note().as_deref(),
+            Some("3 of 40 pages unreadable, 2 without text")
+        );
     }
 
     #[test]

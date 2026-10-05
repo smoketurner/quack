@@ -64,6 +64,10 @@ open:
   resolution passes could land twice (`(keep, drop)` and `(drop, keep)`). Each pair keeps
   one row, the more-decided one, so a reviewer's rejection survives.
 
+A column that needs no backfill needs no bump: `ADD COLUMN IF NOT EXISTS` on open adds it,
+and rows written earlier read as `NULL`. `_quack_documents.page_count`, `pages_unreadable`,
+and `pages_empty` arrived this way.
+
 Phrase search (`"..."` in a keyword query) needed no bump: it post-filters candidates by
 substring instead of adding term positions to `_quack_terms`.
 

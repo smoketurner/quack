@@ -759,8 +759,11 @@ impl CliJob {
         } else {
             String::new()
         };
+        let pages = result.pages_note().map_or(String::new(), |note| {
+            format!("\n{note}; the rest was kept.")
+        });
         Ok(format!(
-            "Loaded {} ({}){tables}{chunks}\nYou can now ask questions about this data.",
+            "Loaded {} ({}){tables}{chunks}{pages}\nYou can now ask questions about this data.",
             result.filename, result.file_type
         ))
     }
@@ -2425,8 +2428,11 @@ impl App {
             }
             let mut text = String::from("Documents:");
             for doc in docs {
+                let pages = doc
+                    .pages_note()
+                    .map_or(String::new(), |note| format!("  [{note}]"));
                 let line = format!(
-                    "\n  {}  {:<10}  {}  {}",
+                    "\n  {}  {:<10}  {}  {}{pages}",
                     doc.id.short(),
                     doc.status,
                     if doc.pinned { "pinned" } else { "      " },
