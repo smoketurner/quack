@@ -98,6 +98,8 @@ pub(crate) enum MessageKind {
     /// A direct SQL result table.
     Sql,
     System,
+    /// A file on its way in.
+    Upload,
     Error,
 }
 
@@ -512,16 +514,23 @@ impl CliJob {
     }
 
     /// What the transcript says when it starts.
-    fn announcement(&self) -> String {
+    fn announcement(&self) -> Message {
         match self {
-            Self::Import(request) => format!("Importing from {}", request.url),
-            Self::Ingest(path) => format!("Ingesting {}", path.display()),
+            Self::Import(request) => Message::new(
+                MessageKind::System,
+                format!("Importing from {}", request.url),
+            ),
+            Self::Ingest(path) => {
+                Message::new(MessageKind::Upload, format!("Loading {}", path.display()))
+            }
             Self::Ontology(_)
             | Self::Graph(_)
             | Self::Embeddings(_)
             | Self::Okf(_)
             | Self::ContextImport(_)
-            | Self::ContextExport(_) => format!("{}\u{2026}", self.label()),
+            | Self::ContextExport(_) => {
+                Message::new(MessageKind::System, format!("{}\u{2026}", self.label()))
+            }
         }
     }
 
@@ -1023,6 +1032,10 @@ impl App {
                 self.handle_key_event(key.code, key.modifiers);
                 true
             }
+            Event::Paste(text) => {
+                self.handle_paste(text);
+                true
+            }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp => {
                     self.scroll_up(3);
@@ -1036,6 +1049,33 @@ impl App {
             },
             Event::Resize(..) => true,
             _ => false,
+        }
+    }
+
+    /// Pasted text. A terminal pastes the paths of files dropped on it, so
+    /// a paste into an empty input that names only loadable files loads
+    /// them at once; any other is typed in.
+    fn handle_paste(&mut self, text: &str) {
+        if self.awaiting_permission() {
+            return;
+        }
+        if self.textarea.is_empty()
+            && let Some(paths) = Input::files(text)
+        {
+            self.scroll = Scroll::Latest;
+            self.load_files(paths);
+            return;
+        }
+        // Terminals paste a line break as a bare carriage return.
+        self.textarea
+            .insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
+        self.reset_completion();
+        self.history.leave();
+    }
+
+    fn load_files(&mut self, paths: Vec<PathBuf>) {
+        for path in paths {
+            self.run_job(CliJob::Ingest(path));
         }
     }
 
@@ -1737,8 +1777,8 @@ impl App {
             SlashCommand::Unpin { id } => self.set_pinned(id, Pinning::Unpinned),
             SlashCommand::Tables => self.show_tables(),
             SlashCommand::Schema { table } => self.show_schema(table),
-            SlashCommand::Ingest { path } => match Input::file(&path) {
-                Some(path) => self.run_job(CliJob::Ingest(path)),
+            SlashCommand::Ingest { path } => match Input::files(&path) {
+                Some(paths) => self.load_files(paths),
                 None => self.note(
                     MessageKind::Error,
                     format!("'{path}' is not a file quack can ingest"),
@@ -1839,7 +1879,10 @@ impl App {
         self.submit_work(
             JobKind::Models,
             String::from("list models"),
-            Some(String::from("Listing each provider's models")),
+            Some(Message::new(
+                MessageKind::System,
+                "Listing each provider's models",
+            )),
             move |_ctx| async move {
                 BackgroundResult::Done {
                     kind: MessageKind::System,
@@ -2373,7 +2416,7 @@ impl App {
         }
         match Input::classify(line) {
             Input::Command(command) => self.handle_slash_command(&command),
-            Input::File(path) => self.run_job(CliJob::Ingest(path)),
+            Input::Files(paths) => self.load_files(paths),
             Input::Sql(sql) => self.run_direct_sql(sql),
             Input::Question(question) if self.config.general.chat_model.is_none() => {
                 self.note(MessageKind::User, question);
@@ -2526,7 +2569,7 @@ impl App {
         &mut self,
         kind: JobKind,
         label: String,
-        announce: Option<String>,
+        announce: Option<Message>,
         work: F,
     ) where
         F: FnOnce(JobContext) -> Fut + Send + 'static,
@@ -2541,8 +2584,11 @@ impl App {
             drop(tx.send(AppMsg::Finished(id, result)));
             outcome
         });
-        if let Some(text) = announce {
-            self.note(MessageKind::System, format!("{text} (job #{})", job.number));
+        if let Some(message) = announce {
+            self.note(
+                message.kind,
+                format!("{} (job #{})", message.content, job.number),
+            );
         }
     }
 
@@ -3232,6 +3278,57 @@ mod tests {
             lines.get(4).is_some_and(|l| l.contains("7 more lines")),
             "{lines:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_file_loads_at_once_and_other_pastes_are_typed_in() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut app = app(dir.path());
+        let file = dir.path().join("team notes.md");
+        std::fs::write(&file, "# Notes\n\nThe team met.").unwrap_or_else(|e| fail(&e.to_string()));
+        let dropped = file.display().to_string().replace(' ', "\\ ");
+
+        // The path a terminal pastes for a dropped file: loaded, not typed.
+        assert!(app.handle_terminal_event(&Event::Paste(dropped.clone())));
+        assert!(app.textarea.is_empty());
+        let announced = last(&app);
+        assert_eq!(announced.kind, MessageKind::Upload);
+        assert!(
+            announced.content.contains("team notes.md (job #"),
+            "{}",
+            announced.content
+        );
+        settle(&mut app).await;
+        assert_ne!(
+            last(&app).kind,
+            MessageKind::Error,
+            "{}",
+            last(&app).content
+        );
+
+        // Any other paste is typed in, line breaks kept.
+        app.handle_terminal_event(&Event::Paste(String::from("SELECT 1\rFROM t\r\nLIMIT 1")));
+        assert_eq!(app.textarea.lines(), ["SELECT 1", "FROM t", "LIMIT 1"]);
+
+        // A path pasted into text already typed joins it and waits for Enter.
+        app.set_input("/ingest ");
+        let before = app.messages.len();
+        app.handle_terminal_event(&Event::Paste(dropped.clone()));
+        assert_eq!(app.textarea.lines(), [format!("/ingest {dropped}")]);
+        assert_eq!(app.messages.len(), before);
+        app.submit_message();
+        assert_eq!(last(&app).kind, MessageKind::Upload);
+        settle(&mut app).await;
+
+        // A write prompt takes keys only; a paste does not answer or queue.
+        app.clear_input();
+        app.handle_slash_command("/sql CREATE TABLE t AS SELECT 1 AS a");
+        db_settle(&mut app).await;
+        assert!(app.awaiting_permission());
+        let before = app.messages.len();
+        app.handle_terminal_event(&Event::Paste(dropped));
+        assert_eq!(app.messages.len(), before);
+        assert!(app.textarea.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

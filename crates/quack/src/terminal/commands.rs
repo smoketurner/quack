@@ -50,7 +50,7 @@ pub(crate) enum SlashCommand {
         #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "TABLE")]
         table: String,
     },
-    /// Load a file (a bare path typed at the prompt does the same)
+    /// Load a file (a path typed at the prompt or a file dropped on the terminal does the same)
     #[command(name = "/ingest", visible_alias = "/attach", disable_help_flag = true)]
     Ingest {
         #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "PATH")]
@@ -304,8 +304,8 @@ fn takes_verbatim(command: &Command) -> bool {
 pub(crate) enum Input {
     /// A `/` command.
     Command(String),
-    /// A path to a file quack can load.
-    File(PathBuf),
+    /// Paths to files quack can load.
+    Files(Vec<PathBuf>),
     /// A statement to run as typed.
     Sql(String),
     /// A question for the agent.
@@ -314,10 +314,11 @@ pub(crate) enum Input {
 
 impl Input {
     pub(crate) fn classify(line: String) -> Self {
-        if line.starts_with('/') {
+        // Files first: an absolute path starts with `/` like a command.
+        if let Some(paths) = Self::files(&line) {
+            Self::Files(paths)
+        } else if line.starts_with('/') {
             Self::Command(line)
-        } else if let Some(path) = Self::file(&line) {
-            Self::File(path)
         } else if looks_like_direct_sql(&line) {
             Self::Sql(line)
         } else {
@@ -325,18 +326,28 @@ impl Input {
         }
     }
 
-    /// The file `text` names, when it is one quack can load: quoted or
-    /// not, `~/` for the home directory, relative to the working directory
-    /// otherwise.
-    pub(crate) fn file(text: &str) -> Option<PathBuf> {
-        let cleaned = text.trim().trim_matches('\'').trim_matches('"');
-        if cleaned.is_empty() || cleaned.contains('\n') {
-            return None;
+    /// The files `text` names, when all of it is files quack can load: one
+    /// path as typed, quoted or not, or the shell-quoted paths a terminal
+    /// writes for files dropped on it.
+    pub(crate) fn files(text: &str) -> Option<Vec<PathBuf>> {
+        let text = text.trim();
+        if let Some(path) = Self::file(text.trim_matches('\'').trim_matches('"')) {
+            return Some(vec![path]);
         }
-        FileType::of(cleaned)?;
-        let path = match cleaned.strip_prefix("~/") {
+        let paths: Vec<PathBuf> = shlex::split(text)?
+            .iter()
+            .map(|word| Self::file(word))
+            .collect::<Option<_>>()?;
+        (!paths.is_empty()).then_some(paths)
+    }
+
+    /// `name` as a path, when it is a file quack can load: `~/` for the
+    /// home directory, relative to the working directory otherwise.
+    fn file(name: &str) -> Option<PathBuf> {
+        FileType::of(name)?;
+        let path = match name.strip_prefix("~/") {
             Some(under_home) => dirs::home_dir()?.join(under_home),
-            None => PathBuf::from(cleaned),
+            None => PathBuf::from(name),
         };
         path.is_file().then_some(path)
     }
@@ -961,7 +972,10 @@ mod tests {
             Input::classify(String::from("/tables")),
             Input::Command(String::from("/tables"))
         );
-        assert_eq!(Input::classify(format!("'{path}'")), Input::File(file));
+        assert_eq!(
+            Input::classify(format!("'{path}'")),
+            Input::Files(vec![file.clone()])
+        );
         assert_eq!(
             Input::classify(String::from("SELECT 1")),
             Input::Sql(String::from("SELECT 1"))
@@ -970,6 +984,31 @@ mod tests {
             Input::classify(String::from("what is in notes.md")),
             Input::Question(String::from("what is in notes.md"))
         );
-        assert!(Input::file("/nowhere/notes.md").is_none());
+        assert!(Input::files("/nowhere/notes.md").is_none());
+        assert!(Input::files("").is_none());
+
+        // A dropped file arrives shell-quoted: spaces escaped or the path
+        // in quotes, several files on one line.
+        let spaced = dir.path().join("q3 review (final).md");
+        std::fs::write(&spaced, "# hi").unwrap_or_else(|e| fail(&e.to_string()));
+        let literal = spaced.display().to_string();
+        let escaped = literal
+            .replace(' ', "\\ ")
+            .replace('(', "\\(")
+            .replace(')', "\\)");
+        for line in [literal.clone(), escaped.clone(), format!("\"{literal}\"")] {
+            assert_eq!(
+                Input::classify(line.clone()),
+                Input::Files(vec![spaced.clone()]),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            Input::files(&format!("{escaped} '{path}'\n")),
+            Some(vec![spaced, file])
+        );
+        // One name that is not a file makes the whole line something else.
+        assert!(Input::files(&format!("{escaped} /nowhere/notes.md")).is_none());
+        assert!(Input::files(&format!("summarize {escaped}")).is_none());
     }
 }

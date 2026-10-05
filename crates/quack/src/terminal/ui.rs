@@ -562,6 +562,7 @@ impl Message {
             MessageKind::Step => ("   ", Style::default().fg(Color::Yellow)),
             MessageKind::Sql => ("   ", Style::default().fg(Color::White)),
             MessageKind::System => ("   ", Style::default().fg(Color::DarkGray)),
+            MessageKind::Upload => (" \u{2191} ", Style::default().fg(Color::Green)),
             MessageKind::Error => ("   ", Style::default().fg(Color::Red)),
         };
         let prompt_style = if self.kind == MessageKind::User {
@@ -574,7 +575,11 @@ impl Message {
         let body: Vec<Vec<Span<'static>>> = match self.kind {
             MessageKind::Assistant => markdown::render(&self.content),
             MessageKind::Step => self.step_rows(expand_steps, style),
-            MessageKind::User | MessageKind::Sql | MessageKind::System | MessageKind::Error => self
+            MessageKind::User
+            | MessageKind::Sql
+            | MessageKind::System
+            | MessageKind::Upload
+            | MessageKind::Error => self
                 .content
                 .lines()
                 .map(|l| vec![Span::styled(l.to_owned(), style)])
