@@ -298,8 +298,8 @@ fn takes_verbatim(command: &Command) -> bool {
 pub(crate) enum Input {
     /// A `/` command.
     Command(String),
-    /// Paths to files quack can load.
-    Files(Vec<PathBuf>),
+    /// A line of names of files quack can load.
+    Files(FileLine),
     /// A statement to run as typed.
     Sql(String),
     /// A question for the agent.
@@ -309,8 +309,8 @@ pub(crate) enum Input {
 impl Input {
     pub(crate) fn classify(line: String) -> Self {
         // Files first: an absolute path starts with `/` like a command.
-        if let Some(paths) = Self::files(&line) {
-            Self::Files(paths)
+        if let Some(files) = FileLine::of(&line) {
+            Self::Files(files)
         } else if line.starts_with('/') {
             Self::Command(line)
         } else if looks_like_direct_sql(&line) {
@@ -319,20 +319,47 @@ impl Input {
             Self::Question(line)
         }
     }
+}
 
-    /// The files `text` names, when all of it is files quack can load: one
-    /// path as typed, quoted or not, or the shell-quoted paths a terminal
+/// A line that names only files quack can load.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FileLine {
+    /// Every name on it, as paths.
+    Files(Vec<PathBuf>),
+    /// Its names end at a word starting with `#`, which the shell split
+    /// reads as a comment: loading the names before it would leave files
+    /// out without saying so.
+    Comment,
+}
+
+impl FileLine {
+    pub(crate) const COMMENT: &str = "a name starting with # reads as a comment, so it and the                                       names after it would be left out; nothing was loaded.                                       Write it as ./#name or in quotes";
+
+    /// `text` as files, when all of it is files quack can load: one path
+    /// as typed, quoted or not, or the shell-quoted paths a terminal
     /// writes for files dropped on it.
-    pub(crate) fn files(text: &str) -> Option<Vec<PathBuf>> {
+    pub(crate) fn of(text: &str) -> Option<Self> {
         let text = text.trim();
         if let Some(path) = Self::file(text.trim_matches('\'').trim_matches('"')) {
-            return Some(vec![path]);
+            return Some(Self::Files(vec![path]));
         }
-        let paths: Vec<PathBuf> = shlex::split(text)?
+        let words = shlex::split(text)?;
+        let paths: Vec<PathBuf> = words
             .iter()
             .map(|word| Self::file(word))
             .collect::<Option<_>>()?;
-        (!paths.is_empty()).then_some(paths)
+        if paths.is_empty() {
+            return None;
+        }
+        // `#` opens a comment only where a word starts, so the line with
+        // every `#` made an ordinary character splits into more words
+        // exactly when a comment was dropped from it.
+        let whole = shlex::split(&text.replace('#', "x"));
+        Some(if whole.is_some_and(|all| all.len() == words.len()) {
+            Self::Files(paths)
+        } else {
+            Self::Comment
+        })
     }
 
     /// `name` as a path, when it is a file quack can load: `~/` for the
@@ -965,7 +992,7 @@ mod tests {
         );
         assert_eq!(
             Input::classify(format!("'{path}'")),
-            Input::Files(vec![file.clone()])
+            Input::Files(FileLine::Files(vec![file.clone()]))
         );
         assert_eq!(
             Input::classify(String::from("SELECT 1")),
@@ -975,8 +1002,8 @@ mod tests {
             Input::classify(String::from("what is in notes.md")),
             Input::Question(String::from("what is in notes.md"))
         );
-        assert!(Input::files("/nowhere/notes.md").is_none());
-        assert!(Input::files("").is_none());
+        assert!(FileLine::of("/nowhere/notes.md").is_none());
+        assert!(FileLine::of("").is_none());
 
         // A dropped file arrives shell-quoted: spaces escaped or the path
         // in quotes, several files on one line.
@@ -990,16 +1017,43 @@ mod tests {
         for line in [literal.clone(), escaped.clone(), format!("\"{literal}\"")] {
             assert_eq!(
                 Input::classify(line.clone()),
-                Input::Files(vec![spaced.clone()]),
+                Input::Files(FileLine::Files(vec![spaced.clone()])),
                 "{line}"
             );
         }
         assert_eq!(
-            Input::files(&format!("{escaped} '{path}'\n")),
-            Some(vec![spaced, file])
+            FileLine::of(&format!("{escaped} '{path}'\n")),
+            Some(FileLine::Files(vec![spaced, file.clone()]))
         );
         // One name that is not a file makes the whole line something else.
-        assert!(Input::files(&format!("{escaped} /nowhere/notes.md")).is_none());
-        assert!(Input::files(&format!("summarize {escaped}")).is_none());
+        assert!(FileLine::of(&format!("{escaped} /nowhere/notes.md")).is_none());
+        assert!(FileLine::of(&format!("summarize {escaped}")).is_none());
+
+        // A `#` inside a name is part of it, alone or among several.
+        let hashed = dir.path().join("#drafts.md");
+        std::fs::write(&hashed, "# hi").unwrap_or_else(|e| fail(&e.to_string()));
+        let hash_path = hashed.display().to_string();
+        assert_eq!(
+            FileLine::of(&format!("{path} {hash_path}")),
+            Some(FileLine::Files(vec![file, hashed]))
+        );
+        // A word that starts with `#` ends the names the split returns:
+        // the line is refused whole, whatever follows the `#`.
+        for cut in [
+            String::from("#drafts.md"),
+            String::from("#drafts.md 'more.md"),
+            String::from("#"),
+            format!("'{hash_path}' #more.md"),
+        ] {
+            assert_eq!(
+                FileLine::of(&format!("{path} {cut}")),
+                Some(FileLine::Comment),
+                "{cut}"
+            );
+        }
+        // Quoted, it is a name again: no such file here, so not a file line.
+        assert!(FileLine::of(&format!("{path} '#drafts.md'")).is_none());
+        // A question that mentions a file and a `#` word stays a question.
+        assert!(FileLine::of(&format!("summarize {path} #urgent")).is_none());
     }
 }

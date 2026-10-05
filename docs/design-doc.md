@@ -1798,7 +1798,8 @@ what is being approved. Input starting with `SELECT`/`WITH`/`FROM`/
 cannot parse ("show me the first rows") is asked as a question when a chat model is set,
 with a note saying so, and `/sql` always runs its line as a statement. Direct SQL and `/sql` pass the agent's
 gate: internal tables refused, writes ask `y`/`n`/`a`, `max_query_rows` rows shown. A line that
-is the path of a loadable file (or several, shell-quoted) is loaded. The session turns on
+is the path of a loadable file (or several, shell-quoted) is loaded; several names cut short
+by a word starting with `#`, which the shell split reads as a comment, are refused whole. The session turns on
 bracketed paste, so a file dropped on the terminal arrives as one paste of its path: into
 an empty input it loads at once, announced on a green `↑` line with its job number, and
 into text already typed it is inserted like any other paste.

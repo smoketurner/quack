@@ -54,7 +54,9 @@ use crate::graph_cli::{self, GraphAction};
 use crate::ontology_cli::{self, OntologyAction};
 use crate::terminal::SessionSetup;
 use crate::terminal::chart::ChartData;
-use crate::terminal::commands::{Completion, ContextAction, GraphWalk, Input, Route, SlashCommand};
+use crate::terminal::commands::{
+    Completion, ContextAction, FileLine, GraphWalk, Input, Route, SlashCommand,
+};
 use crate::terminal::picker::{Picked, Picker};
 use crate::terminal::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
 
@@ -1141,10 +1143,10 @@ impl App {
             return;
         }
         if self.textarea.is_empty()
-            && let Some(paths) = Input::files(text)
+            && let Some(FileLine::Files(paths)) = FileLine::of(text)
         {
             self.scroll = Scroll::Latest;
-            self.load_files(paths);
+            self.load_files(FileLine::Files(paths));
             return;
         }
         // Terminals paste a line break as a bare carriage return.
@@ -1154,9 +1156,14 @@ impl App {
         self.history.leave();
     }
 
-    fn load_files(&mut self, paths: Vec<PathBuf>) {
-        for path in paths {
-            self.run_job(CliJob::Ingest(path));
+    fn load_files(&mut self, files: FileLine) {
+        match files {
+            FileLine::Files(paths) => {
+                for path in paths {
+                    self.run_job(CliJob::Ingest(path));
+                }
+            }
+            FileLine::Comment => self.note(MessageKind::Error, FileLine::COMMENT),
         }
     }
 
@@ -1897,8 +1904,8 @@ impl App {
             SlashCommand::Unpin { id } => self.set_pinned(id, Pinning::Unpinned),
             SlashCommand::Tables => self.show_tables(),
             SlashCommand::Schema { table } => self.show_schema(table),
-            SlashCommand::Ingest { path } => match Input::files(&path) {
-                Some(paths) => self.load_files(paths),
+            SlashCommand::Ingest { path } => match FileLine::of(&path) {
+                Some(files) => self.load_files(files),
                 None => self.note(
                     MessageKind::Error,
                     format!("'{path}' is not a file quack can ingest"),
@@ -3430,6 +3437,19 @@ mod tests {
         app.submit_message();
         assert_eq!(last(&app).kind, MessageKind::Upload);
         settle(&mut app).await;
+
+        // Names cut short by a word starting with `#` load nothing, typed
+        // as a line or after /ingest, and the error says why.
+        for line in [
+            format!("{dropped} #drafts.md"),
+            format!("/ingest {dropped} #drafts.md"),
+        ] {
+            let before = app.messages.len();
+            app.submit_text(line);
+            assert_eq!(app.messages.len(), before + 1);
+            assert_eq!(last(&app).kind, MessageKind::Error);
+            assert_eq!(last(&app).content, FileLine::COMMENT);
+        }
 
         // A write prompt takes keys only; a paste does not answer or queue.
         app.clear_input();
