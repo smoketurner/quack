@@ -404,10 +404,12 @@ async fn embedding_batch_size_bounds_every_embed_request() {
     .ingested()
     .unwrap();
 
-    // One report per stored batch, counting chunks, ending at all of them.
+    // The total with nothing done, then one report per stored batch,
+    // counting chunks, ending at all of them.
     let reported = reported.into_inner().unwrap();
     let batch_count = model.model().batches.lock().unwrap().len();
-    assert_eq!(reported.len(), batch_count, "{reported:?}");
+    assert_eq!(reported.len(), batch_count + 1, "{reported:?}");
+    assert_eq!(reported.first().copied(), Some((0, result.chunks_stored)));
     assert!(reported.is_sorted_by(|a, b| a.0 < b.0), "{reported:?}");
     assert_eq!(
         reported.last().copied(),
