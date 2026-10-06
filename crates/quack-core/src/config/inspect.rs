@@ -425,6 +425,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "max_nodes",
             "merge_threshold",
             "auto_merge_threshold",
+            "follow_ingest",
         ],
     ),
     (
@@ -928,6 +929,12 @@ fn graph(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "auto_merge_threshold",
         graph.auto_merge_threshold,
         default.auto_merge_threshold,
+    );
+    s.text(
+        "follow_ingest",
+        graph.follow_ingest.as_str(),
+        default.follow_ingest.as_str(),
+        None,
     );
 }
 

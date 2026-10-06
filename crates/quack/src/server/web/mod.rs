@@ -27,7 +27,7 @@ use jiff::tz::TimeZone;
 use axum_extra::extract::Form as MultiForm;
 use quack_core::analysis::events::ToolStep;
 use quack_core::ids::{
-    CandidateId, ClassId, DocumentId, NodeId, RelationId, SessionId, UserId, WorkspaceId,
+    CandidateId, ClassId, DocumentId, EdgeId, NodeId, RelationId, SessionId, UserId, WorkspaceId,
 };
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::induction::{ItemKind, Proposal};
@@ -43,7 +43,7 @@ use quack_core::storage::control::{
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{
     ChunkSearchResult, DocumentInfo, DocumentSource, DocumentStatus, Pinning, ResultSort,
-    SamplePool, SortDirection, TableDescription,
+    SortDirection, TableDescription,
 };
 use rust_embed::Embed;
 use serde::Deserialize;
@@ -67,17 +67,18 @@ use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, passwo
 use super::error::ApiError;
 use super::oidc::Oidc;
 use super::state::{App, ServeMode};
+use crate::graph_cli;
 use quack_core::analysis::tools::{FindPathArgs, NonBlank, SearchGraphArgs};
 use quack_core::config::{GraphConfig, OidcConfig};
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery};
 use quack_core::graph::resolve::MergeDecision;
-use quack_core::graph::store::Revalidation;
+use quack_core::graph::store::{Keep, NodeEdit, Revalidation};
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    ExtractSource, GraphResult, GraphStatus, Origin, Standing as GraphStanding, resolve,
-    store as graph_store,
+    ExtractSource, GraphResult, GraphStatus, Origin, Properties, Standing as GraphStanding,
+    resolve, store as graph_store,
 };
 use quack_core::import::ImportRequest;
 use quack_core::jobs::JobNumber;
@@ -761,6 +762,7 @@ struct GraphNodeView {
 }
 
 struct GraphEdgeView {
+    id: EdgeId,
     source: String,
     relation: RelationId,
     target: String,
@@ -793,7 +795,6 @@ struct GraphPage {
     status: GraphStatus,
     drift: Vec<String>,
     has_ontology: bool,
-    chunk_count: usize,
     /// What revalidating a stale graph would drop, or why that could not
     /// be counted.
     revalidation: Option<Result<Revalidation, String>>,
@@ -906,6 +907,11 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/graph/revalidate", post(graph_revalidate))
         .route("/w/{id}/graph/review", post(graph_review))
         .route("/w/{id}/graph/merges/{mid}", post(graph_merge_decide))
+        .route("/w/{id}/graph/nodes", post(graph_node_add))
+        .route("/w/{id}/graph/nodes/{nid}", post(graph_node_edit))
+        .route("/w/{id}/graph/nodes/{nid}/delete", post(graph_node_delete))
+        .route("/w/{id}/graph/edges", post(graph_edge_add))
+        .route("/w/{id}/graph/edges/{eid}/delete", post(graph_edge_delete))
         .route("/w/{id}/settings", get(settings).post(settings_save))
         .route("/w/{id}/members", post(member_add))
         .route("/w/{id}/members/{user}/remove", post(member_remove))
@@ -1606,7 +1612,14 @@ async fn import_submit(
     let request = ImportRequest::from(form);
     Ok(
         match import_api::run_import(&app, &access, &request).await {
-            Ok(summary) => Flash::to(format!("/w/{id}/tables")).opening(summary.table),
+            Ok(imported) => match imported.graph_job {
+                Some(job) => Flash::notice(
+                    format!("/w/{id}/tables"),
+                    format!("imported; graph follow-up queued as job {job}"),
+                )
+                .opening(imported.summary.table),
+                None => Flash::to(format!("/w/{id}/tables")).opening(imported.summary.table),
+            },
             Err(e) => Flash::error(format!("/w/{id}/tables"), e.message),
         }
         .into_response(),
@@ -2512,7 +2525,6 @@ async fn render_graph(
         status,
         drift,
         has_ontology: data.has_ontology,
-        chunk_count: data.chunk_count,
         revalidation: data
             .revalidation
             .map(|preview| preview.map_err(|e| e.to_string())),
@@ -2588,8 +2600,6 @@ impl GraphAsk {
 struct GraphPageData {
     status: GraphStatus,
     has_ontology: bool,
-    /// Chunks not yet sent to extraction.
-    chunk_count: usize,
     /// What revalidating would drop, or why that could not be counted;
     /// read only while the graph is stale.
     revalidation: Option<CoreResult<Revalidation>>,
@@ -2608,15 +2618,12 @@ impl GraphPageData {
     fn read(db: &WorkspaceDb, ask: &GraphAsk, options: &GraphConfig) -> CoreResult<Self> {
         let status = graph_store::status(db)?;
         let ontology = ontology_store::current(db)?;
-        let chunk_count =
-            usize::try_from(db.pool_size(SamplePool::NotGraphExtracted)?).unwrap_or(0);
         let revalidation = status.stale.then(|| Revalidation::preview(db));
         let merges = resolve::pending(db)?;
         let result = ask.run(db, options);
         Ok(Self {
             status,
             has_ontology: ontology.is_some(),
-            chunk_count,
             revalidation,
             merges,
             result,
@@ -2644,6 +2651,7 @@ impl GraphResultView {
                     Origin::Chunk {
                         document_id: None, ..
                     } => String::from("unknown"),
+                    Origin::Manual { .. } => p.origin.assertion().unwrap_or_default(),
                 })
                 .collect();
             items.sort();
@@ -2678,6 +2686,7 @@ impl GraphResultView {
             .edges
             .iter()
             .map(|e| GraphEdgeView {
+                id: e.id.clone(),
                 source: label_of(&e.source_node_id),
                 relation: e.relation_id.clone(),
                 target: label_of(&e.target_node_id),
@@ -2700,6 +2709,8 @@ struct ExtractForm {
     sample: Option<String>,
     #[serde(default)]
     reset: bool,
+    #[serde(default)]
+    all: bool,
 }
 
 async fn graph_extract(
@@ -2719,7 +2730,11 @@ async fn graph_extract(
             &graph_api::ExtractionPlan {
                 source: form.source.unwrap_or_default(),
                 sample,
-                reset: form.reset,
+                reset: form.reset.then_some(if form.all {
+                    Keep::Nothing
+                } else {
+                    Keep::Asserted
+                }),
             },
         )
         .await;
@@ -2784,4 +2799,180 @@ async fn graph_merge_decide(
     };
     let decided = access.decide_merge(&app, &mid, decision).await;
     Ok(Flash::after(back, decided, |_| None).into_response())
+}
+
+/// The graph page's add-node form.
+#[derive(Deserialize)]
+struct NodeForm {
+    label: String,
+    class: String,
+    /// `KEY=VALUE` lines.
+    #[serde(default)]
+    properties: String,
+    #[serde(default, deserialize_with = "blank_as_none")]
+    note: Option<String>,
+}
+
+/// The graph page's edit form for one node: blank fields stay as they
+/// are; a `KEY=` line with no value removes that property.
+#[derive(Deserialize)]
+struct NodeEditForm {
+    #[serde(default, deserialize_with = "blank_as_none")]
+    label: Option<String>,
+    #[serde(default, deserialize_with = "blank_as_none")]
+    class: Option<String>,
+    #[serde(default)]
+    properties: String,
+    #[serde(default, deserialize_with = "blank_as_none")]
+    note: Option<String>,
+}
+
+/// The graph page's add-edge form: nodes by id, as the inspector lists them.
+#[derive(Deserialize)]
+struct EdgeForm {
+    source: String,
+    target: String,
+    relation: String,
+    #[serde(default, deserialize_with = "blank_as_none")]
+    note: Option<String>,
+}
+
+/// `KEY=VALUE` lines as a property patch: an empty value is `null`, which
+/// removes the key on an edit.
+fn property_lines(text: &str) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let mut patch =
+        graph_cli::parse_properties(&lines).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    for value in patch.values_mut() {
+        if value.as_str().is_some_and(str::is_empty) {
+            *value = serde_json::Value::Null;
+        }
+    }
+    Ok(patch)
+}
+
+async fn graph_node_add(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(form): Form<NodeForm>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let back = format!("/w/{id}/graph");
+    let properties = match property_lines(&form.properties) {
+        Ok(patch) => Properties::from(patch),
+        Err(e) => return Ok(Flash::error(back, e.message).into_response()),
+    };
+    let added = access
+        .create_node(
+            &app,
+            graph_api::CreateNode {
+                label: form.label,
+                class: ClassId::from(form.class),
+                properties,
+                note: form.note,
+            },
+        )
+        .await;
+    Ok(Flash::after(back, added, |added| {
+        Some(if added.created {
+            format!("added {}", added.subject)
+        } else {
+            format!("{} was already in the graph; asserted", added.subject)
+        })
+    })
+    .into_response())
+}
+
+async fn graph_node_edit(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, nid)): Path<(WorkspaceId, NodeId)>,
+    Form(form): Form<NodeEditForm>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let back = format!("/w/{id}/graph");
+    let patch = match property_lines(&form.properties) {
+        Ok(patch) => patch,
+        Err(e) => return Ok(Flash::error(back, e.message).into_response()),
+    };
+    let edit = NodeEdit {
+        label: form.label,
+        class: form.class.map(ClassId::from),
+        properties: (!patch.is_empty()).then_some(patch),
+    };
+    let updated = access
+        .update_node(
+            &app,
+            &nid,
+            graph_api::UpdateNode {
+                edit,
+                note: form.note,
+            },
+        )
+        .await;
+    Ok(Flash::after(back, updated, |node| Some(format!("updated {node}"))).into_response())
+}
+
+async fn graph_node_delete(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, nid)): Path<(WorkspaceId, NodeId)>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let deleted = access.delete_node(&app, &nid).await;
+    Ok(Flash::after(format!("/w/{id}/graph"), deleted, |node| {
+        Some(format!("deleted {node} and its edges"))
+    })
+    .into_response())
+}
+
+async fn graph_edge_add(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(form): Form<EdgeForm>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let added = access
+        .create_edge(
+            &app,
+            graph_api::CreateEdge {
+                source: NodeId::from(form.source.trim()),
+                target: NodeId::from(form.target.trim()),
+                relation: RelationId::from(form.relation.trim()),
+                properties: Properties::default(),
+                note: form.note,
+            },
+        )
+        .await;
+    Ok(Flash::after(format!("/w/{id}/graph"), added, |added| {
+        Some(if added.created {
+            format!("added the {} edge", added.subject.relation_id)
+        } else {
+            format!(
+                "the {} edge was already there; asserted",
+                added.subject.relation_id
+            )
+        })
+    })
+    .into_response())
+}
+
+async fn graph_edge_delete(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, eid)): Path<(WorkspaceId, EdgeId)>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let deleted = access.delete_edge(&app, &eid).await;
+    Ok(Flash::after(format!("/w/{id}/graph"), deleted, |edge| {
+        Some(format!("deleted the {} edge", edge.relation_id))
+    })
+    .into_response())
 }

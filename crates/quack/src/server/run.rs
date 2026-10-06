@@ -7,12 +7,18 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use std::time::Duration;
+
+use quack_core::analysis::tools::SharedDb;
 use quack_core::embedding::refresh;
 use quack_core::graph::extract;
+use quack_core::graph::follow_up::{self, FollowUpSummary};
 use quack_core::graph::resolve::ResolutionSummary;
-use quack_core::ids::RunId;
+use quack_core::ids::{DocumentId, RunId};
 use quack_core::jobs::{JobContext, JobId, JobKind, JobSpec, Lane, LaneKey};
-use quack_core::ontology::documents;
+use quack_core::llm::Embeddings;
+use quack_core::ontology::{documents, store as ontology_store};
+use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde_json::Value;
 
@@ -42,6 +48,13 @@ impl RunKind {
         action: AuditAction::GraphExtract,
         resource: ResourceKind::GraphRun,
         label: "graph extraction",
+    };
+    /// The extraction that follows an ingest under `[graph].follow_ingest`.
+    pub(crate) const FOLLOW_UP: Self = Self {
+        job: JobKind::Graph,
+        action: AuditAction::GraphExtract,
+        resource: ResourceKind::GraphRun,
+        label: "graph follow-up",
     };
     pub(crate) const ONTOLOGY: Self = Self {
         job: JobKind::Ontology,
@@ -87,6 +100,16 @@ impl RunReport for GraphReport {
             "{} nodes, {} edges from {} chunks",
             self.summary.nodes, self.summary.edges, self.summary.chunks
         )
+    }
+}
+
+impl RunReport for FollowUpSummary {
+    fn detail(&self) -> Value {
+        serde_json::json!({ "summary": self })
+    }
+
+    fn message(&self) -> String {
+        self.to_string()
     }
 }
 
@@ -214,4 +237,75 @@ impl BackgroundRun {
             tracing::error!(run = %self.id, kind = self.kind.label, error = %e.message, "audit write failed at the end of a background run");
         }
     }
+}
+
+/// How many seconds a follow-up waits for the workspace's extraction slot
+/// before giving up: a request-time table extraction holds it briefly.
+const SLOT_WAIT_SECONDS: u32 = 60;
+
+/// Queue the graph extraction that follows `documents` becoming ready,
+/// when `[graph].follow_ingest` asks for one: an audited background run
+/// in the workspace's graph lane, so it waits behind an extraction in
+/// progress. `None` when nothing follows.
+pub(crate) async fn follow_ingest(
+    app: &App,
+    access: &Access,
+    db: SharedDb,
+    embedder: Option<Embeddings>,
+    documents: Vec<DocumentId>,
+) -> ApiResult<Option<JobId>> {
+    if app.config.graph.follow_ingest.is_off() || documents.is_empty() {
+        return Ok(None);
+    }
+    // Nothing to extract into without an ontology: no run, no audit rows.
+    let workspace_id = access.membership.workspace.id.clone();
+    if app
+        .read(&workspace_id, ontology_store::latest_version)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let run = BackgroundRun::start(
+        app,
+        access,
+        RunKind::FOLLOW_UP,
+        serde_json::json!({
+            "documents": documents,
+            "follow_ingest": app.config.graph.follow_ingest.as_str(),
+        }),
+    )
+    .await?;
+    let app = Arc::clone(app);
+    let job = run.submit(move |ctx| async move {
+        let mut slot = None;
+        for _ in 0..SLOT_WAIT_SECONDS {
+            slot = app.begin_extraction(&workspace_id);
+            if slot.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let Some(slot) = slot else {
+            return Err(String::from(
+                "a graph extraction is still running for this workspace; run `graph extract` later",
+            ));
+        };
+        let progress = |done: ChunkDone| ctx.progress(done.done, done.total);
+        let cancel = ctx.cancel_token();
+        let control = RunControl {
+            progress: &progress,
+            cancel: Some(&cancel),
+        };
+        let outcome =
+            follow_up::after_documents(&db, &app.config, embedder.as_ref(), &documents, control)
+                .await;
+        drop(slot);
+        match outcome {
+            Ok(Some(summary)) => Ok(summary),
+            Ok(None) => Ok(FollowUpSummary::default()),
+            Err(e) => Err(e.to_string()),
+        }
+    });
+    Ok(Some(job))
 }
