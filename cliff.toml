@@ -25,9 +25,12 @@ body = """
 {%- endfor %}
 {% endfor %}
 """
-# The file ends with a newline, as the end-of-file hook requires.
 footer = "\n"
 trim = true
+# The file ends with exactly one newline, as the end-of-file hook requires.
+postprocessors = [
+  { pattern = '\n+\z', replace = "\n" },
+]
 
 [git]
 # A squash merge's subject ends in "(#N)": link it to the pull request.

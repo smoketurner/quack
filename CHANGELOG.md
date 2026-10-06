@@ -25,6 +25,10 @@ needs (config keys, schema moves, `quack embeddings refresh`) are in
 ### Documentation
 
 - Upgrade notes, contributor setup and recipes, review documents, rustdoc gate
+
+### Build and CI
+
+- **cliff:** End the changelog with a newline
 ## v2026.10.3 (2026-10-05)
 
 ### Features
