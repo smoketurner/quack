@@ -720,7 +720,15 @@ the query text, in `_quack_audit`.
 
 `quack audit` filters by user, workspace, action, outcome, and time range, prints
 `--format text`, `json` (NDJSON), `csv`, or `ocsf`, and follows pages itself (`--limit 0`
-reads the whole log). `GET /api/v1/admin/audit` takes the same filters and `?format=ocsf`,
+reads the whole log). `quack audit -w ws --detail --format ocsf` opens the workspace file
+and joins each `_quack_audit` detail row to its access row by the shared id
+(`AuditRow::to_ocsf_with_detail`), as `GET /api/v1/workspaces/{id}/audit?format=ocsf`
+does for members: a query event then carries the `ai_operation` profile, `ai_model`
+(the provider and model that answered, which the query detail records beside the prompt
+and the steps), the tool calls with their durations under `unmapped.ai.tools`, and the
+documents and chunks the answer cited as resources; any other action's detail rides under
+`unmapped.detail`. The question's text goes in only with `--with-prompt` or `?prompt=true`,
+since it is workspace content. `GET /api/v1/admin/audit` takes the same filters and `?format=ocsf`,
 caps `limit` at 1000 a page, and answers JSON with a `next_cursor` for the same filter
 (`null` on the last page). Pages are keyset on `(timestamp, id)`, newest first, so rows
 appended mid-paging never shift what is left to read. `ocsf` renders each row as an OCSF
@@ -2485,6 +2493,13 @@ installers.
   uploads, grants write, edits the context and ontology, and runs proposals and extraction.
   `owner` manages members and tokens and sees all sessions. `is_admin` manages users and all
   workspaces but is not thereby a member of any; reading content requires membership.
+- **An admin's self-grant is marked.** `Need::OWN` lets a server admin without membership
+  manage a workspace's members, so an admin can add themself. That grant must carry a
+  non-empty `reason` (400 without it; the Settings form has the field), its access row is
+  `break_glass` rather than `member` (OCSF: a Create at severity Medium), and its detail
+  records the role, the reason, and `"acting_as": "admin"`. Every other membership change
+  records the role in its detail. Whether a self-grant should also expire or be refused
+  outright is an operator choice left for a later migration.
 - **Audit is split at the boundary, and the access half is mandatory.**
   - Every request touching a workspace, allowed or denied, writes a `control.db.audit_log`
     row (section 5.5): who, workspace, resource by opaque id, action, outcome, channel,
@@ -2828,7 +2843,9 @@ the air-gapped static binary, which loads no extensions.
 `cargo fmt --check`, clippy with `-D warnings` over all targets and features, and
 `cargo test --locked --workspace` on Linux and macOS, plus dependency review and cargo-deny.
 Coverage (`make test-coverage`, `cargo llvm-cov`) and mutation testing (`make test-mutants`,
-the whole workspace) are local-only and not wired into a release. There is no fuzzing.
+the whole workspace) are local-only and not wired into a release. Every file parser and
+the chunker are fuzzed nightly (`fuzz/`, `docs/ci-cd.md`), and `cargo deny check` runs
+weekly on its own.
 
 **Evaluation.** `make eval` (`crates/quack-core/examples/eval.rs`, issue #74) measures
 answer quality. It ingests an in-tree storms-like fixture (`crates/quack-core/eval/`: 27

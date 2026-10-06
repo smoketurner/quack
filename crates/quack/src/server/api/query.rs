@@ -53,6 +53,8 @@ struct PreparedTurn {
     session_id: SessionId,
     policy: WritePolicy,
     prompt: String,
+    /// The chat model's provider and id.
+    model: (String, String),
 }
 
 impl PreparedTurn {
@@ -82,6 +84,7 @@ impl PreparedTurn {
             return Err(ApiError::bad_request("prompt must not be empty"));
         }
         let chat = app.config.chat_model_ref()?;
+        let model_names = (chat.provider_name.to_string(), chat.model.to_owned());
         let mode = body.mode;
         let db = app.workspace_db(workspace_id).await?;
         let reader = app.reader_db(workspace_id).await?;
@@ -117,6 +120,7 @@ impl PreparedTurn {
             session_id,
             policy,
             prompt: body.prompt.clone(),
+            model: model_names,
         })
     }
 
@@ -131,6 +135,7 @@ impl PreparedTurn {
             session_id,
             policy,
             prompt,
+            model,
         } = self;
         let (sink, events) = events::channel();
         let lane = LaneKey::Session(session_id.clone());
@@ -180,6 +185,7 @@ impl PreparedTurn {
             access,
             session_id,
             prompt,
+            model,
         }
     }
 }
@@ -208,6 +214,8 @@ struct Turn {
     access: Access,
     session_id: SessionId,
     prompt: String,
+    /// The chat model's provider and id, for the audit detail.
+    model: (String, String),
 }
 
 /// Whether a turn's stream has sent its `complete` or `error` event.
@@ -245,13 +253,17 @@ impl Turn {
     /// is removed, as print mode does, so the session list shows no empty
     /// entries.
     async fn record(&self, app: &App, end: TurnEnd<'_>) {
-        let (outcome, steps) = match end {
-            TurnEnd::Answered(response) => (Outcome::Allowed, response.steps.clone()),
+        let (outcome, steps, citations) = match end {
+            TurnEnd::Answered(response) => (
+                Outcome::Allowed,
+                response.steps.clone(),
+                response.citations.clone(),
+            ),
             TurnEnd::Failed(Some(TurnFailure {
                 kind: FailureKind::ProviderNotAllowed,
                 ..
-            })) => (Outcome::Denied, Vec::new()),
-            TurnEnd::Failed(_) => (Outcome::Error, Vec::new()),
+            })) => (Outcome::Denied, Vec::new(), Vec::new()),
+            TurnEnd::Failed(_) => (Outcome::Error, Vec::new(), Vec::new()),
         };
         if outcome != Outcome::Allowed
             && let Ok(db) = app.workspace_db(&self.access.membership.workspace.id).await
@@ -261,7 +273,32 @@ impl Turn {
                 tracing::warn!(error = %e.message, "could not remove the empty session");
             }
         }
-        let detail = serde_json::json!({ "prompt": self.prompt, "steps": steps });
+        // The model and the cited chunks beside the prompt and the steps:
+        // what the workspace's OCSF export renders as the `ai_operation`
+        // profile. Step rows are not kept here; the message has them.
+        let steps: Vec<serde_json::Value> = steps
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "tool": s.tool, "detail": s.detail, "summary": s.summary,
+                    "rows": s.rows, "duration_ms": s.duration_ms,
+                })
+            })
+            .collect();
+        let citations: Vec<serde_json::Value> = citations
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "document_id": c.document_id, "chunk_id": c.chunk_id, "chunk_index": c.chunk_index,
+                })
+            })
+            .collect();
+        let detail = serde_json::json!({
+            "prompt": self.prompt,
+            "model": { "provider": self.model.0, "name": self.model.1 },
+            "steps": steps,
+            "citations": citations,
+        });
         if let Err(e) = self
             .access
             .audit(

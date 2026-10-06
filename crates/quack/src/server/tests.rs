@@ -20,7 +20,7 @@ use quack_core::config::{
 };
 use quack_core::embedding::{Dimension, Vector};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
-use quack_core::ids::{ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
+use quack_core::ids::{AuditId, ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use quack_core::ingestion::parser::PageCounts;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -8181,4 +8181,126 @@ async fn sql_export_streams_every_row_and_refuses_writes() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(String::from_utf8_lossy(&bytes).lines().count(), 1001);
+}
+
+/// An admin who is not a member may add themself only with a reason; the
+/// grant is a `break_glass` row whose detail names the role, the reason,
+/// and that admin rights were used. Any other grant is a `member` row with
+/// the role in its detail.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admin_self_grant_needs_a_reason_and_is_marked_break_glass() {
+    let h = harness(ServeMode::Login).await;
+    let root_id = h.user("root", UserKind::Admin).await;
+    let owner_id = h.user("owner", UserKind::Standard).await;
+    h.user("vera", UserKind::Standard).await;
+    let ws = h.workspace("finance", &owner_id).await;
+    let root = h.login("root").await;
+    let owner = h.login("owner").await;
+    let members = format!("/api/v1/workspaces/{ws}/members");
+    let (status, body) = h
+        .post(
+            &members,
+            &root,
+            serde_json::json!({ "username": "root", "role": "owner" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reason"),
+        "{body}"
+    );
+    let (status, body) = h
+        .post(
+            &members,
+            &root,
+            serde_json::json!({ "username": "root", "role": "owner", "reason": "  " }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = h
+        .post(
+            &members,
+            &root,
+            serde_json::json!({ "username": "root", "role": "owner", "reason": "incident 42" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // An owner adding someone else needs no reason and is a plain member row.
+    let (status, body) = h
+        .post(
+            &members,
+            &owner,
+            serde_json::json!({ "username": "vera", "role": "viewer" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let glass = h
+        .audit(AuditFilter {
+            action: Some(String::from("break_glass")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(glass.len(), 1, "{glass:?}");
+    assert_eq!(glass[0].entry.user_id.as_ref(), Some(&root_id));
+    let details = h
+        .app
+        .read(&ws, |db| audit::list(db, 50))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let by_id = |id: &AuditId| {
+        details
+            .iter()
+            .find(|d| &d.id == id)
+            .and_then(|d| d.detail.clone())
+    };
+    let detail = by_id(&glass[0].entry.id).unwrap_or_default();
+    assert_eq!(detail["role"], "owner", "{detail}");
+    assert_eq!(detail["reason"], "incident 42");
+    assert_eq!(detail["acting_as"], "admin");
+    let member_rows = h
+        .audit(AuditFilter {
+            action: Some(String::from("member")),
+            workspace_id: Some(ws.clone()),
+            ..AuditFilter::default()
+        })
+        .await;
+    let plain = member_rows
+        .iter()
+        .find(|r| r.entry.user_id.as_ref() == Some(&owner_id))
+        .unwrap_or_else(|| fail("the owner's grant is audited"));
+    assert_eq!(by_id(&plain.entry.id).unwrap_or_default()["role"], "viewer");
+
+    // The workspace's OCSF export joins both halves: the self-grant is a
+    // Medium Create event, and a query event would carry the ai profile.
+    let (status, body) = h
+        .get(
+            &format!("/api/v1/workspaces/{ws}/audit?format=ocsf"),
+            &owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = body["audit"].as_array().cloned().unwrap_or_default();
+    let event = events
+        .iter()
+        .find(|e| e["api"]["operation"] == "break_glass")
+        .unwrap_or_else(|| fail("the break_glass event is exported"));
+    assert_eq!(event["severity_id"], 3, "{event}");
+    assert_eq!(
+        event["unmapped"]["detail"]["reason"], "incident 42",
+        "{event}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| e["class_uid"].is_number() && e["metadata"]["version"] == "1.9.0"),
+        "{body}"
+    );
+    let (status, _) = h
+        .get(&format!("/api/v1/workspaces/{ws}/audit?format=xml"), &owner)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
