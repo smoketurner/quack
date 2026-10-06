@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::inspect::SettingFilter;
-use quack_core::config::{Config, Grant};
+use quack_core::config::{Config, Grant, LogFormat};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
@@ -42,11 +42,13 @@ use quack_core::okf::{self, Bundle, DirSink, TarSink};
 use quack_core::ontology::store::Revision;
 use quack_core::prefix::PrefixMatch;
 use quack_core::progress::RunControl;
+use quack_core::proxy::Proxies;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, ResourceKind, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
 use quack_core::storage::workspace::{DocumentFields, Pinning, QueryResults, WorkspaceDb};
 use quack_core::storage::writer::Writer;
+use quack_core::vault::Vault;
 use quack_core::{config, doctor};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -209,6 +211,10 @@ enum Commands {
     /// Serve the REST API and web UI
     Serve(ServeArgs),
 
+    /// Ask a running `quack serve` whether it can serve (its /readyz), for
+    /// a container health check: exit 0 when ready, 1 otherwise
+    Ready(ReadyArgs),
+
     /// Serve the workspace as an MCP server over stdio (for Claude Code
     /// and editors); logs go to stderr
     Mcp(McpArgs),
@@ -251,6 +257,24 @@ enum Commands {
     /// without the model, each run saying whether the data changed
     #[command(subcommand)]
     Saved(saved_cli::SavedAction),
+
+    /// The vault key that seals every stored token in control.db
+    #[command(subcommand)]
+    Vault(VaultAction),
+}
+
+#[derive(Subcommand)]
+enum VaultAction {
+    /// Print the vault key, or write it to a file only its owner can read;
+    /// a copy of control.db restored on another host needs it as vault.key
+    ExportKey {
+        /// Write the key here (mode 0600) instead of printing it
+        #[arg(long, value_name = "FILE")]
+        to: Option<PathBuf>,
+        /// Print without asking
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -271,6 +295,14 @@ struct ExportArgs {
 
     #[command(flatten)]
     flags: ExportFlags,
+}
+
+#[derive(clap::Args)]
+struct ReadyArgs {
+    /// The server's base URL; default: http://{[server].bind}, or
+    /// loopback when it binds every address
+    #[arg(long)]
+    url: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -789,6 +821,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         Commands::Graph(action) => run_on_writer(cli, action).await,
         Commands::Embeddings(action) => run_on_writer(cli, action).await,
         Commands::Saved(action) => run_saved(cli, action).await,
+        Commands::Vault(VaultAction::ExportKey { to, yes }) => run_vault_export(to, yes).await,
         Commands::Okf(OkfAction::Export { dir }) => run_okf_export(cli, &dir).await,
         Commands::Import(args) => run_import(cli, args).await,
         Commands::Context(args) => {
@@ -804,9 +837,14 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         }
         Commands::Mcp(args) => run_mcp(cli, args.allow_write).await,
         Commands::Serve(args) => {
-            // The server logs each request at info; other commands stay quiet.
-            init_logging_at("info,sqlx=warn,hyper=warn,h2=warn");
+            // The server logs at info in the file's format; other commands
+            // stay quiet. Each request's access line is `quack::access` at
+            // debug, so `RUST_LOG=quack::access=debug` turns it on alone.
             let config = Config::load().context("failed to load configuration")?;
+            init_logging_as(
+                "info,sqlx=warn,hyper=warn,h2=warn",
+                config.server.log_format,
+            );
             let mode = if args.local {
                 ServeMode::Local
             } else {
@@ -815,6 +853,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             server::serve(config, args.bind, mode).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Ready(args) => run_ready(args).await,
         Commands::Admin(command) => {
             init_logging();
             let config = Config::load().context("failed to load configuration")?;
@@ -881,6 +920,47 @@ async fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// `quack vault export-key`: the key as stored, to a 0600 file or, after
+/// a yes, to stdout.
+async fn run_vault_export(to: Option<PathBuf>, yes: bool) -> Result<ExitCode> {
+    init_logging();
+    let config = Config::load().context("failed to load configuration")?;
+    let vault = Vault::new(config.data_dir(), KeySource::Keychain);
+    let Some(key) = vault.key_text().await? else {
+        anyhow::bail!("no vault key exists yet; one is made when the first token is stored");
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if let Some(path) = to {
+        write_private(&path, key.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        writeln!(out, "Wrote the vault key to {}", path.display())?;
+    } else {
+        let question = "The vault key unseals every token in control.db. Print it?";
+        if !Confirm::Ask.ask_to_drop(yes, &mut out, question)? {
+            writeln!(out, "Not printed.")?;
+            return Ok(ExitCode::FAILURE);
+        }
+        writeln!(out, "{key}")?;
+    }
+    out.flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Write `bytes` to a new file readable by its owner alone.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.flush()
 }
 
 /// `quack -p PROMPT`: one turn, answer to stdout, steps to stderr.
@@ -1782,13 +1862,21 @@ fn init_logging() {
 
 /// Log to stderr at `default` unless `RUST_LOG` says otherwise.
 fn init_logging_at(default: &str) {
-    tracing_subscriber::fmt()
+    init_logging_as(default, LogFormat::Text);
+}
+
+/// Log to stderr at `default` unless `RUST_LOG` says otherwise, as text
+/// lines or as one JSON object per line.
+fn init_logging_as(default: &str, format: LogFormat) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
+    let builder = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default)),
-        )
-        .init();
+        .with_env_filter(filter);
+    match format {
+        LogFormat::Text => builder.init(),
+        LogFormat::Json => builder.json().init(),
+    }
     // The provider is installed at the top of `main`, before any subscriber
     // exists; this is the first point where saying so reaches a log.
     CryptoModule::linked().log();
@@ -2027,6 +2115,53 @@ async fn follow_ingest(
         writeln!(out, "  Graph: {summary}")?;
     }
     Ok(())
+}
+
+/// `quack ready`: `GET /readyz` on the server and exit by its answer. The
+/// container image's health check runs this, since the image has no shell.
+async fn run_ready(args: ReadyArgs) -> Result<ExitCode> {
+    let url = if let Some(url) = args.url {
+        url
+    } else {
+        let config = Config::load().context("failed to load configuration")?;
+        let bind: std::net::SocketAddr = config.server.bind.parse().with_context(|| {
+            format!(
+                "[server].bind '{}' is not a socket address",
+                config.server.bind
+            )
+        })?;
+        let host = if bind.ip().is_unspecified() {
+            String::from("127.0.0.1")
+        } else {
+            bind.ip().to_string()
+        };
+        format!("http://{host}:{}", bind.port())
+    };
+    let client = Proxies::from_env()
+        .client()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("could not build the HTTP client")?;
+    let readyz = format!("{}/readyz", url.trim_end_matches('/'));
+    let response = client.get(&readyz).send().await;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match response {
+        Ok(response) if response.status().is_success() => {
+            writeln!(out, "ready")?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            writeln!(out, "not ready ({status}): {body}")?;
+            Ok(ExitCode::FAILURE)
+        }
+        Err(e) => {
+            writeln!(out, "not ready: {readyz} did not answer: {e}")?;
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
 /// The lines `quack ingest` prints for a stored file.

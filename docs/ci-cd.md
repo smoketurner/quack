@@ -260,7 +260,9 @@ by: `reusable-build.yml` uses no Actions cache, and `release.yml`'s gates job ru
   cargo-chef caches the dependency build, and the musl binary lands in
   `gcr.io/distroless/static-debian13:nonroot`. Environment: `QUACK_DATA_DIR=/data`,
   `QUACK_CONFIG_DIR=/config`, `QUACK_BIND=0.0.0.0:8080`. Entrypoint `/quack`, default
-  command `serve`, so `docker run ... quack user add alice --admin` also works.
+  command `serve`, so `docker run ... quack user add alice --admin` also works. The
+  `HEALTHCHECK` is `/quack ready`, which calls `GET /readyz` (the image has no shell or
+  curl); the compose file declares the same check.
 - **`Dockerfile.release`**: the same runtime from prebuilt `dist/linux-<arch>/quack`
   binaries; no compilation, so multi-arch builds need no emulation.
 - **`.dockerignore`**: a deny-by-default allowlist that keeps the context small and

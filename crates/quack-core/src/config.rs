@@ -675,6 +675,8 @@ pub struct ProviderConfig {
     /// Ollama, which serves one request per model unless
     /// `OLLAMA_NUM_PARALLEL` says otherwise, 8 for hosted APIs.
     pub max_concurrent_requests: Option<RequestLimit>,
+    /// How a throttled or failed request is tried again.
+    pub retry: RetryPolicy,
     /// Extra HTTP headers sent with every model request to this provider,
     /// checked as header names and values when the file is read. The
     /// credential headers are refused: rig would send one in place of the
@@ -687,6 +689,72 @@ pub struct ProviderConfig {
     /// `[providers.NAME.models."ID"]`: one model's settings, keyed by the
     /// model id as `chat_model` names it.
     pub models: BTreeMap<String, ModelSettings>,
+}
+
+/// `max_retries` and `retry_backoff_ms` on `[providers.NAME]`: a request
+/// that the provider throttles (429), times out (408), or fails on its
+/// side (5xx), or whose transport drops, is sent again up to `max_retries`
+/// more times, waiting `Retry-After` when the response names it, else
+/// `backoff` doubled per attempt with jitter. Every provider type takes
+/// the same policy, Bedrock's SDK included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    pub backoff: Duration,
+}
+
+impl RetryPolicy {
+    pub const DEFAULT_RETRIES: u32 = 3;
+    pub const DEFAULT_BACKOFF_MS: u64 = 500;
+    /// The longest first wait the file may set; later waits double from it
+    /// and stop at a minute.
+    pub const MAX_BACKOFF_MS: u64 = 30_000;
+    pub const MAX_WAIT: Duration = Duration::from_secs(60);
+
+    /// No retries at all.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            max_retries: 0,
+            backoff: Duration::ZERO,
+        }
+    }
+
+    /// The wait before retry `attempt` (1 for the first), doubled each
+    /// time, with up to a quarter of jitter, bounded by [`Self::MAX_WAIT`].
+    #[must_use]
+    pub fn wait(self, attempt: u32, jitter: f64) -> Duration {
+        let doubled = self
+            .backoff
+            .saturating_mul(1_u32 << attempt.saturating_sub(1).min(16));
+        let jittered = doubled.mul_f64(jitter.clamp(0.0, 1.0).mul_add(0.25, 1.0));
+        jittered.min(Self::MAX_WAIT)
+    }
+}
+
+impl RetryPolicy {
+    /// The policy the file's two optional keys describe; the backoff is
+    /// capped at `MAX_BACKOFF_MS`.
+    #[must_use]
+    pub fn from_raw(max_retries: Option<u32>, backoff_ms: Option<u64>) -> Self {
+        Self {
+            max_retries: max_retries.unwrap_or(Self::DEFAULT_RETRIES),
+            backoff: Duration::from_millis(
+                backoff_ms
+                    .unwrap_or(Self::DEFAULT_BACKOFF_MS)
+                    .min(Self::MAX_BACKOFF_MS),
+            ),
+        }
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: Self::DEFAULT_RETRIES,
+            backoff: Duration::from_millis(Self::DEFAULT_BACKOFF_MS),
+        }
+    }
 }
 
 /// What requests to a model carry. A key left unset falls back to the
@@ -730,6 +798,8 @@ struct RawProviderConfig {
     region: Option<AwsRegion>,
 
     max_concurrent_requests: Option<RequestLimit>,
+    max_retries: Option<u32>,
+    retry_backoff_ms: Option<u64>,
     headers: Option<BTreeMap<String, String>>,
     oauth: Option<OAuthConfig>,
     temperature: Option<bool>,
@@ -827,6 +897,7 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
             bedrock: bedrock_config,
             openai_api,
             max_concurrent_requests: raw.max_concurrent_requests,
+            retry: RetryPolicy::from_raw(raw.max_retries, raw.retry_backoff_ms),
             headers: raw.headers.filter(|headers| !headers.is_empty()),
             model_defaults: ModelSettings {
                 temperature: raw.temperature,
@@ -859,6 +930,7 @@ impl ProviderConfig {
                 }),
             openai_api: None,
             max_concurrent_requests: None,
+            retry: RetryPolicy::default(),
             headers: None,
             model_defaults: ModelSettings::default(),
             models: BTreeMap::new(),
@@ -1234,7 +1306,24 @@ pub struct ServerConfig {
     /// Sign-in through the organization's `OpenID` Connect issuer, beside
     /// password login.
     pub oidc: Option<OidcConfig>,
+    /// How `quack serve` writes its log lines: `text` for a terminal,
+    /// `json` (one object per line) for a log collector.
+    pub log_format: LogFormat,
 }
+
+/// `[server].log_format`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+text_enum!(LogFormat, "log format", {
+    Text => "text",
+    Json => "json",
+});
 
 impl ServerConfig {
     /// The login lockout these settings describe.
@@ -1443,6 +1532,7 @@ impl Default for ServerConfig {
             login_lockout_minutes: 15,
             trusted_proxies: Vec::new(),
             oidc: None,
+            log_format: LogFormat::Text,
         }
     }
 }

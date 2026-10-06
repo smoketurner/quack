@@ -951,6 +951,7 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/graph/edges", post(graph_edge_add))
         .route("/w/{id}/graph/edges/{eid}/delete", post(graph_edge_delete))
         .route("/w/{id}/settings", get(settings).post(settings_save))
+        .route("/w/{id}/delete", post(workspace_delete))
         .route("/w/{id}/members", post(member_add))
         .route("/w/{id}/members/{user}/remove", post(member_remove))
         .route("/w/{id}/groups", post(group_set))
@@ -2251,6 +2252,9 @@ async fn settings(
 
 #[derive(Deserialize)]
 struct SettingsForm {
+    /// Absent (an older form) keeps the name.
+    #[serde(default)]
+    name: Option<String>,
     classification: String,
     #[serde(default)]
     providers: BTreeSet<String>,
@@ -2280,8 +2284,45 @@ async fn settings_save(
         classification: Some(form.classification),
         allowed_providers,
     };
-    let saved = workspaces_api::update_settings(&app, &access, changes).await;
+    let saved = match workspaces_api::update_settings(&app, &access, changes).await {
+        Ok(ws) => match form.name {
+            Some(name) => workspaces_api::rename(&app, &access, &name).await,
+            None => Ok(ws),
+        },
+        Err(e) => Err(e),
+    };
     Ok(Flash::after(format!("/w/{id}/settings"), saved, |_| None).into_response())
+}
+
+#[derive(Deserialize)]
+struct DeleteWorkspaceForm {
+    /// The workspace's name typed again.
+    confirm: String,
+}
+
+/// The settings page's delete form: the name typed again is the
+/// confirmation, and a successful delete lands on the workspace list.
+async fn workspace_delete(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(form): Form<DeleteWorkspaceForm>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
+    let name = access.membership.workspace.name.clone();
+    if form.confirm.trim() != name {
+        return Ok(Flash::error(
+            format!("/w/{id}/settings"),
+            "type the workspace's name to delete it",
+        )
+        .into_response());
+    }
+    let deleted = workspaces_api::delete_workspace(&app, &access).await;
+    Ok(match deleted {
+        Ok(()) => Flash::notice("/workspaces", format!("Deleted workspace '{name}'")),
+        Err(e) => Flash::error(format!("/w/{id}/settings"), e.message),
+    }
+    .into_response())
 }
 
 async fn member_add(

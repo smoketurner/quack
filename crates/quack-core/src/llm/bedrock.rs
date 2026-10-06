@@ -60,6 +60,7 @@ use super::limit::{GatePermit, ProviderGates};
 use crate::config::bedrock::is_fips_host;
 use crate::config::{
     AwsRegion, BaseUrl, BedrockApi, BedrockConfig, BedrockEndpoint, ProviderConfig, ProviderName,
+    RetryPolicy,
 };
 use crate::error::{Error, Result};
 use crate::proxy::Proxies;
@@ -389,8 +390,15 @@ fn runtime_endpoint_override(sdk: &SdkConfig) -> Option<String> {
 /// profile and region when the file names them, the SDK's defaults
 /// otherwise, and the provider's request limit on model calls.
 async fn sdk_config(name: &ProviderName, provider: &ProviderConfig) -> SdkConfig {
-    let mut loader =
-        aws_config::defaults(BehaviorVersion::latest()).http_client(LimitedAwsHttp::new(
+    // The same retry policy as every other provider: the SDK counts
+    // attempts, so one more than the retries.
+    let retry = aws_config::retry::RetryConfig::standard()
+        .with_max_attempts(provider.retry.max_retries.saturating_add(1))
+        .with_initial_backoff(provider.retry.backoff)
+        .with_max_backoff(RetryPolicy::MAX_WAIT);
+    let mut loader = aws_config::defaults(BehaviorVersion::latest())
+        .retry_config(retry)
+        .http_client(LimitedAwsHttp::new(
             ProviderGates::for_provider(name, provider),
             Proxies::from_env(),
         ));

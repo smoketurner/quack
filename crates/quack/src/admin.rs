@@ -2,7 +2,8 @@
 //! members, and the access audit log. Every mutation is itself audited on the `cli`
 //! channel with no user, because the operator at the shell is implicit.
 
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
@@ -13,12 +14,14 @@ use quack_core::ids::{AuditId, UserId, WorkspaceId};
 use quack_core::ocsf::PromptText;
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::audit;
+use quack_core::storage::backup::{self, Described, Manifest, RestoreRequest};
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, Expiry, GrantedBy,
     IssuedToken, Outcome, ResourceKind, Role, Scope, UserKind, UserRow, WorkspaceName,
     WorkspaceRow,
 };
 use quack_core::storage::workspace::WorkspaceDb;
+use quack_core::storage::writer::Writer;
 
 use crate::confirm::Confirm;
 use crate::text_or_json::TextOrJson;
@@ -27,7 +30,7 @@ use crate::text_or_json::TextOrJson;
 /// audit log.
 #[derive(Subcommand)]
 pub(crate) enum AdminCommand {
-    /// Workspaces: create one or list them
+    /// Workspaces: create, list, rename, delete, snapshot, or restore one
     #[command(subcommand)]
     Workspace(WorkspaceAction),
 
@@ -73,6 +76,38 @@ pub(crate) enum WorkspaceAction {
         /// `json` prints one JSON object per row
         #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
         format: TextOrJson,
+    },
+    /// Give a workspace a new name; `-w` and the URL bar then use it
+    Rename {
+        /// The workspace's current name
+        name: String,
+        /// Non-empty, with no slashes or dots
+        new_name: WorkspaceName,
+    },
+    /// Delete a workspace: its file, its members, and its API tokens;
+    /// the access audit log keeps its rows
+    Delete {
+        name: String,
+        /// Delete without asking
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Write a workspace as one tar: its file after a checkpoint, its
+    /// uploaded files, and a manifest naming its members and settings
+    Snapshot {
+        name: String,
+        /// Write the tar here instead of stdout
+        #[arg(long, value_name = "FILE")]
+        to: Option<PathBuf>,
+    },
+    /// A snapshot's tar as a new workspace: members this server has users
+    /// for get their role again
+    Restore {
+        /// The tar, or `-` for stdin
+        file: PathBuf,
+        /// The new workspace's name; the snapshot's own when absent
+        #[arg(long)]
+        name: Option<WorkspaceName>,
     },
 }
 
@@ -245,8 +280,157 @@ pub(crate) async fn run_workspace(config: &Config, action: WorkspaceAction) -> R
             )?;
             out.flush()?;
         }
+        WorkspaceAction::Rename { name, new_name } => {
+            let ws = control.workspace_named(&name).await?;
+            let entry = AuditEntry::new(AuditAction::Workspace, Outcome::Allowed, Channel::Cli);
+            let ws = control.rename_workspace(&ws.id, &new_name, entry).await?;
+            let mut out = stdout.lock();
+            writeln!(out, "Renamed '{name}' to '{}' ({})", ws.name, ws.id)?;
+            out.flush()?;
+        }
+        WorkspaceAction::Delete { name, yes } => {
+            let ws = control.workspace_named(&name).await?;
+            let mut out = stdout.lock();
+            let question = format!(
+                "Delete workspace '{name}' ({}), its file, its members, and its tokens?",
+                ws.id
+            );
+            if !Confirm::Ask.ask_to_drop(yes, &mut out, &question)? {
+                writeln!(out, "Nothing deleted.")?;
+                return Ok(());
+            }
+            let entry = AuditEntry::new(AuditAction::Delete, Outcome::Allowed, Channel::Cli);
+            control.delete_workspace(&ws.id, entry).await?;
+            let dir = config.workspace_dir(ws.id.as_str());
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)
+                    .with_context(|| format!("failed to remove {}", dir.display()))?;
+            }
+            writeln!(out, "Deleted workspace '{name}' ({})", ws.id)?;
+            out.flush()?;
+        }
+        WorkspaceAction::Snapshot { name, to } => {
+            snapshot_workspace(config, &control, &name, to).await?;
+        }
+        WorkspaceAction::Restore { file, name } => {
+            restore_workspace(config, &control, file, name).await?;
+        }
     }
     Ok(())
+}
+
+/// `quack workspace snapshot`: the tar to `to`, or to a piped stdout.
+async fn snapshot_workspace(
+    config: &Config,
+    control: &ControlPlane,
+    name: &str,
+    to: Option<PathBuf>,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    let ws = control.workspace_named(name).await?;
+    let described = Described::of(control, &ws).await?;
+    let dir = config.workspace_dir(ws.id.as_str());
+    let writer = Writer::spawn(WorkspaceDb::open(config, ws.id.as_str())?)
+        .context("failed to start the workspace writer")?;
+    let Some(path) = to else {
+        if stdout.is_terminal() {
+            anyhow::bail!("stdout is a terminal; pipe the tar somewhere or use --to FILE");
+        }
+        // The tar is written on the writer's thread, which holds the
+        // stdout lock for the whole snapshot; nothing else prints then.
+        return writer
+            .run(move |db| {
+                let manifest = Manifest::of(db, described)?;
+                let out = std::io::stdout().lock();
+                backup::snapshot(db, &dir, &manifest, out)?.flush()?;
+                Ok(())
+            })
+            .await
+            .map_err(Into::into);
+    };
+    let out_path = path.clone();
+    writer
+        .run(move |db| {
+            let manifest = Manifest::of(db, described)?;
+            let file = std::fs::File::create(&out_path)?;
+            backup::snapshot(db, &dir, &manifest, file)?.sync_all()?;
+            Ok(())
+        })
+        .await?;
+    let mut out = stdout.lock();
+    writeln!(out, "Wrote '{name}' to {}", path.display())?;
+    out.flush()?;
+    Ok(())
+}
+
+/// `quack workspace restore`: a new workspace from `file` (`-` is stdin).
+async fn restore_workspace(
+    config: &Config,
+    control: &ControlPlane,
+    file: PathBuf,
+    name: Option<WorkspaceName>,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    let audit = |action| AuditEntry::new(action, Outcome::Allowed, Channel::Cli);
+    let source = if file.as_os_str() == "-" {
+        let mut bytes = Vec::new();
+        std::io::stdin().lock().read_to_end(&mut bytes)?;
+        Source::Bytes(bytes)
+    } else {
+        Source::File(file)
+    };
+    let restored = backup::restore(
+        control,
+        config,
+        move || source.open(),
+        RestoreRequest {
+            name,
+            owner: None,
+            audit: &audit,
+        },
+    )
+    .await?;
+    let mut out = stdout.lock();
+    writeln!(
+        out,
+        "Restored '{}' ({}) from a snapshot taken {} by quack {}",
+        restored.workspace.name,
+        restored.workspace.id,
+        restored.manifest.taken_at,
+        restored.manifest.quack_version
+    )?;
+    writeln!(out, "{} member(s) kept their role", restored.members_kept)?;
+    if !restored.members_missing.is_empty() {
+        writeln!(
+            out,
+            "no user here for: {} (`quack user add` them, then `quack member add`)",
+            restored.members_missing.join(", ")
+        )?;
+    }
+    if !restored.providers_dropped.is_empty() {
+        writeln!(
+            out,
+            "allowed providers not configured here, dropped: {}",
+            restored.providers_dropped.join(", ")
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// Where a restore reads its tar from, twice: the manifest, then the files.
+enum Source {
+    File(PathBuf),
+    Bytes(Vec<u8>),
+}
+
+impl Source {
+    fn open(&self) -> std::io::Result<Box<dyn Read + Send>> {
+        Ok(match self {
+            Self::File(path) => Box::new(std::fs::File::open(path)?),
+            Self::Bytes(bytes) => Box::new(std::io::Cursor::new(bytes.clone())),
+        })
+    }
 }
 
 pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> {
@@ -958,6 +1142,25 @@ mod tests {
         assert!(matches!(
             parse(&["workspace", "create", "sales"]),
             Ok(Line::Workspace(WorkspaceAction::Create { name })) if name.as_str() == "sales"
+        ));
+        assert!(matches!(
+            parse(&["workspace", "rename", "sales", "sales-2025"]),
+            Ok(Line::Workspace(WorkspaceAction::Rename { name, new_name }))
+                if name == "sales" && new_name.as_str() == "sales-2025"
+        ));
+        assert!(matches!(
+            parse(&["workspace", "delete", "sales", "-y"]),
+            Ok(Line::Workspace(WorkspaceAction::Delete { name, yes: true })) if name == "sales"
+        ));
+        assert!(matches!(
+            parse(&["workspace", "snapshot", "sales", "--to", "s.tar"]),
+            Ok(Line::Workspace(WorkspaceAction::Snapshot { name, to: Some(to) }))
+                if name == "sales" && to.as_os_str() == "s.tar"
+        ));
+        assert!(matches!(
+            parse(&["workspace", "restore", "-", "--name", "copy"]),
+            Ok(Line::Workspace(WorkspaceAction::Restore { file, name: Some(name) }))
+                if file.as_os_str() == "-" && name.as_str() == "copy"
         ));
         assert!(matches!(
             parse(&["user", "disable", "bob"]),

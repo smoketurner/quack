@@ -200,9 +200,10 @@ impl Writer {
         Ok(())
     }
 
-    /// Closures waiting (interactive, background), for tests.
-    #[cfg(test)]
-    fn waiting(&self) -> (usize, usize) {
+    /// Closures waiting (interactive, background): the writer's queue
+    /// depth, which the server's metrics report.
+    #[must_use]
+    pub fn waiting(&self) -> (usize, usize) {
         let lines = self.shared.lines();
         (lines.interactive.len(), lines.background.len())
     }

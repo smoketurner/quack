@@ -16,13 +16,15 @@ use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::{
-    BaseUrl, Config, FollowIngest, ProviderConfig, ProviderName, ProviderType, SecureCookies,
+    BaseUrl, Config, FollowIngest, ProviderConfig, ProviderName, ProviderType, RetryPolicy,
+    SecureCookies,
 };
 use quack_core::embedding::{Dimension, Vector};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::ids::{AuditId, ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::parser::SectionKind;
+use quack_core::storage::backup;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -5864,6 +5866,8 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
                 BaseUrl::try_from(String::from("http://127.0.0.1:9"))
                     .unwrap_or_else(|e| fail(&e.to_string())),
             ),
+            // Nothing listens there: retrying would only wait.
+            retry: RetryPolicy::none(),
             ..ProviderConfig::new(ProviderType::Ollama)
         },
     );
@@ -8735,5 +8739,256 @@ async fn a_documents_fields_are_set_over_the_api_and_shown() {
                 |v| v["fields"] == serde_json::json!(["author", "authored_at", "tags"])
             )),
         "{details:?}"
+    );
+}
+
+/// `/readyz` reports each component; `/metrics` answers loopback and
+/// admins with Prometheus text that counts the requests served, and
+/// refuses everyone else.
+#[tokio::test(flavor = "multi_thread")]
+async fn readiness_and_metrics_are_served_outside_the_limiter() {
+    let h = harness(ServeMode::Login).await;
+    let (status, body) = h.call(Method::GET, "/readyz", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["control_db"]["status"], "ok", "{body}");
+    assert_eq!(body["data_dir"]["status"], "ok", "{body}");
+    assert_eq!(body["vault_key"]["status"], "ok", "{body}");
+
+    // No peer address in a oneshot test, so not loopback: a bearer is needed.
+    let (status, _) = h.call(Method::GET, "/metrics", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    drop(h.user("plain", UserKind::Standard).await);
+    let plain = h.login("plain").await;
+    let (status, _) = h.call(Method::GET, "/metrics", Some(&plain), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    drop(h.user("root", UserKind::Admin).await);
+    let admin = h.login("root").await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .header(header::AUTHORIZATION, format!("Bearer {admin}"))
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let response = h
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .to_vec(),
+    )
+    .unwrap_or_default();
+    assert!(
+        text.contains(r#"quack_http_requests_total{method="GET",route="/readyz",status="200"}"#),
+        "{text}"
+    );
+    assert!(
+        text.contains("quack_jobs{kind=\"ingest\",state=\"queued\"} 0"),
+        "{text}"
+    );
+    assert!(text.contains("quack_open_workspaces 0"), "{text}");
+    assert!(
+        text.contains("quack_writer_waiting{priority=\"interactive\"} 0"),
+        "{text}"
+    );
+}
+
+/// A snapshot carries the file, its members, and its settings; a restore
+/// brings them back under a new id; a rename and a delete follow, the
+/// delete refused while a job of the workspace is active and keeping the
+/// audit rows after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_workspace_round_trips_through_a_snapshot_and_is_renamed_and_deleted() {
+    let h = harness(ServeMode::Login).await;
+    let admin = h.user("root", UserKind::Admin).await;
+    let viewer = h.user("vera", UserKind::Standard).await;
+    let ws = h.workspace("sales", &admin).await;
+    h.app
+        .control
+        .set_member(&ws, &viewer, Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let token = h.login("root").await;
+    let sql = |s: &str| serde_json::json!({ "sql": s });
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &token,
+            sql("CREATE TABLE t AS SELECT 7 AS a"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &format!("/api/v1/workspaces/{ws}"),
+            Some(&token),
+            Some(serde_json::json!({ "classification": "secret" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The snapshot is a tar whose first entry is the manifest.
+    let (status, tar, headers) = h
+        .send_bytes(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/workspaces/{ws}/snapshot"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap_or_else(|e| fail(&e.to_string())),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/x-tar")
+    );
+    let manifest = backup::read_manifest(tar.as_ref()).unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(manifest.name, "sales");
+    assert_eq!(manifest.classification, "secret");
+    assert_eq!(manifest.members.len(), 2, "{manifest:?}");
+    let snapshots = h
+        .audit(AuditFilter {
+            action: Some(String::from("snapshot")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(snapshots.len(), 1);
+
+    // Restored under a new name: the table, the setting, and the members.
+    let (status, body, _) = h
+        .send(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/workspaces/restore?name=sales-copy")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/x-tar")
+                .body(Body::from(tar.clone()))
+                .unwrap_or_else(|e| fail(&e.to_string())),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["workspace"]["name"], "sales-copy");
+    assert_eq!(body["workspace"]["classification"], "secret");
+    assert_eq!(body["members_kept"], 2, "{body}");
+    let copy = body["workspace"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_ne!(copy, ws.to_string());
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{copy}/sql"),
+            &token,
+            sql("SELECT a FROM t"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0][0], 7);
+    let vera = h.login("vera").await;
+    let (status, body) = h.get(&format!("/api/v1/workspaces/{copy}"), &vera).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], "viewer", "{body}");
+
+    // The same name again is a conflict; a non-snapshot is a bad request.
+    let (status, _, _) = h
+        .send(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/workspaces/restore?name=sales-copy")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(tar))
+                .unwrap_or_else(|e| fail(&e.to_string())),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _, _) = h
+        .send(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/workspaces/restore")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from("not a tar"))
+                .unwrap_or_else(|e| fail(&e.to_string())),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = h
+        .send(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/workspaces/restore")
+                .header(header::AUTHORIZATION, format!("Bearer {vera}"))
+                .body(Body::empty())
+                .unwrap_or_else(|e| fail(&e.to_string())),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Rename over PATCH; a taken name is a conflict.
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &format!("/api/v1/workspaces/{copy}"),
+            Some(&token),
+            Some(serde_json::json!({ "name": "sales-2025" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "sales-2025");
+    let (status, _) = h
+        .call(
+            Method::PATCH,
+            &format!("/api/v1/workspaces/{copy}"),
+            Some(&token),
+            Some(serde_json::json!({ "name": "sales" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Delete: viewers may not; the owner may; the rows and the directory go,
+    // the audit stays.
+    let (status, _) = h
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/workspaces/{copy}"),
+            Some(&vera),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let dir = h.app.config.workspace_dir(&copy);
+    assert!(dir.join("data.duckdb").exists());
+    let (status, body) = h
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/workspaces/{copy}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(!dir.exists());
+    let (status, _) = h.get(&format!("/api/v1/workspaces/{copy}"), &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let copy_id = WorkspaceId::from(copy.clone());
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(copy_id),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        rows.iter().any(|r| r.entry.action == AuditAction::Delete)
+            && rows.iter().any(|r| r.entry.action == AuditAction::Restore),
+        "{rows:?}"
     );
 }

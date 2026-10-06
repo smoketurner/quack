@@ -130,6 +130,7 @@ impl From<CoreError> for ApiError {
             | CoreError::UnsupportedFileType(_)
             | CoreError::EmptyFile(_)
             | CoreError::InvalidWorkspaceName
+            | CoreError::Snapshot(_)
             | CoreError::Ontology(_) => StatusCode::BAD_REQUEST,
             CoreError::Analysis(_)
             | CoreError::UnknownValue { .. }

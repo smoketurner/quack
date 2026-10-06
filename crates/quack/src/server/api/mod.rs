@@ -63,22 +63,7 @@ impl StreamEvent {
 
 pub(crate) fn router(app: &App) -> Router<App> {
     Router::new()
-        .route(
-            "/auth/login",
-            super::throttled_login(app, post(auth::login)),
-        )
-        .route("/auth/logout", post(auth::logout))
-        .route("/auth/logout-all", post(auth::logout_all))
-        .route("/auth/password", post(auth::change_password))
-        .route("/auth/me", get(auth::me))
-        .route(
-            "/workspaces",
-            get(workspaces::list).post(workspaces::create),
-        )
-        .route(
-            "/workspaces/{id}",
-            get(workspaces::show).patch(workspaces::update),
-        )
+        .merge(control_routes(app))
         .route("/workspaces/{id}/audit", get(workspaces::audit_detail))
         .route("/workspaces/{id}/query", post(query::query))
         .route("/workspaces/{id}/query/stream", post(query::stream))
@@ -152,6 +137,32 @@ pub(crate) fn router(app: &App) -> Router<App> {
             axum::routing::patch(admin::update_user).delete(admin::delete_user),
         )
         .route("/admin/audit", get(admin::audit))
+}
+
+/// Signing in, and the workspaces themselves: listing, creating,
+/// restoring, settings, snapshots, deletion.
+fn control_routes(app: &App) -> Router<App> {
+    Router::new()
+        .route(
+            "/auth/login",
+            super::throttled_login(app, post(auth::login)),
+        )
+        .route("/auth/logout", post(auth::logout))
+        .route("/auth/logout-all", post(auth::logout_all))
+        .route("/auth/password", post(auth::change_password))
+        .route("/auth/me", get(auth::me))
+        .route(
+            "/workspaces",
+            get(workspaces::list).post(workspaces::create),
+        )
+        .route("/workspaces/restore", post(workspaces::restore))
+        .route(
+            "/workspaces/{id}",
+            get(workspaces::show)
+                .patch(workspaces::update)
+                .delete(workspaces::delete),
+        )
+        .route("/workspaces/{id}/snapshot", get(workspaces::snapshot))
 }
 
 /// The knowledge graph's routes: search and path, status, the builds, the

@@ -42,7 +42,9 @@ API Activity event with that name.
 | `ingest` | A file is uploaded, a document replaced, a bundle imported | `allowed`, `denied`, `error` | API: Create |
 | `import` | A Postgres, SQLite, or URL import is started | `allowed`, `error` | API: Create |
 | `export` | A workspace is exported as an OKF bundle, or a statement's rows are streamed out | `allowed`, `denied` (a write statement), `error` | API: Read |
-| `delete` | A document, session, saved question, or other resource is deleted | `allowed`, `denied`, `error` | API: Delete |
+| `delete` | A document, session, saved question, workspace, or other resource is deleted | `allowed`, `denied`, `error` | API: Delete |
+| `snapshot` | A workspace is written out as a snapshot (`quack workspace snapshot`, `GET .../snapshot`, the Settings page) | `allowed`, `error` | API: Update |
+| `restore` | A snapshot is restored as a new workspace (`quack workspace restore`, `POST /workspaces/restore`) | `allowed` | API: Update |
 | `context` | The workspace context is edited or restored | `allowed` | API: Update |
 | `ontology` | The ontology is imported, edited, or restored to a version | `allowed`, `error` | API: Other |
 | `propose` | An ontology proposal run starts or ends | `allowed`, `error` | API: Create |

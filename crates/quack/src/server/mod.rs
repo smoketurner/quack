@@ -25,9 +25,11 @@ use anyhow::Context;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, MatchedPath};
 use axum::http::{HeaderValue, Request, StatusCode, header};
+use axum::response::IntoResponse;
 use axum::routing::get;
 use quack_core::DUCK;
 use quack_core::config::Config;
+use quack_core::telemetry;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::KeyExtractor;
 use tower_governor::{GovernorError, GovernorLayer};
@@ -196,9 +198,14 @@ pub(crate) fn router(app: App) -> Router {
         .layer(axum::middleware::from_fn(request_slots));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        // Readiness and metrics stay outside the limiter too: a watcher
+        // that is throttled reads a live server as dead.
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .merge(web::assets())
         .merge(limited)
         .layer(DefaultBodyLimit::max(upload_limit))
+        .layer(axum::middleware::from_fn(record_request))
         // One span per request, carrying the id the request-id layer set
         // (it is the outer layer, so the header exists here); the response
         // event carries status and latency.
@@ -229,7 +236,10 @@ pub(crate) fn router(app: App) -> Router {
                     |response: &axum::http::Response<_>,
                      latency: Duration,
                      _span: &tracing::Span| {
+                        // The access log, on its own target so it can be
+                        // turned on alone: `RUST_LOG=quack::access=debug`.
                         tracing::debug!(
+                            target: "quack::access",
                             latency_ms = latency.as_millis(),
                             status = response.status().as_u16(),
                             "finished processing request"
@@ -336,6 +346,74 @@ impl fmt::Display for Banner<'_> {
             workers = config.server.workers_per_workspace,
         )
     }
+}
+
+/// Count the request and its latency under the route's template, never
+/// its path (a path can name workspace content); an unmatched path counts
+/// as `-`.
+async fn record_request(
+    request: Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = request.method().to_string();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| String::from("-"), |m| m.as_str().to_owned());
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    telemetry::http_request(
+        &method,
+        &route,
+        response.status().as_u16(),
+        started.elapsed(),
+    );
+    response
+}
+
+/// `GET /readyz`: whether this server can serve, component by component:
+/// `control.db` answers, the data directory takes a write, and the vault
+/// key opens. 200 with every check `ok`, else 503 naming the failed ones.
+async fn readyz(axum::extract::State(app): axum::extract::State<App>) -> axum::response::Response {
+    let readiness = app.readiness().await;
+    let status = if readiness.ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, axum::Json(readiness)).into_response()
+}
+
+/// `GET /metrics`: the Prometheus text, to loopback or to an admin's
+/// bearer; anyone else gets 403. The gauges are read as the page is made.
+async fn metrics(
+    axum::extract::State(app): axum::extract::State<App>,
+    peer: auth::Peer,
+    identity: Result<auth::Identity, error::ApiError>,
+) -> axum::response::Response {
+    let local = peer.0.is_some_and(|ip| ip.is_loopback());
+    if !local {
+        match identity {
+            Ok(identity) => {
+                if let Err(e) = identity.require_admin() {
+                    return e.into_response();
+                }
+            }
+            Err(e) => return e.into_response(),
+        }
+    }
+    app.refresh_gauges().await;
+    let Some(text) = telemetry::render() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "metrics are not recorded").into_response();
+    };
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        text,
+    )
+        .into_response()
 }
 
 /// Run the rest of the request with an acting slot and an egress slot of

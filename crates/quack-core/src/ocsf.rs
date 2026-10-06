@@ -79,6 +79,8 @@ impl EventClass {
             | AuditAction::GraphReview
             | AuditAction::GraphRevalidate
             | AuditAction::GraphMerge
+            | AuditAction::Snapshot
+            | AuditAction::Restore
             | AuditAction::GraphEdit
             | AuditAction::Password
             | AuditAction::EmbeddingsRefresh => Self::Api(Update),

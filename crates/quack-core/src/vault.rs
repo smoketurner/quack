@@ -171,6 +171,17 @@ impl Vault {
         self.slot.location().await
     }
 
+    /// The key as it is stored, for `quack vault export-key`; `None` when
+    /// nothing has been sealed yet and no key exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the keychain refuses or the key file cannot
+    /// be read.
+    pub async fn key_text(&self) -> Result<Option<String>> {
+        self.slot.read().await
+    }
+
     /// The key, made and stored the first time something is sealed.
     async fn sealing_key(&self) -> Result<&VaultKey> {
         self.key

@@ -670,6 +670,10 @@ pub enum AuditAction {
     GraphReview,
     GraphRevalidate,
     GraphMerge,
+    /// A workspace written out as a snapshot.
+    Snapshot,
+    /// A workspace restored from a snapshot.
+    Restore,
     /// A person added, corrected, or deleted a graph node or edge.
     GraphEdit,
     EmbeddingsRefresh,
@@ -719,6 +723,8 @@ history_enum!(AuditAction, Unknown, {
     GraphReview => "graph_review",
     GraphRevalidate => "graph_revalidate",
     GraphMerge => "graph_merge",
+    Snapshot => "snapshot",
+    Restore => "restore",
     GraphEdit => "graph_edit",
     EmbeddingsRefresh => "embeddings_refresh",
     EmbeddingsStatus => "embeddings_status",
@@ -1363,6 +1369,16 @@ impl ControlPlane {
         Ok(ws)
     }
 
+    /// One round trip to `control.db`, for a readiness check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database does not answer.
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// The workspace called `name`.
     ///
     /// # Errors
@@ -1454,6 +1470,68 @@ impl ControlPlane {
             Bound::new(&update)?
         };
         bound.query().execute(&self.pool).await?;
+        self.get_workspace(id)
+            .await?
+            .ok_or_else(|| ResourceKind::Workspace.missing(id.to_string()))
+    }
+
+    /// Delete a workspace's row, which takes its members and API tokens
+    /// with it, and commit the audit row with it. The files are the
+    /// caller's to remove once nothing holds them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace is missing or the write fails.
+    pub async fn delete_workspace(&self, id: &WorkspaceId, audit: AuditEntry) -> Result<()> {
+        let delete = Bound::new(
+            Query::delete()
+                .from_table(Workspaces::Table)
+                .and_where(Expr::col(Workspaces::Id).eq(id)),
+        )?;
+        let audit = audit
+            .in_workspace(id)
+            .on(ResourceKind::Workspace.id(id.as_str()));
+        if !self.commit_audited(vec![delete], audit).await? {
+            return Err(ResourceKind::Workspace.missing(id.to_string()));
+        }
+        tracing::info!(workspace_id = %id, "deleted workspace");
+        Ok(())
+    }
+
+    /// Give a workspace a new name, audited in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::WorkspaceExists`] when the name is taken, an error
+    /// when the workspace is missing or the write fails.
+    pub async fn rename_workspace(
+        &self,
+        id: &WorkspaceId,
+        name: &WorkspaceName,
+        audit: AuditEntry,
+    ) -> Result<WorkspaceRow> {
+        let update = Bound::new(
+            Query::update()
+                .table(Workspaces::Table)
+                .value(Workspaces::Name, name.as_str())
+                .value(Workspaces::UpdatedAt, Expr::cust("CURRENT_TIMESTAMP"))
+                .and_where(Expr::col(Workspaces::Id).eq(id)),
+        )?;
+        let audit = audit
+            .in_workspace(id)
+            .on(ResourceKind::Workspace.id(id.as_str()));
+        let changed = self
+            .commit_audited(vec![update], audit)
+            .await
+            .map_err(|e| match &e {
+                Error::Sqlite(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                    Error::WorkspaceExists(name.as_str().to_owned())
+                }
+                _ => e,
+            })?;
+        if !changed {
+            return Err(ResourceKind::Workspace.missing(id.to_string()));
+        }
         self.get_workspace(id)
             .await?
             .ok_or_else(|| ResourceKind::Workspace.missing(id.to_string()))

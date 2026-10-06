@@ -2047,12 +2047,17 @@ mode emits:
 
 ```
 GET    /healthz                                   liveness, no auth
+GET    /readyz                                    readiness, no auth: 200 {control_db, data_dir, vault_key} each `ok`, else 503 with the failing probe's error
+GET    /metrics                                   Prometheus text; loopback, or an admin's bearer
 POST   /api/v1/auth/login                         {username,password} -> token (web session)
 ANY    /mcp/v1/{id}                               MCP over streamable HTTP, same bearer (section 11.3)
 GET    /api/v1/workspaces
 POST   /api/v1/workspaces
+POST   /api/v1/workspaces/restore?name=           admin; body: a snapshot tar -> 201 {workspace, manifest, members_kept, members_missing, providers_dropped}
 GET    /api/v1/workspaces/{id}
-PATCH  /api/v1/workspaces/{id}                    settings
+PATCH  /api/v1/workspaces/{id}                    settings; `name` renames (409 when taken)
+DELETE /api/v1/workspaces/{id}                    owner; the row, members, tokens, and directory go at once (409 while a job of it is active); audit rows stay
+GET    /api/v1/workspaces/{id}/snapshot           owner; the workspace as a tar (manifest.json, data.duckdb after a checkpoint, files/), audited `snapshot`
 POST   /api/v1/auth/login  POST /api/v1/auth/logout  GET /api/v1/auth/me
 POST   /api/v1/workspaces/{id}/query              {prompt, session_id?, mode?, allow_write?}
 POST   /api/v1/workspaces/{id}/query/stream       same, SSE agent events; closing the stream cancels the turn;
@@ -2286,7 +2291,8 @@ cancellation token in its `TurnRequest`.
 quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query]
       [--allow-write] [-c | -r SESSION] [--stdin] [--verbose]
 quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
-quack workspace create NAME | list [--format json]
+quack workspace create NAME | list [--format json] | rename NAME NEW_NAME
+quack workspace delete NAME [-y] | snapshot NAME [--to FILE] | restore FILE|- [--name NAME]
 quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--author A] [--authored DATE] [--tag T].. [--pin] [--no-embed] [--replace [ID]] [--prune]
 quack docs [--format json] [--all] [--pin ID | --unpin ID | --delete ID | --tag ID TAG | --untag ID TAG | --author ID NAME | --authored ID DATE]
 quack embeddings refresh [-w NAME] [-y]
@@ -2322,6 +2328,8 @@ quack auth unregister [--issuer URL] [--yes]
 quack config [--changed] [--format json]
 quack doctor [-w NAME] [--offline] [--format json]
 quack serve [--bind ADDR] [--local]
+quack ready [URL]    GET /readyz on the server (the default URL from [server].bind), exit 0 or 1; the image's health check
+quack vault export-key [--to FILE] [-y]    the vault key, to a 0600 file or (after a yes) stdout
 quack mcp [-w NAME] [--allow-write]
 quack user add [--admin] | list [--format json] ; quack token create|list|revoke ;
 quack member add|remove|list ; quack audit [filters] [--format text|json|csv|ocsf]   (server admin)
@@ -2351,6 +2359,30 @@ way), so a new install needs no setup step. Naming the default with `-w` does th
 name is a `WorkspaceName`: trimmed, non-empty, and without `/`, `\`, or `.`. The CLI verb,
 `POST /api/v1/workspaces`, the web console, and `default_workspace` in `config.toml` all go
 through that type. Workspaces created before the rule keep their names and still open.
+
+**Snapshot, restore, rename, delete.** A workspace is one directory under
+`{data_dir}/workspaces/{id}` plus a `control.db` row, and `storage::backup` moves the pair as
+one tar: `manifest.json` first (format version, the quack, schema, and DuckDB versions that
+wrote the file, the embedding profile, the name, classification, provider allow-list, and
+members by username and role; never tokens), then `data.duckdb` after a `CHECKPOINT` on the
+writer's thread, so no write lands between the checkpoint and the copy, then `files/`.
+`quack workspace snapshot NAME [--to FILE]`, the Settings page's download, and
+`GET .../snapshot` write it; `quack workspace restore FILE [--name N]` and
+`POST /api/v1/workspaces/restore` read it: a new row (the manifest's name unless given),
+the tar unpacked into the new directory (paths that leave it are refused), the settings
+applied (allowed providers this server lacks are dropped and reported), each manifest member
+this server has a user for given their role again (the rest reported), and one open of the
+file, which runs any schema upgrade; a manifest from a newer format or schema is refused with
+the quack to run, and a failure after the row exists deletes the row and directory again.
+The restore is audited as `restore` with the snapshot's date and version in the detail.
+`quack workspace rename OLD NEW` and `name` on `PATCH .../workspaces/{id}` (the Settings
+page's Name field) change the name the unique index guards. `quack workspace delete NAME`
+(asks; `-y` skips), `DELETE .../workspaces/{id}`, and the Settings page's form (the name
+typed again) delete at once: the server lets go of the open file and its MCP transports
+(409 while a job of the workspace is queued or running), the row goes with its members and
+API tokens in one audited transaction, then the directory. `audit_log` has no foreign key to
+`workspaces`, so the rows stay. There is no archive state and no undo; the snapshot is the
+undo.
 
 **Exit codes:** 0 ok, 1 runtime error, 2 usage (an unknown `-w` included), 3 write refused,
 4 auth required, 5 the result of `quack saved run --exit-code` changed. A reader that closes
@@ -2385,7 +2417,10 @@ needs one:
   `[context].max_tokens` together exceed it;
 - the chat model: what a turn sends it; an effort level it lacks, or a GPT-5.6 model on Chat
   Completions without effort `"none"`, fails, since every turn would be refused;
-- `[server]`: a non-loopback bind warns, `local` off loopback fails, no users yet is noted.
+- `[server]`: a non-loopback bind warns, `local` off loopback fails, no users yet is noted;
+- the vault key: where it is (the keychain or `vault.key`), with `quack vault export-key` as
+  the way to keep a copy off the host, since a restored `control.db` opens its sealed tokens
+  only with it.
 
 With no chat model, it looks for a local Ollama and suggests a `config.toml` snippet with
 that Ollama's models. It creates nothing: a missing data directory, control database, or
@@ -2505,7 +2540,16 @@ installers.
     `Authorization` header, each random bearer got a fresh bucket (issue #237). Everyone
     behind one address (a NAT, a same-host reverse proxy) shares one budget.
     `X-Forwarded-For` is not trusted; any client can write it.
-  - `/healthz` is outside every limiter: a throttled health check reads as a dead server.
+  - `/healthz`, `/readyz`, and `/metrics` are outside every limiter: a throttled health
+    check reads as a dead server. `/readyz` answers 503 until `control.db` answers a query,
+    the data directory takes a write, and the vault key can be read; `quack ready` calls it
+    for the container image's `HEALTHCHECK`, since the image has no shell. `/metrics` is
+    Prometheus text (`quack_core::telemetry`, the `metrics` facade with the Prometheus
+    exporter rendering on request, no listener of its own): provider requests, latency, and
+    permit waits by provider, model, and status; retries; HTTP requests by method, route
+    template, and status; jobs by kind and state; the writers' queues; open workspaces.
+    Labels carry ids, kinds, and names only. It is served to loopback without a credential
+    and to an admin's bearer from anywhere else.
   - Per-key state is swept once a minute. governor keeps one entry per caller until
     dropped, so an unswept limiter grows by one entry per address ever seen.
 - **Nothing a caller receives is cached.** Pages, API answers, downloads, and event streams
@@ -2567,6 +2611,8 @@ type = "ollama"
 auth = "none"
 base_url = "http://localhost:11434"
 # max_concurrent_requests = 1          # model requests in flight at once; default 1 for Ollama, 8 otherwise
+# max_retries = 3                      # a 429, 5xx, or dropped connection is sent again this many times
+# retry_backoff_ms = 500               # the first wait; doubles each retry with jitter, a Retry-After header wins, 60 s at most
 # temperature = false                  # send quack's temperature; default true for Ollama only
 # effort = "high"                      # this provider's models, over [analysis]; also background_effort
 
@@ -2689,6 +2735,7 @@ session_idle_minutes = 120              # ... or this long after its last reques
 permission_timeout_seconds = 300        # how long a streamed turn waits for a person to approve a write
 shutdown_grace_seconds = 20             # how long SIGTERM or Ctrl-C waits for jobs and requests to end; keep the supervisor's kill timeout above it
 secure_cookies = "auto"                 # "always": Secure cookies on loopback too (same-host TLS proxy)
+log_format = "text"                     # "json": one JSON object per line for a log collector; the access log is `quack::access` at debug
 
 [server.oidc]            # optional: "Sign in with <issuer>" beside the password form
 issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"

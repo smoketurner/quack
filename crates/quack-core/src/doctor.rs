@@ -35,6 +35,7 @@ use crate::proxy::Proxies;
 use crate::storage::control::ControlPlane;
 use crate::storage::workspace::{MetaKey, WorkspaceDb};
 use crate::text::Count;
+use crate::vault::Vault;
 use rig::ProviderError;
 use rig::error::ErrorKind;
 use rig::operation::RerankRequest;
@@ -81,6 +82,8 @@ pub enum Area {
     Server,
     /// The OAuth clients quack registered itself (`quack auth register`).
     Auth,
+    /// The key that seals every stored token (`quack vault export-key`).
+    Vault,
 }
 
 text_enum!(Area, "doctor area", {
@@ -95,6 +98,7 @@ text_enum!(Area, "doctor area", {
     Reranker => "reranker",
     Server => "server",
     Auth => "auth",
+    Vault => "vault",
 });
 
 /// One finding: what was checked, how it came out, and what to do.
@@ -339,6 +343,7 @@ pub async fn run(inspection: &Inspection, options: &Options) -> Report {
             KeySource::Keychain,
         )
         .await;
+        check_vault(&mut report, config, KeySource::Keychain).await;
         report
     })
     .await
@@ -1490,6 +1495,38 @@ async fn check_sign_in(report: &mut Report, config: &Config, probing: Probing) {
             .fix("check the claim's name, and that the issuer is configured to put groups in its tokens"),
         );
     }
+}
+
+/// Where the vault key is, since every sealed token in `control.db` is
+/// unreadable without it: a copy kept off this host restores them.
+pub(crate) async fn check_vault(report: &mut Report, config: &Config, key_source: KeySource) {
+    let vault = Vault::new(config.data_dir(), key_source);
+    let check = match vault.key_text().await {
+        Err(e) => Check::new(
+            Area::Vault,
+            Status::Fail,
+            format!("the vault key cannot be read: {e}"),
+        )
+        .fix("unlock the keychain, or check vault.key's permissions"),
+        Ok(None) => Check::new(
+            Area::Vault,
+            Status::Ok,
+            "no vault key yet; one is made when the first token is stored",
+        ),
+        Ok(Some(_)) => {
+            let location = vault
+                .key_location()
+                .await
+                .map_or_else(|e| e.to_string(), |l| l.to_string());
+            Check::new(
+                Area::Vault,
+                Status::Ok,
+                format!("the vault key is in the {location}; the sealed tokens in control.db open only with it"),
+            )
+            .fix("`quack vault export-key --to FILE` keeps a copy off this host; a restore of control.db elsewhere needs it as vault.key")
+        }
+    };
+    report.push(check);
 }
 
 /// Warn about the temporary sign-in clients an interrupted `quack auth
