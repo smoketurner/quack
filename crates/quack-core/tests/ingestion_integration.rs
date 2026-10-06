@@ -2243,6 +2243,8 @@ fn piped_bytes_load_as_a_temporary_stdin_table() {
         Some(&serde_json::json!(2))
     );
 
+    // Closed first: Windows lets no second handle open the file (#448).
+    drop(db);
     let reopened = WorkspaceDb::open(&config, "ws-stdin").unwrap();
     assert!(
         !reopened
