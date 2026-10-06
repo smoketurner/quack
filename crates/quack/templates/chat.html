@@ -38,7 +38,16 @@
         {% if !m.steps.is_empty() %}
         <details class="mt-2 text-sm"><summary class="cursor-pointer text-slate-400">{{ m.steps.len() }} steps</summary>
           <ol class="mt-1 space-y-1 font-mono text-xs wrap-anywhere">
-            {% for st in m.steps %}<li><span class="font-semibold">{{ st.tool }}</span> {{ st.detail }} <span class="text-slate-400">→ {{ st.summary }}, {{ st.duration_ms }} ms</span></li>{% endfor %}
+            {% for st in m.steps %}<li><span class="font-semibold">{{ st.tool }}</span> {{ st.detail }} <span class="text-slate-400">→ {{ st.summary }}, {{ st.duration_ms }} ms</span>
+              {% if !st.columns.is_empty() %}
+              <details class="step-result mt-1"><summary class="cursor-pointer text-slate-500">rows</summary>
+                <div class="mt-1 max-h-72 overflow-auto rounded border border-slate-800"><table class="min-w-full text-xs"><thead><tr class="border-b border-slate-700 text-left">{% for c in st.columns %}<th scope="col" class="px-2 py-1 font-mono whitespace-nowrap">{{ c }}</th>{% endfor %}</tr></thead><tbody>
+                  {% for row in st.cells %}<tr class="border-b border-slate-800">{% for v in row %}<td class="px-2 py-1 whitespace-nowrap">{{ v }}</td>{% endfor %}</tr>{% endfor %}
+                </tbody></table></div>
+                {% if let Some(rows) = st.rows %}{% if *rows > st.cells.len() as u64 %}<p class="mt-1 text-slate-500">first {{ st.cells.len() }} of {{ rows }} rows</p>{% endif %}{% endif %}
+                <form method="post" action="/w/{{ ws.membership.workspace.id }}/sql.csv" class="mt-1"><input type="hidden" name="sql" value="{{ st.detail }}"><button type="submit" class="text-blue-400 hover:underline">Export full result</button></form>
+              </details>
+              {% endif %}</li>{% endfor %}
           </ol></details>
         {% endif %}
         <div class="answer mt-2{% if m.role == "user" %} whitespace-pre-wrap{% endif %}">{{ m.content_html|safe }}</div>

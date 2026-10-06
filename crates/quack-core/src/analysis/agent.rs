@@ -773,15 +773,21 @@ impl BuildContext<'_> {
             .preamble(system_prompt)
             .tool(search)
             .tool(ReadDocumentTool::new(reader(), ctx.retrieval_config))
-            .tool(RunSqlTool::new(
-                Arc::clone(&ctx.shared_db),
-                reader(),
-                ctx.analysis_config.max_query_rows,
-            ))
+            .tool(
+                RunSqlTool::new(
+                    Arc::clone(&ctx.shared_db),
+                    reader(),
+                    ctx.analysis_config.max_query_rows,
+                )
+                .with_step_rows(ctx.analysis_config.step_result_rows as usize),
+            )
             .tool(DescribeTableTool(reader()))
             .tool(ListTablesTool(reader()))
             .tool(ListDocumentsTool(reader()))
-            .tool(CreateChartTool::new(reader()))
+            .tool(
+                CreateChartTool::new(reader())
+                    .with_step_rows(ctx.analysis_config.step_result_rows as usize),
+            )
             .temperature(0.1)
             .add_hook(InvalidToolCalls)
             .add_hook(EmptyAnswer);

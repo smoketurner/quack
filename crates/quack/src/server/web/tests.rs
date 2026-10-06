@@ -80,6 +80,7 @@ fn transcript_folds_tool_rows_into_the_answer_after_them() {
         };
     let tool = |detail: &str| {
         Some(MessageMeta::Tool(ToolMeta {
+            result: None,
             tool: ToolName::RunSql,
             detail: detail.to_owned(),
             duration_ms: 3,

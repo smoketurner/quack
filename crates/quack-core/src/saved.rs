@@ -542,6 +542,7 @@ mod tests {
             detail: sql.to_owned(),
             summary: rows.map_or_else(|| String::from("refused"), |n| format!("{n} rows")),
             rows,
+            result: None,
             duration_ms: 1,
         }
     }

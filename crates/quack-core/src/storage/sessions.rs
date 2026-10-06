@@ -24,7 +24,7 @@ use rig::memory::{ConversationMemory, MemoryError, MemoryPolicy, TokenWindowMemo
 use rig::message::{AssistantContent, Message, UserContent};
 use rig::wasm_compat::WasmBoxedFuture;
 
-use super::workspace::WorkspaceDb;
+use super::workspace::{QueryResults, WorkspaceDb};
 use super::writer::Writer;
 
 /// How the agent may answer in a session.
@@ -148,6 +148,9 @@ pub struct ToolMeta {
     pub duration_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<u64>,
+    /// The first rows the statement returned, kept with the step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<QueryResults>,
 }
 
 impl ToolMeta {
@@ -159,6 +162,7 @@ impl ToolMeta {
             detail: self.detail.clone(),
             summary,
             rows: self.rows,
+            result: self.result.clone(),
             duration_ms: self.duration_ms,
         }
     }
@@ -171,6 +175,7 @@ impl From<&ToolStep> for ToolMeta {
             detail: step.detail.clone(),
             duration_ms: step.duration_ms,
             rows: step.rows,
+            result: step.result.clone(),
         }
     }
 }

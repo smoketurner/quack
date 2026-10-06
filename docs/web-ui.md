@@ -165,8 +165,12 @@ row is processing (marked `data-pending`).
   download post it as before, and without JavaScript the textarea is the editor.
   Ctrl/Cmd+Enter runs the statement.
 - `static/js/app.js` is quack's own. It posts to `/api/v1/workspaces/{id}/query/stream`,
-  parses the SSE events, and renders the steps block, the answer, citations as links to the
-  passage each one cites, and the chart spec as an ECharts option. A `permission_required` event
+  parses the SSE events, and renders the steps block (a `run_sql` or `create_chart` step's
+  kept rows as a collapsed grid with an Export full result form that posts the statement to
+  the SQL page's download), the answer, citations as links to the
+  passage each one cites, and the chart spec as an ECharts option with the toolbox's
+  save-as-image and read-only data view, `stack` on bar and line series when the spec is
+  stacked, and a Download CSV link built from the spec as a data URL. A `permission_required` event
   becomes a card with the statement, Run it, Don't run it, and Allow for this turn, posted to
   `.../sessions/{sid}/permissions/{request}`, and the time the turn stops waiting. When the event carries a `notice`
   (its `reason` is `read_documents`: the turn read document text, so the write is asked for even
