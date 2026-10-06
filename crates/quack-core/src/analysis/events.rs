@@ -16,6 +16,7 @@ use super::citations::CitationRegistry;
 use super::policy::Hold;
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
+use crate::storage::control::Outcome;
 
 /// A turn's embeddings, by input (the role is part of it).
 type EmbeddingCache = HashMap<Input, Vector>;
@@ -135,8 +136,10 @@ pub enum Delivery {
     TurnGone,
 }
 
-/// The interface's answer to a permission request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The interface's answer to a permission request: the API body's
+/// `decision` and the audit detail's, as `deny`, `allow`, `allow_turn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Decision {
     Deny,
     /// This statement only.
@@ -144,7 +147,28 @@ pub enum Decision {
     /// This statement and every later write in the same turn held for the
     /// same reason (the terminal's `a`). The interface keeps its own flag for
     /// the turns after.
-    AllowForTurn,
+    AllowTurn,
+}
+
+impl Decision {
+    /// The text form, as the API body and the audit detail carry it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Allow => "allow",
+            Self::AllowTurn => "allow_turn",
+        }
+    }
+
+    /// How the audit log records the answer.
+    #[must_use]
+    pub const fn outcome(self) -> Outcome {
+        match self {
+            Self::Allow | Self::AllowTurn => Outcome::Allowed,
+            Self::Deny => Outcome::Denied,
+        }
+    }
 }
 
 impl PermissionRequest {
@@ -156,7 +180,7 @@ impl PermissionRequest {
     /// Run this statement and every later write of the turn. `TurnGone`
     /// means nothing ran.
     pub fn allow_for_turn(self) -> Delivery {
-        self.answer(Decision::AllowForTurn)
+        self.answer(Decision::AllowTurn)
     }
 
     /// Refuse the statement. A refusal needs no turn to take it: a request
@@ -167,7 +191,9 @@ impl PermissionRequest {
         }
     }
 
-    fn answer(self, decision: Decision) -> Delivery {
+    /// Give `decision` to the turn. `TurnGone` means it had stopped
+    /// waiting, so nothing ran.
+    pub fn answer(self, decision: Decision) -> Delivery {
         if self.reply.send(decision).is_ok() {
             Delivery::Delivered
         } else {
@@ -266,7 +292,7 @@ pub struct TurnRecorder {
     sink: EventSink,
     steps: Arc<Mutex<Vec<ToolStep>>>,
     citations: CitationRegistry,
-    /// The hold the interface answered `AllowForTurn` to: later writes in
+    /// The hold the interface answered `AllowTurn` to: later writes in
     /// this turn held for that reason, or one before it, run without asking.
     writes_granted: Arc<Mutex<Option<Hold>>>,
     /// Embeddings computed so far this turn, by exact input text: more
@@ -425,7 +451,7 @@ impl TurnRecorder {
         match answer.await.unwrap_or(Decision::Deny) {
             Decision::Deny => false,
             Decision::Allow => true,
-            Decision::AllowForTurn => {
+            Decision::AllowTurn => {
                 *self
                     .writes_granted
                     .lock()
@@ -435,7 +461,7 @@ impl TurnRecorder {
         }
     }
 
-    /// The hold an `AllowForTurn` answer has covered so far.
+    /// The hold an `AllowTurn` answer has covered so far.
     fn granted(&self) -> Option<Hold> {
         *self
             .writes_granted

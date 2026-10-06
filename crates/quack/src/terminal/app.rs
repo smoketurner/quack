@@ -21,7 +21,7 @@ use jiff::Timestamp;
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::citations::{Citation, Sources};
 use quack_core::analysis::events::{
-    self, AgentEvent, Delivery, PermissionRequest, ToolName, ToolStep,
+    self, AgentEvent, Decision, Delivery, PermissionRequest, ToolName, ToolStep,
 };
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
@@ -310,27 +310,6 @@ pub(crate) struct PendingWrite<'a> {
     pub(crate) notice: Option<&'static str>,
     /// Prompts queued behind this one.
     pub(crate) waiting: usize,
-}
-
-/// An answer to a write prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Answer {
-    Yes,
-    No,
-    /// Yes, and allow writes for the rest of the session.
-    Always,
-}
-
-impl Answer {
-    /// The answer a key gives, if it is one: `y`, `n` (or Esc), `a`.
-    const fn of(code: KeyCode) -> Option<Self> {
-        match code {
-            KeyCode::Char('y' | 'Y') => Some(Self::Yes),
-            KeyCode::Char('a' | 'A') => Some(Self::Always),
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(Self::No),
-            _ => None,
-        }
-    }
 }
 
 /// An agent turn submitted as a job, and where its text goes. Its events
@@ -1806,9 +1785,13 @@ impl App {
         }
     }
 
+    /// The answer a key gives, if it is one: `y`, `n` (or Esc), `a`.
     fn handle_permission_key(&mut self, code: KeyCode) {
-        let Some(answer) = Answer::of(code) else {
-            return;
+        let answer = match code {
+            KeyCode::Char('y' | 'Y') => Decision::Allow,
+            KeyCode::Char('a' | 'A') => Decision::AllowTurn,
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Decision::Deny,
+            _ => return,
         };
         let Some(prompt) = self.prompts.pop_front() else {
             return;
@@ -1820,13 +1803,13 @@ impl App {
     }
 
     /// The user's answer to a write the agent asked for.
-    fn decide_agent_write(&mut self, request: PermissionRequest, answer: Answer) {
+    fn decide_agent_write(&mut self, request: PermissionRequest, answer: Decision) {
         match answer {
-            Answer::Yes => match request.allow() {
+            Decision::Allow => match request.allow() {
                 Delivery::Delivered => self.note(MessageKind::System, "Allowed."),
                 Delivery::TurnGone => self.note(MessageKind::System, TURN_GONE),
             },
-            Answer::Always => {
+            Decision::AllowTurn => {
                 // The rest of this turn through the request, the turns
                 // after (queued ones included) through the shared flag each
                 // reads when it starts.
@@ -1837,7 +1820,7 @@ impl App {
                     self.note(MessageKind::System, TURN_GONE);
                 }
             }
-            Answer::No => {
+            Decision::Deny => {
                 request.deny();
                 self.note(MessageKind::System, "Refused.");
             }
@@ -1845,17 +1828,17 @@ impl App {
     }
 
     /// The user's answer to a typed statement's write prompt.
-    fn decide_pending_sql(&mut self, sql: String, answer: Answer) {
+    fn decide_pending_sql(&mut self, sql: String, answer: Decision) {
         match answer {
-            Answer::No => {
+            Decision::Deny => {
                 self.note(MessageKind::System, "Refused.");
                 return;
             }
-            Answer::Always => {
+            Decision::AllowTurn => {
                 self.allow_write.store(true, Ordering::Relaxed);
                 self.note(MessageKind::System, ALLOWED_FOR_SESSION);
             }
-            Answer::Yes => {}
+            Decision::Allow => {}
         }
         self.execute_direct_sql(sql, Side::Write);
     }
