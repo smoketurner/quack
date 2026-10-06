@@ -9,13 +9,15 @@ use duckdb::types::ToSqlOutput;
 
 use super::resolve::MergeStatus;
 use super::{
-    Drift, Edge, GraphStatus, Node, NormalizedLabel, Origin, Properties, Provenance, Standing,
+    Drift, Edge, GraphStatus, Node, NormalizedLabel, Origin, Properties, Provenance,
+    ProvenanceColumns, Standing, tables,
 };
 use crate::embedding::Vector;
 use crate::error::{Error, Result};
-use crate::ids::{ChunkId, ClassId, DocumentId, EdgeId, NodeId};
+use crate::ids::{ChunkId, ClassId, DocumentId, EdgeId, NodeId, RelationId};
 use crate::ontology::{IdRenames, Ontology, OntologyVersion, store as ontology_store};
-use crate::storage::workspace::{MetaKey, WorkspaceDb};
+use crate::storage::control::ResourceKind;
+use crate::storage::workspace::{MetaKey, SamplePool, WorkspaceDb};
 
 /// A node to store: merged into an existing one with the same normalized
 /// label and class, else inserted.
@@ -55,6 +57,31 @@ impl Source {
             },
             confidence: 1.0,
         }
+    }
+}
+
+/// A person's statement that a node or edge holds: who, and why. Written
+/// as one manual provenance row per subject, replacing an earlier one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Assertion {
+    /// The server user; `None` from the command line.
+    pub author: Option<String>,
+    pub note: Option<String>,
+}
+
+impl Assertion {
+    /// The row to write: `asserted_at` is the database's `now()`.
+    fn write(&self, db: &WorkspaceDb, subject_id: &str) -> Result<()> {
+        let note = self
+            .note
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty());
+        db.connection().execute(
+            "INSERT OR REPLACE INTO _quack_provenance              (subject_id, document_id, chunk_id, table_name, row_key, confidence, author, note, asserted_at)              VALUES (?, NULL, '', '', '', 1.0, ?, ?, now())",
+            duckdb::params![subject_id, self.author.as_deref(), note],
+        )?;
+        Ok(())
     }
 }
 
@@ -183,6 +210,13 @@ pub fn add_provenance(
             table_name,
             row_key,
         } => (None, "", table_name.as_str(), row_key.as_str()),
+        Origin::Manual { author, note, .. } => {
+            return Assertion {
+                author: author.clone(),
+                note: note.clone(),
+            }
+            .write(db, subject_id);
+        }
     };
     db.connection().execute(
         "INSERT OR IGNORE INTO _quack_provenance (subject_id, document_id, chunk_id, table_name, row_key, confidence) \
@@ -455,7 +489,8 @@ pub fn provenance_of(db: &WorkspaceDb, subject_ids: &[impl AsRef<str>]) -> Resul
         return Ok(Vec::new());
     }
     let mut stmt = db.connection().prepare(
-        "SELECT subject_id, document_id, chunk_id, table_name, row_key, confidence \
+        "SELECT subject_id, document_id, chunk_id, table_name, row_key, confidence, \
+                author, note, CAST(asserted_at AS VARCHAR) \
          FROM _quack_provenance WHERE list_contains(?::VARCHAR[], subject_id) \
          ORDER BY subject_id, chunk_id, table_name, row_key",
     )?;
@@ -464,7 +499,15 @@ pub fn provenance_of(db: &WorkspaceDb, subject_ids: &[impl AsRef<str>]) -> Resul
     while let Some(row) = rows.next()? {
         out.push(Provenance {
             subject_id: row.get(0)?,
-            origin: Origin::from_columns(row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
+            origin: Origin::from_columns(ProvenanceColumns {
+                document_id: row.get(1)?,
+                chunk_id: row.get(2)?,
+                table_name: row.get(3)?,
+                row_key: row.get(4)?,
+                author: row.get(6)?,
+                note: row.get(7)?,
+                asserted_at: row.get(8)?,
+            }),
             confidence: row.get::<_, Option<f64>>(5)?.unwrap_or(1.0),
         });
     }
@@ -534,17 +577,18 @@ pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
     )?;
     let built_with_version = built_with(db)?;
     let ontology_version = ontology_store::latest_version(db)?;
-    let missing_tables = match ontology_store::current(db)? {
+    let (missing_tables, pending_tables) = match ontology_store::current(db)? {
         Some(ontology) => {
             let tables = db.list_tables()?;
-            ontology
+            let missing = ontology
                 .mappings
                 .iter()
                 .map(|m| m.table.clone())
                 .filter(|t| !tables.contains(t))
-                .collect()
+                .collect();
+            (missing, tables::pending(db, &ontology, &tables)?)
         }
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
     Ok(GraphStatus {
         nodes: u64::try_from(nodes).unwrap_or(0),
@@ -558,23 +602,415 @@ pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
         pending_merges: u64::try_from(pending_merges).unwrap_or(0),
         drift: drift(db)?,
         missing_tables,
+        pending_chunks: db.pool_size(SamplePool::NotGraphExtracted)?,
+        pending_tables,
     })
 }
 
-/// Remove every node, edge, provenance row, merge proposal, and the drift.
+/// What [`clear`] leaves standing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keep {
+    /// Nodes and edges a person asserted, with their manual provenance
+    /// (an edge only while both its ends stay).
+    Asserted,
+    Nothing,
+}
+
+/// Remove every node, edge, provenance row, merge proposal, the record of
+/// extracted chunks and built tables, and the drift, except what `keep`
+/// names.
 ///
 /// # Errors
 ///
 /// Returns an error if a delete fails.
-pub fn clear(db: &WorkspaceDb) -> Result<()> {
+pub fn clear(db: &WorkspaceDb, keep: Keep) -> Result<()> {
+    const ASSERTED: &str = "SELECT subject_id FROM _quack_provenance WHERE asserted_at IS NOT NULL";
     let conn = db.connection();
+    match keep {
+        Keep::Nothing => conn.execute_batch(
+            "DELETE FROM _quack_provenance; DELETE FROM _quack_graph_edges; \
+             DELETE FROM _quack_graph_nodes;",
+        )?,
+        Keep::Asserted => conn.execute_batch(&format!(
+            "DELETE FROM _quack_graph_nodes WHERE id NOT IN ({ASSERTED}); \
+             DELETE FROM _quack_graph_edges WHERE id NOT IN ({ASSERTED}) \
+                OR source_node_id NOT IN (SELECT id FROM _quack_graph_nodes) \
+                OR target_node_id NOT IN (SELECT id FROM _quack_graph_nodes); \
+             DELETE FROM _quack_provenance WHERE asserted_at IS NULL \
+                OR (subject_id NOT IN (SELECT id FROM _quack_graph_nodes) \
+                    AND subject_id NOT IN (SELECT id FROM _quack_graph_edges));"
+        ))?,
+    }
     conn.execute_batch(
-        "DELETE FROM _quack_provenance; DELETE FROM _quack_graph_edges; \
-         DELETE FROM _quack_graph_nodes; DELETE FROM _quack_graph_merges; \
-         DELETE FROM _quack_graph_extracted;",
+        "DELETE FROM _quack_graph_merges; DELETE FROM _quack_graph_extracted; \
+         DELETE FROM _quack_graph_tables_built;",
     )?;
     db.set_meta(MetaKey::GraphDrift, "{}")?;
     db.delete_meta(MetaKey::GraphBuiltWithOntologyVersion)
+}
+
+/// A node as a person refers to it: its id, or its exact label (an alias
+/// counts), in one class or any.
+///
+/// # Errors
+///
+/// Returns an error when nothing matches, or more than one node does (the
+/// error names them, so the caller can give the id).
+pub fn find_node(db: &WorkspaceDb, reference: &str, class_id: Option<&str>) -> Result<Node> {
+    let reference = reference.trim();
+    if let Some(found) = node(db, &NodeId::from(reference))? {
+        return Ok(found);
+    }
+    let matches = super::traverse::resolve_entry(db, reference, class_id, None)?;
+    match matches.as_slice() {
+        [] => Err(ResourceKind::GraphNode.missing(reference)),
+        [one] => Ok(one.clone()),
+        many => Err(Error::Analysis(format!(
+            "'{reference}' names {} nodes; give the id: {}",
+            many.len(),
+            many.iter()
+                .map(|n| format!("{n} {}", n.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// What a person's node write did: the node, and whether it is new.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Asserted<T> {
+    #[serde(flatten)]
+    pub subject: T,
+    pub created: bool,
+}
+
+/// The ontology a person's write is checked against.
+fn asserting_ontology(db: &WorkspaceDb) -> Result<Ontology> {
+    ontology_store::current(db)?.ok_or_else(|| {
+        Error::Ontology(String::from(
+            "no ontology yet: the graph takes only classes and relations an ontology defines",
+        ))
+    })
+}
+
+/// Assert a node: a new one of `class_id`, or the one that already has
+/// this label and class, which takes the given properties (its own
+/// values give way) and stops being provisional. Writes the manual
+/// provenance row either way, in one transaction.
+///
+/// # Errors
+///
+/// Returns an error when there is no ontology, the class is not in it,
+/// the label is blank, or a write fails.
+pub fn create_node(
+    db: &WorkspaceDb,
+    node: &NewNode,
+    assertion: &Assertion,
+) -> Result<Asserted<Node>> {
+    let ontology = asserting_ontology(db)?;
+    if !ontology.defines_class(node.class_id.as_str()) {
+        return Err(Error::Ontology(format!(
+            "no class '{}' in the ontology; the classes are {}",
+            node.class_id,
+            ontology.class_ids().join(", ")
+        )));
+    }
+    let normalized = NormalizedLabel::new(&node.label);
+    if normalized.is_empty() {
+        return Err(Error::Analysis(String::from("a node needs a label")));
+    }
+    let tx = db.connection().unchecked_transaction()?;
+    let existing: Option<(NodeId, Option<String>)> = tx
+        .query_row(
+            "SELECT id, CAST(properties AS VARCHAR) FROM _quack_graph_nodes \
+             WHERE normalized_label = ? AND class_id = ?",
+            duckdb::params![normalized, node.class_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (id, created) = if let Some((id, properties)) = existing {
+        let mut merged = node.properties.clone();
+        merged.fill_from(&Properties::from_column(properties.as_deref()));
+        tx.execute(
+            "UPDATE _quack_graph_nodes SET properties = ?, provisional = false WHERE id = ?",
+            duckdb::params![merged.to_json(), id],
+        )?;
+        (id, false)
+    } else {
+        let id = NodeId::generate();
+        tx.execute(
+            "INSERT INTO _quack_graph_nodes (id, label, normalized_label, class_id, properties, provisional) \
+             VALUES (?, ?, ?, ?, ?, false)",
+            duckdb::params![
+                id,
+                node.label.trim(),
+                normalized,
+                node.class_id,
+                node.properties.to_json()
+            ],
+        )?;
+        (id, true)
+    };
+    assertion.write(db, id.as_str())?;
+    tx.commit()?;
+    let subject =
+        self::node(db, &id)?.ok_or_else(|| ResourceKind::GraphNode.missing(id.as_str()))?;
+    Ok(Asserted { subject, created })
+}
+
+/// What a person changes on a node; a field left `None` stays.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeEdit {
+    pub label: Option<String>,
+    pub class: Option<ClassId>,
+    /// Merged into the node's properties: a value sets its key, `null`
+    /// removes it.
+    pub properties: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl NodeEdit {
+    /// Whether anything is set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.label.is_none() && self.class.is_none() && self.properties.is_none()
+    }
+}
+
+/// Correct a node: its label, class, or properties, under the ontology,
+/// with the manual provenance row written. A class change must leave
+/// every edge at the node allowed; a label change must not collide with
+/// another node of the class.
+///
+/// # Errors
+///
+/// Returns an error when the node is missing, the change breaks the
+/// ontology or collides, or a write fails.
+pub fn update_node(
+    db: &WorkspaceDb,
+    id: &NodeId,
+    edit: &NodeEdit,
+    assertion: &Assertion,
+) -> Result<Node> {
+    let ontology = asserting_ontology(db)?;
+    let current = node(db, id)?.ok_or_else(|| ResourceKind::GraphNode.missing(id.as_str()))?;
+    let label = edit
+        .label
+        .as_deref()
+        .map_or_else(|| current.label.clone(), |l| l.trim().to_owned());
+    let normalized = NormalizedLabel::new(&label);
+    if normalized.is_empty() {
+        return Err(Error::Analysis(String::from("a node needs a label")));
+    }
+    let class_id = edit
+        .class
+        .clone()
+        .unwrap_or_else(|| current.class_id.clone());
+    if !ontology.defines_class(class_id.as_str()) {
+        return Err(Error::Ontology(format!(
+            "no class '{class_id}' in the ontology; the classes are {}",
+            ontology.class_ids().join(", ")
+        )));
+    }
+    let tx = db.connection().unchecked_transaction()?;
+    let taken: Option<NodeId> = tx
+        .query_row(
+            "SELECT id FROM _quack_graph_nodes WHERE normalized_label = ? AND class_id = ? AND id <> ?",
+            duckdb::params![normalized, class_id, id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(taken) = taken {
+        return Err(Error::Analysis(format!(
+            "another {class_id} node already has the label '{label}' ({taken}); merge them instead"
+        )));
+    }
+    if class_id != current.class_id {
+        for edge in edges(db, std::slice::from_ref(id), EdgeScope::Touching)? {
+            let (source, target) = if edge.source_node_id == *id {
+                (class_id.clone(), class_of(db, &edge.target_node_id)?)
+            } else {
+                (class_of(db, &edge.source_node_id)?, class_id.clone())
+            };
+            if !ontology.allows_edge(edge.relation_id.as_str(), source.as_str(), target.as_str()) {
+                return Err(Error::Ontology(format!(
+                    "as a {class_id} the node could not take its edge {} ({} -> {}); delete that edge first",
+                    edge.relation_id, source, target
+                )));
+            }
+        }
+    }
+    let mut properties = current.properties;
+    if let Some(patch) = &edit.properties {
+        properties.patch(patch);
+    }
+    tx.execute(
+        "UPDATE _quack_graph_nodes SET label = ?, normalized_label = ?, class_id = ?, \
+         properties = ?, provisional = false WHERE id = ?",
+        duckdb::params![label, normalized, class_id, properties.to_json(), id],
+    )?;
+    assertion.write(db, id.as_str())?;
+    tx.commit()?;
+    node(db, id)?.ok_or_else(|| ResourceKind::GraphNode.missing(id.as_str()))
+}
+
+/// The class of a node that must exist.
+fn class_of(db: &WorkspaceDb, id: &NodeId) -> Result<ClassId> {
+    Ok(node(db, id)?
+        .ok_or_else(|| ResourceKind::GraphNode.missing(id.as_str()))?
+        .class_id)
+}
+
+/// Delete a node with its edges, their provenance, its provenance, and
+/// its merge proposals, in one transaction.
+///
+/// # Errors
+///
+/// Returns an error when the node is missing or a delete fails.
+pub fn delete_node(db: &WorkspaceDb, id: &NodeId) -> Result<Node> {
+    let current = node(db, id)?.ok_or_else(|| ResourceKind::GraphNode.missing(id.as_str()))?;
+    let tx = db.connection().unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM _quack_provenance WHERE subject_id IN \
+         (SELECT id FROM _quack_graph_edges WHERE source_node_id = ? OR target_node_id = ?)",
+        duckdb::params![id, id],
+    )?;
+    tx.execute(
+        "DELETE FROM _quack_graph_edges WHERE source_node_id = ? OR target_node_id = ?",
+        duckdb::params![id, id],
+    )?;
+    tx.execute(
+        "DELETE FROM _quack_provenance WHERE subject_id = ?",
+        duckdb::params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM _quack_graph_merges WHERE keep_node_id = ? OR drop_node_id = ?",
+        duckdb::params![id, id],
+    )?;
+    tx.execute(
+        "DELETE FROM _quack_graph_nodes WHERE id = ?",
+        duckdb::params![id],
+    )?;
+    tx.commit()?;
+    Ok(current)
+}
+
+/// An edge a person asserts between two existing nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewEdge {
+    pub source: NodeId,
+    pub target: NodeId,
+    pub relation: RelationId,
+    pub properties: Properties,
+}
+
+/// Assert an edge: a new one, or the one that already joins these nodes
+/// by this relation, which stops being provisional. The relation must
+/// join the two nodes' classes under the ontology. Writes the manual
+/// provenance row either way, in one transaction.
+///
+/// # Errors
+///
+/// Returns an error when a node is missing, the ontology does not allow
+/// the edge, or a write fails.
+pub fn create_edge(
+    db: &WorkspaceDb,
+    edge: &NewEdge,
+    assertion: &Assertion,
+) -> Result<Asserted<Edge>> {
+    let ontology = asserting_ontology(db)?;
+    let source = class_of(db, &edge.source)?;
+    let target = class_of(db, &edge.target)?;
+    if !ontology.defines_relation(edge.relation.as_str()) {
+        return Err(Error::Ontology(format!(
+            "no relation '{}' in the ontology; the relations are {}",
+            edge.relation,
+            ontology.relation_ids().join(", ")
+        )));
+    }
+    if !ontology.allows_edge(edge.relation.as_str(), source.as_str(), target.as_str()) {
+        return Err(Error::Ontology(format!(
+            "the ontology does not allow {} from a {source} to a {target}",
+            edge.relation
+        )));
+    }
+    let tx = db.connection().unchecked_transaction()?;
+    let existing: Option<EdgeId> = tx
+        .query_row(
+            "SELECT id FROM _quack_graph_edges \
+             WHERE source_node_id = ? AND target_node_id = ? AND relation_id = ?",
+            duckdb::params![edge.source, edge.target, edge.relation],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let (id, created) = if let Some(id) = existing {
+        let mut properties = edge.properties.clone();
+        let current: Option<String> = tx.query_row(
+            "SELECT CAST(properties AS VARCHAR) FROM _quack_graph_edges WHERE id = ?",
+            duckdb::params![id],
+            |r| r.get(0),
+        )?;
+        properties.fill_from(&Properties::from_column(current.as_deref()));
+        tx.execute(
+            "UPDATE _quack_graph_edges SET properties = ?, provisional = false WHERE id = ?",
+            duckdb::params![properties.to_json(), id],
+        )?;
+        (id, false)
+    } else {
+        let id = EdgeId::generate();
+        tx.execute(
+            "INSERT INTO _quack_graph_edges (id, source_node_id, target_node_id, relation_id, properties, provisional) \
+             VALUES (?, ?, ?, ?, ?, false)",
+            duckdb::params![
+                id,
+                edge.source,
+                edge.target,
+                edge.relation,
+                edge.properties.to_json()
+            ],
+        )?;
+        (id, true)
+    };
+    assertion.write(db, id.as_str())?;
+    tx.commit()?;
+    let subject =
+        self::edge(db, &id)?.ok_or_else(|| ResourceKind::GraphEdge.missing(id.as_str()))?;
+    Ok(Asserted { subject, created })
+}
+
+/// One edge by id.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn edge(db: &WorkspaceDb, id: &EdgeId) -> Result<Option<Edge>> {
+    let sql = format!("SELECT {EDGE_COLUMNS} WHERE id = ?");
+    let mut stmt = db.connection().prepare(&sql)?;
+    let mut rows = stmt.query(duckdb::params![id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(Edge::try_from(row)?)),
+        None => Ok(None),
+    }
+}
+
+/// Delete an edge with its provenance.
+///
+/// # Errors
+///
+/// Returns an error when the edge is missing or a delete fails.
+pub fn delete_edge(db: &WorkspaceDb, id: &EdgeId) -> Result<Edge> {
+    let current = edge(db, id)?.ok_or_else(|| ResourceKind::GraphEdge.missing(id.as_str()))?;
+    let tx = db.connection().unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM _quack_provenance WHERE subject_id = ?",
+        duckdb::params![id],
+    )?;
+    tx.execute(
+        "DELETE FROM _quack_graph_edges WHERE id = ?",
+        duckdb::params![id],
+    )?;
+    tx.commit()?;
+    Ok(current)
 }
 
 /// The nodes and edges one extraction stored.
@@ -602,6 +1038,26 @@ pub fn record_extracted(
         duckdb::params![chunk_id, ontology_version, yielded.nodes, yielded.edges],
     )?;
     Ok(())
+}
+
+/// The chunks of `documents` no extraction has read, in document order.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn unextracted_chunks_of(db: &WorkspaceDb, documents: &[DocumentId]) -> Result<Vec<ChunkId>> {
+    let mut stmt = db.connection().prepare(
+        "SELECT c.id FROM _quack_chunks c \
+         WHERE list_contains(?::VARCHAR[], c.document_id) \
+           AND NOT EXISTS (SELECT 1 FROM _quack_graph_extracted x WHERE x.chunk_id = c.id) \
+         ORDER BY c.document_id, c.chunk_index",
+    )?;
+    let mut rows = stmt.query(duckdb::params![IdList::new(documents)])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get::<_, ChunkId>(0)?);
+    }
+    Ok(out)
 }
 
 /// How many chunks the record says were extracted.

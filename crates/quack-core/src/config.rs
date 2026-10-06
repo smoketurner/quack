@@ -1193,6 +1193,9 @@ pub struct GraphConfig {
     pub merge_threshold: f64,
     /// Cosine distance under which the merge happens without review.
     pub auto_merge_threshold: f64,
+    /// What an ingest or import extracts into the graph once its document
+    /// is ready.
+    pub follow_ingest: FollowIngest,
 }
 
 impl Default for GraphConfig {
@@ -1202,6 +1205,43 @@ impl Default for GraphConfig {
             max_nodes: 200,
             merge_threshold: 0.08,
             auto_merge_threshold: 0.02,
+            follow_ingest: FollowIngest::Off,
+        }
+    }
+}
+
+/// `[graph].follow_ingest`: whether a document that becomes ready is
+/// extracted into the graph at once, and from what. `all` spends one
+/// model call per chunk, which is why the default is `off`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FollowIngest {
+    /// Nothing follows; `quack graph extract` builds the graph.
+    #[default]
+    Off,
+    /// The document's mapped tables, deterministically: no model calls.
+    Tables,
+    /// Its mapped tables, then its chunks through the chat model.
+    All,
+}
+
+text_enum!(FollowIngest, "follow_ingest", {
+    Off => "off",
+    Tables => "tables",
+    All => "all",
+});
+
+impl FollowIngest {
+    #[must_use]
+    pub fn is_off(self) -> bool {
+        self == Self::Off
+    }
+
+    #[must_use]
+    pub fn includes_documents(self) -> bool {
+        match self {
+            Self::All => true,
+            Self::Off | Self::Tables => false,
         }
     }
 }
@@ -1625,6 +1665,9 @@ text_enum!(Effort, "effort", {
 #[serde(default, deny_unknown_fields)]
 pub struct AnalysisConfig {
     pub max_query_rows: u32,
+    /// Rows of a `run_sql` or `create_chart` result kept on the step for
+    /// the transcript; the model sees up to `max_query_rows`.
+    pub step_result_rows: u32,
     pub query_timeout_seconds: u32,
     pub memory_limit_mb: u32,
     pub threads: u32,
@@ -1678,6 +1721,7 @@ impl Default for AnalysisConfig {
     fn default() -> Self {
         Self {
             max_query_rows: 250,
+            step_result_rows: 50,
             query_timeout_seconds: 30,
             memory_limit_mb: 256,
             threads: 4,

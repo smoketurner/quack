@@ -38,7 +38,6 @@ fn a_failed_revalidation_preview_is_shown_in_the_stale_banner() {
         },
         drift: Vec::new(),
         has_ontology: true,
-        chunk_count: 0,
         revalidation: Some(Err(String::from("no ontology to validate against"))),
         merges: Vec::new(),
         query: GraphQueryView::default(),
@@ -81,6 +80,7 @@ fn transcript_folds_tool_rows_into_the_answer_after_them() {
         };
     let tool = |detail: &str| {
         Some(MessageMeta::Tool(ToolMeta {
+            result: None,
             tool: ToolName::RunSql,
             detail: detail.to_owned(),
             duration_ms: 3,

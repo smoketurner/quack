@@ -2,7 +2,7 @@
 //! admins, settings and snapshots by owners, and the content half of the
 //! audit for members.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -11,14 +11,14 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use quack_core::error::Error as CoreError;
-use quack_core::ids::WorkspaceId;
+use quack_core::ids::{AuditId, WorkspaceId};
+use quack_core::ocsf::PromptText;
 use quack_core::okf;
-use quack_core::storage::audit;
+use quack_core::storage::audit::{self, AuditDetailRow};
 use quack_core::storage::backup::{self, Described, Manifest, RestoreRequest};
 use quack_core::storage::control::{
-    AuditAction, Membership, Outcome, ProviderAllowList, ResourceKind, Role, Standing, UserKind,
-    WorkspaceChanges, WorkspaceName, WorkspaceRow,
+    AuditAction, AuditRow, ControlPlane, Membership, Outcome, ProviderAllowList, ResourceKind,
+    Role, Standing, UserKind, WorkspaceChanges, WorkspaceName, WorkspaceRow,
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -276,11 +276,7 @@ pub(crate) async fn restore(
             audit: &audit,
         },
     )
-    .await
-    .map_err(|e| match e {
-        e @ CoreError::Ingestion(_) => ApiError::bad_request(e.to_string()),
-        e => ApiError::from(e),
-    })?;
+    .await?;
     Ok((StatusCode::CREATED, Json(restored)))
 }
 
@@ -358,6 +354,12 @@ pub(crate) async fn update_settings(
 pub(crate) struct AuditQuery {
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// `ocsf`: each detail row joined to its access row as an OCSF event
+    /// (the `ai_operation` profile on queries); absent, the detail rows.
+    pub format: Option<String>,
+    /// With `format=ocsf`, carry the question's text on query events.
+    #[serde(default)]
+    pub prompt: bool,
 }
 
 fn default_limit() -> u32 {
@@ -383,5 +385,40 @@ pub(crate) async fn audit_detail(
             None,
         )
         .await?;
-    Ok(Json(serde_json::json!({ "audit": rows })))
+    match q.format.as_deref() {
+        None => Ok(Json(serde_json::json!({ "audit": rows }))),
+        Some("ocsf") => {
+            let prompt = if q.prompt {
+                PromptText::Include
+            } else {
+                PromptText::Omit
+            };
+            let events = ocsf_events(&app.control, &rows, prompt).await?;
+            Ok(Json(serde_json::json!({ "audit": events })))
+        }
+        Some(other) => Err(ApiError::bad_request(format!(
+            "format must be ocsf, not {other}"
+        ))),
+    }
+}
+
+/// A workspace's detail rows joined to their access rows by the shared
+/// id, rendered as OCSF events, newest first; a detail row whose access
+/// row is gone is left out.
+pub(crate) async fn ocsf_events(
+    control: &ControlPlane,
+    details: &[AuditDetailRow],
+    prompt: PromptText,
+) -> ApiResult<Vec<serde_json::Value>> {
+    let ids: Vec<AuditId> = details.iter().map(|d| d.id.clone()).collect();
+    let access_rows = control.audit_rows_by_ids(&ids).await?;
+    let by_id: HashMap<&AuditId, &AuditRow> =
+        access_rows.iter().map(|r| (&r.entry.id, r)).collect();
+    let mut events = Vec::with_capacity(details.len());
+    for detail in details {
+        if let Some(row) = by_id.get(&detail.id) {
+            events.push(row.to_ocsf_with_detail(Some(detail), prompt)?);
+        }
+    }
+    Ok(events)
 }

@@ -567,6 +567,9 @@ pub enum AuditAction {
     Admin,
     Workspace,
     Member,
+    /// An admin granted themself a role in a workspace they were not a
+    /// member of: membership taken by admin right, with a reason.
+    BreakGlass,
     Token,
     /// Opened one resource: a document, table, version, or session.
     Open,
@@ -595,6 +598,8 @@ pub enum AuditAction {
     Snapshot,
     /// A workspace restored from a snapshot.
     Restore,
+    /// A person added, corrected, or deleted a graph node or edge.
+    GraphEdit,
     EmbeddingsRefresh,
     EmbeddingsStatus,
     SessionRead,
@@ -619,6 +624,7 @@ history_enum!(AuditAction, Unknown, {
     Admin => "admin",
     Workspace => "workspace",
     Member => "member",
+    BreakGlass => "break_glass",
     Token => "token",
     Open => "open",
     List => "list",
@@ -642,6 +648,7 @@ history_enum!(AuditAction, Unknown, {
     GraphMerge => "graph_merge",
     Snapshot => "snapshot",
     Restore => "restore",
+    GraphEdit => "graph_edit",
     EmbeddingsRefresh => "embeddings_refresh",
     EmbeddingsStatus => "embeddings_status",
     SessionRead => "session_read",
@@ -675,6 +682,8 @@ pub enum ResourceKind {
     InductionRun,
     GraphRun,
     GraphMerge,
+    GraphNode,
+    GraphEdge,
     EmbeddingsRun,
     /// An MCP resource URI.
     Resource,
@@ -700,6 +709,8 @@ history_enum!(ResourceKind, Unknown, {
     InductionRun => "induction_run",
     GraphRun => "graph_run",
     GraphMerge => "graph_merge",
+    GraphNode => "graph_node",
+    GraphEdge => "graph_edge",
     EmbeddingsRun => "embeddings_run",
     Resource => "resource",
     Audit => "audit",
@@ -2457,11 +2468,26 @@ impl ControlPlane {
         )?)
     }
 
-    /// Audit rows matching the filter, newest first.
+    /// The access rows with these ids, for joining a workspace's detail
+    /// rows to them; ids with no row are left out.
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
+    pub async fn audit_rows_by_ids(&self, ids: &[AuditId]) -> Result<Vec<AuditRow>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bound = AuditFilter::by_ids(ids)?;
+        Ok(bound.query_as().fetch_all(&self.pool).await?)
+    }
+
+    /// One page of the access audit under `filter`, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cursor belongs to another filter or the
+    /// query fails.
     pub async fn query_audit(&self, filter: &AuditFilter) -> Result<AuditPage> {
         let digest = filter.digest();
         if let Some(after) = &filter.cursor
@@ -2510,6 +2536,31 @@ impl AuditFilter {
         let mut hex = sha256_hex(canonical.as_bytes());
         hex.truncate(16);
         hex
+    }
+
+    /// The access rows with these ids, in no order: the half of a
+    /// workspace's audit that `control.db` holds, joined by the detail
+    /// rows' ids.
+    pub(crate) fn by_ids(ids: &[AuditId]) -> sqlx::Result<Bound> {
+        Bound::new(
+            Query::select()
+                .columns([
+                    AuditLog::Id,
+                    AuditLog::Timestamp,
+                    AuditLog::UserId,
+                    AuditLog::TokenHash,
+                    AuditLog::WorkspaceId,
+                    AuditLog::Action,
+                    AuditLog::ResourceType,
+                    AuditLog::ResourceId,
+                    AuditLog::Outcome,
+                    AuditLog::Channel,
+                    AuditLog::ClientAddr,
+                    AuditLog::RequestId,
+                ])
+                .from(AuditLog::Table)
+                .and_where(Expr::col(AuditLog::Id).is_in(ids.iter().map(AuditId::as_str))),
+        )
     }
 
     /// The filtered audit select, built and bound in one scope so no builder

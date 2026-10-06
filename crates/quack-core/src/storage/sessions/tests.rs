@@ -103,6 +103,7 @@ fn step(tool: ToolName, detail: &str, summary: &str) -> ToolStep {
         detail: detail.to_owned(),
         summary: summary.to_owned(),
         rows: None,
+        result: None,
         duration_ms: 7,
     }
 }

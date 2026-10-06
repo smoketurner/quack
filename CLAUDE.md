@@ -102,7 +102,8 @@ cargo run --bin quack -- saved list | add NAME --from-session ID | run NAME [--r
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
 cargo run --bin quack -- ontology rename class|relation OLD NEW                   # a new id as a new version; the graph's nodes and edges move with it
 cargo run --bin quack -- ontology propose [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
-cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] | revalidate [-y] | review | merges | merge ID..
+cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] [--reset [--all]] | revalidate [-y] | review | merges | merge ID..
+cargo run --bin quack -- graph add node LABEL --class C [--property K=V] | add edge FROM REL TO | set NODE [--label L] [--to-class C] [--property K=V] [--unset K] | delete node NODE | delete edge ID   # a person's assertions, recorded with author and note
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
 cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
@@ -111,7 +112,7 @@ cargo run --bin quack -- auth register [--issuer URL] [--device-code|--token-env
 cargo run --bin quack -- config [--changed] [--format json]                      # every recognized setting, its value and origin, the file's unknown keys, the env vars read
 cargo run --bin quack -- doctor [--offline] [--format json]                      # every check with its fix: config, data dir mode, workspace, model providers (probed), bind, vault key; exit 1 on a failure
 cargo run --bin quack -- ready [URL] ; vault export-key [--to FILE] [-y]          # GET /readyz (the image's HEALTHCHECK); the vault key to a 0600 file or stdout
-cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
+cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit [-w ws --detail --format ocsf [--with-prompt]]   # server admin; --detail joins the workspace's own audit (OCSF ai_operation on queries)
 cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1, MCP under /mcp/v1/{workspace}; /readyz and /metrics (quack_core::telemetry) outside the limiter; [server].log_format = "json" for a collector; every provider request retried under [providers.NAME].max_retries / retry_backoff_ms (llm::limit::Attempts)
 cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors
 ```
@@ -150,7 +151,10 @@ instructions, `quack_core::storage::context`, versioned in `_quack_context`) is 
 into the system prompt after the schema and documents, capped at `[context].max_tokens`;
 the agent never writes it. The prompt states today's date (`PromptOptions::today`, the
 system's local zone from jiff) right after the mode paragraph; tests pin it. Charts are `analysis::chart::ChartSpec` (bar, line, scatter,
-pie; 200 points max), not ECharts.
+pie; several series from several `y` columns or a `series_by` pivot, `stacked`; 200 distinct x
+values and 8 series max), not ECharts. A `run_sql` or `create_chart` step keeps its first
+`[analysis].step_result_rows` rows (`ToolStep::result`); `POST .../sql/export` and the SQL page's
+download stream every row of a read statement (`WorkspaceDb::stream_query`).
 
 Background work is asynchronous everywhere (design doc 4.1): `quack_core::jobs::JobQueue`
 runs submitted jobs with optional lanes that keep submission order (a chat session is a
@@ -332,7 +336,18 @@ trims and defaults the caller's fields, `run` checks class and relation ids agai
 ontology and resolves the entry points, and an unresolved path end is an `UnknownEntity`
 naming the closest labels. `graph::store::status` reports size, `provisional` (the newest ontology version
 was auto-accepted), `stale` (`graph_built_with_ontology_version` lags), pending merges,
-and drift; `revalidate` drops what the current ontology no longer allows, and
+drift, `pending_chunks` (chunks no extraction read), and `pending_tables` (mapped tables
+whose fingerprint in `_quack_graph_tables_built`, written by each mapping's last batch,
+no longer matches: owning document, keyed row count, hash over the mapped columns);
+`[graph].follow_ingest` (`off`, `tables`, `all`) has `graph::follow_up::after_documents`
+extract a document into the graph as it becomes ready (the server queues it as an audited
+graph run after an upload or import; the CLI and terminal run it after their ingest). A
+person's writes go through `store::{create_node, update_node, delete_node, create_edge,
+delete_edge}` (`quack graph add|set|delete`, the `.../graph/nodes` and `.../graph/edges`
+routes audited as `graph_edit`, the graph page's forms), each checked against the ontology
+and recorded as `Origin::Manual` provenance (`author`, `note`, `asserted_at`), rendered
+everywhere as `asserted by {author}: {note}`; `graph extract --reset` keeps them unless
+`--all`; `revalidate` drops what the current ontology no longer allows, and
 `Revalidation::preview` counts that first (totals, per class id, per relation id) so
 `quack graph revalidate` asks before dropping (`-y` skips; with nobody to ask it fails,
 `Confirm::ask_to_drop`), and the graph page and `POST .../graph/revalidate` send back the

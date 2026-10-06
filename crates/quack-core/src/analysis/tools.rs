@@ -18,7 +18,7 @@ use crate::storage::workspace::{
 };
 use crate::storage::writer::Writer;
 
-use super::chart::{ChartKind, ChartSpec};
+use super::chart::{ChartKind, ChartSpec, SeriesColumns};
 use super::citations::{ChunkLocation, Markers};
 use super::events::{DetailPreview, ToolName, TurnRecorder};
 use super::policy::{Exposure, Hold, RefusalFlag, WriteDecision, WritePolicy};
@@ -561,7 +561,12 @@ pub struct RunSqlTool {
     /// reads through it.
     gate: SqlGate,
     max_query_rows: u32,
+    /// Rows kept on the step for the transcript.
+    step_result_rows: usize,
 }
+
+/// Rows a step keeps when the config is not consulted (tests).
+pub const DEFAULT_STEP_RESULT_ROWS: usize = 50;
 
 impl RunSqlTool {
     #[must_use]
@@ -570,7 +575,15 @@ impl RunSqlTool {
             db,
             gate: SqlGate { db: reader_db },
             max_query_rows,
+            step_result_rows: DEFAULT_STEP_RESULT_ROWS,
         }
+    }
+
+    /// Keep `rows` rows of each result on its step.
+    #[must_use]
+    pub const fn with_step_rows(mut self, rows: usize) -> Self {
+        self.step_result_rows = rows;
+        self
     }
 
     /// The note for a statement that repeats an earlier one this turn with
@@ -675,7 +688,11 @@ impl Tool for RunSqlTool {
         }
         match results {
             Ok(results) => {
-                step.finish_rows(u64::try_from(results.total_rows).unwrap_or(u64::MAX));
+                step.finish_with_result(
+                    u64::try_from(results.total_rows).unwrap_or(u64::MAX),
+                    results.results.clone(),
+                    self.step_result_rows,
+                );
                 let mut text = results.to_model_text()?;
                 if let Some(note) = Self::repeated_note(&turn, &args.query, shape) {
                     text.push('\n');
@@ -1444,6 +1461,8 @@ impl<T> TurnSlot<T> {
 pub struct CreateChartTool {
     /// Charts only read: the gate lets no write through.
     gate: SqlGate,
+    /// Rows kept on the step for the transcript.
+    step_result_rows: usize,
 }
 
 impl CreateChartTool {
@@ -1451,7 +1470,15 @@ impl CreateChartTool {
     pub const fn new(db: ReaderDb) -> Self {
         Self {
             gate: SqlGate { db },
+            step_result_rows: DEFAULT_STEP_RESULT_ROWS,
         }
+    }
+
+    /// Keep `rows` rows of each chart's result on its step.
+    #[must_use]
+    pub const fn with_step_rows(mut self, rows: usize) -> Self {
+        self.step_result_rows = rows;
+        self
     }
 }
 
@@ -1466,8 +1493,15 @@ pub struct CreateChartArgs {
     pub kind: String,
     /// Column for the x axis (category labels; slice names for pie)
     pub x: String,
-    /// Numeric column for the y axis (slice values for pie)
-    pub y: String,
+    /// Numeric column(s) for the y axis, one series each (slice values
+    /// for pie, which takes one). Several for "revenue and cost by month".
+    pub y: Vec<String>,
+    /// For long-format rows ("orders by month, one line per region"): the
+    /// column whose distinct values become the series, each taking the
+    /// first y column. Leave unset for wide rows with several y columns.
+    pub series_by: Option<String>,
+    /// Stack bars or lines on each other instead of beside each other
+    pub stacked: Option<bool>,
     /// Chart title
     pub title: String,
 }
@@ -1481,7 +1515,10 @@ impl Tool for CreateChartTool {
     fn description(&self) -> String {
         String::from(
             "Draw a chart from a SQL query: runs the query and renders a bar, line, scatter, or pie \
-             chart of column y against column x. The query must return at most 200 rows.",
+             chart of the y column(s) against column x. Several y columns are several series; \
+             series_by pivots long rows (one row per x and group) into one series per group, at \
+             most 8. At most 200 distinct x values; for a histogram, bin in SQL and chart the \
+             counts as bars.",
         )
     }
 
@@ -1521,7 +1558,17 @@ impl Tool for CreateChartTool {
         }
 
         let spec = args.kind.parse::<ChartKind>().and_then(|kind| {
-            ChartSpec::from_results(&results, kind, &args.x, &args.y, &args.title)
+            ChartSpec::from_results(
+                &results,
+                kind,
+                &args.x,
+                SeriesColumns {
+                    y: &args.y,
+                    series_by: args.series_by.as_deref(),
+                },
+                &args.title,
+            )
+            .map(|spec| spec.stacked(args.stacked.unwrap_or(false)))
         });
         let spec = match spec {
             Ok(spec) => spec,
@@ -1529,16 +1576,21 @@ impl Tool for CreateChartTool {
         };
 
         let summary = format!(
-            "{} chart \"{}\" with {} points ({} by {})",
+            "{}{} chart \"{}\" with {} points ({} by {})",
+            if spec.stacked { "stacked " } else { "" },
             spec.kind.as_str(),
             spec.title,
             spec.points(),
-            args.y,
+            spec.series_names().join(", "),
             args.x
         );
         turn.chart.put(spec);
 
-        step.finish(format!("{} points", results.rows.len()));
+        step.finish_with_result(
+            u64::try_from(results.rows.len()).unwrap_or(u64::MAX),
+            results,
+            self.step_result_rows,
+        );
         Ok(format!(
             "Chart created and shown to the user: {summary}. Describe what it shows; do not repeat the data."
         ))
@@ -2001,7 +2053,7 @@ async fn format_graph_result(
                 }
                 .to_string(),
             ),
-            Origin::Chunk { .. } => None,
+            Origin::Chunk { .. } | Origin::Manual { .. } => None,
         })
         .collect();
     if !rows.is_empty() {

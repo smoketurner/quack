@@ -16,11 +16,12 @@ use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::{
-    BaseUrl, Config, ProviderConfig, ProviderName, ProviderType, RetryPolicy, SecureCookies,
+    BaseUrl, Config, FollowIngest, ProviderConfig, ProviderName, ProviderType, RetryPolicy,
+    SecureCookies,
 };
 use quack_core::embedding::{Dimension, Vector};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
-use quack_core::ids::{ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
+use quack_core::ids::{AuditId, ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use quack_core::ingestion::parser::PageCounts;
 use quack_core::storage::backup;
 use std::sync::Arc;
@@ -98,7 +99,7 @@ impl Harness {
         (status, value, headers)
     }
 
-    /// `send`, with the body as it came: for a tar, not JSON or text.
+    /// `send`, with the body as it came: for a file, not JSON or text.
     async fn send_bytes(
         &self,
         request: Request<Body>,
@@ -5753,8 +5754,17 @@ async fn a_large_batch_of_uploads_is_spooled_and_processed() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    // The spooled bytes go in each job's `when_ended` hook, which runs on
+    // its own task after the lane slot is released: wait for it.
     let spool = h.app.config.workspace_uploads_dir(ws.as_str());
-    let left = std::fs::read_dir(&spool).map_or(0, Iterator::count);
+    let mut left = usize::MAX;
+    for _ in 0..200 {
+        left = std::fs::read_dir(&spool).map_or(0, Iterator::count);
+        if left == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert_eq!(left, 0, "spooled uploads left in {}", spool.display());
 }
 
@@ -6354,10 +6364,11 @@ async fn closing_the_state_checkpoints_each_workspace() {
     assert!(!log.exists(), "the log was checkpointed into the file");
 }
 
-/// A download the row cap cut says so in its filename and on its button;
-/// a complete one keeps the plain name, and neither file carries a marker.
+/// The grid is capped, but the download streams every row: the button
+/// says so when the grid was cut, and the file is the whole result either
+/// way, under the plain name.
 #[tokio::test]
-async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
+async fn the_csv_download_holds_every_row_past_the_grids_cap() {
     let mut config = Config::default();
     config.analysis.max_query_rows = 3;
     let h = harness_with(ServeMode::Login, config).await;
@@ -6377,20 +6388,17 @@ async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
     assert_eq!(status, StatusCode::OK);
     assert!(
         html.contains("10 rows (showing 3)")
-            && html.contains(">Download CSV (first 3 of 10 rows)</button>"),
+            && html.contains(">Download CSV (all 10 rows)</button>"),
         "{html}"
     );
     let (status, csv, headers) = h
         .form(&format!("/w/{ws}/sql.csv"), Some(&cookie), capped)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        disposition(&headers),
-        "attachment; filename=\"query-first-3-of-10.csv\""
-    );
-    assert_eq!(csv, "n\n0\n1\n2\n");
+    assert_eq!(disposition(&headers), "attachment; filename=\"query.csv\"");
+    assert_eq!(csv, "n\n0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n");
 
-    // A result of exactly the cap is complete.
+    // A result within the cap: no note on the button.
     let complete = "sql=SELECT+*+FROM+range(3)+t(n)";
     let (_, html, _) = h
         .form(&format!("/w/{ws}/sql"), Some(&cookie), complete)
@@ -6399,11 +6407,10 @@ async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
         html.contains(">Download CSV</button>") && !html.contains("showing"),
         "{html}"
     );
-    let (status, csv, headers) = h
+    let (status, csv, _) = h
         .form(&format!("/w/{ws}/sql.csv"), Some(&cookie), complete)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(disposition(&headers), "attachment; filename=\"query.csv\"");
     assert_eq!(csv, "n\n0\n1\n2\n");
 }
 
@@ -7379,6 +7386,7 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
                     detail: String::from(OVERDUE),
                     summary: String::from("1 rows"),
                     rows: Some(1),
+                    result: None,
                     duration_ms: 1,
                 }],
                 ..AgentResponse::default()
@@ -7634,6 +7642,671 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
         detail.iter().any(|row| row.action == "saved_run"),
         "the workspace keeps the run's detail row"
     );
+}
+
+/// The shipments ontology the graph tests build from: three classes
+/// keyed by name or purchase order, two relations, one mapping.
+fn shipments_ontology() -> serde_json::Value {
+    serde_json::json!({
+        "classes": [
+            { "id": "vendor", "key": "name", "properties": ["name"] },
+            { "id": "country", "key": "name", "properties": ["name"] },
+            { "id": "shipment", "key": "po", "properties": ["po"] }
+        ],
+        "relations": [
+            { "id": "supplied_by", "domain": "shipment", "range": "vendor" },
+            { "id": "delivered_to", "domain": "shipment", "range": "country" }
+        ],
+        "properties": [
+            { "id": "name", "type": "string" },
+            { "id": "po", "type": "string" }
+        ],
+        "mappings": [{
+            "table": "shipments", "class": "shipment", "key": "po",
+            "relations": [
+                { "relation": "supplied_by", "column": "vendor", "target_class": "vendor", "target_key": "name" },
+                { "relation": "delivered_to", "column": "country", "target_class": "country", "target_key": "name" }
+            ]
+        }]
+    })
+}
+
+/// A person's node and edge writes over REST and the graph page: each
+/// checked against the ontology, recorded as asserted by them, audited
+/// as `graph_edit`, and shown with its assertion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_person_edits_graph_nodes_and_edges_over_the_api_and_the_page() {
+    let h = harness(ServeMode::Local).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "edits" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    for sql in [
+        "CREATE TABLE shipments (po TEXT, vendor TEXT, country TEXT)",
+        "INSERT INTO shipments VALUES ('PO-1', 'Orgenics', 'Kenya')",
+    ] {
+        let (status, body) = h
+            .call(
+                Method::POST,
+                &format!("/api/v1/workspaces/{ws}/sql"),
+                None,
+                Some(serde_json::json!({ "sql": sql })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = h
+        .call(
+            Method::PUT,
+            &format!("/api/v1/workspaces/{ws}/ontology"),
+            None,
+            Some(shipments_ontology()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let base = format!("/api/v1/workspaces/{ws}/graph");
+    let (_, status_body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(
+        status_body["pending_tables"],
+        serde_json::json!(["shipments"]),
+        "{status_body}"
+    );
+    assert_eq!(status_body["pending_chunks"], 0);
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/extract"),
+            None,
+            Some(serde_json::json!({ "source": "tables" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, status_body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(
+        status_body["pending_tables"],
+        serde_json::json!([]),
+        "{status_body}"
+    );
+
+    // A node: 201 new, 200 when it was there, 400 outside the ontology.
+    let (status, body) = h
+        .post(
+            &format!("{base}/nodes"),
+            "",
+            serde_json::json!({ "label": "Acme", "class": "vendor", "properties": { "name": "Acme" }, "note": "vendor list" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["created"], true);
+    let acme = body["id"].as_str().unwrap_or_default().to_owned();
+    let (status, body) = h
+        .post(
+            &format!("{base}/nodes"),
+            "",
+            serde_json::json!({ "label": "ACME", "class": "vendor" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], false);
+    assert_eq!(body["id"], acme);
+    let (status, body) = h
+        .post(
+            &format!("{base}/nodes"),
+            "",
+            serde_json::json!({ "label": "MV Hope", "class": "vessel" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // A correction, and an empty one.
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &format!("{base}/nodes/{acme}"),
+            None,
+            Some(
+                serde_json::json!({ "label": "Acme Pharma", "properties": { "country": "Kenya" } }),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["label"], "Acme Pharma");
+    assert_eq!(body["properties"]["country"], "Kenya");
+    let (status, _) = h
+        .call(
+            Method::PATCH,
+            &format!("{base}/nodes/{acme}"),
+            None,
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // An edge the ontology allows, and one it does not.
+    let (_, body) = h
+        .post(
+            &format!("{base}/search"),
+            "",
+            serde_json::json!({ "class": "shipment" }),
+        )
+        .await;
+    let po1 = body["nodes"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let (status, body) = h
+        .post(
+            &format!("{base}/edges"),
+            "",
+            serde_json::json!({ "source": po1, "target": acme, "relation": "supplied_by", "note": "corrected supplier" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let edge = body["id"].as_str().unwrap_or_default().to_owned();
+    let (status, body) = h
+        .post(
+            &format!("{base}/edges"),
+            "",
+            serde_json::json!({ "source": acme, "target": po1, "relation": "supplied_by" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("does not allow"), "{body}");
+
+    // The search shows the assertion as provenance, with its author.
+    let (_, body) = h
+        .post(
+            &format!("{base}/search"),
+            "",
+            serde_json::json!({ "entity": "Acme Pharma", "hops": 1 }),
+        )
+        .await;
+    let asserted: Vec<&serde_json::Value> = body["provenance"]
+        .as_array()
+        .map(|p| p.iter().filter(|p| p["asserted_at"].is_string()).collect())
+        .unwrap_or_default();
+    assert_eq!(asserted.len(), 2, "{body}");
+    assert!(asserted.iter().all(|p| p["author"].is_string()), "{body}");
+    assert!(
+        asserted.iter().any(|p| p["note"] == "corrected supplier"),
+        "{body}"
+    );
+    let (status, html, _) = h
+        .form(&format!("/w/{ws}/graph"), None, "entity=Acme+Pharma")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("asserted by"), "{html}");
+    assert!(html.contains("Delete node and its edges"), "{html}");
+
+    // The page's forms: an edit, then a delete.
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/graph/nodes/{acme}"),
+            None,
+            "label=&class=&properties=country%3D%0Aregion%3DEast+Africa&note=page",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, html) = h.land(&headers, None).await;
+    assert!(html.contains("updated Acme Pharma (vendor)"), "{html}");
+    let (_, body) = h
+        .post(
+            &format!("{base}/search"),
+            "",
+            serde_json::json!({ "entity": "Acme Pharma", "hops": 0 }),
+        )
+        .await;
+    assert_eq!(
+        body["nodes"][0]["properties"]["region"], "East Africa",
+        "{body}"
+    );
+    assert!(
+        body["nodes"][0]["properties"]["country"].is_null(),
+        "{body}"
+    );
+    let (status, _, headers) = h
+        .form(&format!("/w/{ws}/graph/edges/{edge}/delete"), None, "")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, html) = h.land(&headers, None).await;
+    assert!(html.contains("deleted the supplied_by edge"), "{html}");
+
+    // Deletes over REST: the node goes with what is left at it; a second
+    // delete is 404.
+    let (status, body) = h
+        .call(Method::DELETE, &format!("{base}/nodes/{acme}"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = h
+        .call(Method::DELETE, &format!("{base}/nodes/{acme}"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = h
+        .call(Method::DELETE, &format!("{base}/edges/{edge}"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let edits = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("graph_edit")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(edits.len(), 7, "{edits:?}");
+    assert!(
+        edits
+            .iter()
+            .any(|r| r.entry.resource_id.as_deref() == Some(edge.as_str())
+                && r.entry.resource_type == Some(ResourceKind::GraphEdge)),
+        "{edits:?}"
+    );
+    assert!(
+        edits
+            .iter()
+            .any(|r| r.entry.resource_id.as_deref() == Some(acme.as_str())
+                && r.entry.resource_type == Some(ResourceKind::GraphNode)),
+        "{edits:?}"
+    );
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let details = with_db(db, |db| audit::list(db, 100))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let ops: Vec<&str> = details
+        .iter()
+        .filter(|d| d.action == "graph_edit")
+        .filter_map(|d| d.detail.as_ref()?["op"].as_str())
+        .collect();
+    for op in ["create", "assert", "update", "delete"] {
+        assert!(ops.contains(&op), "{op} missing from {ops:?}");
+    }
+    assert!(
+        details.iter().any(|d| d.action == "graph_edit"
+            && d.detail
+                .as_ref()
+                .is_some_and(|v| v["note"] == "corrected supplier")),
+        "{details:?}"
+    );
+}
+
+/// With `[graph].follow_ingest = "tables"`, a table file that replaces a
+/// mapped table queues a graph run once it is ready; the ingest job
+/// names it, it is audited as a graph extraction, and the status no
+/// longer lists the table as pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_queues_the_graph_follow_up_the_setting_asks_for() {
+    let mut config = Config::default();
+    config.graph.follow_ingest = FollowIngest::Tables;
+    let h = harness_with(ServeMode::Local, config).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "follow" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    let base = format!("/api/v1/workspaces/{ws}/documents");
+    let upload = |h: &Harness, path: String, csv: &str| {
+        let (content_type, body) = multipart("shipments.csv", "text/csv", csv);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let h = h.router.clone();
+        async move {
+            let response = h
+                .oneshot(request)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            (status, body)
+        }
+    };
+    // No ontology yet: the first upload makes the table and nothing follows.
+    let (status, body) = upload(&h, base.clone(), "po,vendor,country\nPO-1,Orgenics,Kenya\n").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let first = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let first_job = body["documents"][0]["job"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(h.wait_ready(&ws, &first, "").await["status"], "ready");
+    let done = wait_for_job(&h, &ws, &first_job, "").await;
+    assert_eq!(done["state"], "succeeded", "{done}");
+    assert!(
+        !done["outcome"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("follow-up"),
+        "{done}"
+    );
+    let (status, body) = h
+        .call(
+            Method::PUT,
+            &format!("/api/v1/workspaces/{ws}/ontology"),
+            None,
+            Some(shipments_ontology()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A replacement with a new row: the graph follows.
+    let (status, body) = upload(
+        &h,
+        format!("{base}?replace={first}"),
+        "po,vendor,country\nPO-1,Orgenics,Kenya\nPO-2,Aurobindo,Uganda\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let second = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let job = body["documents"][0]["job"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(h.wait_ready(&ws, &second, "").await["status"], "ready");
+    let done = wait_for_job(&h, &ws, &job, "").await;
+    let result = done["outcome"].as_str().unwrap_or_default().to_owned();
+    let follow = result
+        .rsplit("graph follow-up queued as job ")
+        .next()
+        .filter(|rest| rest.len() < result.len())
+        .unwrap_or_else(|| fail(&format!("no follow-up in {result}")))
+        .to_owned();
+    let followed = wait_for_job(&h, &ws, &follow, "").await;
+    assert_eq!(followed["state"], "succeeded", "{followed}");
+    assert_eq!(followed["kind"], "graph", "{followed}");
+    assert_eq!(
+        followed["outcome"], "graph: table shipments: 2 nodes, 4 edges",
+        "{followed}"
+    );
+    let (_, status_body) = h
+        .get(&format!("/api/v1/workspaces/{ws}/graph/status"), "")
+        .await;
+    assert_eq!(status_body["nodes"], 6, "{status_body}");
+    assert_eq!(
+        status_body["pending_tables"],
+        serde_json::json!([]),
+        "{status_body}"
+    );
+    let runs = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("graph_extract")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(
+        runs[0].entry.resource_id, runs[1].entry.resource_id,
+        "{runs:?}"
+    );
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let details = with_db(db, |db| audit::list(db, 100))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let extracts: Vec<&serde_json::Value> = details
+        .iter()
+        .filter(|d| d.action == "graph_extract")
+        .filter_map(|d| d.detail.as_ref())
+        .collect();
+    assert!(
+        extracts.iter().any(|d| d["follow_ingest"] == "tables"),
+        "{extracts:?}"
+    );
+    assert!(
+        extracts.iter().any(|d| d["finished"] == true),
+        "{extracts:?}"
+    );
+}
+
+/// `POST .../sql/export` streams every row past the grid's cap in the
+/// asked format, refuses a write, and audits the export with its row
+/// count; the SQL page's download takes the same path.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_export_streams_every_row_and_refuses_writes() {
+    let mut config = Config::default();
+    config.analysis.max_query_rows = 10;
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("sales", &owner).await;
+    let token = h.login("owner").await;
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &token,
+            serde_json::json!({ "sql": "CREATE TABLE big AS SELECT range AS n FROM range(1000)" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let export = |sql: &str, format: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/workspaces/{ws}/sql/export"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "sql": sql, "format": format }).to_string(),
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    let (status, bytes, headers) = h
+        .send_bytes(export("SELECT n FROM big ORDER BY n", "csv"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/csv; charset=utf-8")
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(text.lines().count(), 1001, "a header and every row");
+    assert!(
+        text.ends_with("999\n"),
+        "{}",
+        text.lines().last().unwrap_or_default()
+    );
+    let (status, bytes, _) = h
+        .send_bytes(export("SELECT n FROM big WHERE n < 3", "ndjson"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n"
+    );
+    let (status, bytes, _) = h.send_bytes(export("DELETE FROM big", "csv")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let (status, _, _) = h
+        .send_bytes(export("SELECT * FROM _quack_documents", "csv"))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // The audit row lands once the stream has ended.
+    let mut exports = Vec::new();
+    for _ in 0..50 {
+        exports = h
+            .audit(AuditFilter {
+                action: Some(String::from("export")),
+                ..AuditFilter::default()
+            })
+            .await;
+        if exports.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(exports.len(), 3, "{exports:?}");
+    assert!(exports.iter().any(|r| r.entry.outcome == Outcome::Denied));
+
+    // The web download streams the whole result too.
+    let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    let cookie = session_cookie(&headers);
+    let (status, bytes, _) = h
+        .send_bytes(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/w/{ws}/sql.csv"))
+                .header(header::COOKIE, format!("quack_session={cookie}"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("sql=SELECT+n+FROM+big"))
+                .unwrap_or_else(|e| fail(&e.to_string())),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(String::from_utf8_lossy(&bytes).lines().count(), 1001);
+}
+
+/// An admin who is not a member may add themself only with a reason; the
+/// grant is a `break_glass` row whose detail names the role, the reason,
+/// and that admin rights were used. Any other grant is a `member` row with
+/// the role in its detail.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admin_self_grant_needs_a_reason_and_is_marked_break_glass() {
+    let h = harness(ServeMode::Login).await;
+    let root_id = h.user("root", UserKind::Admin).await;
+    let owner_id = h.user("owner", UserKind::Standard).await;
+    h.user("vera", UserKind::Standard).await;
+    let ws = h.workspace("finance", &owner_id).await;
+    let root = h.login("root").await;
+    let owner = h.login("owner").await;
+    let members = format!("/api/v1/workspaces/{ws}/members");
+    let (status, body) = h
+        .post(
+            &members,
+            &root,
+            serde_json::json!({ "username": "root", "role": "owner" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reason"),
+        "{body}"
+    );
+    let (status, body) = h
+        .post(
+            &members,
+            &root,
+            serde_json::json!({ "username": "root", "role": "owner", "reason": "  " }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = h
+        .post(
+            &members,
+            &root,
+            serde_json::json!({ "username": "root", "role": "owner", "reason": "incident 42" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // An owner adding someone else needs no reason and is a plain member row.
+    let (status, body) = h
+        .post(
+            &members,
+            &owner,
+            serde_json::json!({ "username": "vera", "role": "viewer" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let glass = h
+        .audit(AuditFilter {
+            action: Some(String::from("break_glass")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(glass.len(), 1, "{glass:?}");
+    assert_eq!(glass[0].entry.user_id.as_ref(), Some(&root_id));
+    let details = h
+        .app
+        .read(&ws, |db| audit::list(db, 50))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let by_id = |id: &AuditId| {
+        details
+            .iter()
+            .find(|d| &d.id == id)
+            .and_then(|d| d.detail.clone())
+    };
+    let detail = by_id(&glass[0].entry.id).unwrap_or_default();
+    assert_eq!(detail["role"], "owner", "{detail}");
+    assert_eq!(detail["reason"], "incident 42");
+    assert_eq!(detail["acting_as"], "admin");
+    let member_rows = h
+        .audit(AuditFilter {
+            action: Some(String::from("member")),
+            workspace_id: Some(ws.clone()),
+            ..AuditFilter::default()
+        })
+        .await;
+    let plain = member_rows
+        .iter()
+        .find(|r| r.entry.user_id.as_ref() == Some(&owner_id))
+        .unwrap_or_else(|| fail("the owner's grant is audited"));
+    assert_eq!(by_id(&plain.entry.id).unwrap_or_default()["role"], "viewer");
+
+    // The workspace's OCSF export joins both halves: the self-grant is a
+    // Medium Create event, and a query event would carry the ai profile.
+    let (status, body) = h
+        .get(
+            &format!("/api/v1/workspaces/{ws}/audit?format=ocsf"),
+            &owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = body["audit"].as_array().cloned().unwrap_or_default();
+    let event = events
+        .iter()
+        .find(|e| e["api"]["operation"] == "break_glass")
+        .unwrap_or_else(|| fail("the break_glass event is exported"));
+    assert_eq!(event["severity_id"], 3, "{event}");
+    assert_eq!(
+        event["unmapped"]["detail"]["reason"], "incident 42",
+        "{event}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| e["class_uid"].is_number() && e["metadata"]["version"] == "1.9.0"),
+        "{body}"
+    );
+    let (status, _) = h
+        .get(&format!("/api/v1/workspaces/{ws}/audit?format=xml"), &owner)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 /// `/readyz` reports each component; `/metrics` answers loopback and

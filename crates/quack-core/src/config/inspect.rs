@@ -382,6 +382,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
         "analysis",
         &[
             "max_query_rows",
+            "step_result_rows",
             "query_timeout_seconds",
             "memory_limit_mb",
             "threads",
@@ -426,6 +427,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "max_nodes",
             "merge_threshold",
             "auto_merge_threshold",
+            "follow_ingest",
         ],
     ),
     (
@@ -785,6 +787,11 @@ fn analysis(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         default.max_query_rows,
     );
     s.literal(
+        "step_result_rows",
+        analysis.step_result_rows,
+        default.step_result_rows,
+    );
+    s.literal(
         "query_timeout_seconds",
         analysis.query_timeout_seconds,
         default.query_timeout_seconds,
@@ -953,6 +960,12 @@ fn graph(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "auto_merge_threshold",
         graph.auto_merge_threshold,
         default.auto_merge_threshold,
+    );
+    s.text(
+        "follow_ingest",
+        graph.follow_ingest.as_str(),
+        default.follow_ingest.as_str(),
+        None,
     );
 }
 

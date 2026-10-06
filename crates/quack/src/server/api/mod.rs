@@ -68,6 +68,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/workspaces/{id}/query", post(query::query))
         .route("/workspaces/{id}/query/stream", post(query::stream))
         .route("/workspaces/{id}/sql", post(query::sql))
+        .route("/workspaces/{id}/sql/export", post(query::export))
         .route("/workspaces/{id}/search", post(query::search))
         .route(
             "/workspaces/{id}/documents",
@@ -99,20 +100,7 @@ pub(crate) fn router() -> Router<App> {
         .merge(ontology_routes())
         .route("/workspaces/{id}/okf", get(okf::export))
         .route("/workspaces/{id}/import", post(import::import))
-        .route("/workspaces/{id}/graph/search", post(graph::search))
-        .route("/workspaces/{id}/graph/path", post(graph::path))
-        .route("/workspaces/{id}/graph/status", get(graph::status))
-        .route("/workspaces/{id}/graph/extract", post(graph::extract))
-        .route(
-            "/workspaces/{id}/graph/revalidate",
-            get(graph::revalidation_preview).post(graph::revalidate),
-        )
-        .route("/workspaces/{id}/graph/review", post(graph::review))
-        .route("/workspaces/{id}/graph/merges", get(graph::merges))
-        .route(
-            "/workspaces/{id}/graph/merges/{mid}",
-            axum::routing::put(graph::decide_merge),
-        )
+        .merge(graph_routes())
         .route("/workspaces/{id}/jobs", get(jobs::list))
         .route("/workspaces/{id}/jobs/stream", get(jobs::stream))
         .route("/workspaces/{id}/jobs/{job}", get(jobs::show))
@@ -170,6 +158,36 @@ fn control_routes() -> Router<App> {
                 .delete(workspaces::delete),
         )
         .route("/workspaces/{id}/snapshot", get(workspaces::snapshot))
+}
+
+/// The knowledge graph's routes: search and path, status, the builds, the
+/// merge queue, and a person's node and edge edits.
+fn graph_routes() -> Router<App> {
+    Router::new()
+        .route("/workspaces/{id}/graph/search", post(graph::search))
+        .route("/workspaces/{id}/graph/path", post(graph::path))
+        .route("/workspaces/{id}/graph/status", get(graph::status))
+        .route("/workspaces/{id}/graph/extract", post(graph::extract))
+        .route(
+            "/workspaces/{id}/graph/revalidate",
+            get(graph::revalidation_preview).post(graph::revalidate),
+        )
+        .route("/workspaces/{id}/graph/review", post(graph::review))
+        .route("/workspaces/{id}/graph/merges", get(graph::merges))
+        .route(
+            "/workspaces/{id}/graph/merges/{mid}",
+            axum::routing::put(graph::decide_merge),
+        )
+        .route("/workspaces/{id}/graph/nodes", post(graph::create_node))
+        .route(
+            "/workspaces/{id}/graph/nodes/{nid}",
+            axum::routing::patch(graph::update_node).delete(graph::delete_node),
+        )
+        .route("/workspaces/{id}/graph/edges", post(graph::create_edge))
+        .route(
+            "/workspaces/{id}/graph/edges/{eid}",
+            delete(graph::delete_edge),
+        )
 }
 
 /// The ontology's routes: the current one, its candidates, and its versions.

@@ -10,6 +10,7 @@
 //! workspace file.
 
 pub mod extract;
+pub mod follow_up;
 pub mod query;
 pub mod resolve;
 pub mod store;
@@ -136,6 +137,17 @@ impl Properties {
         }
     }
 
+    /// Apply a person's edit: each value sets its key, `null` removes it.
+    pub fn patch(&mut self, edit: &serde_json::Map<String, serde_json::Value>) {
+        for (key, value) in edit {
+            if value.is_null() {
+                self.0.remove(key);
+            } else {
+                self.0.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
     /// The other names the node is known by, merged in from nodes that
     /// resolution folded into it; entry-point lookup matches them too.
     #[must_use]
@@ -244,10 +256,21 @@ impl fmt::Display for Properties {
 }
 
 /// Where a node or edge came from. Serialized flat into [`Provenance`],
-/// as `document_id` and `chunk_id` or `table_name` and `row_key`.
+/// as `document_id` and `chunk_id`, `table_name` and `row_key`, or the
+/// person who asserted it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Origin {
+    /// A person stated it (`quack graph add`, the API, the graph page).
+    /// First, so a row with `asserted_at` never reads as a chunk.
+    Manual {
+        /// The server user; `None` from the command line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        asserted_at: String,
+    },
     /// A chunk of a document.
     Chunk {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -258,16 +281,55 @@ pub enum Origin {
     Row { table_name: String, row_key: String },
 }
 
+/// The `_quack_provenance` columns of one row, as the store reads them.
+#[derive(Debug, Clone)]
+pub struct ProvenanceColumns {
+    pub document_id: Option<DocumentId>,
+    /// Empty when the row is not a chunk's.
+    pub chunk_id: ChunkId,
+    pub table_name: String,
+    pub row_key: String,
+    pub author: Option<String>,
+    pub note: Option<String>,
+    pub asserted_at: Option<String>,
+}
+
+impl Default for ProvenanceColumns {
+    fn default() -> Self {
+        Self {
+            document_id: None,
+            chunk_id: ChunkId::from(String::new()),
+            table_name: String::new(),
+            row_key: String::new(),
+            author: None,
+            note: None,
+            asserted_at: None,
+        }
+    }
+}
+
 impl Origin {
-    /// From the `_quack_provenance` columns, where the unused pair is
-    /// stored as empty text: a row when the table is named, else a chunk.
+    /// From the `_quack_provenance` columns, where an unused text column
+    /// is empty: an assertion when it has a time, a row when the table is
+    /// named, else a chunk.
     #[must_use]
-    pub fn from_columns(
-        document_id: Option<DocumentId>,
-        chunk_id: ChunkId,
-        table_name: String,
-        row_key: String,
-    ) -> Self {
+    pub fn from_columns(columns: ProvenanceColumns) -> Self {
+        let ProvenanceColumns {
+            document_id,
+            chunk_id,
+            table_name,
+            row_key,
+            author,
+            note,
+            asserted_at,
+        } = columns;
+        if let Some(asserted_at) = asserted_at {
+            return Self::Manual {
+                author,
+                note,
+                asserted_at,
+            };
+        }
         if table_name.is_empty() {
             Self::Chunk {
                 document_id,
@@ -286,8 +348,26 @@ impl Origin {
     pub fn chunk_id(&self) -> Option<&ChunkId> {
         match self {
             Self::Chunk { chunk_id, .. } => Some(chunk_id),
-            Self::Row { .. } => None,
+            Self::Row { .. } | Self::Manual { .. } => None,
         }
+    }
+
+    /// "asserted by {author}: {note}" for a manual origin, as every
+    /// rendering shows it; `None` for the others.
+    #[must_use]
+    pub fn assertion(&self) -> Option<String> {
+        let Self::Manual { author, note, .. } = self else {
+            return None;
+        };
+        let mut text = match author {
+            Some(author) => format!("asserted by {}", OneLine(author)),
+            None => String::from("asserted by hand"),
+        };
+        if let Some(note) = note.as_deref().filter(|n| !n.trim().is_empty()) {
+            text.push_str(": ");
+            text.push_str(&OneLine(note).to_string());
+        }
+        Some(text)
     }
 }
 
@@ -395,6 +475,14 @@ pub struct GraphStatus {
     /// mapping is removed or the data comes back.
     #[serde(default)]
     pub missing_tables: Vec<String>,
+    /// Chunks of ready documents no extraction has read yet.
+    #[serde(default)]
+    pub pending_chunks: u64,
+    /// Mapped tables whose rows changed since table extraction last read
+    /// them (re-ingested, re-imported, or updated by SQL), or that it
+    /// never read.
+    #[serde(default)]
+    pub pending_tables: Vec<String>,
 }
 
 impl GraphStatus {
@@ -448,6 +536,20 @@ impl fmt::Display for GraphStatus {
                 f,
                 "Mapped tables no longer in the workspace (extraction skips them): {}",
                 self.missing_tables.join(", ")
+            )?;
+        }
+        if self.pending_chunks > 0 {
+            writeln!(
+                f,
+                "{} chunks not yet extracted: `quack graph extract --source documents`",
+                self.pending_chunks
+            )?;
+        }
+        if !self.pending_tables.is_empty() {
+            writeln!(
+                f,
+                "Mapped tables changed since the graph read them: {} (`quack graph extract --source tables`)",
+                self.pending_tables.join(", ")
             )?;
         }
         if self.drift.total() > 0 {
@@ -588,6 +690,17 @@ pub fn ddl(dimension: Dimension) -> String {
             confidence DOUBLE,
             PRIMARY KEY (subject_id, chunk_id, table_name, row_key)
         );
+        ALTER TABLE _quack_provenance ADD COLUMN IF NOT EXISTS author TEXT;
+        ALTER TABLE _quack_provenance ADD COLUMN IF NOT EXISTS note TEXT;
+        ALTER TABLE _quack_provenance ADD COLUMN IF NOT EXISTS asserted_at TIMESTAMP;
+        CREATE TABLE IF NOT EXISTS _quack_graph_tables_built (
+            table_name TEXT PRIMARY KEY,
+            document_id TEXT,
+            ontology_version INTEGER NOT NULL,
+            row_count BIGINT NOT NULL,
+            row_hash TEXT NOT NULL,
+            built_at TIMESTAMP DEFAULT now()
+        );
         CREATE TABLE IF NOT EXISTS _quack_graph_extracted (
             chunk_id TEXT PRIMARY KEY,
             ontology_version INTEGER NOT NULL,
@@ -694,26 +807,47 @@ mod tests {
     fn origins_serialize_flat_and_round_trip() {
         let chunk = Provenance {
             subject_id: String::from("n"),
-            origin: Origin::from_columns(
-                Some(DocumentId::from("d")),
-                ChunkId::from("c"),
-                String::new(),
-                String::new(),
-            ),
+            origin: Origin::from_columns(ProvenanceColumns {
+                document_id: Some(DocumentId::from("d")),
+                chunk_id: ChunkId::from("c"),
+                ..ProvenanceColumns::default()
+            }),
             confidence: 0.5,
         };
         let row = Provenance {
             subject_id: String::from("n"),
-            origin: Origin::from_columns(
-                None,
-                ChunkId::from(String::new()),
-                String::from("t"),
-                String::from("k"),
-            ),
+            origin: Origin::from_columns(ProvenanceColumns {
+                table_name: String::from("t"),
+                row_key: String::from("k"),
+                ..ProvenanceColumns::default()
+            }),
+            confidence: 1.0,
+        };
+        let manual = Provenance {
+            subject_id: String::from("n"),
+            origin: Origin::from_columns(ProvenanceColumns {
+                author: Some(String::from("ada")),
+                note: Some(String::from("checked the filing")),
+                asserted_at: Some(String::from("2026-10-06 12:00:00")),
+                ..ProvenanceColumns::default()
+            }),
             confidence: 1.0,
         };
         assert_eq!(chunk.origin.chunk_id(), Some(&ChunkId::from("c")));
         assert_eq!(row.origin.chunk_id(), None);
+        assert_eq!(manual.origin.chunk_id(), None);
+        assert_eq!(
+            manual.origin.assertion().as_deref(),
+            Some("asserted by ada: checked the filing")
+        );
+        assert_eq!(chunk.origin.assertion(), None);
+        assert_eq!(
+            serde_json::to_value(&manual).ok(),
+            Some(serde_json::json!({
+                "subject_id": "n", "author": "ada", "note": "checked the filing",
+                "asserted_at": "2026-10-06 12:00:00", "confidence": 1.0
+            }))
+        );
         assert_eq!(
             serde_json::to_value(&chunk).ok(),
             Some(serde_json::json!({
@@ -726,7 +860,7 @@ mod tests {
                 "subject_id": "n", "table_name": "t", "row_key": "k", "confidence": 1.0
             }))
         );
-        for p in [chunk, row] {
+        for p in [chunk, row, manual] {
             let back: Option<Provenance> = serde_json::to_string(&p)
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok());
@@ -772,22 +906,12 @@ mod tests {
             provenance: vec![
                 Provenance {
                     subject_id: String::from("b"),
-                    origin: Origin::from_columns(
-                        None,
-                        ChunkId::from(String::new()),
-                        String::new(),
-                        String::new(),
-                    ),
+                    origin: Origin::from_columns(ProvenanceColumns::default()),
                     confidence: 1.0,
                 },
                 Provenance {
                     subject_id: String::from("ac"),
-                    origin: Origin::from_columns(
-                        None,
-                        ChunkId::from(String::new()),
-                        String::new(),
-                        String::new(),
-                    ),
+                    origin: Origin::from_columns(ProvenanceColumns::default()),
                     confidence: 1.0,
                 },
             ],

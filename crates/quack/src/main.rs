@@ -29,6 +29,7 @@ use quack_core::config::{Config, Grant, LogFormat};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::graph::follow_up;
 use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::PageCounts;
@@ -1963,6 +1964,42 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     }
     report_ingested(&mut out, &result, pin)?;
     out.flush()?;
+    follow_ingest(
+        config,
+        &ws_db,
+        embedding_model.as_ref(),
+        &[result.document_id],
+        &mut out,
+    )
+    .await?;
+    out.flush()?;
+    Ok(())
+}
+
+/// The graph extraction `[graph].follow_ingest` asks for after an ingest
+/// or import, run here and reported in one line; nothing when it is off.
+async fn follow_ingest(
+    config: &Config,
+    db: &Writer,
+    embedder: Option<&Embeddings>,
+    documents: &[DocumentId],
+    out: &mut impl Write,
+) -> Result<()> {
+    let followed = follow_up::after_documents(
+        db,
+        config,
+        embedder,
+        documents,
+        RunControl {
+            progress: &progress_line::to_stderr,
+            cancel: None,
+        },
+    )
+    .await
+    .context("graph follow-up failed")?;
+    if let Some(summary) = followed {
+        writeln!(out, "  Graph: {summary}")?;
+    }
     Ok(())
 }
 
@@ -2132,6 +2169,16 @@ async fn ingest_folder(
             )?,
         }
     }
+    out.flush()?;
+    let stored: Vec<DocumentId> = report
+        .results
+        .iter()
+        .filter_map(|r| match &r.outcome {
+            Outcome::Ingested(id) | Outcome::Replaced { new: id, .. } => Some(id.clone()),
+            Outcome::Skipped(_) | Outcome::Failed(_) => None,
+        })
+        .collect();
+    follow_ingest(config, &ws_db, embedding_model.as_ref(), &stored, &mut out).await?;
     out.flush()?;
     let failed = report.failed();
     if failed > 0 {

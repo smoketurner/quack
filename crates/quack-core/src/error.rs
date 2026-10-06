@@ -153,6 +153,11 @@ pub enum Error {
     #[error("ingestion error: {0}")]
     Ingestion(String),
 
+    /// A workspace snapshot that is not one, is from a newer quack, or
+    /// names a path outside the workspace (`storage::backup`).
+    #[error("snapshot error: {0}")]
+    Snapshot(String),
+
     /// The work was cancelled (a job's cancel token) before it finished.
     #[error("cancelled")]
     Cancelled,

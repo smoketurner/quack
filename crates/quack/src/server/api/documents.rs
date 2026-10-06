@@ -507,13 +507,7 @@ impl Lane<'_> {
             &data,
         )
         .await?
-        .submit(
-            app,
-            id,
-            Some(access.identity.user_id.clone()),
-            Arc::clone(self.db),
-            self.embedder,
-        );
+        .submit(app, access, Arc::clone(self.db), self.embedder);
         Ok(Enqueued::Queued {
             id: document_id,
             filename,

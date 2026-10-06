@@ -126,7 +126,7 @@ impl Manifest {
     /// Returns an error naming the newer format or schema.
     pub fn check_readable(&self) -> Result<()> {
         if self.format > FORMAT_VERSION {
-            return Err(Error::Ingestion(format!(
+            return Err(Error::Snapshot(format!(
                 "the snapshot is format {} (written by quack {}); this quack reads up to {FORMAT_VERSION}",
                 self.format, self.quack_version
             )));
@@ -134,7 +134,7 @@ impl Manifest {
         if let Some(schema) = self.schema_version
             && schema > WorkspaceDb::schema_version()
         {
-            return Err(Error::Ingestion(format!(
+            return Err(Error::Snapshot(format!(
                 "the snapshot's workspace has schema version {schema} (written by quack {}); \
                  this quack writes {}; upgrade quack to restore it",
                 self.quack_version,
@@ -189,7 +189,7 @@ pub fn read_manifest<R: Read>(tar: R) -> Result<Manifest> {
             return Ok(serde_json::from_str(&text)?);
         }
     }
-    Err(Error::Ingestion(String::from(
+    Err(Error::Snapshot(String::from(
         "not a workspace snapshot: no manifest.json",
     )))
 }
@@ -204,7 +204,7 @@ pub fn read_manifest<R: Read>(tar: R) -> Result<Manifest> {
 /// leaves the directory, or a write fails.
 pub fn unpack<R: Read>(tar: R, workspace_dir: &Path) -> Result<Manifest> {
     if workspace_dir.join(DATABASE).exists() {
-        return Err(Error::Ingestion(format!(
+        return Err(Error::Snapshot(format!(
             "{} already holds a workspace file",
             workspace_dir.display()
         )));
@@ -242,7 +242,7 @@ pub fn unpack<R: Read>(tar: R, workspace_dir: &Path) -> Result<Manifest> {
         std::io::copy(&mut entry, &mut file)?;
     }
     manifest
-        .ok_or_else(|| Error::Ingestion(String::from("not a workspace snapshot: no manifest.json")))
+        .ok_or_else(|| Error::Snapshot(String::from("not a workspace snapshot: no manifest.json")))
 }
 
 /// How a snapshot comes back as a workspace.
@@ -437,7 +437,7 @@ where
 
 /// Bytes the tar reader cannot take as a tar.
 fn not_a_snapshot(e: &std::io::Error) -> Error {
-    Error::Ingestion(format!("not a workspace snapshot: {e}"))
+    Error::Snapshot(format!("not a workspace snapshot: {e}"))
 }
 
 /// A tar entry's path as a relative path with no `..` or root.
@@ -448,7 +448,7 @@ fn safe_relative(path: &Path) -> Result<PathBuf> {
             Component::Normal(part) => out.push(part),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(Error::Ingestion(format!(
+                return Err(Error::Snapshot(format!(
                     "the snapshot names a path outside the workspace: {}",
                     path.display()
                 )));
