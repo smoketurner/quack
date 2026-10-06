@@ -2,13 +2,16 @@
 //! search without the model.
 
 use std::convert::Infallible;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Json;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use futures::Stream;
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::events::{self, AgentEvent, FailureKind, TurnFailure};
@@ -21,11 +24,13 @@ use quack_core::llm::{self, Embeddings};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{
-    ChunkScope, HybridLimits, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
+    ChunkScope, ExportFormat, HybridLimits, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use super::StreamEvent;
+use super::okf::{BodyWriter, CHUNKS_IN_FLIGHT};
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
@@ -48,6 +53,8 @@ struct PreparedTurn {
     session_id: SessionId,
     policy: WritePolicy,
     prompt: String,
+    /// The chat model's provider and id.
+    model: (String, String),
 }
 
 impl PreparedTurn {
@@ -77,6 +84,7 @@ impl PreparedTurn {
             return Err(ApiError::bad_request("prompt must not be empty"));
         }
         let chat = app.config.chat_model_ref()?;
+        let model_names = (chat.provider_name.to_string(), chat.model.to_owned());
         let mode = body.mode;
         let db = app.workspace_db(workspace_id).await?;
         let reader = app.reader_db(workspace_id).await?;
@@ -112,6 +120,7 @@ impl PreparedTurn {
             session_id,
             policy,
             prompt: body.prompt.clone(),
+            model: model_names,
         })
     }
 
@@ -126,6 +135,7 @@ impl PreparedTurn {
             session_id,
             policy,
             prompt,
+            model,
         } = self;
         let (sink, events) = events::channel();
         let lane = LaneKey::Session(session_id.clone());
@@ -175,6 +185,7 @@ impl PreparedTurn {
             access,
             session_id,
             prompt,
+            model,
         }
     }
 }
@@ -203,6 +214,8 @@ struct Turn {
     access: Access,
     session_id: SessionId,
     prompt: String,
+    /// The chat model's provider and id, for the audit detail.
+    model: (String, String),
 }
 
 /// Whether a turn's stream has sent its `complete` or `error` event.
@@ -240,13 +253,17 @@ impl Turn {
     /// is removed, as print mode does, so the session list shows no empty
     /// entries.
     async fn record(&self, app: &App, end: TurnEnd<'_>) {
-        let (outcome, steps) = match end {
-            TurnEnd::Answered(response) => (Outcome::Allowed, response.steps.clone()),
+        let (outcome, steps, citations) = match end {
+            TurnEnd::Answered(response) => (
+                Outcome::Allowed,
+                response.steps.clone(),
+                response.citations.clone(),
+            ),
             TurnEnd::Failed(Some(TurnFailure {
                 kind: FailureKind::ProviderNotAllowed,
                 ..
-            })) => (Outcome::Denied, Vec::new()),
-            TurnEnd::Failed(_) => (Outcome::Error, Vec::new()),
+            })) => (Outcome::Denied, Vec::new(), Vec::new()),
+            TurnEnd::Failed(_) => (Outcome::Error, Vec::new(), Vec::new()),
         };
         if outcome != Outcome::Allowed
             && let Ok(db) = app.workspace_db(&self.access.membership.workspace.id).await
@@ -256,7 +273,32 @@ impl Turn {
                 tracing::warn!(error = %e.message, "could not remove the empty session");
             }
         }
-        let detail = serde_json::json!({ "prompt": self.prompt, "steps": steps });
+        // The model and the cited chunks beside the prompt and the steps:
+        // what the workspace's OCSF export renders as the `ai_operation`
+        // profile. Step rows are not kept here; the message has them.
+        let steps: Vec<serde_json::Value> = steps
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "tool": s.tool, "detail": s.detail, "summary": s.summary,
+                    "rows": s.rows, "duration_ms": s.duration_ms,
+                })
+            })
+            .collect();
+        let citations: Vec<serde_json::Value> = citations
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "document_id": c.document_id, "chunk_id": c.chunk_id, "chunk_index": c.chunk_index,
+                })
+            })
+            .collect();
+        let detail = serde_json::json!({
+            "prompt": self.prompt,
+            "model": { "provider": self.model.0, "name": self.model.1 },
+            "steps": steps,
+            "citations": citations,
+        });
         if let Err(e) = self
             .access
             .audit(
@@ -400,6 +442,31 @@ pub(crate) struct SqlRequest {
     pub sql: String,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct ExportRequest {
+    pub sql: String,
+    #[serde(default = "default_export_format")]
+    pub format: ExportFormat,
+}
+
+fn default_export_format() -> ExportFormat {
+    ExportFormat::Csv
+}
+
+/// `POST .../sql/export`: every row of a read statement, streamed in
+/// `format` with no row cap, for the viewer role; a statement that
+/// writes is refused. Audited as `export` with the statement, the format,
+/// and the row count once the stream ends.
+pub(crate) async fn export(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+    Json(body): Json<ExportRequest>,
+) -> ApiResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access.export_sql(&app, body.sql, body.format).await
+}
+
 /// Direct SQL. Reads need the viewer role; anything that mutates needs the
 /// member role and the write scope. `_quack_` tables are never reachable.
 /// A capped result set for the API and the web grid.
@@ -427,6 +494,92 @@ pub(crate) async fn sql(
 }
 
 impl Access {
+    /// Stream every row of a read statement to the response in `format`
+    /// (the pattern `okf::export` uses): the statement runs on a reader
+    /// connection inside a read-only transaction, written a chunk at a
+    /// time into a bounded channel the body drains. A statement that
+    /// writes, or references internal tables, is refused before anything
+    /// runs. The `export` audit row carries the statement, the format,
+    /// and the rows written, or the error.
+    pub(crate) async fn export_sql(
+        self,
+        app: &App,
+        statement: String,
+        format: ExportFormat,
+    ) -> ApiResult<Response> {
+        let workspace_id = self.membership.workspace.id.clone();
+        let sql = statement.clone();
+        let kind = app
+            .read(&workspace_id, move |db| db.classify_user_statement(&sql))
+            .await
+            .map_err(|e| ApiError::forbidden(e.message))?;
+        if kind.writes().map_err(ApiError::bad_request)? {
+            self.audit(
+                app,
+                AuditAction::Export,
+                None,
+                Outcome::Denied,
+                Some(serde_json::json!({ "sql": statement, "format": format })),
+            )
+            .await?;
+            return Err(ApiError::bad_request(
+                "only a read statement can be exported",
+            ));
+        }
+        let reader = app.reader_db(&workspace_id).await?;
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(CHUNKS_IN_FLIGHT);
+        let failed = tx.clone();
+        let audit_app = Arc::clone(app);
+        let sql = statement.clone();
+        tokio::spawn(async move {
+            // `with_db` already runs the closure inside a read-only
+            // transaction on a reader connection.
+            let written = reader
+                .with_db(move |db| {
+                    let mut out = BodyWriter::new(tx);
+                    let rows = db.stream_query(&sql, format, &mut out)?;
+                    out.flush()?;
+                    Ok(rows)
+                })
+                .await;
+            let (outcome, detail) = match written {
+                Ok(rows) => (
+                    Outcome::Allowed,
+                    serde_json::json!({ "sql": statement, "format": format, "rows": rows }),
+                ),
+                Err(e) => {
+                    tracing::warn!(workspace = %workspace_id, error = %e, "sql export failed partway");
+                    drop(failed.send(Err(io::Error::other(e.to_string()))).await);
+                    (
+                        Outcome::Error,
+                        serde_json::json!({ "sql": statement, "format": format, "error": e.to_string() }),
+                    )
+                }
+            };
+            drop(failed);
+            if let Err(e) = self
+                .audit(&audit_app, AuditAction::Export, None, outcome, Some(detail))
+                .await
+            {
+                tracing::error!(workspace = %workspace_id, error = %e.message, "could not audit a sql export");
+            }
+        });
+        let body = Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        }));
+        Ok((
+            [
+                (header::CONTENT_TYPE, String::from(format.content_type())),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"query.{format}\""),
+                ),
+            ],
+            body,
+        )
+            .into_response())
+    }
+
     /// Classify, authorize, run, and audit one statement: the SQL the API
     /// and the web grid share.
     pub(crate) async fn execute_sql(&self, app: &App, statement: &str) -> ApiResult<SqlOutcome> {

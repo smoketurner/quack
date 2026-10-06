@@ -17,6 +17,7 @@ use super::policy::Hold;
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
 use crate::storage::control::Outcome;
+use crate::storage::workspace::QueryResults;
 
 /// A turn's embeddings, by input (the role is part of it).
 type EmbeddingCache = HashMap<Input, Vector>;
@@ -113,6 +114,10 @@ pub struct ToolStep {
     /// Rows a statement produced, on a step that ran one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<u64>,
+    /// The first `[analysis].step_result_rows` rows the statement
+    /// returned, so a reader can check the answer against them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<QueryResults>,
     pub duration_ms: u64,
 }
 
@@ -489,20 +494,28 @@ pub struct StepInProgress {
 
 impl StepInProgress {
     pub fn finish(self, summary: impl Into<String>) {
-        self.record(summary.into(), None);
+        self.record(summary.into(), None, None);
     }
 
     /// Finish a statement that produced `rows` rows.
     pub fn finish_rows(self, rows: u64) {
-        self.record(format!("{rows} rows"), Some(rows));
+        self.record(format!("{rows} rows"), Some(rows), None);
     }
 
-    fn record(self, summary: String, rows: Option<u64>) {
+    /// Finish a statement that produced `rows` rows, keeping the first
+    /// `keep` of `result` on the step for the transcript.
+    pub fn finish_with_result(self, rows: u64, mut result: QueryResults, keep: usize) {
+        result.rows.truncate(keep);
+        self.record(format!("{rows} rows"), Some(rows), Some(result));
+    }
+
+    fn record(self, summary: String, rows: Option<u64>, result: Option<QueryResults>) {
         let step = ToolStep {
             tool: self.tool,
             detail: self.detail,
             summary,
             rows,
+            result,
             duration_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         };
         if let Ok(mut steps) = self.recorder.steps.lock() {

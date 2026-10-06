@@ -7,8 +7,12 @@ use std::io::{IsTerminal, Write};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use quack_core::config::Config;
-use quack_core::ids::{UserId, WorkspaceId};
+use std::collections::HashMap;
+
+use quack_core::ids::{AuditId, UserId, WorkspaceId};
+use quack_core::ocsf::PromptText;
 use quack_core::prefix::PrefixMatch;
+use quack_core::storage::audit;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, Expiry, GrantedBy,
     IssuedToken, Outcome, ResourceKind, Role, Scope, UserKind, UserRow, WorkspaceName,
@@ -196,6 +200,14 @@ pub(crate) struct AuditArgs {
     limit: u32,
     #[arg(long, value_enum, default_value_t = AuditFormat::Text)]
     format: AuditFormat,
+    /// With -w and --format ocsf: join each row to the workspace's own
+    /// audit detail, so query events carry the model, the tools, and the
+    /// documents cited (the OCSF `ai_operation` profile)
+    #[arg(long, requires = "workspace")]
+    detail: bool,
+    /// With --detail: carry each question's text on its event
+    #[arg(long, requires = "detail")]
+    with_prompt: bool,
 }
 
 /// How `quack audit` prints.
@@ -636,6 +648,15 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
         Some(name) => Some(control.workspace_named(name).await?.id),
         None => None,
     };
+    if args.detail {
+        let Some(workspace_id) = workspace_id else {
+            anyhow::bail!("--detail needs -w WORKSPACE");
+        };
+        if format != AuditFormat::Ocsf {
+            anyhow::bail!("--detail prints OCSF events; add --format ocsf");
+        }
+        return audit_with_detail(config, &control, &workspace_id, &args).await;
+    }
     let mut filter = AuditFilter {
         user_id,
         workspace_id,
@@ -665,6 +686,44 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
 }
 
 const AUDIT_PAGE: u32 = 1_000;
+
+/// `quack audit -w ws --detail --format ocsf`: the workspace's detail rows
+/// (its own file, opened here) joined to their access rows, one OCSF event
+/// per line. `--limit 0` reads every detail row.
+async fn audit_with_detail(
+    config: &Config,
+    control: &ControlPlane,
+    workspace_id: &WorkspaceId,
+    args: &AuditArgs,
+) -> Result<()> {
+    let db = WorkspaceDb::open(config, workspace_id.as_str())?;
+    let limit = if args.limit == 0 {
+        u32::MAX
+    } else {
+        args.limit
+    };
+    let details = audit::list(&db, limit)?;
+    drop(db);
+    let ids: Vec<AuditId> = details.iter().map(|d| d.id.clone()).collect();
+    let rows = control.audit_rows_by_ids(&ids).await?;
+    let by_id: HashMap<&AuditId, &AuditRow> = rows.iter().map(|r| (&r.entry.id, r)).collect();
+    let prompt = if args.with_prompt {
+        PromptText::Include
+    } else {
+        PromptText::Omit
+    };
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    for detail in &details {
+        let Some(row) = by_id.get(&detail.id) else {
+            continue;
+        };
+        let event = row.to_ocsf_with_detail(Some(detail), prompt)?;
+        writeln!(out, "{}", serde_json::to_string(&event)?)?;
+    }
+    out.flush()?;
+    Ok(())
+}
 
 /// `quack audit` output, written a page at a time.
 enum AuditOutput<W: Write> {

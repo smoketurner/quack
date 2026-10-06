@@ -3,23 +3,56 @@
 (function () {
   "use strict";
 
+  // Save-as-image and a read-only data view, from the vendored ECharts;
+  // the data view is the spec's own numbers, nothing is re-run.
+  function toolbox() {
+    return { feature: { saveAsImage: { title: "Save image" }, dataView: { title: "Data", readOnly: true, lang: ["Data", "Close", ""] } } };
+  }
+
   function chartOption(spec) {
     if (spec.kind === "pie") {
       var first = (spec.series && spec.series[0]) || { values: [] };
       return {
         title: { text: spec.title },
         tooltip: {},
+        toolbox: toolbox(),
         series: [{ type: "pie", radius: "60%", data: spec.x.values.map(function (l, i) { return { name: l, value: first.values[i] }; }) }]
       };
     }
     return {
       title: { text: spec.title },
-      tooltip: {},
+      tooltip: { trigger: "axis" },
+      toolbox: toolbox(),
       legend: { bottom: 0 },
       xAxis: { type: "category", name: spec.x.label, data: spec.x.values },
       yAxis: { type: "value" },
-      series: spec.series.map(function (s) { return { name: s.name, type: spec.kind, data: s.values }; })
+      series: spec.series.map(function (s) {
+        var out = { name: s.name, type: spec.kind, data: s.values };
+        if (spec.stacked && (spec.kind === "bar" || spec.kind === "line")) out.stack = "total";
+        return out;
+      })
     };
+  }
+
+  // The chart's numbers as CSV, built here from the spec: x label, then
+  // one column per series. Opens as a data URL, so no statement runs again.
+  function chartCsv(spec) {
+    function cell(v) {
+      var s = String(v == null ? "" : v);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }
+    var lines = [[spec.x.label].concat(spec.series.map(function (s) { return s.name; })).map(cell).join(",")];
+    spec.x.values.forEach(function (label, i) {
+      lines.push([label].concat(spec.series.map(function (s) { return s.values[i]; })).map(cell).join(","));
+    });
+    return lines.join("\n") + "\n";
+  }
+
+  function chartDownload(spec) {
+    var a = el("a", "mt-1 inline-block text-xs text-blue-400 hover:underline", "Download CSV");
+    a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(chartCsv(spec));
+    a.download = ((spec.title || "chart").replace(/[^A-Za-z0-9_-]+/g, "-") || "chart") + ".csv";
+    return a;
   }
 
   // The page is dark; charts take ECharts' dark theme over its background.
@@ -37,6 +70,7 @@
     var chart = initChart(el);
     chart.setOption(chartOption(spec));
     window.addEventListener("resize", function () { chart.resize(); });
+    if (el.parentNode) el.parentNode.insertBefore(chartDownload(spec), el.nextSibling);
   }
 
   function renderStoredCharts() {
@@ -321,6 +355,34 @@
     });
   }
 
+  // The rows a run_sql or create_chart step kept, as a collapsed grid with
+  // a form that exports the whole result through the SQL page's download.
+  function stepResult(step, ws) {
+    var details = el("details", "step-result mt-1");
+    details.appendChild(el("summary", "cursor-pointer text-slate-500", "rows"));
+    var wrap = el("div", "mt-1 max-h-72 overflow-auto rounded border border-slate-800");
+    var table = el("table", "min-w-full text-xs");
+    var head = el("tr", "border-b border-slate-700 text-left");
+    step.result.columns.forEach(function (c) { head.appendChild(el("th", "px-2 py-1 font-mono whitespace-nowrap", c)); });
+    var thead = el("thead"); thead.appendChild(head); table.appendChild(thead);
+    var tbody = el("tbody");
+    step.result.rows.forEach(function (row) {
+      var tr = el("tr", "border-b border-slate-800");
+      row.forEach(function (v) { tr.appendChild(el("td", "px-2 py-1 whitespace-nowrap", v == null ? "" : (typeof v === "object" ? JSON.stringify(v) : String(v)))); });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody); wrap.appendChild(table); details.appendChild(wrap);
+    if (step.rows != null && step.rows > step.result.rows.length) details.appendChild(el("p", "mt-1 text-slate-500", "first " + step.result.rows.length + " of " + step.rows + " rows"));
+    var form = el("form", "mt-1");
+    form.method = "post";
+    form.action = "/w/" + ws + "/sql.csv";
+    var sql = el("input"); sql.type = "hidden"; sql.name = "sql"; sql.value = step.detail;
+    form.appendChild(sql);
+    form.appendChild(el("button", "text-blue-400 hover:underline", "Export full result"));
+    details.appendChild(form);
+    return details;
+  }
+
   function handle(event, data, view, chat, status) {
     if (event === "status") {
       setWorking(view, data);
@@ -344,6 +406,7 @@
       if (pending) {
         pending.removeAttribute("data-pending");
         pending.appendChild(el("span", "text-slate-400", " → " + f.summary + ", " + f.duration_ms + " ms"));
+        if (f.result && f.result.columns && f.result.columns.length) pending.appendChild(stepResult(f, chat.getAttribute("data-workspace")));
       }
     } else if (event === "complete") {
       var r = JSON.parse(data);

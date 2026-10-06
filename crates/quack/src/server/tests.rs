@@ -13,14 +13,14 @@
 )]
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::{
     BaseUrl, Config, FollowIngest, ProviderConfig, ProviderName, ProviderType, SecureCookies,
 };
 use quack_core::embedding::{Dimension, Vector};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
-use quack_core::ids::{ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
+use quack_core::ids::{AuditId, ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use quack_core::ingestion::parser::PageCounts;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -95,6 +95,25 @@ impl Harness {
             serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
         });
         (status, value, headers)
+    }
+
+    /// `send`, with the body as it came: for a file, not JSON or text.
+    async fn send_bytes(
+        &self,
+        request: Request<Body>,
+    ) -> (StatusCode, Bytes, axum::http::HeaderMap) {
+        let response = self
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|e| fail(&format!("request failed: {e}")));
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        (status, bytes, headers)
     }
 
     async fn call(
@@ -6345,10 +6364,11 @@ async fn closing_the_state_checkpoints_each_workspace() {
     assert!(!log.exists(), "the log was checkpointed into the file");
 }
 
-/// A download the row cap cut says so in its filename and on its button;
-/// a complete one keeps the plain name, and neither file carries a marker.
+/// The grid is capped, but the download streams every row: the button
+/// says so when the grid was cut, and the file is the whole result either
+/// way, under the plain name.
 #[tokio::test]
-async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
+async fn the_csv_download_holds_every_row_past_the_grids_cap() {
     let mut config = Config::default();
     config.analysis.max_query_rows = 3;
     let h = harness_with(ServeMode::Login, config).await;
@@ -6368,20 +6388,17 @@ async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
     assert_eq!(status, StatusCode::OK);
     assert!(
         html.contains("10 rows (showing 3)")
-            && html.contains(">Download CSV (first 3 of 10 rows)</button>"),
+            && html.contains(">Download CSV (all 10 rows)</button>"),
         "{html}"
     );
     let (status, csv, headers) = h
         .form(&format!("/w/{ws}/sql.csv"), Some(&cookie), capped)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        disposition(&headers),
-        "attachment; filename=\"query-first-3-of-10.csv\""
-    );
-    assert_eq!(csv, "n\n0\n1\n2\n");
+    assert_eq!(disposition(&headers), "attachment; filename=\"query.csv\"");
+    assert_eq!(csv, "n\n0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n");
 
-    // A result of exactly the cap is complete.
+    // A result within the cap: no note on the button.
     let complete = "sql=SELECT+*+FROM+range(3)+t(n)";
     let (_, html, _) = h
         .form(&format!("/w/{ws}/sql"), Some(&cookie), complete)
@@ -6390,11 +6407,10 @@ async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
         html.contains(">Download CSV</button>") && !html.contains("showing"),
         "{html}"
     );
-    let (status, csv, headers) = h
+    let (status, csv, _) = h
         .form(&format!("/w/{ws}/sql.csv"), Some(&cookie), complete)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(disposition(&headers), "attachment; filename=\"query.csv\"");
     assert_eq!(csv, "n\n0\n1\n2\n");
 }
 
@@ -7370,6 +7386,7 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
                     detail: String::from(OVERDUE),
                     summary: String::from("1 rows"),
                     rows: Some(1),
+                    result: None,
                     duration_ms: 1,
                 }],
                 ..AgentResponse::default()
@@ -8067,6 +8084,229 @@ async fn an_upload_queues_the_graph_follow_up_the_setting_asks_for() {
         extracts.iter().any(|d| d["finished"] == true),
         "{extracts:?}"
     );
+}
+
+/// `POST .../sql/export` streams every row past the grid's cap in the
+/// asked format, refuses a write, and audits the export with its row
+/// count; the SQL page's download takes the same path.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_export_streams_every_row_and_refuses_writes() {
+    let mut config = Config::default();
+    config.analysis.max_query_rows = 10;
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("sales", &owner).await;
+    let token = h.login("owner").await;
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &token,
+            serde_json::json!({ "sql": "CREATE TABLE big AS SELECT range AS n FROM range(1000)" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let export = |sql: &str, format: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/workspaces/{ws}/sql/export"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "sql": sql, "format": format }).to_string(),
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    let (status, bytes, headers) = h
+        .send_bytes(export("SELECT n FROM big ORDER BY n", "csv"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/csv; charset=utf-8")
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(text.lines().count(), 1001, "a header and every row");
+    assert!(
+        text.ends_with("999\n"),
+        "{}",
+        text.lines().last().unwrap_or_default()
+    );
+    let (status, bytes, _) = h
+        .send_bytes(export("SELECT n FROM big WHERE n < 3", "ndjson"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n"
+    );
+    let (status, bytes, _) = h.send_bytes(export("DELETE FROM big", "csv")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let (status, _, _) = h
+        .send_bytes(export("SELECT * FROM _quack_documents", "csv"))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // The audit row lands once the stream has ended.
+    let mut exports = Vec::new();
+    for _ in 0..50 {
+        exports = h
+            .audit(AuditFilter {
+                action: Some(String::from("export")),
+                ..AuditFilter::default()
+            })
+            .await;
+        if exports.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(exports.len(), 3, "{exports:?}");
+    assert!(exports.iter().any(|r| r.entry.outcome == Outcome::Denied));
+
+    // The web download streams the whole result too.
+    let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    let cookie = session_cookie(&headers);
+    let (status, bytes, _) = h
+        .send_bytes(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/w/{ws}/sql.csv"))
+                .header(header::COOKIE, format!("quack_session={cookie}"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("sql=SELECT+n+FROM+big"))
+                .unwrap_or_else(|e| fail(&e.to_string())),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(String::from_utf8_lossy(&bytes).lines().count(), 1001);
+}
+
+/// An admin who is not a member may add themself only with a reason; the
+/// grant is a `break_glass` row whose detail names the role, the reason,
+/// and that admin rights were used. Any other grant is a `member` row with
+/// the role in its detail.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admin_self_grant_needs_a_reason_and_is_marked_break_glass() {
+    let h = harness(ServeMode::Login).await;
+    let root_id = h.user("root", UserKind::Admin).await;
+    let owner_id = h.user("owner", UserKind::Standard).await;
+    h.user("vera", UserKind::Standard).await;
+    let ws = h.workspace("finance", &owner_id).await;
+    let root = h.login("root").await;
+    let owner = h.login("owner").await;
+    let members = format!("/api/v1/workspaces/{ws}/members");
+    let (status, body) = h
+        .post(
+            &members,
+            &root,
+            serde_json::json!({ "username": "root", "role": "owner" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reason"),
+        "{body}"
+    );
+    let (status, body) = h
+        .post(
+            &members,
+            &root,
+            serde_json::json!({ "username": "root", "role": "owner", "reason": "  " }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = h
+        .post(
+            &members,
+            &root,
+            serde_json::json!({ "username": "root", "role": "owner", "reason": "incident 42" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // An owner adding someone else needs no reason and is a plain member row.
+    let (status, body) = h
+        .post(
+            &members,
+            &owner,
+            serde_json::json!({ "username": "vera", "role": "viewer" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let glass = h
+        .audit(AuditFilter {
+            action: Some(String::from("break_glass")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(glass.len(), 1, "{glass:?}");
+    assert_eq!(glass[0].entry.user_id.as_ref(), Some(&root_id));
+    let details = h
+        .app
+        .read(&ws, |db| audit::list(db, 50))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let by_id = |id: &AuditId| {
+        details
+            .iter()
+            .find(|d| &d.id == id)
+            .and_then(|d| d.detail.clone())
+    };
+    let detail = by_id(&glass[0].entry.id).unwrap_or_default();
+    assert_eq!(detail["role"], "owner", "{detail}");
+    assert_eq!(detail["reason"], "incident 42");
+    assert_eq!(detail["acting_as"], "admin");
+    let member_rows = h
+        .audit(AuditFilter {
+            action: Some(String::from("member")),
+            workspace_id: Some(ws.clone()),
+            ..AuditFilter::default()
+        })
+        .await;
+    let plain = member_rows
+        .iter()
+        .find(|r| r.entry.user_id.as_ref() == Some(&owner_id))
+        .unwrap_or_else(|| fail("the owner's grant is audited"));
+    assert_eq!(by_id(&plain.entry.id).unwrap_or_default()["role"], "viewer");
+
+    // The workspace's OCSF export joins both halves: the self-grant is a
+    // Medium Create event, and a query event would carry the ai profile.
+    let (status, body) = h
+        .get(
+            &format!("/api/v1/workspaces/{ws}/audit?format=ocsf"),
+            &owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = body["audit"].as_array().cloned().unwrap_or_default();
+    let event = events
+        .iter()
+        .find(|e| e["api"]["operation"] == "break_glass")
+        .unwrap_or_else(|| fail("the break_glass event is exported"));
+    assert_eq!(event["severity_id"], 3, "{event}");
+    assert_eq!(
+        event["unmapped"]["detail"]["reason"], "incident 42",
+        "{event}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| e["class_uid"].is_number() && e["metadata"]["version"] == "1.9.0"),
+        "{body}"
+    );
+    let (status, _) = h
+        .get(&format!("/api/v1/workspaces/{ws}/audit?format=xml"), &owner)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 /// An admin disables, re-enables, demotes, resets, and removes a user over

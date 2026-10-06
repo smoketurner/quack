@@ -810,6 +810,23 @@ impl Message {
             )]);
         }
         rows.splice(at..at, detail_rows);
+        if let Some(result) = self.result.as_ref().filter(|r| !r.columns.is_empty()) {
+            if expanded {
+                let mut table = Vec::new();
+                if result.write_table(&mut table).is_ok() {
+                    rows.extend(
+                        String::from_utf8_lossy(&table)
+                            .lines()
+                            .map(|l| vec![Span::styled(format!("  {l}"), dim)]),
+                    );
+                }
+            } else {
+                rows.push(vec![Span::styled(
+                    format!("  ({} rows kept; /steps shows them)", result.rows.len()),
+                    dim,
+                )]);
+            }
+        }
         rows
     }
 }

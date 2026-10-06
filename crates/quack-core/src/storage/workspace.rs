@@ -420,8 +420,127 @@ const READ_ONLY_KEYWORDS: &[&str] = &[
     "EXPLAIN",
 ];
 
+/// How a streamed result set is written ([`WorkspaceDb::stream_query`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    Csv,
+    Ndjson,
+    Json,
+}
+
+text_enum!(ExportFormat, "export format", {
+    Csv => "csv",
+    Ndjson => "ndjson",
+    Json => "json",
+});
+
+impl ExportFormat {
+    /// The media type of what is written.
+    #[must_use]
+    pub const fn content_type(self) -> &'static str {
+        match self {
+            Self::Csv => "text/csv; charset=utf-8",
+            Self::Ndjson => "application/x-ndjson",
+            Self::Json => "application/json",
+        }
+    }
+}
+
+/// One row at a time in an [`ExportFormat`], the same shapes
+/// [`QueryResults::write_csv`], `write_ndjson`, and `write_json` make.
+enum RowWriter<'a, W: Write> {
+    Csv(Box<csv::Writer<&'a mut W>>),
+    Ndjson {
+        out: &'a mut W,
+        keys: Vec<String>,
+    },
+    Json {
+        out: &'a mut W,
+        keys: Vec<String>,
+        first: bool,
+    },
+}
+
+impl<'a, W: Write> RowWriter<'a, W> {
+    fn start(format: ExportFormat, columns: &[String], out: &'a mut W) -> Result<Self> {
+        let keys = QueryResults {
+            columns: columns.to_vec(),
+            rows: Vec::new(),
+        }
+        .json_keys();
+        Ok(match format {
+            ExportFormat::Csv => {
+                let mut writer = csv::Writer::from_writer(out);
+                writer.write_record(columns)?;
+                Self::Csv(Box::new(writer))
+            }
+            ExportFormat::Ndjson => Self::Ndjson { out, keys },
+            ExportFormat::Json => {
+                out.write_all(b"[")?;
+                Self::Json {
+                    out,
+                    keys,
+                    first: true,
+                }
+            }
+        })
+    }
+
+    fn row(&mut self, values: &[serde_json::Value]) -> Result<()> {
+        match self {
+            Self::Csv(writer) => {
+                let cells: Vec<String> = values
+                    .iter()
+                    .map(|v| match v {
+                        serde_json::Value::Null => String::new(),
+                        other => display_json_value(other),
+                    })
+                    .collect();
+                writer.write_record(&cells)?;
+            }
+            Self::Ndjson { out, keys } => {
+                writeln!(out, "{}", json_object(keys, values)?)?;
+            }
+            Self::Json { out, keys, first } => {
+                if !*first {
+                    out.write_all(b",")?;
+                }
+                *first = false;
+                write!(out, "\n{}", json_object(keys, values)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            Self::Csv(mut writer) => writer.flush()?,
+            Self::Ndjson { out, .. } => out.flush()?,
+            Self::Json { out, .. } => {
+                out.write_all(b"\n]\n")?;
+                out.flush()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One row as a JSON object whose keys keep column order.
+fn json_object(keys: &[String], values: &[serde_json::Value]) -> Result<String> {
+    let mut fields = Vec::with_capacity(keys.len());
+    for (column, value) in keys.iter().zip(values) {
+        fields.push(format!(
+            "{}:{}",
+            serde_json::to_string(column)?,
+            serde_json::to_string(value)?
+        ));
+    }
+    Ok(format!("{{{}}}", fields.join(",")))
+}
+
 /// Query result set from a `DuckDB` workspace database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueryResults {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
@@ -2649,6 +2768,54 @@ impl WorkspaceDb {
 
     fn read_rows(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
         self.under_timeout(|db| Ok(db.read_rows_untimed(sql, keep, false)?.0))
+    }
+
+    /// Write every row of `sql` to `out` as it arrives, in `format`, under
+    /// the query timeout: the whole result set with nothing held in memory
+    /// but one row. The caller classifies the statement as a read and runs
+    /// this inside [`Self::read_only`]. Returns how many rows were written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL is invalid, execution fails, or a write
+    /// to `out` fails.
+    pub fn stream_query(
+        &self,
+        sql: &str,
+        format: ExportFormat,
+        out: &mut impl Write,
+    ) -> Result<u64> {
+        self.under_timeout(|db| db.stream_query_untimed(sql, format, out))
+    }
+
+    fn stream_query_untimed(
+        &self,
+        sql: &str,
+        format: ExportFormat,
+        out: &mut impl Write,
+    ) -> Result<u64> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        let (columns, column_count) = match rows.as_ref() {
+            Some(stmt_ref) if stmt_ref.column_count() > 0 => {
+                (stmt_ref.column_names(), stmt_ref.column_count())
+            }
+            _ => (Vec::new(), 0),
+        };
+        let mut writer = RowWriter::start(format, &columns, out)?;
+        let mut written = 0_u64;
+        if column_count > 0 {
+            while let Some(row) = rows.next()? {
+                let mut values = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    values.push(extract_value(row, i));
+                }
+                writer.row(&values)?;
+                written = written.saturating_add(1);
+            }
+        }
+        writer.finish()?;
+        Ok(written)
     }
 
     /// Read `sql`'s rows, keeping `keep` of them, and when `digested`,

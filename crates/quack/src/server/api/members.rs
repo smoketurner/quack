@@ -4,7 +4,9 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::ids::{UserId, WorkspaceId};
-use quack_core::storage::control::{AuditAction, GroupRoleRow, Outcome, ResourceKind, Role};
+use quack_core::storage::control::{
+    AuditAction, GroupRoleRow, Outcome, ResourceKind, Role, Standing, UserKind,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Identity, Need};
@@ -29,6 +31,10 @@ pub(crate) struct AddMember {
     pub username: String,
     #[serde(default = "default_role")]
     pub role: Role,
+    /// Why, when an admin grants themself a role in a workspace they are
+    /// not a member of; required then, ignored otherwise.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 fn default_role() -> Role {
@@ -72,7 +78,33 @@ impl Access {
             .find_user_by_username(&member.username)
             .await?
             .ok_or_else(|| ApiError::not_found("no such user"))?;
-        let entry = self.entry(AuditAction::Member, Outcome::Allowed);
+        // An admin with no membership giving themself a role: membership by
+        // admin right, marked as such and never without a reason.
+        let self_grant = self.membership.standing == Standing::Admin
+            && self.identity.kind == UserKind::Admin
+            && user.id == self.identity.user_id;
+        let reason = member
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty());
+        let (action, detail) = if self_grant {
+            let Some(reason) = reason else {
+                return Err(ApiError::bad_request(
+                    "granting yourself access to a workspace you are not a member of needs a reason",
+                ));
+            };
+            (
+                AuditAction::BreakGlass,
+                serde_json::json!({ "role": member.role, "reason": reason, "acting_as": "admin" }),
+            )
+        } else {
+            (
+                AuditAction::Member,
+                serde_json::json!({ "role": member.role }),
+            )
+        };
+        let entry = self.entry(action, Outcome::Allowed);
         app.control
             .set_member(
                 &self.membership.workspace.id,
@@ -81,7 +113,7 @@ impl Access {
                 entry.clone(),
             )
             .await?;
-        self.record_detail(app, &entry, None).await?;
+        self.record_detail(app, &entry, Some(detail)).await?;
         Ok(NewMember {
             user_id: user.id,
             username: user.username,

@@ -4297,6 +4297,7 @@ dependencies = [
  "dirs",
  "duckdb",
  "ego-tree",
+ "forwarded-header-value",
  "futures",
  "http",
  "http-body",

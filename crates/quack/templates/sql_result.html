@@ -5,7 +5,7 @@
 <form method="post" action="/w/{{ ws_id }}/sql.csv" class="flex items-center gap-4 text-sm text-slate-400">
   <input type="hidden" id="result-sql" name="sql" value="{{ sql }}">
   <span>{{ row_count }} rows{% if truncated %} (showing {{ rows.len() }}){% endif %} in {{ duration_ms }} ms</span>
-  <button type="submit" class="text-blue-400 hover:underline">Download CSV{% if truncated %} (first {{ rows.len() }} of {{ row_count }} rows){% endif %}</button>
+  <button type="submit" class="text-blue-400 hover:underline">Download CSV{% if truncated %} (all {{ row_count }} rows){% endif %}</button>
 </form>
 <div class="mt-2 overflow-x-auto rounded border border-slate-800 bg-slate-900">
   <table class="min-w-full text-sm">

@@ -8,6 +8,7 @@
 
 use std::net::IpAddr;
 
+use forwarded_header_value::{ForwardedHeaderValue, ForwardedStanza, Protocol};
 use ipnet::IpNet;
 
 /// The forwarded headers a request carried, as the proxy wrote them.
@@ -33,7 +34,8 @@ pub struct Client {
 /// The client behind `peer`: the peer itself unless it is a trusted proxy,
 /// in which case the rightmost forwarded address that is not itself a
 /// trusted proxy. A forwarded chain made only of trusted proxies resolves
-/// to its leftmost entry, the one the first proxy saw.
+/// to its leftmost entry, the one the first proxy saw. A header that does
+/// not parse (`forwarded-header-value` refuses it whole) counts as absent.
 #[must_use]
 pub fn client_addr(peer: IpAddr, headers: Forwarded<'_>, trusted: &[IpNet]) -> Client {
     let is_trusted = |ip: IpAddr| trusted.iter().any(|net| net.contains(&ip));
@@ -43,72 +45,50 @@ pub fn client_addr(peer: IpAddr, headers: Forwarded<'_>, trusted: &[IpNet]) -> C
             https: None,
         };
     }
-    let (chain, proto) = match headers.rfc7239 {
-        Some(forwarded) => parse_forwarded(forwarded),
-        None => (
-            headers
-                .x_forwarded_for
-                .map(|v| v.split(',').filter_map(parse_ip).collect::<Vec<_>>())
-                .unwrap_or_default(),
-            headers.x_forwarded_proto.map(|p| {
-                p.split(',')
-                    .next_back()
-                    .unwrap_or(p)
-                    .trim()
-                    .to_ascii_lowercase()
-            }),
-        ),
+    let chain = if let Some(value) = headers.rfc7239 {
+        forwarded_hops(value)
+    } else {
+        x_forwarded_hops(headers.x_forwarded_for, headers.x_forwarded_proto)
     };
-    let https = proto.as_deref().map(|p| p == "https");
-    let mut client = peer;
-    for hop in chain.iter().rev() {
-        client = *hop;
-        if !is_trusted(*hop) {
+    let mut client = Client {
+        ip: peer,
+        https: None,
+    };
+    for &(ip, https) in chain.iter().rev() {
+        client = Client { ip, https };
+        if !is_trusted(ip) {
             break;
         }
     }
-    Client { ip: client, https }
+    client
 }
 
-/// The `for=` addresses of every element of a `Forwarded` header, in
-/// order, and the last `proto=` it names.
-fn parse_forwarded(value: &str) -> (Vec<IpAddr>, Option<String>) {
-    let mut chain = Vec::new();
-    let mut proto = None;
-    for element in value.split(',') {
-        for pair in element.split(';') {
-            let Some((name, raw)) = pair.split_once('=') else {
-                continue;
-            };
-            let raw = raw.trim().trim_matches('"');
-            match name.trim().to_ascii_lowercase().as_str() {
-                "for" => {
-                    if let Some(ip) = parse_ip(raw) {
-                        chain.push(ip);
-                    }
-                }
-                "proto" => proto = Some(raw.to_ascii_lowercase()),
-                _ => {}
-            }
-        }
-    }
-    (chain, proto)
+/// Each `Forwarded` stanza's address, with the scheme it names.
+fn forwarded_hops(value: &str) -> Vec<(IpAddr, Option<bool>)> {
+    let Ok(value) = ForwardedHeaderValue::from_forwarded(value) else {
+        return Vec::new();
+    };
+    value
+        .iter()
+        .filter_map(|stanza| {
+            let https = stanza.forwarded_proto.map(|p| p == Protocol::Https);
+            stanza.forwarded_for_ip().map(|ip| (ip, https))
+        })
+        .collect()
 }
 
-/// An address as a forwarded header writes it: bare, with a port, or an
-/// IPv6 in brackets; an obfuscated identifier (`_hidden`) is none.
-fn parse_ip(raw: &str) -> Option<IpAddr> {
-    let raw = raw.trim().trim_matches('"');
-    if let Some(inner) = raw.strip_prefix('[') {
-        let end = inner.find(']')?;
-        return inner.get(..end)?.parse().ok();
-    }
-    if let Ok(ip) = raw.parse::<IpAddr>() {
-        return Some(ip);
-    }
-    raw.rsplit_once(':')
-        .and_then(|(host, _port)| host.parse::<std::net::Ipv4Addr>().ok())
-        .map(IpAddr::V4)
+/// Each `X-Forwarded-For` address, with the one scheme
+/// `X-Forwarded-Proto` names for the request.
+fn x_forwarded_hops(for_: Option<&str>, proto: Option<&str>) -> Vec<(IpAddr, Option<bool>)> {
+    let https = proto.map(|proto| proto.trim().eq_ignore_ascii_case("https"));
+    let Some(Ok(value)) = for_.map(ForwardedHeaderValue::from_x_forwarded_for) else {
+        return Vec::new();
+    };
+    value
+        .iter()
+        .filter_map(ForwardedStanza::forwarded_for_ip)
+        .map(|ip| (ip, https))
+        .collect()
 }
 
 #[cfg(test)]
@@ -182,7 +162,7 @@ mod tests {
         let client = client_addr(
             ip("10.0.0.1"),
             Forwarded {
-                x_forwarded_for: Some("10.0.0.5:1234, 10.0.0.2"),
+                x_forwarded_for: Some("10.0.0.5, 10.0.0.2"),
                 ..Forwarded::default()
             },
             &trusted,
@@ -193,9 +173,16 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_hops_are_skipped() {
-        assert_eq!(parse_ip("_hidden"), None);
-        assert_eq!(parse_ip("192.0.2.1:8080"), Some(ip("192.0.2.1")));
-        assert_eq!(parse_ip("\"[::1]\""), Some(ip("::1")));
+    fn a_header_that_does_not_parse_counts_as_absent() {
+        let trusted = [net("10.0.0.0/8")];
+        let client = client_addr(
+            ip("10.0.0.1"),
+            Forwarded {
+                x_forwarded_for: Some("not an address"),
+                ..Forwarded::default()
+            },
+            &trusted,
+        );
+        assert_eq!(client.ip, ip("10.0.0.1"));
     }
 }

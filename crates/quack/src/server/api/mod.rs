@@ -83,6 +83,7 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/workspaces/{id}/query", post(query::query))
         .route("/workspaces/{id}/query/stream", post(query::stream))
         .route("/workspaces/{id}/sql", post(query::sql))
+        .route("/workspaces/{id}/sql/export", post(query::export))
         .route("/workspaces/{id}/search", post(query::search))
         .route(
             "/workspaces/{id}/documents",
