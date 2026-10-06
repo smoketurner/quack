@@ -6,6 +6,7 @@ use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
 use crate::storage::workspace::{PinnedDocument, WorkspaceDb};
 use crate::text::{Fenced, OneLine, Tokens};
+use jiff::civil::Date;
 use std::fmt::Write;
 
 /// `DuckDB`'s Friendly SQL idioms, one line each, for the system prompt. Kept to
@@ -49,6 +50,10 @@ SELECT ..., INSERT OR REPLACE INTO t ...\n";
 #[derive(Debug, Clone)]
 pub struct PromptOptions {
     pub mode: ChatMode,
+    /// The date the prompt states, in the system's local zone, so "last
+    /// quarter" has an anchor. It changes once a day, so a provider's
+    /// prefix cache is invalidated that often and no more.
+    pub today: Date,
     /// What happens to mutating SQL this turn; the model is told so it
     /// attempts statements through the tool instead of refusing on its own.
     pub write_policy: WritePolicy,
@@ -65,8 +70,9 @@ pub struct PromptOptions {
 }
 
 /// The system prompt, assembled in the order the design fixes (section
-/// 7.2): role and mode, tool guidance and dialect, tables, documents and
-/// pinned text, the workspace context, and the trust and permission rules.
+/// 7.2): role and mode, the date, tool guidance and dialect, tables,
+/// documents and pinned text, the workspace context, and the trust and
+/// permission rules.
 #[derive(Debug, Default)]
 pub struct SystemPrompt {
     text: String,
@@ -173,6 +179,8 @@ impl SystemPrompt {
                  source.\n\n",
             ),
         }
+        writeln!(prompt.text, "Today is {}.", options.today)?;
+        writeln!(prompt.text)?;
 
         let ontology = ontology_store::current(db)?;
         let graph = graph_store::status(db)?;

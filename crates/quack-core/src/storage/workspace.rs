@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use aws_lc_rs::digest;
+use jiff::civil::DateTime;
 
 use crate::config::Config;
 use crate::crypto;
@@ -2115,7 +2116,8 @@ impl WorkspaceDb {
                          JOIN df d ON d.term = t.term \
                          JOIN _quack_chunks ch ON ch.id = t.chunk_id, stats s \
                          GROUP BY t.chunk_id) \
-             SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, sc.score \
+             SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, sc.score, \
+                    CAST(d.ingested_at AS VARCHAR) \
              FROM scored sc \
              JOIN _quack_chunks c ON c.id = sc.chunk_id \
              JOIN _quack_documents d ON d.id = c.document_id \
@@ -2194,7 +2196,8 @@ impl WorkspaceDb {
         let filter = scope.sql();
         let sql = format!(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, \
-                    1.0 / (1.0 + array_cosine_distance(c.embedding, ?::{})) AS score \
+                    1.0 / (1.0 + array_cosine_distance(c.embedding, ?::{})) AS score, \
+                    CAST(d.ingested_at AS VARCHAR) \
              FROM _quack_chunks c \
              JOIN _quack_documents d ON d.id = c.document_id \
              WHERE c.embedding IS NOT NULL AND c.embedding_profile IS NOT DISTINCT FROM ? \
@@ -2299,7 +2302,8 @@ impl WorkspaceDb {
         size: u32,
     ) -> Result<Vec<ChunkSearchResult>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0 \
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0, \
+                    CAST(d.ingested_at AS VARCHAR) \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
              WHERE d.status = ? AND {} AND (?::VARCHAR IS NULL OR c.id > ?) \
              ORDER BY c.id LIMIT ?",
@@ -2321,7 +2325,8 @@ impl WorkspaceDb {
     pub fn chunks_by_ids(&self, ids: &[ChunkId]) -> Result<Vec<ChunkSearchResult>> {
         let mut out = Vec::with_capacity(ids.len());
         let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0 \
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0, \
+                    CAST(d.ingested_at AS VARCHAR) \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id WHERE c.id = ?",
         )?;
         for id in ids {
@@ -3098,15 +3103,21 @@ pub struct ChunkSearchResult {
     /// Higher is better. Vector-only: `1 / (1 + distance)`; keyword-only:
     /// BM25; hybrid: reciprocal rank fusion.
     pub score: f64,
+    /// When the chunk's document was ingested (UTC).
+    pub ingested_at: DateTime,
 }
 
 /// A row of `id, content, document_id, chunk_index, filename, heading,
-/// page, score`, the columns every search selects.
+/// page, score, ingested_at`, the columns every search selects.
 impl TryFrom<&duckdb::Row<'_>> for ChunkSearchResult {
     type Error = duckdb::Error;
 
     fn try_from(row: &duckdb::Row<'_>) -> duckdb::Result<Self> {
         let page: Option<i64> = row.get(6)?;
+        let ingested_at: String = row.get(8)?;
+        let ingested_at = ingested_at.parse().map_err(|e: jiff::Error| {
+            duckdb::Error::FromSqlConversionFailure(8, duckdb::types::Type::Text, Box::new(e))
+        })?;
         Ok(Self {
             id: row.get(0)?,
             content: row.get(1)?,
@@ -3116,6 +3127,7 @@ impl TryFrom<&duckdb::Row<'_>> for ChunkSearchResult {
             heading: row.get(5)?,
             page: page.and_then(|p| u32::try_from(p).ok()),
             score: row.get(7)?,
+            ingested_at,
         })
     }
 }

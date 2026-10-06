@@ -859,6 +859,7 @@ fn evaluate_citations(path: &Path) -> Result<CitationReport> {
                 heading: None,
                 page: None,
                 score: 1.0,
+                ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
             })
             .collect();
         let _first_marker = registry.register(&registered);

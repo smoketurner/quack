@@ -162,6 +162,7 @@ async fn run_turn_answering(
         write_policy: policy,
         prompt: PromptOptions {
             mode: ChatMode::Chat,
+            today: jiff::civil::Date::constant(2026, 10, 5),
             write_policy: policy,
             pinned_token_budget: Tokens::new(1_000),
             context: None,

@@ -12,7 +12,7 @@ pub mod oauth;
 pub mod sampling;
 mod slot;
 
-use jiff::Timestamp;
+use jiff::{Timestamp, Zoned};
 use rig::agent::OutputMode;
 use rig::embeddings::Embedding;
 use rig::providers::{anthropic, ollama, openai};
@@ -1332,6 +1332,7 @@ async fn start_turn<'c>(
                 .ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
             let prompt = PromptOptions {
                 mode: session.mode,
+                today: Zoned::now().date(),
                 write_policy: policy,
                 pinned_token_budget,
                 context: context::combined(guard)?,

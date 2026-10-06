@@ -1213,7 +1213,9 @@ terminal as a system line, SSE as a `status` event.
 
 1. Role and behavior for the mode (7.5): retrieve before answering, cite with `[n]`, run
    SQL rather than estimate, state assumptions, ask one clarifying question when the
-   request is ambiguous.
+   request is ambiguous. Then today's date (`Today is YYYY-MM-DD.`, the system's local
+   zone), so "last quarter" has an anchor without a tool call; it is the one line that
+   changes between turns, once a day.
 2. Tool guidance, the error rule (read a `run_sql` error, fix the statement, rerun it), and
    a Friendly SQL reference pinned to the bundled DuckDB version, which the prompt states.
    The reference covers only what the confined connection (7.4) can run (no file reads,
@@ -1394,7 +1396,8 @@ cover a write after it.
 
 Every interface returns one response object (11.2), built by `AgentResponse::to_json`:
 `answer`, `citations` (each with `n`, `chunk_id`, `document_id`, `filename`, `chunk_index`,
-`page`, `heading`, `label`), `queries`, `steps`, `graph`, `chart`, `write_refused`,
+`page`, `heading`, `ingested_at` (when the document was ingested, UTC; `null` on answers
+recorded before it was kept), `label`), `queries`, `steps`, `graph`, `chart`, `write_refused`,
 `cancelled`, `usage`, `duration_ms`, `session_id`. `AuthRequired` is exit code 4 from every command that
 reaches a provider.
 
@@ -1896,7 +1899,7 @@ mode emits:
 ```json
 {
   "answer": "...",
-  "citations": [{"n": 1, "document_id": "...", "filename": "Policy-2024.pdf", "page": 12, "heading": "Exclusions", "chunk_id": "...", "chunk_index": 3, "label": "Policy-2024.pdf p.12"}],
+  "citations": [{"n": 1, "document_id": "...", "filename": "Policy-2024.pdf", "page": 12, "heading": "Exclusions", "chunk_id": "...", "chunk_index": 3, "ingested_at": "2026-10-05T14:03:11.412", "label": "Policy-2024.pdf, page 12, under \"Exclusions\", ingested 2026-10-05"}],
   "queries": [{"sql": "...", "rows": 4, "duration_ms": 9}],
   "steps": [{"tool": "run_sql", "summary": "4 rows", "rows": 4, "duration_ms": 9, "detail": "..."}],
   "graph": {"nodes": [...], "edges": [...]},

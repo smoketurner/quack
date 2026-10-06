@@ -145,7 +145,8 @@ model `rerank_model` score them through rig's `Rerank` at an OpenAI-compatible `
 `chat` or `query`; `--mode` / `/mode` set it. The workspace context (owner-written
 instructions, `quack_core::storage::context`, versioned in `_quack_context`) is injected
 into the system prompt after the schema and documents, capped at `[context].max_tokens`;
-the agent never writes it. Charts are `analysis::chart::ChartSpec` (bar, line, scatter,
+the agent never writes it. The prompt states today's date (`PromptOptions::today`, the
+system's local zone from jiff) right after the mode paragraph; tests pin it. Charts are `analysis::chart::ChartSpec` (bar, line, scatter,
 pie; 200 points max), not ECharts.
 
 Background work is asynchronous everywhere (design doc 4.1): `quack_core::jobs::JobQueue`
@@ -269,7 +270,7 @@ temporary client stays recorded (sealed) until deleted, so an interrupted run le
 each rotation step's key set (`Registrar::publish_keys`, a full-metadata `PUT`) and deletes the
 client (`unregister`).
 Every interface returns one response object, `AgentResponse::to_json` (answer, citations with
-labels, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `duration_ms`, `session_id`); a write refused
+labels and the document's `ingested_at`, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `duration_ms`, `session_id`); a write refused
 inside a turn is `write_refused: true` (REST 200, MCP structured content, print exit 3). A streamed
 web or REST turn from someone who may write asks instead: a `permission_required` SSE event, answered
 by `POST .../sessions/{sid}/permissions/{request}` (`server::permissions`, held in memory, refused after

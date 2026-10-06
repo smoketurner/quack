@@ -392,6 +392,7 @@ fn hit(n: u32, filename: &str, content: &str) -> ChunkSearchResult {
         heading: (n == 0).then(|| String::from("Exclusions")),
         page: (n == 0).then_some(12),
         score: 0.125,
+        ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
     }
 }
 

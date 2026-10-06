@@ -82,6 +82,7 @@ fn prompt(c: &mut Criterion) {
     let db = workspace();
     let options = PromptOptions {
         mode: ChatMode::Chat,
+        today: jiff::civil::Date::constant(2026, 10, 5),
         write_policy: WritePolicy::Deny,
         pinned_token_budget: Tokens::new(4_000),
         context: Some(String::from(

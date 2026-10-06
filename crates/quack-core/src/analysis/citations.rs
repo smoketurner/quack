@@ -4,6 +4,8 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use jiff::civil::DateTime;
+
 use crate::ids::{ChunkId, DocumentId};
 use crate::storage::workspace::ChunkSearchResult;
 use crate::text::OneLine;
@@ -18,6 +20,10 @@ pub struct Citation {
     pub chunk_index: u32,
     pub page: Option<u32>,
     pub heading: Option<String>,
+    /// When the document was ingested (UTC); `None` on answers recorded
+    /// before it was kept.
+    #[serde(default)]
+    pub ingested_at: Option<DateTime>,
 }
 
 impl Citation {
@@ -32,18 +38,23 @@ impl Citation {
             chunk_index: hit.chunk_index,
             page: hit.page,
             heading: hit.heading.clone(),
+            ingested_at: Some(hit.ingested_at),
         }
     }
 
-    /// `filename, page 12, under "Exclusions"` for footers and status lines.
+    /// `filename, page 12, under "Exclusions", ingested 2026-10-05` for
+    /// footers and status lines.
     #[must_use]
     pub fn label(&self) -> String {
-        ChunkLocation {
+        let location = ChunkLocation {
             filename: &self.filename,
             page: self.page,
             heading: self.heading.as_deref(),
+        };
+        match self.ingested_at {
+            Some(at) => format!("{location}, ingested {}", at.date()),
+            None => location.to_string(),
         }
-        .to_string()
     }
 }
 
@@ -252,6 +263,7 @@ mod tests {
             heading: None,
             page: Some(idx.saturating_add(1)),
             score: 1.0,
+            ingested_at: DateTime::constant(2026, 10, 5, 14, 3, 0, 0),
         }
     }
 
@@ -335,8 +347,8 @@ mod tests {
     }
 
     #[test]
-    fn label_includes_page_and_heading_when_present() {
-        let c = Citation {
+    fn label_includes_page_heading_and_ingestion_date_when_present() {
+        let mut c = Citation {
             n: 1,
             chunk_id: ChunkId::from("a"),
             document_id: DocumentId::from("d"),
@@ -344,7 +356,29 @@ mod tests {
             chunk_index: 0,
             page: Some(12),
             heading: Some(String::from("Exclusions")),
+            ingested_at: Some(DateTime::constant(2026, 10, 5, 14, 3, 0, 0)),
         };
+        assert_eq!(
+            c.label(),
+            "policy.pdf, page 12, under \"Exclusions\", ingested 2026-10-05"
+        );
+        c.ingested_at = None;
         assert_eq!(c.label(), "policy.pdf, page 12, under \"Exclusions\"");
+    }
+
+    /// An answer recorded before the ingestion time was kept still reads.
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test asserts Ok and the field exists"
+    )]
+    fn a_stored_citation_without_an_ingestion_time_still_decodes() {
+        let stored = r#"{"n":1,"chunk_id":"a","document_id":"d","filename":"p.pdf","chunk_index":0,"page":null,"heading":null}"#;
+        let citation: Citation = serde_json::from_str(stored).unwrap();
+        assert_eq!(citation.ingested_at, None);
+        let fresh = Citation::new(2, &hit("b", "q.md", 0));
+        let json = serde_json::to_value(&fresh).unwrap();
+        assert_eq!(json["ingested_at"], "2026-10-05T14:03:00");
     }
 }
