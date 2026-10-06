@@ -461,8 +461,10 @@ fn merge_nodes_in(db: &WorkspaceDb, keep: &NodeId, drop: &NodeId) -> Result<()> 
         [],
     )?;
     conn.execute(
-        "INSERT OR IGNORE INTO _quack_provenance (subject_id, document_id, chunk_id, table_name, row_key, confidence) \
-         SELECT ?, document_id, chunk_id, table_name, row_key, confidence FROM _quack_provenance WHERE subject_id = ?",
+        "INSERT OR IGNORE INTO _quack_provenance \
+         (subject_id, document_id, chunk_id, table_name, row_key, confidence, author, note, asserted_at) \
+         SELECT ?, document_id, chunk_id, table_name, row_key, confidence, author, note, asserted_at \
+         FROM _quack_provenance WHERE subject_id = ?",
         duckdb::params![keep, drop],
     )?;
     conn.execute(

@@ -11,11 +11,14 @@ use quack_core::config::Config;
 use quack_core::extraction::ExtractionRun;
 use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::query::UnknownEntity;
-use quack_core::graph::store::Revalidation;
+use quack_core::graph::store::{Assertion, Keep, NewEdge, NewNode, NodeEdit, Revalidation};
 use quack_core::graph::traverse::Hops;
-use quack_core::graph::{ExtractSource, extract, resolve, store as graph_store, tables};
+use quack_core::graph::{
+    ExtractSource, Properties, Standing, extract, resolve, store as graph_store, tables,
+};
+use quack_core::ids::{ClassId, EdgeId, RelationId};
 use quack_core::llm::{self, Embeddings};
-use quack_core::ontology::store as ontology_store;
+use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::progress::RunControl;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
@@ -57,6 +60,101 @@ pub(crate) enum GraphAction {
     Merge { ids: Vec<String> },
     /// Decline merge proposals by id (prefixes accepted)
     Reject { ids: Vec<String> },
+    /// Assert a node or an edge the documents and tables did not yield
+    #[command(subcommand)]
+    Add(AddWhat),
+    /// Correct a node: its label, class, or properties
+    Set(SetArgs),
+    /// Delete a node (with its edges) or an edge
+    #[command(subcommand)]
+    Delete(DeleteWhat),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AddWhat {
+    /// A node of a class; one with the same label and class takes the
+    /// properties instead
+    Node {
+        label: String,
+        #[arg(long)]
+        class: String,
+        /// A property, as KEY=VALUE (repeatable)
+        #[arg(long = "property", value_name = "KEY=VALUE")]
+        properties: Vec<String>,
+        /// Why: kept with the assertion
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// An edge between two nodes (by id, or by exact label)
+    Edge {
+        from: String,
+        relation: String,
+        to: String,
+        /// A property, as KEY=VALUE (repeatable)
+        #[arg(long = "property", value_name = "KEY=VALUE")]
+        properties: Vec<String>,
+        /// Why: kept with the assertion
+        #[arg(long)]
+        note: Option<String>,
+    },
+}
+
+#[derive(clap::Args)]
+pub(crate) struct SetArgs {
+    /// The node, by id or exact label
+    node: String,
+    /// Only a node of this class, when the label names several
+    #[arg(long)]
+    class: Option<String>,
+    #[arg(long)]
+    label: Option<String>,
+    /// Move the node to this class (its edges must still fit)
+    #[arg(long = "to-class")]
+    to_class: Option<String>,
+    /// Set a property, as KEY=VALUE (repeatable)
+    #[arg(long = "property", value_name = "KEY=VALUE")]
+    properties: Vec<String>,
+    /// Remove a property (repeatable)
+    #[arg(long = "unset", value_name = "KEY")]
+    unset: Vec<String>,
+    /// Why: kept with the assertion
+    #[arg(long)]
+    note: Option<String>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DeleteWhat {
+    /// A node by id or exact label, with every edge at it
+    Node {
+        node: String,
+        #[arg(long)]
+        class: Option<String>,
+    },
+    /// An edge by id
+    Edge { id: String },
+}
+
+/// `KEY=VALUE` pairs as properties: a value that reads as a JSON number
+/// or boolean is stored as one, anything else as text.
+pub(crate) fn parse_properties(
+    pairs: &[String],
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut out = serde_json::Map::new();
+    for pair in pairs {
+        let (key, value) = pair
+            .split_once('=')
+            .with_context(|| format!("'{pair}' is not KEY=VALUE"))?;
+        let key = key.trim();
+        if key.is_empty() {
+            anyhow::bail!("'{pair}' has no key");
+        }
+        let value = serde_json::from_str::<serde_json::Value>(value.trim())
+            .ok()
+            .filter(|v| v.is_number() || v.is_boolean())
+            .unwrap_or_else(|| serde_json::Value::String(value.trim().to_owned()));
+        out.insert(key.to_owned(), value);
+    }
+    Ok(out)
 }
 
 #[derive(clap::Args)]
@@ -96,9 +194,13 @@ pub(crate) struct ExtractArgs {
     /// Chunks to send to the model at most (default: all)
     #[arg(long)]
     sample: Option<u32>,
-    /// Start from an empty graph instead of adding to it
+    /// Start from an empty graph instead of adding to it; nodes and edges
+    /// a person asserted stay unless --all is given too
     #[arg(long)]
     reset: bool,
+    /// With --reset: drop asserted nodes and edges too
+    #[arg(long, requires = "reset")]
+    all: bool,
     /// Do not ask before spending the model calls
     #[arg(long, short = 'y')]
     pub(crate) yes: bool,
@@ -204,9 +306,148 @@ pub(crate) async fn run(
             })
             .await?;
         }
+        GraphAction::Add(what) => run_add(db, out, what).await?,
+        GraphAction::Set(args) => run_set(db, out, args).await?,
+        GraphAction::Delete(what) => run_delete(db, out, what).await?,
     }
     out.flush()?;
     Ok(())
+}
+
+async fn run_add(db: &Writer, out: &mut impl Write, what: AddWhat) -> Result<()> {
+    match what {
+        AddWhat::Node {
+            label,
+            class,
+            properties,
+            note,
+        } => {
+            let properties = Properties::from(parse_properties(&properties)?);
+            let assertion = Assertion { author: None, note };
+            db.render(out, move |db, out| {
+                let added = graph_store::create_node(
+                    db,
+                    &NewNode {
+                        label,
+                        class_id: ClassId::from(class),
+                        properties,
+                        standing: Standing::Reviewed,
+                    },
+                    &assertion,
+                )?;
+                writeln!(
+                    out,
+                    "{} {} ({}).",
+                    if added.created {
+                        "Added"
+                    } else {
+                        "Already there; asserted"
+                    },
+                    added.subject,
+                    added.subject.id
+                )?;
+                Ok(())
+            })
+            .await
+        }
+        AddWhat::Edge {
+            from,
+            relation,
+            to,
+            properties,
+            note,
+        } => {
+            let properties = Properties::from(parse_properties(&properties)?);
+            let assertion = Assertion { author: None, note };
+            db.render(out, move |db, out| {
+                let source = graph_store::find_node(db, &from, None)?;
+                let target = graph_store::find_node(db, &to, None)?;
+                let added = graph_store::create_edge(
+                    db,
+                    &NewEdge {
+                        source: source.id,
+                        target: target.id,
+                        relation: RelationId::from(relation),
+                        properties,
+                    },
+                    &assertion,
+                )?;
+                writeln!(
+                    out,
+                    "{} {} -{}-> {} ({}).",
+                    if added.created {
+                        "Added"
+                    } else {
+                        "Already there; asserted"
+                    },
+                    source.label,
+                    added.subject.relation_id,
+                    target.label,
+                    added.subject.id
+                )?;
+                Ok(())
+            })
+            .await
+        }
+    }
+}
+
+async fn run_set(db: &Writer, out: &mut impl Write, args: SetArgs) -> Result<()> {
+    let SetArgs {
+        node,
+        class,
+        label,
+        to_class,
+        properties,
+        unset,
+        note,
+    } = args;
+    let mut patch = parse_properties(&properties)?;
+    for key in unset {
+        patch.insert(key, serde_json::Value::Null);
+    }
+    let edit = NodeEdit {
+        label,
+        class: to_class.map(ClassId::from),
+        properties: (!patch.is_empty()).then_some(patch),
+    };
+    if edit.is_empty() {
+        anyhow::bail!("nothing to change: give --label, --to-class, --property, or --unset");
+    }
+    let assertion = Assertion { author: None, note };
+    db.render(out, move |db, out| {
+        let found = graph_store::find_node(db, &node, class.as_deref())?;
+        let updated = graph_store::update_node(db, &found.id, &edit, &assertion)?;
+        writeln!(out, "Updated {updated} ({}).", updated.id)?;
+        Ok(())
+    })
+    .await
+}
+
+async fn run_delete(db: &Writer, out: &mut impl Write, what: DeleteWhat) -> Result<()> {
+    match what {
+        DeleteWhat::Node { node, class } => {
+            db.render(out, move |db, out| {
+                let found = graph_store::find_node(db, &node, class.as_deref())?;
+                let deleted = graph_store::delete_node(db, &found.id)?;
+                writeln!(out, "Deleted {deleted} and its edges.")?;
+                Ok(())
+            })
+            .await
+        }
+        DeleteWhat::Edge { id } => {
+            db.render(out, move |db, out| {
+                let deleted = graph_store::delete_edge(db, &EdgeId::from(id))?;
+                writeln!(
+                    out,
+                    "Deleted edge {} -{}-> {}.",
+                    deleted.source_node_id, deleted.relation_id, deleted.target_node_id
+                )?;
+                Ok(())
+            })
+            .await
+        }
+    }
 }
 
 async fn run_search(
@@ -309,6 +550,37 @@ async fn run_revalidate(
     .await
 }
 
+/// Every mapping's rows into the graph, one line per table.
+async fn extract_tables(
+    db: &Writer,
+    out: &mut impl Write,
+    ontology: &Ontology,
+    standing: Standing,
+) -> Result<()> {
+    if ontology.mappings.is_empty() {
+        writeln!(
+            out,
+            "No mapped tables in the ontology; skipping table extraction."
+        )?;
+        return Ok(());
+    }
+    let mapped = ontology.clone();
+    let summaries = db
+        .run(move |db| tables::extract(db, &mapped, standing))
+        .await?;
+    for summary in summaries {
+        match &summary.skipped {
+            Some(reason) => writeln!(out, "Table {}: skipped, {reason}", summary.table)?,
+            None => writeln!(
+                out,
+                "Table {}: {} rows -> {} nodes, {} edges",
+                summary.table, summary.rows, summary.nodes, summary.edges
+            )?,
+        }
+    }
+    Ok(())
+}
+
 async fn run_extract(
     config: &Config,
     db: &Writer,
@@ -323,32 +595,24 @@ async fn run_extract(
         .context("no ontology yet: run `quack ontology init` or `quack ontology propose` first")?;
     let standing = db.run(ontology_store::current_standing).await?;
     if args.reset {
-        db.run(graph_store::clear).await?;
-        writeln!(out, "Cleared the graph.")?;
+        let keep = if args.all {
+            Keep::Nothing
+        } else {
+            Keep::Asserted
+        };
+        db.run(move |db| graph_store::clear(db, keep)).await?;
+        writeln!(
+            out,
+            "{}",
+            match keep {
+                Keep::Asserted => "Cleared the graph, keeping what people asserted.",
+                Keep::Nothing => "Cleared the graph.",
+            }
+        )?;
     }
     let sources = args.source;
     if sources.includes_tables() {
-        if ontology.mappings.is_empty() {
-            writeln!(
-                out,
-                "No mapped tables in the ontology; skipping table extraction."
-            )?;
-        } else {
-            let mapped = ontology.clone();
-            let summaries = db
-                .run(move |db| tables::extract(db, &mapped, standing))
-                .await?;
-            for summary in summaries {
-                match &summary.skipped {
-                    Some(reason) => writeln!(out, "Table {}: skipped, {reason}", summary.table)?,
-                    None => writeln!(
-                        out,
-                        "Table {}: {} rows -> {} nodes, {} edges",
-                        summary.table, summary.rows, summary.nodes, summary.edges
-                    )?,
-                }
-            }
-        }
+        extract_tables(db, out, &ontology, standing).await?;
     }
     if sources.includes_documents() {
         let sample = args.sample;
@@ -517,5 +781,200 @@ mod tests {
             again,
             "Dropped 0 nodes and 0 edges; the graph now matches ontology version 2.\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use quack_core::embedding::Dimension;
+    use quack_core::ontology::Ontology;
+    use quack_core::ontology::store::Revision;
+
+    use super::*;
+
+    #[expect(clippy::panic, reason = "test failure path")]
+    fn fail(msg: &str) -> ! {
+        panic!("{msg}")
+    }
+
+    async fn graph(db: &Writer, action: GraphAction) -> Result<String> {
+        let mut out = Vec::new();
+        run(
+            &Config::default(),
+            db,
+            action,
+            Confirm::Assume,
+            &mut out,
+            RunControl::unobserved(),
+        )
+        .await?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// An empty graph under the built-in ontology.
+    fn empty_graph() -> Writer {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        ontology_store::save(
+            &db,
+            &Ontology::builtin_default(),
+            Revision::reviewed(None, None),
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string()))
+    }
+
+    fn node(label: &str, class: &str, properties: &[&str], note: Option<&str>) -> GraphAction {
+        GraphAction::Add(AddWhat::Node {
+            label: String::from(label),
+            class: String::from(class),
+            properties: properties.iter().map(|p| String::from(*p)).collect(),
+            note: note.map(String::from),
+        })
+    }
+
+    /// `quack graph add` on the built-in ontology: a node by label (again
+    /// finds it), a refusal from the ontology, and an edge by labels.
+    #[tokio::test]
+    async fn add_writes_asserted_nodes_and_edges() {
+        let db = empty_graph();
+        let added = graph(
+            &db,
+            node(
+                "Ada Lovelace",
+                "person",
+                &["born=1815", "role=analyst"],
+                Some("checked"),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            added.starts_with("Added Ada Lovelace (person) ("),
+            "{added}"
+        );
+        let again = graph(&db, node("ada lovelace", "person", &[], None))
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            again.starts_with("Already there; asserted Ada Lovelace"),
+            "{again}"
+        );
+        let refused = graph(&db, node("Babbage", "robot", &[], None))
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(refused.contains("no class 'robot'"), "{refused}");
+        graph(&db, node("London", "place", &[], None))
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let edge = graph(
+            &db,
+            GraphAction::Add(AddWhat::Edge {
+                from: String::from("Ada Lovelace"),
+                relation: String::from("mentions"),
+                to: String::from("London"),
+                properties: Vec::new(),
+                note: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            edge.starts_with("Added Ada Lovelace -mentions-> London ("),
+            "{edge}"
+        );
+        let bad_pair = parse_properties(&[String::from("novalue")])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(bad_pair.contains("is not KEY=VALUE"), "{bad_pair}");
+    }
+
+    /// `quack graph set` corrects a node found by label; an empty edit is
+    /// refused; `delete` takes a node with its edges.
+    #[tokio::test]
+    async fn set_and_delete_correct_and_remove_nodes() {
+        let db = empty_graph();
+        for action in [
+            node(
+                "Ada Lovelace",
+                "person",
+                &["born=1815", "role=analyst"],
+                None,
+            ),
+            node("London", "place", &[], None),
+            GraphAction::Add(AddWhat::Edge {
+                from: String::from("Ada Lovelace"),
+                relation: String::from("mentions"),
+                to: String::from("London"),
+                properties: Vec::new(),
+                note: None,
+            }),
+        ] {
+            graph(&db, action)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        let set = graph(
+            &db,
+            GraphAction::Set(SetArgs {
+                node: String::from("Ada Lovelace"),
+                class: None,
+                label: Some(String::from("Augusta Ada King")),
+                to_class: None,
+                properties: vec![String::from("born=1815-12-10")],
+                unset: vec![String::from("role")],
+                note: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            set.starts_with("Updated Augusta Ada King (person)"),
+            "{set}"
+        );
+        let node = db
+            .run(|db| graph_store::find_node(db, "Augusta Ada King", None))
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            node.properties.get("born"),
+            Some(&serde_json::json!("1815-12-10"))
+        );
+        assert_eq!(node.properties.get("role"), None);
+        let nothing = graph(
+            &db,
+            GraphAction::Set(SetArgs {
+                node: String::from("Augusta Ada King"),
+                class: None,
+                label: None,
+                to_class: None,
+                properties: Vec::new(),
+                unset: Vec::new(),
+                note: None,
+            }),
+        )
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(nothing.contains("nothing to change"), "{nothing}");
+        let deleted = graph(
+            &db,
+            GraphAction::Delete(DeleteWhat::Node {
+                node: String::from("London"),
+                class: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(deleted, "Deleted London (place) and its edges.\n");
+        let status = db
+            .run(graph_store::status)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!((status.nodes, status.edges), (1, 0), "{status}");
     }
 }

@@ -6,17 +6,17 @@
 
 use std::collections::BTreeMap;
 
-use quack_core::config::GraphConfig;
+use quack_core::config::{Config, FollowIngest, GraphConfig};
 use quack_core::embedding::{Dimension, Embedder, EmbeddingModel, Input, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::extraction::{Extract, ExtractFuture, ExtractionRun};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::resolve::MergeDecision;
-use quack_core::graph::store::{NewNode, Revalidation};
+use quack_core::graph::store::{Assertion, NewEdge, NewNode, NodeEdit, Revalidation};
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    GraphResult, Node, Origin, Properties, Standing, extract, resolve, store as graph_store,
-    tables, traverse,
+    GraphResult, Node, Origin, Properties, Standing, extract, follow_up, resolve,
+    store as graph_store, tables, traverse,
 };
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
 use quack_core::ingestion::parser::SectionKind;
@@ -960,7 +960,7 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     assert_eq!(status.edges, 3);
     assert!(!status.stale);
 
-    graph_store::clear(&db).unwrap();
+    graph_store::clear(&db, graph_store::Keep::Nothing).unwrap();
     let status = graph_store::status(&db).unwrap();
     assert!(!status.enabled());
     assert_eq!(status.built_with_version, None);
@@ -1155,7 +1155,7 @@ async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
 
     // A sample reads only its chunks, across the same pages. Each document
     // gets a quota of 50, which the two-chunk one cannot fill.
-    graph_store::clear(&db).unwrap();
+    graph_store::clear(&db, graph_store::Keep::Nothing).unwrap();
     let plan = ChunkPlan::new(&db, Some(100)).unwrap();
     assert_eq!(plan.len(), 52);
     let summary = extract::run(
@@ -1924,4 +1924,346 @@ fn a_save_applies_its_renames_and_refuses_ids_its_ontology_lacks() {
             "{error}"
         );
     }
+}
+
+/// A table-built graph with "ada"'s assertion ready to use.
+fn asserting() -> (WorkspaceDb, Ontology, Assertion) {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    let ada = Assertion {
+        author: Some(String::from("ada")),
+        note: Some(String::from("from the vendor list")),
+    };
+    (db, current, ada)
+}
+
+fn vendor(label: &str, name: &str) -> NewNode {
+    NewNode {
+        label: String::from(label),
+        class_id: ClassId::from("vendor"),
+        properties: Properties::from(serde_json::json!({ "name": name })),
+        standing: Standing::Reviewed,
+    }
+}
+
+fn supplied_by(source: &NodeId, target: &NodeId) -> NewEdge {
+    NewEdge {
+        source: source.clone(),
+        target: target.clone(),
+        relation: RelationId::from("supplied_by"),
+        properties: Properties::default(),
+    }
+}
+
+/// A person's node and edge: each checked against the ontology, written
+/// with one manual provenance row that every rendering shows, and found
+/// again by label.
+#[test]
+fn a_person_asserts_nodes_and_edges_under_the_ontology() {
+    let (db, _, ada) = asserting();
+    let bad = graph_store::create_node(
+        &db,
+        &NewNode {
+            class_id: ClassId::from("vessel"),
+            ..vendor("Acme", "Acme")
+        },
+        &ada,
+    )
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(bad.contains("no class 'vessel'"), "{bad}");
+    let added = graph_store::create_node(&db, &vendor("Acme Pharma", "Acme Pharma"), &ada).unwrap();
+    assert!(added.created);
+    assert_eq!(added.subject.standing, Standing::Reviewed);
+    let sources = graph_store::provenance_of(&db, std::slice::from_ref(&added.subject.id)).unwrap();
+    assert_eq!(
+        sources
+            .first()
+            .and_then(|s| s.origin.assertion())
+            .as_deref(),
+        Some("asserted by ada: from the vendor list")
+    );
+    assert_eq!(sources.len(), 1);
+    // Asserting it again finds it, takes the new properties, and keeps one
+    // manual row.
+    let again =
+        graph_store::create_node(&db, &vendor("acme   pharma", "ACME"), &Assertion::default())
+            .unwrap();
+    assert!(!again.created);
+    assert_eq!(again.subject.id, added.subject.id);
+    assert_eq!(
+        again.subject.properties.get("name"),
+        Some(&serde_json::json!("ACME"))
+    );
+    assert_eq!(
+        graph_store::provenance_of(&db, std::slice::from_ref(&added.subject.id))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let po1 = graph_store::find_node(&db, "PO-1", Some("shipment")).unwrap();
+    let kenya = graph_store::find_node(&db, "Kenya", None).unwrap();
+    let edge =
+        graph_store::create_edge(&db, &supplied_by(&po1.id, &added.subject.id), &ada).unwrap();
+    assert!(edge.created);
+    let refused = graph_store::create_edge(&db, &supplied_by(&kenya.id, &po1.id), &ada)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        refused.contains("does not allow supplied_by from a country to a shipment"),
+        "{refused}"
+    );
+    let walk = traverse::neighborhood(
+        &db,
+        std::slice::from_ref(&po1),
+        Hops::new(1),
+        None,
+        &GraphConfig::default(),
+    )
+    .unwrap();
+    assert!(
+        walk.provenance
+            .iter()
+            .any(|p| p.subject_id == edge.subject.id.as_str() && p.origin.assertion().is_some())
+    );
+    let ambiguous = graph_store::find_node(&db, "Kenya", Some("vendor"))
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(ambiguous.contains("graph node"), "{ambiguous}");
+}
+
+/// A correction changes the label and the properties; a label another
+/// node of the class holds, and a class the node's edges no longer fit,
+/// are refused.
+#[test]
+fn a_person_corrects_a_node_under_the_ontology() {
+    let (db, _, ada) = asserting();
+    let added = graph_store::create_node(&db, &vendor("Acme Pharma", "Acme Pharma"), &ada).unwrap();
+    let po1 = graph_store::find_node(&db, "PO-1", None).unwrap();
+    graph_store::create_edge(&db, &supplied_by(&po1.id, &added.subject.id), &ada).unwrap();
+    let edited = graph_store::update_node(
+        &db,
+        &added.subject.id,
+        &NodeEdit {
+            label: Some(String::from("Acme Pharmaceuticals")),
+            class: None,
+            properties: serde_json::json!({ "country": "Kenya", "name": null })
+                .as_object()
+                .cloned(),
+        },
+        &Assertion::default(),
+    )
+    .unwrap();
+    assert_eq!(edited.label, "Acme Pharmaceuticals");
+    assert_eq!(
+        edited.properties.get("country"),
+        Some(&serde_json::json!("Kenya"))
+    );
+    assert_eq!(edited.properties.get("name"), None);
+    let taken = graph_store::update_node(
+        &db,
+        &added.subject.id,
+        &NodeEdit {
+            label: Some(String::from("Orgenics")),
+            ..NodeEdit::default()
+        },
+        &Assertion::default(),
+    )
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(
+        taken.contains("already has the label 'Orgenics'"),
+        "{taken}"
+    );
+    let misfit = graph_store::update_node(
+        &db,
+        &added.subject.id,
+        &NodeEdit {
+            class: Some(ClassId::from("country")),
+            ..NodeEdit::default()
+        },
+        &Assertion::default(),
+    )
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(
+        misfit.contains("could not take its edge supplied_by"),
+        "{misfit}"
+    );
+    assert_eq!(
+        graph_store::find_node(&db, "acme pharmaceuticals", None)
+            .unwrap()
+            .id,
+        added.subject.id
+    );
+}
+
+/// A reset keeps what people asserted (an edge only with both ends)
+/// unless asked to drop everything; deleting a node takes its edges and
+/// every provenance row of theirs.
+#[test]
+fn a_reset_keeps_assertions_and_deletes_cascade() {
+    let (db, current, ada) = asserting();
+    let added = graph_store::create_node(&db, &vendor("Acme Pharma", "Acme Pharma"), &ada).unwrap();
+    let po1 = graph_store::find_node(&db, "PO-1", None).unwrap();
+    graph_store::create_edge(&db, &supplied_by(&po1.id, &added.subject.id), &ada).unwrap();
+    graph_store::clear(&db, graph_store::Keep::Asserted).unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!((status.nodes, status.edges), (1, 0), "{status}");
+    assert!(graph_store::node(&db, &added.subject.id).unwrap().is_some());
+    graph_store::clear(&db, graph_store::Keep::Nothing).unwrap();
+    assert_eq!(graph_store::status(&db).unwrap().nodes, 0);
+
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    let orgenics = graph_store::find_node(&db, "Orgenics", None).unwrap();
+    let before = graph_store::status(&db).unwrap();
+    let deleted = graph_store::delete_node(&db, &orgenics.id).unwrap();
+    assert_eq!(deleted.id, orgenics.id);
+    let after = graph_store::status(&db).unwrap();
+    assert_eq!(after.nodes, before.nodes - 1);
+    assert_eq!(after.edges, before.edges - 2, "{after}");
+    let orphans: i64 = db
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM _quack_provenance p \
+             WHERE NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = p.subject_id) \
+               AND NOT EXISTS (SELECT 1 FROM _quack_graph_edges e WHERE e.id = p.subject_id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphans, 0);
+    let missing = graph_store::delete_node(&db, &orgenics.id)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(missing.contains("graph node"), "{missing}");
+    let po3 = graph_store::find_node(&db, "PO-3", None).unwrap();
+    let edges = graph_store::edges(
+        &db,
+        std::slice::from_ref(&po3.id),
+        graph_store::EdgeScope::Touching,
+    )
+    .unwrap();
+    let dropped = graph_store::delete_edge(&db, &edges.first().unwrap().id).unwrap();
+    assert!(graph_store::edge(&db, &dropped.id).unwrap().is_none());
+}
+
+/// The status counts the chunks no extraction read and names the mapped
+/// tables whose rows changed since table extraction read them: a row
+/// updated by SQL, and a table never read.
+#[test]
+fn status_reports_unextracted_chunks_and_changed_tables() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!(status.pending_chunks, 2, "{status}");
+    assert_eq!(status.pending_tables, ["shipments"], "{status}");
+    assert!(
+        status
+            .to_string()
+            .contains("2 chunks not yet extracted: `quack graph extract --source documents`"),
+        "{status}"
+    );
+    assert!(
+        status
+            .to_string()
+            .contains("Mapped tables changed since the graph read them: shipments"),
+        "{status}"
+    );
+
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert!(status.pending_tables.is_empty(), "{status}");
+
+    // A changed cell makes the table pending, and extracting again takes
+    // the new value onto the existing node.
+    db.execute_statement("UPDATE shipments SET mode = 'Rail' WHERE po = 'PO-1'")
+        .unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!(status.pending_tables, ["shipments"], "{status}");
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    let po1 = graph_store::find_node(&db, "PO-1", None).unwrap();
+    assert_eq!(po1.properties.get("mode"), Some(&serde_json::json!("Rail")));
+    assert!(graph_store::status(&db).unwrap().pending_tables.is_empty());
+
+    // A table that is gone is missing, not pending.
+    db.execute_statement("DROP TABLE shipments").unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!(status.missing_tables, ["shipments"]);
+    assert!(status.pending_tables.is_empty(), "{status}");
+}
+
+/// The follow-up after an ingest: off, nothing; `tables`, the new
+/// document's mapped table and no model calls; `all`, its unextracted
+/// chunks too, each once.
+#[tokio::test]
+async fn an_ingest_follow_up_extracts_what_the_setting_names() {
+    let db = workspace();
+    db.execute_statement(
+        "UPDATE _quack_documents SET tables = '[\"shipments\"]'::JSON WHERE id = 'doc-1'",
+    )
+    .unwrap();
+    let writer = writer_of(&db);
+    let doc = DocumentId::from("doc-1");
+    let mut config = Config::default();
+
+    let off = follow_up::after_documents(
+        &writer,
+        &config,
+        None,
+        std::slice::from_ref(&doc),
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap();
+    assert!(off.is_none());
+    assert_eq!(graph_store::status(&db).unwrap().nodes, 0);
+
+    config.graph.follow_ingest = FollowIngest::Tables;
+    let followed = follow_up::after_documents(
+        &writer,
+        &config,
+        None,
+        std::slice::from_ref(&doc),
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(followed.tables.len(), 1);
+    assert_eq!(followed.tables.first().map(|t| t.nodes), Some(3));
+    assert!(followed.chunks.is_none());
+    assert_eq!(
+        followed.to_string(),
+        "graph: table shipments: 3 nodes, 6 edges"
+    );
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!(status.nodes, 7, "{status}");
+    assert_eq!(status.pending_chunks, 2);
+    assert!(status.pending_tables.is_empty());
+    assert_eq!(
+        status.built_with_version,
+        store::latest_version(&db).unwrap()
+    );
+
+    // A document with no table and no chunks of its own leaves nothing to do.
+    let nothing = follow_up::after_documents(
+        &writer,
+        &config,
+        None,
+        &[DocumentId::from("absent")],
+        RunControl::unobserved(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(nothing.to_string(), "graph: nothing new to extract");
 }

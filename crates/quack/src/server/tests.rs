@@ -16,7 +16,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::{
-    BaseUrl, Config, ProviderConfig, ProviderName, ProviderType, SecureCookies,
+    BaseUrl, Config, FollowIngest, ProviderConfig, ProviderName, ProviderType, SecureCookies,
 };
 use quack_core::embedding::{Dimension, Vector};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
@@ -5736,8 +5736,17 @@ async fn a_large_batch_of_uploads_is_spooled_and_processed() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    // The spooled bytes go in each job's `when_ended` hook, which runs on
+    // its own task after the lane slot is released: wait for it.
     let spool = h.app.config.workspace_uploads_dir(ws.as_str());
-    let left = std::fs::read_dir(&spool).map_or(0, Iterator::count);
+    let mut left = usize::MAX;
+    for _ in 0..200 {
+        left = std::fs::read_dir(&spool).map_or(0, Iterator::count);
+        if left == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert_eq!(left, 0, "spooled uploads left in {}", spool.display());
 }
 
@@ -7616,6 +7625,448 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
     assert!(
         detail.iter().any(|row| row.action == "saved_run"),
         "the workspace keeps the run's detail row"
+    );
+}
+
+/// The shipments ontology the graph tests build from: three classes
+/// keyed by name or purchase order, two relations, one mapping.
+fn shipments_ontology() -> serde_json::Value {
+    serde_json::json!({
+        "classes": [
+            { "id": "vendor", "key": "name", "properties": ["name"] },
+            { "id": "country", "key": "name", "properties": ["name"] },
+            { "id": "shipment", "key": "po", "properties": ["po"] }
+        ],
+        "relations": [
+            { "id": "supplied_by", "domain": "shipment", "range": "vendor" },
+            { "id": "delivered_to", "domain": "shipment", "range": "country" }
+        ],
+        "properties": [
+            { "id": "name", "type": "string" },
+            { "id": "po", "type": "string" }
+        ],
+        "mappings": [{
+            "table": "shipments", "class": "shipment", "key": "po",
+            "relations": [
+                { "relation": "supplied_by", "column": "vendor", "target_class": "vendor", "target_key": "name" },
+                { "relation": "delivered_to", "column": "country", "target_class": "country", "target_key": "name" }
+            ]
+        }]
+    })
+}
+
+/// A person's node and edge writes over REST and the graph page: each
+/// checked against the ontology, recorded as asserted by them, audited
+/// as `graph_edit`, and shown with its assertion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_person_edits_graph_nodes_and_edges_over_the_api_and_the_page() {
+    let h = harness(ServeMode::Local).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "edits" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    for sql in [
+        "CREATE TABLE shipments (po TEXT, vendor TEXT, country TEXT)",
+        "INSERT INTO shipments VALUES ('PO-1', 'Orgenics', 'Kenya')",
+    ] {
+        let (status, body) = h
+            .call(
+                Method::POST,
+                &format!("/api/v1/workspaces/{ws}/sql"),
+                None,
+                Some(serde_json::json!({ "sql": sql })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = h
+        .call(
+            Method::PUT,
+            &format!("/api/v1/workspaces/{ws}/ontology"),
+            None,
+            Some(shipments_ontology()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let base = format!("/api/v1/workspaces/{ws}/graph");
+    let (_, status_body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(
+        status_body["pending_tables"],
+        serde_json::json!(["shipments"]),
+        "{status_body}"
+    );
+    assert_eq!(status_body["pending_chunks"], 0);
+    let (status, body) = h
+        .call(
+            Method::POST,
+            &format!("{base}/extract"),
+            None,
+            Some(serde_json::json!({ "source": "tables" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, status_body) = h.get(&format!("{base}/status"), "").await;
+    assert_eq!(
+        status_body["pending_tables"],
+        serde_json::json!([]),
+        "{status_body}"
+    );
+
+    // A node: 201 new, 200 when it was there, 400 outside the ontology.
+    let (status, body) = h
+        .post(
+            &format!("{base}/nodes"),
+            "",
+            serde_json::json!({ "label": "Acme", "class": "vendor", "properties": { "name": "Acme" }, "note": "vendor list" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["created"], true);
+    let acme = body["id"].as_str().unwrap_or_default().to_owned();
+    let (status, body) = h
+        .post(
+            &format!("{base}/nodes"),
+            "",
+            serde_json::json!({ "label": "ACME", "class": "vendor" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], false);
+    assert_eq!(body["id"], acme);
+    let (status, body) = h
+        .post(
+            &format!("{base}/nodes"),
+            "",
+            serde_json::json!({ "label": "MV Hope", "class": "vessel" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // A correction, and an empty one.
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &format!("{base}/nodes/{acme}"),
+            None,
+            Some(
+                serde_json::json!({ "label": "Acme Pharma", "properties": { "country": "Kenya" } }),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["label"], "Acme Pharma");
+    assert_eq!(body["properties"]["country"], "Kenya");
+    let (status, _) = h
+        .call(
+            Method::PATCH,
+            &format!("{base}/nodes/{acme}"),
+            None,
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // An edge the ontology allows, and one it does not.
+    let (_, body) = h
+        .post(
+            &format!("{base}/search"),
+            "",
+            serde_json::json!({ "class": "shipment" }),
+        )
+        .await;
+    let po1 = body["nodes"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let (status, body) = h
+        .post(
+            &format!("{base}/edges"),
+            "",
+            serde_json::json!({ "source": po1, "target": acme, "relation": "supplied_by", "note": "corrected supplier" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let edge = body["id"].as_str().unwrap_or_default().to_owned();
+    let (status, body) = h
+        .post(
+            &format!("{base}/edges"),
+            "",
+            serde_json::json!({ "source": acme, "target": po1, "relation": "supplied_by" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("does not allow"), "{body}");
+
+    // The search shows the assertion as provenance, with its author.
+    let (_, body) = h
+        .post(
+            &format!("{base}/search"),
+            "",
+            serde_json::json!({ "entity": "Acme Pharma", "hops": 1 }),
+        )
+        .await;
+    let asserted: Vec<&serde_json::Value> = body["provenance"]
+        .as_array()
+        .map(|p| p.iter().filter(|p| p["asserted_at"].is_string()).collect())
+        .unwrap_or_default();
+    assert_eq!(asserted.len(), 2, "{body}");
+    assert!(asserted.iter().all(|p| p["author"].is_string()), "{body}");
+    assert!(
+        asserted.iter().any(|p| p["note"] == "corrected supplier"),
+        "{body}"
+    );
+    let (status, html, _) = h
+        .form(&format!("/w/{ws}/graph"), None, "entity=Acme+Pharma")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("asserted by"), "{html}");
+    assert!(html.contains("Delete node and its edges"), "{html}");
+
+    // The page's forms: an edit, then a delete.
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/graph/nodes/{acme}"),
+            None,
+            "label=&class=&properties=country%3D%0Aregion%3DEast+Africa&note=page",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, html) = h.land(&headers, None).await;
+    assert!(html.contains("updated Acme Pharma (vendor)"), "{html}");
+    let (_, body) = h
+        .post(
+            &format!("{base}/search"),
+            "",
+            serde_json::json!({ "entity": "Acme Pharma", "hops": 0 }),
+        )
+        .await;
+    assert_eq!(
+        body["nodes"][0]["properties"]["region"], "East Africa",
+        "{body}"
+    );
+    assert!(
+        body["nodes"][0]["properties"]["country"].is_null(),
+        "{body}"
+    );
+    let (status, _, headers) = h
+        .form(&format!("/w/{ws}/graph/edges/{edge}/delete"), None, "")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, html) = h.land(&headers, None).await;
+    assert!(html.contains("deleted the supplied_by edge"), "{html}");
+
+    // Deletes over REST: the node goes with what is left at it; a second
+    // delete is 404.
+    let (status, body) = h
+        .call(Method::DELETE, &format!("{base}/nodes/{acme}"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = h
+        .call(Method::DELETE, &format!("{base}/nodes/{acme}"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = h
+        .call(Method::DELETE, &format!("{base}/edges/{edge}"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let edits = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("graph_edit")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(edits.len(), 7, "{edits:?}");
+    assert!(
+        edits
+            .iter()
+            .any(|r| r.entry.resource_id.as_deref() == Some(edge.as_str())
+                && r.entry.resource_type == Some(ResourceKind::GraphEdge)),
+        "{edits:?}"
+    );
+    assert!(
+        edits
+            .iter()
+            .any(|r| r.entry.resource_id.as_deref() == Some(acme.as_str())
+                && r.entry.resource_type == Some(ResourceKind::GraphNode)),
+        "{edits:?}"
+    );
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let details = with_db(db, |db| audit::list(db, 100))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let ops: Vec<&str> = details
+        .iter()
+        .filter(|d| d.action == "graph_edit")
+        .filter_map(|d| d.detail.as_ref()?["op"].as_str())
+        .collect();
+    for op in ["create", "assert", "update", "delete"] {
+        assert!(ops.contains(&op), "{op} missing from {ops:?}");
+    }
+    assert!(
+        details.iter().any(|d| d.action == "graph_edit"
+            && d.detail
+                .as_ref()
+                .is_some_and(|v| v["note"] == "corrected supplier")),
+        "{details:?}"
+    );
+}
+
+/// With `[graph].follow_ingest = "tables"`, a table file that replaces a
+/// mapped table queues a graph run once it is ready; the ingest job
+/// names it, it is audited as a graph extraction, and the status no
+/// longer lists the table as pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_queues_the_graph_follow_up_the_setting_asks_for() {
+    let mut config = Config::default();
+    config.graph.follow_ingest = FollowIngest::Tables;
+    let h = harness_with(ServeMode::Local, config).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "follow" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    let base = format!("/api/v1/workspaces/{ws}/documents");
+    let upload = |h: &Harness, path: String, csv: &str| {
+        let (content_type, body) = multipart("shipments.csv", "text/csv", csv);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let h = h.router.clone();
+        async move {
+            let response = h
+                .oneshot(request)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            (status, body)
+        }
+    };
+    // No ontology yet: the first upload makes the table and nothing follows.
+    let (status, body) = upload(&h, base.clone(), "po,vendor,country\nPO-1,Orgenics,Kenya\n").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let first = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let first_job = body["documents"][0]["job"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(h.wait_ready(&ws, &first, "").await["status"], "ready");
+    let done = wait_for_job(&h, &ws, &first_job, "").await;
+    assert_eq!(done["state"], "succeeded", "{done}");
+    assert!(
+        !done["outcome"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("follow-up"),
+        "{done}"
+    );
+    let (status, body) = h
+        .call(
+            Method::PUT,
+            &format!("/api/v1/workspaces/{ws}/ontology"),
+            None,
+            Some(shipments_ontology()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A replacement with a new row: the graph follows.
+    let (status, body) = upload(
+        &h,
+        format!("{base}?replace={first}"),
+        "po,vendor,country\nPO-1,Orgenics,Kenya\nPO-2,Aurobindo,Uganda\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let second = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let job = body["documents"][0]["job"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(h.wait_ready(&ws, &second, "").await["status"], "ready");
+    let done = wait_for_job(&h, &ws, &job, "").await;
+    let result = done["outcome"].as_str().unwrap_or_default().to_owned();
+    let follow = result
+        .rsplit("graph follow-up queued as job ")
+        .next()
+        .filter(|rest| rest.len() < result.len())
+        .unwrap_or_else(|| fail(&format!("no follow-up in {result}")))
+        .to_owned();
+    let followed = wait_for_job(&h, &ws, &follow, "").await;
+    assert_eq!(followed["state"], "succeeded", "{followed}");
+    assert_eq!(followed["kind"], "graph", "{followed}");
+    assert_eq!(
+        followed["outcome"], "graph: table shipments: 2 nodes, 4 edges",
+        "{followed}"
+    );
+    let (_, status_body) = h
+        .get(&format!("/api/v1/workspaces/{ws}/graph/status"), "")
+        .await;
+    assert_eq!(status_body["nodes"], 6, "{status_body}");
+    assert_eq!(
+        status_body["pending_tables"],
+        serde_json::json!([]),
+        "{status_body}"
+    );
+    let runs = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("graph_extract")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(
+        runs[0].entry.resource_id, runs[1].entry.resource_id,
+        "{runs:?}"
+    );
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let details = with_db(db, |db| audit::list(db, 100))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let extracts: Vec<&serde_json::Value> = details
+        .iter()
+        .filter(|d| d.action == "graph_extract")
+        .filter_map(|d| d.detail.as_ref())
+        .collect();
+    assert!(
+        extracts.iter().any(|d| d["follow_ingest"] == "tables"),
+        "{extracts:?}"
+    );
+    assert!(
+        extracts.iter().any(|d| d["finished"] == true),
+        "{extracts:?}"
     );
 }
 

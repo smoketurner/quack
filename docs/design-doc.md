@@ -1135,6 +1135,40 @@ through scratch `_quack_tmp_graph_*` tables, in one transaction under the statem
 The server releases the workspace lock between batches and runs one extraction per workspace
 at a time; a second `POST .../graph/extract` answers 409.
 
+A re-run of table extraction takes the row's current values onto the node's mapped
+properties (the table is the keyed source of truth; keys from other sources stay). The last
+batch of each mapping records the table's fingerprint in `_quack_graph_tables_built`: the
+document that owns the table, the keyed row count, and an order-insensitive hash over every
+mapped column. The status compares it with the table as it is now, so a re-ingested,
+re-imported, or `UPDATE`d table shows as pending.
+
+**Keeping up.** `GraphStatus.pending_chunks` is the count of chunks of ready documents no
+extraction has read; `pending_tables` names the mapped tables whose fingerprint changed or
+that were never read. Both appear in `quack graph status`, `GET .../graph/status`, and the
+graph page's banner. Extraction stays on demand by default; `[graph].follow_ingest` (`off`,
+`tables`, `all`) makes a document that becomes ready extract itself (`graph::follow_up`):
+its mapped tables, and with `all` its chunks through the chat model (one call each, which
+is why the default is `off`), then resolution. The server queues it when an upload or an
+import succeeds, as an audited `graph_extract` run in the workspace's graph lane (so it
+waits behind an extraction in progress), and the ingest job's outcome names the job; the
+command line and the terminal run it after their own ingest and print one line.
+
+**Assertions.** A person can add, correct, and delete nodes and edges: `quack graph
+add|set|delete`, `POST`/`PATCH`/`DELETE` on `.../graph/nodes[/{nid}]` and
+`.../graph/edges[/{eid}]`, and the graph page's forms. Each write is checked against the
+current ontology (the class exists; the relation joins the two nodes' classes) and records
+`Origin::Manual` provenance: `author` (the server user; none from the command line),
+`note`, and `asserted_at` in `_quack_provenance`, one row per subject. Adding a node or an
+edge that exists asserts it instead (its provisional flag clears; given properties take
+their keys). A correction may not give a node a label another node of its class holds, nor
+a class its edges no longer fit. Deleting a node takes its edges, their provenance, and its
+merge proposals, in one transaction. `graph extract --reset` keeps asserted nodes and edges
+(`store::Keep::Asserted`; `--reset --all` drops them too). Every rendering shows an
+assertion as `asserted by {author}: {note}`: the API's provenance, the page's inspector,
+and an OKF entity file's provenance list. Every edit is audited as `graph_edit` with the
+node or edge as its resource and `{op, label, class, relation, note}` in the workspace's
+detail row.
+
 **Entity resolution.** Nodes are merged on `(normalized_label, class_id)`. A second pass
 checks each node's five nearest neighbours and proposes merging same-class nodes whose label
 embeddings are within a cosine threshold (default 0.08) and whose labels share a token. A
@@ -2018,6 +2052,11 @@ GET    /api/v1/workspaces/{id}/graph/revalidate    what a revalidation would dro
 POST   /api/v1/workspaces/{id}/graph/revalidate    drop it: {"dropped_nodes", "dropped_edges"} from the preview; 409 with the current totals when absent or stale
 POST   /api/v1/workspaces/{id}/graph/review        mark a provisional graph reviewed
 GET    /api/v1/workspaces/{id}/graph/merges        PUT .../graph/merges/{mid} {action: accept|reject}
+POST   /api/v1/workspaces/{id}/graph/nodes         {label, class, properties?, note?}: 201, or 200 when the node existed and was asserted
+PATCH  /api/v1/workspaces/{id}/graph/nodes/{nid}   {label?, class?, properties?, note?}; a property set to null is removed
+DELETE /api/v1/workspaces/{id}/graph/nodes/{nid}   the node with its edges
+POST   /api/v1/workspaces/{id}/graph/edges         {source, target, relation, properties?, note?} by node id: 201, or 200 when asserted
+DELETE /api/v1/workspaces/{id}/graph/edges/{eid}
 POST   /api/v1/workspaces/{id}/import              {url, table, query?, source_table?, limit?}
 GET    /api/v1/workspaces/{id}/embeddings          current, stale, and missing vectors against the configured profile, and the plan
 POST   /api/v1/workspaces/{id}/embeddings/refresh  200 when current, else 202 with the plan and the job
@@ -2223,7 +2262,10 @@ quack docs [--format json] [--all] [--pin ID | --unpin ID | --delete ID | --tag 
 quack embeddings refresh [-w NAME] [-y]
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
             | path FROM TO [--max-hops N] | status | extract [--source all|tables|documents]
-            [--sample N] [--reset] [-y] | revalidate [-y] | review | merges | merge ID.. | reject ID..
+            [--sample N] [--reset [--all]] [-y] | revalidate [-y] | review | merges | merge ID.. | reject ID..
+            | add node LABEL --class C [--property K=V].. [--note T] | add edge FROM RELATION TO [--note T]
+            | set NODE [--label L] [--to-class C] [--property K=V].. [--unset K].. [--note T]
+            | delete node NODE [--class C] | delete edge ID
 quack ontology show | init | propose [--documents] [--from FILE] [--sample N]
               [--auto-accept] [-y] | review [--low-support]
               | accept ID... [--rename N|--merge-into ID|--reparent C] | reject ID...
@@ -2589,6 +2631,7 @@ max_traversal_depth = 3
 max_nodes = 200
 merge_threshold = 0.08                  # cosine distance under which a merge is proposed
 auto_merge_threshold = 0.02             # under which it happens without review
+follow_ingest = "off"                   # off | tables | all: what a ready document extracts into the graph at once
 
 [ontology]
 propose_sample_chunks = 200

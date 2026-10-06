@@ -13,8 +13,10 @@ use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
+use crate::server::run;
 use crate::server::state::{App, ServeMode};
 use quack_core::import::{self, ImportPolicy, ImportRequest, ImportSummary};
+use quack_core::jobs::JobId;
 
 #[derive(Deserialize)]
 pub(crate) struct ImportBody {
@@ -47,8 +49,19 @@ pub(crate) async fn import(
     Json(body): Json<ImportBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let summary = run_import(&app, &access, &ImportRequest::from(body)).await?;
-    Ok(Json(serde_json::to_value(summary)?))
+    let imported = run_import(&app, &access, &ImportRequest::from(body)).await?;
+    let mut body = serde_json::to_value(&imported.summary)?;
+    if let (Some(fields), Some(job)) = (body.as_object_mut(), &imported.graph_job) {
+        fields.insert(String::from("graph_job"), serde_json::to_value(job)?);
+    }
+    Ok(Json(body))
+}
+
+/// What an import did, and the graph follow-up it queued when
+/// `[graph].follow_ingest` asks for one.
+pub(crate) struct Imported {
+    pub summary: ImportSummary,
+    pub graph_job: Option<JobId>,
 }
 
 /// The import the API and the web form share: run it, audit it either way.
@@ -56,7 +69,7 @@ pub(crate) async fn run_import(
     app: &App,
     access: &Access,
     request: &ImportRequest,
-) -> ApiResult<ImportSummary> {
+) -> ApiResult<Imported> {
     let source = request.url.redacted();
     request
         .url
@@ -99,5 +112,14 @@ pub(crate) async fn run_import(
     access
         .audit(app, AuditAction::Import, None, audit_outcome, Some(detail))
         .await?;
-    outcome.map_err(|e| ApiError::unprocessable(e.to_string()))
+    let summary = outcome.map_err(|e| ApiError::unprocessable(e.to_string()))?;
+    let graph_job = run::follow_ingest(
+        app,
+        access,
+        db,
+        embeddings,
+        vec![summary.document_id.clone()],
+    )
+    .await?;
+    Ok(Imported { summary, graph_job })
 }

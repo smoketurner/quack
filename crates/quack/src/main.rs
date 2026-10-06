@@ -29,6 +29,7 @@ use quack_core::config::{Config, Grant};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::graph::follow_up;
 use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::PageCounts;
@@ -44,9 +45,7 @@ use quack_core::progress::RunControl;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, ResourceKind, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
-use quack_core::storage::workspace::{
-    DocumentFields, DocumentSource, Pinning, QueryResults, WorkspaceDb,
-};
+use quack_core::storage::workspace::{DocumentFields, Pinning, QueryResults, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use quack_core::{config, doctor};
 use std::io::{IsTerminal, Read, Write};
@@ -1877,6 +1876,26 @@ async fn run_query(
     Ok(())
 }
 
+/// `quack ingest DIR`: an OKF bundle, or every supported file under the
+/// folder. The per-file flags have no meaning for a folder.
+async fn ingest_dir(
+    opened: &OpenedWorkspace,
+    dir: &Path,
+    per_file: bool,
+    no_embed: bool,
+    prune: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        !per_file,
+        "--replace, --pin, --title, --filename, --author, --authored, and --tag take one file, not a directory"
+    );
+    if Bundle::is_dir(dir) {
+        return ingest_bundle(opened, &dir.display().to_string(), no_embed).await;
+    }
+    let prune = if prune { Prune::Delete } else { Prune::Keep };
+    ingest_folder(opened, dir, no_embed, prune).await
+}
+
 async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     let IngestArgs {
         file,
@@ -1903,15 +1922,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
             || author.is_some()
             || authored.is_some()
             || !tags.is_empty();
-        anyhow::ensure!(
-            !per_file,
-            "--replace, --pin, --title, --filename, --author, --authored, and --tag take one file, not a directory"
-        );
-        if Bundle::is_dir(dir) {
-            return ingest_bundle(&opened, &dir.display().to_string(), no_embed).await;
-        }
-        let prune = if prune { Prune::Delete } else { Prune::Keep };
-        return ingest_folder(&opened, dir, no_embed, prune).await;
+        return ingest_dir(&opened, dir, per_file, no_embed, prune).await;
     }
     if prune {
         anyhow::bail!("--prune goes with a folder");
@@ -1935,10 +1946,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
             .context("failed to build embedding model")?
     };
 
-    let source = match file {
-        StdioPath::Stdio => DocumentSource::Stdin,
-        StdioPath::Path(_) => DocumentSource::Path,
-    };
+    let source = file.document_source();
     let outcome = ingestion::ingest_file(
         config,
         &ws_db,
@@ -1982,6 +1990,42 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     }
     report_ingested(&mut out, &result, pin)?;
     out.flush()?;
+    follow_ingest(
+        config,
+        &ws_db,
+        embedding_model.as_ref(),
+        &[result.document_id],
+        &mut out,
+    )
+    .await?;
+    out.flush()?;
+    Ok(())
+}
+
+/// The graph extraction `[graph].follow_ingest` asks for after an ingest
+/// or import, run here and reported in one line; nothing when it is off.
+async fn follow_ingest(
+    config: &Config,
+    db: &Writer,
+    embedder: Option<&Embeddings>,
+    documents: &[DocumentId],
+    out: &mut impl Write,
+) -> Result<()> {
+    let followed = follow_up::after_documents(
+        db,
+        config,
+        embedder,
+        documents,
+        RunControl {
+            progress: &progress_line::to_stderr,
+            cancel: None,
+        },
+    )
+    .await
+    .context("graph follow-up failed")?;
+    if let Some(summary) = followed {
+        writeln!(out, "  Graph: {summary}")?;
+    }
     Ok(())
 }
 
@@ -2104,6 +2148,16 @@ async fn ingest_folder(
             )?,
         }
     }
+    out.flush()?;
+    let stored: Vec<DocumentId> = report
+        .results
+        .iter()
+        .filter_map(|r| match &r.outcome {
+            Outcome::Ingested(id) | Outcome::Replaced { new: id, .. } => Some(id.clone()),
+            Outcome::Skipped(_) | Outcome::Failed(_) => None,
+        })
+        .collect();
+    follow_ingest(config, &ws_db, embedding_model.as_ref(), &stored, &mut out).await?;
     out.flush()?;
     let failed = report.failed();
     if failed > 0 {
