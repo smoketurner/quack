@@ -28,7 +28,7 @@ fn command_names_complete_by_prefix() {
     assert_eq!(words("/sch"), ["/schema"]);
     assert_eq!(
         words("/s"),
-        ["/sql", "/schema", "/sessions", "/share", "/steps"]
+        ["/sql", "/schema", "/saved", "/sessions", "/share", "/steps"]
     );
     assert!(words("/nothing").is_empty());
     assert!(words("hello").is_empty());
@@ -141,6 +141,69 @@ fn help_lists_every_command_alias_and_usage() {
         assert!(help.contains(line), "{line} missing from\n{help}");
     }
     assert!(help.contains("Shortcuts:"));
+}
+
+/// `/saved` is the CLI's verbs: bare, it lists; `add` takes the
+/// session's last answer, so `--from-session` is optional here; the
+/// command-line flags are neither offered nor accepted.
+#[test]
+fn saved_verbs_parse_and_refuse_the_command_line_only_flags() {
+    assert!(matches!(
+        SlashCommand::parse("/saved"),
+        Ok(SlashCommand::Saved { action: None })
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/saved add overdue"),
+        Ok(SlashCommand::Saved {
+            action: Some(SavedAction::Add {
+                from_session: None,
+                message: None,
+                ..
+            })
+        })
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/saved add overdue --message 5"),
+        Ok(SlashCommand::Saved {
+            action: Some(SavedAction::Add {
+                message: Some(5),
+                ..
+            })
+        })
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/saved run overdue"),
+        Ok(SlashCommand::Saved {
+            action: Some(SavedAction::Run { refresh: false, .. })
+        })
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/saved remove overdue"),
+        Ok(SlashCommand::Saved {
+            action: Some(SavedAction::Remove { .. })
+        })
+    ));
+    assert!(parses("/saved show overdue"));
+    assert!(parses("/saved list --format json"));
+    assert!(parses("/saved run overdue -f csv"));
+    assert!(!parses("/saved run"));
+    assert!(!parses("/saved forget overdue"));
+    for flag in ["--refresh", "--exit-code"] {
+        let refused = SlashCommand::parse(&format!("/saved run overdue {flag}"))
+            .err()
+            .map(|e| (e.kind(), e.to_string()));
+        let Some((kind, text)) = refused else {
+            fail(&format!("{flag} was accepted"));
+        };
+        assert_eq!(kind, ErrorKind::UnknownArgument);
+        assert!(
+            text.contains(&format!("quack saved run NAME {flag}")),
+            "{text}"
+        );
+    }
+    assert_eq!(words("/saved "), ["list", "add", "run", "show", "remove"]);
+    assert_eq!(words("/saved run overdue --"), ["--format"]);
+    assert_eq!(words("/saved add x --"), ["--from-session", "--message"]);
 }
 
 #[test]

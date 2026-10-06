@@ -722,6 +722,83 @@ fn sample() -> QueryResults {
     }
 }
 
+/// The digest covers every row, kept or not, and the column names,
+/// so a change past the cap, a renamed column, or a repeated row
+/// changes it; the same rows in another order give the same digest.
+#[test]
+fn digested_query_covers_the_rows_past_the_cap_in_any_order() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    let digested = |sql: &str, cap: u32| {
+        db.execute_query_digested(sql, cap)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    let ten = digested("SELECT range AS n FROM range(10)", 3);
+    assert_eq!(ten.results.results.rows.len(), 3);
+    assert_eq!(ten.results.total_rows, 10);
+    assert_eq!(ten.digest.len(), 64);
+    assert_eq!(
+        digested("SELECT range AS n FROM range(10)", 100).digest,
+        ten.digest
+    );
+    assert_ne!(
+        digested("SELECT range AS n FROM range(11)", 3).digest,
+        ten.digest
+    );
+    assert_ne!(
+        digested("SELECT range AS m FROM range(10)", 3).digest,
+        ten.digest
+    );
+    assert_eq!(
+        digested("SELECT range AS n FROM range(10) ORDER BY n DESC", 3).digest,
+        ten.digest,
+        "row order does not count"
+    );
+    assert_ne!(
+        digested("SELECT 1 AS n UNION ALL SELECT 1", 3).digest,
+        digested("SELECT 1 AS n", 3).digest,
+        "a repeated row counts"
+    );
+    assert_ne!(
+        digested("SELECT 1 AS n UNION ALL SELECT 1 UNION ALL SELECT 2", 3).digest,
+        digested("SELECT 2 AS n", 3).digest,
+        "a repeated row does not cancel out"
+    );
+    assert_eq!(
+        digested("SELECT 1 AS n WHERE false", 3).digest,
+        digested("SELECT 2 AS n WHERE false", 3).digest
+    );
+}
+
+/// A `GROUP BY` without `ORDER BY` returns its groups in whatever
+/// order the threads finish, so two runs over the same data must
+/// digest the same.
+#[test]
+fn digested_group_by_is_the_same_across_runs() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    db.execute_statement(
+        "CREATE TABLE events (bucket INTEGER, n INTEGER); \
+         INSERT INTO events SELECT range % 64, range FROM range(100000)",
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let sql = "SELECT bucket, count(*) AS c, sum(n) AS s FROM events GROUP BY bucket";
+    let first = db
+        .execute_query_digested(sql, 10)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    for _ in 0..5 {
+        let again = db
+            .execute_query_digested(sql, 10)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(again.digest, first.digest);
+        assert_eq!(again.results.total_rows, 64);
+    }
+    let ordered = db
+        .execute_query_digested(&format!("{sql} ORDER BY bucket DESC"), 10)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(ordered.digest, first.digest);
+}
+
 #[test]
 fn capped_query_keeps_the_cap_and_counts_the_rest() {
     let db =

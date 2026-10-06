@@ -15,6 +15,7 @@ use quack_core::storage::workspace::{SqlName, looks_like_direct_sql};
 use crate::embeddings_cli::EmbeddingsAction;
 use crate::graph_cli::GraphAction;
 use crate::ontology_cli::OntologyAction;
+use crate::saved_cli::SavedAction;
 use crate::{ExportFlags, ModeArg};
 
 /// The argument id of a command that takes the rest of the line as typed
@@ -124,6 +125,12 @@ pub(crate) enum SlashCommand {
     Embeddings {
         #[command(subcommand)]
         action: EmbeddingsAction,
+    },
+    /// Saved questions: list them, or add NAME (this session's last answer), run NAME, show NAME, remove NAME
+    #[command(name = "/saved")]
+    Saved {
+        #[command(subcommand)]
+        action: Option<SavedAction>,
     },
     /// Pick a recent session to resume
     #[command(name = "/sessions")]
@@ -273,7 +280,22 @@ impl SlashCommand {
             })?;
             words.extend(split);
         }
-        SlashLine::try_parse_from(words).map(|line| line.command)
+        let command = SlashLine::try_parse_from(words)?.command;
+        if let Self::Saved {
+            action: Some(SavedAction::Run {
+                refresh, exit_code, ..
+            }),
+        } = &command
+            && let Some(flag) = [("--refresh", *refresh), ("--exit-code", *exit_code)]
+                .into_iter()
+                .find_map(|(flag, given)| given.then_some(flag))
+        {
+            return Err(SlashLine::command().error(
+                ErrorKind::UnknownArgument,
+                format!("{flag} is a command-line flag: quack saved run NAME {flag}"),
+            ));
+        }
+        Ok(command)
     }
 }
 
@@ -402,9 +424,10 @@ const HELP_COLUMN: usize = 18;
 /// more read as `VERB ...` and the popup lists them.
 const INLINE_VERBS: usize = 3;
 
-/// Arguments the terminal supplies itself (`--yes`: it never asks), or
-/// clap's own, so offering them would mislead.
-const IMPLIED_ARGS: &[&str] = &["yes", "help"];
+/// Arguments the terminal supplies itself (`--yes`: it never asks), refuses
+/// (`/saved run`'s `--exit-code` and `--refresh` are command-line flags),
+/// or clap's own, so offering them would mislead.
+const IMPLIED_ARGS: &[&str] = &["yes", "help", "exit_code", "refresh"];
 
 impl SlashCommand {
     /// The `/help` text: every command with its aliases and arguments,

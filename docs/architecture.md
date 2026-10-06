@@ -55,6 +55,7 @@ nothing in it knows about HTTP, terminals, or windows.
 | `storage::writer` | the workspace's one writer connection as an actor: its own thread runs the closures sent to it, interactive before background; callers await `run` / `run_at` | 4.1, 7.4 |
 | `proxy` | `Proxies`: the forward proxy from `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, read once; every reqwest client starts from `Proxies::client` and the AWS SDK connector takes `Proxies::aws`, and loopback and `169.254.0.0/16` are never proxied | 6.2, 10.1 |
 | `priority` | the interactive/background task-local that the writer line and the model limiter read | 4.1 |
+| `saved` | saved questions: an answer's read statements pinned under a name, re-run without the model with a digest of every result set and `changed` against the run before; cron is the scheduler | 8.1 |
 | `storage::sessions`, `storage::context`, `storage::audit` | conversations, the versioned workspace context, the content half of the audit (`AuditLog`: the server's insert-only audit connection) | 5.3, 8 |
 | `embedding` | each text's embedding role (query, document, similarity), each model family's trained prefixes (`presets`) and their `[embedding]` overrides, the profile a vector is made under, the width check, `refresh` | 6.1, 5.4 |
 | `ingestion` | registration with SHA-256 dedup, parsers (`parser`, `html`, `office`, `xlsx`), the decompression limit on zipped uploads (`budget`), chunking, embedding, tables from structured files, piped stdin | 6.1, 6.2 |
@@ -76,7 +77,7 @@ nothing in it knows about HTTP, terminals, or windows.
 | `main` | the clap command tree, print mode entry, the workspace-local subcommands (`ingest`, `docs`, `sessions`, `export`, `context`, `import`, `okf`, `auth`) |
 | `print` | `-p`: one turn, answer to stdout, steps to stderr, text or JSON |
 | `terminal` | the interactive session (ratatui): every submission a job on the work queue, the job strip, streaming per turn, inline steps, queued permission prompts, slash commands, charts, mouse selection copied to the clipboard (`selection`, `clipboard`) |
-| `ontology_cli`, `graph_cli`, `embeddings_cli`, `admin` | `quack ontology`, `quack graph`, `quack embeddings`, and the server administration commands |
+| `ontology_cli`, `graph_cli`, `embeddings_cli`, `saved_cli`, `admin` | `quack ontology`, `quack graph`, `quack embeddings`, `quack saved`, and the server administration commands |
 | `mcp` | the MCP server (rmcp) shared by `quack mcp` on stdio and `/mcp/v1/{workspace}` |
 | `server` | `quack serve`: `auth` (identity and `Access::resolve`), `api` (REST handlers), `web` (askama pages calling the same `Access` operations as the API, [web-ui.md](web-ui.md)), `run` (the audited background runs: embeddings refresh, graph and ontology document passes), `queue` (uploads and cancel bookkeeping on the work queue), `api::jobs` (the jobs API and stream), `state`, `mcp_http` |
 

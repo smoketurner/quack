@@ -115,6 +115,16 @@ fn auth_required_is_recognised_through_context_only_while_typed() {
     assert_eq!(Exit::of(&anyhow::anyhow!("something else")), None);
 }
 
+/// The exit statuses scripts check, each its own number; a changed
+/// saved question is the one that is not an error.
+#[test]
+fn exit_statuses_are_distinct_and_a_change_is_five() {
+    assert_eq!(ExitCode::from(Exit::Usage), ExitCode::from(2));
+    assert_eq!(ExitCode::from(Exit::WriteRefused), ExitCode::from(3));
+    assert_eq!(ExitCode::from(Exit::AuthRequired), ExitCode::from(4));
+    assert_eq!(ExitCode::from(Exit::Changed), ExitCode::from(5));
+}
+
 fn config_in(dir: &std::path::Path) -> Config {
     let mut config = Config::default();
     config.general.data_dir = dir.join("data");

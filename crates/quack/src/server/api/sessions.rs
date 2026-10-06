@@ -49,7 +49,7 @@ pub(crate) async fn list(
 impl Access {
     /// The session, if the caller may see it; one they may not reads as
     /// missing.
-    async fn visible_session(
+    pub(crate) async fn visible_session(
         &self,
         app: &App,
         session_id: &SessionId,

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::llm::egress::Refusal;
+use crate::saved::Unsavable;
 use crate::storage::workspace::DuckDbMessage;
 
 #[derive(Debug, Error)]
@@ -29,6 +30,14 @@ pub enum Error {
     /// A workspace by that name is already there; none was created.
     #[error("workspace '{0}' already exists")]
     WorkspaceExists(String),
+
+    /// A saved question by that name is already there; none was saved.
+    #[error("saved question '{0}' already exists")]
+    SavedQuestionExists(String),
+
+    /// An answer that cannot become a saved question, and why.
+    #[error("cannot save this answer: {0}")]
+    Unsavable(#[from] Unsavable),
 
     /// Text that cannot name a workspace.
     #[error("workspace name must be non-empty and contain no slashes or dots")]
@@ -278,6 +287,9 @@ impl WrittenBy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Record {
     Session,
+    /// A message in a session, named by its sequence number.
+    Message,
+    SavedQuestion,
     Document,
     OntologyVersion,
     MergeProposal,
@@ -287,6 +299,8 @@ pub enum Record {
 
 text_enum!(Record, "record", {
     Session => "session",
+    Message => "message",
+    SavedQuestion => "saved question",
     Document => "document",
     OntologyVersion => "ontology version",
     MergeProposal => "merge proposal",

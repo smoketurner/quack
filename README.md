@@ -177,6 +177,9 @@ cat orders.csv | quack -q "SELECT count(*) FROM stdin"   # piped data is the tab
 ```
 
 ```bash
+quack -p "which invoices are overdue?" -f json -w sales   # one answer as JSON, with its session_id
+quack saved add overdue --from-session ID                 # keep that answer's SQL under a name
+quack saved run overdue --exit-code      # re-run it without the model; exit 5 when the result changed (cron is the scheduler)
 quack context edit                       # definitions and rules the agent follows
 quack ontology propose                   # draft classes and relations from the tables, then review
 quack graph extract -y                   # build the knowledge graph
@@ -199,7 +202,7 @@ You need no configuration to start. Without a chat model, `quack` and `quack -q`
 SQL, load files, and take every slash command; asking a question tells you how to set up a
 model.
 
-Exit codes: 0 ok, 1 error, 2 usage, 3 write refused, 4 auth required.
+Exit codes: 0 ok, 1 error, 2 usage, 3 write refused, 4 auth required, 5 a saved question's result changed (`--exit-code`).
 
 ## How it works
 

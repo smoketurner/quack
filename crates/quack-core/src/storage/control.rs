@@ -527,6 +527,10 @@ pub enum AuditAction {
     Cancel,
     /// A person's decision on a write the agent wanted to run.
     Permission,
+    /// An answer's SQL saved as a question.
+    Save,
+    /// A saved question's SQL run again without the model.
+    SavedRun,
 }
 
 text_enum!(AuditAction, "audit action", {
@@ -564,6 +568,8 @@ text_enum!(AuditAction, "audit action", {
     Mode => "mode",
     Cancel => "cancel",
     Permission => "permission",
+    Save => "save",
+    SavedRun => "saved_run",
 });
 
 /// The kinds of resource an audit row names by opaque id.
@@ -586,6 +592,7 @@ pub enum ResourceKind {
     /// An MCP resource URI.
     Resource,
     Audit,
+    SavedQuestion,
 }
 
 text_enum!(ResourceKind, "resource kind", {
@@ -604,6 +611,7 @@ text_enum!(ResourceKind, "resource kind", {
     EmbeddingsRun => "embeddings_run",
     Resource => "resource",
     Audit => "audit",
+    SavedQuestion => "saved_question",
 });
 
 impl ResourceKind {

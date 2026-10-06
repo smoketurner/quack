@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use aws_lc_rs::digest;
+
 use crate::config::Config;
+use crate::crypto;
 use crate::embedding::{
     Dimension, EmbeddingStatus, Fingerprint, Input, Profile, Prompts, StaleVectors, Vector,
 };
@@ -15,6 +18,7 @@ use crate::ids::{ChunkId, DocumentId, NodeId};
 use crate::ingestion::TableName;
 use crate::ingestion::parser::{FileType, Load, PageCounts};
 use crate::ontology::store::Acceptance;
+use crate::saved;
 use crate::text::OneLine;
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
@@ -452,6 +456,58 @@ impl CappedResults {
         let mut buf = Vec::new();
         table.write_table(&mut buf)?;
         String::from_utf8(buf).map_err(|e| Error::Analysis(format!("UTF-8 error: {e}")))
+    }
+}
+
+/// Query results with a digest of the whole result set ([`ResultDigest`]).
+/// Rows past the cap are digested and counted but not kept.
+#[derive(Debug, Clone)]
+pub struct DigestedResults {
+    pub results: CappedResults,
+    pub digest: String,
+}
+
+/// A digest of a result set that does not depend on row order: the SHA-256
+/// of the column names in order, then the sum modulo 2^256 of every row's
+/// SHA-256, each row as one JSON array. A statement without `ORDER BY` can
+/// return the same rows in a different order from one run to the next, so
+/// row order must not count; a sum, unlike XOR, keeps a repeated row
+/// distinct from a single one, and unlike sorting the row hashes needs no
+/// memory per row.
+struct ResultDigest {
+    columns: digest::Context,
+    /// The row-hash sum, 64-bit limbs least significant first.
+    rows: [u64; 4],
+}
+
+impl ResultDigest {
+    fn new(columns: &[String]) -> Result<Self> {
+        let mut context = digest::Context::new(&digest::SHA256);
+        context.update(&serde_json::to_vec(columns)?);
+        Ok(Self {
+            columns: context,
+            rows: [0; 4],
+        })
+    }
+
+    fn add_row(&mut self, values: &[serde_json::Value]) -> Result<()> {
+        let hash = digest::digest(&digest::SHA256, &serde_json::to_vec(values)?);
+        let mut carry = false;
+        let (words, _) = hash.as_ref().as_chunks::<8>();
+        for (limb, word) in self.rows.iter_mut().zip(words) {
+            let (sum, overflowed) = limb.overflowing_add(u64::from_le_bytes(*word));
+            let (sum, overflowed_again) = sum.overflowing_add(u64::from(carry));
+            *limb = sum;
+            carry = overflowed || overflowed_again;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> String {
+        for limb in self.rows {
+            self.columns.update(&limb.to_le_bytes());
+        }
+        crypto::hex_lower(self.columns.finish().as_ref())
     }
 }
 
@@ -1061,6 +1117,7 @@ impl WorkspaceDb {
         self.conn.execute_batch(DOCUMENTS_DDL)?;
         self.conn.execute_batch(&sql)?;
         self.conn.execute_batch(SESSION_SUMMARIES_DDL)?;
+        self.conn.execute_batch(saved::DDL)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&graph::ddl(dim))?;
         self.upgrade_data(dim)?;
@@ -2338,53 +2395,75 @@ impl WorkspaceDb {
         self.read_rows(sql, Some(max_rows as usize))
     }
 
-    fn read_rows(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
-        self.under_timeout(|db| db.read_rows_untimed(sql, keep))
+    /// [`Self::execute_query_capped`], with a [`ResultDigest`] of the
+    /// whole result set: every row is read and digested, and only the
+    /// first `max_rows` are kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL is invalid or execution fails.
+    pub fn execute_query_digested(&self, sql: &str, max_rows: u32) -> Result<DigestedResults> {
+        self.under_timeout(|db| {
+            let (results, digest) = db.read_rows_untimed(sql, Some(max_rows as usize), true)?;
+            Ok(DigestedResults {
+                results,
+                digest: digest.unwrap_or_default(),
+            })
+        })
     }
 
-    fn read_rows_untimed(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
+    fn read_rows(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
+        self.under_timeout(|db| Ok(db.read_rows_untimed(sql, keep, false)?.0))
+    }
+
+    /// Read `sql`'s rows, keeping `keep` of them, and when `digested`,
+    /// digest every row, kept or not: a digest covers the whole result, so
+    /// rows past the cap are converted only then.
+    fn read_rows_untimed(
+        &self,
+        sql: &str,
+        keep: Option<usize>,
+        digested: bool,
+    ) -> Result<(CappedResults, Option<String>)> {
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
 
-        let empty = CappedResults {
+        let (columns, column_count) = match rows.as_ref() {
+            Some(stmt_ref) if stmt_ref.column_count() > 0 => {
+                (stmt_ref.column_names(), stmt_ref.column_count())
+            }
+            _ => (Vec::new(), 0),
+        };
+        let mut digest = digested.then(|| ResultDigest::new(&columns)).transpose()?;
+        let mut results = CappedResults {
             results: QueryResults {
-                columns: Vec::new(),
+                columns,
                 rows: Vec::new(),
             },
             total_rows: 0,
         };
-        let (columns, column_count) = {
-            let Some(stmt_ref) = rows.as_ref() else {
-                return Ok(empty);
-            };
-            let count = stmt_ref.column_count();
-            if count == 0 {
-                return Ok(empty);
-            }
-            (stmt_ref.column_names(), count)
-        };
+        if column_count == 0 {
+            return Ok((results, digest.map(ResultDigest::finish)));
+        }
 
-        let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
-        let mut total_rows: usize = 0;
         while let Some(row) = rows.next()? {
-            total_rows = total_rows.saturating_add(1);
-            if keep.is_some_and(|keep| result_rows.len() >= keep) {
+            results.total_rows = results.total_rows.saturating_add(1);
+            let kept = keep.is_none_or(|keep| results.results.rows.len() < keep);
+            if !kept && digest.is_none() {
                 continue;
             }
             let mut values = Vec::with_capacity(column_count);
             for i in 0..column_count {
                 values.push(extract_value(row, i));
             }
-            result_rows.push(values);
+            if let Some(digest) = digest.as_mut() {
+                digest.add_row(&values)?;
+            }
+            if kept {
+                results.results.rows.push(values);
+            }
         }
-
-        Ok(CappedResults {
-            results: QueryResults {
-                columns,
-                rows: result_rows,
-            },
-            total_rows,
-        })
+        Ok((results, digest.map(ResultDigest::finish)))
     }
 
     /// Execute a SQL statement that does not return rows.

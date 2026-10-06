@@ -17,9 +17,14 @@ use crate::error::{Error, Result};
 /// a file's bytes, an embedding profile, and a fenced document block.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
-    let mut out = String::with_capacity(64);
-    for b in digest.as_ref() {
+    hex_lower(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes).as_ref())
+}
+
+/// `bytes` as lowercase hex.
+#[must_use]
+pub fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for b in bytes {
         out.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
         out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
     }
