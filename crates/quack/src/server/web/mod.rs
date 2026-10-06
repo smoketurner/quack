@@ -36,9 +36,9 @@ use quack_core::ontology::{
 };
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditAction, AuditFilter, AuditPage, AuditRow, Expiry, IssuedToken, MemberRow, Membership,
-    Outcome, ProviderAllowList, ResourceKind, Role, Scope, Standing, TokenRow, UserKind, UserRow,
-    WorkspaceChanges, WorkspaceTimes,
+    AuditAction, AuditFilter, AuditPage, AuditRow, Expiry, GrantedBy, GroupRoleRow, IssuedToken,
+    MemberRow, Membership, Outcome, ProviderAllowList, ResourceKind, Role, Scope, Standing,
+    TokenRow, UserKind, UserRow, WorkspaceChanges, WorkspaceTimes,
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{
@@ -49,7 +49,7 @@ use rust_embed::Embed;
 use serde::Deserialize;
 
 use self::flash::{Flash, Flashed};
-use super::api::admin::CreateUser;
+use super::api::admin::{CreateUser, UpdateUser};
 use super::api::auth::LoginRequest;
 use super::api::context::ReplaceContext;
 use super::api::documents::{Enqueued, IncomingFile, UploadForm};
@@ -57,7 +57,7 @@ use super::api::embeddings::RefreshStarted;
 use super::api::graph::DropApproval;
 use super::api::graph::ExtractionStarted;
 use super::api::import::ImportBody;
-use super::api::members::AddMember;
+use super::api::members::{AddMember, GroupRole};
 use super::api::ontology::{DecideRequest, RenameRequest};
 use super::api::workspaces::CreateWorkspace;
 use super::api::{
@@ -812,6 +812,9 @@ struct SettingsPage {
     classification: String,
     providers: Vec<(String, bool)>,
     members: Vec<MemberRow>,
+    /// The identity provider's groups with a role here; shown when
+    /// `[server.oidc].groups_claim` is set.
+    groups: Option<Vec<GroupRoleRow>>,
     tokens: Vec<TokenRow>,
     new_token: Option<String>,
     error: Option<String>,
@@ -856,21 +859,21 @@ pub(crate) fn assets() -> Router<App> {
     Router::new().route("/static/{*path}", get(static_asset))
 }
 
-pub(crate) fn router() -> Router<App> {
+pub(crate) fn router(app: &App) -> Router<App> {
     Router::new()
         .route("/", get(index))
         .route(
             "/login",
-            get(login_page).merge(super::throttled_login(post(login_submit))),
+            get(login_page).merge(super::throttled_login(app, post(login_submit))),
         )
         .route("/logout", post(logout))
         .route(
             OidcConfig::START_PATH,
-            super::throttled_login(get(sign_in::begin)),
+            super::throttled_login(app, get(sign_in::begin)),
         )
         .route(
             OidcConfig::CALLBACK_PATH,
-            super::throttled_login(get(sign_in::finish)),
+            super::throttled_login(app, get(sign_in::finish)),
         )
         .route("/workspaces", get(workspaces).post(create_workspace))
         .route("/w/{id}", get(workspace_index))
@@ -915,9 +918,12 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/settings", get(settings).post(settings_save))
         .route("/w/{id}/members", post(member_add))
         .route("/w/{id}/members/{user}/remove", post(member_remove))
+        .route("/w/{id}/groups", post(group_set))
+        .route("/w/{id}/groups/remove", post(group_remove))
         .route("/w/{id}/tokens", post(token_create))
         .route("/w/{id}/tokens/{hash}/revoke", post(token_revoke))
         .route("/admin/users", get(admin_users).post(admin_user_add))
+        .route("/admin/users/{user}/{verb}", post(admin_user_change))
         .route("/admin/audit", get(admin_audit))
         .route("/about", get(about))
 }
@@ -2195,11 +2201,27 @@ impl SettingsPage {
         } else {
             (Vec::new(), Vec::new())
         };
+        let reads_groups = app
+            .config
+            .server
+            .oidc
+            .as_ref()
+            .is_some_and(|oidc| oidc.groups_claim.is_some());
+        let groups = if reads_groups && access.permits(Need::OWN) {
+            Some(
+                app.control
+                    .list_group_roles(&access.membership.workspace.id)
+                    .await?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             page: Page::in_workspace(app, Tab::Settings, access),
             classification: access.membership.workspace.classification.clone(),
             providers,
             members,
+            groups,
             tokens,
             new_token,
             error,
@@ -2273,6 +2295,33 @@ async fn member_remove(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     let removed = access.remove_member(&app, &user_id).await;
+    Ok(Flash::after(format!("/w/{id}/settings"), removed, |()| None).into_response())
+}
+
+async fn group_set(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(form): Form<GroupRole>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
+    let set = access.set_group_role(&app, &form).await;
+    Ok(Flash::after(format!("/w/{id}/settings"), set, |_| None).into_response())
+}
+
+#[derive(Deserialize)]
+struct GroupName {
+    group: String,
+}
+
+async fn group_remove(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(form): Form<GroupName>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
+    let removed = access.remove_group_role(&app, &form.group).await;
     Ok(Flash::after(format!("/w/{id}/settings"), removed, |()| None).into_response())
 }
 
@@ -2361,6 +2410,58 @@ async fn admin_user_add(
 ) -> WebResult<Response> {
     let created = identity.create_user(&app, &form).await;
     Ok(Flash::after("/admin/users", created, |_| None).into_response())
+}
+
+/// The Users page's per-row verbs.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum UserVerb {
+    Disable,
+    Enable,
+    Promote,
+    Demote,
+    Remove,
+}
+
+async fn admin_user_change(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((user, verb)): Path<(UserId, UserVerb)>,
+) -> WebResult<Response> {
+    let change =
+        |update: UpdateUser| async { identity.update_user(&app, &user, update).await.map(drop) };
+    let outcome = match verb {
+        UserVerb::Disable => {
+            change(UpdateUser {
+                disabled: Some(true),
+                ..UpdateUser::default()
+            })
+            .await
+        }
+        UserVerb::Enable => {
+            change(UpdateUser {
+                disabled: Some(false),
+                ..UpdateUser::default()
+            })
+            .await
+        }
+        UserVerb::Promote => {
+            change(UpdateUser {
+                kind: Some(UserKind::Admin),
+                ..UpdateUser::default()
+            })
+            .await
+        }
+        UserVerb::Demote => {
+            change(UpdateUser {
+                kind: Some(UserKind::Standard),
+                ..UpdateUser::default()
+            })
+            .await
+        }
+        UserVerb::Remove => identity.delete_user(&app, &user).await.map(drop),
+    };
+    Ok(Flash::after("/admin/users", outcome, |()| None).into_response())
 }
 
 async fn admin_audit(

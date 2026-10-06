@@ -1074,6 +1074,7 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
         fail("manager build failed");
     };
     let endpoints = Endpoints {
+        claims_supported: None,
         issuer: None,
         authorization: String::from("http://127.0.0.1:9/a"),
         token: String::from("http://127.0.0.1:9/t"),
@@ -1322,6 +1323,7 @@ fn rfc_8414_metadata_goes_between_the_host_and_the_issuers_path() {
 #[test]
 fn a_redirects_issuer_must_match_and_is_required_when_promised() {
     let mut endpoints = Endpoints {
+        claims_supported: None,
         issuer: Some(String::from("https://i")),
         authorization: String::new(),
         token: String::new(),

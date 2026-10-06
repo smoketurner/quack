@@ -29,6 +29,7 @@ duckdb        = { workspace = true, features = ["bundled", "json"] }
 ego-tree      = { workspace = true }
 futures       = { workspace = true, features = ["std"] }
 http          = { workspace = true, features = ["std"] }
+ipnet         = { workspace = true }
 http-body     = { workspace = true }
 hyper-util    = { workspace = true, features = ["client-proxy"] }
 jiff          = { workspace = true, features = ["std", "serde", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }

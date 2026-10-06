@@ -21,7 +21,7 @@
 <section class="mt-8">
   <h2 class="text-sm font-semibold uppercase text-slate-400">Members</h2>
   <table class="data-table mt-2 w-full text-sm" aria-label="Members"><tbody>
-    {% for m in members %}<tr class="border-b border-slate-800"><td class="wrap-anywhere">{{ m.username }}</td><td>{{ m.role }}</td><td class="text-right"><form method="post" action="/w/{{ ws.membership.workspace.id }}/members/{{ m.user_id }}/remove"><button class="text-red-400 hover:underline">Remove</button></form></td></tr>{% endfor %}
+    {% for m in members %}<tr class="border-b border-slate-800"><td class="wrap-anywhere">{{ m.username }}</td><td>{{ m.role }}{% if m.granted_by == GrantedBy::Idp %} <span class="text-xs text-slate-500" title="granted by the identity provider's groups at sign-in">via group</span>{% endif %}</td><td class="text-right"><form method="post" action="/w/{{ ws.membership.workspace.id }}/members/{{ m.user_id }}/remove"><button class="text-red-400 hover:underline">Remove</button></form></td></tr>{% endfor %}
   </tbody></table>
   <form method="post" action="/w/{{ ws.membership.workspace.id }}/members" class="mt-3 flex flex-wrap items-end gap-2 text-sm">
     <input aria-label="Username" name="username" required placeholder="username" class="rounded border border-slate-700 px-3 py-2">
@@ -29,6 +29,20 @@
     <button type="submit" class="rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500">Add member</button>
   </form>
 </section>
+{% if let Some(groups) = groups %}
+<section class="mt-8">
+  <h2 class="text-sm font-semibold uppercase text-slate-400">Groups</h2>
+  <p class="mt-1 text-sm text-slate-400">People in these identity-provider groups get the role at sign-in, and lose it when they leave the group. A role given by hand above is never changed by a group.</p>
+  <table class="data-table mt-2 w-full text-sm" aria-label="Groups"><tbody>
+    {% for g in groups %}<tr class="border-b border-slate-800"><td class="wrap-anywhere">{{ g.group_name }}</td><td>{{ g.role }}</td><td class="text-right"><form method="post" action="/w/{{ ws.membership.workspace.id }}/groups/remove"><input type="hidden" name="group" value="{{ g.group_name }}"><button class="text-red-400 hover:underline">Remove</button></form></td></tr>{% endfor %}
+  </tbody></table>
+  <form method="post" action="/w/{{ ws.membership.workspace.id }}/groups" class="mt-3 flex flex-wrap items-end gap-2 text-sm">
+    <input aria-label="Group" name="group" required placeholder="group name" class="rounded border border-slate-700 px-3 py-2">
+    <select aria-label="Role" name="role" class="rounded border border-slate-700 px-2 py-2"><option>viewer</option><option selected>member</option><option>owner</option></select>
+    <button type="submit" class="rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500">Add group</button>
+  </form>
+</section>
+{% endif %}
 <section class="mt-8">
   <h2 class="text-sm font-semibold uppercase text-slate-400">API tokens</h2>
   <table class="data-table mt-2 w-full text-sm" aria-label="API tokens"><tbody>

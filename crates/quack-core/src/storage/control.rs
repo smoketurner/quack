@@ -12,17 +12,17 @@ use sea_query::{Cond, DynIden, Expr, ExprTrait, IntoIden, OnConflict, Order, Que
 use serde::{Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{FromRow, Row, SqlitePool};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
 
 use jiff::{SignedDuration, Timestamp};
 
 use super::queries::{
-    ApiTokens, AuditLog, Bound, ClientKeys, ClientRegistrations, Members, ProviderTokens,
-    SealedColumns, UserTokens, Users, Workspaces,
+    ApiTokens, AuditLog, Bound, ClientKeys, ClientRegistrations, GroupRoles, Members,
+    ProviderTokens, SealedColumns, UserTokens, Users, Workspaces,
 };
-use crate::config::{Config, ProviderName};
+use crate::config::{Config, Lockout, ProviderName};
 use crate::crypto::sha256_hex;
 use crate::error::{Error, Result};
 use crate::ids::{AuditId, UserId, WorkspaceId};
@@ -315,6 +315,18 @@ pub struct UserRow {
     #[serde(rename = "is_admin")]
     pub kind: UserKind,
     pub created_at: String,
+    /// When an admin disabled the account; a disabled user cannot log in,
+    /// and every credential they hold is refused.
+    pub disabled_at: Option<String>,
+    /// While a lockout for wrong passwords lasts.
+    pub locked_until: Option<String>,
+}
+
+impl UserRow {
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.disabled_at.is_some()
+    }
 }
 
 impl FromRow<'_, SqliteRow> for UserRow {
@@ -324,8 +336,25 @@ impl FromRow<'_, SqliteRow> for UserRow {
             username: row.try_get("username")?,
             kind: UserKind::from(row.try_get::<bool, _>("is_admin")?),
             created_at: row.try_get("created_at")?,
+            disabled_at: row.try_get("disabled_at")?,
+            locked_until: row.try_get("locked_until")?,
         })
     }
+}
+
+/// What checking a password found.
+#[derive(Debug)]
+pub enum PasswordCheck {
+    Verified(UserRow),
+    /// No such user, or a wrong password: the user when there is one, so
+    /// the denied row can name the account aimed at.
+    Wrong(Option<UserId>),
+    Disabled(UserId),
+    /// Too many wrong passwords in a row: refused until `until`.
+    Locked {
+        user_id: UserId,
+        until: String,
+    },
 }
 
 /// What a member may do in a workspace (design doc 12).
@@ -356,6 +385,7 @@ pub struct MemberRow {
     pub username: String,
     pub role: Role,
     pub created_at: String,
+    pub granted_by: GrantedBy,
 }
 
 impl FromRow<'_, SqliteRow> for MemberRow {
@@ -366,8 +396,52 @@ impl FromRow<'_, SqliteRow> for MemberRow {
             username: row.try_get("username")?,
             role: parsed(row, "role")?,
             created_at: row.try_get("created_at")?,
+            granted_by: parsed(row, "granted_by")?,
         })
     }
+}
+
+/// Who gave a member their role: a person, or the identity provider's
+/// group claim at sign-in. Only the latter is revoked when the groups
+/// change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GrantedBy {
+    User,
+    Idp,
+}
+
+text_enum!(GrantedBy, "membership grant", {
+    User => "user",
+    Idp => "idp",
+});
+
+/// A role an identity provider's group carries in a workspace.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GroupRoleRow {
+    pub workspace_id: WorkspaceId,
+    pub group_name: String,
+    pub role: Role,
+    pub created_at: String,
+}
+
+impl FromRow<'_, SqliteRow> for GroupRoleRow {
+    fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
+        Ok(Self {
+            workspace_id: row.try_get("workspace_id")?,
+            group_name: row.try_get("group_name")?,
+            role: parsed(row, "role")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+/// What reconciling a person's groups changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Reconciled {
+    pub granted: usize,
+    pub changed: usize,
+    pub revoked: usize,
 }
 
 /// What an API token may do (design doc 12).
@@ -561,6 +635,8 @@ impl AuditEntry {
 pub enum AuditAction {
     Login,
     Logout,
+    /// A person changed their own password.
+    Password,
     /// A session that expired or no longer exists was presented.
     Session,
     /// Server administration: users.
@@ -613,6 +689,7 @@ pub enum AuditAction {
 history_enum!(AuditAction, Unknown, {
     Login => "login",
     Logout => "logout",
+    Password => "password",
     Session => "session",
     Admin => "admin",
     Workspace => "workspace",
@@ -679,6 +756,8 @@ pub enum ResourceKind {
     Resource,
     Audit,
     SavedQuestion,
+    /// An identity provider's group, named in a workspace's group roles.
+    Group,
     /// A stored name this build does not define, as a newer build wrote
     /// it. Read only: the one write path refuses it.
     Unknown(String),
@@ -705,6 +784,7 @@ history_enum!(ResourceKind, Unknown, {
     Resource => "resource",
     Audit => "audit",
     SavedQuestion => "saved_question",
+    Group => "group",
 });
 
 impl ResourceKind {
@@ -1257,7 +1337,12 @@ impl ControlPlane {
         let (ws, insert) = Self::new_workspace(name)?;
         let mut change = vec![insert];
         if let Some(owner) = owner {
-            change.push(Self::member_insert(&ws.id, owner, Role::Owner)?);
+            change.push(Self::member_insert(
+                &ws.id,
+                owner,
+                Role::Owner,
+                GrantedBy::User,
+            )?);
         }
         let audit = audit
             .in_workspace(&ws.id)
@@ -1459,9 +1544,141 @@ impl ControlPlane {
 
     fn user_select() -> sea_query::SelectStatement {
         Query::select()
-            .columns([Users::Id, Users::Username, Users::IsAdmin, Users::CreatedAt])
+            .columns([
+                Users::Id,
+                Users::Username,
+                Users::IsAdmin,
+                Users::CreatedAt,
+                Users::DisabledAt,
+                Users::LockedUntil,
+            ])
             .from(Users::Table)
             .to_owned()
+    }
+
+    /// One change to a user's row, bound before any await so the future
+    /// stays `Send` (the builder is not).
+    fn user_change(id: &UserId, change: &mut sea_query::UpdateStatement) -> Result<Bound> {
+        Ok(Bound::new(
+            change
+                .table(Users::Table)
+                .and_where(Expr::col(Users::Id).eq(id)),
+        )?)
+    }
+
+    /// One change to a user's row, audited in the same transaction.
+    async fn update_user(&self, id: &UserId, change: Bound, audit: AuditEntry) -> Result<()> {
+        let audit = audit.on(ResourceKind::User.id(id.as_str()));
+        if !self.commit_audited(vec![change], audit).await? {
+            return Err(ResourceKind::User.missing(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Refuse the user's logins and credentials from now on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the user is missing or the write fails.
+    pub async fn disable_user(&self, id: &UserId, audit: AuditEntry) -> Result<()> {
+        let change = Self::user_change(
+            id,
+            Query::update().value(Users::DisabledAt, Expr::cust("CURRENT_TIMESTAMP")),
+        )?;
+        self.update_user(id, change, audit).await?;
+        tracing::info!(user_id = %id, "disabled user");
+        Ok(())
+    }
+
+    /// Let a disabled user log in again, and clear any lockout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the user is missing or the write fails.
+    pub async fn enable_user(&self, id: &UserId, audit: AuditEntry) -> Result<()> {
+        let change = Self::user_change(
+            id,
+            Query::update()
+                .value(Users::DisabledAt, Option::<String>::None)
+                .value(Users::LockedUntil, Option::<String>::None)
+                .value(Users::FailedLogins, 0_i64),
+        )?;
+        self.update_user(id, change, audit).await?;
+        tracing::info!(user_id = %id, "enabled user");
+        Ok(())
+    }
+
+    /// Give or take the server-wide admin flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the user is missing or the write fails.
+    pub async fn set_admin(&self, id: &UserId, kind: UserKind, audit: AuditEntry) -> Result<()> {
+        let change = Self::user_change(
+            id,
+            Query::update().value(Users::IsAdmin, i64::from(bool::from(kind))),
+        )?;
+        self.update_user(id, change, audit).await
+    }
+
+    /// Replace the user's password; the caller ends their sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty password, a missing user, or a failed
+    /// write.
+    pub async fn set_password(&self, id: &UserId, password: &str, audit: AuditEntry) -> Result<()> {
+        if password.is_empty() {
+            return Err(Error::Config(String::from("password must not be empty")));
+        }
+        let password = password.to_owned();
+        let hash = tokio::task::spawn_blocking(move || StoredPasswordHash::new(&password))
+            .await
+            .map_err(|e| Error::Config(format!("password hashing task failed: {e}")))??;
+        let change = Self::user_change(
+            id,
+            Query::update()
+                .value(Users::PasswordHash, hash.0.as_str())
+                .value(Users::PasswordChangedAt, Expr::cust("CURRENT_TIMESTAMP"))
+                .value(Users::FailedLogins, 0_i64)
+                .value(Users::LockedUntil, Option::<String>::None),
+        )?;
+        self.update_user(id, change, audit).await
+    }
+
+    /// Delete a user: their memberships and stored sign-in go with the row,
+    /// and their API tokens are deleted here, since that table carries no
+    /// foreign key to users. The audit log keeps every row that names them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the user is missing or the write fails.
+    pub async fn delete_user(&self, id: &UserId, audit: AuditEntry) -> Result<()> {
+        let tokens = Bound::new(
+            Query::delete()
+                .from_table(ApiTokens::Table)
+                .and_where(Expr::col(ApiTokens::UserId).eq(id)),
+        )?;
+        let user = Bound::new(
+            Query::delete()
+                .from_table(Users::Table)
+                .and_where(Expr::col(Users::Id).eq(id)),
+        )?;
+        let audit = audit.on(ResourceKind::User.id(id.as_str()));
+        // The token delete may touch no row; only the user's row decides.
+        let mut tx = self.pool.begin().await?;
+        tokens.query().execute(&mut *tx).await?;
+        let deleted = user.query().execute(&mut *tx).await?.rows_affected() > 0;
+        if !deleted {
+            return Err(ResourceKind::User.missing(id.to_string()));
+        }
+        Self::audit_insert(&audit)?
+            .query()
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!(user_id = %id, "deleted user");
+        Ok(())
     }
 
     /// Create a user with an argon2id password hash, and record `audit` in
@@ -1998,26 +2215,114 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn verify_password(&self, username: &str, password: &str) -> Result<Option<UserRow>> {
+        match self
+            .check_password(username, password, Lockout::default())
+            .await?
+        {
+            PasswordCheck::Verified(user) => Ok(Some(user)),
+            PasswordCheck::Wrong(_) | PasswordCheck::Disabled(_) | PasswordCheck::Locked { .. } => {
+                Ok(None)
+            }
+        }
+    }
+
+    /// Check a password under `lockout`, and record the outcome on the
+    /// user's row: a wrong one counts toward the lock, a right one clears
+    /// the count. A disabled or locked account is refused before the hash
+    /// is checked; the dummy hash is still verified when there is no such
+    /// user, so timing says nothing about who exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a query fails.
+    pub async fn check_password(
+        &self,
+        username: &str,
+        password: &str,
+        lockout: Lockout,
+    ) -> Result<PasswordCheck> {
         let bound = Bound::new(
             Query::select()
-                .columns([Users::Id, Users::PasswordHash])
+                .columns([
+                    Users::Id,
+                    Users::PasswordHash,
+                    Users::DisabledAt,
+                    Users::LockedUntil,
+                    Users::FailedLogins,
+                ])
                 .from(Users::Table)
                 .and_where(Expr::col(Users::Username).eq(username.trim())),
         )?;
         let row = bound.query().fetch_optional(&self.pool).await?;
-        let (id, hash): (Option<UserId>, Option<String>) = match row {
-            Some(r) => (Some(r.try_get("id")?), r.try_get("password_hash")?),
-            None => (None, None),
-        };
+        let mut found = None;
+        let mut hash = None;
+        if let Some(r) = row {
+            let id: UserId = r.try_get("id")?;
+            let disabled: Option<String> = r.try_get("disabled_at")?;
+            let locked: Option<String> = r.try_get("locked_until")?;
+            let failed: i64 = r.try_get("failed_logins")?;
+            hash = r.try_get("password_hash")?;
+            if disabled.is_some() {
+                return Ok(PasswordCheck::Disabled(id));
+            }
+            if let Some(until) = locked.filter(|until| Self::still_locked(until)) {
+                return Ok(PasswordCheck::Locked { user_id: id, until });
+            }
+            found = Some((id, u32::try_from(failed).unwrap_or(u32::MAX)));
+        }
         let password = password.to_owned();
         let hash = StoredPasswordHash::stored_or_dummy(hash);
         let ok = tokio::task::spawn_blocking(move || hash.verifies(&password))
             .await
             .map_err(|e| Error::Config(format!("password verification task failed: {e}")))?;
-        match (ok, id) {
-            (true, Some(id)) => self.get_user(&id).await,
-            _ => Ok(None),
+        let Some((id, failed)) = found else {
+            return Ok(PasswordCheck::Wrong(None));
+        };
+        if ok {
+            if failed > 0 {
+                self.set_failed_logins(&id, 0, None).await?;
+            }
+            return match self.get_user(&id).await? {
+                Some(user) => Ok(PasswordCheck::Verified(user)),
+                None => Ok(PasswordCheck::Wrong(None)),
+            };
         }
+        let failed = failed.saturating_add(1);
+        let until = lockout.locks_after(failed).then(|| {
+            Timestamp::now()
+                .checked_add(SignedDuration::from_mins(i64::from(lockout.minutes)))
+                .unwrap_or(Timestamp::MAX)
+                .to_string()
+        });
+        self.set_failed_logins(&id, failed, until.as_deref())
+            .await?;
+        match until {
+            Some(until) => {
+                tracing::warn!(user_id = %id, until, "account locked after repeated wrong passwords");
+                Ok(PasswordCheck::Locked { user_id: id, until })
+            }
+            None => Ok(PasswordCheck::Wrong(Some(id))),
+        }
+    }
+
+    /// Whether a stored `locked_until` is still in the future.
+    fn still_locked(until: &str) -> bool {
+        until
+            .parse::<Timestamp>()
+            .is_ok_and(|until| until > Timestamp::now())
+    }
+
+    /// The login counter and lock, not audited: the login itself is.
+    async fn set_failed_logins(&self, id: &UserId, failed: u32, until: Option<&str>) -> Result<()> {
+        let bound = Bound::new(
+            Query::update()
+                .table(Users::Table)
+                .value(Users::FailedLogins, i64::from(failed))
+                .value(Users::LockedUntil, until)
+                .and_where(Expr::col(Users::Id).eq(id)),
+        )?;
+        bound.query().execute(&self.pool).await?;
+        Ok(())
     }
 
     // --- members ------------------------------------------------------------
@@ -2042,11 +2347,12 @@ impl ControlPlane {
                 Query::update()
                     .table(Members::Table)
                     .value(Members::Role, role.as_str())
+                    .value(Members::GrantedBy, GrantedBy::User.as_str())
                     .and_where(Expr::col(Members::WorkspaceId).eq(workspace_id))
                     .and_where(Expr::col(Members::UserId).eq(user_id)),
             )?
         } else {
-            Self::member_insert(workspace_id, user_id, role)?
+            Self::member_insert(workspace_id, user_id, role, GrantedBy::User)?
         };
         let audit = audit
             .in_workspace(workspace_id)
@@ -2064,12 +2370,27 @@ impl ControlPlane {
         Ok(())
     }
 
-    fn member_insert(workspace_id: &WorkspaceId, user_id: &UserId, role: Role) -> Result<Bound> {
+    fn member_insert(
+        workspace_id: &WorkspaceId,
+        user_id: &UserId,
+        role: Role,
+        granted_by: GrantedBy,
+    ) -> Result<Bound> {
         Ok(Bound::new(
             Query::insert()
                 .into_table(Members::Table)
-                .columns([Members::WorkspaceId, Members::UserId, Members::Role])
-                .values([workspace_id.into(), user_id.into(), role.as_str().into()])?,
+                .columns([
+                    Members::WorkspaceId,
+                    Members::UserId,
+                    Members::Role,
+                    Members::GrantedBy,
+                ])
+                .values([
+                    workspace_id.into(),
+                    user_id.into(),
+                    role.as_str().into(),
+                    granted_by.as_str().into(),
+                ])?,
         )?)
     }
 
@@ -2131,6 +2452,7 @@ impl ControlPlane {
                     (Members::Table, Members::UserId),
                     (Members::Table, Members::Role),
                     (Members::Table, Members::CreatedAt),
+                    (Members::Table, Members::GrantedBy),
                 ])
                 .column((Users::Table, Users::Username))
                 .from(Members::Table)
@@ -2142,6 +2464,233 @@ impl ControlPlane {
                 .order_by((Users::Table, Users::Username), Order::Asc),
         )?;
         Ok(bound.query_as().fetch_all(&self.pool).await?)
+    }
+
+    // --- group roles --------------------------------------------------------
+
+    /// Give an identity provider's group a role in the workspace, or change
+    /// it, audited in the same transaction. Members already signed in get
+    /// it at their next sign-in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty group name, a missing workspace, or a
+    /// failed write.
+    pub async fn set_group_role(
+        &self,
+        workspace_id: &WorkspaceId,
+        group: &str,
+        role: Role,
+        audit: AuditEntry,
+    ) -> Result<GroupRoleRow> {
+        let group = group.trim();
+        if group.is_empty() {
+            return Err(Error::Config(String::from("group name must not be empty")));
+        }
+        let bound = Bound::new(
+            Query::insert()
+                .into_table(GroupRoles::Table)
+                .columns([
+                    GroupRoles::WorkspaceId,
+                    GroupRoles::GroupName,
+                    GroupRoles::Role,
+                ])
+                .values([workspace_id.into(), group.into(), role.as_str().into()])?
+                .on_conflict(
+                    OnConflict::columns([GroupRoles::WorkspaceId, GroupRoles::GroupName])
+                        .update_column(GroupRoles::Role)
+                        .to_owned(),
+                ),
+        )?;
+        let audit = audit
+            .in_workspace(workspace_id)
+            .on(ResourceKind::Group.id(group));
+        self.commit_audited(vec![bound], audit)
+            .await
+            .map_err(|e| match &e {
+                Error::Sqlite(sqlx::Error::Database(db)) if db.is_foreign_key_violation() => {
+                    ResourceKind::Workspace.missing(workspace_id.to_string())
+                }
+                _ => e,
+            })?;
+        let bound = Bound::new(
+            Self::group_role_select()
+                .and_where(Expr::col(GroupRoles::WorkspaceId).eq(workspace_id))
+                .and_where(Expr::col(GroupRoles::GroupName).eq(group)),
+        )?;
+        bound
+            .query_as()
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| ResourceKind::Group.missing(group))
+    }
+
+    /// Take a group's role away; whether it had one. Memberships it granted
+    /// go at each member's next sign-in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn remove_group_role(
+        &self,
+        workspace_id: &WorkspaceId,
+        group: &str,
+        audit: AuditEntry,
+    ) -> Result<bool> {
+        let group = group.trim();
+        let bound = Bound::new(
+            Query::delete()
+                .from_table(GroupRoles::Table)
+                .and_where(Expr::col(GroupRoles::WorkspaceId).eq(workspace_id))
+                .and_where(Expr::col(GroupRoles::GroupName).eq(group)),
+        )?;
+        let audit = audit
+            .in_workspace(workspace_id)
+            .on(ResourceKind::Group.id(group));
+        self.commit_audited(vec![bound], audit).await
+    }
+
+    fn group_role_select() -> sea_query::SelectStatement {
+        Query::select()
+            .columns([
+                GroupRoles::WorkspaceId,
+                GroupRoles::GroupName,
+                GroupRoles::Role,
+                GroupRoles::CreatedAt,
+            ])
+            .from(GroupRoles::Table)
+            .to_owned()
+    }
+
+    /// The groups with a role in the workspace, by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn list_group_roles(&self, workspace_id: &WorkspaceId) -> Result<Vec<GroupRoleRow>> {
+        let bound = Bound::new(
+            Self::group_role_select()
+                .and_where(Expr::col(GroupRoles::WorkspaceId).eq(workspace_id))
+                .order_by(GroupRoles::GroupName, Order::Asc),
+        )?;
+        Ok(bound.query_as().fetch_all(&self.pool).await?)
+    }
+
+    /// Make the user's provider-granted memberships match `groups`: in
+    /// each workspace, the highest role among the groups with one, else
+    /// none. Only rows granted by the provider are added, re-roled, or
+    /// deleted; a row a person granted is never touched. Every change
+    /// commits with its own `member` audit row in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a query or the commit fails.
+    pub async fn reconcile_idp_memberships(
+        &self,
+        user_id: &UserId,
+        groups: &[String],
+        audit: impl Fn() -> AuditEntry,
+    ) -> Result<Reconciled> {
+        let wanted = self.roles_for_groups(groups).await?;
+        let bound = Bound::new(
+            Query::select()
+                .columns([Members::WorkspaceId, Members::Role, Members::GrantedBy])
+                .from(Members::Table)
+                .and_where(Expr::col(Members::UserId).eq(user_id)),
+        )?;
+        let mut current: BTreeMap<WorkspaceId, (Role, GrantedBy)> = BTreeMap::new();
+        for row in bound.query().fetch_all(&self.pool).await? {
+            current.insert(
+                row.try_get("workspace_id")?,
+                (parsed(&row, "role")?, parsed(&row, "granted_by")?),
+            );
+        }
+        let mut changes: Vec<(Bound, AuditEntry)> = Vec::new();
+        let mut outcome = Reconciled::default();
+        let entry = |workspace: &WorkspaceId| {
+            audit()
+                .in_workspace(workspace)
+                .on(ResourceKind::User.id(user_id.as_str()))
+        };
+        for (workspace, role) in &wanted {
+            match current.get(workspace) {
+                Some((_, GrantedBy::User)) => {}
+                Some((have, GrantedBy::Idp)) if have == role => {}
+                Some((_, GrantedBy::Idp)) => {
+                    changes.push((
+                        Bound::new(
+                            Query::update()
+                                .table(Members::Table)
+                                .value(Members::Role, role.as_str())
+                                .and_where(Expr::col(Members::WorkspaceId).eq(workspace))
+                                .and_where(Expr::col(Members::UserId).eq(user_id)),
+                        )?,
+                        entry(workspace),
+                    ));
+                    outcome.changed = outcome.changed.saturating_add(1);
+                }
+                None => {
+                    changes.push((
+                        Self::member_insert(workspace, user_id, *role, GrantedBy::Idp)?,
+                        entry(workspace),
+                    ));
+                    outcome.granted = outcome.granted.saturating_add(1);
+                }
+            }
+        }
+        for (workspace, (_, granted_by)) in &current {
+            if *granted_by == GrantedBy::Idp && !wanted.contains_key(workspace) {
+                changes.push((
+                    Bound::new(
+                        Query::delete()
+                            .from_table(Members::Table)
+                            .and_where(Expr::col(Members::WorkspaceId).eq(workspace))
+                            .and_where(Expr::col(Members::UserId).eq(user_id)),
+                    )?,
+                    entry(workspace),
+                ));
+                outcome.revoked = outcome.revoked.saturating_add(1);
+            }
+        }
+        if changes.is_empty() {
+            return Ok(outcome);
+        }
+        let mut tx = self.pool.begin().await?;
+        for (change, audit) in changes {
+            change.query().execute(&mut *tx).await?;
+            Self::audit_insert(&audit)?
+                .query()
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        tracing::info!(user_id = %user_id, ?outcome, "reconciled identity-provider memberships");
+        Ok(outcome)
+    }
+
+    /// The highest role `groups` carry in each workspace.
+    async fn roles_for_groups(&self, groups: &[String]) -> Result<BTreeMap<WorkspaceId, Role>> {
+        let mut wanted = BTreeMap::new();
+        if groups.is_empty() {
+            return Ok(wanted);
+        }
+        let bound = Bound::new(
+            Query::select()
+                .columns([GroupRoles::WorkspaceId, GroupRoles::Role])
+                .from(GroupRoles::Table)
+                .and_where(
+                    Expr::col(GroupRoles::GroupName).is_in(groups.iter().map(String::as_str)),
+                ),
+        )?;
+        for row in bound.query().fetch_all(&self.pool).await? {
+            let workspace: WorkspaceId = row.try_get("workspace_id")?;
+            let role: Role = parsed(&row, "role")?;
+            wanted
+                .entry(workspace)
+                .and_modify(|have: &mut Role| *have = (*have).max(role))
+                .or_insert(role);
+        }
+        Ok(wanted)
     }
 
     // --- API tokens ---------------------------------------------------------

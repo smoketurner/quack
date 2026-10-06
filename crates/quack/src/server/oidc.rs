@@ -8,11 +8,12 @@
 //! user has.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use jiff::{SignedDuration, Timestamp};
 use quack_core::config::OidcConfig;
+use quack_core::crypto::sha256_hex;
 use quack_core::error::Result as CoreResult;
 use quack_core::ids::UserId;
 use quack_core::llm::acting::Acting;
@@ -21,7 +22,9 @@ use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::oidc::{
     Pending, RENEW_MARGIN, SignIn, SignedIn, Stored, SubjectTokens, UserTokens,
 };
-use quack_core::storage::control::{ControlPlane, Origin, UserRow};
+use quack_core::storage::control::{
+    AuditAction, AuditEntry, ControlPlane, Origin, Outcome, UserRow,
+};
 use quack_core::vault::Vault;
 use quack_core::web_sessions::{SessionToken, WebSessions};
 
@@ -49,6 +52,9 @@ pub(crate) struct Oidc {
     /// Each signed-in user's own token (the on-behalf-of subject).
     subjects: Arc<SubjectTokens>,
     sessions: Arc<WebSessions>,
+    /// The digest of the last bearer each user's groups were reconciled
+    /// from: a token is reconciled once, not on every request.
+    reconciled: Mutex<HashMap<UserId, String>>,
 }
 
 impl Oidc {
@@ -73,6 +79,7 @@ impl Oidc {
             sign_in,
             pending: Mutex::new(HashMap::new()),
             sessions,
+            reconciled: Mutex::new(HashMap::new()),
         })
     }
 
@@ -201,11 +208,23 @@ impl Oidc {
         &self,
         control: &ControlPlane,
         token: &str,
+        origin: &Origin,
     ) -> CoreResult<UserRow> {
         let bearer = self.sign_in.verify_bearer(token).await?;
         let user = control.oidc_user(&bearer.subject, &bearer.username).await?;
         self.subjects
             .remember_presented(&user.id, token, bearer.expires_at);
+        if let Some(groups) = bearer.groups.listed() {
+            let digest = sha256_hex(token.as_bytes());
+            let seen = self
+                .reconciled
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(user.id.clone(), digest.clone());
+            if seen.as_deref() != Some(digest.as_str()) {
+                reconcile_groups(control, &user, groups, origin).await?;
+            }
+        }
         Ok(user)
     }
 
@@ -224,3 +243,24 @@ impl Oidc {
 
 #[cfg(test)]
 mod tests;
+
+/// Make the user's provider-granted memberships match the groups their
+/// token lists; each change is a `member` row of their own, from `origin`.
+pub(crate) async fn reconcile_groups(
+    control: &ControlPlane,
+    user: &UserRow,
+    groups: &[String],
+    origin: &Origin,
+) -> CoreResult<()> {
+    let outcome = control
+        .reconcile_idp_memberships(&user.id, groups, || {
+            let mut entry = AuditEntry::new(AuditAction::Member, Outcome::Allowed, origin.clone());
+            entry.user_id = Some(user.id.clone());
+            entry
+        })
+        .await?;
+    if outcome.granted > 0 || outcome.changed > 0 || outcome.revoked > 0 {
+        tracing::info!(user = %user.username, ?outcome, "memberships follow the identity provider's groups");
+    }
+    Ok(())
+}

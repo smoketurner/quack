@@ -61,10 +61,15 @@ impl StreamEvent {
     }
 }
 
-pub(crate) fn router() -> Router<App> {
+pub(crate) fn router(app: &App) -> Router<App> {
     Router::new()
-        .route("/auth/login", super::throttled_login(post(auth::login)))
+        .route(
+            "/auth/login",
+            super::throttled_login(app, post(auth::login)),
+        )
         .route("/auth/logout", post(auth::logout))
+        .route("/auth/logout-all", post(auth::logout_all))
+        .route("/auth/password", post(auth::change_password))
         .route("/auth/me", get(auth::me))
         .route(
             "/workspaces",
@@ -144,7 +149,19 @@ pub(crate) fn router() -> Router<App> {
             get(members::list).post(members::add),
         )
         .route("/workspaces/{id}/members/{user}", delete(members::remove))
+        .route(
+            "/workspaces/{id}/groups",
+            get(members::groups).post(members::set_group),
+        )
+        .route(
+            "/workspaces/{id}/groups/{group}",
+            delete(members::remove_group),
+        )
         .route("/admin/users", get(admin::users).post(admin::create_user))
+        .route(
+            "/admin/users/{user}",
+            axum::routing::patch(admin::update_user).delete(admin::delete_user),
+        )
         .route("/admin/audit", get(admin::audit))
 }
 

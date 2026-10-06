@@ -70,6 +70,10 @@ pub enum Users {
     OidcSubject,
     IsAdmin,
     CreatedAt,
+    DisabledAt,
+    PasswordChangedAt,
+    FailedLogins,
+    LockedUntil,
 }
 
 /// The columns every sealed-token table shares.
@@ -132,6 +136,17 @@ pub enum Members {
     Table,
     WorkspaceId,
     UserId,
+    Role,
+    CreatedAt,
+    GrantedBy,
+}
+
+/// Roles an identity provider's groups carry in a workspace.
+#[derive(Iden)]
+pub enum GroupRoles {
+    Table,
+    WorkspaceId,
+    GroupName,
     Role,
     CreatedAt,
 }

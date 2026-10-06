@@ -4,7 +4,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::ids::{UserId, WorkspaceId};
-use quack_core::storage::control::{AuditAction, Outcome, Role};
+use quack_core::storage::control::{AuditAction, GroupRoleRow, Outcome, ResourceKind, Role};
 use serde::{Deserialize, Serialize};
 
 use crate::server::auth::{Access, Identity, Need};
@@ -105,6 +105,95 @@ impl Access {
             Ok(())
         } else {
             Err(ApiError::not_found("not a member"))
+        }
+    }
+}
+
+/// `GET .../groups`: the identity provider's groups with a role here.
+pub(crate) async fn groups(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
+    access.audit_read(&app, AuditAction::List, "groups").await?;
+    let groups = app.control.list_group_roles(&id).await?;
+    Ok(Json(serde_json::json!({ "groups": groups })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct GroupRole {
+    pub group: String,
+    #[serde(default = "default_role")]
+    pub role: Role,
+}
+
+pub(crate) async fn set_group(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+    Json(body): Json<GroupRole>,
+) -> ApiResult<Json<GroupRoleRow>> {
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
+    Ok(Json(access.set_group_role(&app, &body).await?))
+}
+
+pub(crate) async fn remove_group(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, group)): Path<(WorkspaceId, String)>,
+) -> ApiResult<StatusCode> {
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
+    access.remove_group_role(&app, &group).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+impl Access {
+    /// Give a group a role here, or change it; members already signed in
+    /// get it at their next sign-in.
+    pub(crate) async fn set_group_role(
+        &self,
+        app: &App,
+        body: &GroupRole,
+    ) -> ApiResult<GroupRoleRow> {
+        let entry = self.entry(AuditAction::Member, Outcome::Allowed);
+        let row = app
+            .control
+            .set_group_role(
+                &self.membership.workspace.id,
+                &body.group,
+                body.role,
+                entry.clone(),
+            )
+            .await?;
+        self.record_detail(
+            app,
+            &entry,
+            Some(serde_json::json!({ "group": row.group_name, "role": row.role })),
+        )
+        .await?;
+        Ok(row)
+    }
+
+    /// Take a group's role away; one that had none is an error, after the
+    /// attempt is audited as such.
+    pub(crate) async fn remove_group_role(&self, app: &App, group: &str) -> ApiResult<()> {
+        let entry = self
+            .entry(AuditAction::Member, Outcome::Allowed)
+            .on(ResourceKind::Group.id(group));
+        let removed = app
+            .control
+            .remove_group_role(&self.membership.workspace.id, group, entry.clone())
+            .await?;
+        let detail = serde_json::json!({
+            "group": group,
+            "reason": (!removed).then_some("no role"),
+        });
+        self.record_detail(app, &entry, Some(detail)).await?;
+        if removed {
+            Ok(())
+        } else {
+            Err(ApiError::not_found("that group has no role here"))
         }
     }
 }

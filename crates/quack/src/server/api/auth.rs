@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum_extra::extract::CookieJar;
-use quack_core::storage::control::{AuditAction, Outcome};
+use quack_core::storage::control::{AuditAction, Outcome, PasswordCheck};
 use serde::Deserialize;
 
 use crate::server::auth::{
@@ -72,6 +72,79 @@ impl Identity {
         }
         Ok(jar.remove(SessionCookie::clear()))
     }
+}
+
+/// `POST /auth/logout-all`: every session of this user ends, this one
+/// included, and their stored sign-in token goes.
+pub(crate) async fn logout_all(
+    State(app): State<App>,
+    identity: Identity,
+    jar: CookieJar,
+) -> ApiResult<impl IntoResponse> {
+    if app.mode == ServeMode::Local {
+        return Err(ApiError::bad_request("local mode has no login"));
+    }
+    let entry = identity.audit(AuditAction::Logout, Outcome::Allowed);
+    app.control.record_audit(&entry).await?;
+    app.sessions.close_user(&identity.user_id);
+    if let Some(oidc) = &app.oidc {
+        oidc.forget_unless_signed_in(&identity.user_id).await?;
+    }
+    Ok((jar.remove(SessionCookie::clear()), StatusCode::NO_CONTENT))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ChangePassword {
+    pub current: String,
+    pub new: String,
+}
+
+/// `POST /auth/password`: a person's own password, proven by the current
+/// one (under the login lockout, as a login is); every other session of
+/// theirs ends.
+pub(crate) async fn change_password(
+    State(app): State<App>,
+    identity: Identity,
+    Json(body): Json<ChangePassword>,
+) -> ApiResult<StatusCode> {
+    if app.mode == ServeMode::Local {
+        return Err(ApiError::bad_request("local mode has no passwords"));
+    }
+    let checked = app
+        .control
+        .check_password(
+            &identity.username,
+            &body.current,
+            app.config.server.lockout(),
+        )
+        .await?;
+    let outcome = match &checked {
+        PasswordCheck::Verified(_) => Outcome::Allowed,
+        PasswordCheck::Wrong(_) | PasswordCheck::Disabled(_) | PasswordCheck::Locked { .. } => {
+            Outcome::Denied
+        }
+    };
+    let entry = identity.audit(AuditAction::Password, outcome);
+    match checked {
+        PasswordCheck::Verified(_) => {
+            app.control
+                .set_password(&identity.user_id, &body.new, entry)
+                .await?;
+        }
+        PasswordCheck::Wrong(_) | PasswordCheck::Disabled(_) | PasswordCheck::Locked { .. } => {
+            app.control.record_audit(&entry).await?;
+            return Err(ApiError::forbidden("the current password is wrong"));
+        }
+    }
+    match &identity.credential {
+        Credential::Session(token) => app
+            .sessions
+            .close_user_except(&identity.user_id, token.as_str()),
+        Credential::Local | Credential::Token(_) | Credential::IdentityProvider => {
+            app.sessions.close_user(&identity.user_id);
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(crate) async fn me(identity: Identity) -> Json<serde_json::Value> {

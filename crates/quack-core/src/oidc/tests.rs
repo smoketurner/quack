@@ -104,6 +104,7 @@ impl MockIssuer {
 
     fn sign_in(&self) -> SignIn {
         let config = OidcConfig {
+            groups_claim: None,
             issuer_url: self.url.clone(),
             client_id: Some(String::from("quack")),
             client_secret_env: None,
