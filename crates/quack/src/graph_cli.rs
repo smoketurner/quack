@@ -211,451 +211,465 @@ impl RenderOnWriter for Writer {
     }
 }
 
-/// Run one graph action, writing what the user should see to `out`
-/// (stdout for the CLI, the transcript for the terminal session).
-///
-/// Each database step goes to the workspace writer on its own, never
-/// spanning a model call, so the terminal's other work keeps going during
-/// an extraction; `control` hears about every extracted chunk and can stop it.
-pub(crate) async fn run(
-    config: &Config,
-    db: &Writer,
-    action: GraphAction,
-    confirm: Confirm,
-    out: &mut impl Write,
-    control: RunControl<'_>,
-) -> Result<()> {
-    match action {
-        GraphAction::Search(args) => run_search(config, db, out, args).await?,
-        GraphAction::Path(args) => run_path(config, db, out, args).await?,
-        GraphAction::Extract(args) => {
-            run_extract(config, db, out, &args, confirm.or_yes(args.yes), control).await?;
+impl GraphAction {
+    /// Run one graph action, writing what the user should see to `out`
+    /// (stdout for the CLI, the transcript for the terminal session).
+    ///
+    /// Each database step goes to the workspace writer on its own, never
+    /// spanning a model call, so the terminal's other work keeps going during
+    /// an extraction; `control` hears about every extracted chunk and can stop it.
+    pub(crate) async fn run(
+        self,
+        config: &Config,
+        db: &Writer,
+        confirm: Confirm,
+        out: &mut impl Write,
+        control: RunControl<'_>,
+    ) -> Result<()> {
+        match self {
+            Self::Search(args) => args.run(config, db, out).await?,
+            Self::Path(args) => args.run(config, db, out).await?,
+            Self::Extract(args) => {
+                args.run(config, db, out, confirm.or_yes(args.yes), control)
+                    .await?;
+            }
+            Self::Status { format } => {
+                db.render(out, move |db, out| {
+                    format.write(out, &graph_store::status(db)?)
+                })
+                .await?;
+            }
+            Self::Revalidate { yes } => Self::revalidate(db, out, yes, confirm).await?,
+            Self::Review => {
+                db.render(out, |db, out| {
+                    graph_store::mark_reviewed(db)?;
+                    writeln!(out, "The graph is no longer provisional.")?;
+                    Ok(())
+                })
+                .await?;
+            }
+            Self::Merges => {
+                db.render(out, |db, out| {
+                    let pending = resolve::pending(db)?;
+                    if pending.is_empty() {
+                        writeln!(out, "No pending merges.")?;
+                    }
+                    for m in &pending {
+                        writeln!(
+                            out,
+                            "{}  {:.3}  {} ({}) <- {}",
+                            m.id, m.distance, m.keep.label, m.keep.class_id, m.drop.label
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            }
+            Self::Merge { ids } => {
+                db.render(out, move |db, out| {
+                    for id in &ids {
+                        let m = resolve::decide(db, id, resolve::MergeDecision::Accept, None)?;
+                        writeln!(out, "Merged {} into {}.", m.drop.label, m.keep.label)?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            }
+            Self::Reject { ids } => {
+                db.render(out, move |db, out| {
+                    for id in &ids {
+                        let m = resolve::decide(db, id, resolve::MergeDecision::Reject, None)?;
+                        writeln!(out, "Kept {} and {} apart.", m.keep.label, m.drop.label)?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            }
+            Self::Add(what) => what.run(db, out).await?,
+            Self::Set(args) => args.run(db, out).await?,
+            Self::Delete(what) => what.run(db, out).await?,
         }
-        GraphAction::Status { format } => {
-            db.render(out, move |db, out| {
-                format.write(out, &graph_store::status(db)?)
-            })
-            .await?;
+        out.flush()?;
+        Ok(())
+    }
+
+    /// `quack graph revalidate`: with something to drop, say what and ask.
+    async fn revalidate(
+        db: &Writer,
+        out: &mut impl Write,
+        yes: bool,
+        confirm: Confirm,
+    ) -> Result<()> {
+        let preview = db.run(Revalidation::preview).await?;
+        if !preview.is_empty() {
+            let question = format!(
+                "{preview}If a class or relation was renamed, restore the earlier ontology version and \
+                 use `quack ontology rename`, which moves its nodes and edges. Dropped document \
+                 nodes come back only with `quack graph extract --reset`.\nDrop them?"
+            );
+            if !confirm.ask_to_drop(yes, out, &question)? {
+                writeln!(out, "Nothing dropped; the graph is still stale.")?;
+                return Ok(());
+            }
         }
-        GraphAction::Revalidate { yes } => run_revalidate(db, out, yes, confirm).await?,
-        GraphAction::Review => {
-            db.render(out, |db, out| {
-                graph_store::mark_reviewed(db)?;
-                writeln!(out, "The graph is no longer provisional.")?;
-                Ok(())
-            })
-            .await?;
-        }
-        GraphAction::Merges => {
-            db.render(out, |db, out| {
-                let pending = resolve::pending(db)?;
-                if pending.is_empty() {
-                    writeln!(out, "No pending merges.")?;
-                }
-                for m in &pending {
+        db.render(out, |db, out| {
+            let outcome = graph_store::revalidate(db)?;
+            writeln!(
+                out,
+                "Dropped {} nodes and {} edges; the graph now matches ontology version {}.",
+                outcome.dropped_nodes, outcome.dropped_edges, outcome.version
+            )?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+impl AddWhat {
+    pub(crate) async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
+        match self {
+            Self::Node {
+                label,
+                class,
+                properties,
+                note,
+            } => {
+                let properties = Properties::from(Properties::parse_pairs(&properties)?);
+                let assertion = Assertion { author: None, note };
+                db.render(out, move |db, out| {
+                    let added = graph_store::create_node(
+                        db,
+                        &NewNode {
+                            label,
+                            class_id: ClassId::from(class),
+                            properties,
+                            standing: Standing::Reviewed,
+                        },
+                        &assertion,
+                    )?;
                     writeln!(
                         out,
-                        "{}  {:.3}  {} ({}) <- {}",
-                        m.id, m.distance, m.keep.label, m.keep.class_id, m.drop.label
+                        "{} {} ({}).",
+                        if added.created {
+                            "Added"
+                        } else {
+                            "Already there; asserted"
+                        },
+                        added.subject,
+                        added.subject.id
                     )?;
-                }
-                Ok(())
-            })
-            .await?;
-        }
-        GraphAction::Merge { ids } => {
-            db.render(out, move |db, out| {
-                for id in &ids {
-                    let m = resolve::decide(db, id, resolve::MergeDecision::Accept, None)?;
-                    writeln!(out, "Merged {} into {}.", m.drop.label, m.keep.label)?;
-                }
-                Ok(())
-            })
-            .await?;
-        }
-        GraphAction::Reject { ids } => {
-            db.render(out, move |db, out| {
-                for id in &ids {
-                    let m = resolve::decide(db, id, resolve::MergeDecision::Reject, None)?;
-                    writeln!(out, "Kept {} and {} apart.", m.keep.label, m.drop.label)?;
-                }
-                Ok(())
-            })
-            .await?;
-        }
-        GraphAction::Add(what) => run_add(db, out, what).await?,
-        GraphAction::Set(args) => run_set(db, out, args).await?,
-        GraphAction::Delete(what) => run_delete(db, out, what).await?,
-    }
-    out.flush()?;
-    Ok(())
-}
-
-async fn run_add(db: &Writer, out: &mut impl Write, what: AddWhat) -> Result<()> {
-    match what {
-        AddWhat::Node {
-            label,
-            class,
-            properties,
-            note,
-        } => {
-            let properties = Properties::from(Properties::parse_pairs(&properties)?);
-            let assertion = Assertion { author: None, note };
-            db.render(out, move |db, out| {
-                let added = graph_store::create_node(
-                    db,
-                    &NewNode {
-                        label,
-                        class_id: ClassId::from(class),
-                        properties,
-                        standing: Standing::Reviewed,
-                    },
-                    &assertion,
-                )?;
-                writeln!(
-                    out,
-                    "{} {} ({}).",
-                    if added.created {
-                        "Added"
-                    } else {
-                        "Already there; asserted"
-                    },
-                    added.subject,
-                    added.subject.id
-                )?;
-                Ok(())
-            })
-            .await
-        }
-        AddWhat::Edge {
-            from,
-            relation,
-            to,
-            properties,
-            note,
-        } => {
-            let properties = Properties::from(Properties::parse_pairs(&properties)?);
-            let assertion = Assertion { author: None, note };
-            db.render(out, move |db, out| {
-                let source = graph_store::find_node(db, &from, None)?;
-                let target = graph_store::find_node(db, &to, None)?;
-                let added = graph_store::create_edge(
-                    db,
-                    &NewEdge {
-                        source: source.id,
-                        target: target.id,
-                        relation: RelationId::from(relation),
-                        properties,
-                    },
-                    &assertion,
-                )?;
-                writeln!(
-                    out,
-                    "{} {} -{}-> {} ({}).",
-                    if added.created {
-                        "Added"
-                    } else {
-                        "Already there; asserted"
-                    },
-                    source.label,
-                    added.subject.relation_id,
-                    target.label,
-                    added.subject.id
-                )?;
-                Ok(())
-            })
-            .await
-        }
-    }
-}
-
-async fn run_set(db: &Writer, out: &mut impl Write, args: SetArgs) -> Result<()> {
-    let SetArgs {
-        node,
-        class,
-        label,
-        to_class,
-        properties,
-        unset,
-        note,
-    } = args;
-    let mut patch = Properties::parse_pairs(&properties)?;
-    for key in unset {
-        patch.insert(key, serde_json::Value::Null);
-    }
-    let edit = NodeEdit {
-        label,
-        class: to_class.map(ClassId::from),
-        properties: (!patch.is_empty()).then_some(patch),
-    };
-    if edit.is_empty() {
-        anyhow::bail!("nothing to change: give --label, --to-class, --property, or --unset");
-    }
-    let assertion = Assertion { author: None, note };
-    db.render(out, move |db, out| {
-        let found = graph_store::find_node(db, &node, class.as_deref())?;
-        let updated = graph_store::update_node(db, &found.id, &edit, &assertion)?;
-        writeln!(out, "Updated {updated} ({}).", updated.id)?;
-        Ok(())
-    })
-    .await
-}
-
-async fn run_delete(db: &Writer, out: &mut impl Write, what: DeleteWhat) -> Result<()> {
-    match what {
-        DeleteWhat::Node { node, class } => {
-            db.render(out, move |db, out| {
-                let found = graph_store::find_node(db, &node, class.as_deref())?;
-                let deleted = graph_store::delete_node(db, &found.id)?;
-                writeln!(out, "Deleted {deleted} and its edges.")?;
-                Ok(())
-            })
-            .await
-        }
-        DeleteWhat::Edge { id } => {
-            db.render(out, move |db, out| {
-                let deleted = graph_store::delete_edge(db, &EdgeId::from(id))?;
-                writeln!(
-                    out,
-                    "Deleted edge {} -{}-> {}.",
-                    deleted.source_node_id, deleted.relation_id, deleted.target_node_id
-                )?;
-                Ok(())
-            })
-            .await
-        }
-    }
-}
-
-async fn run_search(
-    config: &Config,
-    db: &Writer,
-    out: &mut impl Write,
-    args: SearchArgs,
-) -> Result<()> {
-    let SearchArgs {
-        entity,
-        class,
-        relation,
-        hops,
-        format,
-    } = args;
-    let options = config.graph;
-    let query = SearchGraphArgs {
-        entity: NonBlank::new(entity.as_deref()),
-        class: NonBlank::new(class.as_deref()),
-        relation: NonBlank::new(relation.as_deref()),
-        hops: Some(hops),
-    }
-    .query()?;
-    let model = Embeddings::from_config(config).await?;
-    let embedding = query.embedding(model.as_ref()).await?;
-    let result = db
-        .run(move |db| {
-            let result = query.run(db, embedding.as_ref(), &options)?;
-            // A walk from an entity always holds that entity, so an empty
-            // one means the name resolved to nothing.
-            match query.entity.as_deref() {
-                Some(entity) if result.nodes.is_empty() => {
-                    Err(UnknownEntity::find(db, entity, embedding.as_ref()).into())
-                }
-                Some(_) | None => Ok(result),
+                    Ok(())
+                })
+                .await
             }
+            Self::Edge {
+                from,
+                relation,
+                to,
+                properties,
+                note,
+            } => {
+                let properties = Properties::from(Properties::parse_pairs(&properties)?);
+                let assertion = Assertion { author: None, note };
+                db.render(out, move |db, out| {
+                    let source = graph_store::find_node(db, &from, None)?;
+                    let target = graph_store::find_node(db, &to, None)?;
+                    let added = graph_store::create_edge(
+                        db,
+                        &NewEdge {
+                            source: source.id,
+                            target: target.id,
+                            relation: RelationId::from(relation),
+                            properties,
+                        },
+                        &assertion,
+                    )?;
+                    writeln!(
+                        out,
+                        "{} {} -{}-> {} ({}).",
+                        if added.created {
+                            "Added"
+                        } else {
+                            "Already there; asserted"
+                        },
+                        source.label,
+                        added.subject.relation_id,
+                        target.label,
+                        added.subject.id
+                    )?;
+                    Ok(())
+                })
+                .await
+            }
+        }
+    }
+}
+
+impl SetArgs {
+    pub(crate) async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
+        let Self {
+            node,
+            class,
+            label,
+            to_class,
+            properties,
+            unset,
+            note,
+        } = self;
+        let mut patch = Properties::parse_pairs(&properties)?;
+        for key in unset {
+            patch.insert(key, serde_json::Value::Null);
+        }
+        let edit = NodeEdit {
+            label,
+            class: to_class.map(ClassId::from),
+            properties: (!patch.is_empty()).then_some(patch),
+        };
+        if edit.is_empty() {
+            anyhow::bail!("nothing to change: give --label, --to-class, --property, or --unset");
+        }
+        let assertion = Assertion { author: None, note };
+        db.render(out, move |db, out| {
+            let found = graph_store::find_node(db, &node, class.as_deref())?;
+            let updated = graph_store::update_node(db, &found.id, &edit, &assertion)?;
+            writeln!(out, "Updated {updated} ({}).", updated.id)?;
+            Ok(())
         })
-        .await?;
-    format.write(out, &result)
+        .await
+    }
 }
 
-async fn run_path(
-    config: &Config,
-    db: &Writer,
-    out: &mut impl Write,
-    args: PathArgs,
-) -> Result<()> {
-    let PathArgs {
-        from,
-        to,
-        max_hops,
-        format,
-    } = args;
-    let options = config.graph;
-    let query = FindPathArgs {
-        from,
-        to,
-        max_hops: Some(max_hops),
+impl DeleteWhat {
+    pub(crate) async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
+        match self {
+            Self::Node { node, class } => {
+                db.render(out, move |db, out| {
+                    let found = graph_store::find_node(db, &node, class.as_deref())?;
+                    let deleted = graph_store::delete_node(db, &found.id)?;
+                    writeln!(out, "Deleted {deleted} and its edges.")?;
+                    Ok(())
+                })
+                .await
+            }
+            Self::Edge { id } => {
+                db.render(out, move |db, out| {
+                    let deleted = graph_store::delete_edge(db, &EdgeId::from(id))?;
+                    writeln!(
+                        out,
+                        "Deleted edge {} -{}-> {}.",
+                        deleted.source_node_id, deleted.relation_id, deleted.target_node_id
+                    )?;
+                    Ok(())
+                })
+                .await
+            }
+        }
     }
-    .query()?;
-    let model = Embeddings::from_config(config).await?;
-    let ends = query.embeddings(model.as_ref()).await?;
-    let max_hops = query.max_hops;
-    let result = db.run(move |db| query.run(db, &ends, &options)).await?;
-    if result.is_empty() && format == TextOrJson::Text {
-        writeln!(out, "No path within {max_hops} hops.")?;
-        return Ok(());
-    }
-    format.write(out, &result)
 }
 
-/// `quack graph revalidate`: with something to drop, say what and ask.
-async fn run_revalidate(
-    db: &Writer,
-    out: &mut impl Write,
-    yes: bool,
-    confirm: Confirm,
-) -> Result<()> {
-    let preview = db.run(Revalidation::preview).await?;
-    if !preview.is_empty() {
-        let question = format!(
-            "{preview}If a class or relation was renamed, restore the earlier ontology version and \
-             use `quack ontology rename`, which moves its nodes and edges. Dropped document \
-             nodes come back only with `quack graph extract --reset`.\nDrop them?"
-        );
-        if !confirm.ask_to_drop(yes, out, &question)? {
-            writeln!(out, "Nothing dropped; the graph is still stale.")?;
+impl SearchArgs {
+    pub(crate) async fn run(
+        self,
+        config: &Config,
+        db: &Writer,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        let Self {
+            entity,
+            class,
+            relation,
+            hops,
+            format,
+        } = self;
+        let options = config.graph;
+        let query = SearchGraphArgs {
+            entity: NonBlank::new(entity.as_deref()),
+            class: NonBlank::new(class.as_deref()),
+            relation: NonBlank::new(relation.as_deref()),
+            hops: Some(hops),
+        }
+        .query()?;
+        let model = Embeddings::from_config(config).await?;
+        let embedding = query.embedding(model.as_ref()).await?;
+        let result = db
+            .run(move |db| {
+                let result = query.run(db, embedding.as_ref(), &options)?;
+                // A walk from an entity always holds that entity, so an empty
+                // one means the name resolved to nothing.
+                match query.entity.as_deref() {
+                    Some(entity) if result.nodes.is_empty() => {
+                        Err(UnknownEntity::find(db, entity, embedding.as_ref()).into())
+                    }
+                    Some(_) | None => Ok(result),
+                }
+            })
+            .await?;
+        format.write(out, &result)
+    }
+}
+
+impl PathArgs {
+    pub(crate) async fn run(
+        self,
+        config: &Config,
+        db: &Writer,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        let Self {
+            from,
+            to,
+            max_hops,
+            format,
+        } = self;
+        let options = config.graph;
+        let query = FindPathArgs {
+            from,
+            to,
+            max_hops: Some(max_hops),
+        }
+        .query()?;
+        let model = Embeddings::from_config(config).await?;
+        let ends = query.embeddings(model.as_ref()).await?;
+        let max_hops = query.max_hops;
+        let result = db.run(move |db| query.run(db, &ends, &options)).await?;
+        if result.is_empty() && format == TextOrJson::Text {
+            writeln!(out, "No path within {max_hops} hops.")?;
             return Ok(());
         }
+        format.write(out, &result)
     }
-    db.render(out, |db, out| {
-        let outcome = graph_store::revalidate(db)?;
-        writeln!(
-            out,
-            "Dropped {} nodes and {} edges; the graph now matches ontology version {}.",
-            outcome.dropped_nodes, outcome.dropped_edges, outcome.version
-        )?;
-        Ok(())
-    })
-    .await
 }
 
-/// Every mapping's rows into the graph, one line per table.
-async fn extract_tables(
-    db: &Writer,
-    out: &mut impl Write,
-    ontology: &Ontology,
-    standing: Standing,
-) -> Result<()> {
-    if ontology.mappings.is_empty() {
-        writeln!(
-            out,
-            "No mapped tables in the ontology; skipping table extraction."
+impl ExtractArgs {
+    pub(crate) async fn run(
+        &self,
+        config: &Config,
+        db: &Writer,
+        out: &mut impl Write,
+        confirm: Confirm,
+        control: RunControl<'_>,
+    ) -> Result<()> {
+        let ontology = db.run(ontology_store::current).await?.context(
+            "no ontology yet: run `quack ontology init` or `quack ontology propose` first",
         )?;
-        return Ok(());
-    }
-    let mapped = ontology.clone();
-    let summaries = db
-        .run(move |db| tables::extract(db, &mapped, standing))
-        .await?;
-    for summary in summaries {
-        match &summary.skipped {
-            Some(reason) => writeln!(out, "Table {}: skipped, {reason}", summary.table)?,
-            None => writeln!(
+        let standing = db.run(ontology_store::current_standing).await?;
+        if self.reset {
+            let keep = if self.all {
+                Keep::Nothing
+            } else {
+                Keep::Asserted
+            };
+            db.run(move |db| graph_store::clear(db, keep)).await?;
+            writeln!(
                 out,
-                "Table {}: {} rows -> {} nodes, {} edges",
-                summary.table, summary.rows, summary.nodes, summary.edges
-            )?,
+                "{}",
+                match keep {
+                    Keep::Asserted => "Cleared the graph, keeping what people asserted.",
+                    Keep::Nothing => "Cleared the graph.",
+                }
+            )?;
         }
-    }
-    Ok(())
-}
-
-async fn run_extract(
-    config: &Config,
-    db: &Writer,
-    out: &mut impl Write,
-    args: &ExtractArgs,
-    confirm: Confirm,
-    control: RunControl<'_>,
-) -> Result<()> {
-    let ontology = db
-        .run(ontology_store::current)
-        .await?
-        .context("no ontology yet: run `quack ontology init` or `quack ontology propose` first")?;
-    let standing = db.run(ontology_store::current_standing).await?;
-    if args.reset {
-        let keep = if args.all {
-            Keep::Nothing
-        } else {
-            Keep::Asserted
-        };
-        db.run(move |db| graph_store::clear(db, keep)).await?;
-        writeln!(
-            out,
-            "{}",
-            match keep {
-                Keep::Asserted => "Cleared the graph, keeping what people asserted.",
-                Keep::Nothing => "Cleared the graph.",
-            }
-        )?;
-    }
-    let sources = args.source;
-    if sources.includes_tables() {
-        extract_tables(db, out, &ontology, standing).await?;
-    }
-    if sources.includes_documents() {
-        let sample = args.sample;
-        let plan = db.run(move |db| ChunkPlan::new(db, sample)).await?;
-        if plan.is_empty() {
-            writeln!(
-                out,
-                "No chunks left to extract: every chunk of every ready document is on record (`--reset` starts over)."
-            )?;
-        } else {
-            let chat = config.chat_model_ref()?;
-            writeln!(
-                out,
-                "Document extraction: {} chunks, one model call each to {chat}.",
-                plan.len()
-            )?;
-            out.flush()?;
-            if confirm.ask(out, "Proceed?", Some("--yes"))? {
-                let extractor = llm::graph_extractor(config, &ontology).await?;
-                let summary = extract::run(
-                    db,
-                    &plan,
-                    &ontology,
-                    standing,
-                    ExtractionRun {
-                        extractor: extractor.as_ref(),
-                        concurrency: config.analysis.extraction_concurrency,
-                        control,
-                    },
-                )
-                .await?;
+        let sources = self.source;
+        if sources.includes_tables() {
+            Self::tables(db, out, &ontology, standing).await?;
+        }
+        if sources.includes_documents() {
+            let sample = self.sample;
+            let plan = db.run(move |db| ChunkPlan::new(db, sample)).await?;
+            if plan.is_empty() {
                 writeln!(
                     out,
-                    "Extracted {} nodes and {} edges from {} chunks ({} failed, {} edges did not fit).",
-                    summary.nodes,
-                    summary.edges,
-                    summary.chunks,
-                    summary.failed_chunks,
-                    summary.invalid_edges
+                    "No chunks left to extract: every chunk of every ready document is on record (`--reset` starts over)."
                 )?;
-                if summary.drift.total() > 0 {
+            } else {
+                let chat = config.chat_model_ref()?;
+                writeln!(
+                    out,
+                    "Document extraction: {} chunks, one model call each to {chat}.",
+                    plan.len()
+                )?;
+                out.flush()?;
+                if confirm.ask(out, "Proceed?", Some("--yes"))? {
+                    let extractor = llm::graph_extractor(config, &ontology).await?;
+                    let summary = extract::run(
+                        db,
+                        &plan,
+                        &ontology,
+                        standing,
+                        ExtractionRun {
+                            extractor: extractor.as_ref(),
+                            concurrency: config.analysis.extraction_concurrency,
+                            control,
+                        },
+                    )
+                    .await?;
                     writeln!(
                         out,
-                        "The documents expressed {} things the ontology lacks; `quack graph status` lists them and `quack ontology propose --documents` proposes them.",
-                        summary.drift.total()
+                        "Extracted {} nodes and {} edges from {} chunks ({} failed, {} edges did not fit).",
+                        summary.nodes,
+                        summary.edges,
+                        summary.chunks,
+                        summary.failed_chunks,
+                        summary.invalid_edges
                     )?;
+                    if summary.drift.total() > 0 {
+                        writeln!(
+                            out,
+                            "The documents expressed {} things the ontology lacks; `quack graph status` lists them and `quack ontology propose --documents` proposes them.",
+                            summary.drift.total()
+                        )?;
+                    }
+                } else {
+                    writeln!(out, "Skipped the documents.")?;
                 }
-            } else {
-                writeln!(out, "Skipped the documents.")?;
             }
         }
+        let embeddings = Embeddings::from_config(config).await?;
+        let resolved = resolve::resolve(db, embeddings.as_ref(), &config.graph).await?;
+        if resolved.auto_merged > 0 || resolved.proposed > 0 {
+            writeln!(
+                out,
+                "Resolution: {} merged, {} proposed for review (`quack graph merges`).",
+                resolved.auto_merged, resolved.proposed
+            )?;
+        }
+        let version = ontology.saved_version()?;
+        db.run(move |db| graph_store::set_built_with(db, version))
+            .await?;
+        write!(out, "{}", db.run(graph_store::status).await?)?;
+        Ok(())
     }
-    let embeddings = Embeddings::from_config(config).await?;
-    let resolved = resolve::resolve(db, embeddings.as_ref(), &config.graph).await?;
-    if resolved.auto_merged > 0 || resolved.proposed > 0 {
-        writeln!(
-            out,
-            "Resolution: {} merged, {} proposed for review (`quack graph merges`).",
-            resolved.auto_merged, resolved.proposed
-        )?;
+
+    /// Every mapping's rows into the graph, one line per table.
+    async fn tables(
+        db: &Writer,
+        out: &mut impl Write,
+        ontology: &Ontology,
+        standing: Standing,
+    ) -> Result<()> {
+        if ontology.mappings.is_empty() {
+            writeln!(
+                out,
+                "No mapped tables in the ontology; skipping table extraction."
+            )?;
+            return Ok(());
+        }
+        let mapped = ontology.clone();
+        let summaries = db
+            .run(move |db| tables::extract(db, &mapped, standing))
+            .await?;
+        for summary in summaries {
+            match &summary.skipped {
+                Some(reason) => writeln!(out, "Table {}: skipped, {reason}", summary.table)?,
+                None => writeln!(
+                    out,
+                    "Table {}: {} rows -> {} nodes, {} edges",
+                    summary.table, summary.rows, summary.nodes, summary.edges
+                )?,
+            }
+        }
+        Ok(())
     }
-    let version = ontology.saved_version()?;
-    db.run(move |db| graph_store::set_built_with(db, version))
-        .await?;
-    write!(out, "{}", db.run(graph_store::status).await?)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -707,15 +721,15 @@ mod tests {
 
     async fn revalidate(db: &Writer, yes: bool) -> Result<String> {
         let mut out = Vec::new();
-        run(
-            &Config::default(),
-            db,
-            GraphAction::Revalidate { yes },
-            Confirm::Assume,
-            &mut out,
-            RunControl::unobserved(),
-        )
-        .await?;
+        GraphAction::Revalidate { yes }
+            .run(
+                &Config::default(),
+                db,
+                Confirm::Assume,
+                &mut out,
+                RunControl::unobserved(),
+            )
+            .await?;
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
@@ -776,15 +790,15 @@ mod edit_tests {
 
     async fn graph(db: &Writer, action: GraphAction) -> Result<String> {
         let mut out = Vec::new();
-        run(
-            &Config::default(),
-            db,
-            action,
-            Confirm::Assume,
-            &mut out,
-            RunControl::unobserved(),
-        )
-        .await?;
+        action
+            .run(
+                &Config::default(),
+                db,
+                Confirm::Assume,
+                &mut out,
+                RunControl::unobserved(),
+            )
+            .await?;
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 

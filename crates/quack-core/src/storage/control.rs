@@ -1867,6 +1867,18 @@ impl ControlPlane {
         Ok(bound.query_as().fetch_optional(&self.pool).await?)
     }
 
+    /// The user with the given username, which must exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] when no user has that name, or an error
+    /// if the query fails.
+    pub async fn user_named(&self, username: &str) -> Result<UserRow> {
+        self.find_user_by_username(username)
+            .await?
+            .ok_or_else(|| ResourceKind::User.missing(username.trim()))
+    }
+
     /// Every user, by name.
     ///
     /// # Errors

@@ -54,7 +54,7 @@ use quack_core::storage::workspace::{
 use crate::ModeArg;
 use crate::confirm::Confirm;
 use crate::embeddings_cli::{self, EmbeddingsAction};
-use crate::graph_cli::{self, GraphAction};
+use crate::graph_cli::GraphAction;
 use crate::ontology_cli::{self, OntologyAction};
 use crate::saved_cli::{self, SavedAction};
 use crate::terminal::SessionSetup;
@@ -633,15 +633,9 @@ impl CliJob {
                 .await?;
             }
             Self::Graph(action) => {
-                graph_cli::run(
-                    &env.config,
-                    &env.db,
-                    action,
-                    Confirm::Assume,
-                    &mut out,
-                    control,
-                )
-                .await?;
+                action
+                    .run(&env.config, &env.db, Confirm::Assume, &mut out, control)
+                    .await?;
             }
             Self::Embeddings(action) => {
                 embeddings_cli::run(
