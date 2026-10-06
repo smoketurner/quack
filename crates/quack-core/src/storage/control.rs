@@ -657,6 +657,8 @@ pub enum ResourceKind {
     /// A message in a session, named by its sequence number.
     Message,
     Document,
+    /// A chunk of a document, named by the document and its position.
+    Chunk,
     User,
     Workspace,
     Token,
@@ -681,6 +683,7 @@ history_enum!(ResourceKind, Unknown, {
     Session => "session",
     Message => "message",
     Document => "document",
+    Chunk => "chunk",
     User => "user",
     Workspace => "workspace",
     Token => "token",

@@ -91,7 +91,8 @@ data-layer, crypto, or dependency change:
 cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # SQL, no agent
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
 cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use
-cargo run --bin quack -- ingest sales.csv -w ws                                # file -> table(s) or chunks
+cargo run --bin quack -- ingest sales.csv -w ws [--replace [ID]]               # file -> table(s) or chunks; --replace supersedes the document with the same name (or ID) once the new one is ready
+cargo run --bin quack -- ingest DIR -w ws [--prune]                            # every supported file under DIR (not a bundle), root and path recorded; re-run skips unchanged, replaces changed, reports gone files of that root (--prune deletes them)
 #   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX
 cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
@@ -145,7 +146,8 @@ model `rerank_model` score them through rig's `Rerank` at an OpenAI-compatible `
 `chat` or `query`; `--mode` / `/mode` set it. The workspace context (owner-written
 instructions, `quack_core::storage::context`, versioned in `_quack_context`) is injected
 into the system prompt after the schema and documents, capped at `[context].max_tokens`;
-the agent never writes it. Charts are `analysis::chart::ChartSpec` (bar, line, scatter,
+the agent never writes it. The prompt states today's date (`PromptOptions::today`, the
+system's local zone from jiff) right after the mode paragraph; tests pin it. Charts are `analysis::chart::ChartSpec` (bar, line, scatter,
 pie; 200 points max), not ECharts.
 
 Background work is asynchronous everywhere (design doc 4.1): `quack_core::jobs::JobQueue`
@@ -269,7 +271,7 @@ temporary client stays recorded (sealed) until deleted, so an interrupted run le
 each rotation step's key set (`Registrar::publish_keys`, a full-metadata `PUT`) and deletes the
 client (`unregister`).
 Every interface returns one response object, `AgentResponse::to_json` (answer, citations with
-labels, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `duration_ms`, `session_id`); a write refused
+labels and the document's `ingested_at`, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `duration_ms`, `session_id`); a write refused
 inside a turn is `write_refused: true` (REST 200, MCP structured content, print exit 3). A streamed
 web or REST turn from someone who may write asks instead: a `permission_required` SSE event, answered
 by `POST .../sessions/{sid}/permissions/{request}` (`server::permissions`, held in memory, refused after
@@ -372,7 +374,16 @@ to the chunks that entity was extracted from (`graph::store::chunks_of_nodes` in
 hit names the entities the graph took from it (`graph::store::entities_of_chunks`). An
 entity that exists only in mapped table rows says so instead of returning nothing. The
 `entity` argument is offered only while the graph has nodes (`SearchDocumentsTool::with_model`, `text_to_sql::Modeled`),
-like the graph tools themselves. Ollama embedding requests go through `llm::OllamaEmbedder`,
+like the graph tools themselves. `read_document(document, from, limit)` (`tools::ReadDocumentTool`,
+registered in every workspace beside `search_documents`) returns a document's chunks in order
+from a position, numbered through the turn's citation registry so `[n]` markers on them
+validate, within `[retrieval].pinned_token_budget` (at most 50 chunks a call), and counts as
+reading document text for the write rule. Every `Citation` carries `excerpt`, the chunk's
+first 500 characters; the web chat links each citation to the passage page
+`/w/{id}/documents/{doc}/chunks/{n}` (`templates/passage.html`, previous and next chunk linked),
+and `GET .../documents/{doc}/chunks?from=&limit=` pages a document's chunks over REST, both
+through `api::documents::read_chunks` (`WorkspaceDb::document_chunks`), audited as opening the
+document. Ollama embedding requests go through `llm::OllamaEmbedder`,
 not rig's client, so they carry `keep_alive` and a chunk-sized `num_ctx`.
 
 Every command resolves its workspace through `ControlPlane::workspace_or_default`: `-w NAME`
@@ -394,7 +405,15 @@ bytes' SHA-256 already belong to a non-failed document whose table or chunks sti
 `parser::PageCounts`: pages in the file, pages whose extraction failed, pages without text;
 `PageCounts::note` is the one wording every interface shows, as `3 of 40 pages unreadable`);
 `ingest_file` does both and takes a `NewFile` (name, bytes, `DocumentSource`, optional
-title and uploader, and its `RunControl`).
+title and uploader, its `RunControl`, and `replaces`, the ready document this file takes
+the place of: `quack ingest --replace [ID]`, `POST .../documents?replace={doc}`, the
+Documents row's Replace control). The old document keeps serving, marked `superseded_by`,
+until the new one is `ready`; then it becomes `DocumentStatus::Superseded` and its pin moves
+over (`WorkspaceDb::finish_replacement`); a failure clears the mark (`mark_document_error`).
+A table file loads over its predecessor's table. A superseded document leaves search, the
+prompt, `list_documents`, and `read_document` (`WorkspaceDb::list_documents` is live rows;
+`list_all_documents` has them all for `quack docs --all` and the page's `?all=true`), but keeps
+its chunks so stored citations still open.
 
 The MCP server (`crates/quack/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `sql`,
 `list_tables`, `describe_table`, `list_documents` and the `quack://workspace/...` resources;

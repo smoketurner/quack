@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::Json;
 use std::collections::HashMap;
 
-use axum::extract::{FromRequest, Multipart, Path, State};
+use axum::extract::{FromRequest, Multipart, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use quack_core::ids::{DocumentId, WorkspaceId};
@@ -21,9 +21,12 @@ use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::queue::UploadJob;
 use crate::server::state::{App, with_db};
+use quack_core::analysis::tools::SharedDb;
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store::Revision;
-use quack_core::storage::workspace::{DocumentInfo, DocumentSource, Pinning, WorkspaceDb};
+use quack_core::storage::workspace::{
+    ChunkSearchResult, DocumentInfo, DocumentSource, Pinning, WorkspaceDb,
+};
 
 pub(crate) async fn list(
     State(app): State<App>,
@@ -62,18 +65,110 @@ pub(crate) async fn show(
     Ok(Json(serde_json::to_value(document)?))
 }
 
+/// `?from=&limit=` on `GET .../documents/{doc}/chunks`: chunk positions
+/// from `from` on, `limit` of them.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub(crate) struct ChunkPage {
+    #[serde(default)]
+    pub from: u32,
+    #[serde(default = "ChunkPage::default_limit")]
+    pub limit: u32,
+}
+
+impl ChunkPage {
+    /// Chunks one request returns at most.
+    pub(crate) const MAX_LIMIT: u32 = 200;
+
+    const fn default_limit() -> u32 {
+        20
+    }
+
+    /// The chunk at `position` with its neighbours, for a passage page.
+    pub(crate) const fn around(position: u32) -> Self {
+        Self {
+            from: position.saturating_sub(1),
+            limit: 3,
+        }
+    }
+}
+
+/// A page of one document's chunks in document order, with the
+/// document itself (its `chunk_count` is the total).
+pub(crate) struct Chunks {
+    pub document: DocumentInfo,
+    pub chunks: Vec<ChunkSearchResult>,
+}
+
+/// Read `page` of `doc`'s chunks, audited as opening the document; what
+/// the REST route and the web passage page share.
+pub(crate) async fn read_chunks(
+    app: &App,
+    access: &Access,
+    doc: &DocumentId,
+    page: ChunkPage,
+) -> ApiResult<Chunks> {
+    let limit = page.limit.clamp(1, ChunkPage::MAX_LIMIT);
+    access
+        .audit(
+            app,
+            AuditAction::Open,
+            Some(ResourceKind::Document.id(doc)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "chunks_from": page.from, "limit": limit })),
+        )
+        .await?;
+    let doc = doc.clone();
+    app.read(&access.membership.workspace.id, move |db| {
+        let document = db
+            .document(&doc)?
+            .ok_or_else(|| ResourceKind::Document.missing(doc.as_str()))?;
+        let chunks = db.document_chunks(&doc, page.from, limit)?;
+        Ok(Chunks { document, chunks })
+    })
+    .await
+}
+
+/// `GET .../documents/{doc}/chunks?from=&limit=`: the document's chunks
+/// from position `from`, each with its text, heading, page, and position.
+pub(crate) async fn chunks(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
+    Query(page): Query<ChunkPage>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let Chunks { document, chunks } = read_chunks(&app, &access, &doc, page).await?;
+    Ok(Json(serde_json::json!({
+        "document_id": document.id,
+        "filename": document.filename,
+        "total": document.chunk_count,
+        "from": page.from,
+        "chunks": chunks,
+    })))
+}
+
 #[derive(Deserialize)]
 pub(crate) struct PastedText {
     pub text: String,
     pub title: Option<String>,
 }
 
+/// `?replace={doc}` on `POST .../documents`: the one file in the request
+/// replaces that ready document.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct UploadQuery {
+    pub replace: Option<DocumentId>,
+}
+
 /// `multipart/form-data` with one or more `file` parts, or JSON
-/// `{text, title}`. Returns 202 with the queued documents.
+/// `{text, title}`. Returns 202 with the queued documents. With
+/// `?replace={doc}` the request carries one file, which takes the place
+/// of that document once it is ready.
 pub(crate) async fn upload(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
+    Query(query): Query<UploadQuery>,
     request: axum::extract::Request,
 ) -> ApiResult<impl IntoResponse> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
@@ -84,6 +179,11 @@ pub(crate) async fn upload(
         .unwrap_or("")
         .to_owned();
     if content_type.starts_with("application/x-tar") {
+        if query.replace.is_some() {
+            return Err(ApiError::bad_request(
+                "replace takes one file, not a bundle",
+            ));
+        }
         let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -108,7 +208,7 @@ pub(crate) async fn upload(
     } else {
         DocumentSource::Paste
     };
-    let queued = enqueue(&app, &access, source, files).await?;
+    let queued = enqueue(&app, &access, source, files, query.replace).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "documents": queued })),
@@ -136,7 +236,7 @@ async fn import_bundle(
     let queued = if files.is_empty() {
         Vec::new()
     } else {
-        enqueue(app, access, DocumentSource::Upload, files).await?
+        enqueue(app, access, DocumentSource::Upload, files, None).await?
     };
     let db = app.workspace_db(&access.membership.workspace.id).await?;
     let for_candidates = bundle.clone();
@@ -270,15 +370,20 @@ impl UploadForm {
 /// workspace's upload lane. Returns `{id, filename, status}` per file; a
 /// file identical to a document already in the workspace is not queued
 /// and comes back as `{id, filename, status: "duplicate"}` naming the
-/// existing document. A pasted text's title is its filename stem.
+/// existing document. A pasted text's title is its filename stem. With
+/// `replaces`, the one file takes that document's place once ready.
 pub(crate) async fn enqueue(
     app: &App,
     access: &Access,
     source: DocumentSource,
     files: Vec<IncomingFile>,
+    replaces: Option<DocumentId>,
 ) -> ApiResult<Vec<Enqueued>> {
     if files.is_empty() {
         return Err(ApiError::bad_request("no file or text in the request"));
+    }
+    if replaces.is_some() && files.len() != 1 {
+        return Err(ApiError::bad_request("replace takes exactly one file"));
     }
     let id = access.membership.workspace.id.clone();
     // Fail now, not in the background, when no model can be built.
@@ -290,12 +395,42 @@ pub(crate) async fn enqueue(
         )
         .await?;
     let db = app.workspace_db(&id).await?;
-    let mut queued = Vec::new();
-    for IncomingFile {
-        name: filename,
-        data,
-    } in files
-    {
+    let mut queued = Vec::with_capacity(files.len());
+    for file in files {
+        let lane = Lane {
+            app,
+            access,
+            db: &db,
+            embedder: embedder.clone(),
+            source,
+            replaces: replaces.as_ref(),
+        };
+        queued.push(lane.enqueue_one(file).await?);
+    }
+    Ok(queued)
+}
+
+/// Where one upload goes: the workspace, who sends it, and what it
+/// replaces.
+struct Lane<'a> {
+    app: &'a App,
+    access: &'a Access,
+    db: &'a SharedDb,
+    embedder: Option<Embeddings>,
+    source: DocumentSource,
+    replaces: Option<&'a DocumentId>,
+}
+
+impl Lane<'_> {
+    /// Register `file`, audit it, and hand it to the upload lane, or
+    /// report the document that already holds its bytes.
+    async fn enqueue_one(self, file: IncomingFile) -> ApiResult<Enqueued> {
+        let IncomingFile {
+            name: filename,
+            data,
+        } = file;
+        let (app, access) = (self.app, self.access);
+        let id = &access.membership.workspace.id;
         let filename = std::path::Path::new(&filename)
             .file_name()
             .and_then(|n| n.to_str())
@@ -304,7 +439,7 @@ pub(crate) async fn enqueue(
         let size = data.len();
         let name = filename.clone();
         let user = access.identity.user_id.clone();
-        let title = match source {
+        let title = match self.source {
             DocumentSource::Paste => std::path::Path::new(&filename)
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -314,13 +449,15 @@ pub(crate) async fn enqueue(
             | DocumentSource::Stdin
             | DocumentSource::Import => None,
         };
-        let registration = with_db(Arc::clone(&db), move |db| {
+        let (source, old) = (self.source, self.replaces.cloned());
+        let registration = with_db(Arc::clone(self.db), move |db| {
             ingestion::register_document(
                 db,
                 &ingestion::NewFile::new(&name, &data)
                     .source(source)
                     .title(title.as_deref())
-                    .ingested_by(Some(user.as_str())),
+                    .ingested_by(Some(user.as_str()))
+                    .replaces(old.as_ref()),
             )
             .map(|r| (r, data))
         })
@@ -341,12 +478,11 @@ pub(crate) async fn enqueue(
                         })),
                     )
                     .await?;
-                queued.push(Enqueued::Duplicate {
+                return Ok(Enqueued::Duplicate {
                     id: existing.id,
                     filename,
                     existing_filename: existing.filename,
                 });
-                continue;
             }
         };
         access
@@ -355,25 +491,35 @@ pub(crate) async fn enqueue(
                 AuditAction::Ingest,
                 Some(ResourceKind::Document.id(&document_id)),
                 Outcome::Allowed,
-                Some(serde_json::json!({ "filename": filename, "size_bytes": size })),
+                Some(serde_json::json!({
+                    "filename": filename,
+                    "size_bytes": size,
+                    "replaces": self.replaces,
+                })),
             )
             .await?;
-        let job = UploadJob::spool(app, &id, &db, document_id.clone(), filename.clone(), &data)
-            .await?
-            .submit(
-                app,
-                &id,
-                Some(access.identity.user_id.clone()),
-                Arc::clone(&db),
-                embedder.clone(),
-            );
-        queued.push(Enqueued::Queued {
+        let job = UploadJob::spool(
+            app,
+            id,
+            self.db,
+            document_id.clone(),
+            filename.clone(),
+            &data,
+        )
+        .await?
+        .submit(
+            app,
+            id,
+            Some(access.identity.user_id.clone()),
+            Arc::clone(self.db),
+            self.embedder,
+        );
+        Ok(Enqueued::Queued {
             id: document_id,
             filename,
             job,
-        });
+        })
     }
-    Ok(queued)
 }
 
 /// What became of one file given to [`enqueue`].

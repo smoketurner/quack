@@ -734,6 +734,283 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
     );
 }
 
+/// A document's chunks page in order through the API and open on the web
+/// passage page, where a citation link lands, with its neighbours linked;
+/// a non-member is refused and the refusal is audited.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_documents_chunks_page_through_the_api_and_open_on_the_passage_page() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let outsider = h.user("outsider", UserKind::Standard).await;
+    let ws = h.workspace("docs", &owner).await;
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    db.run(|db| {
+        let id = DocumentId::from("d");
+        db.insert_document(
+            &NewDocument::new(&id, "policy.md", "text/markdown", 1)
+                .with_status(DocumentStatus::Ready),
+        )?;
+        for (i, text) in [
+            "Flood is excluded.",
+            "Hail is covered.",
+            "Claims close in 30 days.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            db.insert_chunk(&NewChunk {
+                id: &ChunkId::from(format!("c{i}")),
+                document_id: &id,
+                chunk_index: u32::try_from(i).unwrap_or_default(),
+                content: text,
+                heading: (i == 1).then_some("Perils"),
+                page: Some(2),
+                embedding: None,
+            })?;
+        }
+        db.set_document_chunk_count(&id, 3)
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let token = h.login("owner").await;
+    let path = format!("/api/v1/workspaces/{ws}/documents/d/chunks");
+
+    let (status, body) = h.get(&format!("{path}?from=1&limit=1"), &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["document_id"], "d");
+    assert_eq!(body["filename"], "policy.md");
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["from"], 1);
+    let chunks = body["chunks"].as_array().cloned().unwrap_or_default();
+    assert_eq!(chunks.len(), 1, "{body}");
+    assert_eq!(chunks[0]["chunk_index"], 1);
+    assert_eq!(chunks[0]["content"], "Hail is covered.");
+    assert_eq!(chunks[0]["heading"], "Perils");
+    assert_eq!(chunks[0]["page"], 2);
+    let (status, body) = h.get(&path, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["chunks"].as_array().map(Vec::len), Some(3));
+    let (status, body) = h.get(&format!("{path}?from=3"), &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["chunks"].as_array().map(Vec::len), Some(0));
+    let (status, _) = h
+        .get(
+            &format!("/api/v1/workspaces/{ws}/documents/nope/chunks"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let outsider_token = h.login("outsider").await;
+    let (status, _) = h.get(&path, &outsider_token).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let opened = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("open")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        opened.iter().any(|r| r.entry.outcome == Outcome::Allowed
+            && r.entry.user_id.as_ref() == Some(&owner)
+            && r.entry.resource_id.as_deref() == Some("d")),
+        "{opened:?}"
+    );
+    let denied = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            outcome: Some(Outcome::Denied),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        denied
+            .iter()
+            .any(|r| r.entry.user_id.as_ref() == Some(&outsider)),
+        "{denied:?}"
+    );
+
+    // The passage page shows the chunk with links to its neighbours; a
+    // position past the end is a 404 page, and a non-member is refused.
+    let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    let cookie = session_cookie(&headers);
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents/d/chunks/1"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(html.contains("Hail is covered."), "{html}");
+    assert!(html.contains("Chunk 1 of 3"), "{html}");
+    assert!(html.contains("Page 2 · Under \"Perils\""), "{html}");
+    assert!(
+        html.contains(&format!("href=\"/w/{ws}/documents/d/chunks/0\""))
+            && html.contains(&format!("href=\"/w/{ws}/documents/d/chunks/2\"")),
+        "{html}"
+    );
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents/d/chunks/2"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(html.contains("End of document"), "{html}");
+    assert!(!html.contains("/chunks/3\""), "{html}");
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents/d/chunks/3"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{html}");
+    let (_, _, headers) = h
+        .form("/login", None, "username=outsider&password=pw")
+        .await;
+    let (status, _, _) = h
+        .page(
+            &format!("/w/{ws}/documents/d/chunks/0"),
+            Some(&session_cookie(&headers)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// `POST .../documents?replace={doc}` queues one file that takes the
+/// document's place once ready: the old one is `superseded`, out of the
+/// listing, and named by the new one's audit row; the request refuses
+/// more than one file, and the web row's Replace form does the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_supersedes_its_predecessor_once_ready() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("docs", &owner).await;
+    let token = h.login("owner").await;
+    let base = format!("/api/v1/workspaces/{ws}/documents");
+    let paste = |text: &str, title: &str| serde_json::json!({ "text": text, "title": title });
+    let (status, body) = h
+        .post(&base, &token, paste("Flood is excluded.", "policy"))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let old = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(h.wait_ready(&ws, &old, &token).await["status"], "ready");
+
+    let (status, body) = h
+        .post(
+            &format!("{base}?replace={old}"),
+            &token,
+            paste("Flood is covered.", "policy"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let new = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_ne!(new, old);
+    assert_eq!(h.wait_ready(&ws, &new, &token).await["status"], "ready");
+    let (_, replaced) = h.get(&format!("{base}/{old}"), &token).await;
+    assert_eq!(replaced["status"], "superseded", "{replaced}");
+    assert_eq!(replaced["superseded_by"], new, "{replaced}");
+    let (_, listed) = h.get(&base, &token).await;
+    let ids: Vec<&str> = listed["documents"]
+        .as_array()
+        .map(|docs| docs.iter().filter_map(|d| d["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(ids, [new.as_str()], "{listed}");
+    let ingests = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("ingest")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        ingests
+            .iter()
+            .any(|r| r.entry.resource_id.as_deref() == Some(new.as_str())),
+        "{ingests:?}"
+    );
+
+    // A replaced document cannot be replaced again, and a replacement
+    // is one file.
+    let (status, body) = h
+        .post(
+            &format!("{base}?replace={old}"),
+            &token,
+            paste("Flood is excluded again.", "policy"),
+        )
+        .await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "{body}"
+    );
+    assert!(body.to_string().contains("superseded, not ready"), "{body}");
+    let boundary = "two";
+    let two = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.md\"\r\n\r\nA\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"b.md\"\r\n\r\nB\r\n--{boundary}--\r\n"
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("{base}?replace={new}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(two))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body, _) = h.send(request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("exactly one file"), "{body}");
+
+    // The web: the live listing hides the replaced row, `?all=true` shows
+    // it with its replacement, and the row's Replace form queues a file.
+    let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    let cookie = session_cookie(&headers);
+    let (status, html, _) = h.page(&format!("/w/{ws}/documents"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!html.contains(&format!("id=\"doc-{old}\"")), "{html}");
+    assert!(html.contains("Show replaced documents"), "{html}");
+    assert!(
+        html.contains(&format!("/documents/{new}/replace")),
+        "{html}"
+    );
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents?all=true"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(&format!("id=\"doc-{old}\"")), "{html}");
+    assert!(html.contains(&format!("replaced by {new}")), "{html}");
+    let (content_type, bytes) = multipart("policy.md", "text/markdown", "Flood is covered now.");
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/w/{ws}/documents/{new}/replace"))
+        .header(header::COOKIE, format!("quack_session={cookie}"))
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(bytes))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, _, headers) = h.send(request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), format!("/w/{ws}/documents"));
+    let (_, pending) = h.get(&format!("{base}/{new}"), &token).await;
+    assert!(
+        pending["superseded_by"].is_string(),
+        "the replacement is on its way: {pending}"
+    );
+}
+
+/// The `quack_session` cookie a login response set.
+fn session_cookie(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| c.split(';').next())
+        .and_then(|c| c.strip_prefix("quack_session="))
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// The SQL editor's schema: members read every user table's columns as a
 /// statement writes them, never an internal table; anyone else is refused,
 /// and both are audited.

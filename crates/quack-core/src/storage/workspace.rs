@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use aws_lc_rs::digest;
+use jiff::civil::DateTime;
 
 use crate::config::Config;
 use crate::crypto;
@@ -72,7 +73,10 @@ const DOCUMENTS_DDL: &str = "
         tables JSON,
         page_count INTEGER,
         pages_unreadable INTEGER,
-        pages_empty INTEGER
+        pages_empty INTEGER,
+        superseded_by TEXT,
+        source_root TEXT,
+        source_path TEXT
     );
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS title TEXT;
@@ -83,7 +87,10 @@ const DOCUMENTS_DDL: &str = "
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS tables JSON;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_unreadable INTEGER;
-    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_empty INTEGER;";
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_empty INTEGER;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS superseded_by TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_root TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_path TEXT;";
 
 /// Summaries of the turns a session's history window leaves out
 /// (`[analysis].compact_history`), each with how many replayable messages,
@@ -1491,8 +1498,8 @@ impl WorkspaceDb {
             .map_err(|_| Error::Ingestion("file size overflow".into()))?;
 
         self.conn.execute(
-            "INSERT INTO _quack_documents (id, filename, title, mime_type, size_bytes, sha256, source, status, ingested_by) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO _quack_documents (id, filename, title, mime_type, size_bytes, sha256, source, status, ingested_by, source_root, source_path) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             duckdb::params![
                 doc.id,
                 doc.filename,
@@ -1503,6 +1510,8 @@ impl WorkspaceDb {
                 doc.source.as_str(),
                 doc.status,
                 doc.ingested_by,
+                doc.source_root,
+                doc.source_path,
             ],
         )?;
         Ok(())
@@ -1517,33 +1526,172 @@ impl WorkspaceDb {
     /// Returns an error if the query fails.
     pub fn document_by_sha256(&self, sha256: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
-            "{DOCUMENT_SELECT} WHERE sha256 = ? AND status <> ? ORDER BY ingested_at, id LIMIT 1"
+            "{DOCUMENT_SELECT} WHERE sha256 = ? AND {LIVE_STATUS} ORDER BY ingested_at, id LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(duckdb::params![sha256, DocumentStatus::Error])?;
+        let mut rows = stmt.query(duckdb::params![sha256])?;
         match rows.next()? {
             Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
             None => Ok(None),
         }
     }
 
-    /// The live (non-error) document that loaded `table`, if any: one
-    /// document owns a table (issue #51).
+    /// The live document that loaded `table`, if any: one document owns a
+    /// table (issue #51).
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
     pub fn table_owner(&self, table: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
-            "{DOCUMENT_SELECT} WHERE status <> ? AND tables IS NOT NULL \
+            "{DOCUMENT_SELECT} WHERE {LIVE_STATUS} AND tables IS NOT NULL \
              AND list_contains(CAST(tables AS VARCHAR[]), ?) ORDER BY ingested_at, id LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(duckdb::params![DocumentStatus::Error, table])?;
+        let mut rows = stmt.query(duckdb::params![table])?;
         match rows.next()? {
             Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
             None => Ok(None),
         }
+    }
+
+    /// The newest ready document named `filename`: what `--replace` with
+    /// no id replaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn newest_document_named(&self, filename: &str) -> Result<Option<DocumentInfo>> {
+        let sql = format!(
+            "{DOCUMENT_SELECT} WHERE filename = ? AND status = ? \
+             ORDER BY ingested_at DESC, id DESC LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(duckdb::params![filename, DocumentStatus::Ready])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The ready document a run of the folder `source_root` stored from
+    /// `source_path` under it, if one is: what a changed file at that path
+    /// replaces. The same relative path under another folder is another
+    /// document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn newest_document_at_path(
+        &self,
+        source_root: &str,
+        source_path: &str,
+    ) -> Result<Option<DocumentInfo>> {
+        let sql = format!(
+            "{DOCUMENT_SELECT} WHERE source_root = ? AND source_path = ? AND status = ? \
+             ORDER BY ingested_at DESC, id DESC LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(duckdb::params![
+            source_root,
+            source_path,
+            DocumentStatus::Ready
+        ])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every ready document a run of the folder `source_root` stored, by
+    /// its path: what a run compares that folder against to find the files
+    /// that are gone. Documents from any other folder are not touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn documents_under(&self, source_root: &str) -> Result<Vec<DocumentInfo>> {
+        let sql = format!(
+            "{DOCUMENT_SELECT} WHERE source_root = ? AND source_path IS NOT NULL AND status = ? \
+             ORDER BY source_path, ingested_at DESC, id DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let docs = stmt.query_map(duckdb::params![source_root, DocumentStatus::Ready], |row| {
+            DocumentInfo::try_from(row)
+        })?;
+        Ok(docs.collect::<duckdb::Result<_>>()?)
+    }
+
+    /// Mark `old` as being replaced by `new`: `old` keeps serving until
+    /// `new` is ready ([`Self::finish_replacement`]), and a failure of
+    /// `new` undoes the mark ([`Self::mark_document_error`]).
+    ///
+    /// # Errors
+    ///
+    /// `old` must exist, be `ready`, and not already have a replacement
+    /// on its way.
+    pub fn begin_replacement(&self, old: &DocumentId, new: &DocumentId) -> Result<()> {
+        let document = self
+            .document(old)?
+            .ok_or_else(|| ResourceKind::Document.missing(old.as_str()))?;
+        if document.status != DocumentStatus::Ready {
+            return Err(Error::Ingestion(format!(
+                "cannot replace {} ({old}): it is {}, not ready",
+                OneLine(&document.filename),
+                document.status
+            )));
+        }
+        if let Some(pending) = document.superseded_by {
+            return Err(Error::Ingestion(format!(
+                "cannot replace {} ({old}): a replacement ({pending}) is already being processed",
+                OneLine(&document.filename)
+            )));
+        }
+        self.conn.execute(
+            "UPDATE _quack_documents SET superseded_by = ? WHERE id = ?",
+            duckdb::params![new, old],
+        )?;
+        Ok(())
+    }
+
+    /// `new` is ready: the document it replaces becomes `superseded` and
+    /// `new` takes over its pin. Returns the replaced document's id, if
+    /// there was one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an update fails.
+    pub fn finish_replacement(&self, new: &DocumentId) -> Result<Option<DocumentId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, pinned FROM _quack_documents WHERE superseded_by = ?")?;
+        let mut rows = stmt.query(duckdb::params![new])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let (old, pinned): (DocumentId, bool) = (row.get(0)?, row.get(1)?);
+        drop(rows);
+        self.conn.execute(
+            "UPDATE _quack_documents SET status = ? WHERE id = ?",
+            duckdb::params![DocumentStatus::Superseded, old],
+        )?;
+        if pinned {
+            self.conn.execute(
+                "UPDATE _quack_documents SET pinned = true WHERE id = ?",
+                duckdb::params![new],
+            )?;
+        }
+        Ok(Some(old))
+    }
+
+    /// Forget that `new` was to replace anything: the document it would
+    /// have replaced stays as it was.
+    fn abandon_replacement(&self, new: &DocumentId) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _quack_documents SET superseded_by = NULL WHERE superseded_by = ?",
+            duckdb::params![new],
+        )?;
+        Ok(())
     }
 
     /// Whether what a ready document loaded is still there: every table
@@ -1680,7 +1828,8 @@ impl WorkspaceDb {
             "UPDATE _quack_documents SET status = ?, error_message = ? WHERE id = ?",
             duckdb::params![DocumentStatus::Error, message, id],
         )?;
-        Ok(())
+        // A failed replacement leaves the document it was to replace as it was.
+        self.abandon_replacement(id)
     }
 
     /// One document by id.
@@ -1712,7 +1861,11 @@ impl WorkspaceDb {
         let Some(doc) = self.document(id)? else {
             return Ok(false);
         };
-        let tables = if let Some(tables) = doc.tables.clone() {
+        // A replaced document's tables and file now belong to its
+        // replacement; only its own rows go.
+        let tables = if doc.status == DocumentStatus::Superseded {
+            Vec::new()
+        } else if let Some(tables) = doc.tables.clone() {
             tables
         } else {
             // Never a table another document loaded: a row still queued, or
@@ -1749,7 +1902,10 @@ impl WorkspaceDb {
             self.conn
                 .execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)))?;
         }
-        self.remove_document_files(&doc.filename, &tables);
+        if doc.status != DocumentStatus::Superseded {
+            self.remove_document_files(&doc.filename, &tables);
+        }
+        self.abandon_replacement(id)?;
         Ok(true)
     }
 
@@ -2117,7 +2273,8 @@ impl WorkspaceDb {
                          JOIN df d ON d.term = t.term \
                          JOIN _quack_chunks ch ON ch.id = t.chunk_id, stats s \
                          GROUP BY t.chunk_id) \
-             SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, sc.score \
+             SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, sc.score, \
+                    CAST(d.ingested_at AS VARCHAR) \
              FROM scored sc \
              JOIN _quack_chunks c ON c.id = sc.chunk_id \
              JOIN _quack_documents d ON d.id = c.document_id \
@@ -2196,7 +2353,8 @@ impl WorkspaceDb {
         let filter = scope.sql();
         let sql = format!(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, \
-                    1.0 / (1.0 + array_cosine_distance(c.embedding, ?::{})) AS score \
+                    1.0 / (1.0 + array_cosine_distance(c.embedding, ?::{})) AS score, \
+                    CAST(d.ingested_at AS VARCHAR) \
              FROM _quack_chunks c \
              JOIN _quack_documents d ON d.id = c.document_id \
              WHERE c.embedding IS NOT NULL AND c.embedding_profile IS NOT DISTINCT FROM ? \
@@ -2301,7 +2459,8 @@ impl WorkspaceDb {
         size: u32,
     ) -> Result<Vec<ChunkSearchResult>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0 \
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0, \
+                    CAST(d.ingested_at AS VARCHAR) \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
              WHERE d.status = ? AND {} AND (?::VARCHAR IS NULL OR c.id > ?) \
              ORDER BY c.id LIMIT ?",
@@ -2309,6 +2468,34 @@ impl WorkspaceDb {
         ))?;
         let rows = stmt.query_map(
             duckdb::params![DocumentStatus::Ready, after, after, i64::from(size)],
+            |row| ChunkSearchResult::try_from(row),
+        )?;
+        Ok(rows.collect::<duckdb::Result<_>>()?)
+    }
+
+    /// Up to `limit` of a document's chunks from position `from` on, in
+    /// document order, with the citation metadata a search hit carries
+    /// (score 1). Status is not checked: a passage cited by an earlier
+    /// answer must still open after its document was replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn document_chunks(
+        &self,
+        document_id: &DocumentId,
+        from: u32,
+        limit: u32,
+    ) -> Result<Vec<ChunkSearchResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0, \
+                    CAST(d.ingested_at AS VARCHAR) \
+             FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE c.document_id = ? AND c.chunk_index >= ? \
+             ORDER BY c.chunk_index LIMIT ?",
+        )?;
+        let rows = stmt.query_map(
+            duckdb::params![document_id, i64::from(from), i64::from(limit)],
             |row| ChunkSearchResult::try_from(row),
         )?;
         Ok(rows.collect::<duckdb::Result<_>>()?)
@@ -2323,7 +2510,8 @@ impl WorkspaceDb {
     pub fn chunks_by_ids(&self, ids: &[ChunkId]) -> Result<Vec<ChunkSearchResult>> {
         let mut out = Vec::with_capacity(ids.len());
         let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0 \
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0, \
+                    CAST(d.ingested_at AS VARCHAR) \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id WHERE c.id = ?",
         )?;
         for id in ids {
@@ -2737,26 +2925,45 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the query fails.
     pub fn recent_documents(&self, limit: usize) -> Result<(Vec<DocumentInfo>, usize)> {
-        let sql = format!("{DOCUMENT_SELECT} ORDER BY ingested_at DESC, id DESC LIMIT ?");
+        let sql = format!(
+            "{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} ORDER BY ingested_at DESC, id DESC LIMIT ?"
+        );
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(&sql)?;
         let docs = stmt
             .query_map(duckdb::params![limit], |row| DocumentInfo::try_from(row))?
             .collect::<duckdb::Result<Vec<_>>>()?;
-        let total: i64 =
-            self.conn
-                .query_row("SELECT count(*) FROM _quack_documents", [], |row| {
-                    row.get(0)
-                })?;
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM _quack_documents WHERE {NOT_SUPERSEDED}"),
+            [],
+            |row| row.get(0),
+        )?;
         Ok((docs, usize::try_from(total).unwrap_or(usize::MAX)))
     }
 
-    /// List all ingested documents with their status.
+    /// Every document with its status, newest first, failed ones with
+    /// their reason: what the workspace holds now. A replaced document is
+    /// left out ([`Self::list_all_documents`] has it).
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
     pub fn list_documents(&self) -> Result<Vec<DocumentInfo>> {
+        let sql =
+            format!("{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} ORDER BY ingested_at DESC, id DESC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let docs = stmt.query_map([], |row| DocumentInfo::try_from(row))?;
+        Ok(docs.collect::<duckdb::Result<_>>()?)
+    }
+
+    /// Every document row, replaced ones included, newest first: the
+    /// listing behind `quack docs --all` and the Documents page's
+    /// "show replaced" view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn list_all_documents(&self) -> Result<Vec<DocumentInfo>> {
         let sql = format!("{DOCUMENT_SELECT} ORDER BY ingested_at DESC, id DESC");
         let mut stmt = self.conn.prepare(&sql)?;
         let docs = stmt.query_map([], |row| DocumentInfo::try_from(row))?;
@@ -2856,6 +3063,9 @@ pub enum DocumentStatus {
     Ready,
     /// Failed; `error_message` says why.
     Error,
+    /// Replaced by the document `superseded_by` names: no longer searched,
+    /// listed, or read, though its chunks stay so earlier citations open.
+    Superseded,
 }
 
 text_enum!(DocumentStatus, "document status", {
@@ -2863,6 +3073,7 @@ text_enum!(DocumentStatus, "document status", {
     Processing => "processing",
     Ready => "ready",
     Error => "error",
+    Superseded => "superseded",
 });
 
 impl DocumentStatus {
@@ -2871,7 +3082,7 @@ impl DocumentStatus {
     pub fn is_in_flight(self) -> bool {
         match self {
             Self::Queued | Self::Processing => true,
-            Self::Ready | Self::Error => false,
+            Self::Ready | Self::Error | Self::Superseded => false,
         }
     }
 }
@@ -2907,6 +3118,15 @@ pub struct DocumentInfo {
     /// and for rows written before this was recorded.
     pub pages: Option<PageCounts>,
     pub ingested_at: String,
+    /// The document replacing this one: on its way while this one is
+    /// still `ready`, in place once this one is `superseded`.
+    pub superseded_by: Option<DocumentId>,
+    /// The folder the file was ingested from, as its canonical absolute
+    /// path; `None` for a document from anywhere else.
+    pub source_root: Option<String>,
+    /// Where the file was under that folder, with `/` separators; a later
+    /// run of the folder matches the file by root and path together.
+    pub source_path: Option<String>,
 }
 
 impl DocumentInfo {
@@ -2914,6 +3134,37 @@ impl DocumentInfo {
     #[must_use]
     pub fn display_name(&self) -> &str {
         self.title.as_deref().unwrap_or(&self.filename)
+    }
+
+    /// The document in `documents` the model named: by id, exact file
+    /// name, or id prefix.
+    ///
+    /// # Errors
+    ///
+    /// A name that matches none is an error listing the documents there
+    /// are, so the caller corrects it rather than reading an empty result
+    /// as "the workspace has nothing on this".
+    pub fn find<'a>(documents: &'a [Self], want: &str) -> Result<&'a Self> {
+        let want = want.trim();
+        let found = documents
+            .iter()
+            .find(|d| d.id.as_str() == want || d.filename == want)
+            .or_else(|| {
+                documents
+                    .iter()
+                    .find(|d| !want.is_empty() && d.id.as_str().starts_with(want))
+            });
+        found.ok_or_else(|| {
+            let known: Vec<String> = documents
+                .iter()
+                .map(|d| format!("{} ({})", d.id, OneLine(&d.filename)))
+                .collect();
+            Error::Analysis(format!(
+                "no document matches '{want}'; pass an id (a prefix is enough) or an exact \
+                 file name from list_documents. Documents: {}",
+                known.join(", ")
+            ))
+        })
     }
 
     /// The tables a row from before `tables` was recorded loaded into: the
@@ -2976,6 +3227,10 @@ pub struct NewDocument<'a> {
     pub source: DocumentSource,
     pub status: DocumentStatus,
     pub ingested_by: Option<&'a str>,
+    /// The folder the file came from and its path under it, when it came
+    /// from one.
+    pub source_root: Option<&'a str>,
+    pub source_path: Option<&'a str>,
 }
 
 impl<'a> NewDocument<'a> {
@@ -2998,6 +3253,8 @@ impl<'a> NewDocument<'a> {
             source: DocumentSource::Upload,
             status: DocumentStatus::Queued,
             ingested_by: None,
+            source_root: None,
+            source_path: None,
         }
     }
 
@@ -3010,8 +3267,18 @@ impl<'a> NewDocument<'a> {
 
 const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, status, error_message, \
      COALESCE(pinned, false), CAST(ingested_at AS VARCHAR), title, sha256, source, chunk_count, \
-     ingested_by, CAST(tables AS VARCHAR), page_count, pages_unreadable, pages_empty \
+     ingested_by, CAST(tables AS VARCHAR), page_count, pages_unreadable, pages_empty, \
+     superseded_by, source_root, source_path \
      FROM _quack_documents";
+
+/// The `WHERE` clause that keeps a document that still stands for its
+/// bytes, neither failed nor replaced: only such a document is a duplicate
+/// of a re-upload or owns a table.
+const LIVE_STATUS: &str = "status NOT IN ('error', 'superseded')";
+
+/// The `WHERE` clause of every listing of what the workspace holds now: a
+/// failed document stays listed with its reason, a replaced one does not.
+const NOT_SUPERSEDED: &str = "status <> 'superseded'";
 
 /// A row selected with [`DOCUMENT_SELECT`].
 impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
@@ -3043,6 +3310,9 @@ impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
                 }),
                 None => None,
             },
+            superseded_by: row.get(17)?,
+            source_root: row.get(18)?,
+            source_path: row.get(19)?,
         })
     }
 }
@@ -3105,15 +3375,21 @@ pub struct ChunkSearchResult {
     /// Higher is better. Vector-only: `1 / (1 + distance)`; keyword-only:
     /// BM25; hybrid: reciprocal rank fusion.
     pub score: f64,
+    /// When the chunk's document was ingested (UTC).
+    pub ingested_at: DateTime,
 }
 
 /// A row of `id, content, document_id, chunk_index, filename, heading,
-/// page, score`, the columns every search selects.
+/// page, score, ingested_at`, the columns every search selects.
 impl TryFrom<&duckdb::Row<'_>> for ChunkSearchResult {
     type Error = duckdb::Error;
 
     fn try_from(row: &duckdb::Row<'_>) -> duckdb::Result<Self> {
         let page: Option<i64> = row.get(6)?;
+        let ingested_at: String = row.get(8)?;
+        let ingested_at = ingested_at.parse().map_err(|e: jiff::Error| {
+            duckdb::Error::FromSqlConversionFailure(8, duckdb::types::Type::Text, Box::new(e))
+        })?;
         Ok(Self {
             id: row.get(0)?,
             content: row.get(1)?,
@@ -3123,6 +3399,7 @@ impl TryFrom<&duckdb::Row<'_>> for ChunkSearchResult {
             heading: row.get(5)?,
             page: page.and_then(|p| u32::try_from(p).ok()),
             score: row.get(7)?,
+            ingested_at,
         })
     }
 }
@@ -3336,27 +3613,7 @@ impl ChunkScope {
         let documents = db.list_documents()?;
         let mut resolved = Vec::with_capacity(wanted.len());
         for want in wanted {
-            let want = want.trim();
-            let found = documents
-                .iter()
-                .find(|d| d.id.as_str() == want || d.filename == want)
-                .or_else(|| {
-                    documents
-                        .iter()
-                        .find(|d| !want.is_empty() && d.id.as_str().starts_with(want))
-                });
-            let Some(d) = found else {
-                let known: Vec<String> = documents
-                    .iter()
-                    .map(|d| format!("{} ({})", d.id, OneLine(&d.filename)))
-                    .collect();
-                return Err(Error::Analysis(format!(
-                    "no document matches '{want}'; pass an id from list_documents or omit \
-                     document_ids to search everything. Documents: {}",
-                    known.join(", ")
-                )));
-            };
-            resolved.push(d.id.clone());
+            resolved.push(DocumentInfo::find(&documents, want)?.id.clone());
         }
         Ok(Self::documents(resolved))
     }

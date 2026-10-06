@@ -34,7 +34,8 @@
   </form>
 </div>
 {% endif %}
-<div id="rows" class="mt-6">
+<p class="mt-6 text-sm text-slate-400">{% if show_all %}Replaced documents are listed with the document that took their place. <a class="text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/documents">Hide replaced documents</a>{% else %}<a class="text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/documents?all=true">Show replaced documents</a>{% endif %}</p>
+<div id="rows" class="mt-2">
 {{ rows|safe }}
 </div>
 <div hidden hx-get="/w/{{ ws.membership.workspace.id }}/documents/status" hx-trigger="every 3s [document.querySelector('#doc-pending[data-pending]')]" hx-swap="innerHTML"></div>

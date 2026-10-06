@@ -82,6 +82,8 @@ fn to_json_carries_every_field_and_derives_queries() {
             chunk_index: 2,
             page: Some(4),
             heading: None,
+            ingested_at: Some(jiff::civil::DateTime::constant(2026, 10, 5, 14, 3, 0, 0)),
+            excerpt: String::new(),
         }],
         ..AgentResponse::default()
     };
@@ -90,7 +92,11 @@ fn to_json_carries_every_field_and_derives_queries() {
     assert_eq!(json["queries"][0]["sql"], "SELECT count(*) FROM events");
     assert_eq!(json["queries"][0]["rows"], 1);
     assert_eq!(json["queries"].as_array().map(Vec::len), Some(1));
-    assert_eq!(json["citations"][0]["label"], "noaa.pdf, page 4");
+    assert_eq!(
+        json["citations"][0]["label"],
+        "noaa.pdf, page 4, ingested 2026-10-05"
+    );
+    assert_eq!(json["citations"][0]["ingested_at"], "2026-10-05T14:03:00");
     assert_eq!(json["citations"][0]["chunk_id"], "c");
     assert_eq!(json["session_id"], "s1");
     assert_eq!(json["write_refused"], false);

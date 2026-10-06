@@ -164,13 +164,6 @@
     return header;
   }
 
-  function citationLabel(c) {
-    var label = c.filename || "";
-    if (c.page) label += ", page " + c.page;
-    if (c.heading) label += ', under "' + c.heading + '"';
-    return label;
-  }
-
   function startAssistant(messages) {
     var article = el("article", "rounded border border-slate-800 bg-slate-900 p-4 msg-assistant");
     // Busy until complete, so a screen reader reads the finished answer
@@ -377,8 +370,8 @@
         var ol = el("ol", "mt-3 space-y-1 text-sm text-slate-400");
         r.citations.forEach(function (cit) {
           var li = el("li", null, "[" + cit.n + "] ");
-          var a = el("a", "text-blue-400 hover:underline", citationLabel(cit));
-          a.href = "/w/" + chat.getAttribute("data-workspace") + "/documents#doc-" + cit.document_id;
+          var a = el("a", "text-blue-400 hover:underline", cit.label);
+          a.href = "/w/" + chat.getAttribute("data-workspace") + "/documents/" + cit.document_id + "/chunks/" + cit.chunk_index;
           li.appendChild(a);
           ol.appendChild(li);
         });

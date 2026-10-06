@@ -15,6 +15,7 @@ use quack_core::graph::{Properties, Standing, store as graph_store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId};
 use quack_core::import::{HostReach, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::{FileType, PageCounts};
+use quack_core::ingestion::tree::{Folder, FolderReport, Outcome, Prune};
 use quack_core::llm::CancellationToken;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::{ControlPlane, WorkspaceName};
@@ -3305,4 +3306,476 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
     )
     .await;
     assert!(matches!(outcome, Err(Error::Cancelled)));
+}
+
+/// Write `text` at `path` under `root`, making the directories.
+fn write_under(root: &Path, path: &str, text: &str) {
+    let path = root.join(path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// A folder run over `root` into `ws-folder` without an embedding model.
+async fn folder_run(config: &Config, writer: &Writer, root: &Path, prune: Prune) -> FolderReport {
+    Folder {
+        config,
+        db: writer,
+        workspace_id: "ws-folder",
+        root,
+        embedder: None::<&Embedder<MockEmbeddingModel>>,
+        control: RunControl::unobserved(),
+        prune,
+    }
+    .run()
+    .await
+    .unwrap()
+}
+
+/// Each result as its path and the kind of its outcome.
+fn outcome_kinds(report: &FolderReport) -> Vec<(String, &'static str)> {
+    report
+        .results
+        .iter()
+        .map(|r| {
+            let kind = match r.outcome {
+                Outcome::Ingested(_) => "ingested",
+                Outcome::Replaced { .. } => "replaced",
+                Outcome::Skipped(_) => "skipped",
+                Outcome::Failed(_) => "failed",
+            };
+            (r.relative.clone(), kind)
+        })
+        .collect()
+}
+
+/// A folder run ingests every supported file with its path, lists the
+/// rest, counts a file that fails as one outcome among the others, and
+/// skips every unchanged file on the next run.
+#[tokio::test]
+async fn a_folder_run_ingests_supported_files_and_skips_them_next_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-folder").unwrap();
+    let writer = writer_of(&db);
+    let root = dir.path().join("contracts");
+    write_under(&root, "policy.md", "Flood is excluded.");
+    write_under(&root, "rates/sales.csv", "region,total\nnorth,1\n");
+    write_under(&root, "notes.xyz", "?");
+    write_under(&root, "broken.csv", "a,b\n1,2,3,4\n\"unterminated,5\n6\n");
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let root_text = canonical.to_string_lossy();
+
+    let first = folder_run(&config, &writer, &root, Prune::Keep).await;
+    assert_eq!(
+        outcome_kinds(&first),
+        [
+            (String::from("broken.csv"), "failed"),
+            (String::from("policy.md"), "ingested"),
+            (String::from("rates/sales.csv"), "ingested"),
+        ]
+    );
+    assert_eq!(first.unsupported, ["notes.xyz"]);
+    assert!(first.gone.is_empty());
+    assert_eq!(first.failed(), 1);
+    let policy = db
+        .newest_document_at_path(&root_text, "policy.md")
+        .unwrap()
+        .unwrap();
+    assert_eq!(policy.source_path.as_deref(), Some("policy.md"));
+    assert_eq!(policy.source_root.as_deref(), Some(root_text.as_ref()));
+    assert_eq!(policy.filename, "policy.md");
+    assert_eq!(
+        db.newest_document_at_path(&root_text, "rates/sales.csv")
+            .unwrap()
+            .unwrap()
+            .tables,
+        Some(vec![String::from("sales")])
+    );
+    assert!(
+        db.newest_document_at_path(&root_text, "broken.csv")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.newest_document_at_path("/elsewhere", "policy.md")
+            .unwrap()
+            .is_none()
+    );
+
+    let again = folder_run(&config, &writer, &root, Prune::Keep).await;
+    assert_eq!(
+        outcome_kinds(&again),
+        [
+            (String::from("broken.csv"), "failed"),
+            (String::from("policy.md"), "skipped"),
+            (String::from("rates/sales.csv"), "skipped"),
+        ]
+    );
+}
+
+/// On a later run a changed file replaces the document at its path, and
+/// a document whose file is gone is reported and kept, or deleted with
+/// its table when pruning.
+#[tokio::test]
+async fn a_folder_rerun_replaces_changed_files_and_reports_or_prunes_gone_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-folder").unwrap();
+    let writer = writer_of(&db);
+    let root = dir.path().join("contracts");
+    write_under(&root, "policy.md", "Flood is excluded.");
+    write_under(&root, "rates/sales.csv", "region,total\nnorth,1\n");
+    folder_run(&config, &writer, &root, Prune::Keep).await;
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let root_text = canonical.to_string_lossy();
+    let policy = db
+        .newest_document_at_path(&root_text, "policy.md")
+        .unwrap()
+        .unwrap();
+
+    write_under(&root, "policy.md", "Flood is covered.");
+    std::fs::remove_file(root.join("rates/sales.csv")).unwrap();
+    let changed = folder_run(&config, &writer, &root, Prune::Keep).await;
+    let replaced = changed
+        .results
+        .iter()
+        .find(|r| r.relative == "policy.md")
+        .unwrap();
+    assert!(
+        matches!(&replaced.outcome, Outcome::Replaced { old, .. } if *old == policy.id),
+        "{replaced:?}"
+    );
+    assert_eq!(
+        db.document(&policy.id).unwrap().unwrap().status,
+        DocumentStatus::Superseded
+    );
+    let successor = db
+        .newest_document_at_path(&root_text, "policy.md")
+        .unwrap()
+        .unwrap();
+    assert_ne!(successor.id, policy.id);
+    assert_eq!(
+        changed
+            .gone
+            .iter()
+            .map(|d| d.source_path.clone())
+            .collect::<Vec<_>>(),
+        [Some(String::from("rates/sales.csv"))]
+    );
+    assert_eq!(changed.pruned, Prune::Keep);
+    assert!(db.list_tables().unwrap().contains(&String::from("sales")));
+
+    let pruned = folder_run(&config, &writer, &root, Prune::Delete).await;
+    assert_eq!(pruned.gone.len(), 1);
+    assert_eq!(pruned.pruned, Prune::Delete);
+    assert!(
+        db.newest_document_at_path(&root_text, "rates/sales.csv")
+            .unwrap()
+            .is_none()
+    );
+    assert!(!db.list_tables().unwrap().contains(&String::from("sales")));
+    assert!(
+        folder_run(&config, &writer, &root, Prune::Keep)
+            .await
+            .gone
+            .is_empty()
+    );
+}
+
+/// Two folders fed into one workspace keep to themselves: the same
+/// relative path under each is its own document, a run of one folder
+/// never reports or prunes the other's documents, and a change replaces
+/// only within its root.
+#[tokio::test]
+async fn folders_sharing_a_relative_path_are_separate_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-folder").unwrap();
+    let writer = writer_of(&db);
+    let (east, west) = (dir.path().join("east"), dir.path().join("west"));
+    write_under(&east, "policy.md", "East: flood is excluded.");
+    write_under(&east, "only-east.md", "East only.");
+    write_under(&west, "policy.md", "West: flood is covered.");
+    let east_run = folder_run(&config, &writer, &east, Prune::Keep).await;
+    let west_run = folder_run(&config, &writer, &west, Prune::Keep).await;
+    assert_eq!(
+        outcome_kinds(&east_run),
+        [
+            (String::from("only-east.md"), "ingested"),
+            (String::from("policy.md"), "ingested"),
+        ]
+    );
+    assert_eq!(
+        outcome_kinds(&west_run),
+        [(String::from("policy.md"), "ingested")]
+    );
+    assert!(east_run.gone.is_empty() && west_run.gone.is_empty());
+    let root_of = |path: &Path| -> String {
+        std::fs::canonicalize(path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let (east_root, west_root) = (root_of(&east), root_of(&west));
+    let east_policy = db
+        .newest_document_at_path(&east_root, "policy.md")
+        .unwrap()
+        .unwrap();
+    let west_policy = db
+        .newest_document_at_path(&west_root, "policy.md")
+        .unwrap()
+        .unwrap();
+    assert_ne!(east_policy.id, west_policy.id);
+    assert_eq!(db.documents_under(&east_root).unwrap().len(), 2);
+    assert_eq!(db.documents_under(&west_root).unwrap().len(), 1);
+
+    // A change in west replaces west's copy only, and a pruning run of
+    // west touches nothing of east's.
+    write_under(&west, "policy.md", "West: flood is now excluded.");
+    let west_again = folder_run(&config, &writer, &west, Prune::Delete).await;
+    assert!(
+        matches!(
+            west_again.results.first().map(|r| &r.outcome),
+            Some(Outcome::Replaced { old, .. }) if *old == west_policy.id
+        ),
+        "{west_again:?}"
+    );
+    assert!(west_again.gone.is_empty());
+    assert_eq!(
+        db.document(&east_policy.id).unwrap().unwrap().status,
+        DocumentStatus::Ready
+    );
+    assert_eq!(db.documents_under(&east_root).unwrap().len(), 2);
+
+    // Removing east's extra file and pruning east deletes that one alone.
+    std::fs::remove_file(east.join("only-east.md")).unwrap();
+    let east_pruned = folder_run(&config, &writer, &east, Prune::Delete).await;
+    assert_eq!(
+        east_pruned
+            .gone
+            .iter()
+            .map(|d| d.source_path.clone())
+            .collect::<Vec<_>>(),
+        [Some(String::from("only-east.md"))]
+    );
+    assert_eq!(db.documents_under(&east_root).unwrap().len(), 1);
+    assert_eq!(db.documents_under(&west_root).unwrap().len(), 1);
+    assert_eq!(db.list_documents().unwrap().len(), 2);
+}
+
+/// `ingest_file` into `ws-replace` without an embedding model, for the
+/// replacement tests.
+async fn ingest(
+    config: &Config,
+    writer: &Writer,
+    file: ingestion::NewFile<'_>,
+) -> Result<ingestion::IngestOutcome, Error> {
+    ingestion::ingest_file(
+        config,
+        writer,
+        "ws-replace",
+        &file,
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+}
+
+/// A changed file replaces its predecessor: the old document is
+/// `superseded` once the new one is ready, leaves search, the listing,
+/// and the prompt, keeps its chunks for earlier citations, and hands its
+/// pin on. Identical bytes are still a duplicate, and a document that is
+/// not ready, or missing, is refused.
+#[tokio::test]
+async fn a_changed_file_replaces_its_predecessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let ingested = |outcome: ingestion::IngestOutcome| outcome.ingested().unwrap();
+
+    let first = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("policy.md", b"Flood is excluded."),
+        )
+        .await
+        .unwrap(),
+    );
+    db.set_document_pinning(&first.document_id, Pinning::Pinned)
+        .unwrap();
+    let second = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("policy.md", b"Flood is covered.")
+                .replaces(Some(&first.document_id)),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(second.replaced.as_ref(), Some(&first.document_id));
+    let old = db.document(&first.document_id).unwrap().unwrap();
+    assert_eq!(old.status, DocumentStatus::Superseded);
+    assert_eq!(old.superseded_by.as_ref(), Some(&second.document_id));
+    let new = db.document(&second.document_id).unwrap().unwrap();
+    assert_eq!(
+        (new.status, new.pinning),
+        (DocumentStatus::Ready, Pinning::Pinned)
+    );
+    assert_eq!(
+        db.list_documents()
+            .unwrap()
+            .iter()
+            .map(|d| &d.id)
+            .collect::<Vec<_>>(),
+        [&second.document_id]
+    );
+    assert_eq!(db.list_all_documents().unwrap().len(), 2);
+    assert_eq!(db.recent_documents(10).unwrap().1, 1);
+    assert_eq!(
+        db.document_chunks(&first.document_id, 0, 10).unwrap().len(),
+        1
+    );
+    let hits = db
+        .search_keyword_chunks("flood", 5, &ChunkScope::all())
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| &h.document_id).collect::<Vec<_>>(),
+        [&second.document_id]
+    );
+    assert_eq!(db.pinned_documents().unwrap().len(), 1);
+
+    // Identical bytes are a duplicate even as a replacement; a replaced
+    // document, or a missing one, cannot be replaced.
+    let same = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("policy.md", b"Flood is covered.")
+            .replaces(Some(&first.document_id)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(same, ingestion::IngestOutcome::Duplicate(d) if d.id == second.document_id));
+    let stale = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("policy.md", b"Flood is excluded again.")
+            .replaces(Some(&first.document_id)),
+    )
+    .await;
+    assert!(
+        matches!(&stale, Err(Error::Ingestion(m)) if m.contains("it is superseded, not ready")),
+        "{stale:?}"
+    );
+    let missing = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("policy.md", b"Flood is excluded again.")
+            .replaces(Some(&DocumentId::from("nope"))),
+    )
+    .await;
+    assert!(
+        matches!(missing, Err(Error::NotFound { .. })),
+        "{missing:?}"
+    );
+    assert_eq!(
+        db.list_all_documents().unwrap().len(),
+        2,
+        "nothing registered"
+    );
+}
+
+/// A table file takes over its predecessor's table; a failed replacement
+/// leaves the document and its table as they were; a second replacement
+/// of a document whose first is on its way is refused; deleting a
+/// replaced table document leaves the table to its successor.
+#[tokio::test]
+async fn a_table_replacement_swaps_the_table_and_a_failed_one_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let ingested = |outcome: ingestion::IngestOutcome| outcome.ingested().unwrap();
+
+    let sales = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("sales.csv", b"region,total\nnorth,1\n"),
+        )
+        .await
+        .unwrap(),
+    );
+    let sales2 = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("sales.csv", b"region,total\nnorth,1\nsouth,2\n")
+                .replaces(Some(&sales.document_id)),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(sales2.tables, vec![String::from("sales")]);
+    let rows = || -> i64 {
+        db.connection()
+            .query_row("SELECT count(*) FROM sales", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(rows(), 2);
+    assert_eq!(
+        db.table_owner("sales").unwrap().map(|d| d.id),
+        Some(sales2.document_id.clone())
+    );
+    assert_eq!(
+        db.document(&sales.document_id).unwrap().unwrap().status,
+        DocumentStatus::Superseded
+    );
+
+    // A failed replacement leaves the document and its table as they were.
+    let broken = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("sales.csv", b"a,b\n1,2,3,4\n\"unterminated,5\n6\n")
+            .replaces(Some(&sales2.document_id)),
+    )
+    .await;
+    assert!(matches!(broken, Err(Error::Ingestion(_))), "{broken:?}");
+    let kept = db.document(&sales2.document_id).unwrap().unwrap();
+    assert_eq!(
+        (kept.status, kept.superseded_by),
+        (DocumentStatus::Ready, None)
+    );
+    assert_eq!(rows(), 2);
+    let failed = db
+        .list_all_documents()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.status == DocumentStatus::Error)
+        .unwrap();
+    assert_eq!(failed.superseded_by, None);
+
+    // While one replacement is on its way, a second is refused.
+    let pending = ingestion::register_document(
+        &db,
+        &ingestion::NewFile::new("sales.csv", b"region,total\nnorth,3\n")
+            .replaces(Some(&sales2.document_id)),
+    )
+    .unwrap();
+    assert!(matches!(pending, ingestion::Registration::New(_)));
+    let twice = ingestion::register_document(
+        &db,
+        &ingestion::NewFile::new("sales.csv", b"region,total\nnorth,4\n")
+            .replaces(Some(&sales2.document_id)),
+    );
+    assert!(
+        matches!(&twice, Err(Error::Ingestion(m)) if m.contains("already being processed")),
+        "{twice:?}"
+    );
+
+    // Deleting a replaced table document leaves the table to its successor.
+    assert!(db.delete_document(&sales.document_id).unwrap());
+    assert_eq!(rows(), 2);
+    assert!(db.list_tables().unwrap().contains(&String::from("sales")));
 }

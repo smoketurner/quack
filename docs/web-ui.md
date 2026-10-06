@@ -48,6 +48,20 @@ signed-in user and reads no workspace, so it writes no audit row.
   when it was created, and when a request last touched it (`ControlDb::workspace_times`:
   the newest `audit_log` row naming it, allowed or denied; "never used" for a workspace
   the CLI made and nothing has opened through the server), one column each.
+- **`documents.html`** lists what the workspace holds now; "Show replaced documents"
+  (`?all=true`) adds each superseded document with a link to the one that took its place. A
+  ready row's Replace control (`POST /w/{id}/documents/{doc}/replace`, one file) queues the
+  file through the same `documents::enqueue` as the upload form with the row as its
+  predecessor; the row reads "being replaced by …" until the new document is ready. The
+  htmx actions on a row (pin, unpin, delete) swap in the live listing. The upload form takes
+  files, not a folder; `quack ingest DIR` is the folder path (design doc section 6.1).
+- **`passage.html`** (`/w/{id}/documents/{doc}/chunks/{n}`) is where a citation link lands:
+  one chunk of a document with its position and total, page and heading, when the document
+  was ingested, the chunk's full text, and links to the chunks before and after. It reads
+  through the same `documents::read_chunks` as `GET .../documents/{doc}/chunks`, so each
+  visit is audited as opening the document; a position the document does not have is a 404
+  page. The chunk is shown whatever the document's status, so a citation in an old answer
+  still opens after its document was replaced.
 - **`ontology.html`** shows the class tree, relations, properties, and mappings; the JSON
   editor; the version list with the diff to the previous version; the propose form; the
   Rename form, which gives a class or relation a new id and moves the graph's nodes and
@@ -149,7 +163,7 @@ row is processing (marked `data-pending`).
   Ctrl/Cmd+Enter runs the statement.
 - `static/js/app.js` is quack's own. It posts to `/api/v1/workspaces/{id}/query/stream`,
   parses the SSE events, and renders the steps block, the answer, citations as links to the
-  document list, and the chart spec as an ECharts option. A `permission_required` event
+  passage each one cites, and the chart spec as an ECharts option. A `permission_required` event
   becomes a card with the statement, Run it, Don't run it, and Allow for this turn, posted to
   `.../sessions/{sid}/permissions/{request}`, and the time the turn stops waiting. When the event carries a `notice`
   (its `reason` is `read_documents`: the turn read document text, so the write is asked for even

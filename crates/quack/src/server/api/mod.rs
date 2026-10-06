@@ -89,6 +89,10 @@ pub(crate) fn router() -> Router<App> {
                 .patch(documents::update)
                 .delete(documents::remove),
         )
+        .route(
+            "/workspaces/{id}/documents/{doc}/chunks",
+            get(documents::chunks),
+        )
         .route("/workspaces/{id}/embeddings", get(embeddings::show))
         .route(
             "/workspaces/{id}/embeddings/refresh",

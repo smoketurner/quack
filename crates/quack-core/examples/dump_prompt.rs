@@ -48,6 +48,7 @@ fn main() {
 
     let options = PromptOptions {
         mode: ChatMode::Chat,
+        today: jiff::civil::Date::constant(2026, 10, 5),
         write_policy: WritePolicy::Deny,
         pinned_token_budget: Tokens::new(1000),
         context: Some(String::from("Amounts are in cents.")),

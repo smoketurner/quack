@@ -60,6 +60,7 @@ impl<'a> DetailPreview<'a> {
 pub enum ToolName {
     RunSql,
     SearchDocuments,
+    ReadDocument,
     ListDocuments,
     ListTables,
     DescribeTable,
@@ -72,6 +73,7 @@ pub enum ToolName {
 text_enum!(ToolName, "tool", {
     RunSql => "run_sql",
     SearchDocuments => "search_documents",
+    ReadDocument => "read_document",
     ListDocuments => "list_documents",
     ListTables => "list_tables",
     DescribeTable => "describe_table",
@@ -88,6 +90,7 @@ impl ToolName {
         match self {
             Self::RunSql | Self::CreateChart => true,
             Self::SearchDocuments
+            | Self::ReadDocument
             | Self::ListDocuments
             | Self::ListTables
             | Self::DescribeTable

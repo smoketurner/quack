@@ -38,9 +38,13 @@ fn modeled_is_the_furthest_level_the_workspace_reaches() {
     );
 }
 
+/// A fixed date: the prompt's one daily change must not reach a test.
+const TODAY: Date = Date::constant(2026, 10, 5);
+
 fn options(mode: ChatMode, pinned: u32) -> PromptOptions {
     PromptOptions {
         mode,
+        today: TODAY,
         write_policy: WritePolicy::Deny,
         pinned_token_budget: Tokens::new(pinned),
         context: None,
@@ -97,7 +101,8 @@ fn the_graph_procedure_appears_only_once_the_graph_has_nodes() {
 /// caller) must too. Ollama keeps a KV cache for the common prefix of
 /// consecutive requests to the same loaded model; a stable part that
 /// changed for no reason (nondeterministic ordering, a timestamp, a
-/// session id) would silently defeat that cache on every turn.
+/// session id) would silently defeat that cache on every turn. The date
+/// line is the one accepted change, once a day; `options` pins it.
 #[test]
 #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
 fn the_prompt_is_byte_identical_across_repeated_calls_with_no_workspace_change() {
@@ -149,6 +154,27 @@ fn the_prompt_is_byte_identical_across_repeated_calls_with_no_workspace_change()
     assert!(tables_at < documents_at);
     assert!(documents_at < ontology_at);
     assert!(ontology_at < context_at, "{first}");
+}
+
+/// A replaced document is out of the inventory and its count; its
+/// replacement is in.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn a_replaced_document_leaves_the_inventory() {
+    let db = db();
+    for (id, name, status) in [
+        ("d1", "old-policy.md", DocumentStatus::Superseded),
+        ("d2", "policy.md", DocumentStatus::Ready),
+    ] {
+        db.insert_document(
+            &NewDocument::new(&DocumentId::from(id), name, "text/markdown", 1).with_status(status),
+        )
+        .unwrap();
+    }
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
+    assert!(prompt.contains("- policy.md (status: ready"), "{prompt}");
+    assert!(!prompt.contains("old-policy.md"), "{prompt}");
+    assert!(!prompt.contains("older documents"), "{prompt}");
 }
 
 /// The inventory lists the newest documents and counts the rest, so a
@@ -266,6 +292,11 @@ fn prompt_states_mode_and_lists_tables_and_documents() {
     .unwrap();
     let chat = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
     assert!(chat.contains("Mode: chat."));
+    // The date follows the mode paragraph and precedes the tool guidance.
+    let mode_at = chat.find("Mode: chat.").unwrap();
+    let today_at = chat.find("\n\nToday is 2026-10-05.\n\n").unwrap();
+    let guidance_at = chat.find("When answering analytical questions").unwrap();
+    assert!(mode_at < today_at && today_at < guidance_at, "{chat}");
     assert!(chat.contains("- claims (0 rows)"));
     db.execute_statement("INSERT INTO claims VALUES (1, 10), (2, 20)")
         .unwrap();

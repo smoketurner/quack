@@ -266,6 +266,15 @@ fn the_export_streams_to_a_tar_or_a_directory() {
     from_dir.files.sort_by(|a, b| a.path.cmp(&b.path));
     expected.files.sort_by(|a, b| a.path.cmp(&b.path));
     assert_eq!(from_dir, expected);
+    // An export is a bundle by its index; a folder of files is not one.
+    assert!(Bundle::is_dir(dir.path()));
+    let plain = tempfile::tempdir().unwrap_or_else(|e| unreachable_db(&e.to_string()));
+    std::fs::write(plain.path().join("notes.md"), "# Notes")
+        .unwrap_or_else(|e| unreachable_db(&e.to_string()));
+    assert!(!Bundle::is_dir(plain.path()));
+    std::fs::write(plain.path().join(LOG), "# Log")
+        .unwrap_or_else(|e| unreachable_db(&e.to_string()));
+    assert!(Bundle::is_dir(plain.path()));
 }
 
 #[expect(clippy::panic, reason = "test helper: the fixture must build")]

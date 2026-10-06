@@ -2042,3 +2042,72 @@ fn sorting_rewrites_the_statements_own_order_by() {
         );
     }
 }
+
+/// A document's chunks page in document order from any position, whatever
+/// its status, and the model's name for a document resolves by id, exact
+/// file name, or id prefix, else errors with the documents there are.
+#[test]
+fn document_chunks_page_in_order_and_documents_resolve_by_id_name_or_prefix() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    let id = DocumentId::from("doc-aaaa");
+    db.insert_document(
+        &NewDocument::new(&id, "policy.md", "text/markdown", 1).with_status(DocumentStatus::Error),
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    for i in 0..4u32 {
+        db.insert_chunk(&NewChunk {
+            id: &ChunkId::from(format!("c{i}")),
+            document_id: &id,
+            chunk_index: i,
+            content: &format!("part {i}"),
+            heading: None,
+            page: Some(i.saturating_add(1)),
+            embedding: None,
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let positions = |from: u32, limit: u32| -> Vec<u32> {
+        db.document_chunks(&id, from, limit)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .iter()
+            .map(|c| c.chunk_index)
+            .collect()
+    };
+    assert_eq!(positions(0, 10), [0, 1, 2, 3]);
+    assert_eq!(positions(1, 2), [1, 2]);
+    assert_eq!(positions(3, 2), [3]);
+    assert!(positions(4, 2).is_empty());
+    let page = db
+        .document_chunks(&id, 2, 1)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        page.first()
+            .map(|c| (c.content.as_str(), c.page, c.filename.as_str())),
+        Some(("part 2", Some(3), "policy.md"))
+    );
+
+    let documents = db.list_documents().unwrap_or_else(|e| fail(&e.to_string()));
+    for want in ["doc-aaaa", "policy.md", "doc-a", " doc-aaaa "] {
+        assert_eq!(
+            DocumentInfo::find(&documents, want)
+                .map(|d| d.id.as_str())
+                .ok(),
+            Some("doc-aaaa"),
+            "{want}"
+        );
+    }
+    for want in ["", "pol", "doc-b"] {
+        let error = DocumentInfo::find(&documents, want)
+            .map(|d| d.id.clone())
+            .map_err(|e| e.to_string());
+        let Err(error) = error else {
+            fail(&format!("'{want}' matched a document"))
+        };
+        assert!(
+            error.contains(&format!("no document matches '{want}'"))
+                && error.contains("doc-aaaa (policy.md)"),
+            "{error}"
+        );
+    }
+}

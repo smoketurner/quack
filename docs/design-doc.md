@@ -774,6 +774,26 @@ skipped. It restores the ontology snapshot when the workspace has none, else pro
 bundle's types and links as candidates, and offers `index.md` as the context. `quack graph
 extract` rebuilds the graph once the tables and documents are back.
 
+**Ingesting a folder.** `quack ingest DIR` on a directory that is not a bundle (no
+`index.md` or `log.md` at its top, `okf::Bundle::is_dir`) walks it (`ingestion::tree::Tree`:
+every file in path order, directories and files whose name starts with `.` skipped) and
+ingests each file `FileType::of` recognizes as a document named after it, recording the
+folder's canonical absolute path as `_quack_documents.source_root` and the file's
+root-relative `/`-separated path as `source_path` (`ingestion::tree::Folder`). The command prints one line per file (`ingested`, `replaced`,
+`skipped`, `failed`), then the unsupported files, then the documents whose file is gone.
+Running it again on the same folder: an unchanged file is skipped by the SHA-256 dedup; a
+changed file replaces the ready document at its path under the same root through the
+supersede operation above (`WorkspaceDb::newest_document_at_path`), keeping its pin; a
+ready document of that root (`documents_under`) whose path no file has now is reported,
+and deleted only with `--prune`. A
+file that fails to parse is reported and fails the command after the rest have run. The
+walk reports one progress unit per file through the run's `RunControl`; a cancel stops
+between files or inside one. There is no watcher or daemon: a cron line re-runs the
+command. Replacement, "gone", and pruning look only at documents of the folder being
+run: a workspace fed from several folders keeps them apart, and the same relative path
+under two folders is two documents. The web form and the API take files, not folders; the
+terminal's `/ingest` takes files.
+
 **Parsing.**
 
 | Type | Parser | Extracted metadata |
@@ -916,9 +936,25 @@ applies to the URL (`HTTPS_PROXY`, `HTTP_PROXY`; loopback and link-local are nev
 the proxy resolves the name, so quack checks only an address written in the URL and the
 proxy decides which hosts a name may reach.
 
-**Table naming.** The sanitized file stem. On collision the web UI and TUI ask (replace,
-rename, skip); the API and print mode require an explicit name. The prompt describes tables
-live on every build, with no cache (section 7.2).
+**Table naming.** The sanitized file stem. One live document owns a table: a changed file
+with the same name is refused (`Error::TableTaken`, 409) unless it replaces its
+predecessor. The prompt describes tables live on every build, with no cache (section 7.2).
+
+**Replacing a document.** `quack ingest FILE --replace [ID]` (the newest ready document
+with the file's name when no id is given), `POST .../documents?replace={doc}`, and the
+Replace control on a Documents page row register the new file with `NewFile::replaces`.
+The old document stays `ready` and serving, marked `superseded_by` the new id, until the
+new one reaches `ready`; then one writer step sets it `superseded` and hands its pin on. A
+table file loads over its predecessor's table (`CREATE OR REPLACE`, one statement), so the
+name stays the new document's. A failed replacement marks the new row `error` and clears
+the mark, so nothing changes; identical bytes are a duplicate even under `--replace`; a
+document that is not `ready`, or already has a replacement on its way, is refused with the
+reason. A superseded document is out of search (both legs filter on `ready`), the prompt's
+documents block, `list_documents`, `read_document`, and every live listing; its chunks and
+graph provenance stay in the file, so a citation in a stored session still opens on the
+passage page. Graph nodes extracted from it are kept and `graph status` does not change;
+`quack docs --all` and the Documents page's "Show replaced documents" list it with its
+successor. The terminal's `/ingest` takes paths only and has no `--replace`.
 
 Every SQL statement, the agent's or the user's, passes classification and resource limits
 (section 7.4).
@@ -1213,7 +1249,9 @@ terminal as a system line, SSE as a `status` event.
 
 1. Role and behavior for the mode (7.5): retrieve before answering, cite with `[n]`, run
    SQL rather than estimate, state assumptions, ask one clarifying question when the
-   request is ambiguous.
+   request is ambiguous. Then today's date (`Today is YYYY-MM-DD.`, the system's local
+   zone), so "last quarter" has an anchor without a tool call; it is the one line that
+   changes between turns, once a day.
 2. Tool guidance, the error rule (read a `run_sql` error, fix the statement, rerun it), and
    a Friendly SQL reference pinned to the bundled DuckDB version, which the prompt states.
    The reference covers only what the confined connection (7.4) can run (no file reads,
@@ -1306,6 +1344,7 @@ model (`test-utils`, a dev-dependency feature only).
 | Tool | Permission | Description |
 |------|------------|-------------|
 | `search_documents(query, top_k=8, document_ids?, entity?)` | none | Hybrid retrieval; returns chunks with citation metadata and the entities each was the source of |
+| `read_document(document, from=0, limit?)` | none | One document's chunks in order from a position, numbered for citing like search hits, within `[retrieval].pinned_token_budget` (at most 50 chunks a call), with a trailer saying where to continue; a document that is not ready or holds tables is refused with the reason |
 | `list_documents()` | none | Registry with status and pinned flag |
 | `run_sql(query)` | read: none; write: prompt | Execute SQL; result capped at `max_query_rows` with a trailer that says to narrow it in one statement, a note when the statement repeats an earlier one with only its literals changed (the one-query-per-group loop), and which tool call of `max_turns` this was |
 | `describe_table(table_name)` / `list_tables()` | none | Schema and inventory |
@@ -1394,7 +1433,9 @@ cover a write after it.
 
 Every interface returns one response object (11.2), built by `AgentResponse::to_json`:
 `answer`, `citations` (each with `n`, `chunk_id`, `document_id`, `filename`, `chunk_index`,
-`page`, `heading`, `label`), `queries`, `steps`, `graph`, `chart`, `write_refused`,
+`page`, `heading`, `ingested_at` (when the document was ingested, UTC; `null` on answers
+recorded before it was kept), `excerpt` (the first 500 characters of the chunk, with an
+ellipsis when cut; empty on older answers), `label`), `queries`, `steps`, `graph`, `chart`, `write_refused`,
 `cancelled`, `usage`, `duration_ms`, `session_id`. `AuthRequired` is exit code 4 from every command that
 reaches a provider.
 
@@ -1896,7 +1937,7 @@ mode emits:
 ```json
 {
   "answer": "...",
-  "citations": [{"n": 1, "document_id": "...", "filename": "Policy-2024.pdf", "page": 12, "heading": "Exclusions", "chunk_id": "...", "chunk_index": 3, "label": "Policy-2024.pdf p.12"}],
+  "citations": [{"n": 1, "document_id": "...", "filename": "Policy-2024.pdf", "page": 12, "heading": "Exclusions", "chunk_id": "...", "chunk_index": 3, "ingested_at": "2026-10-05T14:03:11.412", "excerpt": "Flood damage is excluded...", "label": "Policy-2024.pdf, page 12, under \"Exclusions\", ingested 2026-10-05"}],
   "queries": [{"sql": "...", "rows": 4, "duration_ms": 9}],
   "steps": [{"tool": "run_sql", "summary": "4 rows", "rows": 4, "duration_ms": 9, "detail": "..."}],
   "graph": {"nodes": [...], "edges": [...]},
@@ -1926,9 +1967,12 @@ POST   /api/v1/workspaces/{id}/sql                {sql}
 POST   /api/v1/workspaces/{id}/search         {query, top_k?}: hybrid retrieval, no LLM (the MCP `search` tool's names)
 GET    /api/v1/workspaces/{id}/documents
 POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 202 {id}
+                                                  ?replace={doc}: the one file takes that ready document's
+                                                  place once ready (the old one becomes "superseded")
                                                   (identical bytes: status "duplicate";
                                                   a table another document owns: 409)
 GET    /api/v1/workspaces/{id}/documents/{doc}    status, metadata
+GET    /api/v1/workspaces/{id}/documents/{doc}/chunks?from=0&limit=20   the chunks from position `from` in order (text, heading, page, position; limit at most 200), with the document's total; audited as opening the document
 PATCH  /api/v1/workspaces/{id}/documents/{doc}    {pinned}
 DELETE /api/v1/workspaces/{id}/documents/{doc}
 GET    /api/v1/workspaces/{id}/tables
@@ -2142,8 +2186,8 @@ quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query]
       [--allow-write] [-c | -r SESSION] [--stdin] [--verbose]
 quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
 quack workspace create NAME | list [--format json]
-quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed]
-quack docs [--format json] [--pin ID | --unpin ID | --delete ID]
+quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed] [--replace [ID]] [--prune]
+quack docs [--format json] [--all] [--pin ID | --unpin ID | --delete ID]
 quack embeddings refresh [-w NAME] [-y]
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
             | path FROM TO [--max-hops N] | status | extract [--source all|tables|documents]

@@ -239,6 +239,7 @@ mod tests {
             heading: None,
             page: None,
             score: 1.0,
+            ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
         }
     }
 

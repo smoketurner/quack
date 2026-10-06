@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -12,8 +13,8 @@ use serde_json::json;
 
 use crate::ids::{ChunkId, NodeId};
 use crate::storage::workspace::{
-    ChunkScope, ChunkSearchResult, HybridLimits, StatementKind, TEMP_OBJECT_REFUSED, WorkspaceDb,
-    creates_temp_object, quote_ident,
+    ChunkScope, ChunkSearchResult, DocumentInfo, DocumentStatus, HybridLimits, StatementKind,
+    TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object, quote_ident,
 };
 use crate::storage::writer::Writer;
 
@@ -30,7 +31,7 @@ use crate::ingestion::parser::PageCounts;
 use crate::llm::{RerankModel, SchemaCall};
 use crate::ontology::{ClassRelations, Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
-use crate::text::{Fenced, NonBlankText, OneLine};
+use crate::text::{Fenced, NonBlankText, OneLine, Tokens};
 
 /// A workspace's writer: its one write connection, on a thread of its own
 /// with a two-tier line of work ([`crate::storage::writer`]).
@@ -1010,7 +1011,7 @@ fn entity_chunks(
 pub fn format_search_results(
     results: &[ChunkSearchResult],
     markers: Markers,
-    entities: &std::collections::BTreeMap<ChunkId, Vec<String>>,
+    entities: &BTreeMap<ChunkId, Vec<String>>,
 ) -> Result<String, std::fmt::Error> {
     if results.is_empty() {
         return Ok(String::from(
@@ -1045,6 +1046,147 @@ pub fn format_search_results(
         writeln!(out)?;
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// read_document
+// ---------------------------------------------------------------------------
+
+/// Chunks one `read_document` call fetches at most; the token budget then
+/// decides how many of them the model sees.
+const MAX_READ_CHUNKS: u32 = 50;
+
+pub struct ReadDocumentTool {
+    db: ReaderDb,
+    /// Chunk text one call hands the model, at most:
+    /// `[retrieval].pinned_token_budget`, the budget a whole-document read
+    /// already has.
+    budget: Tokens,
+}
+
+impl ReadDocumentTool {
+    #[must_use]
+    pub const fn new(db: ReaderDb, retrieval: &RetrievalConfig) -> Self {
+        Self {
+            db,
+            budget: retrieval.pinned_token_budget,
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ReadDocumentArgs {
+    /// The document: an id from `list_documents` (a prefix is enough) or
+    /// its exact file name
+    pub document: String,
+    /// Position of the first chunk to read, counting from 0 (default 0)
+    pub from: Option<u32>,
+    /// How many chunks to read (default: as many as fit the budget, at
+    /// most 50)
+    pub limit: Option<u32>,
+}
+
+impl Tool for ReadDocumentTool {
+    const NAME: &'static str = ToolName::ReadDocument.as_str();
+    type Error = ToolError;
+    type Args = ReadDocumentArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        String::from(
+            "Read one document's chunks in order from a position, for a whole section or a \
+             document's start rather than the best-matching passages. Returns consecutive \
+             chunks numbered [n] for citing, like search_documents, within a token budget, \
+             and says where to continue.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        ReadDocumentArgs::schema()
+    }
+
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let turn = Turn::of(context)?;
+        let from = args.from.unwrap_or(0);
+        let limit = args
+            .limit
+            .unwrap_or(MAX_READ_CHUNKS)
+            .clamp(1, MAX_READ_CHUNKS);
+        let step = turn.recorder.start(
+            ToolName::ReadDocument,
+            &format!("{} from {from}", args.document),
+        );
+        let wanted = args.document;
+        let read = self
+            .db
+            .with_db(move |db| {
+                let documents = db.list_documents()?;
+                let document = DocumentInfo::find(&documents, &wanted)?.clone();
+                if document.status != DocumentStatus::Ready {
+                    return Err(Error::Analysis(format!(
+                        "{} is {}, not ready, so its text cannot be read",
+                        OneLine(&document.filename),
+                        document.status
+                    )));
+                }
+                let Some(total) = document.chunk_count.filter(|n| *n > 0) else {
+                    return Err(Error::Analysis(format!(
+                        "{} holds no text chunks: a tabular file is loaded as a table, which \
+                         run_sql reads",
+                        OneLine(&document.filename)
+                    )));
+                };
+                let chunks = db.document_chunks(&document.id, from, limit)?;
+                Ok((document, chunks, total))
+            })
+            .await;
+        let (document, chunks, total) = match read {
+            Ok(read) => read,
+            Err(e) => return Err(step.fail(e.into())),
+        };
+        // At least one chunk goes out whatever its size; the rest only
+        // while they fit the budget.
+        let mut kept: Vec<ChunkSearchResult> = Vec::with_capacity(chunks.len());
+        let mut used = Tokens::default();
+        for chunk in chunks {
+            let cost = Tokens::estimate(&chunk.content);
+            if !kept.is_empty() && used.saturating_add(cost) > self.budget {
+                break;
+            }
+            used = used.saturating_add(cost);
+            kept.push(chunk);
+        }
+        step.finish(format!("{} chunks", kept.len()));
+        let filename = OneLine(&document.filename);
+        let (Some(first), Some(last)) = (kept.first(), kept.last()) else {
+            return Ok(format!(
+                "{filename} has {total} chunks, positions 0 to {}; from = {from} is past the \
+                 end.",
+                total.saturating_sub(1)
+            ));
+        };
+        let (first, last) = (first.chunk_index, last.chunk_index);
+        let markers = turn.cite(&kept);
+        let mut out = format_search_results(&kept, markers, &BTreeMap::new())?;
+        if i64::from(last).saturating_add(1) >= total {
+            writeln!(
+                out,
+                "End of {filename}: chunks {first} to {last} of {total}."
+            )?;
+        } else {
+            writeln!(
+                out,
+                "Chunks {first} to {last} of {total} in {filename}; call read_document again \
+                 with from = {} for the rest.",
+                last.saturating_add(1)
+            )?;
+        }
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------

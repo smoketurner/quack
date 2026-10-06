@@ -66,7 +66,10 @@ open:
 
 A column that needs no backfill needs no bump: `ADD COLUMN IF NOT EXISTS` on open adds it,
 and rows written earlier read as `NULL`. `_quack_documents.page_count`, `pages_unreadable`,
-and `pages_empty` arrived this way.
+`pages_empty`, `superseded_by` (the id of the document replacing this one; the status
+`superseded` joined the four above with it), and `source_root` with `source_path` (the
+canonical path of the folder `quack ingest DIR` read the file from, and the file's path
+under it) arrived this way.
 
 Phrase search (`"..."` in a keyword query) needed no bump: it post-filters candidates by
 substring instead of adding term positions to `_quack_terms`.
