@@ -7,14 +7,14 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use quack_core::config::GraphConfig;
 use quack_core::extraction::{Extract, ExtractionRun};
 use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::query::{GraphQuery, PathQuery};
 use quack_core::graph::resolve::{MergeDecision, MergeProposal, ResolutionSummary};
 use quack_core::graph::store::Revalidation;
 use quack_core::graph::{
-    ExtractSource, GraphOptions, GraphStatus, Standing, extract, resolve, store as graph_store,
-    tables,
+    ExtractSource, GraphStatus, Standing, extract, resolve, store as graph_store, tables,
 };
 use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::llm::{self, Embeddings};
@@ -55,7 +55,7 @@ pub(crate) async fn search(
         q.hops,
     )
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let options = app.config.graph.options();
+    let options = app.config.graph;
     let detail = serde_json::to_value(&query)?;
     let model = access
         .model(
@@ -101,7 +101,7 @@ pub(crate) async fn path(
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let query = PathQuery::new(&q.from, &q.to, q.max_hops)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let options = app.config.graph.options();
+    let options = app.config.graph;
     let detail = serde_json::to_value(&query)?;
     let model = access
         .model(
@@ -241,7 +241,7 @@ impl Access {
             .await?;
         let ontology = ontology.ok_or_else(|| ApiError::bad_request("no ontology yet"))?;
         let version = ontology.saved_version()?;
-        let options = app.config.graph.options();
+        let options = app.config.graph;
         let embeddings = access
             .model(
                 app,
@@ -367,7 +367,7 @@ struct DocumentJob {
     embeddings: Option<Embeddings>,
     /// Freed when the pass ends.
     slot: ExtractionSlot,
-    options: GraphOptions,
+    options: GraphConfig,
 }
 
 impl DocumentJob {

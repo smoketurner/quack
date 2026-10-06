@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use quack_core::config::GraphConfig;
 use quack_core::embedding::{Dimension, Embedder, EmbeddingModel, Input, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::extraction::{Extract, ExtractFuture, ExtractionRun};
@@ -14,8 +15,8 @@ use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::{NewNode, Revalidation};
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    GraphOptions, GraphResult, Node, Origin, Properties, Standing, extract, resolve,
-    store as graph_store, tables, traverse,
+    GraphResult, Node, Origin, Properties, Standing, extract, resolve, store as graph_store,
+    tables, traverse,
 };
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
 use quack_core::ontology::candidates::{self, Queue};
@@ -264,9 +265,9 @@ fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
 
     // Vendor V0 is a hub with about a third of the shipments: a bounded
     // walk out of it returns at most max_nodes.
-    let options = GraphOptions {
+    let options = GraphConfig {
         max_nodes: 7,
-        ..GraphOptions::default()
+        ..GraphConfig::default()
     };
     let hub = traverse::resolve_entry(&db, "V0", Some("vendor"), None).unwrap();
     let found = traverse::neighborhood(&db, &hub, Hops::new(3), None, &options).unwrap();
@@ -348,10 +349,10 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
     graph_store::add_provenance(&db, &uganda_south, &doc("c2")).unwrap();
     let before = graph_store::status(&db).unwrap().nodes;
 
-    let options = GraphOptions {
+    let options = GraphConfig {
         merge_threshold: 0.5,
         auto_merge_threshold: 0.05,
-        ..GraphOptions::default()
+        ..GraphConfig::default()
     };
     let resolved = resolve::resolve(&writer, Some(&letters()), &options)
         .await
@@ -402,10 +403,10 @@ async fn rejected_merge_is_not_reproposed_when_provenance_flips_orientation() {
     };
     let chunk =
         |c: &str| graph_store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from(c), 0.9);
-    let options = GraphOptions {
+    let options = GraphConfig {
         merge_threshold: 0.5,
         auto_merge_threshold: -1.0,
-        ..GraphOptions::default()
+        ..GraphConfig::default()
     };
     let acme = graph_store::upsert_node(&db, &node("Acme")).unwrap();
     graph_store::add_provenance(&db, &acme, &chunk("c1")).unwrap();
@@ -468,10 +469,10 @@ async fn pending_pair_is_not_duplicated_when_provenance_flips_orientation() {
     };
     let chunk =
         |c: &str| graph_store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from(c), 0.9);
-    let options = GraphOptions {
+    let options = GraphConfig {
         merge_threshold: 0.5,
         auto_merge_threshold: -1.0,
-        ..GraphOptions::default()
+        ..GraphConfig::default()
     };
     let acme = graph_store::upsert_node(&db, &node("Acme")).unwrap();
     graph_store::add_provenance(&db, &acme, &chunk("c1")).unwrap();
@@ -672,10 +673,10 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
 
     // Resolution: Orgenics and Orgenics Ltd share a token and embed close,
     // so a merge is proposed; Aurobindo stays apart.
-    let options = GraphOptions {
+    let options = GraphConfig {
         merge_threshold: 0.5,
         auto_merge_threshold: 0.0,
-        ..GraphOptions::default()
+        ..GraphConfig::default()
     };
     let resolved = resolve::resolve(&writer, Some(&letters()), &options)
         .await
@@ -733,7 +734,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
 
 fn paths_merges_and_listing(
     db: &WorkspaceDb,
-    options: &GraphOptions,
+    options: &GraphConfig,
     hood: &GraphResult,
     roots: &[Node],
     current: &Ontology,
@@ -882,7 +883,7 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     // Query mode drops provisional results entirely.
     let roots = traverse::resolve_entry(&db, "Kenya", None, None).unwrap();
     let hood =
-        traverse::neighborhood(&db, &roots, Hops::new(1), None, &GraphOptions::default()).unwrap();
+        traverse::neighborhood(&db, &roots, Hops::new(1), None, &GraphConfig::default()).unwrap();
     assert!(!hood.is_empty());
     assert!(hood.without_provisional().is_empty());
     graph_store::mark_reviewed(&db).unwrap();
@@ -1059,9 +1060,9 @@ fn class_listings_report_the_total_they_were_capped_from() {
         .unwrap();
     }
     let current = ontology();
-    let options = GraphOptions {
+    let options = GraphConfig {
         max_nodes: 5,
-        ..GraphOptions::default()
+        ..GraphConfig::default()
     };
 
     let capped = traverse::by_class(&db, Some(&current), "country", 5, &options).unwrap();
@@ -1073,7 +1074,7 @@ fn class_listings_report_the_total_they_were_capped_from() {
     assert!(tree.contains("cut off at the node limit"), "{tree}");
 
     let whole =
-        traverse::by_class(&db, Some(&current), "country", 50, &GraphOptions::default()).unwrap();
+        traverse::by_class(&db, Some(&current), "country", 50, &GraphConfig::default()).unwrap();
     assert_eq!(whole.nodes.len(), 12);
     assert!(!whole.truncated);
     assert!(!whole.to_string().contains("cut off"), "{tree}");

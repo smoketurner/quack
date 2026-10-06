@@ -66,7 +66,7 @@ use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, passwo
 use super::error::ApiError;
 use super::oidc::Oidc;
 use super::state::{App, ServeMode};
-use quack_core::config::OidcConfig;
+use quack_core::config::{GraphConfig, OidcConfig};
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery};
@@ -74,7 +74,7 @@ use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::Revalidation;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    ExtractSource, GraphOptions, GraphResult, GraphStatus, Origin, resolve, store as graph_store,
+    ExtractSource, GraphResult, GraphStatus, Origin, resolve, store as graph_store,
 };
 use quack_core::import::ImportRequest;
 use quack_core::jobs::JobNumber;
@@ -2391,7 +2391,7 @@ async fn render_graph(
 ) -> WebResult<Response> {
     let access = Access::resolve(app, identity, id, Need::READ).await?;
     access.audit_read(app, AuditAction::Page, "graph").await?;
-    let options = app.config.graph.options();
+    let options = app.config.graph;
     let query = GraphQueryView::from_query(q);
     let ask = GraphAsk::of(q, app, &access).await?;
     let data = app
@@ -2489,7 +2489,7 @@ impl GraphAsk {
     }
 
     /// Its title and result, or why it could not run.
-    fn run(&self, db: &WorkspaceDb, options: &GraphOptions) -> Option<GraphAnswer> {
+    fn run(&self, db: &WorkspaceDb, options: &GraphConfig) -> Option<GraphAnswer> {
         match self {
             Self::Nothing => None,
             Self::Path(path, ends) => Some(GraphAnswer {
@@ -2532,7 +2532,7 @@ struct GraphAnswer {
 }
 
 impl GraphPageData {
-    fn read(db: &WorkspaceDb, ask: &GraphAsk, options: &GraphOptions) -> CoreResult<Self> {
+    fn read(db: &WorkspaceDb, ask: &GraphAsk, options: &GraphConfig) -> CoreResult<Self> {
         let status = graph_store::status(db)?;
         let ontology = ontology_store::current(db)?;
         let chunk_count =

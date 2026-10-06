@@ -23,7 +23,7 @@ use super::events::{DetailPreview, ToolName, TurnRecorder};
 use super::policy::{Exposure, Hold, RefusalFlag, WriteDecision, WritePolicy};
 use super::rerank::{self, ModelReranker, RerankAnswer, Reranker, ScoredReranker};
 use super::text_to_sql::Modeled;
-use crate::config::{RerankMode, RetrievalConfig};
+use crate::config::{GraphConfig, RerankMode, RetrievalConfig};
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
 use crate::ingestion::parser::PageCounts;
@@ -1420,7 +1420,7 @@ pub struct GraphTools<M> {
     pub db: ReaderDb,
     /// `None` resolves entities by exact label and alias only.
     pub embedding_model: Option<Embedder<M>>,
-    pub options: graph::GraphOptions,
+    pub options: GraphConfig,
     /// Query mode does not answer from provisional nodes.
     pub mode: ChatMode,
 }

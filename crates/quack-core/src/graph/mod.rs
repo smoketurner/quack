@@ -550,29 +550,6 @@ impl ExtractSource {
     }
 }
 
-/// Tuning for traversal and resolution, from `[graph]`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct GraphOptions {
-    pub max_traversal_depth: u32,
-    pub max_nodes: u32,
-    /// Cosine distance under which two labels of one class are proposed
-    /// as a merge.
-    pub merge_threshold: f64,
-    /// Cosine distance under which the merge happens without review.
-    pub auto_merge_threshold: f64,
-}
-
-impl Default for GraphOptions {
-    fn default() -> Self {
-        Self {
-            max_traversal_depth: 3,
-            max_nodes: 200,
-            merge_threshold: 0.08,
-            auto_merge_threshold: 0.02,
-        }
-    }
-}
-
 /// The graph tables, created with the workspace's embedding dimension.
 #[must_use]
 pub fn ddl(dimension: Dimension) -> String {

@@ -1252,7 +1252,7 @@ impl TurnRequest<'_> {
             rerank_model,
             config: &config.analysis,
             retrieval_config: &config.retrieval,
-            graph_options: config.graph.options(),
+            graph_options: config.graph,
             write_policy: policy,
             prompt,
             history,

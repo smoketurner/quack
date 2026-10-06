@@ -221,7 +221,7 @@ async fn run_search(
         hops,
         format,
     } = args;
-    let options = config.graph.options();
+    let options = config.graph;
     let query = GraphQuery::new(
         entity.as_deref(),
         class.as_deref(),
@@ -258,7 +258,7 @@ async fn run_path(
         max_hops,
         format,
     } = args;
-    let options = config.graph.options();
+    let options = config.graph;
     let query = PathQuery::new(&from, &to, Some(max_hops))?;
     let model = Embeddings::from_config(config).await?;
     let ends = query.embeddings(model.as_ref()).await?;
@@ -395,7 +395,7 @@ async fn run_extract(
         }
     }
     let embeddings = Embeddings::from_config(config).await?;
-    let resolved = resolve::resolve(db, embeddings.as_ref(), &config.graph.options()).await?;
+    let resolved = resolve::resolve(db, embeddings.as_ref(), &config.graph).await?;
     if resolved.auto_merged > 0 || resolved.proposed > 0 {
         writeln!(
             out,

@@ -8,7 +8,8 @@ use std::time::Instant;
 
 use crate::embedding::EmbeddingModel;
 
-use super::{GraphOptions, Node, store};
+use super::{Node, store};
+use crate::config::GraphConfig;
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
 use crate::ids::{MergeId, NodeId};
@@ -93,7 +94,7 @@ pub struct ResolutionSummary {
 pub async fn resolve<M: EmbeddingModel>(
     db: &Writer,
     embedder: Option<&Embedder<M>>,
-    options: &GraphOptions,
+    options: &GraphConfig,
 ) -> Result<ResolutionSummary> {
     let mut summary = ResolutionSummary::default();
     let Some(embedder) = embedder else {
@@ -250,7 +251,7 @@ struct MergeCounts {
 /// alike their labels (issue #41: WEST VIRGINIA is not VIRGINIA). A pair
 /// with one keyed side is only ever proposed; auto-merge is reserved for
 /// two model-extracted nodes.
-fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<MergeCounts> {
+fn propose_merges(db: &WorkspaceDb, options: &GraphConfig) -> Result<MergeCounts> {
     // The keyed flag is computed per node before the join: a correlated
     // EXISTS per pair row, or a window over the pairs, made DuckDB run
     // out of its 256 MiB on 3,667 nodes, while this streams in seconds.

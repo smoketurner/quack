@@ -2396,7 +2396,7 @@ impl App {
     /// `/graph ENTITY [HOPS]` or `/graph --class CLASS`: a tree of the
     /// neighbourhood or of the class's entities.
     fn show_graph(&mut self, walk: GraphWalk) {
-        let options = self.config.graph.options();
+        let options = self.config.graph;
         let query = match walk {
             GraphWalk::Class(class) => GraphQuery::new(None, Some(&class), None, None),
             GraphWalk::Entity { name, hops } => {
@@ -2426,7 +2426,7 @@ impl App {
 
     /// `/path FROM -> TO`: the shortest relation chain.
     fn show_path(&mut self, route: &Route) {
-        let options = self.config.graph.options();
+        let options = self.config.graph;
         let query = match PathQuery::new(&route.from, &route.to, None) {
             Ok(query) => query,
             Err(e) => return self.note(MessageKind::Error, e.to_string()),

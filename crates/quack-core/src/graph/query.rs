@@ -8,8 +8,9 @@ use std::fmt;
 use crate::embedding::EmbeddingModel;
 use serde::Serialize;
 
+use super::GraphResult;
 use super::traverse::{self, Hops};
-use super::{GraphOptions, GraphResult};
+use crate::config::GraphConfig;
 use crate::embedding::{Embedder, Vector};
 use crate::error::{Error, Result};
 use crate::ontology::{Ontology, store as ontology_store};
@@ -88,7 +89,7 @@ impl GraphQuery {
         &self,
         db: &WorkspaceDb,
         embedding: Option<&Vector>,
-        options: &GraphOptions,
+        options: &GraphConfig,
     ) -> Result<GraphResult> {
         let ontology = ontology_store::current(db)?;
         if let Some(class) = self.class.as_deref() {
@@ -190,7 +191,7 @@ impl PathQuery {
         &self,
         db: &WorkspaceDb,
         ends: &PathEnds,
-        options: &GraphOptions,
+        options: &GraphConfig,
     ) -> Result<GraphResult> {
         let from = traverse::resolve_entry(db, &self.from, None, ends.from.as_ref())?;
         let to = traverse::resolve_entry(db, &self.to, None, ends.to.as_ref())?;

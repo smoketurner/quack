@@ -718,7 +718,7 @@ impl McpServer {
             Ok(query) => query,
             Err(e) => return Ok(failure(e.to_string())),
         };
-        let options = self.inner.config.graph.options();
+        let options = self.inner.config.graph;
         let detail = serde_json::to_value(&query).map_err(internal)?;
         let model = match Embeddings::from_config(&self.inner.config).await {
             Ok(model) => model,
@@ -765,7 +765,7 @@ impl McpServer {
             Ok(query) => query,
             Err(e) => return Ok(failure(e.to_string())),
         };
-        let options = self.inner.config.graph.options();
+        let options = self.inner.config.graph;
         let detail = serde_json::to_value(&query).map_err(internal)?;
         let PathQuery { from, to, max_hops } = query.clone();
         let model = match Embeddings::from_config(&self.inner.config).await {
