@@ -855,7 +855,9 @@ async fn a_dropped_file_loads_at_once_and_other_pastes_are_typed_in() {
     settle(&mut app).await;
 
     // Names cut short by a word starting with `#` load nothing, typed
-    // as a line or after /ingest, and the error says why.
+    // as a line or after /ingest, and the error says why. Windows quoting
+    // has no comments, so there the `#` word is just a missing file.
+    #[cfg(not(windows))]
     for line in [
         format!("{dropped} #drafts.md"),
         format!("/ingest {dropped} #drafts.md"),
