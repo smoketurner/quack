@@ -1216,3 +1216,283 @@ fn every_audit_action_is_documented() {
         "docs/audit.md lacks a row for: {missing:?}"
     );
 }
+
+/// Disabling refuses the password before it is checked and enabling takes
+/// it back; too many wrong passwords lock the account for the configured
+/// minutes, and a right one or an enable clears the count.
+#[tokio::test]
+async fn users_are_disabled_enabled_and_locked_out() {
+    let (_dir, cp) = open().await;
+    let alice = cp
+        .create_user("alice", "hunter42", UserKind::Standard, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let lockout = Lockout {
+        attempts: 2,
+        minutes: 15,
+    };
+    assert!(matches!(
+        cp.check_password("alice", "hunter42", lockout).await,
+        Ok(PasswordCheck::Verified(u)) if u.id == alice.id
+    ));
+    assert!(matches!(
+        cp.check_password("alice", "wrong", lockout).await,
+        Ok(PasswordCheck::Wrong(Some(id))) if id == alice.id
+    ));
+    assert!(matches!(
+        cp.check_password("nobody", "wrong", lockout).await,
+        Ok(PasswordCheck::Wrong(None))
+    ));
+    // The second wrong password in a row locks; the right one is refused
+    // until the lock lifts.
+    assert!(matches!(
+        cp.check_password("alice", "wrong", lockout).await,
+        Ok(PasswordCheck::Locked { user_id, .. }) if user_id == alice.id
+    ));
+    assert!(matches!(
+        cp.check_password("alice", "hunter42", lockout).await,
+        Ok(PasswordCheck::Locked { .. })
+    ));
+    let row = cp
+        .get_user(&alice.id)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .unwrap_or_else(|| fail("alice exists"));
+    assert!(row.locked_until.is_some());
+    cp.enable_user(&alice.id, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(matches!(
+        cp.check_password("alice", "hunter42", lockout).await,
+        Ok(PasswordCheck::Verified(_))
+    ));
+    // Attempts 0 never locks.
+    let never = Lockout::default();
+    for _ in 0..5 {
+        assert!(matches!(
+            cp.check_password("alice", "wrong", never).await,
+            Ok(PasswordCheck::Wrong(Some(_)))
+        ));
+    }
+    cp.disable_user(&alice.id, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(matches!(
+        cp.check_password("alice", "hunter42", lockout).await,
+        Ok(PasswordCheck::Disabled(id)) if id == alice.id
+    ));
+    assert!(
+        cp.get_user(&alice.id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .is_some_and(|u| u.is_disabled())
+    );
+    cp.set_password(&alice.id, "newer", setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.enable_user(&alice.id, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(matches!(
+        cp.check_password("alice", "newer", lockout).await,
+        Ok(PasswordCheck::Verified(_))
+    ));
+    cp.set_admin(&alice.id, UserKind::Admin, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        cp.get_user(&alice.id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .is_some_and(|u| u.kind == UserKind::Admin)
+    );
+    assert!(cp.set_password(&alice.id, "", setup_audit()).await.is_err());
+    let missing = UserId::generate();
+    assert!(cp.disable_user(&missing, setup_audit()).await.is_err());
+}
+
+/// Deleting a user takes their memberships and API tokens with them and
+/// leaves the audit rows that name them.
+#[tokio::test]
+async fn deleting_a_user_takes_tokens_and_memberships_and_keeps_the_audit() {
+    let (_dir, cp) = open().await;
+    let bob = cp
+        .create_user("bob", "pw", UserKind::Standard, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let ws = cp
+        .create_workspace(&workspace_name("sales"), Some(&bob.id), setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let issued = cp
+        .create_token(&ws.id, &bob.id, "t", &[Scope::Read], None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.delete_user(&bob.id, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        cp.get_user(&bob.id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .is_none()
+    );
+    assert!(
+        cp.find_token(&issued.row.token_hash)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .is_none()
+    );
+    assert!(
+        cp.list_members(&ws.id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .is_empty()
+    );
+    let rows = cp
+        .query_audit(&AuditFilter {
+            workspace_id: Some(ws.id.clone()),
+            limit: 10,
+            ..AuditFilter::default()
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .rows;
+    assert!(!rows.is_empty(), "the workspace's rows outlive its member");
+    assert!(cp.delete_user(&bob.id, setup_audit()).await.is_err());
+}
+
+/// Group roles grant the highest role among a person's groups, change it
+/// when the groups change, revoke it when they leave, and never touch a
+/// role a person gave by hand.
+#[tokio::test]
+async fn memberships_follow_group_roles_without_touching_hand_grants() {
+    let (_dir, cp) = open().await;
+    let carol = cp
+        .create_user("carol", "pw", UserKind::Standard, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let sales = cp
+        .create_workspace(&workspace_name("sales"), None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let ops = cp
+        .create_workspace(&workspace_name("ops"), None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.set_group_role(&sales.id, "finance", Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.set_group_role(&sales.id, "leads", Role::Owner, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.set_group_role(&ops.id, "finance", Role::Member, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        cp.set_group_role(&ops.id, " ", Role::Member, setup_audit())
+            .await
+            .is_err()
+    );
+    // A hand grant in ops that the groups would otherwise change.
+    cp.set_member(&ops.id, &carol.id, Role::Owner, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+    let groups = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+    let member_audit = || AuditEntry::new(AuditAction::Member, Outcome::Allowed, Channel::Web);
+    let outcome = cp
+        .reconcile_idp_memberships(&carol.id, &groups(&["finance", "leads"]), member_audit)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        outcome,
+        Reconciled {
+            granted: 1,
+            changed: 0,
+            revoked: 0
+        }
+    );
+    let role_in = |ws: &WorkspaceId| {
+        let ws = ws.clone();
+        let cp = &cp;
+        async move {
+            cp.list_members(&ws)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .into_iter()
+                .find(|m| m.username == "carol")
+                .map(|m| (m.role, m.granted_by))
+        }
+    };
+    assert_eq!(
+        role_in(&sales.id).await,
+        Some((Role::Owner, GrantedBy::Idp))
+    );
+    assert_eq!(role_in(&ops.id).await, Some((Role::Owner, GrantedBy::User)));
+
+    // Leaving the leads group lowers the role; leaving finance revokes it.
+    let outcome = cp
+        .reconcile_idp_memberships(&carol.id, &groups(&["finance"]), member_audit)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(outcome.changed, 1);
+    assert_eq!(
+        role_in(&sales.id).await,
+        Some((Role::Viewer, GrantedBy::Idp))
+    );
+    let outcome = cp
+        .reconcile_idp_memberships(&carol.id, &[], member_audit)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(outcome.revoked, 1);
+    assert_eq!(role_in(&sales.id).await, None);
+    assert_eq!(role_in(&ops.id).await, Some((Role::Owner, GrantedBy::User)));
+    // Each change was audited as a member row.
+    let rows = cp
+        .query_audit(&AuditFilter {
+            user_id: None,
+            workspace_id: Some(sales.id.clone()),
+            action: Some(String::from("member")),
+            limit: 10,
+            ..AuditFilter::default()
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .rows;
+    assert_eq!(rows.len(), 3, "{rows:?}");
+}
+
+/// A group's role is set, listed, and removed; removing one it never had
+/// says so.
+#[tokio::test]
+async fn group_roles_are_set_listed_and_removed() {
+    let (_dir, cp) = open().await;
+    let sales = cp
+        .create_workspace(&workspace_name("sales"), None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.set_group_role(&sales.id, "finance", Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.set_group_role(&sales.id, "leads", Role::Owner, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        cp.remove_group_role(&sales.id, "leads", setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    );
+    assert!(
+        !cp.remove_group_role(&sales.id, "leads", setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    );
+    assert_eq!(
+        cp.list_group_roles(&sales.id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .len(),
+        1
+    );
+}

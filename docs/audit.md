@@ -25,6 +25,7 @@ API Activity event with that name.
 | `login` | A password login or an identity-provider sign-in, on both routes | `allowed`, `denied` (wrong password, disabled or locked account, refused sign-in) | Authentication: Logon |
 | `logout` | A session ends on request | `allowed` | Authentication: Logoff |
 | `session` | A session cookie that has expired, or one the issuer no longer vouches for, is presented | `denied` | Authentication: Logon |
+| `password` | A person changes their own password (`POST /auth/password`), proving the current one first | `allowed`, `denied` (the current password is wrong, or the account is disabled or locked) | API: Update |
 | `admin` | A user is created or changed (`quack user`, the Users page, `/admin/users`) | `allowed` | API: Create |
 | `workspace` | A workspace is created, renamed, or its settings change | `allowed` | API: Other |
 | `member` | A membership is added, changed, or removed, by a person or by the identity provider's groups | `allowed`, `error` (removing a non-member) | API: Update |

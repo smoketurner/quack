@@ -26,9 +26,12 @@ version with a SHA-384 checksum of its file.
   label), membership, tokens (API token hashes; signed-in users' and model providers' OAuth
   tokens in `user_tokens` and `provider_tokens`), each OAuth client's `private_key_jwt`
   signing key in `client_keys` (version 7), the clients quack registered itself (RFC 7591)
-  with their registration access tokens in `client_registrations` (version 8), and the
-  access `audit_log`. The vault seals every token and key. The audit log is append-only; no
-  code path may `UPDATE` or `DELETE` it.
+  with their registration access tokens in `client_registrations` (version 8), each user's
+  lifecycle columns (`disabled_at`, `password_changed_at`, `failed_logins`, `locked_until`;
+  version 9), the roles an identity provider's groups carry in `group_roles` and which
+  memberships that provider granted (`members.granted_by`; version 10), and the access
+  `audit_log`. The vault seals every token and key. The audit log is append-only; no code
+  path may `UPDATE` or `DELETE` it.
 
 ### Databases created before the switch
 

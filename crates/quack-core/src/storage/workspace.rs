@@ -15,7 +15,7 @@ use crate::embedding::{
 };
 use crate::error::{Error, Result, WrittenBy};
 use crate::graph;
-use crate::ids::{ChunkId, DocumentId, NodeId};
+use crate::ids::{ChunkId, DocumentId, NodeId, UserId};
 use crate::ingestion::TableName;
 use crate::ingestion::parser::{FileType, Load, PageCounts};
 use crate::ontology::store::Acceptance;
@@ -38,6 +38,10 @@ const REINDEX_PAGE: u32 = 1000;
 
 /// Every internal table carries this prefix; anything starting with it is hidden.
 pub const INTERNAL_PREFIX: &str = "_quack_";
+
+/// What a deleted user's id and name become in a workspace file
+/// (`WorkspaceDb::forget_user`).
+pub const REMOVED_USER: &str = "removed";
 
 /// The keyword index gained joined identifier terms (`pol8841` beside
 /// `pol` and `8841`); every chunk is reindexed.
@@ -1839,6 +1843,43 @@ impl WorkspaceDb {
             return Ok(chunks > 0);
         }
         Ok(true)
+    }
+
+    /// Replace a deleted user's id and name in this file with
+    /// [`REMOVED_USER`]: the sessions they made, the documents they
+    /// ingested, the context versions they edited, and the detail audit
+    /// rows that name them. The access audit in `control.db` keeps the id.
+    /// Returns how many rows changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an update fails.
+    pub fn forget_user(&self, user_id: &UserId, username: &str) -> Result<usize> {
+        let mut changed = 0_usize;
+        for (sql, value) in [
+            (
+                "UPDATE _quack_sessions SET created_by = ? WHERE created_by = ?",
+                user_id.as_str(),
+            ),
+            (
+                "UPDATE _quack_documents SET ingested_by = ? WHERE ingested_by = ?",
+                user_id.as_str(),
+            ),
+            (
+                "UPDATE _quack_audit SET user_id = ? WHERE user_id = ?",
+                user_id.as_str(),
+            ),
+            (
+                "UPDATE _quack_context SET edited_by = ? WHERE edited_by = ?",
+                username,
+            ),
+        ] {
+            changed = changed.saturating_add(
+                self.conn
+                    .execute(sql, duckdb::params![REMOVED_USER, value])?,
+            );
+        }
+        Ok(changed)
     }
 
     /// Fail every document still `queued` or `processing`: called once

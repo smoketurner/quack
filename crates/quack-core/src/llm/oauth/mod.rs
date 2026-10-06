@@ -115,6 +115,8 @@ pub(crate) struct Endpoints {
     /// Whether every authorization redirect carries `iss` (RFC 9207).
     #[serde(default)]
     authorization_response_iss_parameter_supported: bool,
+    /// The claims the issuer may put in its tokens, when it lists them.
+    pub(crate) claims_supported: Option<Vec<String>>,
 }
 
 impl Endpoints {

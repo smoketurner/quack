@@ -1,3 +1,4 @@
+use ipnet::IpNet;
 use serde::Deserialize;
 use std::borrow::{Borrow, Cow};
 use std::collections::BTreeMap;
@@ -1215,9 +1216,46 @@ pub struct ServerConfig {
     /// How long a stopping server waits for its jobs to end and its
     /// requests to finish before it exits anyway.
     pub shutdown_grace_seconds: u32,
+    /// Wrong passwords in a row before an account is locked for
+    /// `login_lockout_minutes`; 0 never locks (the login rate limit alone).
+    pub login_lockout_attempts: u32,
+    /// How long a locked account refuses logins; the lock lifts by itself.
+    pub login_lockout_minutes: u32,
+    /// Address ranges of the proxies in front of this server. A request
+    /// from one of them is attributed to the client its forwarded headers
+    /// name (`quack_core::net`); from anyone else, to the peer itself.
+    pub trusted_proxies: Vec<IpNet>,
     /// Sign-in through the organization's `OpenID` Connect issuer, beside
     /// password login.
     pub oidc: Option<OidcConfig>,
+}
+
+impl ServerConfig {
+    /// The login lockout these settings describe.
+    #[must_use]
+    pub fn lockout(&self) -> Lockout {
+        Lockout {
+            attempts: self.login_lockout_attempts,
+            minutes: self.login_lockout_minutes,
+        }
+    }
+}
+
+/// When wrong passwords lock an account, and for how long: Auth0's
+/// brute-force protection model, a timed lock that lifts by itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Lockout {
+    /// Wrong passwords in a row before the lock; 0 never locks.
+    pub attempts: u32,
+    pub minutes: u32,
+}
+
+impl Lockout {
+    /// Whether `failed` wrong passwords in a row lock the account.
+    #[must_use]
+    pub fn locks_after(self, failed: u32) -> bool {
+        self.attempts > 0 && failed >= self.attempts
+    }
 }
 
 /// `[server.oidc]`: people sign in to `quack serve` with the organization's
@@ -1256,6 +1294,10 @@ pub struct OidcConfig {
     /// `sub` by default; Entra's `sub` differs per application, so Entra
     /// deployments set `oid`.
     pub subject_claim: String,
+    /// The claim that lists the person's groups (`groups` at most issuers).
+    /// Set, each sign-in grants and revokes the workspace roles
+    /// `group_roles` gives those groups; unset, memberships are by hand.
+    pub groups_claim: Option<String>,
 }
 
 impl OidcConfig {
@@ -1312,6 +1354,7 @@ struct RawOidcConfig {
     audience: Option<String>,
     #[serde(default = "OidcConfig::default_subject_claim")]
     subject_claim: String,
+    groups_claim: Option<String>,
 }
 
 impl TryFrom<RawOidcConfig> for OidcConfig {
@@ -1371,6 +1414,10 @@ impl TryFrom<RawOidcConfig> for OidcConfig {
             redirect_uri: raw.redirect_uri,
             audience,
             subject_claim,
+            groups_claim: raw
+                .groups_claim
+                .map(|c| c.trim().to_owned())
+                .filter(|c| !c.is_empty()),
         })
     }
 }
@@ -1386,6 +1433,9 @@ impl Default for ServerConfig {
             secure_cookies: SecureCookies::Auto,
             permission_timeout_seconds: 300,
             shutdown_grace_seconds: 20,
+            login_lockout_attempts: 5,
+            login_lockout_minutes: 15,
+            trusted_proxies: Vec::new(),
             oidc: None,
         }
     }
