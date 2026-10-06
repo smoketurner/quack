@@ -82,6 +82,7 @@ impl EventClass {
             | AuditAction::Snapshot
             | AuditAction::Restore
             | AuditAction::GraphEdit
+            | AuditAction::Password
             | AuditAction::EmbeddingsRefresh => Self::Api(Update),
             AuditAction::Delete => Self::Api(Delete),
             // A name a newer build wrote is an API event under its own name.

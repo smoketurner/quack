@@ -110,8 +110,12 @@ impl MakeRequestId for RequestIdV7 {
 /// one alike (issue #237). The peer address is the one thing a caller cannot
 /// choose per request. The price is that everyone behind one address (a NAT,
 /// or a reverse proxy in front of quack) shares one budget.
+///
+/// Behind a proxy in `[server].trusted_proxies`, the key is the client the
+/// proxy's forwarded headers name (`auth::client_ip`), so an organization
+/// behind one proxy is not one bucket.
 #[derive(Clone)]
-struct CallerKey;
+struct CallerKey(App);
 
 impl KeyExtractor for CallerKey {
     type Key = std::net::IpAddr;
@@ -123,7 +127,7 @@ impl KeyExtractor for CallerKey {
             .extensions()
             .get::<axum::extract::ConnectInfo<SocketAddr>>()
             .map_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |c| {
-                c.0.ip()
+                auth::client_ip(c.0.ip(), req.headers(), &self.0)
             }))
     }
 }
@@ -132,12 +136,13 @@ impl KeyExtractor for CallerKey {
 /// bucket, so a browser hammering the form cannot spend the budget the API
 /// login would have had, or the other way round.
 pub(crate) fn throttled_login(
+    app: &App,
     route: axum::routing::MethodRouter<App>,
 ) -> axum::routing::MethodRouter<App> {
     let config = GovernorConfigBuilder::default()
         .per_second(LOGIN_RATE_PER_SECOND)
         .burst_size(LOGIN_RATE_BURST)
-        .key_extractor(CallerKey)
+        .key_extractor(CallerKey(Arc::clone(app)))
         .finish()
         .map(Arc::new);
     let Some(config) = config else {
@@ -158,7 +163,7 @@ pub(crate) fn router(app: App) -> Router {
     let governor = GovernorConfigBuilder::default()
         .per_second(RATE_PER_SECOND)
         .burst_size(RATE_BURST)
-        .key_extractor(CallerKey)
+        .key_extractor(CallerKey(Arc::clone(&app)))
         .finish()
         .map(Arc::new);
     // Everything a caller can reach is rate limited, not just the API: the
@@ -173,8 +178,8 @@ pub(crate) fn router(app: App) -> Router {
             &format!("{}/{{*path}}", resource::METADATA_PATH),
             get(resource::metadata_for),
         )
-        .nest("/api/v1", api::router())
-        .merge(web::router());
+        .nest("/api/v1", api::router(&app))
+        .merge(web::router(&app));
     if let Some(config) = governor {
         let limiter = Arc::clone(config.limiter());
         spawn_cleanup(RATE_CLEANUP_INTERVAL, move || limiter.retain_recent());
@@ -386,7 +391,7 @@ async fn metrics(
     peer: auth::Peer,
     identity: Result<auth::Identity, error::ApiError>,
 ) -> axum::response::Response {
-    let local = peer.0.is_some_and(|addr| addr.ip().is_loopback());
+    let local = peer.0.is_some_and(|ip| ip.is_loopback());
     if !local {
         match identity {
             Ok(identity) => {

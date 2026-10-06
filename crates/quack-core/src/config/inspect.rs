@@ -409,6 +409,9 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "permission_timeout_seconds",
             "shutdown_grace_seconds",
             "log_format",
+            "login_lockout_attempts",
+            "login_lockout_minutes",
+            "trusted_proxies",
         ],
     ),
     (
@@ -479,6 +482,7 @@ const OIDC_KEYS: &[&str] = &[
     "redirect_uri",
     "audience",
     "subject_claim",
+    "groups_claim",
 ];
 
 /// The keys a `[providers.NAME.oauth]` table accepts.
@@ -883,6 +887,26 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         default.log_format.as_str(),
         None,
     );
+    s.literal(
+        "login_lockout_attempts",
+        server.login_lockout_attempts,
+        default.login_lockout_attempts,
+    );
+    s.literal(
+        "login_lockout_minutes",
+        server.login_lockout_minutes,
+        default.login_lockout_minutes,
+    );
+    let proxies: Vec<String> = server
+        .trusted_proxies
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    s.optional(
+        "trusted_proxies",
+        Some(render_list(&proxies)),
+        Some(String::from("[]")),
+    );
     let Some(oidc) = &server.oidc else {
         return;
     };
@@ -909,6 +933,7 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         OidcConfig::DEFAULT_SUBJECT_CLAIM,
         None,
     );
+    s.optional_text("groups_claim", oidc.groups_claim.as_deref(), None);
 }
 
 fn jobs(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {

@@ -19,15 +19,16 @@ use quack_core::crypto::sha256_hex;
 use quack_core::error::Error as CoreError;
 use quack_core::ids::{AuditId, UserId, WorkspaceId};
 use quack_core::llm::egress::Egress;
+use quack_core::net::{self, Forwarded};
 use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditResource, Channel, Membership, Origin, Outcome, Role, Scope,
-    Standing, TokenRow, UserKind, UserRow, WorkspaceRow,
+    AuditAction, AuditEntry, AuditResource, Channel, Membership, Origin, Outcome, PasswordCheck,
+    Role, Scope, Standing, TokenRow, UserKind, UserRow, WorkspaceRow,
 };
 use quack_core::storage::sessions::SessionViewer;
 use quack_core::web_sessions::{SessionLookup, SessionToken};
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use super::error::{ApiError, ApiResult};
 use super::oidc::Oidc;
@@ -97,26 +98,30 @@ impl Identity {
 /// production `into_make_service_with_connect_info` always does; the
 /// `oneshot` tests never do.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Peer(pub Option<SocketAddr>);
+pub(crate) struct Peer(pub Option<IpAddr>);
 
-impl<S: Send + Sync> FromRequestParts<S> for Peer {
+impl FromRequestParts<App> for Peer {
     type Rejection = Infallible;
 
     fn from_request_parts(
         parts: &mut Parts,
-        _: &S,
+        state: &App,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> {
-        std::future::ready(Ok(Self::of(parts)))
+        std::future::ready(Ok(Self::of(parts, state)))
     }
 }
 
 impl Peer {
-    fn of(parts: &Parts) -> Self {
+    /// The client: the TCP peer, or when that peer is one of
+    /// `[server].trusted_proxies`, the address its forwarded headers name
+    /// (`quack_core::net`). Audit rows, the `Secure` cookie decision, and
+    /// the rate limiter all take this one answer.
+    fn of(parts: &Parts, app: &App) -> Self {
         Self(
             parts
                 .extensions
                 .get::<ConnectInfo<SocketAddr>>()
-                .map(|info| info.0),
+                .map(|info| client_ip(info.0.ip(), &parts.headers, app)),
         )
     }
 
@@ -128,12 +133,27 @@ impl Peer {
     /// URL is https or was told to always set it: a proxy on the same host
     /// also arrives on loopback (issue #246).
     pub(crate) fn needs_secure(self, server: &ServerConfig) -> bool {
-        self.0.is_some_and(|addr| !addr.ip().is_loopback()) || server.secure_cookies_on_loopback()
+        self.0.is_some_and(|ip| !ip.is_loopback()) || server.secure_cookies_on_loopback()
     }
 
     pub(crate) fn ip(self) -> Option<String> {
-        self.0.map(|addr| addr.ip().to_string())
+        self.0.map(|ip| ip.to_string())
     }
+}
+
+/// The client behind `peer` under the server's trusted proxies.
+pub(crate) fn client_ip(peer: IpAddr, headers: &HeaderMap, app: &App) -> IpAddr {
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    net::client_addr(
+        peer,
+        Forwarded {
+            rfc7239: text("forwarded"),
+            x_forwarded_for: text("x-forwarded-for"),
+            x_forwarded_proto: text("x-forwarded-proto"),
+        },
+        &app.config.server.trusted_proxies,
+    )
+    .ip
 }
 
 /// The id the request-id layer put on the request, for audit rows: the
@@ -209,37 +229,64 @@ pub(crate) async fn password_login(
     username: &str,
     password: &str,
 ) -> ApiResult<Login> {
-    let verified = app.control.verify_password(username, password).await?;
+    let checked = app
+        .control
+        .check_password(username, password, app.config.server.lockout())
+        .await?;
     let origin = Origin {
         channel: Channel::Web,
         client_addr: peer.ip(),
         request_id,
     };
-    let mut entry = AuditEntry::new(
-        LOGIN_ACTION,
-        if verified.is_some() {
-            Outcome::Allowed
-        } else {
+    let outcome = match &checked {
+        PasswordCheck::Verified(_) => Outcome::Allowed,
+        PasswordCheck::Wrong(_) | PasswordCheck::Disabled(_) | PasswordCheck::Locked { .. } => {
             Outcome::Denied
-        },
-        origin,
-    );
-    entry.user_id = match &verified {
-        Some(user) => Some(user.id.clone()),
-        // Name the account a wrong password was aimed at, when there is one.
-        None => app
-            .control
-            .find_user_by_username(username)
-            .await?
-            .map(|u| u.id),
+        }
+    };
+    let mut entry = AuditEntry::new(LOGIN_ACTION, outcome, origin);
+    // Name the account a wrong password was aimed at, when there is one.
+    entry.user_id = match &checked {
+        PasswordCheck::Verified(user) => Some(user.id.clone()),
+        PasswordCheck::Wrong(user_id) => user_id.clone(),
+        PasswordCheck::Disabled(user_id) | PasswordCheck::Locked { user_id, .. } => {
+            Some(user_id.clone())
+        }
     };
     app.control.record_audit(&entry).await?;
 
-    let Some(user) = verified else {
-        return Err(ApiError::unauthorized("wrong username or password"));
+    let user = match checked {
+        PasswordCheck::Verified(user) => user,
+        // A disabled account answers as a wrong password would: the
+        // response says nothing about whether the name exists.
+        PasswordCheck::Wrong(_) | PasswordCheck::Disabled(_) => {
+            return Err(ApiError::unauthorized("wrong username or password"));
+        }
+        PasswordCheck::Locked { until, .. } => {
+            return Err(ApiError::unauthorized(format!(
+                "too many wrong passwords; try again after {until}"
+            )));
+        }
     };
     let token = app.sessions.open(&user.id, None)?;
     Ok(Login { user, token })
+}
+
+/// A user a credential names, unless an admin disabled them: then a denied
+/// row under `action` and a 401, whatever the credential.
+pub(crate) async fn unless_disabled(
+    app: &App,
+    user: UserRow,
+    action: AuditAction,
+    origin: &Origin,
+) -> ApiResult<UserRow> {
+    if !user.is_disabled() {
+        return Ok(user);
+    }
+    let mut entry = AuditEntry::new(action, Outcome::Denied, origin.clone());
+    entry.user_id = Some(user.id.clone());
+    app.control.record_audit(&entry).await?;
+    Err(ApiError::unauthorized("account disabled"))
 }
 
 /// A password login that succeeded: who, and their new session.
@@ -282,7 +329,7 @@ impl Identity {
         let RequestId(request_id) = RequestId::of(&parts.headers);
         let origin = Origin {
             channel: Channel::Web,
-            client_addr: Peer::of(parts).ip(),
+            client_addr: Peer::of(parts, app).ip(),
             request_id,
         };
         if app.mode == ServeMode::Local {
@@ -320,6 +367,7 @@ impl Identity {
                     .get_user(&user_id)
                     .await?
                     .ok_or_else(|| ApiError::unauthorized("session user no longer exists"))?;
+                let user = unless_disabled(app, user, AuditAction::Session, &origin).await?;
                 return Ok(Self {
                     user_id: user.id,
                     username: user.username,
@@ -373,6 +421,7 @@ impl Identity {
             .get_user(&token.user_id)
             .await?
             .ok_or_else(|| ApiError::unauthorized("token user no longer exists"))?;
+        let user = unless_disabled(app, user, AuditAction::Token, &origin).await?;
         Ok(Self {
             user_id: user.id,
             username: user.username,
@@ -390,14 +439,17 @@ impl Identity {
         token: &str,
         origin: Origin,
     ) -> ApiResult<Self> {
-        match oidc.bearer_user(&app.control, token).await {
-            Ok(user) => Ok(Self {
-                user_id: user.id,
-                username: user.username,
-                kind: user.kind,
-                credential: Credential::IdentityProvider,
-                origin,
-            }),
+        match oidc.bearer_user(&app.control, token, &origin).await {
+            Ok(user) => {
+                let user = unless_disabled(app, user, AuditAction::Token, &origin).await?;
+                Ok(Self {
+                    user_id: user.id,
+                    username: user.username,
+                    kind: user.kind,
+                    credential: Credential::IdentityProvider,
+                    origin,
+                })
+            }
             Err(CoreError::Bearer(reason)) => {
                 tracing::info!(%reason, "access token refused");
                 let entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, origin);

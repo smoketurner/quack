@@ -14,6 +14,7 @@ pub mod import;
 pub mod ingestion;
 pub mod jobs;
 pub mod llm;
+pub mod net;
 pub mod ocsf;
 pub mod oidc;
 pub mod okf;

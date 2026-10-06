@@ -61,9 +61,9 @@ impl StreamEvent {
     }
 }
 
-pub(crate) fn router() -> Router<App> {
+pub(crate) fn router(app: &App) -> Router<App> {
     Router::new()
-        .merge(control_routes())
+        .merge(control_routes(app))
         .route("/workspaces/{id}/audit", get(workspaces::audit_detail))
         .route("/workspaces/{id}/query", post(query::query))
         .route("/workspaces/{id}/query/stream", post(query::stream))
@@ -130,21 +130,26 @@ pub(crate) fn router() -> Router<App> {
             "/workspaces/{id}/sessions/{sid}/permissions/{request}",
             post(sessions::decide),
         )
-        .route(
-            "/workspaces/{id}/members",
-            get(members::list).post(members::add),
-        )
-        .route("/workspaces/{id}/members/{user}", delete(members::remove))
+        .merge(membership_routes())
         .route("/admin/users", get(admin::users).post(admin::create_user))
+        .route(
+            "/admin/users/{user}",
+            axum::routing::patch(admin::update_user).delete(admin::delete_user),
+        )
         .route("/admin/audit", get(admin::audit))
 }
 
 /// Signing in, and the workspaces themselves: listing, creating,
 /// restoring, settings, snapshots, deletion.
-fn control_routes() -> Router<App> {
+fn control_routes(app: &App) -> Router<App> {
     Router::new()
-        .route("/auth/login", super::throttled_login(post(auth::login)))
+        .route(
+            "/auth/login",
+            super::throttled_login(app, post(auth::login)),
+        )
         .route("/auth/logout", post(auth::logout))
+        .route("/auth/logout-all", post(auth::logout_all))
+        .route("/auth/password", post(auth::change_password))
         .route("/auth/me", get(auth::me))
         .route(
             "/workspaces",
@@ -187,6 +192,24 @@ fn graph_routes() -> Router<App> {
         .route(
             "/workspaces/{id}/graph/edges/{eid}",
             delete(graph::delete_edge),
+        )
+}
+
+/// Members by hand, and the roles the identity provider's groups carry.
+fn membership_routes() -> Router<App> {
+    Router::new()
+        .route(
+            "/workspaces/{id}/members",
+            get(members::list).post(members::add),
+        )
+        .route("/workspaces/{id}/members/{user}", delete(members::remove))
+        .route(
+            "/workspaces/{id}/groups",
+            get(members::groups).post(members::set_group),
+        )
+        .route(
+            "/workspaces/{id}/groups/{group}",
+            delete(members::remove_group),
         )
 }
 
