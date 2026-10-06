@@ -245,6 +245,7 @@ async fn agent_events_attach_charts_and_steps_and_keys_cancel_the_turn() {
             detail: String::new(),
             summary: String::from("3 rows"),
             rows: Some(3),
+            result: None,
             duration_ms: 4,
         }),
     );
@@ -356,6 +357,7 @@ async fn a_turn_with_text_then_a_tool_then_text_keeps_one_assistant_message() {
             detail: String::new(),
             summary: String::from("1 rows"),
             rows: Some(1),
+            result: None,
             duration_ms: 1,
         }),
     );
@@ -456,6 +458,7 @@ async fn a_turn_with_text_then_a_write_permission_then_text_keeps_one_assistant_
             detail: String::new(),
             summary: String::from("1 rows"),
             rows: Some(1),
+            result: None,
             duration_ms: 1,
         }),
     );

@@ -64,6 +64,7 @@ fn to_json_carries_every_field_and_derives_queries() {
                 detail: String::from("SELECT count(*) FROM events"),
                 summary: String::from("the summary is not parsed"),
                 rows: Some(1),
+                result: None,
                 duration_ms: 7,
             },
             ToolStep {
@@ -71,6 +72,7 @@ fn to_json_carries_every_field_and_derives_queries() {
                 detail: String::from("storms"),
                 summary: String::from("3 chunks"),
                 rows: None,
+                result: None,
                 duration_ms: 4,
             },
         ],

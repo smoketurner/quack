@@ -59,6 +59,7 @@ fn chart_fingerprint_covers_the_plot_not_just_the_title() {
                 name: String::from("s"),
                 values: vec![60.0, 40.0],
             }],
+            stacked: false,
         }
     }
     let width = 60usize;
@@ -83,6 +84,7 @@ fn chart_fingerprint_covers_the_plot_not_just_the_title() {
     assert_ne!(bar_text, pie_text);
 
     let make = |chart| Message {
+        result: None,
         kind: MessageKind::Assistant,
         content: String::from("Here is the chart."),
         chart: Some(chart),

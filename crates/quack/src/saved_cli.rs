@@ -433,6 +433,7 @@ mod tests {
                 detail: String::from(OVERDUE),
                 summary: String::from("1 rows"),
                 rows: Some(1),
+                result: None,
                 duration_ms: 1,
             }],
             ..AgentResponse::default()

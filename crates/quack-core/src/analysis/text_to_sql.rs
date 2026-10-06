@@ -265,7 +265,9 @@ impl SystemPrompt {
              5. Every run_sql result ends with how many tool calls the turn has left; plan \
              the remaining statements and answer before they run out\n\
              6. Explain the results in natural language\n\
-             7. If the user asks for a visualization, use create_chart\n\n\
+             7. If the user asks for a visualization, use create_chart: several y columns for \
+             several measures on one chart, series_by for one series per group of long rows, \
+             stacked for parts of a whole; bin a histogram in SQL and chart the counts as bars\n\n\
              When answering questions about document content:\n\
              1. Call search_documents with the user's question (rephrase and search again if the first results miss)\n\
              2. For a whole section or a document from its start, call read_document with its id or file name and from; it returns consecutive chunks numbered the same way and says where to continue\n\

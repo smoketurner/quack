@@ -7,6 +7,7 @@ use jiff::tz::TimeZone;
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
+use crate::storage::audit::AuditDetailRow;
 use crate::storage::control::{AuditAction, AuditRow, Outcome};
 
 /// The OCSF release the events conform to.
@@ -67,6 +68,7 @@ impl EventClass {
             | AuditAction::Propose
             | AuditAction::GraphExtract
             | AuditAction::Save
+            | AuditAction::BreakGlass
             | AuditAction::Admin => Self::Api(Create),
             AuditAction::Context
             | AuditAction::Member
@@ -78,6 +80,7 @@ impl EventClass {
             | AuditAction::GraphRevalidate
             | AuditAction::GraphMerge
             | AuditAction::GraphEdit
+            | AuditAction::Password
             | AuditAction::EmbeddingsRefresh => Self::Api(Update),
             AuditAction::Delete => Self::Api(Delete),
             // A name a newer build wrote is an API event under its own name.
@@ -201,6 +204,136 @@ impl AuditRow {
     }
 }
 
+/// Whether an exported event carries the question's text. It is workspace
+/// content, so the default leaves it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptText {
+    Omit,
+    Include,
+}
+
+impl AuditRow {
+    /// The row as an OCSF event joined to its `_quack_audit` detail, the
+    /// half that lives inside the workspace: for a query, the
+    /// `ai_operation` profile with the model that answered (`ai_model`),
+    /// the tool calls with their durations, and the documents and chunks
+    /// the answer cited as resources; for any other action, the detail
+    /// under `unmapped.detail`. A `break_glass` row is raised to Medium.
+    /// The prompt goes in only when asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored timestamp does not parse.
+    pub fn to_ocsf_with_detail(
+        &self,
+        detail: Option<&AuditDetailRow>,
+        prompt: PromptText,
+    ) -> Result<Value> {
+        let mut event = self.to_ocsf()?;
+        if self.entry.action == AuditAction::BreakGlass
+            && let Some(object) = event.as_object_mut()
+        {
+            object.insert("severity_id".into(), json!(3));
+            object.insert("severity".into(), json!("Medium"));
+        }
+        let Some(detail) = detail.and_then(|d| d.detail.as_ref()) else {
+            return Ok(event);
+        };
+        let Some(object) = event.as_object_mut() else {
+            return Ok(event);
+        };
+        if self.entry.action != AuditAction::Query {
+            object.insert(
+                "unmapped".into(),
+                unmapped_with(object, "detail", detail.clone()),
+            );
+            return Ok(without_nulls(event));
+        }
+        if let Some(profiles) = object
+            .get_mut("metadata")
+            .and_then(|m| m.get_mut("profiles"))
+            .and_then(Value::as_array_mut)
+        {
+            profiles.push(json!("ai_operation"));
+        }
+        if let Some(model) = detail.get("model") {
+            object.insert(
+                "ai_model".into(),
+                json!({
+                    "name": model.get("name"),
+                    "vendor_name": model.get("provider"),
+                    "type": "Large Language Model",
+                }),
+            );
+        }
+        let tools: Vec<Value> = detail
+            .get("steps")
+            .and_then(Value::as_array)
+            .map(|steps| {
+                steps
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "name": s.get("tool"),
+                            "duration_ms": s.get("duration_ms"),
+                            "rows": s.get("rows"),
+                            "summary": s.get("summary"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut resources = object
+            .get("resources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for cited in detail
+            .get("citations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(document) = cited.get("document_id") {
+                resources.push(json!({ "type": "document", "uid": document }));
+            }
+            if let Some(chunk) = cited.get("chunk_id") {
+                resources.push(json!({ "type": "chunk", "uid": chunk }));
+            }
+        }
+        let mut seen = Vec::new();
+        resources.retain(|r| {
+            if seen.contains(r) {
+                false
+            } else {
+                seen.push(r.clone());
+                true
+            }
+        });
+        object.insert("resources".into(), Value::Array(resources));
+        let mut extra = json!({ "tools": tools, "session_id": self.entry.resource_id });
+        if prompt == PromptText::Include
+            && let Some(text) = detail.get("prompt")
+            && let Some(extra) = extra.as_object_mut()
+        {
+            extra.insert("prompt".into(), text.clone());
+        }
+        object.insert("unmapped".into(), unmapped_with(object, "ai", extra));
+        Ok(without_nulls(event))
+    }
+}
+
+/// The event's `unmapped` object with `key` set to `value`.
+fn unmapped_with(event: &serde_json::Map<String, Value>, key: &str, value: Value) -> Value {
+    let mut unmapped = event
+        .get("unmapped")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    unmapped.insert(key.to_owned(), value);
+    Value::Object(unmapped)
+}
+
 /// OCSF leaves an attribute out rather than setting it to null.
 fn without_nulls(value: Value) -> Value {
     match value {
@@ -306,6 +439,88 @@ mod tests {
             render(&row(AuditAction::Logout, Outcome::Allowed))["type_uid"],
             300_202
         );
+    }
+
+    #[test]
+    fn a_query_with_its_detail_carries_the_ai_operation_profile() {
+        let mut query = row(AuditAction::Query, Outcome::Allowed);
+        query.entry.resource_type = Some(ResourceKind::Session);
+        query.entry.resource_id = Some(String::from("s1"));
+        let detail = AuditDetailRow {
+            id: query.entry.id.clone(),
+            timestamp: String::from("2026-09-24 12:34:56"),
+            user_id: query.entry.user_id.clone(),
+            action: String::from("query"),
+            detail: Some(json!({
+                "prompt": "how many orders per region?",
+                "model": { "provider": "ollama", "name": "gpt-oss:20b" },
+                "steps": [
+                    { "tool": "run_sql", "duration_ms": 9, "rows": 4, "summary": "4 rows" },
+                    { "tool": "search_documents", "duration_ms": 41, "summary": "8 chunks" }
+                ],
+                "citations": [
+                    { "document_id": "d1", "chunk_id": "c1", "chunk_index": 3 },
+                    { "document_id": "d1", "chunk_id": "c2", "chunk_index": 4 }
+                ]
+            })),
+        };
+        let event = query
+            .to_ocsf_with_detail(Some(&detail), PromptText::Omit)
+            .unwrap_or_else(|e| panic_with(&e.to_string()));
+        assert_required(&event);
+        assert_eq!(
+            event["metadata"]["profiles"],
+            json!(["datetime", "ai_operation"])
+        );
+        assert_eq!(event["ai_model"]["name"], "gpt-oss:20b");
+        assert_eq!(event["ai_model"]["vendor_name"], "ollama");
+        assert_eq!(event["unmapped"]["ai"]["tools"][0]["name"], "run_sql");
+        assert_eq!(event["unmapped"]["ai"]["tools"][1]["duration_ms"], 41);
+        assert_eq!(event["unmapped"]["ai"]["session_id"], "s1");
+        assert!(event["unmapped"]["ai"].get("prompt").is_none(), "{event}");
+        let resources = event["resources"].as_array().cloned().unwrap_or_default();
+        assert!(resources.contains(&json!({ "type": "document", "uid": "d1" })));
+        assert!(resources.contains(&json!({ "type": "chunk", "uid": "c2" })));
+        assert_eq!(
+            resources.iter().filter(|r| r["type"] == "document").count(),
+            1,
+            "a document cited twice is one resource"
+        );
+        let with_prompt = query
+            .to_ocsf_with_detail(Some(&detail), PromptText::Include)
+            .unwrap_or_else(|e| panic_with(&e.to_string()));
+        assert_eq!(
+            with_prompt["unmapped"]["ai"]["prompt"],
+            "how many orders per region?"
+        );
+        // Without a detail row the event is the plain one; another action's
+        // detail rides along unmapped.
+        let plain = query
+            .to_ocsf_with_detail(None, PromptText::Include)
+            .unwrap_or_else(|e| panic_with(&e.to_string()));
+        assert!(plain.get("ai_model").is_none());
+        let sql = row(AuditAction::Sql, Outcome::Allowed);
+        let sql_detail = AuditDetailRow {
+            detail: Some(json!({ "sql": "SELECT 1" })),
+            action: String::from("sql"),
+            ..detail
+        };
+        let event = sql
+            .to_ocsf_with_detail(Some(&sql_detail), PromptText::Omit)
+            .unwrap_or_else(|e| panic_with(&e.to_string()));
+        assert_eq!(event["unmapped"]["detail"]["sql"], "SELECT 1");
+    }
+
+    #[test]
+    fn a_break_glass_grant_is_a_medium_create_event() {
+        let event = render(&row(AuditAction::BreakGlass, Outcome::Allowed));
+        assert_required(&event);
+        assert_eq!(event["type_uid"], 600_301);
+        assert_eq!(event["api"]["operation"], "break_glass");
+        let raised = row(AuditAction::BreakGlass, Outcome::Allowed)
+            .to_ocsf_with_detail(None, PromptText::Omit)
+            .unwrap_or_else(|e| panic_with(&e.to_string()));
+        assert_eq!(raised["severity_id"], 3);
     }
 
     #[test]

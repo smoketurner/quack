@@ -27,4 +27,12 @@ Include where possible:
   `config.toml`, OAuth tokens live in an encrypted cache keyed from the OS keychain, and an
   import URL's password is used once and never stored.
 - **Dependencies pinned and scanned** — exact versions in `Cargo.toml`, enforced by
-  `cargo-deny`, Dependabot, and dependency-review in CI.
+  `cargo-deny`, Dependabot, and dependency-review in CI. `cargo deny check` also runs every
+  Monday on its own (`.github/workflows/advisories.yml`), so an advisory published while
+  the repository is quiet opens one issue within a week.
+- **Parsers are fuzzed** — every parser that takes an uploaded file (PDF, Markdown, text,
+  HTML, DOCX, PPTX, XLSX) and the chunker run under libFuzzer for ten minutes each night
+  (`fuzz/`, `.github/workflows/fuzz.yml`); a crash's input is uploaded with the run.
+- **Admin self-grants are marked** — an administrator who gives themself a role in a
+  workspace they are not a member of must state a reason, and the access audit records the
+  grant as `break_glass` rather than an ordinary membership change.

@@ -13,14 +13,14 @@
 )]
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::{
     BaseUrl, Config, FollowIngest, ProviderConfig, ProviderName, ProviderType, SecureCookies,
 };
 use quack_core::embedding::{Dimension, Vector};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
-use quack_core::ids::{ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
+use quack_core::ids::{AuditId, ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::parser::SectionKind;
 use std::sync::Arc;
@@ -98,6 +98,25 @@ impl Harness {
         (status, value, headers)
     }
 
+    /// `send`, with the body as it came: for a file, not JSON or text.
+    async fn send_bytes(
+        &self,
+        request: Request<Body>,
+    ) -> (StatusCode, Bytes, axum::http::HeaderMap) {
+        let response = self
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|e| fail(&format!("request failed: {e}")));
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        (status, bytes, headers)
+    }
+
     async fn call(
         &self,
         method: Method,
@@ -144,12 +163,16 @@ impl Harness {
     }
 
     async fn login(&self, name: &str) -> String {
+        self.login_with(name, "pw").await
+    }
+
+    async fn login_with(&self, name: &str, password: &str) -> String {
         let (status, body) = self
             .call(
                 Method::POST,
                 "/api/v1/auth/login",
                 None,
-                Some(serde_json::json!({ "username": name, "password": "pw" })),
+                Some(serde_json::json!({ "username": name, "password": password })),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -6346,10 +6369,11 @@ async fn closing_the_state_checkpoints_each_workspace() {
     assert!(!log.exists(), "the log was checkpointed into the file");
 }
 
-/// A download the row cap cut says so in its filename and on its button;
-/// a complete one keeps the plain name, and neither file carries a marker.
+/// The grid is capped, but the download streams every row: the button
+/// says so when the grid was cut, and the file is the whole result either
+/// way, under the plain name.
 #[tokio::test]
-async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
+async fn the_csv_download_holds_every_row_past_the_grids_cap() {
     let mut config = Config::default();
     config.analysis.max_query_rows = 3;
     let h = harness_with(ServeMode::Login, config).await;
@@ -6369,20 +6393,17 @@ async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
     assert_eq!(status, StatusCode::OK);
     assert!(
         html.contains("10 rows (showing 3)")
-            && html.contains(">Download CSV (first 3 of 10 rows)</button>"),
+            && html.contains(">Download CSV (all 10 rows)</button>"),
         "{html}"
     );
     let (status, csv, headers) = h
         .form(&format!("/w/{ws}/sql.csv"), Some(&cookie), capped)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        disposition(&headers),
-        "attachment; filename=\"query-first-3-of-10.csv\""
-    );
-    assert_eq!(csv, "n\n0\n1\n2\n");
+    assert_eq!(disposition(&headers), "attachment; filename=\"query.csv\"");
+    assert_eq!(csv, "n\n0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n");
 
-    // A result of exactly the cap is complete.
+    // A result within the cap: no note on the button.
     let complete = "sql=SELECT+*+FROM+range(3)+t(n)";
     let (_, html, _) = h
         .form(&format!("/w/{ws}/sql"), Some(&cookie), complete)
@@ -6391,11 +6412,10 @@ async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
         html.contains(">Download CSV</button>") && !html.contains("showing"),
         "{html}"
     );
-    let (status, csv, headers) = h
+    let (status, csv, _) = h
         .form(&format!("/w/{ws}/sql.csv"), Some(&cookie), complete)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(disposition(&headers), "attachment; filename=\"query.csv\"");
     assert_eq!(csv, "n\n0\n1\n2\n");
 }
 
@@ -7371,6 +7391,7 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
                     detail: String::from(OVERDUE),
                     summary: String::from("1 rows"),
                     rows: Some(1),
+                    result: None,
                     duration_ms: 1,
                 }],
                 ..AgentResponse::default()
@@ -8068,6 +8089,569 @@ async fn an_upload_queues_the_graph_follow_up_the_setting_asks_for() {
         extracts.iter().any(|d| d["finished"] == true),
         "{extracts:?}"
     );
+}
+
+/// `POST .../sql/export` streams every row past the grid's cap in the
+/// asked format, refuses a write, and audits the export with its row
+/// count; the SQL page's download takes the same path.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_export_streams_every_row_and_refuses_writes() {
+    let mut config = Config::default();
+    config.analysis.max_query_rows = 10;
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("sales", &owner).await;
+    let token = h.login("owner").await;
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &token,
+            serde_json::json!({ "sql": "CREATE TABLE big AS SELECT range AS n FROM range(1000)" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let export = |sql: &str, format: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/workspaces/{ws}/sql/export"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "sql": sql, "format": format }).to_string(),
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    let (status, bytes, headers) = h
+        .send_bytes(export("SELECT n FROM big ORDER BY n", "csv"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/csv; charset=utf-8")
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(text.lines().count(), 1001, "a header and every row");
+    assert!(
+        text.ends_with("999\n"),
+        "{}",
+        text.lines().last().unwrap_or_default()
+    );
+    let (status, bytes, _) = h
+        .send_bytes(export("SELECT n FROM big WHERE n < 3", "ndjson"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n"
+    );
+    let (status, bytes, _) = h.send_bytes(export("DELETE FROM big", "csv")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let (status, _, _) = h
+        .send_bytes(export("SELECT * FROM _quack_documents", "csv"))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // The audit row lands once the stream has ended.
+    let mut exports = Vec::new();
+    for _ in 0..50 {
+        exports = h
+            .audit(AuditFilter {
+                action: Some(String::from("export")),
+                ..AuditFilter::default()
+            })
+            .await;
+        if exports.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(exports.len(), 3, "{exports:?}");
+    assert!(exports.iter().any(|r| r.entry.outcome == Outcome::Denied));
+
+    // The web download streams the whole result too.
+    let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    let cookie = session_cookie(&headers);
+    let (status, bytes, _) = h
+        .send_bytes(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/w/{ws}/sql.csv"))
+                .header(header::COOKIE, format!("quack_session={cookie}"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("sql=SELECT+n+FROM+big"))
+                .unwrap_or_else(|e| fail(&e.to_string())),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(String::from_utf8_lossy(&bytes).lines().count(), 1001);
+}
+
+/// An admin who is not a member may add themself only with a reason; the
+/// grant is a `break_glass` row whose detail names the role, the reason,
+/// and that admin rights were used. Any other grant is a `member` row with
+/// the role in its detail.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admin_self_grant_needs_a_reason_and_is_marked_break_glass() {
+    let h = harness(ServeMode::Login).await;
+    let root_id = h.user("root", UserKind::Admin).await;
+    let owner_id = h.user("owner", UserKind::Standard).await;
+    h.user("vera", UserKind::Standard).await;
+    let ws = h.workspace("finance", &owner_id).await;
+    let root = h.login("root").await;
+    let owner = h.login("owner").await;
+    let members = format!("/api/v1/workspaces/{ws}/members");
+    let (status, body) = h
+        .post(
+            &members,
+            &root,
+            serde_json::json!({ "username": "root", "role": "owner" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reason"),
+        "{body}"
+    );
+    let (status, body) = h
+        .post(
+            &members,
+            &root,
+            serde_json::json!({ "username": "root", "role": "owner", "reason": "  " }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = h
+        .post(
+            &members,
+            &root,
+            serde_json::json!({ "username": "root", "role": "owner", "reason": "incident 42" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // An owner adding someone else needs no reason and is a plain member row.
+    let (status, body) = h
+        .post(
+            &members,
+            &owner,
+            serde_json::json!({ "username": "vera", "role": "viewer" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let glass = h
+        .audit(AuditFilter {
+            action: Some(String::from("break_glass")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(glass.len(), 1, "{glass:?}");
+    assert_eq!(glass[0].entry.user_id.as_ref(), Some(&root_id));
+    let details = h
+        .app
+        .read(&ws, |db| audit::list(db, 50))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let by_id = |id: &AuditId| {
+        details
+            .iter()
+            .find(|d| &d.id == id)
+            .and_then(|d| d.detail.clone())
+    };
+    let detail = by_id(&glass[0].entry.id).unwrap_or_default();
+    assert_eq!(detail["role"], "owner", "{detail}");
+    assert_eq!(detail["reason"], "incident 42");
+    assert_eq!(detail["acting_as"], "admin");
+    let member_rows = h
+        .audit(AuditFilter {
+            action: Some(String::from("member")),
+            workspace_id: Some(ws.clone()),
+            ..AuditFilter::default()
+        })
+        .await;
+    let plain = member_rows
+        .iter()
+        .find(|r| r.entry.user_id.as_ref() == Some(&owner_id))
+        .unwrap_or_else(|| fail("the owner's grant is audited"));
+    assert_eq!(by_id(&plain.entry.id).unwrap_or_default()["role"], "viewer");
+
+    // The workspace's OCSF export joins both halves: the self-grant is a
+    // Medium Create event, and a query event would carry the ai profile.
+    let (status, body) = h
+        .get(
+            &format!("/api/v1/workspaces/{ws}/audit?format=ocsf"),
+            &owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = body["audit"].as_array().cloned().unwrap_or_default();
+    let event = events
+        .iter()
+        .find(|e| e["api"]["operation"] == "break_glass")
+        .unwrap_or_else(|| fail("the break_glass event is exported"));
+    assert_eq!(event["severity_id"], 3, "{event}");
+    assert_eq!(
+        event["unmapped"]["detail"]["reason"], "incident 42",
+        "{event}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| e["class_uid"].is_number() && e["metadata"]["version"] == "1.9.0"),
+        "{body}"
+    );
+    let (status, _) = h
+        .get(&format!("/api/v1/workspaces/{ws}/audit?format=xml"), &owner)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// An admin disables, re-enables, demotes, resets, and removes a user over
+/// the API: a disabled user's session and token are refused with a denied
+/// row, a removed user's name becomes "removed" in the workspace file, and
+/// wrong passwords lock the account for the configured minutes.
+#[tokio::test(flavor = "multi_thread")]
+async fn users_are_disabled_locked_out_and_removed_over_the_api() {
+    let mut config = Config::default();
+    config.server.login_lockout_attempts = 2;
+    let h = harness_with(ServeMode::Login, config).await;
+    let root_id = h.user("root", UserKind::Admin).await;
+    let bob_id = h.user("bob", UserKind::Standard).await;
+    let ws = h.workspace("sales", &bob_id).await;
+    let root = h.login("root").await;
+    let bob = h.login("bob").await;
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &bob,
+            serde_json::json!({ "sql": "CREATE TABLE t AS SELECT 1 AS a" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = h
+        .app
+        .control
+        .create_token(&ws, &bob_id, "script", &[Scope::Read], None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .secret
+        .expose()
+        .to_owned();
+
+    // A standard user may not; an admin may not disable themselves.
+    let (status, _) = h
+        .call(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{root_id}"),
+            Some(&bob),
+            Some(serde_json::json!({ "disabled": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h
+        .call(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{root_id}"),
+            Some(&root),
+            Some(serde_json::json!({ "disabled": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Disabled: the session, the token, and a login are all refused, each
+    // with a denied row.
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{bob_id}"),
+            Some(&root),
+            Some(serde_json::json!({ "disabled": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["disabled_at"].is_string(), "{body}");
+    let (status, _) = h.get("/api/v1/auth/me", &bob).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = h.get(&format!("/api/v1/workspaces/{ws}"), &token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = h
+        .call(
+            Method::POST,
+            "/api/v1/auth/login",
+            None,
+            Some(serde_json::json!({ "username": "bob", "password": "pw" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let denied = h
+        .audit(AuditFilter {
+            user_id: Some(bob_id.clone()),
+            outcome: Some(Outcome::Denied),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(denied.len() >= 2, "{denied:?}");
+
+    // Enabled again with a new password and the admin flag.
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{bob_id}"),
+            Some(&root),
+            Some(serde_json::json!({ "disabled": false, "password": "pw2", "is_admin": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["is_admin"], true, "{body}");
+    let (status, _) = h.get(&format!("/api/v1/workspaces/{ws}"), &token).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Two wrong passwords lock the account; the right one then waits.
+    for _ in 0..2 {
+        let (status, _) = h
+            .call(
+                Method::POST,
+                "/api/v1/auth/login",
+                None,
+                Some(serde_json::json!({ "username": "bob", "password": "nope" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/auth/login",
+            None,
+            Some(serde_json::json!({ "username": "bob", "password": "pw2" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("try again"),
+        "{body}"
+    );
+    let (status, _) = h
+        .call(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{bob_id}"),
+            Some(&root),
+            Some(serde_json::json!({ "disabled": false })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let bob = h.login_with("bob", "pw2").await;
+
+    // A person changes their own password; the other session ends, the
+    // one that changed it stays.
+    let other = h.login_with("bob", "pw2").await;
+    let (status, _) = h
+        .post(
+            "/api/v1/auth/password",
+            &bob,
+            serde_json::json!({ "current": "wrong", "new": "pw3" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h
+        .post(
+            "/api/v1/auth/password",
+            &bob,
+            serde_json::json!({ "current": "pw2", "new": "pw3" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = h.get("/api/v1/auth/me", &other).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = h.get("/api/v1/auth/me", &bob).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = h
+        .call(Method::POST, "/api/v1/auth/logout-all", Some(&bob), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = h.get("/api/v1/auth/me", &bob).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Removed: the row, the token, and the name in the workspace file.
+    let (status, body) = h
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/admin/users/{bob_id}"),
+            Some(&root),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["rows_forgotten"].as_u64().unwrap_or_default() >= 1,
+        "{body}"
+    );
+    let (status, _) = h.get(&format!("/api/v1/workspaces/{ws}"), &token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = h.get("/api/v1/admin/users", &root).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["users"].as_array().map(Vec::len), Some(1), "{body}");
+    let named = h
+        .app
+        .read(&ws, |db| {
+            Ok(audit::list(db, 50)?
+                .into_iter()
+                .filter_map(|row| row.user_id)
+                .collect::<Vec<_>>())
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert!(
+        !named.is_empty() && named.iter().all(|n| *n != bob_id),
+        "{named:?}"
+    );
+    let (status, _) = h
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/admin/users/{bob_id}"),
+            Some(&root),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Group roles are set, listed, and removed over the API by owners, and
+/// shown on the Settings page only when a groups claim is configured.
+#[tokio::test(flavor = "multi_thread")]
+async fn group_roles_are_managed_over_the_api() {
+    let h = harness(ServeMode::Login).await;
+    let owner_id = h.user("owner", UserKind::Standard).await;
+    let viewer_id = h.user("viewer", UserKind::Standard).await;
+    let ws = h.workspace("sales", &owner_id).await;
+    h.app
+        .control
+        .set_member(&ws, &viewer_id, Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let owner = h.login("owner").await;
+    let viewer = h.login("viewer").await;
+    let base = format!("/api/v1/workspaces/{ws}/groups");
+    let (status, _) = h
+        .post(&base, &viewer, serde_json::json!({ "group": "finance" }))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = h
+        .post(
+            &base,
+            &owner,
+            serde_json::json!({ "group": "finance", "role": "owner" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["group_name"], "finance");
+    assert_eq!(body["role"], "owner");
+    let (status, body) = h
+        .post(
+            &base,
+            &owner,
+            serde_json::json!({ "group": "finance", "role": "viewer" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], "viewer");
+    let (status, _) = h
+        .post(&base, &owner, serde_json::json!({ "group": " " }))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = h.get(&base, &viewer).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["groups"].as_array().map(Vec::len), Some(1));
+    let (status, _) = h
+        .call(
+            Method::DELETE,
+            &format!("{base}/finance"),
+            Some(&owner),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = h
+        .call(
+            Method::DELETE,
+            &format!("{base}/finance"),
+            Some(&owner),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let members = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("member")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(members.len() >= 3, "{members:?}");
+}
+
+/// Forwarded headers name the client only when the peer is a trusted
+/// proxy; from anyone else the peer is the client, whatever it says.
+#[tokio::test(flavor = "multi_thread")]
+async fn forwarded_headers_count_only_from_trusted_proxies() {
+    let mut config = Config::default();
+    config.server.trusted_proxies = vec![
+        "10.0.0.0/8"
+            .parse()
+            .unwrap_or_else(|e: ipnet::AddrParseError| fail(&e.to_string())),
+    ];
+    let h = harness_with(ServeMode::Login, config).await;
+    h.user("ann", UserKind::Standard).await;
+    let login = |peer: &str, forwarded: Option<&str>| {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .extension(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>()
+                    .unwrap_or_else(|e| fail(&e.to_string())),
+            ));
+        if let Some(chain) = forwarded {
+            builder = builder.header("x-forwarded-for", chain);
+        }
+        builder
+            .body(Body::from(
+                serde_json::json!({ "username": "ann", "password": "pw" }).to_string(),
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    let (status, _, _) = h
+        .send(login("10.0.0.1:5000", Some("203.0.113.9, 10.0.0.2")))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = h
+        .send(login("198.51.100.4:5000", Some("203.0.113.9")))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = h
+        .audit(AuditFilter {
+            action: Some(String::from("login")),
+            ..AuditFilter::default()
+        })
+        .await;
+    let addrs: Vec<Option<&str>> = rows
+        .iter()
+        .map(|r| r.entry.origin.client_addr.as_deref())
+        .collect();
+    assert!(addrs.contains(&Some("203.0.113.9")), "{addrs:?}");
+    assert!(addrs.contains(&Some("198.51.100.4")), "{addrs:?}");
+    assert!(!addrs.contains(&Some("10.0.0.1")), "{addrs:?}");
 }
 
 /// `PATCH .../documents/{doc}` sets a document's own fields (title,

@@ -182,9 +182,17 @@ impl WebSessions {
     }
 
     /// End every session of a user, once the issuer no longer vouches for
-    /// them.
+    /// them, an admin disabled them, or they asked to be logged out
+    /// everywhere.
     pub fn close_user(&self, user_id: &UserId) {
         self.live().retain(|_, session| &session.user_id != user_id);
+    }
+
+    /// End every session of a user but `keep`: the one a password change
+    /// was made from stays.
+    pub fn close_user_except(&self, user_id: &UserId, keep: &str) {
+        self.live()
+            .retain(|token, session| &session.user_id != user_id || token == keep);
     }
 
     /// End every session of a user if `token` is still one of them, and say
