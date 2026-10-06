@@ -8614,7 +8614,8 @@ async fn forwarded_headers_count_only_from_trusted_proxies() {
         "10.0.0.0/8"
             .parse()
             .unwrap_or_else(|e: ipnet::AddrParseError| fail(&e.to_string())),
-    ];
+    ]
+    .into();
     let h = harness_with(ServeMode::Login, config).await;
     h.user("ann", UserKind::Standard).await;
     let login = |peer: &str, forwarded: Option<&str>| {

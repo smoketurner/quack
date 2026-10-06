@@ -632,7 +632,7 @@ fn a_money_column_does_not_mix_numbers_and_strings() {
 /// The exact `DECIMAL` digits of a cell that would lose them survive
 /// every output sink: the JSON serializers (REST `/sql`, MCP `sql`,
 /// `quack -q` JSON/NdJSON) quote the strings, and the text paths (table,
-/// CSV, markdown) keep the raw digits via `display_json_value`. A cell
+/// CSV, markdown) keep the raw digits via `Cell::label`. A cell
 /// that fits stays a number everywhere.
 #[test]
 #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
@@ -1038,29 +1038,29 @@ fn quote_ident_wraps_and_escapes() {
 
 #[test]
 fn display_json_null() {
-    assert_eq!(display_json_value(&serde_json::Value::Null), "NULL");
+    assert_eq!(Cell(&serde_json::Value::Null).label(), "NULL");
 }
 
 #[test]
 fn display_json_string() {
     let val = serde_json::Value::String("hello".into());
-    assert_eq!(display_json_value(&val), "hello");
+    assert_eq!(Cell(&val).label(), "hello");
 }
 
 #[test]
 fn display_json_number() {
     let val = serde_json::Value::Number(42.into());
-    assert_eq!(display_json_value(&val), "42");
+    assert_eq!(Cell(&val).label(), "42");
 }
 
 #[test]
 fn display_json_bool_true() {
-    assert_eq!(display_json_value(&serde_json::Value::Bool(true)), "true");
+    assert_eq!(Cell(&serde_json::Value::Bool(true)).label(), "true");
 }
 
 #[test]
 fn display_json_bool_false() {
-    assert_eq!(display_json_value(&serde_json::Value::Bool(false)), "false");
+    assert_eq!(Cell(&serde_json::Value::Bool(false)).label(), "false");
 }
 
 #[test]
@@ -1962,7 +1962,7 @@ fn cells_are_cut_whatever_their_type() {
         ]],
     };
     let cut = results.with_cells_cut(10);
-    let cells: Vec<String> = cut.rows.iter().flatten().map(display_json_value).collect();
+    let cells: Vec<String> = cut.rows.iter().flatten().map(|v| Cell(v).label()).collect();
     assert_eq!(
         cells,
         vec![

@@ -428,9 +428,10 @@ const READ_ONLY_KEYWORDS: &[&str] = &[
 ];
 
 /// How a streamed result set is written ([`WorkspaceDb::stream_query`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportFormat {
+    #[default]
     Csv,
     Ndjson,
     Json,
@@ -497,24 +498,18 @@ impl<'a, W: Write> RowWriter<'a, W> {
     fn row(&mut self, values: &[serde_json::Value]) -> Result<()> {
         match self {
             Self::Csv(writer) => {
-                let cells: Vec<String> = values
-                    .iter()
-                    .map(|v| match v {
-                        serde_json::Value::Null => String::new(),
-                        other => display_json_value(other),
-                    })
-                    .collect();
+                let cells: Vec<String> = values.iter().map(|v| Cell(v).text()).collect();
                 writer.write_record(&cells)?;
             }
             Self::Ndjson { out, keys } => {
-                writeln!(out, "{}", json_object(keys, values)?)?;
+                writeln!(out, "{}", JsonRow { keys, values }.render()?)?;
             }
             Self::Json { out, keys, first } => {
                 if !*first {
                     out.write_all(b",")?;
                 }
                 *first = false;
-                write!(out, "\n{}", json_object(keys, values)?)?;
+                write!(out, "\n{}", JsonRow { keys, values }.render()?)?;
             }
         }
         Ok(())
@@ -533,17 +528,25 @@ impl<'a, W: Write> RowWriter<'a, W> {
     }
 }
 
-/// One row as a JSON object whose keys keep column order.
-fn json_object(keys: &[String], values: &[serde_json::Value]) -> Result<String> {
-    let mut fields = Vec::with_capacity(keys.len());
-    for (column, value) in keys.iter().zip(values) {
-        fields.push(format!(
-            "{}:{}",
-            serde_json::to_string(column)?,
-            serde_json::to_string(value)?
-        ));
+/// One row as a JSON object whose keys keep column order, written by hand
+/// because `serde_json`'s map sorts its keys.
+struct JsonRow<'a> {
+    keys: &'a [String],
+    values: &'a [serde_json::Value],
+}
+
+impl JsonRow<'_> {
+    fn render(&self) -> Result<String> {
+        let mut fields = Vec::with_capacity(self.keys.len());
+        for (column, value) in self.keys.iter().zip(self.values) {
+            fields.push(format!(
+                "{}:{}",
+                serde_json::to_string(column)?,
+                serde_json::to_string(value)?
+            ));
+        }
+        Ok(format!("{{{}}}", fields.join(",")))
     }
-    Ok(format!("{{{}}}", fields.join(",")))
 }
 
 /// Query result set from a `DuckDB` workspace database.
@@ -4517,13 +4520,49 @@ fn time_text(unit: duckdb::types::TimeUnit, n: i64) -> String {
         )
 }
 
-fn display_json_value(val: &serde_json::Value) -> String {
-    match val {
-        serde_json::Value::Null => String::from("NULL"),
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        other => other.to_string(),
+/// One result cell, as each consumer shows it: a string bare, anything
+/// else as JSON, and NULL as the word (tables, Markdown, chart labels) or
+/// as nothing (CSV, the web console's grid).
+#[derive(Debug, Clone, Copy)]
+pub struct Cell<'a>(pub &'a serde_json::Value);
+
+impl<'a> Cell<'a> {
+    /// The cell at `index` of `row`; a short row reads as NULL.
+    #[must_use]
+    pub fn at(row: &'a [serde_json::Value], index: usize) -> Self {
+        const NULL: &serde_json::Value = &serde_json::Value::Null;
+        Self(row.get(index).unwrap_or(NULL))
+    }
+
+    /// NULL spelled out.
+    #[must_use]
+    pub fn label(self) -> String {
+        match self.0 {
+            serde_json::Value::Null => String::from("NULL"),
+            _ => self.text(),
+        }
+    }
+
+    /// NULL as nothing.
+    #[must_use]
+    pub fn text(self) -> String {
+        match self.0 {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    /// The cell as a number: a numeric string parses, NULL is 0, anything
+    /// else is none.
+    #[must_use]
+    pub fn number(self) -> Option<f64> {
+        match self.0 {
+            serde_json::Value::Number(n) => n.as_f64(),
+            serde_json::Value::String(s) => s.parse::<f64>().ok(),
+            serde_json::Value::Null => Some(0.0),
+            _ => None,
+        }
     }
 }
 
@@ -4537,7 +4576,7 @@ impl QueryResults {
         let mut out = self.clone();
         for row in &mut out.rows {
             for cell in row.iter_mut() {
-                let text = display_json_value(cell);
+                let text = Cell(cell).label();
                 if text.chars().count() > max_chars {
                     let mut cut: String = text.chars().take(max_chars).collect();
                     cut.push('\u{2026}');
@@ -4562,7 +4601,7 @@ impl QueryResults {
         let display_rows: Vec<Vec<String>> = self
             .rows
             .iter()
-            .map(|row| row.iter().map(display_json_value).collect())
+            .map(|row| row.iter().map(|v| Cell(v).label()).collect())
             .collect();
 
         let mut widths: Vec<usize> = self.columns.iter().map(String::len).collect();
@@ -4611,18 +4650,13 @@ impl QueryResults {
     ///
     /// Returns an error if serialization or writing fails.
     pub fn write_ndjson(&self, out: &mut impl Write) -> Result<()> {
-        // Written by hand so keys keep column order; serde_json's map sorts.
         let keys = self.json_keys();
         for row in &self.rows {
-            let mut fields = Vec::with_capacity(keys.len());
-            for (column, value) in keys.iter().zip(row) {
-                fields.push(format!(
-                    "{}:{}",
-                    serde_json::to_string(column)?,
-                    serde_json::to_string(value)?
-                ));
-            }
-            writeln!(out, "{{{}}}", fields.join(","))?;
+            let row = JsonRow {
+                keys: &keys,
+                values: row,
+            };
+            writeln!(out, "{}", row.render()?)?;
         }
         Ok(())
     }
@@ -4637,13 +4671,7 @@ impl QueryResults {
         let mut writer = csv::Writer::from_writer(out);
         writer.write_record(&self.columns)?;
         for row in &self.rows {
-            let cells: Vec<String> = row
-                .iter()
-                .map(|v| match v {
-                    serde_json::Value::Null => String::new(),
-                    other => display_json_value(other),
-                })
-                .collect();
+            let cells: Vec<String> = row.iter().map(|v| Cell(v).text()).collect();
             writer.write_record(&cells)?;
         }
         writer.flush()?;
@@ -4668,7 +4696,7 @@ impl QueryResults {
         let rule: Vec<&str> = self.columns.iter().map(|_| "---").collect();
         writeln!(out, "| {} |", rule.join(" | "))?;
         for row in &self.rows {
-            let cells: Vec<String> = row.iter().map(|v| cell(&display_json_value(v))).collect();
+            let cells: Vec<String> = row.iter().map(|v| cell(&Cell(v).label())).collect();
             writeln!(out, "| {} |", cells.join(" | "))?;
         }
         Ok(())

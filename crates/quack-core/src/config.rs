@@ -1,4 +1,3 @@
-use ipnet::IpNet;
 use serde::Deserialize;
 use std::borrow::{Borrow, Cow};
 use std::collections::BTreeMap;
@@ -10,6 +9,7 @@ use std::time::Duration;
 use crate::embedding::Dimension;
 use crate::error::{Error, Result};
 use crate::ingestion::budget::DecompressionBudget;
+use crate::net::TrustedProxies;
 use crate::ontology::documents::DocumentEvidenceOptions;
 use crate::ontology::induction::TableEvidenceOptions;
 use crate::storage::control::WorkspaceName;
@@ -730,6 +730,15 @@ impl RetryPolicy {
         let jittered = doubled.mul_f64(jitter.clamp(0.0, 1.0).mul_add(0.25, 1.0));
         jittered.min(Self::MAX_WAIT)
     }
+
+    /// [`Self::wait`] with the jitter taken from the clock's sub-second
+    /// nanoseconds: enough spread that clients retrying together do not
+    /// retry in step, with no random source to seed.
+    #[must_use]
+    pub fn next_wait(self, attempt: u32) -> Duration {
+        let nanos = jiff::Timestamp::now().subsec_nanosecond();
+        self.wait(attempt, f64::from(nanos) / 1_000_000_000.0)
+    }
 }
 
 impl RetryPolicy {
@@ -1302,7 +1311,7 @@ pub struct ServerConfig {
     /// Address ranges of the proxies in front of this server. A request
     /// from one of them is attributed to the client its forwarded headers
     /// name (`quack_core::net`); from anyone else, to the peer itself.
-    pub trusted_proxies: Vec<IpNet>,
+    pub trusted_proxies: TrustedProxies,
     /// Sign-in through the organization's `OpenID` Connect issuer, beside
     /// password login.
     pub oidc: Option<OidcConfig>,
@@ -1530,7 +1539,7 @@ impl Default for ServerConfig {
             shutdown_grace_seconds: 20,
             login_lockout_attempts: 5,
             login_lockout_minutes: 15,
-            trusted_proxies: Vec::new(),
+            trusted_proxies: TrustedProxies::default(),
             oidc: None,
             log_format: LogFormat::Text,
         }

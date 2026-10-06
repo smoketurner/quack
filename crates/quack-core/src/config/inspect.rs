@@ -905,6 +905,7 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     );
     let proxies: Vec<String> = server
         .trusted_proxies
+        .ranges()
         .iter()
         .map(ToString::to_string)
         .collect();

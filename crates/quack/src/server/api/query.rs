@@ -445,12 +445,8 @@ pub(crate) struct SqlRequest {
 #[derive(Deserialize)]
 pub(crate) struct ExportRequest {
     pub sql: String,
-    #[serde(default = "default_export_format")]
+    #[serde(default)]
     pub format: ExportFormat,
-}
-
-fn default_export_format() -> ExportFormat {
-    ExportFormat::Csv
 }
 
 /// `POST .../sql/export`: every row of a read statement, streamed in

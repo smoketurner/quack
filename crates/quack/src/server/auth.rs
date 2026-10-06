@@ -19,7 +19,6 @@ use quack_core::crypto::sha256_hex;
 use quack_core::error::Error as CoreError;
 use quack_core::ids::{AuditId, UserId, WorkspaceId};
 use quack_core::llm::egress::Egress;
-use quack_core::net::{self, Forwarded};
 use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditResource, Channel, Membership, Origin, Outcome, PasswordCheck,
@@ -121,7 +120,12 @@ impl Peer {
             parts
                 .extensions
                 .get::<ConnectInfo<SocketAddr>>()
-                .map(|info| client_ip(info.0.ip(), &parts.headers, app)),
+                .map(|info| {
+                    app.config
+                        .server
+                        .trusted_proxies
+                        .client_ip(info.0.ip(), &parts.headers)
+                }),
         )
     }
 
@@ -139,21 +143,6 @@ impl Peer {
     pub(crate) fn ip(self) -> Option<String> {
         self.0.map(|ip| ip.to_string())
     }
-}
-
-/// The client behind `peer` under the server's trusted proxies.
-pub(crate) fn client_ip(peer: IpAddr, headers: &HeaderMap, app: &App) -> IpAddr {
-    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    net::client_addr(
-        peer,
-        Forwarded {
-            rfc7239: text("forwarded"),
-            x_forwarded_for: text("x-forwarded-for"),
-            x_forwarded_proto: text("x-forwarded-proto"),
-        },
-        &app.config.server.trusted_proxies,
-    )
-    .ip
 }
 
 /// The id the request-id layer put on the request, for audit rows: the

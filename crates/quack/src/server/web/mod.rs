@@ -8,7 +8,6 @@ pub(crate) mod markdown;
 mod sign_in;
 
 use std::collections::BTreeSet;
-use std::fmt;
 use std::num::NonZeroUsize;
 
 use askama::Template;
@@ -42,7 +41,7 @@ use quack_core::storage::control::{
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{
-    ChunkSearchResult, DocumentInfo, DocumentSource, DocumentStatus, ExportFormat, Pinning,
+    Cell, ChunkSearchResult, DocumentInfo, DocumentSource, DocumentStatus, ExportFormat, Pinning,
     ResultSort, SortDirection, TableDescription,
 };
 use rust_embed::Embed;
@@ -409,7 +408,7 @@ impl From<&ToolStep> for StepView {
                 r.columns.clone(),
                 r.rows
                     .iter()
-                    .map(|row| row.iter().map(|v| JsonText(v).to_string()).collect())
+                    .map(|row| row.iter().map(|v| Cell(v).text()).collect())
                     .collect(),
             )
         });
@@ -540,7 +539,7 @@ impl TableView {
                 .sample_rows
                 .rows
                 .iter()
-                .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
+                .map(|r| r.iter().map(|v| Cell(v).text()).collect())
                 .collect(),
         }
     }
@@ -1668,20 +1667,6 @@ async fn import_submit(
     )
 }
 
-/// A JSON value shown as text: a string bare, null as nothing, anything
-/// else as JSON.
-struct JsonText<'a>(&'a serde_json::Value);
-
-impl fmt::Display for JsonText<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            serde_json::Value::Null => Ok(()),
-            serde_json::Value::String(s) => f.write_str(s),
-            other => write!(f, "{other}"),
-        }
-    }
-}
-
 async fn sql_page(
     State(app): State<App>,
     WebUser(identity): WebUser,
@@ -1727,7 +1712,7 @@ impl SqlResult {
                 rows: outcome
                     .rows
                     .iter()
-                    .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
+                    .map(|r| r.iter().map(|v| Cell(v).text()).collect())
                     .collect(),
                 row_count: outcome.row_count,
                 duration_ms: outcome.duration_ms,
@@ -2825,7 +2810,7 @@ impl GraphResultView {
                 properties: n
                     .properties
                     .iter()
-                    .map(|(k, v)| format!("{k}: {}", JsonText(v)))
+                    .map(|(k, v)| format!("{k}: {}", Cell(v).text()))
                     .collect::<Vec<_>>()
                     .join(" · "),
                 sources: sources_of(n.id.as_str()),
