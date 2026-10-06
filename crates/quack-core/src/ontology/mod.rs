@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
 use duckdb::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef};
+use schemars::{JsonSchema, Schema, schema_for};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{Error, Result};
@@ -209,10 +210,13 @@ impl FromSql for OntologyVersion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A kind of entity: graph nodes are typed by one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Class {
+    /// `snake_case`, unique among classes.
     pub id: ClassId,
+    /// The class this one specializes; the implicit root `entity` when absent.
     #[serde(default = "root_class")]
     pub parent: ClassId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,6 +226,7 @@ pub struct Class {
     /// The property that identifies an instance (a policy number).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Ids of the properties an instance carries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub properties: Vec<String>,
 }
@@ -235,19 +240,24 @@ fn hidden(total: usize, limit: usize) -> Option<usize> {
     total.checked_sub(limit).filter(|rest| *rest > 0)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A kind of edge, from an entity of `domain` to one of `range`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Relation {
+    /// `snake_case`, unique among relations.
     pub id: RelationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The class of the edge's source (or one of its subclasses).
     pub domain: ClassId,
+    /// The class of the edge's target (or one of its subclasses).
     pub range: ClassId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The type of a property's values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PropertyType {
     String,
@@ -265,9 +275,11 @@ text_enum!(PropertyType, "property type", {
     Boolean => "boolean",
 });
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A typed attribute that classes carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Property {
+    /// Unique among properties.
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -306,7 +318,7 @@ impl Property {
 /// A named calculation over one table: a SQL expression such as
 /// `sum(amount) / 100.0`, checked as a read of that table when the
 /// ontology is saved, so the agent and people compute it one way.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Measure {
     pub id: String,
@@ -343,20 +355,25 @@ impl std::fmt::Display for Measure {
 }
 
 /// One foreign-key-like column of a mapped table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MappingRelation {
+    /// The relation each row's edge takes.
     pub relation: RelationId,
+    /// The column holding the target's key.
     pub column: String,
     pub target_class: ClassId,
+    /// The target class's key property the column's values match.
     pub target_key: String,
 }
 
 /// How a table's rows become nodes and edges (design doc 6.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Mapping {
+    /// The workspace table whose rows become nodes.
     pub table: String,
+    /// The class each row's node takes.
     pub class: ClassId,
     /// The column holding the class key.
     pub key: String,
@@ -376,7 +393,7 @@ impl Mapping {
 }
 
 /// The whole ontology in interchange form.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Ontology {
     /// The stored version this was read from; `None` for one not yet saved.
@@ -385,6 +402,7 @@ pub struct Ontology {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "OntologyVersion::zero_as_none"
     )]
+    #[schemars(with = "Option<u32>")]
     pub version: Option<OntologyVersion>,
     #[serde(default)]
     pub classes: Vec<Class>,
@@ -392,8 +410,10 @@ pub struct Ontology {
     pub relations: Vec<Relation>,
     #[serde(default)]
     pub properties: Vec<Property>,
+    /// How tables' rows become nodes and edges.
     #[serde(default)]
     pub mappings: Vec<Mapping>,
+    /// Named calculations over one table each.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub measures: Vec<Measure>,
 }
@@ -551,6 +571,14 @@ impl std::fmt::Display for IdRenames {
 }
 
 impl Ontology {
+    /// The JSON Schema of the interchange form, as `docs/ontology.schema.json`
+    /// publishes it: what import, `PUT .../ontology`, and the ontology page
+    /// accept.
+    #[must_use]
+    pub fn json_schema() -> Schema {
+        schema_for!(Self)
+    }
+
     /// Parse the JSON interchange form and validate it.
     ///
     /// # Errors

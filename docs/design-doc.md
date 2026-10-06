@@ -1143,7 +1143,11 @@ revalidation preview (below) is what shows the cost before anything is dropped.
 and `import`, `GET/PUT .../ontology`, and the web editor's "download" and "save". Domain
 packs (an insurance ontology, a legal ontology) are shared between workspaces, diffed in
 review, or seeded into new workspaces this way. The file is never the source of truth. The
-example below is that shape written as YAML for brevity.
+example below is that shape written as YAML for brevity. Its JSON Schema
+(`Ontology::json_schema`, derived with `schemars` from the same types the parser reads) is
+committed as `docs/ontology.schema.json`, and a test keeps the file equal to the generated
+schema; `quack ontology schema`, `GET .../ontology/schema`, the ontology page's "JSON
+Schema" link, and the MCP resource `quack://workspace/ontology/schema` serve it.
 
 ```yaml
 version: 3
@@ -1279,6 +1283,28 @@ is why the default is `off`), then resolution. The server queues it when an uplo
 import succeeds, as an audited `graph_extract` run in the workspace's graph lane (so it
 waits behind an extraction in progress), and the ingest job's outcome names the job; the
 command line and the terminal run it after their own ingest and print one line.
+
+**Export.** `graph::export::GraphExport` writes the whole graph, not one capped query, in
+three formats (`GraphFormat`): `csv`, a bundle of `nodes.csv` (`id, label, class_id,
+properties, provisional`), `edges.csv` (`id, source, target, relation_id, weight,
+properties, provisional`; `source` and `target` are Gephi's edge-list names), and
+`provenance.csv` (`subject_id, document_id, chunk_id, table_name, row_key, confidence,
+author, note, asserted_at`), written to a directory or as a tar; `graphml`, one document
+whose nodes and edges carry their properties and provenance as JSON text; and `jsonld`,
+whose `@context` defines `class:` and `relation:` prefixes and whose `@graph` lists the
+current ontology's classes (`rdfs:Class`, with `rdfs:subClassOf`) and relations
+(`rdf:Property`, with domain and range), then every node typed by its class, then every edge
+as an `rdf:Statement` whose predicate is its relation. A node never exports its vector or
+normalized label. Provisional nodes and edges stay out unless asked for, and an edge goes
+only with both its ends. Each part streams from one ordered prepared statement in one
+read-only transaction; a tar entry needs its size first, so each CSV part is staged in an
+anonymous file in the workspace directory (`WorkspaceDb::spool_file`). Manual provenance
+exports with its author and note. `quack graph export DIR|- --format csv|graphml|jsonld
+[--include-provisional]`, `/graph export DIR` in the terminal, `GET .../graph/export`, and the
+graph page's Download form write it; the route streams like the OKF export and audits
+`export` with `{format, nodes, edges, provenance}` when the stream ends. Importing a graph
+is not built: every node and edge needs provenance, and an imported row needs its own
+`Origin`.
 
 **Assertions.** A person can add, correct, and delete nodes and edges: `quack graph
 add|set|delete`, `POST`/`PATCH`/`DELETE` on `.../graph/nodes[/{nid}]` and
@@ -1584,7 +1610,12 @@ provisional nodes says the matches exist but are unreviewed.
 
 A result cut short by `max_nodes` says so, and a class listing carries the total it was
 capped from (`GraphResult::total_nodes`, `truncated`); otherwise the reader takes the cap
-for the class's population. Traversal cannot count, and user SQL may not read `_quack_`
+for the class's population. Every result also carries `status`
+(`GraphStatusSummary`: `built_with_version`, `ontology_version`, `stale`,
+`provisional_nodes`, `drift_total`, and `dropped_provisional`, the provisional nodes query
+mode removed from it), filled by `GraphQuery::run` and `PathQuery::run`, so an answer's
+`graph` entries say whether the graph behind them is current without a second call. The
+prompt's graph line names the drift count beside the provisional and stale notes. Traversal cannot count, and user SQL may not read `_quack_`
 tables, so `describe_class` reports the exact count of a class and its subclasses. To count
 by a property, filter, or join, the graph procedure in the prompt points the model at
 `run_sql` over `graph_<class>` and `graph_edges` (section 6.4), with `WHERE NOT provisional` in
@@ -2229,6 +2260,7 @@ POST   /api/v1/workspaces/{id}/tables/retype    {name, column, type}: give a col
 POST   /api/v1/workspaces/{id}/graph/search    {entity?, class?, relation?, hops?}
 POST   /api/v1/workspaces/{id}/graph/path      {from, to, max_hops?}
 GET    /api/v1/workspaces/{id}/graph/status
+GET    /api/v1/workspaces/{id}/graph/export?format=csv|graphml|jsonld[&include_provisional=true]   the whole graph, streamed (csv as a tar); audited `export` with the counts
 POST   /api/v1/workspaces/{id}/graph/extract       tables now; documents -> 202 with the cost, one run per workspace (409 while one runs)
 GET    /api/v1/workspaces/{id}/graph/revalidate    what a revalidation would drop: totals, per class id, per relation id
 POST   /api/v1/workspaces/{id}/graph/revalidate    drop it: {"dropped_nodes", "dropped_edges"} from the preview; 409 with the current totals when absent or stale
@@ -2245,6 +2277,7 @@ POST   /api/v1/workspaces/{id}/embeddings/refresh  200 when current, else 202 wi
 GET    /api/v1/workspaces/{id}/okf                 the bundle as a tar (import is POST .../documents with a tar)
 GET    /api/v1/workspaces/{id}/ontology            current version, JSON
 PUT    /api/v1/workspaces/{id}/ontology            import: validate, write a new version
+GET    /api/v1/workspaces/{id}/ontology/schema     the interchange form's JSON Schema (docs/ontology.schema.json)
 POST   /api/v1/workspaces/{id}/ontology/init       the built-in default as version 1
 POST   /api/v1/workspaces/{id}/ontology/rename     {kind: class|relation, from, to}: a new version; nodes and edges move to the new id
 GET    /api/v1/workspaces/{id}/ontology/versions[?limit=20] | /{v}[?against=N] for a diff
@@ -2331,7 +2364,7 @@ once the graph has nodes, `search_graph` and `find_path`. Each answers with stru
 content plus text. Refusals (a write without permission, an internal table, a missing
 table) are tool errors the client model can read. Resources:
 `quack://workspace/tables`, `.../tables/{name}/schema`, `.../documents`, `.../ontology`
-(JSON), `.../context` (Markdown).
+(JSON), `.../ontology/schema` (the interchange form's JSON Schema), `.../context` (Markdown).
 
 ```json
 { "mcpServers": { "quack": { "command": "quack", "args": ["mcp", "-w", "logistics"] } } }
@@ -2452,7 +2485,8 @@ quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class
             | add node LABEL --class C [--property K=V].. [--note T] | add edge FROM RELATION TO [--note T]
             | set NODE [--label L] [--to-class C] [--property K=V].. [--unset K].. [--note T]
             | delete node NODE [--class C] | delete edge ID
-quack ontology show | init | propose [--documents] [--from FILE] [--sample N]
+            | export DIR|- [--format csv|graphml|jsonld] [--include-provisional]
+quack ontology show | schema | init | propose [--documents] [--from FILE] [--sample N]
               [--auto-accept] [-y] | review [--low-support]
               | accept ID... [--rename N|--merge-into ID|--reparent C] | reject ID...
               | export FILE | import FILE | versions | diff [FROM] [TO] | restore V

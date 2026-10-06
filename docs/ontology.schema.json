@@ -1,0 +1,302 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ontology",
+  "description": "The whole ontology in interchange form.",
+  "type": "object",
+  "properties": {
+    "classes": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Class"
+      }
+    },
+    "mappings": {
+      "description": "How tables' rows become nodes and edges.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Mapping"
+      }
+    },
+    "measures": {
+      "description": "Named calculations over one table each.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Measure"
+      }
+    },
+    "properties": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Property"
+      }
+    },
+    "relations": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Relation"
+      }
+    },
+    "version": {
+      "description": "The stored version this was read from; `None` for one not yet saved.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "Class": {
+      "description": "A kind of entity: graph nodes are typed by one.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "`snake_case`, unique among classes.",
+          "$ref": "#/$defs/ClassId"
+        },
+        "key": {
+          "description": "The property that identifies an instance (a policy number).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent": {
+          "description": "The class this one specializes; the implicit root `entity` when absent.",
+          "$ref": "#/$defs/ClassId",
+          "default": "entity"
+        },
+        "properties": {
+          "description": "Ids of the properties an instance carries.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id"
+      ]
+    },
+    "ClassId": {
+      "description": "An ontology class: a `snake_case` name such as `person`.",
+      "type": "string"
+    },
+    "Mapping": {
+      "description": "How a table's rows become nodes and edges (design doc 6.3).",
+      "type": "object",
+      "properties": {
+        "class": {
+          "description": "The class each row's node takes.",
+          "$ref": "#/$defs/ClassId"
+        },
+        "key": {
+          "description": "The column holding the class key.",
+          "type": "string"
+        },
+        "properties": {
+          "description": "Column to property id.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "relations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MappingRelation"
+          }
+        },
+        "table": {
+          "description": "The workspace table whose rows become nodes.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "table",
+        "class",
+        "key"
+      ]
+    },
+    "MappingRelation": {
+      "description": "One foreign-key-like column of a mapped table.",
+      "type": "object",
+      "properties": {
+        "column": {
+          "description": "The column holding the target's key.",
+          "type": "string"
+        },
+        "relation": {
+          "description": "The relation each row's edge takes.",
+          "$ref": "#/$defs/RelationId"
+        },
+        "target_class": {
+          "$ref": "#/$defs/ClassId"
+        },
+        "target_key": {
+          "description": "The target class's key property the column's values match.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "relation",
+        "column",
+        "target_class",
+        "target_key"
+      ]
+    },
+    "Measure": {
+      "description": "A named calculation over one table: a SQL expression such as\n`sum(amount) / 100.0`, checked as a read of that table when the\nontology is saved, so the agent and people compute it one way.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expression": {
+          "description": "What goes after `SELECT` and before `FROM table`.",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "table": {
+          "description": "The table the expression reads.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "table",
+        "expression"
+      ]
+    },
+    "Property": {
+      "description": "A typed attribute that classes carry.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "description": "What a value means, shown beside every column mapped to it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Unique among properties.",
+          "type": "string"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "synonyms": {
+          "description": "Other words people use for it, which the table search matches.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "type": {
+          "$ref": "#/$defs/PropertyType"
+        },
+        "unit": {
+          "description": "The unit a number is in (`cents`, `USD`, `kg`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "values": {
+          "description": "Allowed values for `enum`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "type"
+      ]
+    },
+    "PropertyType": {
+      "description": "The type of a property's values.",
+      "type": "string",
+      "enum": [
+        "string",
+        "number",
+        "date",
+        "enum",
+        "boolean"
+      ]
+    },
+    "Relation": {
+      "description": "A kind of edge, from an entity of `domain` to one of `range`.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "domain": {
+          "description": "The class of the edge's source (or one of its subclasses).",
+          "$ref": "#/$defs/ClassId"
+        },
+        "id": {
+          "description": "`snake_case`, unique among relations.",
+          "$ref": "#/$defs/RelationId"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "range": {
+          "description": "The class of the edge's target (or one of its subclasses).",
+          "$ref": "#/$defs/ClassId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "domain",
+        "range"
+      ]
+    },
+    "RelationId": {
+      "description": "An ontology relation: a `snake_case` name such as `works_at`.",
+      "type": "string"
+    }
+  }
+}

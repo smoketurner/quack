@@ -3283,6 +3283,20 @@ impl WorkspaceDb {
         result
     }
 
+    /// An anonymous file, removed when closed, for an export to stage
+    /// workspace content in: under the workspace's own directory, or the
+    /// system's temporary directory for an in-memory database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be created.
+    pub fn spool_file(&self) -> Result<std::fs::File> {
+        Ok(match &self.files_dir {
+            Some(dir) => tempfile::tempfile_in(dir)?,
+            None => tempfile::tempfile()?,
+        })
+    }
+
     /// Run `f`'s reads inside `BEGIN TRANSACTION READ ONLY`, scoped to `f`
     /// alone: reader connections use this for every query so no transaction
     /// outlives one piece of work, pinning an old snapshot and blocking

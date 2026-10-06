@@ -31,6 +31,7 @@ use quack_core::config::{Config, Grant, LogFormat};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::graph::export::Destination;
 use quack_core::graph::follow_up::FollowUp;
 use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
@@ -1027,7 +1028,14 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             run_ingest(cli, args).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Ontology(ontology_cli::OntologyAction::Schema) => {
+            ontology_cli::write_schema(&mut std::io::stdout().lock())?;
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Ontology(action) => run_on_writer(cli, action).await,
+        Commands::Graph(graph_cli::GraphAction::Export(args)) if args.to_stdout() => {
+            run_graph_export(cli, &args).await
+        }
         Commands::Graph(action) => run_on_writer(cli, action).await,
         Commands::Embeddings(action) => run_on_writer(cli, action).await,
         Commands::Saved(action) => run_saved(cli, action).await,
@@ -1449,6 +1457,18 @@ async fn run_okf_export(cli: &Cli, dir: &StdioPath) -> Result<ExitCode> {
             writeln!(out, "wrote {} files to {dir}", summary.files)?;
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `quack graph export - --format F`: the graph on stdout, a tar of the
+/// CSV bundle or the document itself, in one read. A directory goes
+/// through the writer like the other graph verbs.
+async fn run_graph_export(cli: &Cli, args: &graph_cli::ExportArgs) -> Result<ExitCode> {
+    init_logging();
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+    let db = opened.open_db()?;
+    let out = std::io::BufWriter::new(std::io::stdout().lock());
+    db.read_only(|db| args.export().write(db, Destination::Stream(out)))?;
     Ok(ExitCode::SUCCESS)
 }
 

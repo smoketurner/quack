@@ -9,6 +9,7 @@ use clap::Subcommand;
 use quack_core::analysis::tools::{FindPathArgs, NonBlank, SearchGraphArgs};
 use quack_core::config::Config;
 use quack_core::extraction::ExtractionRun;
+use quack_core::graph::export::{Destination, GraphExport, GraphFormat, ProvisionalExport};
 use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::query::UnknownEntity;
 use quack_core::graph::store::{Assertion, Keep, NewEdge, NewNode, NodeEdit, Revalidation};
@@ -24,6 +25,7 @@ use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
 
 use crate::confirm::Confirm;
+use crate::stdio::StdioPath;
 use crate::text_or_json::TextOrJson;
 
 #[derive(Subcommand)]
@@ -68,6 +70,62 @@ pub(crate) enum GraphAction {
     /// Delete a node (with its edges) or an edge
     #[command(subcommand)]
     Delete(DeleteWhat),
+    /// Write the whole graph for Gephi, Neo4j, or `NetworkX`: a CSV bundle
+    /// (nodes.csv, edges.csv, provenance.csv), `GraphML`, or JSON-LD, each
+    /// node and edge with its provenance
+    Export(ExportArgs),
+}
+
+#[derive(clap::Args)]
+pub(crate) struct ExportArgs {
+    /// Directory to write (created), or - for stdout: a tar of the CSV
+    /// bundle, or the `GraphML` or JSON-LD document
+    dir: StdioPath,
+    /// csv, graphml, or jsonld
+    #[arg(long, default_value = "csv")]
+    format: GraphFormat,
+    /// Include nodes and edges built from an unreviewed ontology
+    #[arg(long)]
+    include_provisional: bool,
+}
+
+impl ExportArgs {
+    /// Whether the export goes to standard output, which only the command
+    /// line writes (`run_graph_export`).
+    pub(crate) fn to_stdout(&self) -> bool {
+        self.dir == StdioPath::Stdio
+    }
+
+    pub(crate) fn export(&self) -> GraphExport {
+        GraphExport {
+            format: self.format,
+            provisional: ProvisionalExport::from(self.include_provisional),
+        }
+    }
+
+    /// Write the export to its directory and say what went.
+    async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
+        let export = self.export();
+        let StdioPath::Path(dir) = self.dir else {
+            anyhow::bail!("give a directory to write the graph to");
+        };
+        let target = dir.clone();
+        let summary = db
+            .run(move |db| {
+                db.read_only(|db| export.write::<std::io::Sink>(db, Destination::Dir(&target)))
+            })
+            .await?;
+        writeln!(
+            out,
+            "Wrote {} nodes, {} edges, and {} provenance rows as {} to {}.",
+            summary.nodes,
+            summary.edges,
+            summary.provenance,
+            summary.format,
+            dir.display()
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Subcommand)]
@@ -288,6 +346,7 @@ impl GraphAction {
             Self::Add(what) => what.run(db, out).await?,
             Self::Set(args) => args.run(db, out).await?,
             Self::Delete(what) => what.run(db, out).await?,
+            Self::Export(args) => args.run(db, out).await?,
         }
         out.flush()?;
         Ok(())

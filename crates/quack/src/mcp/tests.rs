@@ -427,6 +427,12 @@ async fn stdio_resources_render_tables_context_and_schemas() {
             .unwrap_or_else(|e| fail(&e.message)),
         None
     );
+    let schema = writer
+        .resource_text(WorkspaceResource::OntologySchema)
+        .await
+        .unwrap_or_else(|e| fail(&e.message))
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    assert_eq!(schema, serde_json::to_value(Ontology::json_schema()).ok());
     let info = writer.get_info();
     assert!(info.instructions.is_some_and(|i| i.contains("'stdio'")));
 }
@@ -445,4 +451,8 @@ fn resource_uris_round_trip() {
     assert_eq!(WorkspaceResource::parse("quack://elsewhere"), None);
     assert_eq!(WorkspaceResource::parse("quack://workspace/tables/t"), None);
     assert_eq!(WorkspaceResource::parse("quack://workspace/sessions"), None);
+    assert_eq!(
+        WorkspaceResource::OntologySchema.uri(),
+        "quack://workspace/ontology/schema"
+    );
 }

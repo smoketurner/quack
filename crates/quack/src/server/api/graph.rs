@@ -5,10 +5,12 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::Response;
 use quack_core::config::GraphConfig;
 use quack_core::extraction::{Extract, ExtractionRun};
+use quack_core::graph::export::{Destination, GraphExport, GraphFormat, ProvisionalExport};
 use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::resolve::{MergeDecision, MergeProposal, ResolutionSummary};
 use quack_core::graph::store::{
@@ -20,10 +22,12 @@ use quack_core::graph::{
 };
 use quack_core::ids::{ClassId, EdgeId, NodeId, RelationId, RunId, WorkspaceId};
 use quack_core::llm::{self, Embeddings};
+use quack_core::okf;
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::{Deserialize, Serialize};
 
+use crate::server::api::okf::Download;
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::run::{BackgroundRun, GraphReport, RunKind};
@@ -124,6 +128,46 @@ pub(crate) async fn status(
         .await?;
     let status = app.read(&id, graph_store::status).await?;
     Ok(Json(serde_json::to_value(status)?))
+}
+
+/// `GET .../graph/export?format=csv|graphml|jsonld&include_provisional=true`.
+#[derive(Deserialize, Default)]
+pub(crate) struct ExportQuery {
+    #[serde(default)]
+    format: GraphFormat,
+    #[serde(default)]
+    include_provisional: bool,
+}
+
+/// The whole graph as an attachment (a tar of the CSV bundle, `GraphML`, or
+/// JSON-LD), streamed like the OKF export and audited as `export` with
+/// `{format, nodes, edges, provenance}` when it ends.
+pub(crate) async fn export(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+    Query(query): Query<ExportQuery>,
+) -> ApiResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let export = GraphExport {
+        format: query.format,
+        provisional: ProvisionalExport::from(query.include_provisional),
+    };
+    let download = Download {
+        filename: format!(
+            "{}.graph.{}",
+            okf::slug(&access.membership.workspace.name),
+            export.format.extension()
+        ),
+        content_type: export.format.content_type(),
+        format: export.format.as_str(),
+    };
+    download
+        .stream(&app, access, id, move |db, body| {
+            let summary = export.write(db, Destination::Stream(body))?;
+            Ok(serde_json::to_value(summary)?)
+        })
+        .await
 }
 
 #[derive(Deserialize, Default)]

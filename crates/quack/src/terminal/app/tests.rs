@@ -129,6 +129,32 @@ fn last(app: &App) -> &Message {
     app.messages.last().unwrap_or_else(|| fail("no messages"))
 }
 
+/// `/graph export` writes to a directory; stdout is the session's own screen.
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_exports_go_to_a_directory() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut app = app(dir.path());
+    let target = dir.path().join("export");
+    app.handle_slash_command(&format!(
+        "/graph export {} --format jsonld",
+        dropped_path(&target)
+    ));
+    settle(&mut app).await;
+    assert!(
+        last(&app).content.contains("Wrote 0 nodes, 0 edges"),
+        "{}",
+        last(&app).content
+    );
+    assert!(target.join("graph.jsonld").is_file());
+    app.handle_slash_command("/graph export -");
+    settle(&mut app).await;
+    assert!(
+        last(&app).content.contains("give a directory"),
+        "{}",
+        last(&app).content
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn slash_commands_run_sql_schema_and_cli_verbs_without_a_terminal() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));

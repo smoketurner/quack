@@ -177,6 +177,7 @@ fn graph_routes() -> Router<App> {
         .route("/workspaces/{id}/graph/search", post(graph::search))
         .route("/workspaces/{id}/graph/path", post(graph::path))
         .route("/workspaces/{id}/graph/status", get(graph::status))
+        .route("/workspaces/{id}/graph/export", get(graph::export))
         .route("/workspaces/{id}/graph/extract", post(graph::extract))
         .route(
             "/workspaces/{id}/graph/revalidate",
@@ -225,6 +226,7 @@ fn ontology_routes() -> Router<App> {
             "/workspaces/{id}/ontology",
             get(ontology::show).put(ontology::replace),
         )
+        .route("/workspaces/{id}/ontology/schema", get(ontology::schema))
         .route("/workspaces/{id}/ontology/init", post(ontology::init))
         .route("/workspaces/{id}/ontology/rename", post(ontology::rename))
         .route("/workspaces/{id}/ontology/propose", post(ontology::propose))

@@ -9,8 +9,8 @@ use duckdb::types::ToSqlOutput;
 
 use super::resolve::MergeStatus;
 use super::{
-    Drift, Edge, GraphStatus, Node, NormalizedLabel, Origin, Properties, Provenance,
-    ProvenanceColumns, Standing, tables,
+    Drift, Edge, GraphStatus, GraphStatusSummary, Node, NormalizedLabel, Origin, Properties,
+    Provenance, ProvenanceColumns, Standing, tables,
 };
 use crate::embedding::Vector;
 use crate::error::{Error, Result};
@@ -564,19 +564,13 @@ pub fn record_drift(db: &WorkspaceDb, run: &Drift) -> Result<()> {
 /// Returns an error if a read fails.
 pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
     let conn = db.connection();
-    let (nodes, provisional_nodes): (i64, i64) = conn.query_row(
-        "SELECT count(*), count(*) FILTER (WHERE provisional) FROM _quack_graph_nodes",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let (nodes, summary) = summary_and_size(db)?;
     let edges: i64 = conn.query_row("SELECT count(*) FROM _quack_graph_edges", [], |r| r.get(0))?;
     let pending_merges: i64 = conn.query_row(
         "SELECT count(*) FROM _quack_graph_merges WHERE status = ?",
         [MergeStatus::Pending],
         |r| r.get(0),
     )?;
-    let built_with_version = built_with(db)?;
-    let ontology_version = ontology_store::latest_version(db)?;
     let (missing_tables, pending_tables) = match ontology_store::current(db)? {
         Some(ontology) => {
             let tables = db.list_tables()?;
@@ -591,20 +585,51 @@ pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
         None => (Vec::new(), Vec::new()),
     };
     Ok(GraphStatus {
-        nodes: u64::try_from(nodes).unwrap_or(0),
+        nodes,
         edges: u64::try_from(edges).unwrap_or(0),
-        provisional_nodes: u64::try_from(provisional_nodes).unwrap_or(0),
-        built_with_version,
-        ontology_version,
-        // Stale needs a recorded build that lags and something built: a
-        // never-built graph (`None`) and an empty one are not stale.
-        stale: nodes > 0 && built_with_version.is_some_and(|built| Some(built) < ontology_version),
+        provisional_nodes: summary.provisional_nodes,
+        built_with_version: summary.built_with_version,
+        ontology_version: summary.ontology_version,
+        stale: summary.stale,
         pending_merges: u64::try_from(pending_merges).unwrap_or(0),
         drift: drift(db)?,
         missing_tables,
         pending_chunks: db.pool_size(SamplePool::NotGraphExtracted)?,
         pending_tables,
     })
+}
+
+/// The status every graph result carries: versions, staleness, the
+/// provisional count, and the drift total, without the costlier checks
+/// of [`status`].
+///
+/// # Errors
+///
+/// Returns an error if a read fails.
+pub fn summary(db: &WorkspaceDb) -> Result<GraphStatusSummary> {
+    summary_and_size(db).map(|(_, summary)| summary)
+}
+
+/// [`summary`], and the node count it was judged on.
+fn summary_and_size(db: &WorkspaceDb) -> Result<(u64, GraphStatusSummary)> {
+    let (nodes, provisional_nodes): (i64, i64) = db.connection().query_row(
+        "SELECT count(*), count(*) FILTER (WHERE provisional) FROM _quack_graph_nodes",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let built_with_version = built_with(db)?;
+    let ontology_version = ontology_store::latest_version(db)?;
+    let summary = GraphStatusSummary {
+        built_with_version,
+        ontology_version,
+        // Stale needs a recorded build that lags and something built: a
+        // never-built graph (`None`) and an empty one are not stale.
+        stale: nodes > 0 && built_with_version.is_some_and(|built| Some(built) < ontology_version),
+        provisional_nodes: u64::try_from(provisional_nodes).unwrap_or(0),
+        drift_total: u64::try_from(drift(db)?.total()).unwrap_or(u64::MAX),
+        dropped_provisional: 0,
+    };
+    Ok((u64::try_from(nodes).unwrap_or(0), summary))
 }
 
 /// What [`clear`] leaves standing.

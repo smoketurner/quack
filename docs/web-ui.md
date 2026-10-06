@@ -75,13 +75,15 @@ signed-in user and reads no workspace, so it writes no audit row.
 - **`ontology.html`** shows the class tree, relations, properties, and mappings; the JSON
   editor; the version list with the diff to the previous version; the propose form; the
   Rename form, which gives a class or relation a new id and moves the graph's nodes and
-  edges with it; and the paged review queue with bulk accept and reject.
+  edges with it; the paged review queue with bulk accept and reject; and links to download
+  the ontology's JSON and its JSON Schema.
 - **`graph.html`** shows status banners (provisional, stale, missing mapped tables,
   chunks and tables the graph has not caught up with, drift), the search and path forms,
   the ECharts result with a node inspector (each entry carries an edit form and a delete
   button for people who may write; each edge a delete button), a "Correct the graph"
-  section with add-node and add-edge forms, the merge queue, and the extract, revalidate,
-  and review buttons. The stale banner lists what a
+  section with add-node and add-edge forms, the merge queue, the extract, revalidate,
+  and review buttons, and a Download form (a `GET` to `.../graph/export` with the format and
+  whether to include provisional rows). The stale banner lists what a
   revalidation would drop (totals, per class id, per relation id). Its button names those
   totals and posts them, and the server drops only when they still match what it counts.
   When the preview cannot be counted, the banner says why and offers no drop.

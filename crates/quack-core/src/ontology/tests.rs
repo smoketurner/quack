@@ -252,3 +252,49 @@ fn diff_reports_added_removed_and_changed_ids() {
     );
     assert!(base.diff(&base).is_empty());
 }
+
+/// `docs/ontology.schema.json` is what `Ontology::json_schema` generates;
+/// regenerate it with `quack ontology schema > docs/ontology.schema.json`.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test reads committed files")]
+fn the_committed_schema_is_the_generated_one() {
+    let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+    let committed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(docs.join("ontology.schema.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        committed,
+        serde_json::to_value(Ontology::json_schema()).unwrap(),
+        "docs/ontology.schema.json is out of date: run `quack ontology schema > docs/ontology.schema.json`"
+    );
+}
+
+/// The schema describes what the parser takes: the strict, renamed, and
+/// defaulted fields show in it, and the example pack's ontology parses.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test reads committed files")]
+fn the_schema_matches_what_import_accepts() {
+    let schema = serde_json::to_value(Ontology::json_schema()).unwrap();
+    assert_eq!(
+        schema.get("additionalProperties"),
+        Some(&serde_json::json!(false))
+    );
+    let definitions = schema.get("$defs").unwrap();
+    let required = definitions
+        .pointer("/Property/required")
+        .and_then(serde_json::Value::as_array)
+        .unwrap();
+    assert!(
+        required.contains(&serde_json::json!("type")),
+        "{required:?}"
+    );
+    assert_eq!(
+        definitions.pointer("/Class/properties/parent/default"),
+        Some(&serde_json::json!("entity"))
+    );
+
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/storms/ontology.json");
+    let parsed = Ontology::from_json(&std::fs::read_to_string(example).unwrap());
+    assert!(parsed.is_ok(), "{parsed:?}");
+}

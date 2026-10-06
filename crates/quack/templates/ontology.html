@@ -120,6 +120,7 @@
       <div class="mt-2 flex items-center gap-3 text-sm">
         {% if ws.can_write %}<button type="submit" class="rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500">Save as new version</button>{% endif %}
         <a class="text-blue-400 hover:underline" href="/api/v1/workspaces/{{ ws.membership.workspace.id }}/ontology" download="ontology.json">Download JSON</a>
+        <a class="text-blue-400 hover:underline" href="/api/v1/workspaces/{{ ws.membership.workspace.id }}/ontology/schema" download="ontology.schema.json">JSON Schema</a>
       </div>
     </form>
     {% if let Some(d) = diff %}
