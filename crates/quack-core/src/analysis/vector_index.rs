@@ -49,8 +49,9 @@ impl<M> DuckDbVectorIndex<M>
 where
     M: EmbeddingModel + Send + Sync,
 {
-    /// The chunks nearest the request's query, across the workspace. A
-    /// search that finds any records that the turn has read document text.
+    /// The chunks nearest the request's query, within the documents the
+    /// person limited the turn to (the whole workspace when none). A search
+    /// that finds any records that the turn has read document text.
     #[expect(
         clippy::result_large_err,
         reason = "rig's VectorStoreError, which the VectorStoreIndex methods return"
@@ -65,9 +66,11 @@ where
             .await
             .map_err(store_error)?;
         let samples = u32::try_from(req.samples()).unwrap_or(DEFAULT_SAMPLES);
+        let scope =
+            ChunkScope::documents(self.turn.scope().documents().iter().map(|d| d.id.clone()));
         let chunks = self
             .db
-            .with_db(move |db| db.search_similar_chunks(&query_vec, samples, &ChunkScope::all()))
+            .with_db(move |db| db.search_similar_chunks(&query_vec, samples, &scope))
             .await
             .map_err(store_error)?;
         if !chunks.is_empty() {
@@ -119,6 +122,7 @@ mod tests {
     use super::*;
     use crate::ids::{ChunkId, DocumentId};
     use crate::ingestion::parser::SectionKind;
+    use crate::storage::workspace::Ranks;
 
     /// A retrieved chunk goes into the prompt fenced like any other
     /// document text, whatever it says.
@@ -136,6 +140,7 @@ mod tests {
             kind: SectionKind::Body,
             locator: None,
             ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
+            ranks: Ranks::default(),
         };
         let value = ContextDocument(&chunk).value();
         let field = |name: &str| value.get(name).and_then(serde_json::Value::as_str);

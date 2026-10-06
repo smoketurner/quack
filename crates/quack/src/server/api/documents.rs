@@ -25,19 +25,67 @@ use quack_core::analysis::tools::SharedDb;
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store::Revision;
 use quack_core::storage::workspace::{
-    ChunkSearchResult, DocumentFields, DocumentInfo, DocumentSource, Pinning, WorkspaceDb,
+    ChunkSearchResult, DocumentFields, DocumentFilter, DocumentInfo, DocumentSource, Pinning,
 };
+
+/// `GET .../documents`'s filter: lists comma-separated, dates as
+/// `YYYY-MM-DD`, each field given narrowing the listing.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListFilter {
+    types: Option<String>,
+    sources: Option<String>,
+    tags: Option<String>,
+    since: Option<jiff::civil::Date>,
+    until: Option<jiff::civil::Date>,
+    author: Option<String>,
+}
+
+impl ListFilter {
+    fn items(list: Option<&str>) -> Vec<String> {
+        list.unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The filter it asks for.
+    fn filter(&self) -> ApiResult<DocumentFilter> {
+        let mut sources = Vec::new();
+        for source in Self::items(self.sources.as_deref()) {
+            sources.push(
+                source
+                    .parse::<DocumentSource>()
+                    .map_err(|e| ApiError::bad_request(e.to_string()))?,
+            );
+        }
+        Ok(DocumentFilter {
+            types: Self::items(self.types.as_deref()),
+            sources,
+            tags: Self::items(self.tags.as_deref()),
+            since: self.since,
+            until: self.until,
+            author: self.author.clone(),
+        })
+    }
+}
 
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
+    Query(q): Query<ListFilter>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let filter = q.filter()?;
     access
         .audit_read(&app, AuditAction::List, "documents")
         .await?;
-    let docs = app.read(&id, WorkspaceDb::list_documents).await?;
+    let docs = app
+        .read(&id, move |db| db.list_documents_matching(&filter))
+        .await?;
     Ok(Json(serde_json::json!({ "documents": docs })))
 }
 

@@ -19,9 +19,9 @@ use axum::http::request::Parts;
 use quack_core::analysis::citations::Sources;
 use quack_core::analysis::events;
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::{FindPathArgs, ReaderDb, SearchGraphArgs, SharedDb};
+use quack_core::analysis::search::DocumentSearch;
+use quack_core::analysis::tools::{FindPathArgs, ReaderDb, Rerank, SearchGraphArgs, SharedDb};
 use quack_core::config::Config;
-use quack_core::embedding::Input;
 use quack_core::ids::{SessionId, UserId};
 use quack_core::llm::acting::Acting;
 use quack_core::llm::egress::Egress;
@@ -33,7 +33,7 @@ use quack_core::storage::control::{
 };
 use quack_core::storage::sessions::{self, ChatMode, SessionViewer};
 use quack_core::storage::workspace::{
-    ChunkScope, HybridLimits, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
+    DocumentFilter, SearchMode, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -181,14 +181,36 @@ pub(crate) struct QueryArgs {
     /// keeps the mode it was created with.
     #[schemars(with = "Option<ChatMode>")]
     pub mode: Option<String>,
+    /// Limit the question to these documents: ids from `list_documents`
+    /// (prefixes accepted) or exact file names; omit for every document.
+    #[serde(default)]
+    pub document_ids: Vec<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Default, Deserialize, JsonSchema)]
 pub(crate) struct SearchArgs {
-    /// Words or a phrase to find in the documents.
+    /// Words or a phrase to find in the documents; a "quoted phrase" must
+    /// appear exactly.
     pub query: String,
     /// Chunks to return (default from the workspace configuration).
     pub top_k: Option<u32>,
+    /// Search only these documents: ids from `list_documents` (prefixes
+    /// accepted) or exact file names.
+    #[serde(default)]
+    pub document_ids: Vec<String>,
+    /// Search only the passages this knowledge-graph entity was extracted
+    /// from.
+    pub entity: Option<String>,
+    /// Search only documents of these types, sources, or tags, written in a
+    /// date range, or by an author.
+    #[serde(default)]
+    pub filters: DocumentFilter,
+    /// `hybrid` (the default), `keyword`, or `vector`.
+    pub mode: Option<SearchMode>,
+    /// Also return each leg's candidates with their ranks and scores, the
+    /// quoted-phrase filter, and the rerank outcome.
+    #[serde(default)]
+    pub explain: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -407,13 +429,18 @@ impl McpServer {
             session_id: &session_id,
             policy: self.inner.policy,
             message: &question,
+            documents: &args.document_ids,
             sink,
             cancel: caller.cancel(),
         }
         .run(&self.inner.config)
         .await;
         drop(drain);
-        let detail = serde_json::json!({ "prompt": question, "session_id": session_id });
+        let detail = serde_json::json!({
+            "prompt": question,
+            "session_id": session_id,
+            "documents": args.document_ids,
+        });
         match outcome {
             Ok(response) => {
                 caller
@@ -466,7 +493,7 @@ impl McpServer {
     /// Hybrid retrieval over the documents, no model in the loop.
     #[tool(
         name = "search",
-        description = "Find the most relevant document chunks for a query by meaning and by keyword. Returns chunks with their file, page, heading, and score; no model is called."
+        description = "Find the most relevant document chunks for a query by meaning and by keyword, optionally within named documents, a graph entity's passages, or documents matching a filter. Returns chunks with their file, page, heading, fused score, and rank in each leg; `explain` adds both legs' candidates and the rerank outcome. No chat model is called unless the workspace reranks with it."
     )]
     async fn search(
         &self,
@@ -484,62 +511,49 @@ impl McpServer {
         args: SearchArgs,
         caller: &Caller,
     ) -> Result<CallToolResult, McpError> {
-        let query = args.query.trim().to_owned();
-        if query.is_empty() {
-            return Ok(failure("query must not be empty"));
-        }
-        let top_k = args
-            .top_k
-            .unwrap_or(self.inner.config.retrieval.top_k)
-            .clamp(1, 100);
-        let rrf_k = self.inner.config.retrieval.rrf_k;
-        let detail = serde_json::json!({ "q": query });
-        let model = match Embeddings::from_config(&self.inner.config).await {
+        let config = &self.inner.config;
+        let search =
+            match DocumentSearch::new(&args.query, args.top_k.unwrap_or(config.retrieval.top_k)) {
+                Ok(search) => DocumentSearch {
+                    documents: args.document_ids,
+                    entity: args.entity.filter(|e| !e.trim().is_empty()),
+                    filter: args.filters,
+                    mode: args.mode.unwrap_or_default(),
+                    ..search
+                },
+                Err(e) => return Ok(failure(e.to_string())),
+            };
+        let detail = serde_json::json!({ "q": search.query, "search": search.describe() });
+        let model = match Embeddings::from_config(config).await {
             Ok(model) => model,
+            Err(e) => return caller.unbuilt(AuditAction::Search, detail, &e).await,
+        };
+        let rerank = match Rerank::from_config(config).await {
+            Ok(rerank) => rerank,
             Err(e) => return caller.unbuilt(AuditAction::Search, detail, &e).await,
         };
         // Run the search, audit its outcome, then answer — the way the `sql`
         // tool does, so a post-authorization failure is recorded instead of
         // dropped, while tool failures stay normal tool results.
-        let result: Result<Vec<_>, McpError> = async {
-            let embedding = match model {
-                Some(model) => match model.embed_interactive(&Input::Query(query.clone())).await {
-                    Ok(vector) => Some(vector),
-                    Err(e) => return Err(internal(format!("embedding failed: {e}"))),
-                },
-                None => None,
-            };
-            let text = query.clone();
-            self.reader_db(move |db| {
-                let scope = ChunkScope::all();
-                match embedding.as_ref() {
-                    Some(vector) => db.search_hybrid_chunks(
-                        &text,
-                        vector,
-                        HybridLimits { top_k, rrf_k },
-                        &scope,
-                    ),
-                    None => db.search_keyword_chunks(&text, top_k, &scope),
-                }
-            })
-            .await
-        }
-        .await;
-        let outcome = if result.is_ok() {
-            Outcome::Allowed
-        } else {
-            Outcome::Error
+        let result = search
+            .run(
+                &self.inner.reader,
+                model.as_ref(),
+                rerank.as_ref(),
+                config.retrieval.rrf_k,
+            )
+            .await;
+        let outcome = match &result {
+            Ok(_) => Outcome::Allowed,
+            Err(e) => Outcome::of_failure(e),
         };
         caller
             .record(AuditAction::Search, None, outcome, Some(detail))
             .await?;
-        let hits = match result {
-            Ok(hits) => hits,
-            Err(e) => return Ok(failure(e.message)),
-        };
-        Ok(CallToolResult::structured(
-            serde_json::json!({ "chunks": hits }),
-        ))
+        match result {
+            Ok(found) => Ok(CallToolResult::structured(found.to_json(args.explain))),
+            Err(e) => Ok(failure(e.to_string())),
+        }
     }
 
     /// Run one SQL statement. Reads always run; writes need this

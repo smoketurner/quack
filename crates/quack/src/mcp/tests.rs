@@ -98,6 +98,7 @@ async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
                 question: String::from("follow the maintenance note"),
                 session_id: None,
                 mode: None,
+                document_ids: Vec::new(),
             }),
             Extensions::default(),
         )
@@ -218,13 +219,49 @@ async fn stdio_tools_gate_writes_and_serve_resources() {
         .search(
             Parameters(SearchArgs {
                 query: String::from("  "),
-                top_k: None,
+                ..SearchArgs::default()
             }),
             Extensions::default(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.message));
     assert_eq!(empty.is_error, Some(true));
+}
+
+/// `search` scopes to named documents, refusing one that is not there, and
+/// explains its legs on request.
+#[tokio::test(flavor = "multi_thread")]
+async fn stdio_search_scopes_to_documents_and_explains() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let writer = server(dir.path(), WritePolicy::Deny);
+    let unknown = writer
+        .search(
+            Parameters(SearchArgs {
+                query: String::from("renewal"),
+                document_ids: vec![String::from("missing.md")],
+                ..SearchArgs::default()
+            }),
+            Extensions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert!(error_text(&unknown).contains("no document matches 'missing.md'"));
+    let explained = writer
+        .search(
+            Parameters(SearchArgs {
+                query: String::from("renewal"),
+                explain: true,
+                ..SearchArgs::default()
+            }),
+            Extensions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert_eq!(field(&explained, "chunks"), serde_json::json!([]));
+    assert_eq!(
+        field(&explained, "explain").get("rerank"),
+        Some(&serde_json::json!("not reranked"))
+    );
 }
 
 /// `query` with a model that cannot answer: the failure is reported,
@@ -261,6 +298,7 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
             question: String::from("how many?"),
             session_id: session_id.map(str::to_owned),
             mode: mode.map(str::to_owned),
+            document_ids: Vec::new(),
         })
     };
     let session_count = || async {
@@ -296,6 +334,27 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
         .await
         .unwrap_or_else(|e| fail(&e.message));
     assert!(error_text(&unknown).contains("does not exist"));
+
+    // A question limited to a document that is not there fails before the
+    // model is asked, and leaves no session behind.
+    let scoped = server
+        .query(
+            Parameters(QueryArgs {
+                question: String::from("how many?"),
+                session_id: None,
+                mode: None,
+                document_ids: vec![String::from("missing.md")],
+            }),
+            Extensions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert!(
+        error_text(&scoped).contains("no document matches 'missing.md'"),
+        "{}",
+        error_text(&scoped)
+    );
+    assert_eq!(session_count().await, 0);
 
     let existing = db
         .run(|db| sessions::create_session(db, "o/m", ChatMode::Chat, None))

@@ -66,6 +66,11 @@ open:
   matched a node pair in either orientation, a pair whose provenance flipped between
   resolution passes could land twice (`(keep, drop)` and `(drop, keep)`). Each pair keeps
   one row, the more-decided one, so a reviewer's rejection survives.
+- **12**: Detects each document's language (`_quack_documents.language`, an ISO 639-3
+  code) from its first chunks under `[retrieval].languages`, records the workspace's
+  stemmings in `_quack_meta.languages`, and rebuilds the term index: each chunk stemmed
+  under its document's language, runs of Chinese, Japanese, and Korean as character
+  bigrams (issue #395).
 
 A column that needs no backfill needs no bump: `ADD COLUMN IF NOT EXISTS` on open adds it,
 and rows written earlier read as `NULL`. `_quack_documents.page_count`, `pages_unreadable`,

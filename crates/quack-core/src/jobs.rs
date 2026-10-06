@@ -126,6 +126,8 @@ pub enum JobKind {
     Export,
     /// The models each provider lists, fetched for someone waiting on them.
     Models,
+    /// A document search a person runs without the model.
+    Search,
 }
 
 impl JobKind {
@@ -140,6 +142,7 @@ impl JobKind {
         Self::Embeddings,
         Self::Export,
         Self::Models,
+        Self::Search,
     ];
 
     /// The kind as it serializes.
@@ -155,6 +158,7 @@ impl JobKind {
             Self::Embeddings => "embeddings",
             Self::Export => "export",
             Self::Models => "models",
+            Self::Search => "search",
         }
     }
 }
@@ -166,7 +170,7 @@ impl JobKind {
     #[must_use]
     pub const fn priority(self) -> Priority {
         match self {
-            Self::Chat | Self::Sql | Self::Models => Priority::Interactive,
+            Self::Chat | Self::Sql | Self::Models | Self::Search => Priority::Interactive,
             Self::Ingest
             | Self::Import
             | Self::Ontology

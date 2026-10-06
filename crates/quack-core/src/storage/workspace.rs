@@ -25,6 +25,11 @@ use crate::saved;
 use crate::storage::control::ResourceKind;
 use crate::text::OneLine;
 
+mod terms;
+
+use terms::TermFrequencies;
+pub use terms::{Analyzer, Language, LanguageSetting, Stemming, Unspaced};
+
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
@@ -45,9 +50,6 @@ pub const INTERNAL_PREFIX: &str = "_quack_";
 /// (`WorkspaceDb::forget_user`).
 pub const REMOVED_USER: &str = "removed";
 
-/// The keyword index gained joined identifier terms (`pol8841` beside
-/// `pol` and `8841`); every chunk is reindexed.
-const JOINED_IDENTIFIER_TERMS: u32 = 7;
 /// Every stored vector records the profile it was made under.
 const VECTOR_PROFILES: u32 = 8;
 /// A document's status is one of four values.
@@ -59,6 +61,10 @@ const ONTOLOGY_ACCEPTANCE: u32 = 10;
 /// as `(keep, drop)` and once as `(drop, keep)`; collapse each pair to one
 /// row, keeping the more-decided one so a reviewer's rejection is not lost.
 const MERGE_DEDUP: u32 = 11;
+/// Each document records the language it was detected as, and its chunks
+/// are stemmed under it, with unspaced scripts as bigrams (issue #395):
+/// every document is detected and every chunk reindexed.
+const DOCUMENT_LANGUAGES: u32 = 12;
 
 /// The documents table, and the columns older files gain on open.
 const DOCUMENTS_DDL: &str = "
@@ -101,7 +107,8 @@ const DOCUMENTS_DDL: &str = "
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS authored_at TIMESTAMP;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS modified_at TIMESTAMP;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS tags JSON;
-    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS metadata JSON;";
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS metadata JSON;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS language TEXT;";
 
 /// Summaries of the turns a session's history window leaves out
 /// (`[analysis].compact_history`), each with how many replayable messages,
@@ -116,7 +123,7 @@ const SESSION_SUMMARIES_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_session_s
 
 /// Schema version of the internal tables, recorded in `_quack_meta`: the
 /// newest step above.
-const WORKSPACE_SCHEMA_VERSION: u32 = MERGE_DEDUP;
+const WORKSPACE_SCHEMA_VERSION: u32 = DOCUMENT_LANGUAGES;
 
 /// The oldest `DuckDB` that must read a file created here, given to `DuckDB`
 /// when the file is opened. It is the bundled library's own default, named so
@@ -167,6 +174,9 @@ pub enum MetaKey {
     WrittenByQuack,
     /// The `DuckDB` library version that quack was built with.
     WrittenByDuckDb,
+    /// The stemmings the documents were indexed under, comma-separated: a
+    /// query is tokenized under all of them.
+    Languages,
 }
 
 text_enum!(MetaKey, "meta key", {
@@ -177,6 +187,7 @@ text_enum!(MetaKey, "meta key", {
     GraphDrift => "graph_drift",
     WrittenByQuack => "written_by_quack",
     WrittenByDuckDb => "written_by_duckdb",
+    Languages => "languages",
 });
 text_enum_sql!(MetaKey);
 
@@ -760,6 +771,8 @@ pub struct WorkspaceDb {
     /// `files/` under the workspace directory, where ingested files are
     /// kept; `None` in memory.
     files_dir: Option<PathBuf>,
+    /// `[retrieval].languages`: what a document may be detected as.
+    languages: LanguageSetting,
 }
 
 impl WorkspaceDb {
@@ -797,10 +810,18 @@ impl WorkspaceDb {
             vectors,
             query_timeout: Duration::from_secs(30),
             files_dir: None,
+            languages: LanguageSetting::Auto,
         };
         db.confine_to(None)?;
         db.create_internal_tables()?;
         Ok(db)
+    }
+
+    /// Detect documents among `languages` from now on (`[retrieval].languages`).
+    #[must_use]
+    pub fn with_languages(mut self, languages: LanguageSetting) -> Self {
+        self.languages = languages;
+        self
     }
 
     /// Override the per-statement timeout (tests and callers with special needs).
@@ -914,6 +935,7 @@ impl WorkspaceDb {
             vectors: Vectors::new(column_dimension, profile),
             query_timeout: config.analysis.query_timeout(),
             files_dir: Some(files_dir),
+            languages: config.retrieval.languages.clone(),
         };
         db.apply_resource_limits(config)?;
         let workspace_dir = std::fs::canonicalize(config.workspace_dir(workspace_id))?;
@@ -947,6 +969,7 @@ impl WorkspaceDb {
             vectors: Arc::clone(&self.vectors),
             query_timeout: self.query_timeout,
             files_dir: self.files_dir.clone(),
+            languages: self.languages.clone(),
         })
     }
 
@@ -1289,10 +1312,12 @@ impl WorkspaceDb {
             .meta(MetaKey::SchemaVersion)?
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
-        // Version 4 introduced the term index and version 6 changed its
-        // tokens (stemming); both are before the joined terms.
-        if recorded < JOINED_IDENTIFIER_TERMS && self.chunk_count()? > 0 {
-            tracing::info!("indexing existing chunks for keyword search");
+        // Version 4 introduced the term index, version 6 stemmed it, version
+        // 7 added joined identifiers, and version 12 stems each document
+        // under its own language: every one of them rebuilds the index.
+        if recorded < DOCUMENT_LANGUAGES && self.chunk_count()? > 0 {
+            tracing::info!("detecting document languages and indexing chunks for keyword search");
+            self.detect_missing_languages()?;
             self.reindex_terms()?;
         }
         // Vectors made before profiles went to the model unprefixed, under
@@ -2286,7 +2311,8 @@ impl WorkspaceDb {
     /// Returns an error if the insert fails.
     pub fn insert_chunk(&self, chunk: &NewChunk<'_>) -> Result<()> {
         let page = chunk.page.map(i64::from);
-        let terms = TermFrequencies::of(chunk.content, chunk.heading);
+        let stemming = self.document_stemming(chunk.document_id, chunk.content)?;
+        let terms = TermFrequencies::of(&Analyzer::of(stemming), chunk.content, chunk.heading);
         let length = terms.total();
         match chunk.embedding {
             Some(emb) => {
@@ -2347,6 +2373,96 @@ impl WorkspaceDb {
         Ok(())
     }
 
+    /// The stemming a document's chunks are indexed under: the language it
+    /// was detected as, detected now from `sample` when it has none yet.
+    fn document_stemming(&self, id: &DocumentId, sample: &str) -> Result<Stemming> {
+        let code: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT language FROM _quack_documents WHERE id = ?",
+                duckdb::params![id],
+                |row| row.get(0),
+            )
+            .or_else(|e| match e {
+                duckdb::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        match code {
+            Some(code) => Ok(Stemming::of_code(Some(&code))),
+            None => self.set_document_language(id, sample),
+        }
+    }
+
+    /// Detect a document's language from `sample` (its opening text, under
+    /// `[retrieval].languages`), record it, and add its stemming to the
+    /// workspace's set: what its chunks are indexed under.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a write fails.
+    pub fn set_document_language(&self, id: &DocumentId, sample: &str) -> Result<Stemming> {
+        let code = self.languages.detect(sample);
+        self.conn.execute(
+            "UPDATE _quack_documents SET language = ? WHERE id = ?",
+            duckdb::params![code, id],
+        )?;
+        self.record_languages()?;
+        Ok(Stemming::of_code(Some(code)))
+    }
+
+    /// Record the stemmings the documents were indexed under, which a
+    /// query is tokenized under.
+    fn record_languages(&self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT language FROM _quack_documents WHERE language IS NOT NULL")?;
+        let codes = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        let recorded = Analyzer::record(codes.iter().map(|c| Some(c.as_str())));
+        self.set_meta(MetaKey::Languages, &recorded)
+    }
+
+    /// The stemmings a query is tokenized under: every one a document of
+    /// the workspace was indexed under.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `_quack_meta` cannot be read.
+    pub fn query_analyzer(&self) -> Result<Analyzer> {
+        Ok(Analyzer::of_recorded(
+            self.meta(MetaKey::Languages)?.as_deref(),
+        ))
+    }
+
+    /// Characters of a document's opening text its language is detected
+    /// from.
+    pub const LANGUAGE_SAMPLE_CHARS: usize = 8000;
+
+    /// Detect the language of every document with chunks that has none,
+    /// from its first chunks: documents ingested before detection.
+    fn detect_missing_languages(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.document_id, left(string_agg(c.content, ' ' ORDER BY c.chunk_index), ?) \
+             FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE d.language IS NULL AND c.chunk_index < 16 \
+             GROUP BY c.document_id",
+        )?;
+        let samples = stmt
+            .query_map(
+                duckdb::params![i64::try_from(Self::LANGUAGE_SAMPLE_CHARS).unwrap_or(i64::MAX)],
+                |row| Ok((row.get::<_, DocumentId>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        for (id, sample) in samples {
+            self.conn.execute(
+                "UPDATE _quack_documents SET language = ? WHERE id = ?",
+                duckdb::params![self.languages.detect(&sample), id],
+            )?;
+        }
+        self.record_languages()
+    }
+
     fn chunk_count(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -2366,8 +2482,9 @@ impl WorkspaceDb {
     fn reindex_terms_by(&self, page: u32) -> Result<()> {
         self.conn.execute("DELETE FROM _quack_terms", [])?;
         let mut stmt = self.conn.prepare(
-            "SELECT id, heading, content FROM _quack_chunks \
-             WHERE ?::VARCHAR IS NULL OR id > ? ORDER BY id LIMIT ?",
+            "SELECT c.id, c.heading, c.content, d.language FROM _quack_chunks c \
+             LEFT JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE ?::VARCHAR IS NULL OR c.id > ? ORDER BY c.id LIMIT ?",
         )?;
         // A page at a time by id, so a large workspace never holds every
         // chunk's text at once.
@@ -2375,15 +2492,20 @@ impl WorkspaceDb {
         loop {
             let page = stmt
                 .query_map(duckdb::params![after, after, i64::from(page)], |row| {
-                    PendingChunk::try_from(row)
+                    Ok((
+                        PendingChunk::try_from(row)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
                 })?
                 .collect::<duckdb::Result<Vec<_>>>()?;
-            let Some(last) = page.last() else {
+            let Some((last, _)) = page.last() else {
                 return Ok(());
             };
             after = Some(last.id.clone());
-            for chunk in &page {
-                let terms = TermFrequencies::of(&chunk.content, chunk.heading.as_deref());
+            for (chunk, language) in &page {
+                let analyzer = Analyzer::of(Stemming::of_code(language.as_deref()));
+                let terms =
+                    TermFrequencies::of(&analyzer, &chunk.content, chunk.heading.as_deref());
                 self.conn.execute(
                     "UPDATE _quack_chunks SET token_count = ? WHERE id = ?",
                     duckdb::params![terms.total(), chunk.id],
@@ -2539,11 +2661,7 @@ impl WorkspaceDb {
         if scope.is_empty() {
             return Ok(Vec::new());
         }
-        let terms: Vec<String> = TermFrequencies::of(query, None)
-            .0
-            .into_iter()
-            .map(|(t, _)| t)
-            .collect();
+        let terms = TermFrequencies::distinct(&self.query_analyzer()?, query);
         if terms.is_empty() {
             return Ok(Vec::new());
         }
@@ -2587,6 +2705,10 @@ impl WorkspaceDb {
             .query_map(params.as_slice(), |row| ChunkSearchResult::try_from(row))?
             .collect::<duckdb::Result<Vec<_>>>()?;
         phrases.retain_matching(&mut results, top_k);
+        for (i, hit) in results.iter_mut().enumerate() {
+            hit.ranks.keyword_rank = Some(Ranks::place(i));
+            hit.ranks.bm25 = Some(hit.score);
+        }
         Ok(results)
     }
 
@@ -2608,14 +2730,72 @@ impl WorkspaceDb {
         limits: HybridLimits,
         scope: &ChunkScope,
     ) -> Result<Vec<ChunkSearchResult>> {
+        Ok(self
+            .explain_search(query_text, query_embedding, limits, scope)?
+            .fused)
+    }
+
+    /// One search in `mode`, with its workings. Hybrid without a query
+    /// vector (no embedding model) runs the keyword leg alone; vector mode
+    /// without one is an error, since nothing else would answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a leg fails, or vector mode has no vector.
+    pub fn search_chunks(
+        &self,
+        query: &str,
+        embedding: Option<&Vector>,
+        mode: SearchMode,
+        limits: HybridLimits,
+        scope: &ChunkScope,
+    ) -> Result<SearchExplanation> {
+        match (mode, embedding) {
+            (SearchMode::Hybrid, Some(vector)) => self.explain_search(query, vector, limits, scope),
+            (SearchMode::Hybrid | SearchMode::Keyword, _) => Ok(SearchExplanation::keyword_only(
+                query,
+                self.search_keyword_chunks(query, limits.top_k, scope)?,
+            )),
+            (SearchMode::Vector, Some(vector)) => {
+                let phrases = Phrases::parse(query);
+                let fetch = phrases.fetch(limits.top_k, limits.top_k);
+                let hits = self.search_similar_chunks(vector, fetch, scope)?;
+                Ok(SearchExplanation::vector_only(phrases, hits, limits.top_k))
+            }
+            (SearchMode::Vector, None) => Err(Error::Analysis(String::from(
+                "vector search needs an embedding model ([embedding].model); search by keyword instead",
+            ))),
+        }
+    }
+
+    /// [`Self::search_hybrid_chunks`] with its workings: both legs as they
+    /// ranked their (over-fetched) candidates, the fused ranking, and the
+    /// quoted phrases that filtered it. Each hit carries its rank and score
+    /// in every leg that found it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either search fails.
+    pub fn explain_search(
+        &self,
+        query_text: &str,
+        query_embedding: &Vector,
+        limits: HybridLimits,
+        scope: &ChunkScope,
+    ) -> Result<SearchExplanation> {
         let phrases = Phrases::parse(query_text);
         let candidates = limits.top_k.saturating_mul(2).max(1);
         let fuse_k = phrases.fetch(limits.top_k, candidates);
         let vector = self.search_similar_chunks(query_embedding, fuse_k, scope)?;
         let keyword = self.search_keyword_chunks(query_text, fuse_k, scope)?;
-        let mut fused = limits.fuse(vector, keyword, fuse_k);
+        let mut fused = limits.fuse(vector.clone(), keyword.clone(), fuse_k);
         phrases.retain_matching(&mut fused, limits.top_k);
-        Ok(fused)
+        Ok(SearchExplanation {
+            vector,
+            keyword,
+            fused,
+            phrases: phrases.0,
+        })
     }
 
     /// Search for the most similar chunks to a query embedding. `score` is
@@ -2668,9 +2848,13 @@ impl WorkspaceDb {
         params.push(&DocumentStatus::Ready);
         scope.bind(&mut params);
         params.push(&limit);
-        let results = stmt
+        let mut results = stmt
             .query_map(params.as_slice(), |row| ChunkSearchResult::try_from(row))?
             .collect::<duckdb::Result<Vec<_>>>()?;
+        for (i, hit) in results.iter_mut().enumerate() {
+            hit.ranks.vector_rank = Some(Ranks::place(i));
+            hit.ranks.vector_score = Some(hit.score);
+        }
         Ok(results)
     }
 
@@ -3298,6 +3482,27 @@ impl WorkspaceDb {
         Ok(docs.collect::<duckdb::Result<_>>()?)
     }
 
+    /// The documents [`Self::list_documents`] lists that `filter` lets
+    /// through.
+    ///
+    /// # Errors
+    ///
+    /// An unknown file type, `since` after `until`, or a failed query.
+    pub fn list_documents_matching(&self, filter: &DocumentFilter) -> Result<Vec<DocumentInfo>> {
+        let clause = filter.clause()?;
+        let sql = format!(
+            "{DOCUMENT_SELECT} d WHERE {NOT_SUPERSEDED}{} ORDER BY ingested_at DESC, id DESC",
+            clause.sql
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(clause.params.len());
+        for param in &clause.params {
+            params.push(param);
+        }
+        let docs = stmt.query_map(params.as_slice(), |row| DocumentInfo::try_from(row))?;
+        Ok(docs.collect::<duckdb::Result<_>>()?)
+    }
+
     /// Every document row, replaced ones included, newest first: the
     /// listing behind `quack docs --all` and the Documents page's
     /// "show replaced" view.
@@ -3485,6 +3690,10 @@ pub struct DocumentInfo {
     /// description).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
+    /// The ISO 639-3 code of the language its text was indexed under
+    /// (`deu`, `cmn`); `None` for a table or a document not yet processed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 impl DocumentInfo {
@@ -3538,7 +3747,9 @@ impl DocumentInfo {
 }
 
 /// How a document reached the workspace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentSource {
     /// A file sent through the API or web UI.
@@ -3648,7 +3859,7 @@ const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, statu
      COALESCE(pinned, false), CAST(ingested_at AS VARCHAR), title, sha256, source, chunk_count, \
      ingested_by, CAST(tables AS VARCHAR), page_count, pages_unreadable, pages_empty, \
      superseded_by, source_root, source_path, author, CAST(authored_at AS VARCHAR), \
-     CAST(modified_at AS VARCHAR), CAST(tags AS VARCHAR), CAST(metadata AS VARCHAR) \
+     CAST(modified_at AS VARCHAR), CAST(tags AS VARCHAR), CAST(metadata AS VARCHAR), language \
      FROM _quack_documents";
 
 /// The `WHERE` clause that keeps a document that still stands for its
@@ -3704,6 +3915,7 @@ impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
                 .get::<_, Option<String>>(24)?
                 .and_then(|json| serde_json::from_str(&json).ok())
                 .unwrap_or_default(),
+            language: row.get(25)?,
         })
     }
 }
@@ -3778,6 +3990,49 @@ pub struct ChunkSearchResult {
     /// Where it sits in a source without pages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locator: Option<String>,
+    /// Where it stood in each ranking that found it.
+    #[serde(flatten)]
+    pub ranks: Ranks,
+}
+
+/// Where a hit stood in each ranking of one search, for a person checking
+/// why retrieval found or missed a passage. Ranks count from 1; a ranking
+/// that did not return the hit leaves its fields empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct Ranks {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_rank: Option<u32>,
+    /// `1 / (1 + cosine distance)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyword_rank: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bm25: Option<f64>,
+    /// Its place in the reranker's order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_rank: Option<u32>,
+    /// The rerank model's relevance score; the chat model ranks without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f64>,
+}
+
+impl Ranks {
+    /// A 1-based rank from a 0-based position.
+    #[must_use]
+    pub fn place(index: usize) -> u32 {
+        u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1)
+    }
+
+    /// Keep every rank `other` has that this one lacks.
+    fn merge(&mut self, other: Self) {
+        self.vector_rank = self.vector_rank.or(other.vector_rank);
+        self.vector_score = self.vector_score.or(other.vector_score);
+        self.keyword_rank = self.keyword_rank.or(other.keyword_rank);
+        self.bm25 = self.bm25.or(other.bm25);
+        self.rerank_rank = self.rerank_rank.or(other.rerank_rank);
+        self.rerank_score = self.rerank_score.or(other.rerank_score);
+    }
 }
 
 /// A row of `id, content, document_id, chunk_index, filename, heading,
@@ -3804,49 +4059,9 @@ impl TryFrom<&duckdb::Row<'_>> for ChunkSearchResult {
             ingested_at,
             kind: row.get::<_, Option<SectionKind>>(9)?.unwrap_or_default(),
             locator: row.get(10)?,
+            ranks: Ranks::default(),
         })
     }
-}
-
-/// Punctuation that joins alphanumeric runs into one identifier (`POL-8841`,
-/// `v1.2.3`, `ns/part:7`) without introducing whitespace.
-fn is_identifier_joiner(c: char) -> bool {
-    matches!(c, '-' | '.' | '_' | '/' | ':')
-}
-
-/// Lowercased alphanumeric runs, stemmed; the same rule indexes chunks and
-/// parses queries. A run joined by identifier punctuation with no
-/// whitespace (`POL-8841`, `v1.2.3`, `ABC_123`, `ns/part:7`) additionally
-/// indexes its punctuation-stripped, lowercased, unstemmed form (`pol8841`)
-/// alongside the split, stemmed pieces (`pol`, `8841`), so the query
-/// `POL-8841` matches a document containing that exact identifier ahead of
-/// one that merely contains `pol` and `8841` apart. Because the joined form
-/// is derived the same way on both sides, a bare run like `pol8841` in text
-/// is also found by the query `POL-8841` — desirable, since both spell the
-/// same identifier. Ordinary prose has no joiner in a run, so it tokenizes
-/// exactly as before.
-#[must_use]
-pub fn tokenize(text: &str) -> Vec<String> {
-    static STEMMER: std::sync::LazyLock<rust_stemmers::Stemmer> = std::sync::LazyLock::new(|| {
-        rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English)
-    });
-    let mut terms = Vec::new();
-    for run in text.split(|c: char| !(c.is_alphanumeric() || is_identifier_joiner(c))) {
-        let run = run.trim_matches(|c: char| !c.is_alphanumeric());
-        if run.is_empty() {
-            continue;
-        }
-        for token in run.split(|c: char| !c.is_alphanumeric()) {
-            if !token.is_empty() {
-                terms.push(STEMMER.stem(&token.to_lowercase()).into_owned());
-            }
-        }
-        if run.contains(is_identifier_joiner) {
-            let alnum: String = run.chars().filter(|c| c.is_alphanumeric()).collect();
-            terms.push(alnum.to_lowercase());
-        }
-    }
-    terms
 }
 
 /// The quoted phrases of a keyword query: each `"..."` pair is an exact
@@ -3916,30 +4131,6 @@ impl Phrases {
     }
 }
 
-/// How often each term occurs in a chunk's content and heading, by term.
-struct TermFrequencies(Vec<(String, u32)>);
-
-impl TermFrequencies {
-    fn of(content: &str, heading: Option<&str>) -> Self {
-        let mut counts: BTreeMap<String, u32> = BTreeMap::new();
-        for term in tokenize(content)
-            .into_iter()
-            .chain(heading.map(tokenize).unwrap_or_default())
-        {
-            let entry = counts.entry(term).or_insert(0);
-            *entry = entry.saturating_add(1);
-        }
-        Self(counts.into_iter().collect())
-    }
-
-    /// Total term occurrences, the chunk length BM25 normalizes by.
-    fn total(&self) -> i64 {
-        self.0
-            .iter()
-            .fold(0i64, |acc, (_, tf)| acc.saturating_add(i64::from(*tf)))
-    }
-}
-
 /// The chunks of ready documents a long run draws from, and the order
 /// its documents come in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3972,6 +4163,173 @@ impl SamplePool {
     }
 }
 
+/// Which rankings a search runs.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    /// Vector and keyword, fused by reciprocal rank; keyword alone without
+    /// an embedding model.
+    #[default]
+    Hybrid,
+    /// BM25 over the term index only.
+    Keyword,
+    /// Cosine similarity only.
+    Vector,
+}
+
+text_enum!(SearchMode, "search mode", {
+    Hybrid => "hybrid",
+    Keyword => "keyword",
+    Vector => "vector",
+});
+
+/// What a document must be for a search or a listing to include it. Each
+/// list keeps a document matching any of its entries; every field given
+/// must hold.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentFilter {
+    /// File types, as extensions (`pdf`, `md`, `docx`) or MIME types
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<String>,
+    /// How documents arrived: `upload`, `paste`, `path`, `stdin`, or `import`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<DocumentSource>,
+    /// Tags, compared without regard to case
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Written on or after this date, `YYYY-MM-DD` (the ingest date for a
+    /// document that gives none)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub since: Option<jiff::civil::Date>,
+    /// Written on or before this date, `YYYY-MM-DD`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub until: Option<jiff::civil::Date>,
+    /// Text the author contains, compared without regard to case
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+}
+
+impl DocumentFilter {
+    /// Whether it lets every document through.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The `AND ...` conditions on `_quack_documents d`, with their
+    /// parameters in order.
+    ///
+    /// # Errors
+    ///
+    /// An unknown file type, or `since` after `until`.
+    fn clause(&self) -> Result<FilterClause> {
+        let mut clause = FilterClause::default();
+        let mut mime_types: Vec<String> = Vec::new();
+        for kind in &self.types {
+            let kind = kind.trim().trim_start_matches('.').to_ascii_lowercase();
+            let mime = if kind.contains('/') {
+                kind
+            } else {
+                FileType::of(&format!("file.{kind}"))
+                    .map(|t| t.mime_type().to_owned())
+                    .ok_or_else(|| {
+                        Error::Analysis(format!(
+                            "unknown document type '{kind}'; give an extension such as pdf, md, \
+                             or docx, or a MIME type"
+                        ))
+                    })?
+            };
+            if !mime_types.contains(&mime) {
+                mime_types.push(mime);
+            }
+        }
+        clause.any_of("d.mime_type", mime_types);
+        clause.any_of(
+            "COALESCE(d.source, 'upload')",
+            self.sources.iter().map(ToString::to_string).collect(),
+        );
+        let tags: Vec<String> = self
+            .tags
+            .iter()
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !tags.is_empty() {
+            clause.sql.push_str(
+                " AND list_has_any(COALESCE(from_json(lower(CAST(d.tags AS VARCHAR)), '[\"VARCHAR\"]'), []), ?::VARCHAR[])",
+            );
+            clause.params.push(sql_text_list(&tags));
+        }
+        if let (Some(since), Some(until)) = (self.since, self.until)
+            && since > until
+        {
+            return Err(Error::Analysis(format!(
+                "since ({since}) is after until ({until})"
+            )));
+        }
+        for (bound, op) in [(self.since, ">="), (self.until, "<=")] {
+            if let Some(date) = bound {
+                clause
+                    .sql
+                    .push_str(" AND CAST(COALESCE(d.authored_at, d.ingested_at) AS DATE) ");
+                clause.sql.push_str(op);
+                clause.sql.push_str(" ?::DATE");
+                clause.params.push(date.to_string());
+            }
+        }
+        if let Some(author) = self
+            .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            clause
+                .sql
+                .push_str(" AND contains(lower(COALESCE(d.author, '')), lower(?))");
+            clause.params.push(author.to_owned());
+        }
+        Ok(clause)
+    }
+}
+
+/// A [`DocumentFilter`] as SQL: conditions on `_quack_documents d` and their
+/// text parameters, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FilterClause {
+    sql: String,
+    params: Vec<String>,
+}
+
+impl FilterClause {
+    /// `AND column IN (...)` over `values`, unless there are none.
+    fn any_of(&mut self, column: &str, values: Vec<String>) {
+        if values.is_empty() {
+            return;
+        }
+        self.sql.push_str(" AND ");
+        self.sql.push_str(column);
+        self.sql.push_str(" IN (");
+        self.sql.push_str(&vec!["?"; values.len()].join(", "));
+        self.sql.push(')');
+        self.params.extend(values);
+    }
+}
+
 /// Which chunks a search may return. Empty means the whole workspace; a
 /// scope narrows it to certain documents, to an explicit set of chunks
 /// (the chunks a graph entity was extracted from), or to both at once.
@@ -3984,6 +4342,8 @@ pub struct ChunkScope {
     /// those chunks, and `Some(empty)` means none — an entity whose chunks
     /// came back empty must return no rows, not the whole workspace.
     chunks: Option<Vec<ChunkId>>,
+    /// What the chunks' documents must be.
+    filter: FilterClause,
 }
 
 impl ChunkScope {
@@ -3999,6 +4359,7 @@ impl ChunkScope {
         Self {
             documents: ids.into_iter().collect(),
             chunks: None,
+            filter: FilterClause::default(),
         }
     }
 
@@ -4020,6 +4381,22 @@ impl ChunkScope {
             resolved.push(DocumentInfo::find(&documents, want)?.id.clone());
         }
         Ok(Self::documents(resolved))
+    }
+
+    /// Narrow further to the documents `filter` lets through.
+    ///
+    /// # Errors
+    ///
+    /// An unknown file type, or `since` after `until`.
+    pub fn with_filter(mut self, filter: &DocumentFilter) -> Result<Self> {
+        self.filter = filter.clause()?;
+        Ok(self)
+    }
+
+    /// The documents it is limited to; empty for every document.
+    #[must_use]
+    pub fn document_ids(&self) -> &[DocumentId] {
+        &self.documents
     }
 
     /// Narrow further to these chunk ids, however few.
@@ -4047,6 +4424,7 @@ impl ChunkScope {
             let placeholders = vec!["?"; chunks.len()].join(", ");
             clauses.push(format!(" AND c.id IN ({placeholders})"));
         }
+        clauses.push(self.filter.sql.clone());
         clauses.concat()
     }
 
@@ -4055,6 +4433,7 @@ impl ChunkScope {
         self.documents
             .len()
             .saturating_add(self.chunks.as_ref().map_or(0, Vec::len))
+            .saturating_add(self.filter.params.len())
     }
 
     /// Push the scope's parameters, in the order [`ChunkScope::sql`] names
@@ -4065,6 +4444,9 @@ impl ChunkScope {
         }
         for id in self.chunks.iter().flatten() {
             params.push(id);
+        }
+        for param in &self.filter.params {
+            params.push(param);
         }
     }
 }
@@ -4094,6 +4476,7 @@ impl HybridLimits {
                     1.0 / (k + f64::from(u32::try_from(rank).unwrap_or(u32::MAX)) + 1.0);
                 if let Some(existing) = fused.iter_mut().find(|h| h.id == hit.id) {
                     existing.score += contribution;
+                    existing.ranks.merge(hit.ranks);
                 } else {
                     hit.score = contribution;
                     fused.push(hit);
@@ -4108,6 +4491,63 @@ impl HybridLimits {
         });
         fused.truncate(usize::try_from(keep).unwrap_or(usize::MAX));
         fused
+    }
+}
+
+/// What one search did, for a person checking why it found or missed a
+/// passage.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SearchExplanation {
+    /// The vector leg's candidates, best first; empty without one.
+    pub vector: Vec<ChunkSearchResult>,
+    /// The keyword (BM25) leg's candidates, best first.
+    pub keyword: Vec<ChunkSearchResult>,
+    /// What the search returns: the legs fused, or the one leg that ran.
+    pub fused: Vec<ChunkSearchResult>,
+    /// Quoted phrases in the query, which a hit must contain exactly.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub phrases: Vec<String>,
+}
+
+impl SearchExplanation {
+    /// The keyword leg alone, as a search without vectors runs.
+    fn keyword_only(query: &str, keyword: Vec<ChunkSearchResult>) -> Self {
+        Self {
+            fused: keyword.clone(),
+            keyword,
+            vector: Vec::new(),
+            phrases: Phrases::parse(query).0,
+        }
+    }
+
+    /// The vector leg alone. A quoted phrase still filters it.
+    fn vector_only(phrases: Phrases, vector: Vec<ChunkSearchResult>, top_k: u32) -> Self {
+        let mut fused = vector.clone();
+        phrases.retain_matching(&mut fused, top_k);
+        Self {
+            vector,
+            keyword: Vec::new(),
+            fused,
+            phrases: phrases.0,
+        }
+    }
+
+    /// What the quoted phrases did, when there are any.
+    #[must_use]
+    pub fn phrase_note(&self) -> Option<String> {
+        if self.phrases.is_empty() {
+            return None;
+        }
+        let quoted: Vec<String> = self.phrases.iter().map(|p| format!("\"{p}\"")).collect();
+        Some(format!(
+            "{} must appear exactly: the candidates were over-fetched and only those containing {} kept",
+            quoted.join(", "),
+            if self.phrases.len() == 1 {
+                "it"
+            } else {
+                "them all"
+            }
+        ))
     }
 }
 

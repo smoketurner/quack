@@ -5,6 +5,7 @@
 
 pub(crate) mod flash;
 pub(crate) mod markdown;
+mod search;
 mod sign_in;
 
 use std::collections::BTreeSet;
@@ -156,6 +157,7 @@ enum Tab {
     Workspaces,
     Chat,
     Documents,
+    Search,
     Tables,
     Sql,
     Context,
@@ -170,9 +172,10 @@ enum Tab {
 
 impl Tab {
     /// The workspace tabs, in header order.
-    const WORKSPACE: [Self; 9] = [
+    const WORKSPACE: [Self; 10] = [
         Self::Chat,
         Self::Documents,
+        Self::Search,
         Self::Tables,
         Self::Sql,
         Self::Context,
@@ -187,6 +190,7 @@ impl Tab {
             Self::Workspaces => "Workspaces",
             Self::Chat => "Chat",
             Self::Documents => "Documents",
+            Self::Search => "Search",
             Self::Tables => "Tables",
             Self::Sql => "SQL",
             Self::Context => "Context",
@@ -205,6 +209,7 @@ impl Tab {
         match self {
             Self::Chat => "chat",
             Self::Documents => "documents",
+            Self::Search => "search",
             Self::Tables => "tables",
             Self::Sql => "sql",
             Self::Context => "context",
@@ -438,6 +443,8 @@ struct ChatPage {
     /// What the workspace holds, for the empty state before any session.
     tables: Vec<String>,
     documents: Vec<DocumentInfo>,
+    /// The ready documents a question can be limited to.
+    pickable: Vec<search::PickableDocument>,
 }
 
 #[derive(Template)]
@@ -921,6 +928,10 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/documents/{doc}/delete", post(delete_doc))
         .route("/w/{id}/documents/{doc}/replace", post(replace_doc))
         .route("/w/{id}/embeddings/refresh", post(refresh_embeddings))
+        .route(
+            "/w/{id}/search",
+            get(search::search_page).post(search::search_run),
+        )
         .route("/w/{id}/jobs", get(jobs_page))
         .route("/w/{id}/jobs/rows", get(job_rows))
         .route("/w/{id}/jobs/{job}/cancel", post(job_cancel))
@@ -1220,6 +1231,7 @@ async fn chat(
     } else {
         (Vec::new(), Vec::new())
     };
+    let pickable = app.read(&id, search::PickableDocument::read).await?;
     html(&ChatPage {
         page: Page::in_workspace(&app, Tab::Chat, &access),
         sessions: sessions_list,
@@ -1227,6 +1239,7 @@ async fn chat(
         messages: MessageView::transcript(&messages),
         tables,
         documents,
+        pickable,
     })
 }
 

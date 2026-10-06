@@ -15,6 +15,7 @@ use jiff::Timestamp;
 use quack_core::analysis::agent::{AgentResponse, Analysis};
 use quack_core::analysis::events::{self, AgentEvent, ToolName};
 use quack_core::analysis::policy::{Approver, Hold, WritePolicy};
+use quack_core::analysis::search::DocumentScope;
 use quack_core::analysis::text_to_sql::PromptOptions;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::{AnalysisConfig, GraphConfig, RetrievalConfig};
@@ -170,6 +171,7 @@ async fn run_turn_answering(
             context: None,
             context_max_tokens: Tokens::new(1_000),
             ollama_context_cap: None,
+            scope: DocumentScope::default(),
         },
         history,
         message,

@@ -310,6 +310,11 @@
     var body = { prompt: prompt, mode: form.mode.value };
     if (chat.getAttribute("data-session")) body.session_id = chat.getAttribute("data-session");
     if (form.allow_write && form.allow_write.checked) body.allow_write = true;
+    if (form.documents) {
+      var picked = Array.prototype.filter.call(form.documents.options, function (o) { return o.selected; })
+        .map(function (o) { return o.value; });
+      if (picked.length) body.document_ids = picked;
+    }
 
     // Stop aborts the request; the server sees the stream close and
     // cancels the turn, recording what streamed so far.

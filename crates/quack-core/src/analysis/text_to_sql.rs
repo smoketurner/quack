@@ -1,4 +1,5 @@
 use crate::analysis::policy::WritePolicy;
+use crate::analysis::search::DocumentScope;
 use crate::error::Result;
 use crate::graph::{GraphStatus, store as graph_store};
 use crate::ingestion::parser::PageCounts;
@@ -67,6 +68,8 @@ pub struct PromptOptions {
     /// (`[analysis].max_context_tokens`); `None` for providers that size
     /// their own.
     pub ollama_context_cap: Option<Tokens>,
+    /// The documents the person limited the question to.
+    pub scope: DocumentScope,
 }
 
 /// The system prompt, assembled in the order the design fixes (section
@@ -197,6 +200,10 @@ impl SystemPrompt {
 
         let tables = prompt.tables(db)?;
         let documents = prompt.documents(db)?;
+        if let Some(note) = options.scope.prompt_note() {
+            writeln!(prompt.text, "{note}")?;
+            writeln!(prompt.text)?;
+        }
         prompt.pinned_documents(db, options.pinned_token_budget)?;
 
         if let Some(ontology) = ontology {

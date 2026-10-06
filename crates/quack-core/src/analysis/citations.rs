@@ -281,6 +281,7 @@ fn is_channel_marker(inside: &str) -> bool {
 mod tests {
     use super::*;
     use crate::ingestion::parser::SectionKind;
+    use crate::storage::workspace::Ranks;
 
     fn hit(id: &str, file: &str, idx: u32) -> ChunkSearchResult {
         ChunkSearchResult {
@@ -295,6 +296,7 @@ mod tests {
             kind: SectionKind::Body,
             locator: None,
             ingested_at: DateTime::constant(2026, 10, 5, 14, 3, 0, 0),
+            ranks: Ranks::default(),
         }
     }
 

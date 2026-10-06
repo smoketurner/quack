@@ -13,6 +13,7 @@ use crate::net::TrustedProxies;
 use crate::ontology::documents::DocumentEvidenceOptions;
 use crate::ontology::induction::TableEvidenceOptions;
 use crate::storage::control::WorkspaceName;
+use crate::storage::workspace::LanguageSetting;
 use crate::text::Tokens;
 
 pub mod bedrock;
@@ -1670,6 +1671,10 @@ pub struct RetrievalConfig {
     /// `/rerank` endpoint (vLLM, llama.cpp, Text Embeddings Inference),
     /// for `rerank = "reranker"`.
     pub rerank_model: Option<ModelSpec>,
+    /// What a document's language may be detected as at ingest, for the
+    /// keyword index's stemming: `["auto"]` (any), or Snowball language
+    /// names, one fixed or several detected among.
+    pub languages: LanguageSetting,
 }
 
 impl Default for RetrievalConfig {
@@ -1682,6 +1687,7 @@ impl Default for RetrievalConfig {
             rerank: RerankMode::None,
             rerank_candidates: 24,
             rerank_model: None,
+            languages: LanguageSetting::Auto,
         }
     }
 }

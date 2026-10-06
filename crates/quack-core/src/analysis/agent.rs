@@ -18,6 +18,7 @@ use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, Turn
 use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls};
 use super::policy::WritePolicy;
 use super::rerank::RerankAnswer;
+use super::search::DocumentScope;
 use super::text_to_sql::{Modeled, PromptOptions, SystemPrompt};
 use super::tools::{
     CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphTools,
@@ -104,6 +105,10 @@ pub struct AgentResponse {
     /// included. `None` on a response no turn timed.
     #[serde(default)]
     pub duration_ms: Option<u64>,
+    /// The documents the person limited the question to; empty for the
+    /// whole workspace.
+    #[serde(default)]
+    pub documents: DocumentScope,
 }
 
 /// One SQL statement the turn ran, as the response object lists it.
@@ -157,6 +162,7 @@ impl AgentResponse {
             "cancelled": self.cancelled,
             "usage": self.usage,
             "duration_ms": self.duration_ms,
+            "documents": self.documents,
             "session_id": session_id,
         })
     }
@@ -427,7 +433,7 @@ where
             asked,
         } = self;
         let read = PromptAndModel::read(&reader_db, &prompt).await?;
-        let turn = Turn::new(recorder.clone(), write_policy);
+        let turn = Turn::new(recorder.clone(), write_policy).within(prompt.scope.clone());
         let Replay { history, dropped } = Replay::check(history);
         let window = Window::for_turn(&prompt, &read.system_prompt, &history, user_message);
         let agent = BuildContext {
@@ -722,6 +728,7 @@ impl Turn {
             cancelled: false,
             usage,
             duration_ms: Some(u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX)),
+            documents: self.scope().clone(),
         }
     }
 }

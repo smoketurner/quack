@@ -28,13 +28,34 @@ fn command_names_complete_by_prefix() {
     assert_eq!(words("/sch"), ["/schema"]);
     assert_eq!(
         words("/s"),
-        ["/sql", "/schema", "/saved", "/sessions", "/share", "/steps"]
+        [
+            "/sql",
+            "/schema",
+            "/search",
+            "/saved",
+            "/sessions",
+            "/share",
+            "/steps"
+        ]
     );
+    assert_eq!(words("/se"), ["/search", "/sessions"]);
     assert!(words("/nothing").is_empty());
     assert!(words("hello").is_empty());
     assert!(words("").is_empty());
     assert!(words("/sql SELECT 1").is_empty(), "free text gets nothing");
     assert!(words("/exit ").is_empty());
+}
+
+/// `/search` takes the rest of the line as typed, quotes included, and
+/// needs a query.
+#[test]
+fn search_takes_the_query_verbatim() {
+    let parsed = SlashCommand::parse("/search \"flood exclusion\" --in policy");
+    assert!(
+        matches!(parsed, Ok(SlashCommand::Search { ref query }) if query == "\"flood exclusion\" --in policy"),
+        "the line after the command is the query"
+    );
+    assert!(!parses("/search"));
 }
 
 #[test]

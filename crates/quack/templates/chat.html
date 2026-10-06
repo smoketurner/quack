@@ -68,6 +68,12 @@
           <select name="mode" class="rounded border border-slate-700 px-2 py-1">
             <option value="chat">chat</option><option value="query">query (sources only)</option>
           </select></label>
+        {% if !pickable.is_empty() %}
+        <label class="flex items-center gap-1"><span>Documents</span>
+          <select name="documents" multiple size="1" title="Limit the question to these documents; none picked asks about all" class="max-w-64 rounded border border-slate-700 px-2 py-1">
+            {% for d in pickable %}<option value="{{ d.id }}">{{ d.name }}</option>{% endfor %}
+          </select></label>
+        {% endif %}
         {% if ws.can_write %}
         <label class="flex items-center gap-1"><input type="checkbox" name="allow_write"> Run changes without asking</label>
         {% endif %}

@@ -1,5 +1,7 @@
 use super::*;
 use crate::embedding::Dimension;
+use crate::ids::DocumentId;
+use crate::storage::workspace::{DocumentStatus, NewDocument};
 
 /// The history the window keeps of a session's turns under `budget`.
 fn windowed(db: &WorkspaceDb, session: &SessionId, budget: u32) -> Result<Vec<Message>> {
@@ -94,6 +96,7 @@ fn response(content: &str, steps: Vec<ToolStep>) -> AgentResponse {
         cancelled: false,
         usage: None,
         duration_ms: None,
+        documents: DocumentScope::default(),
     }
 }
 
@@ -691,4 +694,42 @@ fn export_markdown_has_headings_steps_and_answers() {
     assert!(md.contains("## open claims?\n"));
     assert!(md.contains("**run_sql** — 1 rows, 7 ms\n\n```sql\nSELECT 1\n```"));
     assert!(md.trim_end().ends_with("Four."));
+}
+
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn the_documents_a_question_was_limited_to_are_kept_on_its_message() {
+    let db = db();
+    db.insert_document(
+        &NewDocument::new(&DocumentId::from("d1"), "policy.md", "text/markdown", 1)
+            .with_status(DocumentStatus::Ready),
+    )
+    .unwrap();
+    let scope = DocumentScope::resolve(&db, &[String::from("policy.md")]).unwrap();
+    let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
+    let mut answer = response("Renewals are yearly.", vec![]);
+    answer.documents = scope.clone();
+    record_turn(&db, &session.id, "renewals?", Timestamp::now(), &answer).unwrap();
+    record_turn(
+        &db,
+        &session.id,
+        "and claims?",
+        Timestamp::now(),
+        &response("Claims close in 30 days.", vec![]),
+    )
+    .unwrap();
+    let rows = messages(&db, &session.id).unwrap();
+    let asked: Vec<Option<&MessageMeta>> = rows
+        .iter()
+        .filter(|r| r.role == MessageRole::User)
+        .map(|r| r.metadata.as_ref())
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            Some(&MessageMeta::User(UserMeta { documents: scope })),
+            None
+        ],
+        "an unscoped question stores no metadata"
+    );
 }

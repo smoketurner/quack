@@ -278,5 +278,45 @@
         "contains": "seized at forty percent open"
       }
     ]
+  },
+  {
+    "question": "Bis wann muss ein Hagelschaden gemeldet werden?",
+    "kind": "multilingual",
+    "expected": [
+      {
+        "filename": "sturmschaeden.md",
+        "contains": "innerhalb von sieben Tagen"
+      }
+    ]
+  },
+  {
+    "question": "Welche Versicherung deckt eine Überschwemmung durch Starkregen?",
+    "kind": "multilingual",
+    "expected": [
+      {
+        "filename": "sturmschaeden.md",
+        "contains": "Elementarschadenversicherung"
+      }
+    ]
+  },
+  {
+    "question": "台风过后多久报告损失？",
+    "kind": "multilingual",
+    "expected": [
+      {
+        "filename": "taifeng-lipei.md",
+        "contains": "七天内报告损失"
+      }
+    ]
+  },
+  {
+    "question": "洪水损失需要什么保险？",
+    "kind": "multilingual",
+    "expected": [
+      {
+        "filename": "taifeng-lipei.md",
+        "contains": "附加洪水保险"
+      }
+    ]
   }
 ]

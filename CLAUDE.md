@@ -97,7 +97,8 @@ cargo run --bin quack -- ingest DIR -w ws [--prune]                            #
 #   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX, EPUB, ODT, EML/MBOX, VTT/SRT, source code, RTF
 #   --author/--authored/--tag set what the file says about itself; a table inside a document with >= [ingestion].table_rows_as_table rows also loads as <stem>_tableN
 cargo run --bin quack -- docs [--tag ID TAG | --untag ID TAG | --author ID NAME | --authored ID DATE]   # a document's own fields; PATCH .../documents/{doc} over REST
-cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
+cargo run --bin quack -- -p "question" -w ws [-f text|json] [--documents DOC,..]   # one agent turn; steps on stderr; --documents limits it to those documents
+cargo run --bin quack -- search QUERY -w ws [--in DOC..] [--keyword|--vector] [--explain] [-f text|json]   # analysis::search::DocumentSearch without the model: each hit's vector, keyword, and rerank rank
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
 cargo run --bin quack -- saved list | add NAME --from-session ID | run NAME [--refresh] [--exit-code] | show NAME | remove NAME   # an answer's SQL re-run without the model; exit 5 when changed; cron schedules it
@@ -141,12 +142,23 @@ rig's conversation memory (`llm::memory::History`: `SessionMemory` under `Transc
 rig's token window over `[analysis].history_token_budget`), and with
 `[analysis].compact_history` the turns it leaves out become a chat-model summary kept in
 `_quack_session_summaries`. Retrieval is hybrid (exact cosine scan plus quack's own
-BM25 over `_quack_terms` with Snowball-stemmed tokens, reciprocal rank fusion in
-`WorkspaceDb::search_hybrid_chunks`;
+BM25 over `_quack_terms`, reciprocal rank fusion in `WorkspaceDb::explain_search`;
 no DuckDB extension is ever loaded, see design doc section 14), then an optional reranker
 (`analysis::rerank`, `[retrieval].rerank = "none" | "model" | "reranker"`; `model` over-fetches
 `rerank_candidates` and has the chat model order them, `reranker` has the dedicated rerank
-model `rerank_model` score them through rig's `Rerank` at an OpenAI-compatible `/rerank`); citations are registered per turn
+model `rerank_model` score them through rig's `Rerank` at an OpenAI-compatible `/rerank`).
+Each document's text is stemmed under the language `whatlang` detects at ingest
+(`storage::workspace::{Language, Stemming, Analyzer}`, `_quack_documents.language`,
+`[retrieval].languages = ["auto"]` or Snowball names), Chinese, Japanese, and Korean runs
+become character bigrams, and a query is tokenized under every stemming in
+`_quack_meta.languages`. Every hit carries its rank and score in each leg and the reranker
+(`ChunkSearchResult::ranks`). One type, `analysis::search::DocumentSearch` (query, `top_k`,
+documents, graph entity, `DocumentFilter`, mode `hybrid|keyword|vector`), is the search of
+`search_documents`, REST and MCP `search`, `quack search`, `/search`, and the web Search
+page (`/w/{id}/search`); a person can limit a question to documents (`document_ids` on REST
+and MCP `query`, `-p --documents`, the chat's document picker): `DocumentScope` is resolved
+when the turn starts, noted in the system prompt, recorded on the user message
+(`UserMeta`), and intersected with the model's `document_ids`. Citations are registered per turn
 (`analysis::citations`) and validated before the answer is returned. Sessions have a mode,
 `chat` or `query`; `--mode` / `/mode` set it. The workspace context (owner-written
 instructions, `quack_core::storage::context`, versioned in `_quack_context`) is injected

@@ -249,3 +249,42 @@ fn auth_status_names_the_actor_only_when_one_is_sent() {
     }
     assert!(token_state("p", None, Grant::AuthorizationCode, false).contains("quack auth login p"));
 }
+
+/// `quack search` takes documents after `--in`, one mode at most, and
+/// `-f`; `--documents` belongs to `-p`.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+#[expect(clippy::panic, reason = "test failure path")]
+fn search_and_documents_flags_parse() {
+    let cli = Cli::try_parse_from([
+        "quack",
+        "search",
+        "\"flood exclusion\"",
+        "--in",
+        "a.md",
+        "b.pdf",
+        "--keyword",
+        "--explain",
+        "-f",
+        "json",
+    ])
+    .unwrap();
+    let Some(Commands::Search(args)) = cli.command else {
+        panic!("not a search")
+    };
+    assert_eq!(args.query, "\"flood exclusion\"");
+    assert_eq!(args.documents, ["a.md", "b.pdf"]);
+    assert_eq!(args.mode(), SearchMode::Keyword);
+    assert_eq!(args.detail(), SearchDetail::Workings);
+    assert_eq!(args.format, TextOrJson::Json);
+    let vector = Cli::try_parse_from(["quack", "search", "q", "--vector"]).unwrap();
+    assert!(matches!(
+        vector.command,
+        Some(Commands::Search(ref a)) if a.mode() == SearchMode::Vector && a.detail() == SearchDetail::Hits
+    ));
+    assert!(Cli::try_parse_from(["quack", "search", "q", "--keyword", "--vector"]).is_err());
+    let print =
+        Cli::try_parse_from(["quack", "-p", "renewals?", "--documents", "a.md,b.pdf"]).unwrap();
+    assert_eq!(print.documents, ["a.md", "b.pdf"]);
+    assert!(Cli::try_parse_from(["quack", "--documents", "a.md"]).is_err());
+}

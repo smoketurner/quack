@@ -211,6 +211,7 @@ async fn refresh_pin(
         session_id: &session_id,
         policy: WritePolicy::Deny,
         prompt: &question.question,
+        documents: &[],
         format: TextOrJson::Text,
         verbose: model.verbose,
     }

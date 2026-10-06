@@ -16,15 +16,15 @@ use futures::Stream;
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::events::{self, AgentEvent, FailureKind, TurnFailure};
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::{ReaderDb, SharedDb};
-use quack_core::embedding::{Input, Vector};
+use quack_core::analysis::search::{DocumentSearch, SearchOutcome};
+use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
 use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{
-    ChunkScope, ExportFormat, HybridLimits, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
+    DocumentFilter, ExportFormat, SearchMode, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -43,6 +43,10 @@ pub(crate) struct QueryRequest {
     pub mode: Option<ChatMode>,
     #[serde(default)]
     pub allow_write: bool,
+    /// The documents the question is limited to, each by id, id prefix,
+    /// or file name; empty for every document.
+    #[serde(default)]
+    pub document_ids: Vec<String>,
 }
 
 /// A turn that has passed its checks and has its session: ready to run.
@@ -53,6 +57,7 @@ struct PreparedTurn {
     session_id: SessionId,
     policy: WritePolicy,
     prompt: String,
+    documents: Vec<String>,
     /// The chat model's provider and id.
     model: (String, String),
 }
@@ -120,6 +125,7 @@ impl PreparedTurn {
             session_id,
             policy,
             prompt: body.prompt.clone(),
+            documents: body.document_ids.clone(),
             model: model_names,
         })
     }
@@ -135,6 +141,7 @@ impl PreparedTurn {
             session_id,
             policy,
             prompt,
+            documents,
             model,
         } = self;
         let (sink, events) = events::channel();
@@ -160,6 +167,7 @@ impl PreparedTurn {
                     session_id: &session,
                     policy,
                     message: &text,
+                    documents: &documents,
                     sink,
                     cancel: ctx.cancel_token(),
                 })
@@ -642,15 +650,53 @@ impl Access {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SearchQuery {
     pub query: String,
     pub top_k: Option<u32>,
+    /// Documents to search within, each by id, id prefix, or file name.
+    #[serde(default)]
+    pub document_ids: Vec<String>,
+    /// A graph entity whose source passages to search within.
+    pub entity: Option<String>,
+    #[serde(default)]
+    pub filters: DocumentFilter,
+    #[serde(default)]
+    pub mode: SearchMode,
+    /// Also return each leg's candidates, the phrase note, and the rerank
+    /// outcome.
+    #[serde(default)]
+    pub explain: bool,
 }
 
-/// Hybrid retrieval with no model call: the embedding provider when one is
-/// configured, else keyword search alone. The query is in the body: search
-/// text is workspace content, and a URL ends up in logs.
+impl SearchQuery {
+    /// The search it asks for, `top_k` defaulting to `[retrieval].top_k`.
+    pub(crate) fn search(&self, app: &App) -> ApiResult<DocumentSearch> {
+        let search = DocumentSearch::new(
+            &self.query,
+            self.top_k.unwrap_or(app.config.retrieval.top_k),
+        )
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        Ok(DocumentSearch {
+            documents: self.document_ids.clone(),
+            entity: self
+                .entity
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .map(str::to_owned),
+            filter: self.filters.clone(),
+            mode: self.mode,
+            ..search
+        })
+    }
+}
+
+/// Retrieval with no chat model call unless the workspace reranks with
+/// it: the embedding provider when one is configured, else keyword search
+/// alone. The query is in the body: search text is workspace content, and
+/// a URL ends up in logs.
 pub(crate) async fn search(
     State(app): State<App>,
     identity: Identity,
@@ -658,59 +704,52 @@ pub(crate) async fn search(
     Json(q): Json<SearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let query = q.query.trim().to_owned();
-    if query.is_empty() {
-        return Err(ApiError::bad_request("query must not be empty"));
-    }
-    let top_k = q.top_k.unwrap_or(app.config.retrieval.top_k).clamp(1, 100);
-    let rrf_k = app.config.retrieval.rrf_k;
-    let model = access
-        .model(
-            &app,
-            AuditAction::Search,
-            Embeddings::from_config(&app.config).await,
-        )
-        .await?;
-    // Run the search, audit its outcome, then propagate — the way `execute_sql`
-    // does, so a post-authorization failure is recorded instead of dropped.
-    let search_result: ApiResult<Vec<_>> = async {
-        let embedding: Option<Vector> = match model {
-            Some(model) => Some(
-                model
-                    .embed_interactive(&Input::Query(query.clone()))
-                    .await?,
-            ),
-            None => None,
-        };
-        let reader_db = app.reader_db(&id).await?;
-        let text = query.clone();
-        reader_db
-            .with_db(move |db| {
-                let scope = ChunkScope::all();
-                match embedding.as_ref() {
-                    Some(vector) => db.search_hybrid_chunks(
-                        &text,
-                        vector,
-                        HybridLimits { top_k, rrf_k },
-                        &scope,
-                    ),
-                    None => db.search_keyword_chunks(&text, top_k, &scope),
-                }
-            })
-            .await
-            .map_err(ApiError::from)
-    }
-    .await;
-    let outcome = Outcome::of(&search_result);
-    access
-        .audit(
-            &app,
+    let found = access.search(&app, &q).await?;
+    Ok(Json(found.to_json(q.explain)))
+}
+
+impl Access {
+    /// Run, audit, and answer one search: what the API and the web Search
+    /// page share. A search that fails after authorization is audited
+    /// before its error is returned.
+    pub(crate) async fn search(&self, app: &App, q: &SearchQuery) -> ApiResult<SearchOutcome> {
+        let search = q.search(app)?;
+        let model = self
+            .model(
+                app,
+                AuditAction::Search,
+                Embeddings::from_config(&app.config).await,
+            )
+            .await?;
+        let rerank = self
+            .model(
+                app,
+                AuditAction::Search,
+                Rerank::from_config(&app.config).await,
+            )
+            .await?;
+        let found = async {
+            let reader = app.reader_db(&self.membership.workspace.id).await?;
+            search
+                .run(
+                    &reader,
+                    model.as_ref(),
+                    rerank.as_ref(),
+                    app.config.retrieval.rrf_k,
+                )
+                .await
+                .map_err(ApiError::from)
+        }
+        .await;
+        let outcome = Outcome::of(&found);
+        self.audit(
+            app,
             AuditAction::Search,
             None,
             outcome,
-            Some(serde_json::json!({ "q": query })),
+            Some(serde_json::json!({ "q": search.query, "search": search.describe() })),
         )
         .await?;
-    let hits = search_result?;
-    Ok(Json(serde_json::json!({ "chunks": hits })))
+        found
+    }
 }

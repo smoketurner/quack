@@ -51,6 +51,7 @@ fn options(mode: ChatMode, pinned: u32) -> PromptOptions {
         context: None,
         context_max_tokens: Tokens::new(4000),
         ollama_context_cap: None,
+        scope: DocumentScope::default(),
     }
 }
 
@@ -638,4 +639,28 @@ fn the_stale_parenthetical_fires_for_a_genuinely_stale_graph() {
         prompt.contains(STALE),
         "the stale parenthetical is missing for a genuinely stale graph:\n{prompt}"
     );
+}
+
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn the_prompt_names_the_documents_a_question_is_limited_to() {
+    let db = db();
+    db.insert_document(
+        &NewDocument::new(&DocumentId::from("d1"), "policy.md", "text/markdown", 1)
+            .with_status(DocumentStatus::Ready),
+    )
+    .unwrap();
+    let unscoped = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    assert!(!unscoped.contains("limited this question"), "{unscoped}");
+    let options = PromptOptions {
+        scope: DocumentScope::resolve(&db, &[String::from("policy.md")]).unwrap(),
+        ..options(ChatMode::Chat, 0)
+    };
+    let scoped = SystemPrompt::build(&db, &options).unwrap();
+    let note = scoped
+        .find("The person limited this question to these documents: policy.md (id: d1)")
+        .unwrap_or(usize::MAX);
+    let inventory = scoped.find("Ingested documents:").unwrap_or(usize::MAX);
+    let trust = scoped.find("Trust:").unwrap_or(0);
+    assert!(inventory < note && note < trust, "{scoped}");
 }

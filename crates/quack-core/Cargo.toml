@@ -66,6 +66,7 @@ tokio-util    = { workspace = true, features = ["rt"] }
 toml          = { workspace = true, features = ["std", "parse", "serde", "display"] }
 tracing       = { workspace = true, features = ["std"] }
 uuid          = { workspace = true, features = ["std", "v7"] }
+whatlang      = { workspace = true }
 zip           = { workspace = true, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

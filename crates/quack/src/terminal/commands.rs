@@ -70,6 +70,12 @@ pub(crate) enum SlashCommand {
     /// List ingested documents
     #[command(name = "/docs")]
     Docs,
+    /// Search the documents without the model: each hit's vector, keyword, and rerank rank
+    #[command(name = "/search", disable_help_flag = true)]
+    Search {
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "QUERY")]
+        query: String,
+    },
     /// Pin a document's full text into every prompt
     #[command(name = "/pin", disable_help_flag = true)]
     Pin { id: String },

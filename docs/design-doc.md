@@ -143,7 +143,7 @@ Every interface calls the same core entry points:
 | Operation | Core | Web | REST | MCP | TUI / print |
 |-----------|------|-----|------|-----|-------------|
 | Ask | `llm::TurnRequest::run` (event stream) | SSE fragments | SSE or JSON | `query` tool | inline / stdout+stderr |
-| Retrieve | `WorkspaceDb::search_hybrid_chunks`, `analysis::rerank` | via agent, `/search` page | `POST .../search` | `search` tool | via agent |
+| Retrieve | `analysis::search::DocumentSearch` (`WorkspaceDb::search_chunks`, `explain_search`, `analysis::rerank`) | via agent, Search page | `POST .../search` | `search` tool | `/search`, `quack search` |
 | SQL | `WorkspaceDb::execute_query{,_capped}` | SQL page | `POST .../sql` | `sql` tool | `/sql`, `-q` |
 | Ingest | `ingestion::ingest_file` | upload | `POST .../documents` | - | `/ingest`, `quack ingest` |
 | Graph | `graph::traverse::{neighborhood,path}` | graph page | `GET .../graph/*` | `search_graph` | `/graph`, `quack graph` |
@@ -345,7 +345,8 @@ which rebuilds DuckDB's "Did you mean" and "Candidate bindings" suggestions from
 CREATE TABLE _quack_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   -- schema_version, embedding_dimension (the width of the vector columns),
   -- graph_built_with_ontology_version, graph_drift,
-  -- written_by_quack, written_by_duckdb (the versions that last opened the file)
+  -- written_by_quack, written_by_duckdb (the versions that last opened the file),
+  -- languages (the stemmings the documents were indexed under, comma-separated)
 
 -- every embedding profile a stored vector was made under (section 6.1)
 CREATE TABLE _quack_embedding_profiles (
@@ -379,7 +380,8 @@ CREATE TABLE _quack_documents (
     pages_unreadable INTEGER,              -- pages whose extraction failed
     pages_empty      INTEGER,              -- pages that read and held no text
     ingested_by   TEXT,
-    ingested_at   TIMESTAMP DEFAULT now()
+    ingested_at   TIMESTAMP DEFAULT now(),
+    language      TEXT                     -- ISO 639-3 code its text was indexed under (deu, cmn)
 );
 -- sha256, source, status and tables are nullable because older workspaces gain them
 -- through ALTER TABLE ... ADD COLUMN IF NOT EXISTS on open.
@@ -400,7 +402,7 @@ CREATE TABLE _quack_chunks (
 
 CREATE TABLE _quack_terms (              -- BM25 index quack maintains at insert time
     chunk_id TEXT NOT NULL,
-    term     TEXT NOT NULL,              -- Snowball-English stem of an alphanumeric run
+    term     TEXT NOT NULL,              -- a word stemmed under its document's language, or a CJK bigram
     tf       INTEGER NOT NULL
 );
 CREATE INDEX _quack_terms_term_idx ON _quack_terms (term);
@@ -907,7 +909,7 @@ levers are `OLLAMA_NUM_PARALLEL` and a smaller embedding model.
 Every ingest logs chunk count, batches, seconds, and chunks per second (`embedded chunks`);
 `quack ingest` prints them. No index is built: vector search is an exact scan,
 and a chunk's term rows are appended on insert. A full term rebuild happens only when an
-older workspace is opened (schema version below 6). Re-uploading a file with the same
+older workspace is opened (schema version below 12). Re-uploading a file with the same
 SHA-256 is a no-op with a message.
 
 **Hybrid retrieval.** A query runs an exact cosine scan over `embedding` (core
@@ -915,8 +917,19 @@ SHA-256 is a no-op with a message.
 (`_quack_terms`, scored in SQL; no DuckDB extension). This is the main gain over the pgvector setup,
 which leaves keyword-exact questions (part numbers, policy IDs) unanswered.
 
-- *Tokens:* lowercased alphanumeric runs through the Snowball English stemmer
-  (`rust-stemmers`), so `renewals` meets `renewal`. Queries tokenize identically.
+- *Tokens:* lowercased alphanumeric runs through a Snowball stemmer (`rust-stemmers`, 18
+  languages), so `renewals` meets `renewal`. Each document is stemmed under its own
+  language (`storage::workspace::Language`, `Stemming`): at ingest `whatlang` detects it
+  from the first 8,000 characters of text and `_quack_documents.language` records the ISO
+  639-3 code. `[retrieval].languages = ["auto"]` (the default) detects any language and
+  falls back to English when the detector is unsure; a list of Snowball names
+  (`["english", "german"]`) detects among them, and one name fixes it. A language without
+  a stemmer (Chinese, Japanese, Korean, Polish) is only lowercased. Runs of Han, Hiragana,
+  Katakana, and Hangul become character bigrams (a lone character stays whole), since
+  those scripts put no spaces between words. `_quack_meta.languages` holds every stemming
+  the documents were indexed under, and a query is tokenized under all of them (one term
+  per distinct stem), so a short query needs no detection. Stopwords are not removed: BM25's
+  inverse document frequency already discounts them.
 - *Joined identifiers:* a run joined by `-`, `.`, `_`, `/`, or `:` without whitespace, such
   as `POL-8841`, also indexes its punctuation-stripped, unstemmed form (`pol8841`) beside the
   pieces (`pol`, `8841`). A query for it ranks a chunk containing it above one with `pol`
@@ -925,8 +938,9 @@ which leaves keyword-exact questions (part numbers, policy IDs) unanswered.
   BM25 ranks by the phrase's tokens, over-fetched, and a post-filter keeps chunks whose
   content or heading contains the phrase (case-insensitive, whitespace-normalized). A phrase
   matching nothing returns no keyword results, not the unfiltered ranking.
-- *Rebuild:* the term index is rebuilt on open when a workspace predates the stemmer or the
-  joined identifier form.
+- *Rebuild:* the term index is rebuilt on open when a workspace predates the stemmer, the
+  joined identifier form, or per-document languages (schema version 12, which first detects
+  each document's language from its first chunks).
 - *Fusion:* each ranking is over-fetched to twice `top_k` (more with a phrase), fused by
   reciprocal rank fusion (`k = 60`), and the top `k` chunks (default 8) returned.
 - *Reranking:* `analysis::rerank::Reranker` sits between fusion and the answer, off by
@@ -939,6 +953,29 @@ which leaves keyword-exact questions (part numbers, policy IDs) unanswered.
   Embeddings Inference), reached over `LimitedHttp` with the turn's priority, and the
   scores give the order. Other provider types are refused at config load. A failed ranking
   call keeps the fused order, and the tool step says so.
+- *Workings:* every hit carries its rank and score in each leg that found it
+  (`ChunkSearchResult::ranks`: `vector_rank`, `vector_score`, `keyword_rank`, `bm25`,
+  `rerank_rank`, `rerank_score`); `score` stays the fused value. `WorkspaceDb::explain_search`
+  returns both legs' candidates, the fused list, and the quoted phrases that filtered it.
+- *One search for every interface:* `analysis::search::DocumentSearch` holds the query,
+  `top_k`, the documents to search within (ids, prefixes, or file names), a graph entity, a
+  `DocumentFilter`, and the mode (`hybrid`, `keyword`, `vector`; hybrid runs keyword alone
+  without an embedding model, vector fails without one). `search_documents`, REST and MCP
+  `search`, `quack search`, the terminal's `/search`, and the Search page all resolve it the
+  same way and rerank as `[retrieval].rerank` says.
+- *Filters:* `DocumentFilter { types, sources, tags, since, until, author }` adds bound
+  predicates on the document row both legs already join: types as extensions or MIME types,
+  tags without regard to case, `since` and `until` on the authored date (the ingest date for
+  a document that gives none), the author as a case-insensitive substring. Each list keeps a
+  document matching any entry. The same filter narrows `GET .../documents`.
+- *A person's scope:* a question can be limited to documents (`document_ids` on REST
+  `query`, MCP `query`, `quack -p --documents`, the web chat's document picker). The turn
+  resolves them to ready documents (`analysis::search::DocumentScope`) before the model is
+  called, names them in the system prompt, records them on the user message
+  (`_quack_messages.metadata`, `UserMeta`), and `search_documents` intersects the model's
+  `document_ids` with them: the model may narrow the scope, and naming only documents
+  outside it is an error saying which documents the person chose. `read_document` and
+  `always_retrieve` stay within the scope too; pinned documents are still injected.
 
 **Citations.** Every retrieved chunk carries `document_id`, `filename`, `title`, `page`,
 `heading`, and its fused score. The agent cites with `[n]` markers mapped to these chunks.
@@ -1337,8 +1374,10 @@ terminal as a system line, SSE as a `status` event.
    question out of a small window: the first 25 tables are described and the rest listed
    by name; the first 40 columns are listed and the rest counted; sample rows appear only
    up to 20 columns, cut at 60 characters per cell. `describe_table` has the rest.
-4. Documents block: every document by filename, title, status and mime type, then the
-   pinned documents with their full text (6.1), each fenced as document text (below).
+4. Documents block: every document by filename, title, status and mime type, then, when
+   the person limited the question to documents, a sentence naming them (`DocumentScope`,
+   6.1), then the pinned documents with their full text (6.1), each fenced as document
+   text (below).
 5. Ontology block, whenever an ontology exists: classes with parents, relations with domain
    and range (compact), capped at 30 items per section with the rest counted, since an
    induced ontology has a class per table; `describe_class` has what the cap omits. Node and
@@ -1417,7 +1456,7 @@ model (`test-utils`, a dev-dependency feature only).
 
 | Tool | Permission | Description |
 |------|------------|-------------|
-| `search_documents(query, top_k=8, document_ids?, entity?)` | none | Hybrid retrieval; returns chunks with citation metadata and the entities each was the source of |
+| `search_documents(query, top_k=8, document_ids?, entity?, filters?)` | none | Hybrid retrieval within the person's document scope; `filters` is a `DocumentFilter`; returns chunks with citation metadata and the entities each was the source of |
 | `read_document(document, from=0, limit?)` | none | One document's chunks in order from a position, numbered for citing like search hits, within `[retrieval].pinned_token_budget` (at most 50 chunks a call), with a trailer saying where to continue; a document that is not ready or holds tables is refused with the reason |
 | `list_documents()` | none | Registry with status and pinned flag |
 | `run_sql(query)` | read: none; write: prompt | Execute SQL; result capped at `max_query_rows` with a trailer that says to narrow it in one statement, a note when the statement repeats an earlier one with only its literals changed (the one-query-per-group loop), and which tool call of `max_turns` this was |
@@ -2008,6 +2047,11 @@ and ask again. The UI covers:
   to the document's row, charts and graph results inline, the allow-writes checkbox, a
   mode selector for new sessions, Stop, an empty state that lists what the workspace holds.
 - Documents: upload (multi-file), paste text, status with progress, pin, delete.
+- Search (`/w/{id}/search`): a POST form (query, a multi-select of ready documents, the
+  mode, an optional graph entity) that runs the same search as the agent without the model
+  and shows each hit's fused score, its vector, keyword, and rerank rank and score, a link
+  to its passage page, both legs' candidates, the phrase note, and the rerank outcome.
+  Audited as `search`; the chat form's document picker lists the same documents.
 - Tables: list with schema and sample rows, and the import form; a SQL page with an editor
   that highlights SQL and completes table and column names, a result grid, and download.
   The grid holds at most `max_query_rows`; the download streams every row
@@ -2059,14 +2103,17 @@ PATCH  /api/v1/workspaces/{id}                    settings; `name` renames (409 
 DELETE /api/v1/workspaces/{id}                    owner; the row, members, tokens, and directory go at once (409 while a job of it is active); audit rows stay
 GET    /api/v1/workspaces/{id}/snapshot           owner; the workspace as a tar (manifest.json, data.duckdb after a checkpoint, files/), audited `snapshot`
 POST   /api/v1/auth/login  POST /api/v1/auth/logout  GET /api/v1/auth/me
-POST   /api/v1/workspaces/{id}/query              {prompt, session_id?, mode?, allow_write?}
+POST   /api/v1/workspaces/{id}/query              {prompt, session_id?, mode?, allow_write?, document_ids?}
 POST   /api/v1/workspaces/{id}/query/stream       same, SSE agent events; closing the stream cancels the turn;
                                                   a turn whose job never ran ends with an `error` event
 POST   /api/v1/workspaces/{id}/sessions/{sid}/permissions/{request}  {decision}: answer a write the turn waits on
 POST   /api/v1/workspaces/{id}/sql                {sql}
 POST   /api/v1/workspaces/{id}/sql/export         {sql, format: csv|ndjson|json}: every row of a read statement, streamed; audited `export`
-POST   /api/v1/workspaces/{id}/search         {query, top_k?}: hybrid retrieval, no LLM (the MCP `search` tool's names)
-GET    /api/v1/workspaces/{id}/documents
+POST   /api/v1/workspaces/{id}/search         {query, top_k?, document_ids?, entity?, filters?, mode?, explain?}: retrieval
+                                                  without the chat model unless it reranks; each chunk carries its leg ranks;
+                                                  `explain` adds both legs, the phrase note, and the rerank outcome
+                                                  (the MCP `search` tool's names)
+GET    /api/v1/workspaces/{id}/documents          ?types=&sources=&tags= (comma-separated), since=, until=, author=
 POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 202 {id}
                                                   ?replace={doc}: the one file takes that ready document's
                                                   place once ready (the old one becomes "superseded")
@@ -2175,8 +2222,9 @@ One tool set serves two transports through `rmcp`, the official Rust SDK:
   channel `mcp`.
 
 Each `query` call starts a session (owned by the server user, `mode` `chat` or `query`)
-and returns its `session_id`; passing the id back continues it. A turn that fails before
-recording anything leaves no session.
+and returns its `session_id`; passing the id back continues it, and `document_ids` limits
+the question to documents. A turn that fails before recording anything leaves no session.
+`search` takes `document_ids`, `entity`, `filters`, `mode`, and `explain`, as REST does.
 
 Tools: `query`, `search`, `sql`, `list_tables`, `describe_table`, `list_documents`, and,
 once the graph has nodes, `search_graph` and `find_path`. Each answers with structured
@@ -2208,7 +2256,8 @@ an empty input it loads at once, announced on a green `↑` line with its job nu
 into text already typed it is inserted like any other paste.
 
 Slash commands: `/help`, `/tables`, `/schema TABLE`, `/sql`, `/ingest PATH` (`/attach`),
-`/import`, `/docs`, `/pin`, `/unpin`, `/delete`, `/ontology ...` and `/graph ...`, `/graph
+`/import`, `/docs`, `/search QUERY` (each hit's leg ranks, then both legs and the rerank
+outcome), `/pin`, `/unpin`, `/delete`, `/ontology ...` and `/graph ...`, `/graph
 ENTITY`, `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/saved [list | add
 NAME | run NAME | show NAME | remove NAME]` (`add` pins this session's last answer;
 `--refresh` and `--exit-code` are refused as command-line flags), `/sessions`,
@@ -2288,8 +2337,9 @@ cancellation token in its `TurnRequest`.
 ### 11.5 Print mode and CLI
 
 ```
-quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query]
+quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query] [--documents DOC,..]
       [--allow-write] [-c | -r SESSION] [--stdin] [--verbose]
+quack search QUERY [-w NAME] [--in DOC..] [--keyword | --vector] [--explain] [-k N] [-f text|json]
 quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
 quack workspace create NAME | list [--format json] | rename NAME NEW_NAME
 quack workspace delete NAME [-y] | snapshot NAME [--to FILE] | restore FILE|- [--name NAME]
@@ -2673,6 +2723,8 @@ rerank_candidates = 24
 # rerank_model = "tei/BAAI/bge-reranker-v2-m3"   # a type = "openai" provider serving /rerank
 pinned_token_budget = 8000   # full text of pinned documents in the prompt
 always_retrieve = false      # retrieve every turn, not only when the model asks
+languages = ["auto"]         # what a document may be detected as for keyword stemming:
+                             # "auto", or Snowball names (["english", "german"]); one name fixes it
 
 [ingestion]
 chunk_size_tokens = 512
@@ -2922,12 +2974,12 @@ the chunker are fuzzed nightly (`fuzz/`, `docs/ci-cd.md`), and `cargo deny check
 weekly on its own.
 
 **Evaluation.** `make eval` (`crates/quack-core/examples/eval.rs`, issue #74) measures
-answer quality. It ingests an in-tree storms-like fixture (`crates/quack-core/eval/`: 27
-documents and three CSV tables written for the harness, not the NOAA download) into a
-temporary workspace and prints:
+answer quality. It ingests an in-tree storms-like fixture (`crates/quack-core/eval/`: 32
+documents, one German and one Chinese among them, and three CSV tables written for the
+harness, not the NOAA download) into a temporary workspace and prints:
 
-- recall@1/5/8 and MRR (mean reciprocal rank) over a 21-question gold set, per question kind
-  (`identifier`, `phrase`, `semantic`) and per backend (`search_keyword_chunks`,
+- recall@1/5/8 and MRR (mean reciprocal rank) over a 32-question gold set, per question kind
+  (`identifier`, `phrase`, `semantic`, `multilingual`) and per backend (`search_keyword_chunks`,
   `search_similar_chunks`, `search_hybrid_chunks`);
 - precision and recall of `ontology::induction::propose_from_tables` against a hand-written
   expected ontology;
@@ -3046,7 +3098,8 @@ Every gap is a GitHub issue unless the item says otherwise.
     `publish` job writes `SHA256SUMS` and creates the GitHub release. `Dockerfile` builds
     the same image from source for `make image` and `docker-compose.yml`. Section 14.
 11. ~~No stemming in keyword search~~ (#31, closed: Snowball English over the same
-    tokenizer; schema version 6 rebuilds older term indexes on open); ~~no reranking hook~~
+    tokenizer; schema version 6 rebuilds older term indexes on open; #395: each document
+    stemmed under its detected language, CJK as bigrams, schema version 12); ~~no reranking hook~~
     (#34, closed: `Reranker` trait, `none` or `model`); ~~large-workspace vector index
     options~~ (#32, closed as a recorded decision in section 15, item 2). Sections 6.1, 15.
 12. ~~Web UI mapping of the chart spec to ECharts~~ (#26, closed): `static/js/app.js` maps
