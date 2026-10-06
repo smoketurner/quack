@@ -9,7 +9,7 @@ use quick_xml::events::Event;
 use super::budget::DecompressionBudget;
 use super::parser::{DocumentMeta, Extracted, Flow, Section, SectionBuilder};
 use super::table::Table;
-use super::zipped::{Package, element_text, element_texts, entity_text};
+use super::zipped::{Package, Xml};
 use crate::error::{Error, Result};
 
 const KIND: &str = "an OpenDocument text file";
@@ -26,25 +26,26 @@ pub fn extract(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
     let mut meta = DocumentMeta::default();
     let mut title = None;
     if let Some(xml) = package.part("meta.xml")? {
-        title = element_text(&xml, "title");
+        title = Xml(&xml).text("title");
         DocumentMeta::set(
             &mut meta.author,
-            element_text(&xml, "creator")
-                .or_else(|| element_text(&xml, "initial-creator"))
+            Xml(&xml)
+                .text("creator")
+                .or_else(|| Xml(&xml).text("initial-creator"))
                 .as_deref(),
         );
         DocumentMeta::set(
             &mut meta.authored_at,
-            element_text(&xml, "creation-date").as_deref(),
+            Xml(&xml).text("creation-date").as_deref(),
         );
-        DocumentMeta::set(&mut meta.modified_at, element_text(&xml, "date").as_deref());
-        meta.extra("subject", element_text(&xml, "subject").as_deref());
-        meta.extra("description", element_text(&xml, "description").as_deref());
-        for keyword in element_texts(&xml, "keyword") {
+        DocumentMeta::set(&mut meta.modified_at, Xml(&xml).text("date").as_deref());
+        meta.extra("subject", Xml(&xml).text("subject").as_deref());
+        meta.extra("description", Xml(&xml).text("description").as_deref());
+        for keyword in Xml(&xml).texts("keyword") {
             meta.tag(&keyword);
         }
     }
-    let sections = content_sections(&content)?;
+    let sections = Walk::sections(&content)?;
     if sections.is_empty() {
         return Err(Error::Ingestion(String::from(
             "no extractable text: the document has no paragraphs",
@@ -81,6 +82,91 @@ struct Walk {
 }
 
 impl Walk {
+    /// `content.xml`'s headings, paragraphs, tables, and notes as sections.
+    fn sections(xml: &str) -> Result<Vec<Section>> {
+        let mut reader = Reader::from_str(xml);
+        let mut walk = Self::default();
+        let mut buf = Vec::new();
+        loop {
+            let event = reader
+                .read_event_into(&mut buf)
+                .map_err(|e| Error::Ingestion(format!("ODT XML error: {e}")))?;
+            match event {
+                Event::Start(e) => match e.local_name().as_ref() {
+                    "h" if walk.note.is_none() && walk.table.is_none() => {
+                        walk.in_heading = true;
+                        walk.text.clear();
+                    }
+                    "p" => walk.paragraphs = walk.paragraphs.saturating_add(1),
+                    "table" if walk.note.is_none() => walk.table = Some(Vec::new()),
+                    "table-row" => walk.row.clear(),
+                    "table-cell" => walk.cell.clear(),
+                    "note-body" => {
+                        walk.note_depth = walk.note_depth.saturating_add(1);
+                        if walk.note.is_none() {
+                            walk.note = Some(String::new());
+                        }
+                    }
+                    "note-citation" => walk.in_citation = true,
+                    _ => {}
+                },
+                Event::Empty(e) => match e.local_name().as_ref() {
+                    "s" | "tab" => walk.push_text(" "),
+                    "line-break" => walk.push_text("\n"),
+                    "table-cell" => walk.row.push(String::new()),
+                    _ => {}
+                },
+                Event::Text(t) => walk.push_text(&t.xml10_content()),
+                Event::GeneralRef(r) => {
+                    if let Some(t) = Xml::entity_text(&r) {
+                        walk.push_text(&t);
+                    }
+                }
+                Event::End(e) => match e.local_name().as_ref() {
+                    "h" | "p" => walk.end_paragraph(),
+                    "table-cell" => {
+                        let cell = std::mem::take(&mut walk.cell);
+                        walk.row.push(cell);
+                    }
+                    "table-row" => {
+                        let row = std::mem::take(&mut walk.row);
+                        if let Some(rows) = walk.table.as_mut() {
+                            rows.push(row);
+                        }
+                    }
+                    "table" => {
+                        if let Some(rows) = walk.table.take()
+                            && let Some(table) = Table::from_rows(rows)
+                        {
+                            walk.out.push(Section::table(None, table.render()));
+                        }
+                    }
+                    "note-body" => {
+                        walk.note_depth = walk.note_depth.saturating_sub(1);
+                        if walk.note_depth == 0
+                            && let Some(note) = walk.note.take()
+                        {
+                            let note = note.trim().to_owned();
+                            if !note.is_empty() {
+                                walk.pending_notes.push(note);
+                            }
+                        }
+                    }
+                    "note-citation" => walk.in_citation = false,
+                    _ => {}
+                },
+                Event::Eof => break,
+                Event::CData(_)
+                | Event::Comment(_)
+                | Event::Decl(_)
+                | Event::PI(_)
+                | Event::DocType(_) => {}
+            }
+            buf.clear();
+        }
+        Ok(walk.out.finish())
+    }
+
     fn push_text(&mut self, t: &str) {
         if self.in_citation {
             return;
@@ -117,90 +203,6 @@ impl Walk {
             self.out.push(Section::note(None, note));
         }
     }
-}
-
-fn content_sections(xml: &str) -> Result<Vec<Section>> {
-    let mut reader = Reader::from_str(xml);
-    let mut walk = Walk::default();
-    let mut buf = Vec::new();
-    loop {
-        let event = reader
-            .read_event_into(&mut buf)
-            .map_err(|e| Error::Ingestion(format!("ODT XML error: {e}")))?;
-        match event {
-            Event::Start(e) => match e.local_name().as_ref() {
-                "h" if walk.note.is_none() && walk.table.is_none() => {
-                    walk.in_heading = true;
-                    walk.text.clear();
-                }
-                "p" => walk.paragraphs = walk.paragraphs.saturating_add(1),
-                "table" if walk.note.is_none() => walk.table = Some(Vec::new()),
-                "table-row" => walk.row.clear(),
-                "table-cell" => walk.cell.clear(),
-                "note-body" => {
-                    walk.note_depth = walk.note_depth.saturating_add(1);
-                    if walk.note.is_none() {
-                        walk.note = Some(String::new());
-                    }
-                }
-                "note-citation" => walk.in_citation = true,
-                _ => {}
-            },
-            Event::Empty(e) => match e.local_name().as_ref() {
-                "s" | "tab" => walk.push_text(" "),
-                "line-break" => walk.push_text("\n"),
-                "table-cell" => walk.row.push(String::new()),
-                _ => {}
-            },
-            Event::Text(t) => walk.push_text(&t.xml10_content()),
-            Event::GeneralRef(r) => {
-                if let Some(t) = entity_text(&r) {
-                    walk.push_text(&t);
-                }
-            }
-            Event::End(e) => match e.local_name().as_ref() {
-                "h" | "p" => walk.end_paragraph(),
-                "table-cell" => {
-                    let cell = std::mem::take(&mut walk.cell);
-                    walk.row.push(cell);
-                }
-                "table-row" => {
-                    let row = std::mem::take(&mut walk.row);
-                    if let Some(rows) = walk.table.as_mut() {
-                        rows.push(row);
-                    }
-                }
-                "table" => {
-                    if let Some(rows) = walk.table.take()
-                        && let Some(table) = Table::from_rows(rows)
-                    {
-                        walk.out.push(Section::table(None, table.render()));
-                    }
-                }
-                "note-body" => {
-                    walk.note_depth = walk.note_depth.saturating_sub(1);
-                    if walk.note_depth == 0
-                        && let Some(note) = walk.note.take()
-                    {
-                        let note = note.trim().to_owned();
-                        if !note.is_empty() {
-                            walk.pending_notes.push(note);
-                        }
-                    }
-                }
-                "note-citation" => walk.in_citation = false,
-                _ => {}
-            },
-            Event::Eof => break,
-            Event::CData(_)
-            | Event::Comment(_)
-            | Event::Decl(_)
-            | Event::PI(_)
-            | Event::DocType(_) => {}
-        }
-        buf.clear();
-    }
-    Ok(walk.out.finish())
 }
 
 #[cfg(test)]

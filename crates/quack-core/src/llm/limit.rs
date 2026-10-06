@@ -235,7 +235,7 @@ impl Attempts {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(Duration::from_secs)
             .filter(|d| *d <= RetryPolicy::MAX_WAIT);
-        Some(named.unwrap_or_else(|| self.policy.wait(attempt.saturating_add(1), jitter())))
+        Some(named.unwrap_or_else(|| self.policy.next_wait(attempt.saturating_add(1))))
     }
 
     /// Whether a failure is worth another attempt, and the wait: a failing
@@ -251,7 +251,7 @@ impl Attempts {
         if attempt >= self.policy.max_retries || !rig::error::transient_transport(error) {
             return None;
         }
-        Some(self.policy.wait(attempt.saturating_add(1), jitter()))
+        Some(self.policy.next_wait(attempt.saturating_add(1)))
     }
 
     /// Note a retry: one `warn!` per attempt, and the counter.
@@ -266,15 +266,6 @@ impl Attempts {
         );
         telemetry::provider_retry(&self.provider, model);
     }
-}
-
-/// A fraction of a second's nanoseconds, so two waiters back off apart.
-fn jitter() -> f64 {
-    f64::from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos()),
-    ) / 1_000_000_000.0
 }
 
 impl std::fmt::Debug for ProviderGates {

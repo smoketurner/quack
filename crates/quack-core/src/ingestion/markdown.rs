@@ -68,7 +68,7 @@ pub fn sections(text: &str) -> Vec<Section> {
     for event in Parser::new_ext(text, Options::ENABLE_TABLES | Options::ENABLE_FOOTNOTES) {
         match event {
             Event::Start(Tag::Heading { .. }) => {
-                flush_line(&mut out, &mut line);
+                out.flush_lines(&mut line);
                 heading = Some(String::new());
             }
             Event::End(TagEnd::Heading(_)) => {
@@ -77,7 +77,7 @@ pub fn sections(text: &str) -> Vec<Section> {
                 }
             }
             Event::Start(Tag::Table(_)) => {
-                flush_line(&mut out, &mut line);
+                out.flush_lines(&mut line);
                 table = Some(TableRows::default());
             }
             Event::End(TagEnd::Table) => {
@@ -104,7 +104,7 @@ pub fn sections(text: &str) -> Vec<Section> {
             | Event::HardBreak
             | Event::Rule => {
                 if table.is_none() {
-                    flush_line(&mut out, &mut line);
+                    out.flush_lines(&mut line);
                 }
             }
             // Inline code keeps its backticks: an identifier in code is one
@@ -130,7 +130,7 @@ pub fn sections(text: &str) -> Vec<Section> {
                 (None, None) => {
                     // A code block's lines arrive as one text with newlines;
                     // prose lines as text split by soft breaks.
-                    flush_line(&mut out, &mut line);
+                    out.flush_lines(&mut line);
                 }
             },
             Event::FootnoteReference(name) => {
@@ -141,12 +141,12 @@ pub fn sections(text: &str) -> Vec<Section> {
                 }
             }
             Event::Start(Tag::FootnoteDefinition(name)) => {
-                flush_line(&mut out, &mut line);
+                out.flush_lines(&mut line);
                 line.push_str("[^");
                 line.push_str(&name);
                 line.push_str("]: ");
             }
-            Event::End(TagEnd::FootnoteDefinition) => flush_line(&mut out, &mut line),
+            Event::End(TagEnd::FootnoteDefinition) => out.flush_lines(&mut line),
             Event::Start(_)
             | Event::End(_)
             | Event::Html(_)
@@ -154,7 +154,7 @@ pub fn sections(text: &str) -> Vec<Section> {
             | Event::TaskListMarker(_) => {}
         }
     }
-    flush_line(&mut out, &mut line);
+    out.flush_lines(&mut line);
     out.finish()
 }
 
@@ -170,16 +170,6 @@ impl TableRows {
         let text = std::mem::take(&mut self.cell);
         if let Some(row) = self.rows.last_mut() {
             row.push(text);
-        }
-    }
-}
-
-fn flush_line(out: &mut SectionBuilder, line: &mut String) {
-    let text = std::mem::take(line);
-    // A code block's text keeps its own newlines.
-    for l in text.lines() {
-        if !l.trim().is_empty() {
-            out.line(l);
         }
     }
 }

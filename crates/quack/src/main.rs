@@ -29,7 +29,7 @@ use quack_core::config::{Config, Grant, LogFormat};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
-use quack_core::graph::follow_up;
+use quack_core::graph::follow_up::FollowUp;
 use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::PageCounts;
@@ -277,6 +277,48 @@ enum VaultAction {
     },
 }
 
+impl VaultAction {
+    /// `quack vault export-key`: the key as stored, to a 0600 file or, after
+    /// a yes, to stdout.
+    async fn run(self) -> Result<ExitCode> {
+        let Self::ExportKey { to, yes } = self;
+        init_logging();
+        let config = Config::load().context("failed to load configuration")?;
+        let vault = Vault::new(config.data_dir(), KeySource::Keychain);
+        let Some(key) = vault.key_text().await? else {
+            anyhow::bail!("no vault key exists yet; one is made when the first token is stored");
+        };
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        if let Some(path) = to {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options
+                .open(&path)
+                .and_then(|mut file| {
+                    file.write_all(key.as_bytes())?;
+                    file.flush()
+                })
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            writeln!(out, "Wrote the vault key to {}", path.display())?;
+        } else {
+            let question = "The vault key unseals every token in control.db. Print it?";
+            if !Confirm::Ask.ask_to_drop(yes, &mut out, question)? {
+                writeln!(out, "Not printed.")?;
+                return Ok(ExitCode::FAILURE);
+            }
+            writeln!(out, "{key}")?;
+        }
+        out.flush()?;
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
 #[derive(clap::Args)]
 struct SessionsArgs {
     /// `json` prints one JSON object per session
@@ -303,6 +345,55 @@ struct ReadyArgs {
     /// loopback when it binds every address
     #[arg(long)]
     url: Option<String>,
+}
+
+impl ReadyArgs {
+    /// `quack ready`: `GET /readyz` on the server and exit by its answer. The
+    /// container image's health check runs this, since the image has no shell.
+    async fn run(self) -> Result<ExitCode> {
+        let url = if let Some(url) = self.url {
+            url
+        } else {
+            let config = Config::load().context("failed to load configuration")?;
+            let bind: std::net::SocketAddr = config.server.bind.parse().with_context(|| {
+                format!(
+                    "[server].bind '{}' is not a socket address",
+                    config.server.bind
+                )
+            })?;
+            let host = if bind.ip().is_unspecified() {
+                String::from("127.0.0.1")
+            } else {
+                bind.ip().to_string()
+            };
+            format!("http://{host}:{}", bind.port())
+        };
+        let client = Proxies::from_env()
+            .client()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .context("could not build the HTTP client")?;
+        let readyz = format!("{}/readyz", url.trim_end_matches('/'));
+        let response = client.get(&readyz).send().await;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        match response {
+            Ok(response) if response.status().is_success() => {
+                writeln!(out, "ready")?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                writeln!(out, "not ready ({status}): {body}")?;
+                Ok(ExitCode::FAILURE)
+            }
+            Err(e) => {
+                writeln!(out, "not ready: {readyz} did not answer: {e}")?;
+                Ok(ExitCode::FAILURE)
+            }
+        }
+    }
 }
 
 #[derive(clap::Args)]
@@ -821,7 +912,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         Commands::Graph(action) => run_on_writer(cli, action).await,
         Commands::Embeddings(action) => run_on_writer(cli, action).await,
         Commands::Saved(action) => run_saved(cli, action).await,
-        Commands::Vault(VaultAction::ExportKey { to, yes }) => run_vault_export(to, yes).await,
+        Commands::Vault(action) => action.run().await,
         Commands::Okf(OkfAction::Export { dir }) => run_okf_export(cli, &dir).await,
         Commands::Import(args) => run_import(cli, args).await,
         Commands::Context(args) => {
@@ -853,7 +944,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             server::serve(config, args.bind, mode).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Ready(args) => run_ready(args).await,
+        Commands::Ready(args) => args.run().await,
         Commands::Admin(command) => {
             init_logging();
             let config = Config::load().context("failed to load configuration")?;
@@ -920,47 +1011,6 @@ async fn run_doctor(cli: &Cli, args: &DoctorArgs) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
-}
-
-/// `quack vault export-key`: the key as stored, to a 0600 file or, after
-/// a yes, to stdout.
-async fn run_vault_export(to: Option<PathBuf>, yes: bool) -> Result<ExitCode> {
-    init_logging();
-    let config = Config::load().context("failed to load configuration")?;
-    let vault = Vault::new(config.data_dir(), KeySource::Keychain);
-    let Some(key) = vault.key_text().await? else {
-        anyhow::bail!("no vault key exists yet; one is made when the first token is stored");
-    };
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    if let Some(path) = to {
-        write_private(&path, key.as_bytes())
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        writeln!(out, "Wrote the vault key to {}", path.display())?;
-    } else {
-        let question = "The vault key unseals every token in control.db. Print it?";
-        if !Confirm::Ask.ask_to_drop(yes, &mut out, question)? {
-            writeln!(out, "Not printed.")?;
-            return Ok(ExitCode::FAILURE);
-        }
-        writeln!(out, "{key}")?;
-    }
-    out.flush()?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Write `bytes` to a new file readable by its owner alone.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.flush()
 }
 
 /// `quack -p PROMPT`: one turn, answer to stdout, steps to stderr.
@@ -1130,7 +1180,7 @@ impl WriterCommand for graph_cli::GraphAction {
         out: &mut impl Write,
         control: RunControl<'_>,
     ) -> Result<()> {
-        graph_cli::run(config, db, self, Confirm::Ask, out, control).await
+        self.run(config, db, Confirm::Ask, out, control).await
     }
 }
 
@@ -1936,6 +1986,254 @@ impl OpenedWorkspace {
         let reader_db = ReaderDb::open(&db, self.config.analysis.reader_pool_size).await;
         Ok((db, reader_db))
     }
+
+    /// `quack ingest DIR`: an OKF bundle, or every supported file under the
+    /// folder. The per-file flags have no meaning for a folder.
+    async fn ingest_dir(
+        &self,
+        dir: &Path,
+        per_file: bool,
+        no_embed: bool,
+        prune: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !per_file,
+            "--replace, --pin, --title, --filename, --author, --authored, and --tag take one file, not a directory"
+        );
+        if Bundle::is_dir(dir) {
+            return self
+                .ingest_bundle(&dir.display().to_string(), no_embed)
+                .await;
+        }
+        let prune = if prune { Prune::Delete } else { Prune::Keep };
+        self.ingest_folder(dir, no_embed, prune).await
+    }
+
+    /// `quack ingest DIR` on a folder of files: every file quack can load
+    /// becomes a document, one line each; a changed file replaces the document
+    /// at its path, an unchanged one is skipped, unsupported files are listed,
+    /// and documents whose file is gone are reported, or deleted with
+    /// `--prune`. A file that fails is reported and fails the command once
+    /// the rest have run.
+    async fn ingest_folder(&self, dir: &Path, no_embed: bool, prune: Prune) -> Result<()> {
+        let (config, workspace_id) = (&self.config, self.workspace.id.as_str());
+        let ws_db = self.writer()?;
+        let embedding_model = if no_embed {
+            None
+        } else {
+            Embeddings::from_config(config)
+                .await
+                .context("failed to build embedding model")?
+        };
+        let report = Folder {
+            config,
+            db: &ws_db,
+            workspace_id,
+            root: dir,
+            embedder: embedding_model.as_ref(),
+            control: RunControl {
+                progress: &progress_line::to_stderr,
+                cancel: None,
+            },
+            prune,
+        }
+        .run()
+        .await
+        .with_context(|| format!("ingesting {}", dir.display()))?;
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        for FileResult { relative, outcome } in &report.results {
+            match outcome {
+                Outcome::Ingested(id) => writeln!(out, "ingested  {relative} ({id})")?,
+                Outcome::Replaced { old, new } => {
+                    writeln!(out, "replaced  {relative} ({old} -> {new})")?;
+                }
+                Outcome::Skipped(id) => writeln!(out, "skipped   {relative} (identical to {id})")?,
+                Outcome::Failed(error) => writeln!(out, "failed    {relative}: {error}")?,
+            }
+        }
+        if !report.unsupported.is_empty() {
+            writeln!(
+                out,
+                "Not ingested ({} unsupported): {}",
+                report.unsupported.len(),
+                report.unsupported.join(", ")
+            )?;
+        }
+        if !report.gone.is_empty() {
+            let names: Vec<String> = report
+                .gone
+                .iter()
+                .map(|d| {
+                    format!(
+                        "{} ({})",
+                        d.source_path.as_deref().unwrap_or(&d.filename),
+                        d.id
+                    )
+                })
+                .collect();
+            match report.pruned {
+                Prune::Delete => {
+                    writeln!(out, "Deleted ({} gone): {}", names.len(), names.join(", "))?;
+                }
+                Prune::Keep => writeln!(
+                    out,
+                    "Gone from {} ({}, still in the workspace; --prune deletes them): {}",
+                    dir.display(),
+                    names.len(),
+                    names.join(", ")
+                )?,
+            }
+        }
+        out.flush()?;
+        let stored: Vec<DocumentId> = report
+            .results
+            .iter()
+            .filter_map(|r| match &r.outcome {
+                Outcome::Ingested(id) | Outcome::Replaced { new: id, .. } => Some(id.clone()),
+                Outcome::Skipped(_) | Outcome::Failed(_) => None,
+            })
+            .collect();
+        self.follow_ingest(&ws_db, embedding_model.as_ref(), &stored, &mut out)
+            .await?;
+        out.flush()?;
+        let failed = report.failed();
+        if failed > 0 {
+            anyhow::bail!("{failed} of {} files failed", report.results.len());
+        }
+        Ok(())
+    }
+
+    /// `quack ingest DIR` on an OKF bundle. Every concept file becomes a
+    /// Markdown document, its front matter and links feed the ontology review
+    /// queue, and `index.md` is offered as the workspace context.
+    async fn ingest_bundle(&self, dir: &str, no_embed: bool) -> Result<()> {
+        let (config, workspace_id) = (&self.config, self.workspace.id.as_str());
+        let bundle = Bundle::from_dir(&PathBuf::from(dir))?;
+        let ws_db = self.writer()?;
+        let embedding_model = if no_embed {
+            None
+        } else {
+            Embeddings::from_config(config)
+                .await
+                .context("failed to build embedding model")?
+        };
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        let mut stored = 0usize;
+        let mut skipped = 0usize;
+        for file in bundle.documents() {
+            let front = okf::parse_front_matter(&file.content).front;
+            let name = file.document_name();
+            let outcome = ingestion::ingest_file(
+                config,
+                &ws_db,
+                workspace_id,
+                &NewFile::new(&name, file.content.as_bytes()).title(front.get("title")),
+                embedding_model.as_ref(),
+            )
+            .await
+            .with_context(|| format!("ingesting {}", file.path))?;
+            match outcome {
+                IngestOutcome::Ingested(_) => stored = stored.saturating_add(1),
+                IngestOutcome::Duplicate(_) => skipped = skipped.saturating_add(1),
+            }
+        }
+        writeln!(
+            out,
+            "Ingested {stored} concept files from {dir}{}.",
+            if skipped > 0 {
+                format!(" ({skipped} already present)")
+            } else {
+                String::new()
+            }
+        )?;
+        let index_body = bundle
+            .index()
+            .map(|index| {
+                okf::parse_front_matter(&index.content)
+                    .body
+                    .trim()
+                    .to_owned()
+            })
+            .filter(|body| !body.is_empty());
+        // The ontology, the review queue, and the current context: one step on
+        // the writer.
+        let note = format!("restored from {dir}");
+        let (report, existing) = ws_db
+            .run(move |db| {
+                let report = bundle.restore_into(db, Revision::reviewed(None, Some(&note)))?;
+                Ok((report, context::current(db)?.map(|c| c.content)))
+            })
+            .await?;
+        if let Some(version) = report.restored {
+            writeln!(
+                out,
+                "Restored the bundle's ontology (version {version} in this workspace)."
+            )?;
+        }
+        if report.candidates > 0 {
+            writeln!(
+                out,
+                "{} ontology candidates from the bundle's types and links: `quack ontology review`.",
+                report.candidates
+            )?;
+        }
+        if let Some(body) = index_body {
+            if existing.as_deref() == Some(body.as_str()) {
+                writeln!(out, "index.md already is the workspace context.")?;
+            } else {
+                let question = format!(
+                    "index.md can become the workspace context{}. Apply it?",
+                    if existing.is_some() {
+                        " (replacing the current one)"
+                    } else {
+                        ""
+                    }
+                );
+                if Confirm::Ask.ask(&mut out, &question, None)? {
+                    let stored = ws_db.run(move |db| context::set(db, &body, None)).await?;
+                    writeln!(out, "context is now version {}", stored.version)?;
+                } else {
+                    writeln!(
+                        out,
+                        "Left the context alone; `quack context import {dir}/index.md` applies it later."
+                    )?;
+                }
+            }
+        }
+        out.flush()?;
+        Ok(())
+    }
+
+    /// The graph extraction `[graph].follow_ingest` asks for after an ingest
+    /// or import, run here and reported in one line; nothing when it is off.
+    async fn follow_ingest(
+        &self,
+        db: &Writer,
+        embedder: Option<&Embeddings>,
+        documents: &[DocumentId],
+        out: &mut impl Write,
+    ) -> Result<()> {
+        let followed = FollowUp {
+            db,
+            config: &self.config,
+            embeddings: embedder,
+        }
+        .run(
+            documents,
+            RunControl {
+                progress: &progress_line::to_stderr,
+                cancel: None,
+            },
+        )
+        .await
+        .context("graph follow-up failed")?;
+        if let Some(summary) = followed {
+            writeln!(out, "  Graph: {summary}")?;
+        }
+        Ok(())
+    }
 }
 
 async fn run_query(
@@ -1964,26 +2262,6 @@ async fn run_query(
     Ok(())
 }
 
-/// `quack ingest DIR`: an OKF bundle, or every supported file under the
-/// folder. The per-file flags have no meaning for a folder.
-async fn ingest_dir(
-    opened: &OpenedWorkspace,
-    dir: &Path,
-    per_file: bool,
-    no_embed: bool,
-    prune: bool,
-) -> Result<()> {
-    anyhow::ensure!(
-        !per_file,
-        "--replace, --pin, --title, --filename, --author, --authored, and --tag take one file, not a directory"
-    );
-    if Bundle::is_dir(dir) {
-        return ingest_bundle(opened, &dir.display().to_string(), no_embed).await;
-    }
-    let prune = if prune { Prune::Delete } else { Prune::Keep };
-    ingest_folder(opened, dir, no_embed, prune).await
-}
-
 async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     let IngestArgs {
         file,
@@ -2010,7 +2288,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
             || author.is_some()
             || authored.is_some()
             || !tags.is_empty();
-        return ingest_dir(&opened, dir, per_file, no_embed, prune).await;
+        return opened.ingest_dir(dir, per_file, no_embed, prune).await;
     }
     if prune {
         anyhow::bail!("--prune goes with a folder");
@@ -2078,90 +2356,16 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     }
     report_ingested(&mut out, &result, pin)?;
     out.flush()?;
-    follow_ingest(
-        config,
-        &ws_db,
-        embedding_model.as_ref(),
-        &[result.document_id],
-        &mut out,
-    )
-    .await?;
+    opened
+        .follow_ingest(
+            &ws_db,
+            embedding_model.as_ref(),
+            &[result.document_id],
+            &mut out,
+        )
+        .await?;
     out.flush()?;
     Ok(())
-}
-
-/// The graph extraction `[graph].follow_ingest` asks for after an ingest
-/// or import, run here and reported in one line; nothing when it is off.
-async fn follow_ingest(
-    config: &Config,
-    db: &Writer,
-    embedder: Option<&Embeddings>,
-    documents: &[DocumentId],
-    out: &mut impl Write,
-) -> Result<()> {
-    let followed = follow_up::after_documents(
-        db,
-        config,
-        embedder,
-        documents,
-        RunControl {
-            progress: &progress_line::to_stderr,
-            cancel: None,
-        },
-    )
-    .await
-    .context("graph follow-up failed")?;
-    if let Some(summary) = followed {
-        writeln!(out, "  Graph: {summary}")?;
-    }
-    Ok(())
-}
-
-/// `quack ready`: `GET /readyz` on the server and exit by its answer. The
-/// container image's health check runs this, since the image has no shell.
-async fn run_ready(args: ReadyArgs) -> Result<ExitCode> {
-    let url = if let Some(url) = args.url {
-        url
-    } else {
-        let config = Config::load().context("failed to load configuration")?;
-        let bind: std::net::SocketAddr = config.server.bind.parse().with_context(|| {
-            format!(
-                "[server].bind '{}' is not a socket address",
-                config.server.bind
-            )
-        })?;
-        let host = if bind.ip().is_unspecified() {
-            String::from("127.0.0.1")
-        } else {
-            bind.ip().to_string()
-        };
-        format!("http://{host}:{}", bind.port())
-    };
-    let client = Proxies::from_env()
-        .client()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .context("could not build the HTTP client")?;
-    let readyz = format!("{}/readyz", url.trim_end_matches('/'));
-    let response = client.get(&readyz).send().await;
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    match response {
-        Ok(response) if response.status().is_success() => {
-            writeln!(out, "ready")?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Ok(response) => {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            writeln!(out, "not ready ({status}): {body}")?;
-            Ok(ExitCode::FAILURE)
-        }
-        Err(e) => {
-            writeln!(out, "not ready: {readyz} did not answer: {e}")?;
-            Ok(ExitCode::FAILURE)
-        }
-    }
 }
 
 /// The lines `quack ingest` prints for a stored file.
@@ -2201,205 +2405,6 @@ fn report_ingested(out: &mut impl Write, result: &IngestResult, pin: bool) -> Re
             )?;
         }
     }
-    Ok(())
-}
-
-/// `quack ingest DIR` on a folder of files: every file quack can load
-/// becomes a document, one line each; a changed file replaces the document
-/// at its path, an unchanged one is skipped, unsupported files are listed,
-/// and documents whose file is gone are reported, or deleted with
-/// `--prune`. A file that fails is reported and fails the command once
-/// the rest have run.
-async fn ingest_folder(
-    opened: &OpenedWorkspace,
-    dir: &Path,
-    no_embed: bool,
-    prune: Prune,
-) -> Result<()> {
-    let (config, workspace_id) = (&opened.config, opened.workspace.id.as_str());
-    let ws_db = opened.writer()?;
-    let embedding_model = if no_embed {
-        None
-    } else {
-        Embeddings::from_config(config)
-            .await
-            .context("failed to build embedding model")?
-    };
-    let report = Folder {
-        config,
-        db: &ws_db,
-        workspace_id,
-        root: dir,
-        embedder: embedding_model.as_ref(),
-        control: RunControl {
-            progress: &progress_line::to_stderr,
-            cancel: None,
-        },
-        prune,
-    }
-    .run()
-    .await
-    .with_context(|| format!("ingesting {}", dir.display()))?;
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-    for FileResult { relative, outcome } in &report.results {
-        match outcome {
-            Outcome::Ingested(id) => writeln!(out, "ingested  {relative} ({id})")?,
-            Outcome::Replaced { old, new } => {
-                writeln!(out, "replaced  {relative} ({old} -> {new})")?;
-            }
-            Outcome::Skipped(id) => writeln!(out, "skipped   {relative} (identical to {id})")?,
-            Outcome::Failed(error) => writeln!(out, "failed    {relative}: {error}")?,
-        }
-    }
-    if !report.unsupported.is_empty() {
-        writeln!(
-            out,
-            "Not ingested ({} unsupported): {}",
-            report.unsupported.len(),
-            report.unsupported.join(", ")
-        )?;
-    }
-    if !report.gone.is_empty() {
-        let names: Vec<String> = report
-            .gone
-            .iter()
-            .map(|d| {
-                format!(
-                    "{} ({})",
-                    d.source_path.as_deref().unwrap_or(&d.filename),
-                    d.id
-                )
-            })
-            .collect();
-        match report.pruned {
-            Prune::Delete => writeln!(out, "Deleted ({} gone): {}", names.len(), names.join(", "))?,
-            Prune::Keep => writeln!(
-                out,
-                "Gone from {} ({}, still in the workspace; --prune deletes them): {}",
-                dir.display(),
-                names.len(),
-                names.join(", ")
-            )?,
-        }
-    }
-    out.flush()?;
-    let stored: Vec<DocumentId> = report
-        .results
-        .iter()
-        .filter_map(|r| match &r.outcome {
-            Outcome::Ingested(id) | Outcome::Replaced { new: id, .. } => Some(id.clone()),
-            Outcome::Skipped(_) | Outcome::Failed(_) => None,
-        })
-        .collect();
-    follow_ingest(config, &ws_db, embedding_model.as_ref(), &stored, &mut out).await?;
-    out.flush()?;
-    let failed = report.failed();
-    if failed > 0 {
-        anyhow::bail!("{failed} of {} files failed", report.results.len());
-    }
-    Ok(())
-}
-
-/// `quack ingest DIR` on an OKF bundle. Every concept file becomes a
-/// Markdown document, its front matter and links feed the ontology review
-/// queue, and `index.md` is offered as the workspace context.
-async fn ingest_bundle(opened: &OpenedWorkspace, dir: &str, no_embed: bool) -> Result<()> {
-    let (config, workspace_id) = (&opened.config, opened.workspace.id.as_str());
-    let bundle = Bundle::from_dir(&PathBuf::from(dir))?;
-    let ws_db = opened.writer()?;
-    let embedding_model = if no_embed {
-        None
-    } else {
-        Embeddings::from_config(config)
-            .await
-            .context("failed to build embedding model")?
-    };
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-    let mut stored = 0usize;
-    let mut skipped = 0usize;
-    for file in bundle.documents() {
-        let front = okf::parse_front_matter(&file.content).front;
-        let name = file.document_name();
-        let outcome = ingestion::ingest_file(
-            config,
-            &ws_db,
-            workspace_id,
-            &NewFile::new(&name, file.content.as_bytes()).title(front.get("title")),
-            embedding_model.as_ref(),
-        )
-        .await
-        .with_context(|| format!("ingesting {}", file.path))?;
-        match outcome {
-            IngestOutcome::Ingested(_) => stored = stored.saturating_add(1),
-            IngestOutcome::Duplicate(_) => skipped = skipped.saturating_add(1),
-        }
-    }
-    writeln!(
-        out,
-        "Ingested {stored} concept files from {dir}{}.",
-        if skipped > 0 {
-            format!(" ({skipped} already present)")
-        } else {
-            String::new()
-        }
-    )?;
-    let index_body = bundle
-        .index()
-        .map(|index| {
-            okf::parse_front_matter(&index.content)
-                .body
-                .trim()
-                .to_owned()
-        })
-        .filter(|body| !body.is_empty());
-    // The ontology, the review queue, and the current context: one step on
-    // the writer.
-    let note = format!("restored from {dir}");
-    let (report, existing) = ws_db
-        .run(move |db| {
-            let report = bundle.restore_into(db, Revision::reviewed(None, Some(&note)))?;
-            Ok((report, context::current(db)?.map(|c| c.content)))
-        })
-        .await?;
-    if let Some(version) = report.restored {
-        writeln!(
-            out,
-            "Restored the bundle's ontology (version {version} in this workspace)."
-        )?;
-    }
-    if report.candidates > 0 {
-        writeln!(
-            out,
-            "{} ontology candidates from the bundle's types and links: `quack ontology review`.",
-            report.candidates
-        )?;
-    }
-    if let Some(body) = index_body {
-        if existing.as_deref() == Some(body.as_str()) {
-            writeln!(out, "index.md already is the workspace context.")?;
-        } else {
-            let question = format!(
-                "index.md can become the workspace context{}. Apply it?",
-                if existing.is_some() {
-                    " (replacing the current one)"
-                } else {
-                    ""
-                }
-            );
-            if Confirm::Ask.ask(&mut out, &question, None)? {
-                let stored = ws_db.run(move |db| context::set(db, &body, None)).await?;
-                writeln!(out, "context is now version {}", stored.version)?;
-            } else {
-                writeln!(
-                    out,
-                    "Left the context alone; `quack context import {dir}/index.md` applies it later."
-                )?;
-            }
-        }
-    }
-    out.flush()?;
     Ok(())
 }
 

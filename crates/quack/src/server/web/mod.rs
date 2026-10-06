@@ -8,7 +8,6 @@ pub(crate) mod markdown;
 mod sign_in;
 
 use std::collections::BTreeSet;
-use std::fmt;
 use std::num::NonZeroUsize;
 
 use askama::Template;
@@ -42,7 +41,7 @@ use quack_core::storage::control::{
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{
-    ChunkSearchResult, DocumentInfo, DocumentSource, DocumentStatus, ExportFormat, Pinning,
+    Cell, ChunkSearchResult, DocumentInfo, DocumentSource, DocumentStatus, ExportFormat, Pinning,
     ResultSort, SortDirection, TableDescription,
 };
 use rust_embed::Embed;
@@ -60,14 +59,11 @@ use super::api::import::ImportBody;
 use super::api::members::{AddMember, GroupRole};
 use super::api::ontology::{DecideRequest, RenameRequest};
 use super::api::workspaces::CreateWorkspace;
-use super::api::{
-    documents as docs_api, graph as graph_api, import as import_api, workspaces as workspaces_api,
-};
+use super::api::{documents as docs_api, graph as graph_api, import as import_api};
 use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, password_login};
 use super::error::ApiError;
 use super::oidc::Oidc;
 use super::state::{App, ServeMode};
-use crate::graph_cli;
 use quack_core::analysis::tools::{FindPathArgs, NonBlank, SearchGraphArgs};
 use quack_core::config::{GraphConfig, OidcConfig};
 use quack_core::embedding::Vector;
@@ -409,7 +405,7 @@ impl From<&ToolStep> for StepView {
                 r.columns.clone(),
                 r.rows
                     .iter()
-                    .map(|row| row.iter().map(|v| JsonText(v).to_string()).collect())
+                    .map(|row| row.iter().map(|v| Cell(v).text()).collect())
                     .collect(),
             )
         });
@@ -540,7 +536,7 @@ impl TableView {
                 .sample_rows
                 .rows
                 .iter()
-                .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
+                .map(|r| r.iter().map(|v| Cell(v).text()).collect())
                 .collect(),
         }
     }
@@ -1668,20 +1664,6 @@ async fn import_submit(
     )
 }
 
-/// A JSON value shown as text: a string bare, null as nothing, anything
-/// else as JSON.
-struct JsonText<'a>(&'a serde_json::Value);
-
-impl fmt::Display for JsonText<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            serde_json::Value::Null => Ok(()),
-            serde_json::Value::String(s) => f.write_str(s),
-            other => write!(f, "{other}"),
-        }
-    }
-}
-
 async fn sql_page(
     State(app): State<App>,
     WebUser(identity): WebUser,
@@ -1727,7 +1709,7 @@ impl SqlResult {
                 rows: outcome
                     .rows
                     .iter()
-                    .map(|r| r.iter().map(|v| JsonText(v).to_string()).collect())
+                    .map(|r| r.iter().map(|v| Cell(v).text()).collect())
                     .collect(),
                 row_count: outcome.row_count,
                 duration_ms: outcome.duration_ms,
@@ -2284,9 +2266,9 @@ async fn settings_save(
         classification: Some(form.classification),
         allowed_providers,
     };
-    let saved = match workspaces_api::update_settings(&app, &access, changes).await {
+    let saved = match access.update_settings(&app, changes).await {
         Ok(ws) => match form.name {
-            Some(name) => workspaces_api::rename(&app, &access, &name).await,
+            Some(name) => access.rename_workspace(&app, &name).await,
             None => Ok(ws),
         },
         Err(e) => Err(e),
@@ -2317,7 +2299,7 @@ async fn workspace_delete(
         )
         .into_response());
     }
-    let deleted = workspaces_api::delete_workspace(&app, &access).await;
+    let deleted = access.delete_workspace(&app).await;
     Ok(match deleted {
         Ok(()) => Flash::notice("/workspaces", format!("Deleted workspace '{name}'")),
         Err(e) => Flash::error(format!("/w/{id}/settings"), e.message),
@@ -2825,7 +2807,7 @@ impl GraphResultView {
                 properties: n
                     .properties
                     .iter()
-                    .map(|(k, v)| format!("{k}: {}", JsonText(v)))
+                    .map(|(k, v)| format!("{k}: {}", Cell(v).text()))
                     .collect::<Vec<_>>()
                     .join(" · "),
                 sources: sources_of(n.id.as_str()),
@@ -2986,25 +2968,6 @@ struct EdgeForm {
     note: Option<String>,
 }
 
-/// `KEY=VALUE` lines as a property patch: an empty value is `null`, which
-/// removes the key on an edit.
-fn property_lines(text: &str) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
-    let lines: Vec<String> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_owned)
-        .collect();
-    let mut patch =
-        graph_cli::parse_properties(&lines).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    for value in patch.values_mut() {
-        if value.as_str().is_some_and(str::is_empty) {
-            *value = serde_json::Value::Null;
-        }
-    }
-    Ok(patch)
-}
-
 async fn graph_node_add(
     State(app): State<App>,
     WebUser(identity): WebUser,
@@ -3013,9 +2976,9 @@ async fn graph_node_add(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let back = format!("/w/{id}/graph");
-    let properties = match property_lines(&form.properties) {
+    let properties = match Properties::parse_patch_lines(&form.properties) {
         Ok(patch) => Properties::from(patch),
-        Err(e) => return Ok(Flash::error(back, e.message).into_response()),
+        Err(e) => return Ok(Flash::error(back, e.to_string()).into_response()),
     };
     let added = access
         .create_node(
@@ -3046,9 +3009,9 @@ async fn graph_node_edit(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let back = format!("/w/{id}/graph");
-    let patch = match property_lines(&form.properties) {
+    let patch = match Properties::parse_patch_lines(&form.properties) {
         Ok(patch) => patch,
-        Err(e) => return Ok(Flash::error(back, e.message).into_response()),
+        Err(e) => return Ok(Flash::error(back, e.to_string()).into_response()),
     };
     let edit = NodeEdit {
         label: form.label,

@@ -19,7 +19,6 @@ use quack_core::crypto::sha256_hex;
 use quack_core::error::Error as CoreError;
 use quack_core::ids::{AuditId, UserId, WorkspaceId};
 use quack_core::llm::egress::Egress;
-use quack_core::net::{self, Forwarded};
 use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditResource, Channel, Membership, Origin, Outcome, PasswordCheck,
@@ -121,7 +120,12 @@ impl Peer {
             parts
                 .extensions
                 .get::<ConnectInfo<SocketAddr>>()
-                .map(|info| client_ip(info.0.ip(), &parts.headers, app)),
+                .map(|info| {
+                    app.config
+                        .server
+                        .trusted_proxies
+                        .client_ip(info.0.ip(), &parts.headers)
+                }),
         )
     }
 
@@ -139,21 +143,6 @@ impl Peer {
     pub(crate) fn ip(self) -> Option<String> {
         self.0.map(|ip| ip.to_string())
     }
-}
-
-/// The client behind `peer` under the server's trusted proxies.
-pub(crate) fn client_ip(peer: IpAddr, headers: &HeaderMap, app: &App) -> IpAddr {
-    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    net::client_addr(
-        peer,
-        Forwarded {
-            rfc7239: text("forwarded"),
-            x_forwarded_for: text("x-forwarded-for"),
-            x_forwarded_proto: text("x-forwarded-proto"),
-        },
-        &app.config.server.trusted_proxies,
-    )
-    .ip
 }
 
 /// The id the request-id layer put on the request, for audit rows: the
@@ -272,23 +261,6 @@ pub(crate) async fn password_login(
     Ok(Login { user, token })
 }
 
-/// A user a credential names, unless an admin disabled them: then a denied
-/// row under `action` and a 401, whatever the credential.
-pub(crate) async fn unless_disabled(
-    app: &App,
-    user: UserRow,
-    action: AuditAction,
-    origin: &Origin,
-) -> ApiResult<UserRow> {
-    if !user.is_disabled() {
-        return Ok(user);
-    }
-    let mut entry = AuditEntry::new(action, Outcome::Denied, origin.clone());
-    entry.user_id = Some(user.id.clone());
-    app.control.record_audit(&entry).await?;
-    Err(ApiError::unauthorized("account disabled"))
-}
-
 /// A password login that succeeded: who, and their new session.
 pub(crate) struct Login {
     pub(crate) user: UserRow,
@@ -367,7 +339,10 @@ impl Identity {
                     .get_user(&user_id)
                     .await?
                     .ok_or_else(|| ApiError::unauthorized("session user no longer exists"))?;
-                let user = unless_disabled(app, user, AuditAction::Session, &origin).await?;
+                let user = app
+                    .control
+                    .admit(user, AuditAction::Session, &origin)
+                    .await?;
                 return Ok(Self {
                     user_id: user.id,
                     username: user.username,
@@ -421,7 +396,7 @@ impl Identity {
             .get_user(&token.user_id)
             .await?
             .ok_or_else(|| ApiError::unauthorized("token user no longer exists"))?;
-        let user = unless_disabled(app, user, AuditAction::Token, &origin).await?;
+        let user = app.control.admit(user, AuditAction::Token, &origin).await?;
         Ok(Self {
             user_id: user.id,
             username: user.username,
@@ -441,7 +416,7 @@ impl Identity {
     ) -> ApiResult<Self> {
         match oidc.bearer_user(&app.control, token, &origin).await {
             Ok(user) => {
-                let user = unless_disabled(app, user, AuditAction::Token, &origin).await?;
+                let user = app.control.admit(user, AuditAction::Token, &origin).await?;
                 Ok(Self {
                     user_id: user.id,
                     username: user.username,

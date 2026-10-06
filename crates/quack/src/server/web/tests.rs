@@ -58,7 +58,7 @@ fn a_failed_revalidation_preview_is_shown_in_the_stale_banner() {
 
 #[test]
 fn cells_render_strings_bare_and_null_empty() {
-    let text = |v: &serde_json::Value| JsonText(v).to_string();
+    let text = |v: &serde_json::Value| Cell(v).text();
     assert_eq!(text(&serde_json::json!("s")), "s");
     assert_eq!(text(&serde_json::Value::Null), "");
     assert_eq!(text(&serde_json::json!(4.5)), "4.5");

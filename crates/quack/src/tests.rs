@@ -205,14 +205,14 @@ async fn a_created_workspace_opens_by_name() {
     let create = || admin::WorkspaceAction::Create {
         name: "sales".parse().unwrap(),
     };
-    admin::run_workspace(&config, create()).await.unwrap();
+    create().run(&config).await.unwrap();
     let opened = OpenedWorkspace::in_config(config.clone(), Some("sales"))
         .await
         .unwrap();
     assert_eq!(opened.name, "sales");
     opened.open_db().unwrap();
 
-    let again = admin::run_workspace(&config, create()).await.unwrap_err();
+    let again = create().run(&config).await.unwrap_err();
     assert_eq!(again.to_string(), "workspace 'sales' already exists");
     let control = ControlPlane::open(&config).await.unwrap();
     assert_eq!(control.list_workspaces().await.unwrap().len(), 1);

@@ -24,7 +24,7 @@ use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::ids::{AuditId, ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::parser::SectionKind;
-use quack_core::storage::backup;
+use quack_core::storage::backup::Manifest;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -8614,7 +8614,8 @@ async fn forwarded_headers_count_only_from_trusted_proxies() {
         "10.0.0.0/8"
             .parse()
             .unwrap_or_else(|e: ipnet::AddrParseError| fail(&e.to_string())),
-    ];
+    ]
+    .into();
     let h = harness_with(ServeMode::Login, config).await;
     h.user("ann", UserKind::Standard).await;
     let login = |peer: &str, forwarded: Option<&str>| {
@@ -8851,7 +8852,7 @@ async fn a_workspace_round_trips_through_a_snapshot_and_is_renamed_and_deleted()
             .and_then(|v| v.to_str().ok()),
         Some("application/x-tar")
     );
-    let manifest = backup::read_manifest(tar.as_ref()).unwrap_or_else(|e| fail(&e.to_string()));
+    let manifest = Manifest::read(tar.as_ref()).unwrap_or_else(|e| fail(&e.to_string()));
     assert_eq!(manifest.name, "sales");
     assert_eq!(manifest.classification, "secret");
     assert_eq!(manifest.members.len(), 2, "{manifest:?}");

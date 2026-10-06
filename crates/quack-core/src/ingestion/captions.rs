@@ -13,19 +13,19 @@ use crate::error::{Error, Result};
 const SECTION_CHARS: usize = 600;
 const GAP_SECONDS: u64 = 10;
 
-/// One cue: when it starts and ends, in milliseconds, and its lines.
+/// One cue: when it starts and ends, and its lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Cue {
-    start_ms: u64,
-    end_ms: u64,
+    start: CueTime,
+    end: CueTime,
     text: String,
 }
 
 impl Cue {
-    fn new(start_ms: u64, end_ms: u64, lines: &[String]) -> Self {
+    fn new(start: CueTime, end: CueTime, lines: &[String]) -> Self {
         Self {
-            start_ms,
-            end_ms,
+            start,
+            end,
             text: lines
                 .iter()
                 .map(|l| l.trim())
@@ -36,26 +36,41 @@ impl Cue {
     }
 }
 
-fn millis(hours: u8, minutes: u8, seconds: u8, milliseconds: u16) -> u64 {
-    u64::from(hours)
-        .saturating_mul(3_600_000)
-        .saturating_add(u64::from(minutes).saturating_mul(60_000))
-        .saturating_add(u64::from(seconds).saturating_mul(1_000))
-        .saturating_add(u64::from(milliseconds))
+/// When a cue starts or ends, in milliseconds from the start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CueTime(u64);
+
+impl CueTime {
+    fn from_hms(hours: u8, minutes: u8, seconds: u8, milliseconds: u16) -> Self {
+        Self(
+            u64::from(hours)
+                .saturating_mul(3_600_000)
+                .saturating_add(u64::from(minutes).saturating_mul(60_000))
+                .saturating_add(u64::from(seconds).saturating_mul(1_000))
+                .saturating_add(u64::from(milliseconds)),
+        )
+    }
+
+    /// How long after `earlier` this is; zero when it is not after.
+    fn since(self, earlier: Self) -> u64 {
+        self.0.saturating_sub(earlier.0)
+    }
 }
 
 /// `12:04`, or `1:02:03` past an hour.
-pub(crate) fn clock(ms: u64) -> String {
-    let seconds = ms.div_euclid(1_000);
-    let (h, m, s) = (
-        seconds.div_euclid(3_600),
-        seconds.rem_euclid(3_600).div_euclid(60),
-        seconds.rem_euclid(60),
-    );
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m}:{s:02}")
+impl std::fmt::Display for CueTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let seconds = self.0.div_euclid(1_000);
+        let (h, m, s) = (
+            seconds.div_euclid(3_600),
+            seconds.rem_euclid(3_600).div_euclid(60),
+            seconds.rem_euclid(60),
+        );
+        if h > 0 {
+            write!(f, "{h}:{m:02}:{s:02}")
+        } else {
+            write!(f, "{m}:{s:02}")
+        }
     }
 }
 
@@ -71,13 +86,13 @@ pub fn vtt(text: &str) -> Result<Extracted> {
         .iter()
         .filter_map(|block| match block {
             VttBlock::Que(cue) => Some(Cue::new(
-                millis(
+                CueTime::from_hms(
                     cue.timings.start.hours,
                     cue.timings.start.minutes,
                     cue.timings.start.seconds,
                     cue.timings.start.milliseconds,
                 ),
-                millis(
+                CueTime::from_hms(
                     cue.timings.end.hours,
                     cue.timings.end.minutes,
                     cue.timings.end.seconds,
@@ -88,7 +103,7 @@ pub fn vtt(text: &str) -> Result<Extracted> {
             VttBlock::Comment(_) | VttBlock::Style(_) | VttBlock::Region(_) => None,
         })
         .collect();
-    sections(&cues, "WebVTT")
+    Cues(cues).into_extracted("WebVTT")
 }
 
 /// `SubRip` captions.
@@ -103,13 +118,13 @@ pub fn srt(text: &str) -> Result<Extracted> {
         .iter()
         .map(|cue| {
             Cue::new(
-                millis(
+                CueTime::from_hms(
                     cue.start.hours,
                     cue.start.minutes,
                     cue.start.seconds,
                     cue.start.milliseconds,
                 ),
-                millis(
+                CueTime::from_hms(
                     cue.end.hours,
                     cue.end.minutes,
                     cue.end.seconds,
@@ -119,49 +134,60 @@ pub fn srt(text: &str) -> Result<Extracted> {
             )
         })
         .collect();
-    sections(&cues, "SubRip")
+    Cues(cues).into_extracted("SubRip")
 }
 
-/// Cues merged into timed sections.
-pub(crate) fn sections(cues: &[Cue], format: &str) -> Result<Extracted> {
-    let mut out = Vec::new();
-    let mut run: Vec<&Cue> = Vec::new();
-    let flush = |run: &mut Vec<&Cue>, out: &mut Vec<Section>| {
-        let Some(first) = run.first() else {
-            return;
+/// A captions file's cues, in order.
+pub(crate) struct Cues(Vec<Cue>);
+
+impl Cues {
+    /// The cues merged into timed sections: a gap of more than
+    /// `GAP_SECONDS` or `SECTION_CHARS` of text starts the next.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no cue has text.
+    pub(crate) fn into_extracted(self, format: &str) -> Result<Extracted> {
+        let cues = &self.0;
+        let mut out = Vec::new();
+        let mut run: Vec<&Cue> = Vec::new();
+        let flush = |run: &mut Vec<&Cue>, out: &mut Vec<Section>| {
+            let Some(first) = run.first() else {
+                return;
+            };
+            let text = run
+                .iter()
+                .map(|c| c.text.as_str())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.is_empty() {
+                out.push(Section::body(None, text).at(first.start.to_string()));
+            }
+            run.clear();
         };
-        let text = run
-            .iter()
-            .map(|c| c.text.as_str())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !text.is_empty() {
-            out.push(Section::body(None, text).at(clock(first.start_ms)));
+        for cue in cues {
+            let gap = run
+                .last()
+                .is_some_and(|last| cue.start.since(last.end) > GAP_SECONDS * 1_000);
+            let full = run.iter().map(|c| c.text.len()).sum::<usize>() >= SECTION_CHARS;
+            if gap || full {
+                flush(&mut run, &mut out);
+            }
+            run.push(cue);
         }
-        run.clear();
-    };
-    for cue in cues {
-        let gap = run
-            .last()
-            .is_some_and(|last| cue.start_ms.saturating_sub(last.end_ms) > GAP_SECONDS * 1_000);
-        let full = run.iter().map(|c| c.text.len()).sum::<usize>() >= SECTION_CHARS;
-        if gap || full {
-            flush(&mut run, &mut out);
+        flush(&mut run, &mut out);
+        if out.is_empty() {
+            return Err(Error::Ingestion(format!(
+                "no extractable text: the {format} file has no cue text"
+            )));
         }
-        run.push(cue);
+        Ok(Extracted {
+            sections: out,
+            flow: Flow::Sectioned,
+            ..Extracted::default()
+        })
     }
-    flush(&mut run, &mut out);
-    if out.is_empty() {
-        return Err(Error::Ingestion(format!(
-            "no extractable text: the {format} file has no cue text"
-        )));
-    }
-    Ok(Extracted {
-        sections: out,
-        flow: Flow::Sectioned,
-        ..Extracted::default()
-    })
 }
 
 #[cfg(test)]
@@ -170,9 +196,9 @@ mod tests {
 
     #[test]
     fn clock_drops_the_hour_until_there_is_one() {
-        assert_eq!(clock(724_500), "12:04");
-        assert_eq!(clock(3_723_000), "1:02:03");
-        assert_eq!(clock(0), "0:00");
+        assert_eq!(CueTime(724_500).to_string(), "12:04");
+        assert_eq!(CueTime(3_723_000).to_string(), "1:02:03");
+        assert_eq!(CueTime(0).to_string(), "0:00");
     }
 
     #[test]
@@ -215,13 +241,13 @@ mod tests {
         let cues: Vec<Cue> = (0..40u64)
             .map(|i| {
                 Cue::new(
-                    i * 1_000,
-                    i * 1_000 + 900,
+                    CueTime(i * 1_000),
+                    CueTime(i * 1_000 + 900),
                     &[format!("cue number {i} with some words")],
                 )
             })
             .collect();
-        let extracted = sections(&cues, "test").unwrap_or_default();
+        let extracted = Cues(cues).into_extracted("test").unwrap_or_default();
         assert!(extracted.sections.len() > 1, "{}", extracted.sections.len());
         assert!(
             extracted

@@ -112,7 +112,7 @@ impl MakeRequestId for RequestIdV7 {
 /// or a reverse proxy in front of quack) shares one budget.
 ///
 /// Behind a proxy in `[server].trusted_proxies`, the key is the client the
-/// proxy's forwarded headers name (`auth::client_ip`), so an organization
+/// proxy's forwarded headers name (`TrustedProxies::client_ip`), so an organization
 /// behind one proxy is not one bucket.
 #[derive(Clone)]
 struct CallerKey(App);
@@ -127,7 +127,11 @@ impl KeyExtractor for CallerKey {
             .extensions()
             .get::<axum::extract::ConnectInfo<SocketAddr>>()
             .map_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |c| {
-                auth::client_ip(c.0.ip(), req.headers(), &self.0)
+                self.0
+                    .config
+                    .server
+                    .trusted_proxies
+                    .client_ip(c.0.ip(), req.headers())
             }))
     }
 }

@@ -11,12 +11,13 @@ use quack_core::embedding::{Dimension, Embedder, EmbeddingModel, Input, Profile,
 use quack_core::error::Error;
 use quack_core::extraction::{Extract, ExtractFuture, ExtractionRun};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
+use quack_core::graph::follow_up::FollowUp;
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::{Assertion, NewEdge, NewNode, NodeEdit, Revalidation};
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    GraphResult, Node, Origin, Properties, Standing, extract, follow_up, resolve,
-    store as graph_store, tables, traverse,
+    GraphResult, Node, Origin, Properties, Standing, extract, resolve, store as graph_store,
+    tables, traverse,
 };
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
 use quack_core::ingestion::parser::SectionKind;
@@ -2215,26 +2216,24 @@ async fn an_ingest_follow_up_extracts_what_the_setting_names() {
     let doc = DocumentId::from("doc-1");
     let mut config = Config::default();
 
-    let off = follow_up::after_documents(
-        &writer,
-        &config,
-        None,
-        std::slice::from_ref(&doc),
-        RunControl::unobserved(),
-    )
+    let off = FollowUp {
+        db: &writer,
+        config: &config,
+        embeddings: None,
+    }
+    .run(std::slice::from_ref(&doc), RunControl::unobserved())
     .await
     .unwrap();
     assert!(off.is_none());
     assert_eq!(graph_store::status(&db).unwrap().nodes, 0);
 
     config.graph.follow_ingest = FollowIngest::Tables;
-    let followed = follow_up::after_documents(
-        &writer,
-        &config,
-        None,
-        std::slice::from_ref(&doc),
-        RunControl::unobserved(),
-    )
+    let followed = FollowUp {
+        db: &writer,
+        config: &config,
+        embeddings: None,
+    }
+    .run(std::slice::from_ref(&doc), RunControl::unobserved())
     .await
     .unwrap()
     .unwrap();
@@ -2255,13 +2254,12 @@ async fn an_ingest_follow_up_extracts_what_the_setting_names() {
     );
 
     // A document with no table and no chunks of its own leaves nothing to do.
-    let nothing = follow_up::after_documents(
-        &writer,
-        &config,
-        None,
-        &[DocumentId::from("absent")],
-        RunControl::unobserved(),
-    )
+    let nothing = FollowUp {
+        db: &writer,
+        config: &config,
+        embeddings: None,
+    }
+    .run(&[DocumentId::from("absent")], RunControl::unobserved())
     .await
     .unwrap()
     .unwrap();

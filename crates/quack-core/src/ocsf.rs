@@ -214,6 +214,14 @@ pub enum PromptText {
     Include,
 }
 
+impl From<bool> for PromptText {
+    /// `true` when the caller asked for the prompt (`--with-prompt`,
+    /// `?prompt=true`).
+    fn from(include: bool) -> Self {
+        if include { Self::Include } else { Self::Omit }
+    }
+}
+
 impl AuditRow {
     /// The row as an OCSF event joined to its `_quack_audit` detail, the
     /// half that lives inside the workspace: for a query, the
@@ -232,6 +240,16 @@ impl AuditRow {
         prompt: PromptText,
     ) -> Result<Value> {
         let mut event = self.to_ocsf()?;
+        // The event's `unmapped` object with `key` set to `value`.
+        let unmapped_with = |event: &serde_json::Map<String, Value>, key: &str, value: Value| {
+            let mut unmapped = event
+                .get("unmapped")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            unmapped.insert(key.to_owned(), value);
+            Value::Object(unmapped)
+        };
         if self.entry.action == AuditAction::BreakGlass
             && let Some(object) = event.as_object_mut()
         {
@@ -323,17 +341,6 @@ impl AuditRow {
         object.insert("unmapped".into(), unmapped_with(object, "ai", extra));
         Ok(without_nulls(event))
     }
-}
-
-/// The event's `unmapped` object with `key` set to `value`.
-fn unmapped_with(event: &serde_json::Map<String, Value>, key: &str, value: Value) -> Value {
-    let mut unmapped = event
-        .get("unmapped")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    unmapped.insert(key.to_owned(), value);
-    Value::Object(unmapped)
 }
 
 /// OCSF leaves an attribute out rather than setting it to null.

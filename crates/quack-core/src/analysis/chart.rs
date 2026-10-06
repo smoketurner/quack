@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
-use crate::storage::workspace::QueryResults;
+use crate::storage::workspace::{Cell, QueryResults};
 
 /// Most points per series (distinct x values); beyond this the query
 /// should aggregate.
@@ -129,7 +129,7 @@ impl ChartSpec {
         let mut names: Vec<String> = Vec::new();
         let mut values: HashMap<String, Vec<Option<f64>>> = HashMap::new();
         for (i, row) in results.rows.iter().enumerate() {
-            let label = label_of(row.get(x_idx));
+            let label = Cell::at(row, x_idx).label();
             let position = if let Some(&position) = positions.get(&label) {
                 position
             } else {
@@ -143,7 +143,7 @@ impl ChartSpec {
                 labels.len().saturating_sub(1)
             };
             let targets: Vec<(String, usize)> = match by_idx {
-                Some(by) => vec![(label_of(row.get(by)), first_y)],
+                Some(by) => vec![(Cell::at(row, by).label(), first_y)],
                 None => columns
                     .y
                     .iter()
@@ -162,7 +162,7 @@ impl ChartSpec {
                     values.insert(name.clone(), Vec::new());
                 }
                 let y = row.get(idx).cloned().unwrap_or(serde_json::Value::Null);
-                let number = number_of(&y).ok_or_else(|| {
+                let number = Cell(&y).number().ok_or_else(|| {
                     Error::Analysis(format!(
                         "row {} of column '{}' is not numeric: {y}",
                         i.saturating_add(1),
@@ -207,25 +207,6 @@ impl ChartSpec {
     pub fn stacked(mut self, stacked: bool) -> Self {
         self.stacked = stacked;
         self
-    }
-}
-
-/// A cell as an axis label or a series name.
-fn label_of(value: Option<&serde_json::Value>) -> String {
-    match value {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Null) | None => String::from("NULL"),
-        Some(other) => other.to_string(),
-    }
-}
-
-/// A cell as a number: a NULL is 0.
-fn number_of(value: &serde_json::Value) -> Option<f64> {
-    match value {
-        serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.parse::<f64>().ok(),
-        serde_json::Value::Null => Some(0.0),
-        _ => None,
     }
 }
 
