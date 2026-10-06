@@ -1444,7 +1444,23 @@ async fn memberships_follow_group_roles_without_touching_hand_grants() {
         .unwrap_or_else(|e| fail(&e.to_string()))
         .rows;
     assert_eq!(rows.len(), 3, "{rows:?}");
+}
 
+/// A group's role is set, listed, and removed; removing one it never had
+/// says so.
+#[tokio::test]
+async fn group_roles_are_set_listed_and_removed() {
+    let (_dir, cp) = open().await;
+    let sales = cp
+        .create_workspace(&workspace_name("sales"), None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.set_group_role(&sales.id, "finance", Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.set_group_role(&sales.id, "leads", Role::Owner, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
     assert!(
         cp.remove_group_role(&sales.id, "leads", setup_audit())
             .await

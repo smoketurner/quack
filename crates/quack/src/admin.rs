@@ -329,7 +329,7 @@ pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> 
             out.flush()?;
         }
         UserAction::Remove { username, yes } => {
-            remove_user(config, &control, &username, yes).await?
+            remove_user(config, &control, &username, yes).await?;
         }
     }
     Ok(())
