@@ -24,7 +24,8 @@ use quack_core::ids::UserId;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::client_key::{ClientKeyName, ClientKeys, PublicJwk};
 use quack_core::llm::oauth::{CachedToken, KeySource, TokenManager};
-use quack_core::oidc::{OidcSubject, Origin};
+use quack_core::oidc::OidcSubject;
+use quack_core::storage::control::Origin;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, SealedOwner, UserKind,
     WorkspaceName,

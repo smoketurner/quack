@@ -19,11 +19,10 @@ use quack_core::crypto::sha256_hex;
 use quack_core::error::Error as CoreError;
 use quack_core::ids::{AuditId, UserId, WorkspaceId};
 use quack_core::llm::egress::Egress;
-use quack_core::oidc::Origin;
 use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditResource, Channel, Outcome, Role, Scope, TokenRow, UserKind,
-    UserRow, WorkspaceRow,
+    AuditAction, AuditEntry, AuditResource, Channel, Origin, Outcome, Role, Scope, TokenRow,
+    UserKind, UserRow, WorkspaceRow,
 };
 use quack_core::storage::sessions::SessionViewer;
 use quack_core::web_sessions::{SessionLookup, SessionToken};
@@ -62,31 +61,13 @@ pub(crate) struct Identity {
     pub username: String,
     pub kind: UserKind,
     pub credential: Credential,
-    pub client_addr: Option<String>,
-    pub request_id: Option<String>,
-    /// Set for requests that arrived over a transport of their own (MCP),
-    /// so audit rows name that channel rather than the credential's.
-    pub channel: Option<Channel>,
+    /// Where the request came from; its channel is the credential's (a
+    /// session or local mode is `Web`, a token `Api`) unless the request
+    /// arrived over a transport of its own (MCP).
+    pub origin: Origin,
 }
 
 impl Identity {
-    pub(crate) fn channel(&self) -> Channel {
-        self.channel.unwrap_or(match self.credential {
-            Credential::Token(_) | Credential::IdentityProvider => Channel::Api,
-            Credential::Local | Credential::Session(_) => Channel::Web,
-        })
-    }
-
-    /// Where this request came from, for an audit row recorded later on its
-    /// behalf.
-    pub(crate) fn origin(&self) -> Origin {
-        Origin {
-            channel: self.channel(),
-            client_addr: self.client_addr.clone(),
-            request_id: self.request_id.clone(),
-        }
-    }
-
     fn token_hash(&self) -> Option<String> {
         match &self.credential {
             Credential::Token(t) => Some(t.token_hash.clone()),
@@ -96,11 +77,9 @@ impl Identity {
 
     /// An audit entry attributed to this caller.
     pub(crate) fn audit(&self, action: AuditAction, outcome: Outcome) -> AuditEntry {
-        let mut entry = AuditEntry::new(action, outcome, self.channel());
+        let mut entry = AuditEntry::new(action, outcome, self.origin.clone());
         entry.user_id = Some(self.user_id.clone());
         entry.token_hash = self.token_hash();
-        entry.client_addr.clone_from(&self.client_addr);
-        entry.request_id.clone_from(&self.request_id);
         entry
     }
 
@@ -231,6 +210,11 @@ pub(crate) async fn password_login(
     password: &str,
 ) -> ApiResult<Login> {
     let verified = app.control.verify_password(username, password).await?;
+    let origin = Origin {
+        channel: Channel::Web,
+        client_addr: peer.ip(),
+        request_id,
+    };
     let mut entry = AuditEntry::new(
         LOGIN_ACTION,
         if verified.is_some() {
@@ -238,7 +222,7 @@ pub(crate) async fn password_login(
         } else {
             Outcome::Denied
         },
-        Channel::Web,
+        origin,
     );
     entry.user_id = match &verified {
         Some(user) => Some(user.id.clone()),
@@ -249,8 +233,6 @@ pub(crate) async fn password_login(
             .await?
             .map(|u| u.id),
     };
-    entry.client_addr = peer.ip();
-    entry.request_id = request_id;
     app.control.record_audit(&entry).await?;
 
     let Some(user) = verified else {
@@ -288,7 +270,8 @@ impl FromRequestParts<App> for Identity {
         if state.mode != ServeMode::Local
             && let Some(oidc) = &state.oidc
         {
-            oidc.acting(&identity.user_id, identity.origin()).enter();
+            oidc.acting(&identity.user_id, identity.origin.clone())
+                .enter();
         }
         Ok(identity)
     }
@@ -296,17 +279,19 @@ impl FromRequestParts<App> for Identity {
 
 impl Identity {
     async fn resolve(parts: &Parts, app: &App) -> ApiResult<Self> {
-        let client_addr = Peer::of(parts).ip();
         let RequestId(request_id) = RequestId::of(&parts.headers);
+        let origin = Origin {
+            channel: Channel::Web,
+            client_addr: Peer::of(parts).ip(),
+            request_id,
+        };
         if app.mode == ServeMode::Local {
             return Ok(Self {
                 user_id: UserId::from(LOCAL_USER_ID),
                 username: String::from(LOCAL_USER_ID),
                 kind: UserKind::Admin,
                 credential: Credential::Local,
-                client_addr,
-                request_id,
-                channel: None,
+                origin,
             });
         }
 
@@ -327,11 +312,6 @@ impl Identity {
                 renewal_due,
             } => {
                 if renewal_due && let Some(oidc) = &app.oidc {
-                    let origin = Origin {
-                        channel: Channel::Web,
-                        client_addr: client_addr.clone(),
-                        request_id: request_id.clone(),
-                    };
                     oidc.require_current(&app.control, &user_id, &presented, &origin)
                         .await?;
                 }
@@ -345,55 +325,45 @@ impl Identity {
                     username: user.username,
                     kind: user.kind,
                     credential: Credential::Session(SessionToken::presented(presented)),
-                    client_addr,
-                    request_id,
-                    channel: None,
+                    origin,
                 });
             }
             // Saying so, rather than falling through to "unknown token",
             // is what lets a browser tell an expired login from a bad one.
             SessionLookup::Expired => {
-                let mut entry =
-                    AuditEntry::new(AuditAction::Session, Outcome::Denied, Channel::Web);
-                entry.client_addr = client_addr;
-                entry.request_id = request_id;
+                let entry = AuditEntry::new(AuditAction::Session, Outcome::Denied, origin);
                 app.control.record_audit(&entry).await?;
                 return Err(ApiError::unauthorized("session expired; log in again"));
             }
             SessionLookup::Unknown => {}
         }
 
+        let origin = Origin {
+            channel: Channel::Api,
+            ..origin
+        };
         if let Some(oidc) = app.oidc.as_ref().filter(|o| o.accepts_bearers())
             && presented.split('.').count() == 3
         {
-            return Self::from_access_token(app, oidc, &presented, client_addr, request_id).await;
+            return Self::from_access_token(app, oidc, &presented, origin).await;
         }
 
-        Self::from_api_token(app, &presented, client_addr, request_id).await
+        Self::from_api_token(app, &presented, origin).await
     }
 
     /// A bearer that is one of quack's API tokens.
-    async fn from_api_token(
-        app: &App,
-        presented: &str,
-        client_addr: Option<String>,
-        request_id: Option<String>,
-    ) -> ApiResult<Self> {
+    async fn from_api_token(app: &App, presented: &str, origin: Origin) -> ApiResult<Self> {
         let hash = sha256_hex(presented.as_bytes());
         let Some(token) = app.control.find_token(&hash).await? else {
-            let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, Channel::Api);
-            entry.client_addr = client_addr;
-            entry.request_id = request_id;
+            let entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, origin);
             app.control.record_audit(&entry).await?;
             return Err(ApiError::unauthorized("unknown token"));
         };
         if token.is_expired(jiff::Timestamp::now()) {
-            let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, Channel::Api);
+            let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, origin);
             entry.user_id = Some(token.user_id.clone());
             entry.token_hash = Some(token.token_hash.clone());
             entry = entry.in_workspace(&token.workspace_id);
-            entry.client_addr = client_addr;
-            entry.request_id = request_id;
             app.control.record_audit(&entry).await?;
             return Err(ApiError::unauthorized("token expired"));
         }
@@ -408,9 +378,7 @@ impl Identity {
             username: user.username,
             kind: user.kind,
             credential: Credential::Token(token),
-            client_addr,
-            request_id,
-            channel: None,
+            origin,
         })
     }
 
@@ -420,8 +388,7 @@ impl Identity {
         app: &App,
         oidc: &Oidc,
         token: &str,
-        client_addr: Option<String>,
-        request_id: Option<String>,
+        origin: Origin,
     ) -> ApiResult<Self> {
         match oidc.bearer_user(&app.control, token).await {
             Ok(user) => Ok(Self {
@@ -429,15 +396,11 @@ impl Identity {
                 username: user.username,
                 kind: user.kind,
                 credential: Credential::IdentityProvider,
-                client_addr,
-                request_id,
-                channel: None,
+                origin,
             }),
             Err(CoreError::Bearer(reason)) => {
                 tracing::info!(%reason, "access token refused");
-                let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, Channel::Api);
-                entry.client_addr = client_addr;
-                entry.request_id = request_id;
+                let entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, origin);
                 app.control.record_audit(&entry).await?;
                 Err(ApiError::unauthorized(format!(
                     "access token refused: {reason}"

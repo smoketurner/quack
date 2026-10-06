@@ -430,7 +430,38 @@ impl FromStr for Expiry {
     }
 }
 
-/// One access-audit row to record: who, what, outcome, channel.
+/// Where a request came from: the channel it arrived over, and the
+/// client address and request id the server saw, when it recorded them.
+#[derive(Debug, Clone)]
+pub struct Origin {
+    pub channel: Channel,
+    pub client_addr: Option<String>,
+    pub request_id: Option<String>,
+}
+
+/// A request over `channel` with no address or id: the CLI, or a row the
+/// server writes before it has read either.
+impl From<Channel> for Origin {
+    fn from(channel: Channel) -> Self {
+        Self {
+            channel,
+            client_addr: None,
+            request_id: None,
+        }
+    }
+}
+
+impl Origin {
+    /// The denied `session` row for `user`, when their sign-in has ended.
+    #[must_use]
+    pub fn denied_session(&self, user: &UserId) -> AuditEntry {
+        let mut entry = AuditEntry::new(AuditAction::Session, Outcome::Denied, self.clone());
+        entry.user_id = Some(user.clone());
+        entry
+    }
+}
+
+/// One access-audit row to record: who, what, outcome, origin.
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
     /// UUID v7; the same id keys `_quack_audit` inside the workspace.
@@ -443,15 +474,13 @@ pub struct AuditEntry {
     /// An opaque id or a table name; never content.
     pub resource_id: Option<String>,
     pub outcome: Outcome,
-    pub channel: Channel,
-    pub client_addr: Option<String>,
-    pub request_id: Option<String>,
+    pub origin: Origin,
 }
 
 impl AuditEntry {
     /// A fresh entry with a new UUID v7 and nothing else set.
     #[must_use]
-    pub fn new(action: AuditAction, outcome: Outcome, channel: Channel) -> Self {
+    pub fn new(action: AuditAction, outcome: Outcome, origin: impl Into<Origin>) -> Self {
         Self {
             id: AuditId::generate(),
             user_id: None,
@@ -461,9 +490,7 @@ impl AuditEntry {
             resource_type: None,
             resource_id: None,
             outcome,
-            channel,
-            client_addr: None,
-            request_id: None,
+            origin: origin.into(),
         }
     }
 
@@ -2240,9 +2267,9 @@ impl ControlPlane {
                     entry.resource_type.map(ResourceKind::as_str).into(),
                     entry.resource_id.as_deref().into(),
                     entry.outcome.as_str().into(),
-                    entry.channel.as_str().into(),
-                    entry.client_addr.as_deref().into(),
-                    entry.request_id.as_deref().into(),
+                    entry.origin.channel.as_str().into(),
+                    entry.origin.client_addr.as_deref().into(),
+                    entry.origin.request_id.as_deref().into(),
                 ])?,
         )?)
     }

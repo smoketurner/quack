@@ -25,7 +25,7 @@ pub(crate) async fn handle(
     Path(workspace): Path<WorkspaceId>,
     mut request: Request,
 ) -> ApiResult<Response> {
-    identity.channel = Some(Channel::Mcp);
+    identity.origin.channel = Channel::Mcp;
     let access = Access::resolve(&app, identity, &workspace, Need::READ).await?;
     let policy = WritePolicy::Deny.allowed_if(access.permits(Need::WRITE));
     let key = McpKey {
