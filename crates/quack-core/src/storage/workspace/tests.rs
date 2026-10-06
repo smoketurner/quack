@@ -1360,6 +1360,8 @@ fn insert_text_chunk(
         content,
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: None,
     })
     .unwrap_or_else(|e| fail(&e.to_string()));
@@ -1432,6 +1434,8 @@ fn search_keyword_chunks_phrase_match_in_heading() {
         content: "See below for what is not covered.",
         heading: Some("Flood Exclusion"),
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: None,
     })
     .unwrap_or_else(|e| fail(&e.to_string()));
@@ -1499,6 +1503,8 @@ fn search_hybrid_chunks_ranks_identifier_and_filters_phrase() {
         content: "Policy POL-8841 covers water damage.",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&embedding),
     })
     .unwrap_or_else(|e| fail(&e.to_string()));
@@ -1509,6 +1515,8 @@ fn search_hybrid_chunks_ranks_identifier_and_filters_phrase() {
         content: "The pol number appears here, and the 8841 total appears elsewhere in this paragraph.",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&embedding),
     })
     .unwrap_or_else(|e| fail(&e.to_string()));
@@ -1540,6 +1548,8 @@ fn search_hybrid_chunks_phrase_filters_to_matching_chunks() {
         content: "The flood exclusion applies to basements.",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&embedding),
     })
     .unwrap_or_else(|e| fail(&e.to_string()));
@@ -1550,6 +1560,8 @@ fn search_hybrid_chunks_phrase_filters_to_matching_chunks() {
         content: "Exclusion of flood risk is handled in a separate clause.",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&embedding),
     })
     .unwrap_or_else(|e| fail(&e.to_string()));
@@ -2063,6 +2075,8 @@ fn document_chunks_page_in_order_and_documents_resolve_by_id_name_or_prefix() {
             content: &format!("part {i}"),
             heading: None,
             page: Some(i.saturating_add(1)),
+            kind: SectionKind::Body,
+            locator: None,
             embedding: None,
         })
         .unwrap_or_else(|e| fail(&e.to_string()));

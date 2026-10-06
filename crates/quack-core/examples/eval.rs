@@ -34,6 +34,7 @@ use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::store::EdgeScope;
 use quack_core::graph::{self, Standing, store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
+use quack_core::ingestion::parser::{FileType, Load, SectionKind};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
@@ -251,7 +252,7 @@ async fn ingest_documents(
     embedder: &Embedder<HashEmbedder>,
 ) -> Result<()> {
     let writer = writer_of(db)?;
-    for path in list_files(dir, "md")? {
+    for path in list_chunked_files(dir)? {
         let data = std::fs::read(&path)?;
         let filename = file_name(&path)?;
         ingestion::ingest_file(
@@ -264,6 +265,23 @@ async fn ingest_documents(
         .await?;
     }
     Ok(())
+}
+
+/// Every file in `dir` that ingests as chunks (Markdown, HTML, DOCX, PDF,
+/// ...), in name order.
+fn list_chunked_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(FileType::of)
+                .is_some_and(|t| matches!(t.load(), Load::Chunks(_)))
+        })
+        .collect();
+    entries.sort();
+    Ok(entries)
 }
 
 async fn ingest_tables(
@@ -859,6 +877,8 @@ fn evaluate_citations(path: &Path) -> Result<CitationReport> {
                 heading: None,
                 page: None,
                 score: 1.0,
+                kind: SectionKind::Body,
+                locator: None,
                 ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
             })
             .collect();

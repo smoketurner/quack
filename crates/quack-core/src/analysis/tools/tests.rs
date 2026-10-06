@@ -9,6 +9,7 @@ use crate::graph::store::NewNode;
 use crate::graph::{Properties, Standing};
 use crate::ids::{ClassId, DocumentId};
 use crate::ingestion::parser::PageCounts;
+use crate::ingestion::parser::SectionKind;
 use crate::llm::EmbedModel;
 use crate::ontology::Mapping;
 use crate::ontology::store::Revision;
@@ -98,6 +99,8 @@ async fn seed_hail_chunks(db: &SharedDb) {
                 content: text,
                 heading: None,
                 page: None,
+                kind: SectionKind::Body,
+                locator: None,
                 embedding: None,
             })?;
         }
@@ -126,6 +129,8 @@ fn an_entity_filter_resolves_to_its_chunks_or_says_why_it_cannot() {
             content: "Acme ships to Kenya.",
             heading: None,
             page: None,
+            kind: SectionKind::Body,
+            locator: None,
             embedding: None,
         })
         .is_ok()
@@ -392,6 +397,8 @@ fn hit(n: u32, filename: &str, content: &str) -> ChunkSearchResult {
         heading: (n == 0).then(|| String::from("Exclusions")),
         page: (n == 0).then_some(12),
         score: 0.125,
+        kind: SectionKind::Body,
+        locator: None,
         ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
     }
 }
@@ -488,6 +495,8 @@ async fn seed_document(db: &SharedDb, name: &str, count: u32, text: &str) {
                 content: &format!("{text} {i}"),
                 heading: None,
                 page: None,
+                kind: SectionKind::Body,
+                locator: None,
                 embedding: None,
             })?;
         }
@@ -1034,6 +1043,8 @@ async fn search_documents_top_k_is_capped_regardless_of_what_the_model_asks_for(
                 content: &format!("Hail fell in county {i}."),
                 heading: None,
                 page: None,
+                kind: SectionKind::Body,
+                locator: None,
                 embedding: None,
             })?;
         }

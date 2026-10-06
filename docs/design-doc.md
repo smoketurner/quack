@@ -796,14 +796,37 @@ terminal's `/ingest` takes files.
 
 **Parsing.**
 
-| Type | Parser | Extracted metadata |
-|------|--------|--------------------|
-| PDF | `pdf_oxide` | page numbers, Info title; a page that fails to read or holds no text is left out and counted, never the rest of the file |
-| Markdown, plain text | direct | headings (ATX and setext) |
-| HTML | `scraper` (html5ever) | headings, `<title>` |
-| DOCX | `zip` + `quick-xml` | headings from `Heading N` and `Title` styles, core title |
-| PPTX | `zip` + `quick-xml` | one section per slide, slide title as heading, slide number as page |
+| Type | Parser | Sections and metadata |
+|------|--------|-----------------------|
+| PDF | `pdf_oxide` (`ingestion::pdf`) | each page's typed regions: running headers, footers, page numbers, and artifacts are dropped; a structural heading (the structure tree, else a line set larger than the body) starts a section; the tables the layout detector finds are table sections; a page that fails to read or holds no text is left out and counted, never the rest of the file; Info title, author, creation and modification dates, keywords |
+| Markdown | `pulldown-cmark` (`ingestion::markdown`) | headings (a `#` inside a code fence is code), pipe tables as table sections; front matter's `title`, `author`, `date`, `modified`, `tags`, and the rest as named values |
+| plain text | direct | one section |
+| HTML | `scraper` (html5ever) | headings, `<table>` as table sections; `nav`, `aside`, `footer`, `form`, scripts, and styles skipped; `<title>` and the `author`, `date`, `keywords`, `description` meta tags (HTML, Dublin Core, Open Graph names) |
+| DOCX | `office_oxide` | headings from outline levels (any style name, any locale), tables, footnotes, endnotes, and comments as note sections; core title, creator, dates, keywords |
+| PPTX | `office_oxide` | one section per slide, slide title as heading, slide number as page, speaker notes as note sections; core properties |
+| EPUB | `zip` + `quick-xml` + the HTML parser | the spine's XHTML items as chapters, `chapter N` as the locator; OPF title, creator, date, subjects |
+| ODT | `zip` + `quick-xml` (`ingestion::odt`) | `text:h` headings, tables, footnote bodies as note sections; `meta.xml` title, creator, dates, keywords |
+| `.eml`, `.mbox` | `mail-parser` | one section per message under its subject, with From, To, and Date above the body (HTML-only bodies read as text); `message N` as a mailbox's locator; From and Date as author and date |
+| `.vtt`, `.srt` | `subtp` | cues merged into runs of about 600 characters, a new run after a gap over 10 seconds; the run's start time (`12:04`) as the locator |
+| source code (`.rs`, `.py`, `.js`, `.ts`, `.go`, `.java`, `.c`, `.sql`, ...) | direct | one code section, chunked by whole lines with `line N` as each chunk's locator (no grammar: a definition-aware split is a dependency decision left open) |
+| RTF | `rtf-parser` | one section |
 | CSV, Parquet, JSON, JSONL, XLSX | DuckDB (section 6.2) | become tables, not chunks |
+
+Every section has a kind (`body`, `table`, `note`, `code`) and may carry a locator beside
+its page; both are stored on the chunk (`_quack_chunks.kind`, `locator`) and the locator
+is part of every citation label (`meeting.vtt, 12:04`, `main.rs, line 40`) and of the
+passage page. A table is rendered as a pipe-delimited Markdown table (`ingestion::table`),
+one chunk per table, split by rows with the header on every piece when it is longer than
+the window; a table with at least `[ingestion].table_rows_as_table` data rows (default 20)
+is also loaded as a table of the workspace, `<stem>_tableN`, owned by the document like a
+workbook's sheets, so `run_sql` can query it.
+
+What a file says about itself lands on the document row: `author`, `authored_at`,
+`modified_at` (what parses as a timestamp; the text otherwise under `metadata`), `tags`,
+and `metadata` (a subject, recipients, a description, front-matter keys). The uploader's
+own values win (`quack ingest --author`, `--authored`, `--tag`), and a person can set
+them afterwards (`PATCH .../documents/{doc}`, `quack docs --author|--authored|--tag|--untag`).
+They show in the Documents page, `list_documents`, and the prompt's document inventory.
 
 A scanned PDF (no text layer) is reported as `error: no extractable text`. OCR is deferred.
 
@@ -840,10 +863,12 @@ up to 4 billion cells; ODS is capped at 100 million cells by `calamine` itself.
 difference; token counts via `tiktoken` (`cl100k_base`). A sectioned source (Markdown, HTML,
 DOCX headings, PPTX slides, plain text) splits at section boundaries first, so no chunk spans
 two sections; within a section the window ignores paragraphs and sentences. The chunk stores
-its nearest preceding heading, which the embedding model gets as the chunk's title.
+its nearest preceding heading, which the embedding model gets as the chunk's title. A table
+section is cut by rows, a code section by lines (`Chunker::table`, `Chunker::lines`).
 
-A PDF is one continuous text: pages are joined by a blank line and windowed as a whole, so a
-paragraph split by a page break stays in one chunk. Each chunk records the page of its first
+A PDF is one continuous text: its body pages are joined by a blank line and windowed as a
+whole, so a paragraph split by a page break stays in one chunk, and its table sections are
+chunked apart in place. Each chunk records the page of its first
 token. Its heading is the document's Info title (else the filename stem), since a PDF has no
 heading to give the embedding context.
 
@@ -1980,7 +2005,7 @@ POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 2
                                                   a table another document owns: 409)
 GET    /api/v1/workspaces/{id}/documents/{doc}    status, metadata
 GET    /api/v1/workspaces/{id}/documents/{doc}/chunks?from=0&limit=20   the chunks from position `from` in order (text, heading, page, position; limit at most 200), with the document's total; audited as opening the document
-PATCH  /api/v1/workspaces/{id}/documents/{doc}    {pinned}
+PATCH  /api/v1/workspaces/{id}/documents/{doc}    {pinned?, title?, author?, authored_at?, tags?}: each given field is set (an empty text clears it)
 DELETE /api/v1/workspaces/{id}/documents/{doc}
 GET    /api/v1/workspaces/{id}/tables
 POST   /api/v1/workspaces/{id}/tables/describe  {name}: columns, row count, sample rows
@@ -2193,8 +2218,8 @@ quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query]
       [--allow-write] [-c | -r SESSION] [--stdin] [--verbose]
 quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
 quack workspace create NAME | list [--format json]
-quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed] [--replace [ID]] [--prune]
-quack docs [--format json] [--all] [--pin ID | --unpin ID | --delete ID]
+quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--author A] [--authored DATE] [--tag T].. [--pin] [--no-embed] [--replace [ID]] [--prune]
+quack docs [--format json] [--all] [--pin ID | --unpin ID | --delete ID | --tag ID TAG | --untag ID TAG | --author ID NAME | --authored ID DATE]
 quack embeddings refresh [-w NAME] [-y]
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
             | path FROM TO [--max-hops N] | status | extract [--source all|tables|documents]
@@ -2532,6 +2557,7 @@ embedding_concurrency = 2     # requests in flight; Ollama needs OLLAMA_NUM_PARA
 tokenizer_encoding = "cl100k_base"
 upload_max_mb = 512
 max_decompressed_mb = 1024      # what a DOCX, PPTX, or zipped workbook may inflate to while parsed
+table_rows_as_table = 20        # a table inside a document with this many rows also loads as a workspace table
 
 [context]
 max_tokens = 4000

@@ -80,6 +80,7 @@ use quack_core::graph::{
     store as graph_store,
 };
 use quack_core::import::ImportRequest;
+use quack_core::ingestion::parser::SectionKind;
 use quack_core::jobs::JobNumber;
 use quack_core::llm::Embeddings;
 use quack_core::ontology::ROOT_CLASS;

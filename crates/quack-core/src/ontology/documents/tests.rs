@@ -1,6 +1,7 @@
 use super::*;
 use crate::embedding::Dimension;
 use crate::extraction::{Extract, ExtractFuture};
+use crate::ingestion::parser::SectionKind;
 use crate::progress::ChunkDone;
 use crate::progress::RunControl;
 use crate::storage::workspace::{NewChunk, NewDocument};
@@ -60,6 +61,8 @@ fn workspace_with_docs() -> WorkspaceDb {
                     content: &content,
                     heading: None,
                     page: None,
+                    kind: SectionKind::Body,
+                    locator: None,
                     embedding: None
                 })
                 .is_ok()
@@ -81,6 +84,8 @@ fn workspace_with_docs() -> WorkspaceDb {
             content: "not ready but long enough to pass the length filter here",
             heading: None,
             page: None,
+            kind: SectionKind::Body,
+            locator: None,
             embedding: None
         })
         .is_ok()

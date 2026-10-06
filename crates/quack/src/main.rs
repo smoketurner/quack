@@ -44,7 +44,9 @@ use quack_core::progress::RunControl;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, ResourceKind, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
-use quack_core::storage::workspace::{DocumentSource, Pinning, QueryResults, WorkspaceDb};
+use quack_core::storage::workspace::{
+    DocumentFields, DocumentSource, Pinning, QueryResults, WorkspaceDb,
+};
 use quack_core::storage::writer::Writer;
 use quack_core::{config, doctor};
 use std::io::{IsTerminal, Read, Write};
@@ -293,6 +295,19 @@ struct IngestArgs {
     #[arg(long)]
     pin: bool,
 
+    /// The author to record, over what the file says
+    #[arg(long)]
+    author: Option<String>,
+
+    /// The authored date to record (YYYY-MM-DD or ISO 8601), over what
+    /// the file says
+    #[arg(long, value_name = "DATE")]
+    authored: Option<String>,
+
+    /// A tag to record (repeatable), over the file's own
+    #[arg(long = "tag", value_name = "TAG")]
+    tags: Vec<String>,
+
     /// Replace a ready document: the one with the same file name, or the
     /// given id (prefixes accepted). It is superseded once this file is
     /// ready and untouched if ingestion fails; a table file takes over its
@@ -436,6 +451,24 @@ struct DocsArgs {
     /// the table it was loaded as
     #[arg(long, value_name = "DOCUMENT_ID")]
     delete: Option<String>,
+
+    /// Add a tag to a document: the id (prefixes accepted) and the tag
+    #[arg(long, num_args = 2, value_names = ["DOCUMENT_ID", "TAG"])]
+    tag: Vec<String>,
+
+    /// Remove a tag from a document: the id (prefixes accepted) and the tag
+    #[arg(long, num_args = 2, value_names = ["DOCUMENT_ID", "TAG"])]
+    untag: Vec<String>,
+
+    /// Set a document's author: the id (prefixes accepted) and the name
+    /// (empty to clear)
+    #[arg(long, num_args = 2, value_names = ["DOCUMENT_ID", "AUTHOR"])]
+    author: Vec<String>,
+
+    /// Set a document's authored date: the id (prefixes accepted) and the
+    /// date, as YYYY-MM-DD or an ISO 8601 timestamp (empty to clear)
+    #[arg(long, num_args = 2, value_names = ["DOCUMENT_ID", "DATE"])]
+    authored: Vec<String>,
 
     /// `json` prints one JSON object per document
     #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
@@ -1576,6 +1609,52 @@ fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
         let id = find_document(db, prefix)?;
         db.delete_document(&id)?;
     }
+    if let [prefix, tag] = args.tag.as_slice() {
+        let id = find_document(db, prefix)?;
+        let mut tags = db.document(&id)?.map(|d| d.tags).unwrap_or_default();
+        if !tags.iter().any(|t| t == tag) {
+            tags.push(tag.clone());
+        }
+        db.set_document_fields(
+            &id,
+            &DocumentFields {
+                tags: Some(tags),
+                ..DocumentFields::default()
+            },
+        )?;
+    }
+    if let [prefix, tag] = args.untag.as_slice() {
+        let id = find_document(db, prefix)?;
+        let mut tags = db.document(&id)?.map(|d| d.tags).unwrap_or_default();
+        tags.retain(|t| t != tag);
+        db.set_document_fields(
+            &id,
+            &DocumentFields {
+                tags: Some(tags),
+                ..DocumentFields::default()
+            },
+        )?;
+    }
+    if let [prefix, author] = args.author.as_slice() {
+        let id = find_document(db, prefix)?;
+        db.set_document_fields(
+            &id,
+            &DocumentFields {
+                author: Some(author.clone()),
+                ..DocumentFields::default()
+            },
+        )?;
+    }
+    if let [prefix, date] = args.authored.as_slice() {
+        let id = find_document(db, prefix)?;
+        db.set_document_fields(
+            &id,
+            &DocumentFields {
+                authored_at: Some(date.clone()),
+                ..DocumentFields::default()
+            },
+        )?;
+    }
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     let shown = if args.all { Shown::All } else { Shown::Live };
@@ -1621,9 +1700,22 @@ fn list_documents(
             .superseded_by
             .as_ref()
             .map_or(String::new(), |by| format!("  -> {by}"));
+        let about = match (&doc.author, &doc.authored_at, doc.tags.is_empty()) {
+            (None, None, true) => String::new(),
+            (author, authored, _) => format!(
+                "  [{}]",
+                author
+                    .iter()
+                    .map(String::as_str)
+                    .chain(authored.iter().filter_map(|d| d.get(..10)))
+                    .chain(doc.tags.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
         writeln!(
             out,
-            "{}  {:<10}  {:<6}  {}  {}{title}{pages}{replaced}",
+            "{}  {:<10}  {:<6}  {}  {}{title}{about}{pages}{replaced}",
             doc.id,
             doc.status,
             doc.source,
@@ -1794,6 +1886,9 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         pin,
         replace,
         prune,
+        author,
+        authored,
+        tags,
     } = args;
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
     let config = &opened.config;
@@ -1801,11 +1896,17 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     if let StdioPath::Path(dir) = &file
         && dir.is_dir()
     {
-        if replace.is_some() || pin || title.is_some() || filename.is_some() {
-            anyhow::bail!(
-                "--replace, --pin, --title, and --filename take one file, not a directory"
-            );
-        }
+        let per_file = replace.is_some()
+            || pin
+            || title.is_some()
+            || filename.is_some()
+            || author.is_some()
+            || authored.is_some()
+            || !tags.is_empty();
+        anyhow::ensure!(
+            !per_file,
+            "--replace, --pin, --title, --filename, --author, --authored, and --tag take one file, not a directory"
+        );
         if Bundle::is_dir(dir) {
             return ingest_bundle(&opened, &dir.display().to_string(), no_embed).await;
         }
@@ -1845,7 +1946,13 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         &NewFile::new(&effective_filename, &data)
             .source(source)
             .title(title.as_deref())
-            .replaces(replaces.as_ref()),
+            .replaces(replaces.as_ref())
+            .fields(DocumentFields {
+                title: None,
+                author,
+                authored_at: authored,
+                tags: (!tags.is_empty()).then_some(tags),
+            }),
         embedding_model.as_ref(),
     )
     .await

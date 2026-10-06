@@ -5,6 +5,7 @@ use crate::graph::store::NewNode;
 use crate::graph::{Properties, Standing};
 use crate::ids::{ChunkId, ClassId, DocumentId};
 use crate::ingestion::parser::PageCounts;
+use crate::ingestion::parser::SectionKind;
 use crate::ontology::Ontology;
 use crate::ontology::store::Revision;
 use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument, Pinning};
@@ -350,6 +351,8 @@ fn pinned_documents_are_injected_within_budget() {
             content: text,
             heading: None,
             page: None,
+            kind: SectionKind::Body,
+            locator: None,
             embedding: None,
         })
         .unwrap();
@@ -435,6 +438,8 @@ fn a_pinned_document_cannot_leave_its_block_or_its_line() {
         content: text,
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: None,
     })
     .unwrap();

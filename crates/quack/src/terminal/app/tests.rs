@@ -4,6 +4,7 @@ use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::chart::ChartSpec;
 use quack_core::analysis::events::ToolStep;
 use quack_core::analysis::policy::Hold;
+use quack_core::ingestion::parser::SectionKind;
 
 use super::*;
 use crate::terminal::commands::Suggestion;
@@ -1412,6 +1413,8 @@ async fn embeddings_refresh_is_a_job_and_stale_vectors_are_noted_at_startup() {
                 content: "levee report",
                 heading: None,
                 page: None,
+                kind: SectionKind::Body,
+                locator: None,
                 embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
             })?;
             db.execute_statement("UPDATE _quack_chunks SET embedding_profile = 'older'")

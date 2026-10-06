@@ -76,6 +76,7 @@ jiff                 = { version = "=0.2.37", default-features = false } # date/
 jsonwebtoken         = { version = "=11.1.0", default-features = false } # JWT verification of identity-provider access tokens; aws_lc_rs backend only
 keyring-core         = { version = "=1.0.0", default-features = false }
 linux-keyutils-keyring-store = { version = "=1.0.0", default-features = false }
+mail-parser          = { version = "=0.11.9", default-features = false } # .eml and .mbox ingestion
 mimalloc             = { version = "=0.1.52", default-features = false }
 mime_guess           = { version = "=2.0.5", default-features = false }
 oauth2               = { version = "=5.0.0", default-features = false }
@@ -89,6 +90,7 @@ ratatui-textarea     = { version = "=0.9.2", default-features = false }
 reqwest              = { version = "=0.13.5", default-features = false }
 rig                  = { version = "=0.43.0", default-features = false }
 rmcp                 = { version = "=3.5.0", default-features = false } # MCP server (stdio and streamable HTTP)
+rtf-parser           = { version = "=0.4.3", default-features = false } # .rtf ingestion
 rust-embed           = { version = "=8.12.0", default-features = false }
 rust-stemmers        = { version = "=1.2.0", default-features = false } # Snowball stemmers for the keyword index
 rustls               = { version = "=0.23.45", default-features = false }
@@ -102,6 +104,7 @@ shlex                = { version = "=2.0.1", default-features = false } # termin
 sqlparser            = { version = "=0.63.0", default-features = false } # tokenizes typed SQL for terminal completion
 sqlx                 = { version = "=0.9.0", default-features = false }
 strsim               = { version = "=0.11.1", default-features = false } # closest model ids in quack doctor
+subtp                = { version = "=0.2.0", default-features = false } # .srt and .vtt ingestion
 tar                  = { version = "=0.4.46", default-features = false } # OKF bundles over the API
 tempfile             = { version = "=3.27.0", default-features = false }
 thiserror            = { version = "=2.0.21", default-features = false }

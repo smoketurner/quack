@@ -19,6 +19,7 @@ use quack_core::graph::{
     tables, traverse,
 };
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
+use quack_core::ingestion::parser::SectionKind;
 use quack_core::ontology::candidates::{self, Queue};
 use quack_core::ontology::induction::{Candidate, ItemKind, Proposal};
 use quack_core::ontology::store::Revision;
@@ -182,6 +183,8 @@ fn workspace() -> WorkspaceDb {
         content: "Orgenics ships to Kenya from its plant.",
         heading: Some("Vendors"),
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: None,
     })
     .unwrap();
@@ -192,6 +195,8 @@ fn workspace() -> WorkspaceDb {
         content: "FAIL this one",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: None,
     })
     .unwrap();
@@ -292,6 +297,8 @@ fn extraction_samples_evenly_across_documents() {
             content: "Filler text about nothing in particular.",
             heading: None,
             page: None,
+            kind: SectionKind::Body,
+            locator: None,
             embedding: None,
         })
         .unwrap();
@@ -420,6 +427,8 @@ async fn rejected_merge_is_not_reproposed_when_provenance_flips_orientation() {
         content: "Acme Corp is an acme.",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: None,
     })
     .unwrap();
@@ -486,6 +495,8 @@ async fn pending_pair_is_not_duplicated_when_provenance_flips_orientation() {
         content: "Acme Corp is an acme.",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: None,
     })
     .unwrap();
@@ -534,6 +545,8 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
         content: "Orgenics ships to Nowhere.",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: None,
     })
     .unwrap();
@@ -1105,6 +1118,8 @@ async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
             content: "Filler text about nothing in particular.",
             heading: None,
             page: None,
+            kind: SectionKind::Body,
+            locator: None,
             embedding: None,
         })
         .unwrap();

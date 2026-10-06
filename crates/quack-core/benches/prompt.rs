@@ -20,6 +20,7 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::text_to_sql::{self, PromptOptions};
 use quack_core::embedding::Dimension;
 use quack_core::ids::{ChunkId, DocumentId};
+use quack_core::ingestion::parser::SectionKind;
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::storage::sessions::ChatMode;
@@ -54,6 +55,8 @@ fn workspace() -> WorkspaceDb {
                 content: "flood exclusion premium coverage claim policy audit",
                 heading: None,
                 page: Some(c as u32),
+                kind: SectionKind::Body,
+                locator: None,
                 embedding: None,
             })
             .unwrap();
