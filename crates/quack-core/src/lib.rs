@@ -22,6 +22,7 @@ pub mod prefix;
 pub mod priority;
 pub mod progress;
 pub mod proxy;
+pub mod saved;
 pub mod storage;
 pub mod text;
 pub mod vault;

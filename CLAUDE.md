@@ -96,6 +96,7 @@ cargo run --bin quack -- ingest sales.csv -w ws                                #
 cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
+cargo run --bin quack -- saved list | add NAME --from-session ID | run NAME [--refresh] [--exit-code] | show NAME | remove NAME   # an answer's SQL re-run without the model; exit 5 when changed; cron schedules it
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
 cargo run --bin quack -- ontology rename class|relation OLD NEW                   # a new id as a new version; the graph's nodes and edges move with it
 cargo run --bin quack -- ontology propose [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
@@ -112,6 +113,13 @@ cargo run --bin quack -- serve [--bind ADDR] [--local]                          
 cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors
 ```
 
+A saved question (`quack_core::saved`, design doc 8.1) is an answered turn's `run_sql`
+read statements pinned under a name in `_quack_saved_questions`; `quack saved run` runs them
+again without the model, each classified again and under the agent's row cap and timeout,
+records in `_quack_saved_runs` the SHA-256 of every result set and the row counts, and says
+`changed` when any digest differs from the newest completed run of the same pin
+(`--refresh` asks the model again, writes denied, and pins the new answer's statements). There
+is no scheduler: cron runs it, and `--exit-code` exits 5 on a change.
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
 file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model through
 rig's conversation memory (`llm::memory::History`: `SessionMemory` under `TranscriptWindow`,

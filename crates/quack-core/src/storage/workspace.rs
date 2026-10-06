@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use aws_lc_rs::digest;
+
 use crate::config::Config;
+use crate::crypto;
 use crate::embedding::{
     Dimension, EmbeddingStatus, Fingerprint, Input, Profile, Prompts, StaleVectors, Vector,
 };
@@ -15,6 +18,7 @@ use crate::ids::{ChunkId, DocumentId, NodeId};
 use crate::ingestion::TableName;
 use crate::ingestion::parser::{FileType, Load, PageCounts};
 use crate::ontology::store::Acceptance;
+use crate::saved;
 use crate::text::OneLine;
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
@@ -453,6 +457,15 @@ impl CappedResults {
         table.write_table(&mut buf)?;
         String::from_utf8(buf).map_err(|e| Error::Analysis(format!("UTF-8 error: {e}")))
     }
+}
+
+/// Query results with the SHA-256 of the whole result set: the column
+/// names, then every row in result order, each as one JSON array per line.
+/// Rows past the cap are digested and counted but not kept.
+#[derive(Debug, Clone)]
+pub struct DigestedResults {
+    pub results: CappedResults,
+    pub digest: String,
 }
 
 /// The ontology tables (design doc 5.4), created with the other internal
@@ -1061,6 +1074,7 @@ impl WorkspaceDb {
         self.conn.execute_batch(DOCUMENTS_DDL)?;
         self.conn.execute_batch(&sql)?;
         self.conn.execute_batch(SESSION_SUMMARIES_DDL)?;
+        self.conn.execute_batch(saved::DDL)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&graph::ddl(dim))?;
         self.upgrade_data(dim)?;
@@ -2338,11 +2352,37 @@ impl WorkspaceDb {
         self.read_rows(sql, Some(max_rows as usize))
     }
 
-    fn read_rows(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
-        self.under_timeout(|db| db.read_rows_untimed(sql, keep))
+    /// [`Self::execute_query_capped`], with the SHA-256 of the whole
+    /// result set: every row is read and digested, and only the first
+    /// `max_rows` are kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL is invalid or execution fails.
+    pub fn execute_query_digested(&self, sql: &str, max_rows: u32) -> Result<DigestedResults> {
+        self.under_timeout(|db| {
+            let mut context = digest::Context::new(&digest::SHA256);
+            let results = db.read_rows_untimed(sql, Some(max_rows as usize), Some(&mut context))?;
+            Ok(DigestedResults {
+                results,
+                digest: crypto::hex_lower(context.finish().as_ref()),
+            })
+        })
     }
 
-    fn read_rows_untimed(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
+    fn read_rows(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
+        self.under_timeout(|db| db.read_rows_untimed(sql, keep, None))
+    }
+
+    /// Read `sql`'s rows, keeping `keep` of them, and feed every row,
+    /// kept or not, to `digest` when one is given: a digest covers the
+    /// whole result, so rows past the cap are converted only then.
+    fn read_rows_untimed(
+        &self,
+        sql: &str,
+        keep: Option<usize>,
+        mut digest: Option<&mut digest::Context>,
+    ) -> Result<CappedResults> {
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
 
@@ -2363,19 +2403,30 @@ impl WorkspaceDb {
             }
             (stmt_ref.column_names(), count)
         };
+        if let Some(digest) = digest.as_deref_mut() {
+            digest.update(&serde_json::to_vec(&columns)?);
+            digest.update(b"\n");
+        }
 
         let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
         let mut total_rows: usize = 0;
         while let Some(row) = rows.next()? {
             total_rows = total_rows.saturating_add(1);
-            if keep.is_some_and(|keep| result_rows.len() >= keep) {
+            let kept = keep.is_none_or(|keep| result_rows.len() < keep);
+            if !kept && digest.is_none() {
                 continue;
             }
             let mut values = Vec::with_capacity(column_count);
             for i in 0..column_count {
                 values.push(extract_value(row, i));
             }
-            result_rows.push(values);
+            if let Some(digest) = digest.as_deref_mut() {
+                digest.update(&serde_json::to_vec(&values)?);
+                digest.update(b"\n");
+            }
+            if kept {
+                result_rows.push(values);
+            }
         }
 
         Ok(CappedResults {
@@ -4697,6 +4748,43 @@ mod tests {
                 ],
             ],
         }
+    }
+
+    /// The digest covers every row, kept or not, and the column names,
+    /// so a change past the cap, a renamed column, or a reordered result
+    /// changes it, and the same result gives the same digest.
+    #[test]
+    fn digested_query_covers_the_rows_past_the_cap() {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        let digested = |sql: &str, cap: u32| {
+            db.execute_query_digested(sql, cap)
+                .unwrap_or_else(|e| fail(&e.to_string()))
+        };
+        let ten = digested("SELECT range AS n FROM range(10)", 3);
+        assert_eq!(ten.results.results.rows.len(), 3);
+        assert_eq!(ten.results.total_rows, 10);
+        assert_eq!(ten.digest.len(), 64);
+        assert_eq!(
+            digested("SELECT range AS n FROM range(10)", 100).digest,
+            ten.digest
+        );
+        assert_ne!(
+            digested("SELECT range AS n FROM range(11)", 3).digest,
+            ten.digest
+        );
+        assert_ne!(
+            digested("SELECT range AS m FROM range(10)", 3).digest,
+            ten.digest
+        );
+        assert_ne!(
+            digested("SELECT range AS n FROM range(10) ORDER BY n DESC", 3).digest,
+            ten.digest
+        );
+        assert_eq!(
+            digested("SELECT 1 AS n WHERE false", 3).digest,
+            digested("SELECT 2 AS n WHERE false", 3).digest
+        );
     }
 
     #[test]

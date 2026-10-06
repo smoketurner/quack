@@ -308,7 +308,12 @@ impl Spinner {
     }
 }
 
-fn write_started(err: &mut impl Write, tool: ToolName, detail: &str, verbose: bool) -> Result<()> {
+pub(crate) fn write_started(
+    err: &mut impl Write,
+    tool: ToolName,
+    detail: &str,
+    verbose: bool,
+) -> Result<()> {
     writeln!(err, "> {tool}")?;
     if detail.is_empty() {
         return Ok(());
@@ -333,7 +338,7 @@ fn write_started(err: &mut impl Write, tool: ToolName, detail: &str, verbose: bo
     Ok(())
 }
 
-fn write_finished(err: &mut impl Write, step: &ToolStep) -> Result<()> {
+pub(crate) fn write_finished(err: &mut impl Write, step: &ToolStep) -> Result<()> {
     writeln!(err, "  {}, {} ms", step.summary, step.duration_ms)?;
     Ok(())
 }

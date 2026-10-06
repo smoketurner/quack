@@ -135,12 +135,14 @@ impl From<CoreError> for ApiError {
             | CoreError::Ontology(_) => StatusCode::BAD_REQUEST,
             CoreError::Analysis(_)
             | CoreError::UnknownValue { .. }
+            | CoreError::Unsavable(_)
             | CoreError::QueryTimeout { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             // A request is never cancelled through its own handler today (only
             // background jobs are); should one be, it lost to a later action.
-            CoreError::TableTaken { .. } | CoreError::WorkspaceExists(_) | CoreError::Cancelled => {
-                StatusCode::CONFLICT
-            }
+            CoreError::TableTaken { .. }
+            | CoreError::WorkspaceExists(_)
+            | CoreError::SavedQuestionExists(_)
+            | CoreError::Cancelled => StatusCode::CONFLICT,
             CoreError::Sqlite(_)
             | CoreError::DuckDb(_)
             | CoreError::Embedding(_)

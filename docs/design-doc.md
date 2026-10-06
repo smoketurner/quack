@@ -531,6 +531,28 @@ CREATE TABLE _quack_messages (
     created_at TIMESTAMP DEFAULT now(),
     UNIQUE (session_id, seq)
 );
+-- saved questions (section 8.1): an answer's read statements, re-run without the model
+CREATE TABLE _quack_saved_questions (
+    id         TEXT PRIMARY KEY,             -- UUID v7
+    name       TEXT NOT NULL UNIQUE,
+    question   TEXT NOT NULL,
+    mode       TEXT NOT NULL,                -- chat | query, the source session's
+    statements JSON NOT NULL,                -- the pinned read statements, in order
+    session_id TEXT NOT NULL,                -- the session they were pinned from
+    pin        INTEGER NOT NULL DEFAULT 1,   -- counts each pinning; runs compare within a pin
+    created_by TEXT,
+    created_at TIMESTAMP DEFAULT now(),
+    pinned_at  TIMESTAMP DEFAULT now()
+);
+CREATE TABLE _quack_saved_runs (
+    id         TEXT PRIMARY KEY,             -- UUID v7
+    saved_id   TEXT NOT NULL,
+    pin        INTEGER NOT NULL,
+    ran_at     TIMESTAMP DEFAULT now(),
+    status     TEXT NOT NULL,                -- ok | failed
+    changed    BOOLEAN NOT NULL,
+    statements JSON NOT NULL                 -- per statement: sql, digest, rows, previous_rows, changed, columns, result (when within the cap), error
+);
 -- [analysis].compact_history: summaries of the turns the history window leaves out
 CREATE TABLE _quack_session_summaries (
     id TEXT PRIMARY KEY,                        -- UUID v7
@@ -1465,6 +1487,39 @@ message.
   any with no creator (started from the CLI or the TUI). `owner` sees all sessions in the
   workspace for audit.
 
+### 8.1 Saved questions
+
+A question a team asks repeatedly is saved once and re-run without the model, and each run
+says whether the data changed. `quack_core::saved` keeps it in the workspace file:
+`_quack_saved_questions` (the name, the question, the session's mode, the pinned statements,
+the session they came from, and a `pin` counter) and `_quack_saved_runs` (one row per run).
+
+- **Saving pins SQL.** A saved question is made from an answered turn: the person names the
+  answer they just got (`quack saved add NAME --from-session ID [--message N]`, the
+  terminal's `/saved add NAME` for its last answer, `POST .../saved`). quack keeps the
+  question text and the `run_sql` statements that returned rows, in order, each classified
+  again as a read. An answer that ran no such statement, or one that ran a write, cannot be
+  saved; the refusal says which (`Unsavable`). Only someone who can read the source session
+  may save from it.
+- **A run executes the saved SQL and no model.** Each statement is classified again
+  (`classify_user_statement`: no `_quack_` tables, a read) and runs inside a read-only
+  transaction with the agent's row cap (`[analysis].max_query_rows`) and query timeout. The
+  run records, per statement, the SHA-256 of the whole result set (the column names, then
+  every row in result order, each as a JSON array; rows past the cap are digested but not
+  kept), the row count, the row count of the run compared with, and the rows when they fit
+  the cap. `changed` is true when any digest differs from the newest completed run of the
+  same pin; the first run of a pin is not changed. A statement that fails (its table was
+  dropped) is recorded with its error, the run's status is `failed`, and it compares
+  nothing; the next completed run compares with the last completed one.
+- **`--refresh` asks the model again** through the normal turn path: a new session of the
+  saved question's mode, writes denied, the steps on stderr. The statements that answer ran
+  replace the pinned ones, `pin` counts up, and the next run compares with that pin's first
+  result. Without `--refresh`, no model is ever called.
+- **cron is the scheduler.** Nothing in quack runs a saved question on a timer or delivers
+  a result: `quack saved run NAME --exit-code` exits 5 when the result changed, 1 when it
+  failed, 0 otherwise, and `-f json` carries `changed`, the run id, and every statement's
+  digest and counts for a script to read.
+
 ---
 
 ## 9. Charts
@@ -2083,6 +2138,11 @@ quack context show | edit | history | export FILE | import FILE
 # `graph revalidate` asks before it drops anything; with no terminal it fails
 # with what it would drop, and -y / --yes goes ahead.
 quack sessions [--format json] [--limit N] | export SESSION [--sql|--markdown]
+quack saved list [--format text|json] | add NAME --from-session ID [--message N]
+            | run NAME [--refresh] [--exit-code] [-f table|json|csv] | show NAME [--format json]
+            | remove NAME
+# A saved question re-runs an answer's SQL without the model (section 8.1); cron is the
+# scheduler, and --exit-code exits 5 when the result changed.
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-
 quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
@@ -2124,7 +2184,8 @@ name is a `WorkspaceName`: trimmed, non-empty, and without `/`, `\`, or `.`. The
 through that type. Workspaces created before the rule keep their names and still open.
 
 **Exit codes:** 0 ok, 1 runtime error, 2 usage (an unknown `-w` included), 3 write refused,
-4 auth required. A reader that closes stdout early (`| head`) ends the command quietly with 0.
+4 auth required, 5 the result of `quack saved run --exit-code` changed. A reader that closes
+stdout early (`| head`) ends the command quietly with 0.
 
 **`quack config`** and `quack doctor` are the only commands that skip `Config::load`.
 `config` reads the file itself, so it describes even a configuration every other command

@@ -12,6 +12,7 @@ mod mcp;
 mod ontology_cli;
 mod print;
 mod progress_line;
+mod saved_cli;
 #[cfg(test)]
 mod scripted_ollama;
 mod server;
@@ -27,7 +28,7 @@ use quack_core::config::inspect::SettingFilter;
 use quack_core::config::{Config, Grant};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
-use quack_core::error::{Error as CoreError, Record};
+use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
 use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::PageCounts;
@@ -69,6 +70,9 @@ enum Exit {
     WriteRefused,
     /// An OAuth provider needs `quack auth login` first.
     AuthRequired,
+    /// `quack saved run --exit-code`: the result changed since the run
+    /// before.
+    Changed,
 }
 
 impl Exit {
@@ -96,6 +100,7 @@ impl From<Exit> for ExitCode {
             Exit::Usage => 2,
             Exit::WriteRefused => 3,
             Exit::AuthRequired => 4,
+            Exit::Changed => 5,
         })
     }
 }
@@ -239,6 +244,11 @@ enum Commands {
     /// embedding model, width, or input prefixes
     #[command(subcommand)]
     Embeddings(embeddings_cli::EmbeddingsAction),
+
+    /// Saved questions: an answer's SQL kept under a name and re-run
+    /// without the model, each run saying whether the data changed
+    #[command(subcommand)]
+    Saved(saved_cli::SavedAction),
 }
 
 #[derive(clap::Args)]
@@ -670,6 +680,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         Commands::Ontology(action) => run_on_writer(cli, action).await,
         Commands::Graph(action) => run_on_writer(cli, action).await,
         Commands::Embeddings(action) => run_on_writer(cli, action).await,
+        Commands::Saved(action) => run_saved(cli, action).await,
         Commands::Okf(OkfAction::Export { dir }) => run_okf_export(cli, &dir).await,
         Commands::Import(args) => run_import(cli, args).await,
         Commands::Context(args) => {
@@ -979,6 +990,42 @@ async fn run_on_writer(cli: &Cli, command: impl WriterCommand) -> Result<ExitCod
         )
         .await?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `quack saved ...`: the saved questions. A run that failed is the
+/// command's error, after the run was printed; one that changed exits 5
+/// with `--exit-code`.
+async fn run_saved(cli: &Cli, action: saved_cli::SavedAction) -> Result<ExitCode> {
+    init_logging();
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+    let (db, reader_db) = opened.shared(opened.open_db()?).await?;
+    let wants_exit_code = matches!(
+        action,
+        saved_cli::SavedAction::Run {
+            exit_code: true,
+            ..
+        }
+    );
+    let model = saved_cli::Model {
+        db: Arc::clone(&db),
+        reader_db,
+        verbose: cli.verbose,
+    };
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let ran = saved_cli::run(&opened.config, &db, action, None, Some(model), &mut out).await?;
+    out.flush()?;
+    let Some(run) = ran else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    if let Some(failure) = saved_cli::failure(&run) {
+        return Err(failure);
+    }
+    Ok(if wants_exit_code && run.changed {
+        ExitCode::from(Exit::Changed)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// `quack import URL --table NAME`: rows from an external source as a
@@ -1490,16 +1537,14 @@ fn list_documents(db: &WorkspaceDb, format: TextOrJson, out: &mut impl Write) ->
 }
 
 /// Resolve a full id or a unique prefix to a session.
-fn find_session(db: &WorkspaceDb, prefix: &str) -> Result<sessions::SessionRow> {
+pub(crate) fn find_session(db: &WorkspaceDb, prefix: &str) -> CoreResult<sessions::SessionRow> {
     if let Some(exact) = sessions::get_session(db, &SessionId::from(prefix))? {
         return Ok(exact);
     }
-    Ok(
-        PrefixMatch::of(sessions::list_sessions(db, 1000)?, prefix, |s| {
-            s.id.as_str()
-        })
-        .one(Record::Session, prefix)?,
-    )
+    PrefixMatch::of(sessions::list_sessions(db, 1000)?, prefix, |s| {
+        s.id.as_str()
+    })
+    .one(Record::Session, prefix)
 }
 
 fn list_sessions(db: &WorkspaceDb, format: TextOrJson, limit: u32) -> Result<()> {
@@ -1966,6 +2011,16 @@ mod tests {
         );
         assert_eq!(Exit::of(&anyhow::anyhow!(auth().to_string())), None);
         assert_eq!(Exit::of(&anyhow::anyhow!("something else")), None);
+    }
+
+    /// The exit statuses scripts check, each its own number; a changed
+    /// saved question is the one that is not an error.
+    #[test]
+    fn exit_statuses_are_distinct_and_a_change_is_five() {
+        assert_eq!(ExitCode::from(Exit::Usage), ExitCode::from(2));
+        assert_eq!(ExitCode::from(Exit::WriteRefused), ExitCode::from(3));
+        assert_eq!(ExitCode::from(Exit::AuthRequired), ExitCode::from(4));
+        assert_eq!(ExitCode::from(Exit::Changed), ExitCode::from(5));
     }
 
     fn config_in(dir: &std::path::Path) -> Config {
