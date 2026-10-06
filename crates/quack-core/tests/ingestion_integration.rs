@@ -15,6 +15,7 @@ use quack_core::graph::{Properties, Standing, store as graph_store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId};
 use quack_core::import::{HostReach, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::{FileType, PageCounts};
+use quack_core::ingestion::tree::{Folder, FolderReport, Outcome, Prune};
 use quack_core::llm::CancellationToken;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::{ControlPlane, WorkspaceName};
@@ -3305,6 +3306,157 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
     )
     .await;
     assert!(matches!(outcome, Err(Error::Cancelled)));
+}
+
+/// Write `text` at `path` under `root`, making the directories.
+fn write_under(root: &Path, path: &str, text: &str) {
+    let path = root.join(path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// A folder run over `root` into `ws-folder` without an embedding model.
+async fn folder_run(config: &Config, writer: &Writer, root: &Path, prune: Prune) -> FolderReport {
+    Folder {
+        config,
+        db: writer,
+        workspace_id: "ws-folder",
+        root,
+        embedder: None::<&Embedder<MockEmbeddingModel>>,
+        control: RunControl::unobserved(),
+        prune,
+    }
+    .run()
+    .await
+    .unwrap()
+}
+
+/// Each result as its path and the kind of its outcome.
+fn outcome_kinds(report: &FolderReport) -> Vec<(String, &'static str)> {
+    report
+        .results
+        .iter()
+        .map(|r| {
+            let kind = match r.outcome {
+                Outcome::Ingested(_) => "ingested",
+                Outcome::Replaced { .. } => "replaced",
+                Outcome::Skipped(_) => "skipped",
+                Outcome::Failed(_) => "failed",
+            };
+            (r.relative.clone(), kind)
+        })
+        .collect()
+}
+
+/// A folder run ingests every supported file with its path, lists the
+/// rest, counts a file that fails as one outcome among the others, and
+/// skips every unchanged file on the next run.
+#[tokio::test]
+async fn a_folder_run_ingests_supported_files_and_skips_them_next_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-folder").unwrap();
+    let writer = writer_of(&db);
+    let root = dir.path().join("contracts");
+    write_under(&root, "policy.md", "Flood is excluded.");
+    write_under(&root, "rates/sales.csv", "region,total\nnorth,1\n");
+    write_under(&root, "notes.xyz", "?");
+    write_under(&root, "broken.csv", "a,b\n1,2,3,4\n\"unterminated,5\n6\n");
+
+    let first = folder_run(&config, &writer, &root, Prune::Keep).await;
+    assert_eq!(
+        outcome_kinds(&first),
+        [
+            (String::from("broken.csv"), "failed"),
+            (String::from("policy.md"), "ingested"),
+            (String::from("rates/sales.csv"), "ingested"),
+        ]
+    );
+    assert_eq!(first.unsupported, ["notes.xyz"]);
+    assert!(first.gone.is_empty());
+    assert_eq!(first.failed(), 1);
+    let policy = db.newest_document_at_path("policy.md").unwrap().unwrap();
+    assert_eq!(policy.source_path.as_deref(), Some("policy.md"));
+    assert_eq!(policy.filename, "policy.md");
+    assert_eq!(
+        db.newest_document_at_path("rates/sales.csv")
+            .unwrap()
+            .unwrap()
+            .tables,
+        Some(vec![String::from("sales")])
+    );
+    assert!(db.newest_document_at_path("broken.csv").unwrap().is_none());
+
+    let again = folder_run(&config, &writer, &root, Prune::Keep).await;
+    assert_eq!(
+        outcome_kinds(&again),
+        [
+            (String::from("broken.csv"), "failed"),
+            (String::from("policy.md"), "skipped"),
+            (String::from("rates/sales.csv"), "skipped"),
+        ]
+    );
+}
+
+/// On a later run a changed file replaces the document at its path, and
+/// a document whose file is gone is reported and kept, or deleted with
+/// its table when pruning.
+#[tokio::test]
+async fn a_folder_rerun_replaces_changed_files_and_reports_or_prunes_gone_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-folder").unwrap();
+    let writer = writer_of(&db);
+    let root = dir.path().join("contracts");
+    write_under(&root, "policy.md", "Flood is excluded.");
+    write_under(&root, "rates/sales.csv", "region,total\nnorth,1\n");
+    folder_run(&config, &writer, &root, Prune::Keep).await;
+    let policy = db.newest_document_at_path("policy.md").unwrap().unwrap();
+
+    write_under(&root, "policy.md", "Flood is covered.");
+    std::fs::remove_file(root.join("rates/sales.csv")).unwrap();
+    let changed = folder_run(&config, &writer, &root, Prune::Keep).await;
+    let replaced = changed
+        .results
+        .iter()
+        .find(|r| r.relative == "policy.md")
+        .unwrap();
+    assert!(
+        matches!(&replaced.outcome, Outcome::Replaced { old, .. } if *old == policy.id),
+        "{replaced:?}"
+    );
+    assert_eq!(
+        db.document(&policy.id).unwrap().unwrap().status,
+        DocumentStatus::Superseded
+    );
+    let successor = db.newest_document_at_path("policy.md").unwrap().unwrap();
+    assert_ne!(successor.id, policy.id);
+    assert_eq!(
+        changed
+            .gone
+            .iter()
+            .map(|d| d.source_path.clone())
+            .collect::<Vec<_>>(),
+        [Some(String::from("rates/sales.csv"))]
+    );
+    assert_eq!(changed.pruned, Prune::Keep);
+    assert!(db.list_tables().unwrap().contains(&String::from("sales")));
+
+    let pruned = folder_run(&config, &writer, &root, Prune::Delete).await;
+    assert_eq!(pruned.gone.len(), 1);
+    assert_eq!(pruned.pruned, Prune::Delete);
+    assert!(
+        db.newest_document_at_path("rates/sales.csv")
+            .unwrap()
+            .is_none()
+    );
+    assert!(!db.list_tables().unwrap().contains(&String::from("sales")));
+    assert!(
+        folder_run(&config, &writer, &root, Prune::Keep)
+            .await
+            .gone
+            .is_empty()
+    );
 }
 
 /// `ingest_file` into `ws-replace` without an embedding model, for the

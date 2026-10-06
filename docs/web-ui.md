@@ -53,7 +53,8 @@ signed-in user and reads no workspace, so it writes no audit row.
   ready row's Replace control (`POST /w/{id}/documents/{doc}/replace`, one file) queues the
   file through the same `documents::enqueue` as the upload form with the row as its
   predecessor; the row reads "being replaced by …" until the new document is ready. The
-  htmx actions on a row (pin, unpin, delete) swap in the live listing.
+  htmx actions on a row (pin, unpin, delete) swap in the live listing. The upload form takes
+  files, not a folder; `quack ingest DIR` is the folder path (design doc section 6.1).
 - **`passage.html`** (`/w/{id}/documents/{doc}/chunks/{n}`) is where a citation link lands:
   one chunk of a document with its position and total, page and heading, when the document
   was ingested, the chunk's full text, and links to the chunks before and after. It reads

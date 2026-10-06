@@ -32,6 +32,7 @@ use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
 use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::PageCounts;
+use quack_core::ingestion::tree::{FileResult, Folder, Outcome, Prune};
 use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile};
 use quack_core::llm::Embeddings;
 use quack_core::llm::egress::Egress;
@@ -47,7 +48,7 @@ use quack_core::storage::workspace::{DocumentSource, Pinning, QueryResults, Work
 use quack_core::storage::writer::Writer;
 use quack_core::{config, doctor};
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -298,6 +299,11 @@ struct IngestArgs {
     /// table. Identical bytes are still skipped.
     #[arg(long, value_name = "DOCUMENT_ID", num_args = 0..=1, default_missing_value = "")]
     replace: Option<Replace>,
+
+    /// With a folder: delete the documents whose file is no longer in it
+    /// (without this they are only reported)
+    #[arg(long)]
+    prune: bool,
 }
 
 /// What `quack ingest --replace [DOCUMENT_ID]` replaces.
@@ -1779,6 +1785,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         no_embed,
         pin,
         replace,
+        prune,
     } = args;
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
     let config = &opened.config;
@@ -1786,10 +1793,19 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     if let StdioPath::Path(dir) = &file
         && dir.is_dir()
     {
-        if replace.is_some() {
-            anyhow::bail!("--replace takes one file, not a directory");
+        if replace.is_some() || pin || title.is_some() || filename.is_some() {
+            anyhow::bail!(
+                "--replace, --pin, --title, and --filename take one file, not a directory"
+            );
         }
-        return ingest_bundle(&opened, &dir.display().to_string(), no_embed).await;
+        if Bundle::is_dir(dir) {
+            return ingest_bundle(&opened, &dir.display().to_string(), no_embed).await;
+        }
+        let prune = if prune { Prune::Delete } else { Prune::Keep };
+        return ingest_folder(&opened, dir, no_embed, prune).await;
+    }
+    if prune {
+        anyhow::bail!("--prune goes with a folder");
     }
     let NamedInput {
         name: effective_filename,
@@ -1894,7 +1910,94 @@ fn report_ingested(out: &mut impl Write, result: &IngestResult, pin: bool) -> Re
     Ok(())
 }
 
-/// `quack ingest DIR`: an OKF bundle. Every concept file becomes a
+/// `quack ingest DIR` on a folder of files: every file quack can load
+/// becomes a document, one line each; a changed file replaces the document
+/// at its path, an unchanged one is skipped, unsupported files are listed,
+/// and documents whose file is gone are reported, or deleted with
+/// `--prune`. A file that fails is reported and fails the command once
+/// the rest have run.
+async fn ingest_folder(
+    opened: &OpenedWorkspace,
+    dir: &Path,
+    no_embed: bool,
+    prune: Prune,
+) -> Result<()> {
+    let (config, workspace_id) = (&opened.config, opened.workspace.id.as_str());
+    let ws_db = opened.writer()?;
+    let embedding_model = if no_embed {
+        None
+    } else {
+        Embeddings::from_config(config)
+            .await
+            .context("failed to build embedding model")?
+    };
+    let report = Folder {
+        config,
+        db: &ws_db,
+        workspace_id,
+        root: dir,
+        embedder: embedding_model.as_ref(),
+        control: RunControl {
+            progress: &progress_line::to_stderr,
+            cancel: None,
+        },
+        prune,
+    }
+    .run()
+    .await
+    .with_context(|| format!("ingesting {}", dir.display()))?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    for FileResult { relative, outcome } in &report.results {
+        match outcome {
+            Outcome::Ingested(id) => writeln!(out, "ingested  {relative} ({id})")?,
+            Outcome::Replaced { old, new } => {
+                writeln!(out, "replaced  {relative} ({old} -> {new})")?;
+            }
+            Outcome::Skipped(id) => writeln!(out, "skipped   {relative} (identical to {id})")?,
+            Outcome::Failed(error) => writeln!(out, "failed    {relative}: {error}")?,
+        }
+    }
+    if !report.unsupported.is_empty() {
+        writeln!(
+            out,
+            "Not ingested ({} unsupported): {}",
+            report.unsupported.len(),
+            report.unsupported.join(", ")
+        )?;
+    }
+    if !report.gone.is_empty() {
+        let names: Vec<String> = report
+            .gone
+            .iter()
+            .map(|d| {
+                format!(
+                    "{} ({})",
+                    d.source_path.as_deref().unwrap_or(&d.filename),
+                    d.id
+                )
+            })
+            .collect();
+        match report.pruned {
+            Prune::Delete => writeln!(out, "Deleted ({} gone): {}", names.len(), names.join(", "))?,
+            Prune::Keep => writeln!(
+                out,
+                "Gone from {} ({}, still in the workspace; --prune deletes them): {}",
+                dir.display(),
+                names.len(),
+                names.join(", ")
+            )?,
+        }
+    }
+    out.flush()?;
+    let failed = report.failed();
+    if failed > 0 {
+        anyhow::bail!("{failed} of {} files failed", report.results.len());
+    }
+    Ok(())
+}
+
+/// `quack ingest DIR` on an OKF bundle. Every concept file becomes a
 /// Markdown document, its front matter and links feed the ontology review
 /// queue, and `index.md` is offered as the workspace context.
 async fn ingest_bundle(opened: &OpenedWorkspace, dir: &str, no_embed: bool) -> Result<()> {

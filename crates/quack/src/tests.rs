@@ -58,6 +58,8 @@ fn docs_json_carries_every_document_field() {
         "sha256",
         "source",
         "pages",
+        "superseded_by",
+        "source_path",
     ] {
         assert!(row.get(key).is_some(), "{key} missing: {row}");
     }
@@ -166,7 +168,7 @@ fn exit_statuses_are_distinct_and_a_change_is_five() {
     assert_eq!(ExitCode::from(Exit::Changed), ExitCode::from(5));
 }
 
-fn config_in(dir: &std::path::Path) -> Config {
+fn config_in(dir: &Path) -> Config {
     let mut config = Config::default();
     config.general.data_dir = dir.join("data");
     config

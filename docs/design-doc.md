@@ -774,6 +774,24 @@ skipped. It restores the ontology snapshot when the workspace has none, else pro
 bundle's types and links as candidates, and offers `index.md` as the context. `quack graph
 extract` rebuilds the graph once the tables and documents are back.
 
+**Ingesting a folder.** `quack ingest DIR` on a directory that is not a bundle (no
+`index.md` or `log.md` at its top, `okf::Bundle::is_dir`) walks it (`ingestion::tree::Tree`:
+every file in path order, directories and files whose name starts with `.` skipped) and
+ingests each file `FileType::of` recognizes as a document named after it, recording the
+file's root-relative `/`-separated path as `_quack_documents.source_path`
+(`ingestion::tree::Folder`). The command prints one line per file (`ingested`, `replaced`,
+`skipped`, `failed`), then the unsupported files, then the documents whose file is gone.
+Running it again on the same folder: an unchanged file is skipped by the SHA-256 dedup; a
+changed file replaces the ready document at its path through the supersede operation
+above (`WorkspaceDb::newest_document_at_path`), keeping its pin; a ready document with a
+`source_path` no file in the folder has now is reported, and deleted only with `--prune`. A
+file that fails to parse is reported and fails the command after the rest have run. The
+walk reports one progress unit per file through the run's `RunControl`; a cancel stops
+between files or inside one. There is no watcher or daemon: a cron line re-runs the
+command. The workspace records paths relative to the folder, not the folder itself, so one
+workspace is fed from one folder; a second folder's paths would read as that folder's.
+The web form and the API take files, not folders; the terminal's `/ingest` takes files.
+
 **Parsing.**
 
 | Type | Parser | Extracted metadata |
@@ -2166,7 +2184,7 @@ quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query]
       [--allow-write] [-c | -r SESSION] [--stdin] [--verbose]
 quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
 quack workspace create NAME | list [--format json]
-quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed] [--replace [ID]]
+quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed] [--replace [ID]] [--prune]
 quack docs [--format json] [--all] [--pin ID | --unpin ID | --delete ID]
 quack embeddings refresh [-w NAME] [-y]
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C

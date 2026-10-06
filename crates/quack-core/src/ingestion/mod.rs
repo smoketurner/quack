@@ -3,6 +3,7 @@ pub mod chunker;
 pub mod html;
 pub mod office;
 pub mod parser;
+pub mod tree;
 pub mod xlsx;
 
 use std::fmt;
@@ -95,6 +96,9 @@ pub struct NewFile<'a> {
     /// one is ready, and untouched if this one fails. A table file takes
     /// over its table.
     pub replaces: Option<&'a DocumentId>,
+    /// The file's path under the folder it came from (`ingestion::tree`),
+    /// recorded so a later run of the folder finds the document again.
+    pub source_path: Option<&'a str>,
 }
 
 impl<'a> NewFile<'a> {
@@ -109,6 +113,7 @@ impl<'a> NewFile<'a> {
             ingested_by: None,
             control: RunControl::unobserved(),
             replaces: None,
+            source_path: None,
         }
     }
 
@@ -141,6 +146,13 @@ impl<'a> NewFile<'a> {
     #[must_use]
     pub fn replaces(mut self, old: Option<&'a DocumentId>) -> Self {
         self.replaces = old;
+        self
+    }
+
+    /// Record where the file sat in the folder it came from.
+    #[must_use]
+    pub fn source_path(mut self, path: Option<&'a str>) -> Self {
+        self.source_path = path;
         self
     }
 }
@@ -209,6 +221,7 @@ struct Pending {
     sha256: String,
     file_type: FileType,
     replaces: Option<DocumentId>,
+    source_path: Option<String>,
 }
 
 impl Pending {
@@ -230,6 +243,7 @@ impl Pending {
             sha256: sha256_hex(file.data),
             file_type,
             replaces: file.replaces.cloned(),
+            source_path: file.source_path.map(str::to_owned),
         })
     }
 
@@ -268,6 +282,7 @@ impl Pending {
             source: self.source,
             status: DocumentStatus::Queued,
             ingested_by: self.ingested_by.as_deref(),
+            source_path: self.source_path.as_deref(),
         })?;
         Ok(Registration::New(doc_id))
     }

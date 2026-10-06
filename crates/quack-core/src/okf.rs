@@ -167,6 +167,13 @@ impl Bundle {
 
     /// Read every `.md` file under a directory, paths relative to it.
     ///
+    /// Whether `root` is a bundle rather than a folder of files: it has
+    /// an `index.md` or a `log.md` at its top.
+    #[must_use]
+    pub fn is_dir(root: &Path) -> bool {
+        root.join(INDEX).is_file() || root.join(LOG).is_file()
+    }
+
     /// # Errors
     ///
     /// Returns an error if the directory cannot be read or holds no
