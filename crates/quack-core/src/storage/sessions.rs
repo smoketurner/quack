@@ -14,6 +14,7 @@ use crate::analysis::agent::{AgentResponse, TokenUsage};
 use crate::analysis::chart::ChartSpec;
 use crate::analysis::citations::Citation;
 use crate::analysis::events::{ToolName, ToolStep};
+use crate::analysis::search::DocumentScope;
 use crate::error::{Error, Result};
 use crate::graph::GraphResult;
 use crate::ids::{MessageId, SessionId, SummaryId, UserId};
@@ -216,11 +217,32 @@ impl AssistantMeta {
     }
 }
 
+/// What a user message stores beside its text: the documents the person
+/// limited the question to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UserMeta {
+    #[serde(default, skip_serializing_if = "DocumentScope::is_everything")]
+    pub documents: DocumentScope,
+}
+
+impl UserMeta {
+    /// The parts of `response`'s question the transcript keeps, or `None`
+    /// when it has none of them.
+    #[must_use]
+    pub fn of(response: &AgentResponse) -> Option<Self> {
+        let meta = Self {
+            documents: response.documents.clone(),
+        };
+        (meta != Self::default()).then_some(meta)
+    }
+}
+
 /// A message's metadata, by its role. Serialized untagged, so the stored
 /// JSON and every API body are the fields themselves.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(untagged)]
 pub enum MessageMeta {
+    User(UserMeta),
     Tool(ToolMeta),
     Assistant(AssistantMeta),
 }
@@ -231,7 +253,7 @@ impl MessageMeta {
     /// the whole session unreadable.
     fn decode(id: &MessageId, role: MessageRole, text: &str) -> Option<Self> {
         let decoded = match role {
-            MessageRole::User => return None,
+            MessageRole::User => serde_json::from_str(text).map(Self::User),
             MessageRole::Tool => serde_json::from_str(text).map(Self::Tool),
             MessageRole::Assistant => serde_json::from_str(text).map(Self::Assistant),
         };
@@ -260,7 +282,7 @@ impl MessageRow {
     pub fn tool(&self) -> Option<&ToolMeta> {
         match &self.metadata {
             Some(MessageMeta::Tool(meta)) => Some(meta),
-            Some(MessageMeta::Assistant(_)) | None => None,
+            Some(MessageMeta::User(_) | MessageMeta::Assistant(_)) | None => None,
         }
     }
 
@@ -269,7 +291,7 @@ impl MessageRow {
     pub fn assistant(&self) -> Option<&AssistantMeta> {
         match &self.metadata {
             Some(MessageMeta::Assistant(meta)) => Some(meta),
-            Some(MessageMeta::Tool(_)) | None => None,
+            Some(MessageMeta::User(_) | MessageMeta::Tool(_)) | None => None,
         }
     }
 }
@@ -507,7 +529,14 @@ pub fn record_turn(
         .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))?;
 
     // The turn is recorded once it ends; the question keeps the time it was asked.
-    let seq = append_message(db, session_id, MessageRole::User, user_message, None)?;
+    let asked = UserMeta::of(response).map(MessageMeta::User);
+    let seq = append_message(
+        db,
+        session_id,
+        MessageRole::User,
+        user_message,
+        asked.as_ref(),
+    )?;
     db.connection().execute(
         "UPDATE _quack_messages SET created_at = CAST(? AS TIMESTAMP) \
          WHERE session_id = ? AND seq = ?",

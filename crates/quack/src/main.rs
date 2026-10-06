@@ -24,7 +24,8 @@ mod text_or_json;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::{ReaderDb, SharedDb};
+use quack_core::analysis::search::{DocumentSearch, SearchDetail};
+use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
 use quack_core::config::inspect::SettingFilter;
 use quack_core::config::{Config, Grant, LogFormat};
 use quack_core::crypto::{self, CryptoModule};
@@ -49,7 +50,7 @@ use quack_core::storage::control::{ControlPlane, ResourceKind, WorkspaceRow};
 use quack_core::storage::profile::{ColumnTypes, TableProfile};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
 use quack_core::storage::workspace::{
-    DocumentFields, Pinning, QueryResults, StatementKind, WorkspaceDb,
+    DocumentFields, Pinning, QueryResults, SearchMode, StatementKind, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use quack_core::vault::Vault;
@@ -178,6 +179,16 @@ struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
 
+    /// Limit the question to these documents (ids, id prefixes, or file
+    /// names; repeat the flag or separate with commas)
+    #[arg(
+        long,
+        value_name = "DOCUMENT",
+        value_delimiter = ',',
+        requires = "prompt"
+    )]
+    documents: Vec<String>,
+
     /// Wait for piped stdin to close before running (`-p` and `-q` load
     /// it as the `stdin` table). Without it, a pipe that has nothing to
     /// read within a second is skipped
@@ -252,6 +263,9 @@ enum Commands {
     /// List ingested documents, or pin and unpin one
     Docs(DocsArgs),
 
+    /// Search the documents without the model, showing each hit's rank in
+    /// the vector and keyword legs and after reranking
+    Search(SearchArgs),
     /// List the tables with their row counts, notes, and warnings; show
     /// one in full, set its note, or give a column a type
     Tables(tables_cli::TablesArgs),
@@ -620,6 +634,92 @@ struct DocsArgs {
     all: bool,
 }
 
+#[derive(clap::Args)]
+struct SearchArgs {
+    /// What to search for; a "quoted phrase" must appear exactly
+    query: String,
+
+    /// Search only these documents (ids, id prefixes, or file names)
+    #[arg(long = "in", value_name = "DOCUMENT", num_args = 1..)]
+    documents: Vec<String>,
+
+    /// The keyword (BM25) leg alone
+    #[arg(long, conflicts_with = "vector")]
+    keyword: bool,
+
+    /// The vector leg alone
+    #[arg(long)]
+    vector: bool,
+
+    /// Also show each leg's candidates, the quoted-phrase filter, and the
+    /// rerank outcome
+    #[arg(long)]
+    explain: bool,
+
+    /// Hits to show (default `[retrieval].top_k`, at most 100)
+    #[arg(long, short = 'k')]
+    top_k: Option<u32>,
+
+    /// `json` prints the hits (and with --explain, the workings) as one
+    /// JSON document
+    #[arg(short = 'f', long, value_enum, default_value_t = TextOrJson::Text)]
+    format: TextOrJson,
+}
+
+impl SearchArgs {
+    const fn mode(&self) -> SearchMode {
+        match (self.keyword, self.vector) {
+            (true, _) => SearchMode::Keyword,
+            (false, true) => SearchMode::Vector,
+            (false, false) => SearchMode::Hybrid,
+        }
+    }
+
+    const fn detail(&self) -> SearchDetail {
+        if self.explain {
+            SearchDetail::Workings
+        } else {
+            SearchDetail::Hits
+        }
+    }
+
+    /// `quack search`: one search, no model call unless reranking asks the
+    /// chat model; unaudited, like every command-line read.
+    async fn run(&self, cli: &Cli) -> Result<ExitCode> {
+        init_logging();
+        let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+        let config = &opened.config;
+        let search = DocumentSearch {
+            documents: self.documents.clone(),
+            mode: self.mode(),
+            ..DocumentSearch::new(&self.query, self.top_k.unwrap_or(config.retrieval.top_k))?
+        };
+        let embedder = Embeddings::from_config(config).await?;
+        let rerank = Rerank::from_config(config).await?;
+        let (_db, reader) = opened.shared(opened.open_db()?).await?;
+        let outcome = search
+            .run(
+                &reader,
+                embedder.as_ref(),
+                rerank.as_ref(),
+                config.retrieval.rrf_k,
+            )
+            .await?;
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        match self.format {
+            TextOrJson::Text => write!(out, "{}", outcome.render(self.detail()))?,
+            TextOrJson::Json => writeln!(
+                out,
+                "{}",
+                serde_json::to_string_pretty(&outcome.to_json(self.explain))?
+            )?,
+        }
+        out.flush()?;
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
 #[derive(Subcommand)]
 enum OkfAction {
     /// Write the workspace as a bundle: index.md from the context, one
@@ -977,6 +1077,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             run_docs(&ws_db, &args)?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Search(args) => args.run(cli).await,
         Commands::Tables(args) => {
             let ws_db = open_workspace(cli).await?;
             let stdout = std::io::stdout();
@@ -1077,6 +1178,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         session_id: &session_id,
         policy,
         prompt,
+        documents: &cli.documents,
         format,
         verbose: cli.verbose,
     }

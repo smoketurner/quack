@@ -16,7 +16,7 @@ use crate::ids::{MergeId, NodeId};
 use crate::prefix::PrefixMatch;
 use crate::progress::{ChunkDone, RunControl};
 use crate::storage::control::ResourceKind;
-use crate::storage::workspace::{WorkspaceDb, tokenize};
+use crate::storage::workspace::{Analyzer, Unspaced, WorkspaceDb};
 use crate::storage::writer::Writer;
 
 /// A proposed merge: `drop` folds into `keep`.
@@ -380,13 +380,17 @@ fn provenance_count(db: &WorkspaceDb, id: &NodeId) -> Result<i64> {
     )?)
 }
 
-/// Whether two labels share a word of at least three characters.
+/// Whether two labels share a word of at least three characters, or a
+/// character bigram of an unspaced script (a Chinese, Japanese, or Korean
+/// label has no words to share).
 #[must_use]
 pub fn share_token(a: &str, b: &str) -> bool {
+    let analyzer = Analyzer::default();
     let tokens = |s: &str| -> BTreeSet<String> {
-        tokenize(s)
+        analyzer
+            .terms(s)
             .into_iter()
-            .filter(|t| t.chars().count() >= 3)
+            .filter(|t| t.chars().count() >= 3 || Unspaced::is_term(t))
             .collect()
     };
     !tokens(a).is_disjoint(&tokens(b))
@@ -564,5 +568,8 @@ mod tests {
         assert!(share_token("Acme Corp", "ACME Corporation"));
         assert!(!share_token("Acme", "Apex"));
         assert!(!share_token("A B", "A C"));
+        // An unspaced label shares character bigrams, not words.
+        assert!(share_token("東京海上保険", "東京海上"));
+        assert!(!share_token("東京海上", "大阪銀行"));
     }
 }

@@ -7,6 +7,7 @@
 #![expect(clippy::unwrap_used, reason = "a throwaway harness")]
 
 use quack_core::analysis::policy::WritePolicy;
+use quack_core::analysis::search::DocumentScope;
 use quack_core::analysis::text_to_sql::{self, PromptOptions};
 use quack_core::embedding::Dimension;
 use quack_core::graph::store::NewNode;
@@ -54,6 +55,7 @@ fn main() {
         context: Some(String::from("Amounts are in cents.")),
         context_max_tokens: Tokens::new(1000),
         ollama_context_cap: None,
+        scope: DocumentScope::default(),
         question: None,
     };
     let prompt = text_to_sql::SystemPrompt::build(&db, &options).unwrap();

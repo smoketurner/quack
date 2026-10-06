@@ -933,47 +933,73 @@ fn direct_sql_detection_by_leading_keyword() {
 #[test]
 fn tokenize_lowercases_and_splits_on_punctuation() {
     assert_eq!(
-        tokenize("Policy POL-8841 renews; see \"Exclusions\" (page 12)."),
+        Analyzer::default().terms("Policy POL-8841 renews; see \"Exclusions\" (page 12)."),
         vec![
             "polici", "pol", "8841", "pol8841", "renew", "see", "exclus", "page", "12"
         ]
     );
     // Inflections meet at one stem; codes and numbers are untouched.
     assert_eq!(
-        tokenize("renewal renewals renewing"),
+        Analyzer::default().terms("renewal renewals renewing"),
         vec!["renew", "renew", "renew"]
     );
-    assert_eq!(tokenize("AB-12X9"), vec!["ab", "12x9", "ab12x9"]);
-    assert!(tokenize("  --- ").is_empty());
+    assert_eq!(
+        Analyzer::default().terms("AB-12X9"),
+        vec!["ab", "12x9", "ab12x9"]
+    );
+    assert!(Analyzer::default().terms("  --- ").is_empty());
 }
 
 #[test]
 fn tokenize_indexes_the_joined_form_of_an_identifier() {
     // Hyphen, dot, underscore, slash, and colon all join.
-    assert_eq!(tokenize("v1.2.3"), vec!["v1", "2", "3", "v123"]);
-    assert_eq!(tokenize("ABC_123"), vec!["abc", "123", "abc123"]);
-    assert_eq!(tokenize("ns/part:7"), vec!["ns", "part", "7", "nspart7"]);
+    assert_eq!(
+        Analyzer::default().terms("v1.2.3"),
+        vec!["v1", "2", "3", "v123"]
+    );
+    assert_eq!(
+        Analyzer::default().terms("ABC_123"),
+        vec!["abc", "123", "abc123"]
+    );
+    assert_eq!(
+        Analyzer::default().terms("ns/part:7"),
+        vec!["ns", "part", "7", "nspart7"]
+    );
     // A joiner touching whitespace does not merge across words: prose
     // punctuation still tokenizes exactly as before.
     assert_eq!(
-        tokenize("end of sentence - new sentence."),
+        Analyzer::default().terms("end of sentence - new sentence."),
         vec!["end", "of", "sentenc", "new", "sentenc"]
     );
     // The query side uses the same function, so a bare joined form
     // already in text (`pol8841`) is found by the query `POL-8841`.
-    assert!(tokenize("POL-8841").contains(&String::from("pol8841")));
-    assert_eq!(tokenize("pol8841"), vec!["pol8841"]);
+    assert!(
+        Analyzer::default()
+            .terms("POL-8841")
+            .contains(&String::from("pol8841"))
+    );
+    assert_eq!(Analyzer::default().terms("pol8841"), vec!["pol8841"]);
     // The joined form uses full Unicode case folding, not ASCII-only
     // lowercasing, so a non-ASCII identifier's casing does not change
     // which term it indexes: `Ünit-9` in text and `ünit-9` in a query
     // must both produce the joined term `ünit9`.
-    assert_eq!(tokenize("Ünit-9").last(), tokenize("ünit-9").last(),);
-    assert_eq!(tokenize("Ünit-9").last(), Some(&String::from("ünit9")));
+    assert_eq!(
+        Analyzer::default().terms("Ünit-9").last(),
+        Analyzer::default().terms("ünit-9").last(),
+    );
+    assert_eq!(
+        Analyzer::default().terms("Ünit-9").last(),
+        Some(&String::from("ünit9"))
+    );
 }
 
 #[test]
 fn term_frequencies_count_heading_too() {
-    let tf = TermFrequencies::of("flood flood damage", Some("Flood Exclusions"));
+    let tf = TermFrequencies::of(
+        &Analyzer::default(),
+        "flood flood damage",
+        Some("Flood Exclusions"),
+    );
     assert_eq!(
         tf.0,
         vec![
@@ -2180,4 +2206,401 @@ fn stream_statement(db: &WorkspaceDb, sql: &str, format: ExportFormat) -> (u64, 
         .stream_query(sql, format, &mut out)
         .unwrap_or_else(|e| fail(&e.to_string()));
     (rows, String::from_utf8(out).unwrap_or_default())
+}
+
+/// A ready document whose language is detected from `sample`, with one
+/// chunk of `content`.
+fn language_document(db: &WorkspaceDb, id: &str, sample: &str, content: &str) {
+    insert_ready_document(db, id);
+    db.set_document_language(&DocumentId::from(id), sample)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    insert_text_chunk(db, &format!("{id}-c0"), id, 0, content);
+}
+
+const GERMAN_TEXT: &str = "Die Versicherungsverträge werden jedes Jahr erneuert. Der Kunde \
+    erhält rechtzeitig eine Mitteilung über die neuen Bedingungen und kann widersprechen.";
+
+#[test]
+fn a_german_document_is_stemmed_as_german_and_found_by_another_inflection() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    language_document(&db, "de", GERMAN_TEXT, GERMAN_TEXT);
+    let document = db
+        .document(&DocumentId::from("de"))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(document.and_then(|d| d.language).as_deref(), Some("deu"));
+    assert_eq!(
+        db.meta(MetaKey::Languages)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .as_deref(),
+        Some("german")
+    );
+    let hits = db
+        .search_keyword_chunks("Versicherungsvertrag", 5, &ChunkScope::all())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(hits.first().map(|h| h.id.as_str()), Some("de-c0"));
+}
+
+#[test]
+fn a_query_reaches_documents_in_every_language_of_the_workspace() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    language_document(&db, "de", GERMAN_TEXT, GERMAN_TEXT);
+    let english = "The insurance policies are renewed every year, and the customer is told.";
+    language_document(&db, "en", english, english);
+    let japanese = "保険契約の更新手続きについて説明します。";
+    language_document(&db, "ja", japanese, japanese);
+    assert_eq!(
+        db.meta(MetaKey::Languages)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .as_deref(),
+        Some("english,german,unstemmed")
+    );
+    let found = |query: &str| -> Vec<String> {
+        db.search_keyword_chunks(query, 5, &ChunkScope::all())
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .into_iter()
+            .map(|h| h.document_id.into_string())
+            .collect()
+    };
+    assert_eq!(found("renewal"), ["en"]);
+    assert_eq!(found("Versicherungsvertrag"), ["de"]);
+    assert_eq!(found("更新手続き"), ["ja"]);
+}
+
+#[test]
+fn a_chunk_of_a_document_without_a_language_detects_one_from_its_text() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    insert_ready_document(&db, "de");
+    insert_text_chunk(&db, "c0", "de", 0, GERMAN_TEXT);
+    let document = db
+        .document(&DocumentId::from("de"))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(document.and_then(|d| d.language).as_deref(), Some("deu"));
+}
+
+#[test]
+fn the_languages_setting_fixes_what_a_document_is_detected_as() {
+    let db = WorkspaceDb::open_in_memory(Dimension::new(4))
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .with_languages(LanguageSetting::Only(vec![Language::ENGLISH]));
+    language_document(&db, "de", GERMAN_TEXT, GERMAN_TEXT);
+    let document = db
+        .document(&DocumentId::from("de"))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(document.and_then(|d| d.language).as_deref(), Some("eng"));
+}
+
+/// A workspace from before detection has no language on its documents and
+/// English terms: opening it under the new schema detects each document
+/// and reindexes every chunk under its language.
+#[test]
+fn the_upgrade_detects_languages_and_reindexes_the_terms() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    language_document(&db, "de", GERMAN_TEXT, GERMAN_TEXT);
+    db.execute_statement("UPDATE _quack_documents SET language = NULL")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    db.execute_statement("DELETE FROM _quack_terms")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    db.delete_meta(MetaKey::Languages)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    db.set_meta(MetaKey::SchemaVersion, &MERGE_DEDUP.to_string())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    db.upgrade_data(db.embedding_dimension())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let document = db
+        .document(&DocumentId::from("de"))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(document.and_then(|d| d.language).as_deref(), Some("deu"));
+    assert_eq!(
+        db.meta(MetaKey::SchemaVersion)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .as_deref(),
+        Some(WORKSPACE_SCHEMA_VERSION.to_string().as_str())
+    );
+    let hits = db
+        .search_keyword_chunks("Versicherungsvertrag", 5, &ChunkScope::all())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(hits.len(), 1);
+}
+
+fn vector_chunk(db: &WorkspaceDb, id: &str, index: u32, content: &str, vector: [f32; 4]) {
+    let embedding = Vector::from(vector.to_vec());
+    db.insert_chunk(&NewChunk {
+        id: &ChunkId::from(id),
+        document_id: &DocumentId::from("doc1"),
+        chunk_index: index,
+        content,
+        heading: None,
+        page: None,
+        kind: SectionKind::Body,
+        locator: None,
+        embedding: Some(&embedding),
+    })
+    .unwrap_or_else(|e| fail(&e.to_string()));
+}
+
+#[test]
+fn an_explained_search_keeps_each_legs_rank_and_score_on_the_fused_hits() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    insert_ready_document(&db, "doc1");
+    vector_chunk(
+        &db,
+        "near",
+        0,
+        "Hail damage to roofs.",
+        [1.0, 0.0, 0.0, 0.0],
+    );
+    vector_chunk(
+        &db,
+        "word",
+        1,
+        "Flood exclusion applies.",
+        [0.0, 1.0, 0.0, 0.0],
+    );
+    let query = Vector::from(vec![1.0_f32, 0.0, 0.0, 0.0]);
+    let limits = HybridLimits {
+        top_k: 5,
+        rrf_k: 60,
+    };
+    let explained = db
+        .explain_search("flood", &query, limits, &ChunkScope::all())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(explained.vector.len(), 2);
+    assert_eq!(explained.keyword.len(), 1);
+    assert!(explained.phrases.is_empty() && explained.phrase_note().is_none());
+    let hit = |id: &str| {
+        explained
+            .fused
+            .iter()
+            .find(|h| h.id.as_str() == id)
+            .map_or_else(|| fail(&format!("{id} missing")), |h| h.ranks)
+    };
+    let word = hit("word");
+    assert_eq!(word.vector_rank, Some(2));
+    assert_eq!(word.keyword_rank, Some(1));
+    assert!(word.bm25.is_some_and(|b| b > 0.0) && word.vector_score.is_some());
+    let near = hit("near");
+    assert_eq!((near.vector_rank, near.keyword_rank), (Some(1), None));
+    assert_eq!(near.vector_score, Some(1.0));
+    // Hybrid search is the explanation's fused list.
+    let hybrid = db
+        .search_hybrid_chunks("flood", &query, limits, &ChunkScope::all())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let ids = |hits: &[ChunkSearchResult]| -> Vec<String> {
+        hits.iter().map(|h| h.id.to_string()).collect()
+    };
+    assert_eq!(ids(&hybrid), ids(&explained.fused));
+}
+
+#[test]
+fn each_search_mode_runs_its_own_legs() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    insert_ready_document(&db, "doc1");
+    vector_chunk(
+        &db,
+        "near",
+        0,
+        "Hail damage to roofs.",
+        [1.0, 0.0, 0.0, 0.0],
+    );
+    vector_chunk(
+        &db,
+        "word",
+        1,
+        "Flood exclusion applies.",
+        [0.0, 1.0, 0.0, 0.0],
+    );
+    let query = Vector::from(vec![1.0_f32, 0.0, 0.0, 0.0]);
+    let limits = HybridLimits {
+        top_k: 1,
+        rrf_k: 60,
+    };
+    let run = |mode: SearchMode, vector: Option<&Vector>| {
+        db.search_chunks("flood", vector, mode, limits, &ChunkScope::all())
+    };
+    let keyword = run(SearchMode::Keyword, Some(&query)).unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(keyword.vector.is_empty());
+    assert_eq!(keyword.fused.first().map(|h| h.id.as_str()), Some("word"));
+    let vector = run(SearchMode::Vector, Some(&query)).unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(vector.keyword.is_empty());
+    assert_eq!(vector.fused.first().map(|h| h.id.as_str()), Some("near"));
+    // Hybrid without a vector is keyword alone; vector without one fails.
+    let fallback = run(SearchMode::Hybrid, None).unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(fallback.vector.is_empty() && !fallback.fused.is_empty());
+    let refused = run(SearchMode::Vector, None).err().map(|e| e.to_string());
+    assert!(refused.is_some_and(|e| e.contains("embedding model")));
+    // A quoted phrase filters the vector leg too, and says so.
+    let phrased = db
+        .search_chunks(
+            "\"hail damage\"",
+            Some(&query),
+            SearchMode::Vector,
+            HybridLimits {
+                top_k: 5,
+                rrf_k: 60,
+            },
+            &ChunkScope::all(),
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(phrased.fused.len(), 1);
+    assert!(
+        phrased
+            .phrase_note()
+            .is_some_and(|n| n.contains("\"hail damage\""))
+    );
+}
+
+/// Documents with metadata for the filter tests: a tagged PDF by Ana from
+/// 2026, an untagged Markdown file from 2024, and a pasted note.
+fn filtered_documents(db: &WorkspaceDb) {
+    for (id, filename, mime, source) in [
+        (
+            "pdf",
+            "policy.pdf",
+            "application/pdf",
+            DocumentSource::Upload,
+        ),
+        ("md", "notes.md", "text/markdown", DocumentSource::Path),
+        ("txt", "paste.txt", "text/plain", DocumentSource::Paste),
+    ] {
+        db.insert_document(&NewDocument {
+            source,
+            ..NewDocument::new(&DocumentId::from(id), filename, mime, 10)
+                .with_status(DocumentStatus::Ready)
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        insert_text_chunk(db, &format!("{id}-c0"), id, 0, "renewal terms apply");
+    }
+    let set = |id: &str, fields: DocumentFields| {
+        db.set_document_fields(&DocumentId::from(id), &fields)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    };
+    set(
+        "pdf",
+        DocumentFields {
+            author: Some(String::from("Ana Lima")),
+            authored_at: Some(String::from("2026-03-01")),
+            tags: Some(vec![String::from("Policy"), String::from("2026")]),
+            ..DocumentFields::default()
+        },
+    );
+    set(
+        "md",
+        DocumentFields {
+            authored_at: Some(String::from("2024-06-30")),
+            ..DocumentFields::default()
+        },
+    );
+}
+
+#[test]
+fn a_document_filter_narrows_the_listing_and_both_search_legs() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    filtered_documents(&db);
+    let listed = |filter: DocumentFilter| -> Vec<String> {
+        let mut ids: Vec<String> = db
+            .list_documents_matching(&filter)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .into_iter()
+            .map(|d| d.id.into_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+    let date = |text: &str| text.parse::<jiff::civil::Date>().ok();
+    assert_eq!(listed(DocumentFilter::default()), ["md", "pdf", "txt"]);
+    assert_eq!(
+        listed(DocumentFilter {
+            types: vec![String::from("PDF"), String::from(".md")],
+            ..DocumentFilter::default()
+        }),
+        ["md", "pdf"]
+    );
+    assert_eq!(
+        listed(DocumentFilter {
+            types: vec![String::from("text/plain")],
+            ..DocumentFilter::default()
+        }),
+        ["txt"]
+    );
+    assert_eq!(
+        listed(DocumentFilter {
+            sources: vec![DocumentSource::Paste, DocumentSource::Path],
+            ..DocumentFilter::default()
+        }),
+        ["md", "txt"]
+    );
+    assert_eq!(
+        listed(DocumentFilter {
+            tags: vec![String::from("policy")],
+            ..DocumentFilter::default()
+        }),
+        ["pdf"]
+    );
+    assert_eq!(
+        listed(DocumentFilter {
+            author: Some(String::from("LIMA")),
+            ..DocumentFilter::default()
+        }),
+        ["pdf"]
+    );
+    assert_eq!(
+        listed(DocumentFilter {
+            since: date("2025-01-01"),
+            until: date("2026-12-31"),
+            types: vec![String::from("pdf"), String::from("md")],
+            ..DocumentFilter::default()
+        }),
+        ["pdf"]
+    );
+    assert_eq!(
+        listed(DocumentFilter {
+            until: date("2024-12-31"),
+            ..DocumentFilter::default()
+        }),
+        ["md"]
+    );
+    let scope = ChunkScope::all()
+        .with_filter(&DocumentFilter {
+            tags: vec![String::from("2026")],
+            ..DocumentFilter::default()
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let keyword = db
+        .search_keyword_chunks("renewal", 5, &scope)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        keyword.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        ["pdf-c0"]
+    );
+}
+
+#[test]
+fn a_bad_document_filter_is_refused_with_the_reason() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    let unknown = db
+        .list_documents_matching(&DocumentFilter {
+            types: vec![String::from("klingon")],
+            ..DocumentFilter::default()
+        })
+        .err()
+        .map(|e| e.to_string());
+    assert!(unknown.is_some_and(|e| e.contains("unknown document type 'klingon'")));
+    let backwards = ChunkScope::all()
+        .with_filter(&DocumentFilter {
+            since: "2026-02-01".parse().ok(),
+            until: "2026-01-01".parse().ok(),
+            ..DocumentFilter::default()
+        })
+        .err()
+        .map(|e| e.to_string());
+    assert!(backwards.is_some_and(|e| e.contains("is after until")));
+    assert!(DocumentFilter::default().is_empty());
 }

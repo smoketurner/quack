@@ -20,7 +20,14 @@ Two rules hold for every release:
 
 ## Unreleased
 
-No upgrade steps yet. The version-bump pull request renames this section to the tag.
+- Config: `[retrieval].languages` added (default `["auto"]`): what a document may be
+  detected as for keyword stemming, `"auto"` or Snowball language names.
+- Schema: workspace 13. The first open of each workspace detects every document's language
+  from its first chunks and rebuilds the keyword index (`_quack_terms`), reading every chunk
+  once. `control.db` unchanged (migration 8).
+- Embeddings: no refresh needed.
+
+The version-bump pull request renames this section to the tag.
 
 ## v2026.10.3
 

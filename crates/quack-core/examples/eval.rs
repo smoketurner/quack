@@ -41,7 +41,9 @@ use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
 use quack_core::ontology::store::{self as ontology_store, Revision};
 use quack_core::progress::RunControl;
 use quack_core::storage::control::WorkspaceName;
-use quack_core::storage::workspace::{ChunkScope, ChunkSearchResult, HybridLimits, WorkspaceDb};
+use quack_core::storage::workspace::{
+    ChunkScope, ChunkSearchResult, HybridLimits, Ranks, WorkspaceDb,
+};
 use quack_core::storage::writer::Writer;
 use rig::ProviderError;
 use rig::embeddings::Embedding;
@@ -880,6 +882,7 @@ fn evaluate_citations(path: &Path) -> Result<CitationReport> {
                 kind: SectionKind::Body,
                 locator: None,
                 ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
+                ranks: Ranks::default(),
             })
             .collect();
         let _first_marker = registry.register(&registered);

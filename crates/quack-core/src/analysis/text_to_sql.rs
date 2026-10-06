@@ -1,5 +1,6 @@
 use super::table_search::{DETAILED_TABLES, RankedTable, TableCards, TableLayout, user_tables};
 use crate::analysis::policy::WritePolicy;
+use crate::analysis::search::DocumentScope;
 use crate::embedding::Vector;
 use crate::error::Result;
 use crate::graph::views as graph_views;
@@ -70,6 +71,8 @@ pub struct PromptOptions {
     /// (`[analysis].max_context_tokens`); `None` for providers that size
     /// their own.
     pub ollama_context_cap: Option<Tokens>,
+    /// The documents the person limited the question to.
+    pub scope: DocumentScope,
     /// The turn's question, which ranks the tables in a workspace with
     /// more than the prompt describes; `None` leaves the ranking out.
     pub question: Option<Question>,
@@ -233,6 +236,10 @@ impl SystemPrompt {
         let modeled = Modeled::of(ontology.as_ref(), &graph);
         let tables = prompt.tables(db, ontology.as_ref(), modeled)?;
         let documents = prompt.documents(db)?;
+        if let Some(note) = options.scope.prompt_note() {
+            writeln!(prompt.text, "{note}")?;
+            writeln!(prompt.text)?;
+        }
         prompt.pinned_documents(db, options.pinned_token_budget)?;
 
         if let Some(ontology) = &ontology {

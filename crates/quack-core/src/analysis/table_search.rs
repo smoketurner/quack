@@ -17,7 +17,7 @@ use crate::error::Result;
 use crate::graph::views;
 use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::profile::{TableNote, TableProfile};
-use crate::storage::workspace::{INTERNAL_PREFIX, WorkspaceDb, tokenize};
+use crate::storage::workspace::{Analyzer, INTERNAL_PREFIX, WorkspaceDb};
 use crate::storage::writer::Writer;
 use crate::text::OneLine;
 
@@ -245,7 +245,9 @@ impl TableCards {
 
     /// Tables whose card shares a term with the query, by BM25.
     fn keyword_ranking(&self, query: &str) -> Vec<String> {
-        let terms = tokenize(query);
+        // Table cards are names and notes, not documents: one analyzer for both sides.
+        let analyzer = Analyzer::default();
+        let terms = analyzer.terms(query);
         if terms.is_empty() || self.0.is_empty() {
             return Vec::new();
         }
@@ -253,7 +255,7 @@ impl TableCards {
             .0
             .iter()
             .map(|card| {
-                let tokens = tokenize(&card.text);
+                let tokens = analyzer.terms(&card.text);
                 let mut tf: HashMap<String, u32> = HashMap::new();
                 for token in &tokens {
                     let count = tf.entry(token.clone()).or_default();

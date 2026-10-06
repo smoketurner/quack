@@ -67,6 +67,8 @@ pub(crate) struct PrintTurn<'a> {
     pub session_id: &'a SessionId,
     pub policy: WritePolicy,
     pub prompt: &'a str,
+    /// The documents the question is limited to; empty for all.
+    pub documents: &'a [String],
     pub format: TextOrJson,
     /// Full tool inputs and outputs on stderr.
     pub verbose: bool,
@@ -79,6 +81,7 @@ impl PrintTurn<'_> {
             (self.config, self.db, self.reader_db, self.session_id);
         let (policy, prompt, format, verbose) =
             (self.policy, self.prompt, self.format, self.verbose);
+        let documents = self.documents.to_vec();
         let (sink, mut events) = events::channel();
 
         let interrupt = CtrlCGuard::new();
@@ -95,6 +98,7 @@ impl PrintTurn<'_> {
                     session_id: &session_id,
                     policy,
                     message: &prompt,
+                    documents: &documents,
                     sink,
                     cancel,
                 }
@@ -380,6 +384,7 @@ mod tests {
             session_id: &session.id,
             policy: WritePolicy::Allow(Approver::Nobody),
             prompt: "follow the maintenance note",
+            documents: &[],
             format: TextOrJson::Json,
             verbose: false,
         };

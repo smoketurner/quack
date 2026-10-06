@@ -38,8 +38,8 @@ slot; a success opens the same session cookie a password login does.
 
 Every page struct carries a `page: Page`: title, its `Tab`, username, admin flag, local flag,
 and the current workspace with its role and what the caller may do. `base.html` reads it for
-the header and the workspace tabs (`Tab::WORKSPACE`: chat, documents, tables with the import
-form, SQL, context, ontology, graph, jobs, settings), highlighting the page's tab, or the
+the header and the workspace tabs (`Tab::WORKSPACE`: chat, documents, search, tables with
+the import form, SQL, context, ontology, graph, jobs, settings), highlighting the page's tab, or the
 Users, Audit, or About link, with `aria-current="page"`. Users and Audit show to admins;
 About (`/about`: the running version and the projects quack is built with) shows to every
 signed-in user and reads no workspace, so it writes no audit row.
@@ -62,6 +62,16 @@ signed-in user and reads no workspace, so it writes no audit row.
   visit is audited as opening the document; a position the document does not have is a 404
   page. The chunk is shown whatever the document's status, so a citation in an old answer
   still opens after its document was replaced.
+- **`search.html`** (`/w/{id}/search`, `server::web::search`) runs one document search
+  without the model. The form posts its query in the body (search text is workspace
+  content, and a URL ends up in logs) with a multi-select of the newest 200 ready
+  documents, the mode, and an optional graph entity. It goes through the same
+  `Access::search` as `POST .../search`, audited as `search`, and shows each hit's fused
+  score, its vector, keyword, and rerank rank and score, and a link to its passage page,
+  then both legs' candidates in collapsed sections, the phrase note, and the rerank
+  outcome. A search the core refuses (an unknown document, vector mode with no embedding
+  model) is shown on the page, not as a failed page. The chat form offers the same
+  documents in a multi-select; picked ones go out as the turn's `document_ids`.
 - **`ontology.html`** shows the class tree, relations, properties, and mappings; the JSON
   editor; the version list with the diff to the previous version; the propose form; the
   Rename form, which gives a class or relation a new id and moves the graph's nodes and

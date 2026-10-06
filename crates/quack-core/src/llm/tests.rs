@@ -5,7 +5,7 @@ use crate::embedding::Dimension;
 use crate::ids::{ChunkId, ClassId, DocumentId, RelationId};
 use crate::ingestion::parser::SectionKind;
 use crate::ontology::Relation;
-use crate::storage::workspace::{ChunkSearchResult, WorkspaceDb};
+use crate::storage::workspace::{ChunkSearchResult, Ranks, WorkspaceDb};
 use crate::storage::writer::Writer;
 
 fn parse(toml_text: &str) -> Config {
@@ -192,6 +192,7 @@ fn rerank_hit(n: u32) -> ChunkSearchResult {
         kind: SectionKind::Body,
         locator: None,
         ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
+        ranks: Ranks::default(),
     }
 }
 
@@ -403,6 +404,7 @@ async fn a_turn_cut_at_the_output_limit_says_so() {
             session_id: &session.id,
             policy: WritePolicy::Deny,
             message: "list the regions",
+            documents: &[],
             sink,
             cancel: CancellationToken::new(),
         }
@@ -788,6 +790,7 @@ async fn cancelled_turns_are_recorded_and_completed() {
         session_id: &session.id,
         policy: WritePolicy::Deny,
         message: "how many storms?",
+        documents: &[],
         sink,
         cancel,
     }

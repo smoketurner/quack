@@ -24,7 +24,8 @@ use quack_core::analysis::events::{
     self, AgentEvent, Decision, Delivery, PermissionRequest, ToolName, ToolStep,
 };
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::{ReaderDb, SharedDb};
+use quack_core::analysis::search::{DocumentSearch, SearchDetail};
+use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
 use quack_core::config::Config;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::follow_up::FollowUp;
@@ -555,6 +556,7 @@ enum CliJob {
     ContextExport(String),
     Import(ImportRequest),
     Ingest(PathBuf),
+    Search(String),
 }
 
 impl CliJob {
@@ -567,6 +569,7 @@ impl CliJob {
             Self::Okf(_) | Self::ContextExport(_) => JobKind::Export,
             Self::ContextImport(_) | Self::Import(_) => JobKind::Import,
             Self::Ingest(_) => JobKind::Ingest,
+            Self::Search(_) => JobKind::Search,
         }
     }
 
@@ -581,6 +584,7 @@ impl CliJob {
             Self::ContextImport(_) => String::from("Importing the context"),
             Self::ContextExport(_) => String::from("Exporting the context"),
             Self::Import(request) => format!("import {}", request.url),
+            Self::Search(query) => format!("search {}", one_line(query)),
             Self::Ingest(path) => path.file_name().map_or_else(
                 || path.display().to_string(),
                 |name| name.to_string_lossy().into_owned(),
@@ -604,7 +608,8 @@ impl CliJob {
             | Self::Saved(_)
             | Self::Okf(_)
             | Self::ContextImport(_)
-            | Self::ContextExport(_) => {
+            | Self::ContextExport(_)
+            | Self::Search(_) => {
                 Message::new(MessageKind::System, format!("{}\u{2026}", self.label()))
             }
         }
@@ -693,8 +698,28 @@ impl CliJob {
             }
             Self::Import(request) => return Self::import(env, &request, control).await,
             Self::Ingest(path) => return Self::ingest(env, &path, control).await,
+            Self::Search(query) => return Self::search(env, &query).await,
         }
         Ok(String::from_utf8_lossy(&out).trim_end().to_owned())
+    }
+
+    /// `/search QUERY`: the hits with their rank in each leg, then each
+    /// leg's candidates and the rerank outcome.
+    async fn search(env: &JobEnv, query: &str) -> Result<String> {
+        let config = &env.config;
+        let search = DocumentSearch::new(query, config.retrieval.top_k)?;
+        let embedder = Embeddings::from_config(config).await?;
+        let rerank = Rerank::from_config(config).await?;
+        let reader = ReaderDb::new(Arc::clone(&env.db));
+        let outcome = search
+            .run(
+                &reader,
+                embedder.as_ref(),
+                rerank.as_ref(),
+                config.retrieval.rrf_k,
+            )
+            .await?;
+        Ok(outcome.render(SearchDetail::Workings).trim_end().to_owned())
     }
 
     /// Rows from an external source as a workspace table.
@@ -1976,23 +2001,30 @@ impl App {
 
     /// Run a typed `/` line; a line the parser refuses is answered in the
     /// transcript (its help as a note, anything else as an error).
-    fn handle_slash_command(&mut self, input: &str) {
-        let command = match SlashCommand::parse(input) {
-            Ok(command) => command,
-            Err(e) => {
-                let (kind, text) = match e.kind() {
-                    ErrorKind::InvalidSubcommand => {
-                        let name = input.split_whitespace().next().unwrap_or(input);
-                        (MessageKind::Error, format!("unknown command: {name}"))
-                    }
-                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
-                        (MessageKind::System, e.to_string())
-                    }
-                    _ => (MessageKind::Error, e.to_string()),
-                };
-                self.note(kind, text.trim_end());
-                return;
+    /// `input` as a slash command, or `None` once the transcript says why
+    /// it is not one (or shows the help it asked for).
+    fn parse_slash_command(&mut self, input: &str) -> Option<SlashCommand> {
+        let e = match SlashCommand::parse(input) {
+            Ok(command) => return Some(command),
+            Err(e) => e,
+        };
+        let (kind, text) = match e.kind() {
+            ErrorKind::InvalidSubcommand => {
+                let name = input.split_whitespace().next().unwrap_or(input);
+                (MessageKind::Error, format!("unknown command: {name}"))
             }
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                (MessageKind::System, e.to_string())
+            }
+            _ => (MessageKind::Error, e.to_string()),
+        };
+        self.note(kind, text.trim_end());
+        None
+    }
+
+    fn handle_slash_command(&mut self, input: &str) {
+        let Some(command) = self.parse_slash_command(input) else {
+            return;
         };
         match command {
             SlashCommand::Quit => self.quit = Quit::Now,
@@ -2010,6 +2042,7 @@ impl App {
             SlashCommand::Mode { mode: None } => self.show_mode(),
             SlashCommand::Mode { mode: Some(mode) } => self.set_mode(mode),
             SlashCommand::Docs => self.show_documents(),
+            SlashCommand::Search { query } => self.run_job(CliJob::Search(query)),
             SlashCommand::Context { action: None } => self.show_context(),
             SlashCommand::Context {
                 action: Some(ContextAction::Import { file }),
@@ -2750,6 +2783,7 @@ impl App {
                 session_id: &session_id,
                 policy,
                 message: &message,
+                documents: &[],
                 sink,
                 cancel: ctx.cancel_token(),
             })

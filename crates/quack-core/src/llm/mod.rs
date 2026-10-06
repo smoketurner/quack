@@ -30,8 +30,12 @@ use rig::prelude::*;
 use crate::analysis::agent::{AgentResponse, Analysis, Cutoff};
 use crate::analysis::events::{self, AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
-use crate::analysis::rerank::{RERANK_PROMPT, RERANK_TIMEOUT, RerankAnswer};
+use crate::analysis::rerank::{
+    ModelReranker, RERANK_PROMPT, RERANK_TIMEOUT, RerankAnswer, Reranker, ScoredReranker,
+};
+use crate::analysis::search::DocumentScope;
 use crate::analysis::text_to_sql::PromptOptions;
+use crate::analysis::tools::Rerank;
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::{
     BaseUrl, BedrockApi, BedrockEndpoint, Config, Effort, ModelRef, ModelSettings, ProviderAuth,
@@ -646,6 +650,57 @@ impl ChatClient {
             .inspect_err(|e| tracing::warn!(error = %e, "the turn runs without its {label} call"))
             .ok()
     }
+
+    /// The chat model as a listwise reranker, at `background_effort` like
+    /// every other background call; `None` when it cannot be built, and
+    /// the search keeps its fused order.
+    fn rerank_call(
+        &self,
+        model: &str,
+        settings: ModelSettings,
+    ) -> Option<SchemaCall<RerankAnswer>> {
+        self.optional_schema_call::<RerankAnswer>(
+            model,
+            settings,
+            Task {
+                preamble: RERANK_PROMPT,
+                timeout: RERANK_TIMEOUT,
+                label: "rerank",
+            },
+            schema_for!(RerankAnswer),
+        )
+    }
+}
+
+impl Rerank {
+    /// The reranker `[retrieval].rerank` names, for a search a person runs
+    /// outside a turn; `None` when it names none or one cannot be built.
+    ///
+    /// # Errors
+    ///
+    /// A model the configuration names that does not resolve, or a
+    /// provider that cannot be built.
+    pub async fn from_config(config: &Config) -> Result<Option<Self>> {
+        let reranker: Arc<dyn Reranker> = match config.retrieval.rerank {
+            RerankMode::None => return Ok(None),
+            RerankMode::Reranker => match RerankModel::from_config(config).await? {
+                Some(model) => Arc::new(ScoredReranker::new(model)),
+                None => return Ok(None),
+            },
+            RerankMode::Model => {
+                let chat = config.chat_model_ref()?;
+                let client = ChatClient::build(config, &chat).await?;
+                match client.rerank_call(chat.model, config.model_settings(chat)) {
+                    Some(call) => Arc::new(ModelReranker::from_call(call)),
+                    None => return Ok(None),
+                }
+            }
+        };
+        Ok(Some(Self {
+            reranker,
+            candidates: config.retrieval.rerank_candidates,
+        }))
+    }
 }
 
 /// The key rig's `OpenAI` clients are built with when [`bedrock::Signer`]
@@ -1177,6 +1232,9 @@ pub struct TurnRequest<'a> {
     pub session_id: &'a SessionId,
     pub policy: WritePolicy,
     pub message: &'a str,
+    /// The documents the person limits the question to, each by id, id
+    /// prefix, or file name; empty for the whole workspace.
+    pub documents: &'a [String],
     pub sink: EventSink,
     pub cancel: CancellationToken,
 }
@@ -1200,6 +1258,7 @@ impl TurnRequest<'_> {
             session_id,
             policy,
             message,
+            documents,
             sink,
             cancel,
         } = self;
@@ -1213,7 +1272,7 @@ impl TurnRequest<'_> {
             rerank_model,
             prompt,
             history,
-        } = match start_turn(config, &db, session_id, policy).await {
+        } = match start_turn(config, &db, session_id, policy, documents).await {
             Ok(started) => started,
             Err(e) => {
                 drop(sink.send(AgentEvent::Failed(TurnFailure::from(&e))));
@@ -1243,6 +1302,7 @@ impl TurnRequest<'_> {
                 }
             }
         });
+        let prompt_scope = prompt.scope.clone();
         // Someone is watching this turn: its model calls, and the tools' calls
         // inside it, go ahead of background work at the provider (design 4.1).
         let analysis = Analysis {
@@ -1280,6 +1340,7 @@ impl TurnRequest<'_> {
                 content,
                 cancelled: true,
                 duration_ms: Some(u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                documents: prompt_scope,
                 ..AgentResponse::default()
             };
             tracing::info!(session = %session_id, "agent turn cancelled");
@@ -1312,6 +1373,7 @@ async fn start_turn<'c>(
     db: &SharedDb,
     session_id: &SessionId,
     policy: WritePolicy,
+    documents: &[String],
 ) -> Result<StartedTurn<'c>> {
     let chat = config.chat_model_ref()?;
     // Without an embedding provider the agent still runs: document search
@@ -1326,12 +1388,14 @@ async fn start_turn<'c>(
     let ollama_context_cap = (chat.provider.provider_type == ProviderType::Ollama)
         .then_some(config.analysis.max_context_tokens);
     let read = session_id.clone();
+    let documents = documents.to_vec();
     let prompt = db
         .run(move |guard| {
             let session_id = read;
             let session = sessions::get_session(guard, &session_id)?
                 .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))?;
             let prompt = PromptOptions {
+                scope: DocumentScope::resolve(guard, &documents)?,
                 mode: session.mode,
                 today: Zoned::now().date(),
                 write_policy: policy,
@@ -1395,16 +1459,7 @@ async fn dispatch(
     // Built here, where the turn's client is, at `background_effort` like
     // every other background call; without it the search keeps its fused order.
     let reranker = if config.retrieval.rerank == RerankMode::Model {
-        client.optional_schema_call::<RerankAnswer>(
-            chat.model,
-            settings,
-            Task {
-                preamble: RERANK_PROMPT,
-                timeout: RERANK_TIMEOUT,
-                label: "rerank",
-            },
-            schema_for!(RerankAnswer),
-        )
+        client.rerank_call(chat.model, settings)
     } else {
         None
     };

@@ -11,11 +11,11 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::ids::{ChunkId, NodeId};
+use crate::ids::ChunkId;
 use crate::storage::profile::TableProfile;
 use crate::storage::workspace::{
-    ChunkScope, ChunkSearchResult, DocumentInfo, DocumentStatus, HybridLimits, StatementKind,
-    TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object, quote_ident,
+    ChunkSearchResult, DocumentFilter, DocumentInfo, DocumentStatus, HybridLimits, SearchMode,
+    StatementKind, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object, quote_ident,
 };
 use crate::storage::writer::Writer;
 
@@ -23,7 +23,8 @@ use super::chart::{ChartKind, ChartSpec, SeriesColumns};
 use super::citations::{ChunkLocation, Markers};
 use super::events::{DetailPreview, ToolName, TurnRecorder};
 use super::policy::{Exposure, Hold, RefusalFlag, WriteDecision, WritePolicy};
-use super::rerank::{self, ModelReranker, RerankAnswer, Reranker, ScoredReranker};
+use super::rerank::{ModelReranker, RerankAnswer, Reranker, ScoredReranker};
+use super::search::{DocumentScope, DocumentSearch, SearchOutcome, SearchVectors};
 use super::table_search::TableCards;
 use super::text_to_sql::{ColumnLine, Modeled};
 use crate::config::{GraphConfig, RerankMode, RetrievalConfig};
@@ -293,6 +294,9 @@ pub struct Turn {
     /// (`WorkspaceDb::statement_shape`), to spot the model re-running one
     /// statement once per value.
     shapes: Arc<Mutex<Vec<(String, String)>>>,
+    /// The documents the person limited the question to; a search the
+    /// model narrows further stays within them.
+    scope: DocumentScope,
 }
 
 impl Turn {
@@ -306,7 +310,21 @@ impl Turn {
             graph: Arc::new(Mutex::new(Vec::new())),
             exposure: Arc::new(Mutex::new(Exposure::None)),
             shapes: Arc::new(Mutex::new(Vec::new())),
+            scope: DocumentScope::default(),
         }
+    }
+
+    /// The documents the person limited the turn to.
+    #[must_use]
+    pub fn scope(&self) -> &DocumentScope {
+        &self.scope
+    }
+
+    /// Limit the turn's document searches to `scope`.
+    #[must_use]
+    pub fn within(mut self, scope: DocumentScope) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// The context the turn's run hands its tools.
@@ -856,6 +874,10 @@ pub struct SearchDocumentsArgs {
     /// named as it appears in the knowledge graph
     #[serde(default)]
     pub entity: NonBlank,
+    /// Restrict the search to documents of these types, sources, or tags,
+    /// written in a date range, or by an author
+    #[serde(default)]
+    pub filters: DocumentFilter,
 }
 
 impl<M> Tool for SearchDocumentsTool<M>
@@ -901,24 +923,27 @@ where
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let turn = Turn::of(context)?;
-        let entity = args.entity.get();
-        let detail = match (args.document_ids.is_empty(), entity) {
-            (true, None) => args.query.clone(),
-            (true, Some(entity)) => format!("{} (about {entity})", args.query),
-            (false, None) => format!("{} (in {})", args.query, args.document_ids.join(", ")),
-            (false, Some(entity)) => format!(
-                "{} (about {entity}, in {})",
-                args.query,
-                args.document_ids.join(", ")
-            ),
+        let top_k = args
+            .top_k
+            .unwrap_or(self.default_top_k)
+            .clamp(1, MAX_SEARCH_TOP_K);
+        let search = DocumentSearch {
+            query: args.query,
+            top_k,
+            documents: args.document_ids,
+            entity: args.entity.get().map(str::to_owned),
+            filter: args.filters,
+            mode: SearchMode::Hybrid,
         };
-        let step = turn.recorder.start(ToolName::SearchDocuments, &detail);
+        let step = turn
+            .recorder
+            .start(ToolName::SearchDocuments, &search.describe());
         let query_vec: Option<Vector> = match &self.embedding_model {
             None => None,
             Some(model) => {
                 match turn
                     .recorder
-                    .embed_cached(model, Input::Query(args.query.clone()))
+                    .embed_cached(model, Input::Query(search.query.clone()))
                     .await
                 {
                     Ok(vector) => Some(vector),
@@ -927,10 +952,6 @@ where
             }
         };
 
-        let top_k = args
-            .top_k
-            .unwrap_or(self.default_top_k)
-            .clamp(1, MAX_SEARCH_TOP_K);
         let fetch = self
             .rerank
             .as_ref()
@@ -940,7 +961,7 @@ where
         // so `search_documents(query, entity)` is one embed call each,
         // cached against a later call (search_graph, find_path) that
         // resolves the same label again this turn.
-        let entity_vec = match entity {
+        let entity_vec = match search.entity.as_deref() {
             Some(entity) => {
                 // Its resolution answers with the entity's chunks or with
                 // the graph's closest labels.
@@ -952,52 +973,29 @@ where
             None => None,
         };
 
-        let query = args.query.clone();
-        let document_ids = args.document_ids.clone();
-        let entity = entity.map(str::to_owned);
-        let rrf_k = self.rrf_k;
-        let results = self
+        let vectors = SearchVectors {
+            query: query_vec,
+            entity: entity_vec,
+        };
+        let limits = HybridLimits {
+            top_k: fetch,
+            rrf_k: self.rrf_k,
+        };
+        let (searched, within) = (search.clone(), turn.scope.clone());
+        let explained = self
             .db
-            .with_db(move |db| {
-                let mut scope = ChunkScope::for_documents(db, &document_ids)?;
-                if let Some(entity) = entity.as_deref() {
-                    scope = scope.and_chunks(entity_chunks(db, entity, entity_vec.as_ref())?);
-                }
-                match &query_vec {
-                    Some(vector) => db.search_hybrid_chunks(
-                        &query,
-                        vector,
-                        HybridLimits {
-                            top_k: fetch,
-                            rrf_k,
-                        },
-                        &scope,
-                    ),
-                    None => db.search_keyword_chunks(&query, fetch, &scope),
-                }
-            })
+            .with_db(move |db| searched.explain(db, &vectors, limits, &within))
             .await;
-        let results = match results {
-            Ok(results) => results,
+        let explanation = match explained {
+            Ok(explanation) => explanation,
             Err(e) => return Err(step.fail(e.into())),
         };
-        let (results, note) = match &self.rerank {
-            Some(rerank) => {
-                let keep = usize::try_from(top_k).unwrap_or(usize::MAX);
-                let rerank::Reranked {
-                    results: kept,
-                    outcome,
-                } = rerank::apply(rerank.reranker.as_ref(), &args.query, results, keep).await;
-                let note = match outcome {
-                    rerank::RerankOutcome::Skipped => String::new(),
-                    rerank::RerankOutcome::Reranked(name) => format!(", reranked by {name}"),
-                    rerank::RerankOutcome::Failed(_) => String::from(", reranking failed"),
-                };
-                (kept, note)
-            }
-            None => (results, String::new()),
-        };
-        step.finish(format!("{} chunks{note}", results.len()));
+        let SearchOutcome {
+            explanation,
+            rerank: outcome,
+        } = SearchOutcome::rerank(explanation, self.rerank.as_ref(), &search.query, top_k).await;
+        let results = explanation.fused;
+        step.finish(format!("{} chunks{}", results.len(), outcome.suffix()));
         let chunk_ids: Vec<ChunkId> = results.iter().map(|r| r.id.clone()).collect();
         // Best effort: the annotation is extra context, so a graph that
         // cannot be read must not fail a search that already succeeded.
@@ -1013,38 +1011,6 @@ where
 
 /// Entities named per retrieved chunk before the rest are counted.
 const CHUNK_ENTITIES: usize = 8;
-
-/// The chunks an entity was extracted from, for `search_documents(entity)`.
-/// A name that resolves to nothing is an error naming the closest labels,
-/// and an entity that exists only in mapped tables says so: both beat an
-/// empty result the model reads as "the documents do not cover this".
-fn entity_chunks(
-    db: &WorkspaceDb,
-    entity: &str,
-    embedding: Option<&Vector>,
-) -> error::Result<Vec<ChunkId>> {
-    let nodes = graph::traverse::resolve_entry(db, entity, None, embedding)?;
-    if nodes.is_empty() {
-        let unknown = UnknownEntity::find(db, entity, embedding);
-        return Err(if unknown.closest.is_empty() {
-            Error::Analysis(format!(
-                "{unknown}; drop the entity argument to search every document"
-            ))
-        } else {
-            unknown.into()
-        });
-    }
-    let ids: Vec<NodeId> = nodes.iter().map(|n| n.id.clone()).collect();
-    let chunks = graph::store::chunks_of_nodes(db, &ids)?;
-    if chunks.is_empty() {
-        return Err(Error::Analysis(format!(
-            "'{entity}' is in the graph, but only from table rows, so no document passage is \
-             tied to it; search_graph has its connections, or drop the entity argument to search \
-             every document"
-        )));
-    }
-    Ok(chunks)
-}
 
 /// Render search hits as numbered, citable chunks.
 ///
@@ -1164,11 +1130,14 @@ impl Tool for ReadDocumentTool {
             &format!("{} from {from}", args.document),
         );
         let wanted = args.document;
+        let within = turn.scope().clone();
         let read = self
             .db
             .with_db(move |db| {
                 let documents = db.list_documents()?;
                 let document = DocumentInfo::find(&documents, &wanted)?.clone();
+                // The person's scope bounds whole-document reads as it does search.
+                within.narrow(vec![document.id.clone()])?;
                 if document.status != DocumentStatus::Ready {
                     return Err(Error::Analysis(format!(
                         "{} is {}, not ready, so its text cannot be read",
@@ -1797,7 +1766,7 @@ mod tests;
 // ---------------------------------------------------------------------------
 
 use crate::error;
-use crate::graph::query::{GraphQuery, Listed, OntologyId, PathEnds, PathQuery, UnknownEntity};
+use crate::graph::query::{GraphQuery, Listed, OntologyId, PathEnds, PathQuery};
 use crate::graph::store::ClassCensus;
 use crate::graph::{self, GraphResult, Origin};
 

@@ -1046,6 +1046,15 @@ async fn embed_and_store<M: EmbeddingModel>(
     let chunk_ids = db
         .run(move |db| {
             db.write_transaction(|db| {
+                let mut sample = String::new();
+                for chunk in &owned {
+                    if sample.len() >= WorkspaceDb::LANGUAGE_SAMPLE_CHARS {
+                        break;
+                    }
+                    sample.push_str(&chunk.content);
+                    sample.push('\n');
+                }
+                db.set_document_language(&id, &sample)?;
                 let mut ids = Vec::with_capacity(owned.len());
                 for (i, chunk) in owned.iter().enumerate() {
                     let chunk_id = ChunkId::generate();

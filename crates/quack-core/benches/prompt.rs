@@ -17,6 +17,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use quack_core::analysis::policy::WritePolicy;
+use quack_core::analysis::search::DocumentScope;
 use quack_core::analysis::text_to_sql::{self, PromptOptions};
 use quack_core::embedding::Dimension;
 use quack_core::ids::{ChunkId, DocumentId};
@@ -93,6 +94,7 @@ fn prompt(c: &mut Criterion) {
         )),
         context_max_tokens: Tokens::new(2_000),
         ollama_context_cap: None,
+        scope: DocumentScope::default(),
         question: None,
     };
     c.bench_function("build_system_prompt/150_tables", |b| {

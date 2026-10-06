@@ -39,7 +39,7 @@ use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, IssuedToken, Membership,
     Origin, Outcome, ResourceKind, Role, Scope, Standing, UserKind,
 };
-use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
+use quack_core::storage::workspace::{DocumentFields, DocumentStatus, NewChunk, NewDocument};
 use quack_core::web_sessions::WebSessions;
 
 /// The audit row a test's own setup writes.
@@ -8992,6 +8992,208 @@ async fn a_workspace_round_trips_through_a_snapshot_and_is_renamed_and_deleted()
             && rows.iter().any(|r| r.entry.action == AuditAction::Restore),
         "{rows:?}"
     );
+}
+
+/// Two documents about renewals, `policy.md` tagged `2026` and `notes.md`
+/// untagged, one chunk each.
+async fn seed_renewal_documents(h: &Harness, ws: &WorkspaceId) {
+    let db = h
+        .app
+        .workspace_db(ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    db.run(|db| {
+        for (id, name) in [("pol", "policy.md"), ("not", "notes.md")] {
+            let id = DocumentId::from(id);
+            db.insert_document(
+                &NewDocument::new(&id, name, "text/markdown", 1).with_status(DocumentStatus::Ready),
+            )?;
+            db.insert_chunk(&NewChunk {
+                id: &ChunkId::from(format!("{id}-c0")),
+                document_id: &id,
+                chunk_index: 0,
+                content: "Renewal terms for the policy year.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })?;
+            db.set_document_chunk_count(&id, 1)?;
+        }
+        db.set_document_fields(
+            &DocumentId::from("pol"),
+            &DocumentFields {
+                tags: Some(vec![String::from("2026")]),
+                ..DocumentFields::default()
+            },
+        )
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+}
+
+/// `POST .../search` scopes to documents, a filter, and a mode, carries
+/// each leg's rank, explains on request, refuses an unknown document with
+/// 422, and audits every search.
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_search_scopes_explains_and_is_audited() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("search", &owner).await;
+    seed_renewal_documents(&h, &ws).await;
+    let token = h.login("owner").await;
+    let path = format!("/api/v1/workspaces/{ws}/search");
+    let documents = |body: &serde_json::Value| -> Vec<String> {
+        body["chunks"]
+            .as_array()
+            .map(|c| {
+                c.iter()
+                    .filter_map(|c| c["filename"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let (status, body) = h
+        .post(&path, &token, serde_json::json!({ "query": "renewal" }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(documents(&body).len(), 2);
+    assert_eq!(body["chunks"][0]["keyword_rank"], 1, "{body}");
+    assert!(body["chunks"][0]["bm25"].as_f64().is_some(), "{body}");
+    assert!(body.get("explain").is_none());
+
+    let (status, body) = h
+        .post(
+            &path,
+            &token,
+            serde_json::json!({ "query": "renewal", "document_ids": ["notes.md"], "explain": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(documents(&body), ["notes.md"]);
+    assert_eq!(body["explain"]["keyword"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["explain"]["vector"], serde_json::json!([]));
+    assert_eq!(body["explain"]["rerank"], "not reranked");
+
+    let (status, body) = h
+        .post(
+            &path,
+            &token,
+            serde_json::json!({ "query": "renewal", "filters": { "tags": ["2026"] }, "mode": "keyword" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(documents(&body), ["policy.md"]);
+
+    let (status, body) = h
+        .post(
+            &path,
+            &token,
+            serde_json::json!({ "query": "renewal", "mode": "vector" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (status, body) = h
+        .post(
+            &path,
+            &token,
+            serde_json::json!({ "query": "renewal", "document_ids": ["missing.md"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.to_string().contains("missing.md"), "{body}");
+
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("search")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.entry.outcome == Outcome::Allowed)
+            .count(),
+        3,
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.entry.outcome == Outcome::Error)
+            .count(),
+        2,
+        "{rows:?}"
+    );
+
+    // The listing takes the same filter as query parameters.
+    let listing = format!("/api/v1/workspaces/{ws}/documents");
+    let (status, body) = h.get(&format!("{listing}?tags=2026"), &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["documents"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["documents"][0]["filename"], "policy.md");
+    let (status, body) = h
+        .get(&format!("{listing}?types=md&sources=upload"), &token)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["documents"].as_array().map(Vec::len), Some(2));
+    let (status, _) = h.get(&format!("{listing}?sources=carrier"), &token).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = h.get(&format!("{listing}?types=klingon"), &token).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// The web Search page searches in a POST body, shows each hit's ranks
+/// with a link to its passage, keeps the picked documents, and shows a
+/// refused search on the page; the chat form offers the ready documents.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_search_page_shows_ranks_and_the_chat_offers_documents() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("searchpage", &owner).await;
+    seed_renewal_documents(&h, &ws).await;
+    let cookie = web_session(&h, "owner").await;
+    let (status, html, _) = h.page(&format!("/w/{ws}/search"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(html.contains("name=\"query\""), "{html}");
+    assert!(
+        html.contains("<option value=\"pol\">policy.md</option>"),
+        "{html}"
+    );
+    assert!(html.contains("aria-current=\"page\">Search</a>"), "{html}");
+
+    let (status, html, _) = h
+        .form(
+            &format!("/w/{ws}/search"),
+            Some(&cookie),
+            "query=renewal&documents=pol&mode=keyword",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(html.contains("1 passages"), "{html}");
+    assert!(
+        html.contains(&format!("/w/{ws}/documents/pol/chunks/0")),
+        "{html}"
+    );
+    assert!(html.contains("<option value=\"pol\" selected>"), "{html}");
+    assert!(html.contains("Keyword leg: 1 candidates"), "{html}");
+    assert!(html.contains("not reranked"), "{html}");
+
+    let (status, html, _) = h
+        .form(
+            &format!("/w/{ws}/search"),
+            Some(&cookie),
+            "query=renewal&documents=missing",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(html.contains("role=\"alert\""), "{html}");
+    assert!(html.contains("no document matches"), "{html}");
+
+    let (status, html, _) = h.page(&format!("/w/{ws}/chat"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(html.contains("name=\"documents\" multiple"), "{html}");
 }
 
 /// A table's note, profile warnings, and Fix type over REST and the web

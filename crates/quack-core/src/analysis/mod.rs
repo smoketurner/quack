@@ -5,6 +5,7 @@ pub mod events;
 mod hooks;
 pub mod policy;
 pub mod rerank;
+pub mod search;
 pub mod table_search;
 pub mod text_to_sql;
 pub mod tools;

@@ -37,7 +37,7 @@ API Activity event with that name.
 | `show` | An ontology or graph status is shown | `allowed` | API: Read |
 | `stream` | A job or MCP event stream is opened | `allowed`, `denied` | API: Read |
 | `query` | An agent turn, over REST, the web chat, or MCP (`-p` and the terminal are unaudited) | `allowed`, `denied` (the provider is not allowed for the workspace), `error` | API: Read; with the content half, the `ai_operation` profile |
-| `search` | A retrieval without the model (`/search`, the MCP `search` tool) | `allowed`, `denied`, `error` | API: Read |
+| `search` | A document search without the agent (`POST .../search`, the web Search page, the MCP `search` tool); the detail holds the query and what it was limited to | `allowed`, `denied`, `error` | API: Read |
 | `sql` | A statement run directly (`/sql`, the SQL page, the MCP `sql` tool) | `allowed`, `denied` (a write without the write scope, an internal table), `error` | API: Read |
 | `ingest` | A file is uploaded, a document replaced, a bundle imported | `allowed`, `denied`, `error` | API: Create |
 | `import` | A Postgres, SQLite, or URL import is started | `allowed`, `error` | API: Create |

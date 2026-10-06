@@ -4,6 +4,7 @@ use super::*;
 use crate::analysis::chart::ChartKind;
 use crate::analysis::events::{self, AgentEvent, Delivery};
 use crate::analysis::policy::Approver;
+use crate::analysis::rerank::{RankFuture, Ranked};
 use crate::embedding::{Dimension, Profile, Prompts};
 use crate::graph::store::NewNode;
 use crate::graph::{Properties, Standing};
@@ -14,7 +15,7 @@ use crate::llm::EmbedModel;
 use crate::ontology::Mapping;
 use crate::ontology::store::Revision;
 use crate::storage::profile::{TableNote, TableProfile};
-use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
+use crate::storage::workspace::{ChunkScope, DocumentStatus, NewChunk, NewDocument, Ranks};
 
 #[expect(clippy::panic, reason = "test failure path")]
 fn fail_test(msg: &str) -> ! {
@@ -164,14 +165,14 @@ fn an_entity_filter_resolves_to_its_chunks_or_says_why_it_cannot() {
     );
 
     assert_eq!(
-        entity_chunks(&db, "acme", None).unwrap_or_default(),
+        DocumentSearch::entity_chunks(&db, "acme", None).unwrap_or_default(),
         [ChunkId::from("c1")],
         "the entry point normalizes the label"
     );
 
     // In the graph, but only from a table: the model is told to use
     // search_graph rather than reading an empty document search.
-    let tables_only = entity_chunks(&db, "Orgenics", None)
+    let tables_only = DocumentSearch::entity_chunks(&db, "Orgenics", None)
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
@@ -181,7 +182,7 @@ fn an_entity_filter_resolves_to_its_chunks_or_says_why_it_cannot() {
     );
 
     // Not in the graph at all, with and without a near label.
-    let near = entity_chunks(&db, "Acme Corporation", None)
+    let near = DocumentSearch::entity_chunks(&db, "Acme Corporation", None)
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
@@ -189,7 +190,7 @@ fn an_entity_filter_resolves_to_its_chunks_or_says_why_it_cannot() {
         near.contains("the closest labels are: Acme (organization)"),
         "{near}"
     );
-    let nothing = entity_chunks(&db, "Helsinki", None)
+    let nothing = DocumentSearch::entity_chunks(&db, "Helsinki", None)
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
@@ -401,6 +402,7 @@ fn hit(n: u32, filename: &str, content: &str) -> ChunkSearchResult {
         kind: SectionKind::Body,
         locator: None,
         ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
+        ranks: Ranks::default(),
     }
 }
 
@@ -946,8 +948,8 @@ async fn search_tool_runs_keyword_only_without_a_model_and_applies_the_reranker(
             &'a self,
             _query: &'a str,
             candidates: &'a [ChunkSearchResult],
-        ) -> rerank::RankFuture<'a> {
-            Box::pin(async move { Ok((0..candidates.len()).rev().collect()) })
+        ) -> RankFuture<'a> {
+            Box::pin(async move { Ok((0..candidates.len()).rev().map(Ranked::at).collect()) })
         }
         fn name(&self) -> &'static str {
             "reverse"
@@ -968,6 +970,7 @@ async fn search_tool_runs_keyword_only_without_a_model_and_applies_the_reranker(
                 top_k: None,
                 document_ids: Vec::new(),
                 entity: NonBlank::default(),
+                filters: DocumentFilter::default(),
             },
         )
         .await
@@ -994,6 +997,7 @@ async fn search_tool_runs_keyword_only_without_a_model_and_applies_the_reranker(
                 top_k: None,
                 document_ids: Vec::new(),
                 entity: NonBlank::default(),
+                filters: DocumentFilter::default(),
             },
         )
         .await
@@ -1068,6 +1072,7 @@ async fn search_documents_top_k_is_capped_regardless_of_what_the_model_asks_for(
                 top_k: Some(1_000_000),
                 document_ids: Vec::new(),
                 entity: NonBlank::default(),
+                filters: DocumentFilter::default(),
             },
         )
         .await
@@ -1284,6 +1289,7 @@ async fn search(db: &SharedDb, turn: &Turn, query: &str) -> String {
                 top_k: None,
                 document_ids: Vec::new(),
                 entity: NonBlank::default(),
+                filters: DocumentFilter::default(),
             },
         )
         .await
