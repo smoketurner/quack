@@ -5733,8 +5733,17 @@ async fn a_large_batch_of_uploads_is_spooled_and_processed() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    // The spooled bytes go in each job's `when_ended` hook, which runs on
+    // its own task after the lane slot is released: wait for it.
     let spool = h.app.config.workspace_uploads_dir(ws.as_str());
-    let left = std::fs::read_dir(&spool).map_or(0, Iterator::count);
+    let mut left = usize::MAX;
+    for _ in 0..200 {
+        left = std::fs::read_dir(&spool).map_or(0, Iterator::count);
+        if left == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert_eq!(left, 0, "spooled uploads left in {}", spool.display());
 }
 
