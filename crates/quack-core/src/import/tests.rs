@@ -621,3 +621,27 @@ async fn sqlite_imports_refuse_quacks_own_data_directory() {
         Path::new("a/b.db")
     );
 }
+
+/// sqlx's Any driver parses the source as a URL, which a Windows path does
+/// not survive: the path goes over as `sqlite:` and `/` separators, with
+/// the characters sqlx would read as a query or an escape encoded, and
+/// any query kept.
+#[test]
+fn a_sqlite_source_connects_by_a_url_every_platform_parses() {
+    let url = |s: &str| SourceUrl::from(String::from(s)).connect_url();
+    assert_eq!(
+        url(r"sqlite://C:\Users\me\data\src.db"),
+        "sqlite:C:/Users/me/data/src.db"
+    );
+    assert_eq!(url("sqlite:///srv/data/src.db"), "sqlite:/srv/data/src.db");
+    assert_eq!(
+        url("sqlite:rel/src.db?mode=ro"),
+        "sqlite:rel/src.db?mode=ro"
+    );
+    assert_eq!(url("sqlite:/a/100%#1.db"), "sqlite:/a/100%25%231.db");
+    assert_eq!(
+        url("postgres://u:p@h/db"),
+        "postgres://u:p@h/db",
+        "other sources go over as given"
+    );
+}

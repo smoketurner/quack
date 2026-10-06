@@ -50,7 +50,7 @@ pub struct TokenUsage {
 }
 
 /// A counter the provider did not report counts as zero here; a turn where
-/// it reported none at all is `None` (see [`TokenUsage::reported`]).
+/// it reported none at all is `None` (see `TokenUsage::reported`).
 impl From<rig::completion::Usage> for TokenUsage {
     fn from(usage: rig::completion::Usage) -> Self {
         Self {
@@ -779,15 +779,16 @@ impl BuildContext<'_> {
                     reader(),
                     ctx.analysis_config.max_query_rows,
                 )
-                .with_step_rows(ctx.analysis_config.step_result_rows as usize),
+                .with_step_rows(
+                    usize::try_from(ctx.analysis_config.step_result_rows).unwrap_or(usize::MAX),
+                ),
             )
             .tool(DescribeTableTool(reader()))
             .tool(ListTablesTool(reader()))
             .tool(ListDocumentsTool(reader()))
-            .tool(
-                CreateChartTool::new(reader())
-                    .with_step_rows(ctx.analysis_config.step_result_rows as usize),
-            )
+            .tool(CreateChartTool::new(reader()).with_step_rows(
+                usize::try_from(ctx.analysis_config.step_result_rows).unwrap_or(usize::MAX),
+            ))
             .temperature(0.1)
             .add_hook(InvalidToolCalls)
             .add_hook(EmptyAnswer);

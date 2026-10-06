@@ -3,10 +3,10 @@
 //! A workspace's owner can restrict it to some of the configured providers
 //! (`workspaces.allowed_providers`). The restriction is carried by a Tokio
 //! task-local, like [`crate::priority::Priority`] and
-//! [`super::acting::Acting`], so the one check, [`Egress::permit`], finds it
+//! [`super::acting::Acting`], so the one check, `Egress::permit`, finds it
 //! wherever a model request is made: when a model's client is built, and
 //! again as each request passes its provider's gates
-//! ([`super::limit::ProviderGates`]), which nothing quack sends goes around.
+//! (`llm::limit::ProviderGates`), which nothing quack sends goes around.
 //!
 //! Work enters a scope where it learns its workspace: `quack serve` scopes
 //! an empty slot around each request and fills it when the request's

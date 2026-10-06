@@ -219,7 +219,7 @@ impl OllamaEmbedder {
     /// The `num_ctx` for `chunk_size_tokens`-token inputs: twice the chunk
     /// size, since the chunker counts cl100k tokens and the embedding
     /// model's tokenizer may count more, rounded up to a power of two and
-    /// never below [`OLLAMA_EMBED_MIN_CTX`].
+    /// never below `OLLAMA_EMBED_MIN_CTX`.
     #[must_use]
     pub fn context_window(chunk_size_tokens: u32) -> u32 {
         chunk_size_tokens

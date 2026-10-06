@@ -3,7 +3,10 @@
 ## Continuous integration
 
 - **`.github/workflows/ci.yml`**: `fmt`, `clippy` (`--locked -D warnings`), `test`
-  (`cargo test --locked`, Linux + macOS), `dependency-review` (PRs), and `license-check`
+  (`cargo test --locked`, Linux + macOS cached, Windows uncached: a third debug cache would
+  push the entries past the 10 GB Actions budget), `docs` (`cargo doc --no-deps` with
+  `RUSTDOCFLAGS=-D warnings`, the same as `make doc`; `[workspace.lints.rustdoc]` denies
+  broken and private intra-doc links), `dependency-review` (PRs), and `license-check`
   (`cargo-deny check`). The toolchain comes from `rust-toolchain.toml` via `rustup show`;
   `Swatinem/rust-cache` caches builds (see [Build caching](#build-caching)). Actions are
   SHA-pinned. `permissions: {}` is set at the top, with `contents: read` per job.
@@ -120,7 +123,7 @@ total and `gh cache list` the entries. Remove stale generations with `gh cache d
 
 ## Releases (`release.yml` + `reusable-build.yml`)
 
-Trigger: an annotated `v*` tag pushed to the repository (for example `v0.2.0`), or
+Trigger: an annotated `v*` tag pushed to the repository (for example `v2026.10.3`; the scheme is `vYYYY.M.N`, the Nth release of that month), or
 `workflow_dispatch` for a dry run that builds everything and publishes nothing.
 
 Separate build and publish workflows make the provenance SLSA Build Level 3. Everything
@@ -133,7 +136,11 @@ attestation names `reusable-build.yml`, so a consumer can require that identity.
 `release.yml`:
 
 1. **gates**: `cargo fmt --check`, clippy, the test suite, `make crypto-gates`, and
-   `cargo deny check` through the pinned action.
+   `cargo deny check` through the pinned action. On a tag it then renders the release
+   notes: this tag's section of `docs/upgrading.md` (`scripts/upgrading-section.sh`; a
+   missing section fails the release) above the commits since the previous tag, grouped by
+   Conventional Commit type by git-cliff (`cliff.toml`, the same output `CHANGELOG.md`
+   holds), uploaded as the `release-notes` artifact.
    - The tests restore CI's `v1-check-Linux` cache read-only, which is why the job's
      `CARGO_*` environment must match `ci.yml`.
    - `make crypto-gates` requires `cargo tree -i ring -e normal` and
@@ -288,8 +295,9 @@ and `docker compose up -d`.
   actionlint 1.7 does not know the `$/` self-repository `uses:` form that zizmor asks for.
 - `docker buildx build --check -f Dockerfile .` (and `Dockerfile.release`,
   `Dockerfile.build`) validates the Dockerfiles without building.
-- CI builds on Linux and macOS only, so only a `workflow_dispatch` release run exercises
-  the macOS and Windows release builds. Run one before tagging after any build change.
+- CI tests on Linux, macOS, and Windows (the Windows entry builds uncached, so it is the
+  slowest), but only a `workflow_dispatch` release run exercises the release builds
+  themselves. Run one before tagging after any build change.
 - Pin every new action to a SHA (`secure_workflows.yml` enforces it). Resolve current SHAs
   with `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`.
 

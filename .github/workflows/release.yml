@@ -91,6 +91,33 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
+      # The release notes: this tag's Upgrading section first, then the
+      # commits since the previous tag grouped by type (cliff.toml). Rendered
+      # here because this job has the checkout; `publish` only downloads.
+      - name: Render the commits since the previous tag
+        if: github.ref_type == 'tag'
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: notes.body.md
+      - name: Put the upgrade steps first
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ./scripts/upgrading-section.sh "${TAG}" docs/upgrading.md > notes.md
+          printf '\n' >> notes.md
+          cat notes.body.md >> notes.md
+      - name: Upload the release notes
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-notes
+          path: notes.md
+          if-no-files-found: error
 
   version:
     name: Release version
@@ -172,6 +199,10 @@ jobs:
           pattern: packages-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-notes
+          path: notes
       - name: Collect SHA256SUMS
         run: |
           set -euo pipefail
@@ -182,7 +213,7 @@ jobs:
           rm ./*.sha256
           sha256sum -- *.tar.gz *.zip *.tar *.deb *.rpm > SHA256SUMS
       - name: Publish
-        run: gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag ./dist/*
+        run: gh release create "${GITHUB_REF_NAME}" --notes-file notes/notes.md --verify-tag ./dist/*
         env:
           GH_TOKEN: ${{ github.token }}
           # Without a checkout there is no git remote to infer the repository

@@ -365,7 +365,7 @@ impl FileLine {
         if let Some(path) = Self::file(text.trim_matches('\'').trim_matches('"')) {
             return Some(Self::Files(vec![path]));
         }
-        let words = shlex::split(text)?;
+        let words = Self::words(text)?;
         let paths: Vec<PathBuf> = words
             .iter()
             .map(|word| Self::file(word))
@@ -376,12 +376,26 @@ impl FileLine {
         // `#` opens a comment only where a word starts, so the line with
         // every `#` made an ordinary character splits into more words
         // exactly when a comment was dropped from it.
-        let whole = shlex::split(&text.replace('#', "x"));
+        let whole = Self::words(&text.replace('#', "x"));
         Some(if whole.is_some_and(|all| all.len() == words.len()) {
             Self::Files(paths)
         } else {
             Self::Comment
         })
+    }
+
+    /// The words of a pasted line as the terminal quoted them: POSIX shell
+    /// rules (backslash escapes, `#` comments) where terminals write them,
+    /// Windows command-line rules on Windows, where a dropped path is
+    /// double-quoted and its backslashes are separators.
+    #[cfg(not(windows))]
+    fn words(text: &str) -> Option<Vec<String>> {
+        shlex::split(text)
+    }
+
+    #[cfg(windows)]
+    fn words(text: &str) -> Option<Vec<String>> {
+        Some(winsplit::split(text))
     }
 
     /// `name` as a path, when it is a file quack can load: `~/` for the

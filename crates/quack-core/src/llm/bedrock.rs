@@ -6,7 +6,7 @@
 //! `credential_process`, assumed roles, web identity (EKS), and the ECS and
 //! EC2 instance roles.
 //!
-//! Two transports, one [`Session`] per provider:
+//! Two transports, one `Session` per provider:
 //!
 //! - `api = "converse"` (runtime only) is rig-bedrock over the AWS SDK's
 //!   own client. Its HTTPS client is wrapped here so a model call takes a
