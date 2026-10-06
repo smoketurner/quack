@@ -2,7 +2,8 @@ use std::ops::Range;
 
 use crate::embedding::Input;
 use crate::error::{Error, Result};
-use crate::ingestion::parser::{Extracted, Flow, Section};
+use crate::ingestion::parser::{Extracted, Flow, Section, SectionKind};
+use crate::ingestion::table::Table;
 
 /// Splits text into overlapping windows of BPE tokens.
 ///
@@ -90,8 +91,9 @@ impl Chunker {
 
     /// Chunk a parsed document by its flow: sectioned sources chunk
     /// section by section; a continuous source is windowed across its
-    /// pages under its title, else `fallback_heading`, each chunk carrying
-    /// the page it starts on.
+    /// body pages under each page's heading, else the document's title or
+    /// `fallback_heading`, each chunk carrying the page it starts on.
+    /// Tables, notes, and code are chunked their own way in either flow.
     ///
     /// # Errors
     ///
@@ -104,56 +106,75 @@ impl Chunker {
         match extracted.flow {
             Flow::Sectioned => self.sections(&extracted.sections),
             Flow::Continuous => {
-                self.pages(&extracted.sections, extracted.title().or(fallback_heading))
+                let fallback = extracted.title().or(fallback_heading);
+                let mut out = Vec::new();
+                let mut run: Vec<Section> = Vec::new();
+                for section in &extracted.sections {
+                    if section.kind == SectionKind::Body {
+                        run.push(section.clone());
+                        continue;
+                    }
+                    out.extend(self.pages(&run, fallback)?);
+                    run.clear();
+                    out.extend(self.sections(std::slice::from_ref(section))?);
+                }
+                out.extend(self.pages(&run, fallback)?);
+                Ok(out)
             }
         }
     }
 
     /// Window one running text across `pages`, with the pages' tokens
     /// joined by a blank line, so a window may span a page break. Each
-    /// chunk records the page its first token lies on and carries
-    /// `heading`.
+    /// chunk records the page its first token lies on and the heading in
+    /// force there (a page's own, carried on from the one before, else
+    /// `fallback`).
     ///
     /// # Errors
     ///
     /// Returns an error if a window falls outside the text's tokens.
-    pub fn pages(&self, pages: &[Section], heading: Option<&str>) -> Result<Vec<Chunk>> {
+    pub fn pages(&self, pages: &[Section], fallback: Option<&str>) -> Result<Vec<Chunk>> {
         let separator = self.bpe.encode("\n\n");
         let mut tokens: Vec<u32> = Vec::new();
-        let mut page_starts: Vec<(usize, Option<u32>)> = Vec::new();
+        let mut starts: Vec<(usize, Option<u32>, Option<String>)> = Vec::new();
         for page in pages {
             let page_tokens = self.bpe.encode(&page.text);
             if page_tokens.is_empty() {
                 continue;
             }
+            let heading = page.heading.clone().or_else(|| fallback.map(str::to_owned));
             if !tokens.is_empty() {
-                page_starts.push((tokens.len(), page.page));
+                starts.push((tokens.len(), page.page, heading.clone()));
                 tokens.extend_from_slice(&separator);
             }
-            page_starts.push((tokens.len(), page.page));
+            starts.push((tokens.len(), page.page, heading));
             tokens.extend_from_slice(&page_tokens);
         }
         let mut chunks = Vec::new();
         for window in self.windows(tokens.len()) {
-            let page = page_starts
+            let at = starts
                 .iter()
                 .rev()
-                .find(|(first_token, _)| *first_token <= window.start)
-                .and_then(|(_, page)| *page);
+                .find(|(first_token, _, _)| *first_token <= window.start);
             let content = self.decode(&tokens, window)?.trim().to_owned();
             if content.is_empty() {
                 continue;
             }
             chunks.push(Chunk {
                 content,
-                heading: heading.map(str::to_owned),
-                page,
+                heading: at.and_then(|(_, _, heading)| heading.clone()),
+                page: at.and_then(|(_, page, _)| *page),
+                kind: SectionKind::Body,
+                locator: None,
             });
         }
         Ok(chunks)
     }
 
-    /// Chunk every section, carrying its heading and page onto each chunk.
+    /// Chunk every section by its kind, carrying its heading, page, kind,
+    /// and locator onto each chunk: body and note text in token windows,
+    /// a table by rows with its header on every piece, code by lines with
+    /// the line each piece starts on.
     ///
     /// # Errors
     ///
@@ -161,15 +182,90 @@ impl Chunker {
     pub fn sections(&self, sections: &[Section]) -> Result<Vec<Chunk>> {
         let mut out = Vec::new();
         for section in sections {
-            for content in self.text(&section.text)? {
+            let pieces = match section.kind {
+                SectionKind::Body | SectionKind::Note => self
+                    .text(&section.text)?
+                    .into_iter()
+                    .map(|content| (content, section.locator.clone()))
+                    .collect(),
+                SectionKind::Table => self
+                    .table(&section.text)
+                    .into_iter()
+                    .map(|content| (content, section.locator.clone()))
+                    .collect(),
+                SectionKind::Code => self.lines(&section.text),
+            };
+            for (content, locator) in pieces {
                 out.push(Chunk {
                     content,
                     heading: section.heading.clone(),
                     page: section.page,
+                    kind: section.kind,
+                    locator,
                 });
             }
         }
         Ok(out)
+    }
+
+    /// A rendered table in pieces of at most `size` tokens, the header
+    /// and separator lines repeated on each; text that is not a rendered
+    /// table is one piece.
+    #[must_use]
+    pub fn table(&self, markdown: &str) -> Vec<String> {
+        let Some((header, rows)) = Table::split_rendered(markdown) else {
+            return vec![markdown.to_owned()];
+        };
+        let header_tokens = header
+            .iter()
+            .map(|l| self.bpe.count(l).saturating_add(1))
+            .sum::<usize>();
+        let mut pieces = Vec::new();
+        let mut piece: Vec<&str> = Vec::new();
+        let mut used = header_tokens;
+        for row in rows {
+            let cost = self.bpe.count(row).saturating_add(1);
+            if !piece.is_empty() && used.saturating_add(cost) > self.size {
+                pieces.push([header.as_slice(), piece.as_slice()].concat().join("\n"));
+                piece.clear();
+                used = header_tokens;
+            }
+            piece.push(row);
+            used = used.saturating_add(cost);
+        }
+        if !piece.is_empty() || pieces.is_empty() {
+            pieces.push([header.as_slice(), piece.as_slice()].concat().join("\n"));
+        }
+        pieces
+    }
+
+    /// Code in pieces of whole lines of at most `size` tokens, each with
+    /// `line N` for the 1-based line it starts on. A line longer than the
+    /// window is a piece of its own.
+    #[must_use]
+    pub fn lines(&self, text: &str) -> Vec<(String, Option<String>)> {
+        let mut pieces = Vec::new();
+        let mut piece: Vec<&str> = Vec::new();
+        let mut used = 0usize;
+        let mut first_line = 1usize;
+        for (index, line) in text.lines().enumerate() {
+            let cost = self.bpe.count(line).saturating_add(1);
+            if !piece.is_empty() && used.saturating_add(cost) > self.size {
+                pieces.push((piece.join("\n"), Some(format!("line {first_line}"))));
+                piece.clear();
+                used = 0;
+                first_line = index.saturating_add(1);
+            }
+            piece.push(line);
+            used = used.saturating_add(cost);
+        }
+        if !piece.is_empty() {
+            pieces.push((piece.join("\n"), Some(format!("line {first_line}"))));
+        }
+        pieces
+            .into_iter()
+            .filter(|(content, _)| !content.trim().is_empty())
+            .collect()
     }
 }
 
@@ -273,13 +369,18 @@ mod tests {
     }
 }
 
-/// A chunk ready to store: its text, where it came from, and the text to
-/// embed (the heading prepended so retrieval sees the context).
+/// A chunk ready to store: its text, where it came from, what kind of
+/// text it is, and the text to embed (the heading prepended so retrieval
+/// sees the context).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     pub content: String,
     pub heading: Option<String>,
     pub page: Option<u32>,
+    pub kind: SectionKind,
+    /// Where the chunk sits in a source without pages: `line 40`, `12:04`,
+    /// `chapter 3`, `message 2`.
+    pub locator: Option<String>,
 }
 
 impl Chunk {
@@ -302,16 +403,8 @@ mod section_tests {
     fn sections_keep_heading_and_page_on_every_chunk() {
         let words: Vec<String> = (0..120).map(|i| format!("w{i}")).collect();
         let sections = vec![
-            Section {
-                heading: Some(String::from("Exclusions")),
-                page: Some(3),
-                text: words.join(" "),
-            },
-            Section {
-                heading: None,
-                page: Some(4),
-                text: String::from("short"),
-            },
+            Section::body(Some(String::from("Exclusions")), words.join(" ")).on_page(Some(3)),
+            Section::body(None, "short").on_page(Some(4)),
         ];
         let chunks = Chunker::new(40, 5, "cl100k_base")
             .and_then(|c| c.sections(&sections))
@@ -343,11 +436,7 @@ mod section_tests {
 
     fn page(number: u32, words: usize) -> Section {
         let text: Vec<String> = (0..words).map(|i| format!("p{number}w{i}")).collect();
-        Section {
-            heading: None,
-            page: Some(number),
-            text: text.join(" "),
-        }
+        Section::body(None, text.join(" ")).on_page(Some(number))
     }
 
     #[test]
@@ -449,11 +538,7 @@ mod section_tests {
 
     #[test]
     fn continuous_pages_with_no_text_give_no_chunks() {
-        let pages = vec![Section {
-            heading: None,
-            page: Some(1),
-            text: String::new(),
-        }];
+        let pages = vec![Section::body(None, "").on_page(Some(1))];
         assert!(
             Chunker::new(50, 10, "cl100k_base")
                 .and_then(|c| c.pages(&pages, None))
@@ -469,10 +554,9 @@ mod section_tests {
             .and_then(|c| {
                 c.document(
                     &Extracted {
-                        title: None,
                         sections: sections.clone(),
                         flow: Flow::Sectioned,
-                        pages: None,
+                        ..Extracted::default()
                     },
                     Some("file"),
                 )
@@ -485,10 +569,9 @@ mod section_tests {
             .and_then(|c| {
                 c.document(
                     &Extracted {
-                        title: None,
                         sections,
                         flow: Flow::Continuous,
-                        pages: None,
+                        ..Extracted::default()
                     },
                     Some("file"),
                 )
@@ -504,5 +587,122 @@ mod section_tests {
                 .first()
                 .is_some_and(|c| c.content.contains("p2w0"))
         );
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    /// A chunk's kind, heading, page, and locator.
+    type Placed<'a> = (&'a str, Option<&'a str>, Option<u32>, Option<&'a str>);
+
+    fn chunker() -> Chunker {
+        Chunker::new(40, 5, "cl100k_base").unwrap_or_else(|_| unreachable_chunker())
+    }
+
+    #[expect(clippy::panic, reason = "test failure path")]
+    fn unreachable_chunker() -> ! {
+        panic!("the encoding exists")
+    }
+
+    #[test]
+    fn a_table_is_split_by_rows_with_its_header_on_every_piece() {
+        let rows: Vec<Vec<String>> =
+            std::iter::once(vec![String::from("Item"), String::from("Amount")])
+                .chain((0..30).map(|i| vec![format!("item number {i}"), format!("{i}00")]))
+                .collect();
+        let table = Table::from_rows(rows)
+            .map(|t| t.render())
+            .unwrap_or_default();
+        let pieces = chunker().table(&table);
+        assert!(pieces.len() > 1, "{pieces:?}");
+        for piece in &pieces {
+            assert!(
+                piece.starts_with("| Item | Amount |\n| --- | --- |\n| item"),
+                "{piece}"
+            );
+        }
+        let joined = pieces.join("\n");
+        assert!(joined.contains("| item number 29 | 2900 |"));
+        assert_eq!(
+            chunker().table("not a table"),
+            vec![String::from("not a table")]
+        );
+    }
+
+    #[test]
+    fn code_is_split_by_lines_with_the_starting_line_as_locator() {
+        let code: String = (1..=60)
+            .map(|i| format!("let v{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pieces = chunker().lines(&code);
+        assert!(pieces.len() > 1);
+        assert_eq!(
+            pieces.first().and_then(|(_, l)| l.as_deref()),
+            Some("line 1")
+        );
+        let second_start = pieces
+            .get(1)
+            .and_then(|(content, _)| content.lines().next())
+            .unwrap_or_default();
+        let second_locator = pieces
+            .get(1)
+            .and_then(|(_, l)| l.clone())
+            .unwrap_or_default();
+        let n: usize = second_locator
+            .trim_start_matches("line ")
+            .parse()
+            .unwrap_or(0);
+        assert_eq!(second_start, format!("let v{n} = {n};"));
+        assert!(chunker().lines("\n\n").is_empty());
+    }
+
+    #[test]
+    fn sections_carry_kind_and_locator_and_continuous_flow_keeps_tables_apart() {
+        let sections = vec![
+            Section::body(Some(String::from("A")), "body text").on_page(Some(1)),
+            Section::table(
+                Some(String::from("A")),
+                String::from("| x | y |\n| --- | --- |\n| 1 | 2 |"),
+            )
+            .on_page(Some(1)),
+            Section::body(None, "more body").on_page(Some(2)),
+            Section::note(Some(String::from("B")), "a note").at("message 2"),
+        ];
+        let chunks = chunker()
+            .document(
+                &Extracted {
+                    sections: sections.clone(),
+                    flow: Flow::Continuous,
+                    ..Extracted::default()
+                },
+                Some("file"),
+            )
+            .unwrap_or_default();
+        let summary: Vec<Placed<'_>> = chunks
+            .iter()
+            .map(|c| {
+                (
+                    c.kind.as_str(),
+                    c.heading.as_deref(),
+                    c.page,
+                    c.locator.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("body", Some("A"), Some(1), None),
+                ("table", Some("A"), Some(1), None),
+                ("body", Some("A"), Some(2), None),
+                ("note", Some("B"), None, Some("message 2")),
+            ]
+        );
+        let sectioned = chunker().sections(&sections).unwrap_or_default();
+        assert_eq!(sectioned.len(), 4);
+        assert_eq!(sectioned.get(1).map(|c| c.kind), Some(SectionKind::Table));
     }
 }

@@ -3,6 +3,7 @@ use crate::analysis::rerank::{ModelReranker, RerankOutcome, Reranked, apply};
 use crate::config::BedrockConfig;
 use crate::embedding::Dimension;
 use crate::ids::{ChunkId, ClassId, DocumentId, RelationId};
+use crate::ingestion::parser::SectionKind;
 use crate::ontology::Relation;
 use crate::storage::workspace::{ChunkSearchResult, WorkspaceDb};
 use crate::storage::writer::Writer;
@@ -188,6 +189,8 @@ fn rerank_hit(n: u32) -> ChunkSearchResult {
         heading: None,
         page: None,
         score: 1.0,
+        kind: SectionKind::Body,
+        locator: None,
         ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
     }
 }

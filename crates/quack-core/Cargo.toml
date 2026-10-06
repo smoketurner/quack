@@ -36,14 +36,17 @@ hyper-util    = { workspace = true, features = ["client-proxy"] }
 jiff          = { workspace = true, features = ["std", "serde", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
 jsonwebtoken  = { workspace = true, features = ["aws_lc_rs"] }
 keyring-core  = { workspace = true }
+mail-parser   = { workspace = true }
 metrics       = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 oauth2        = { workspace = true }
 office_oxide  = { workspace = true }
 pdf_oxide     = { workspace = true, features = ["legacy-crypto"] }
+pulldown-cmark = { workspace = true }
 quick-xml     = { workspace = true }
 reqwest       = { workspace = true, features = ["rustls", "http2"] }
 rig           = { workspace = true, features = ["agent", "bedrock", "derive", "memory", "reqwest"] } # rig's transport takes its TLS from reqwest's features above
+rtf-parser    = { workspace = true }
 rust-stemmers = { workspace = true }
 rustls        = { workspace = true, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
 schemars      = { workspace = true, features = ["derive"] }
@@ -54,6 +57,7 @@ serde         = { workspace = true, features = ["derive", "std"] }
 serde_json    = { workspace = true, features = ["std"] }
 sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite", "postgres", "any", "migrate", "macros", "tls-rustls-aws-lc-rs"] }
 strsim        = { workspace = true }
+subtp         = { workspace = true }
 tar           = { workspace = true }
 thiserror     = { workspace = true, features = ["std"] }
 tiktoken      = { workspace = true, features = ["vocabs-all"] }

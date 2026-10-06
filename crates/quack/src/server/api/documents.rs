@@ -25,7 +25,7 @@ use quack_core::analysis::tools::SharedDb;
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store::Revision;
 use quack_core::storage::workspace::{
-    ChunkSearchResult, DocumentInfo, DocumentSource, Pinning, WorkspaceDb,
+    ChunkSearchResult, DocumentFields, DocumentInfo, DocumentSource, Pinning, WorkspaceDb,
 };
 
 pub(crate) async fn list(
@@ -534,9 +534,14 @@ pub(crate) enum Enqueued {
     },
 }
 
+/// `PATCH .../documents/{doc}`: pin or unpin, and the fields a person may
+/// set (title, author, authored date, tags); each given field is applied.
 #[derive(Deserialize)]
 pub(crate) struct UpdateDocument {
-    pub pinned: Pinning,
+    #[serde(default)]
+    pub pinned: Option<Pinning>,
+    #[serde(flatten)]
+    pub fields: DocumentFields,
 }
 
 pub(crate) async fn update(
@@ -546,8 +551,67 @@ pub(crate) async fn update(
     Json(body): Json<UpdateDocument>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let document = set_pinned(&app, &access, &doc, body.pinned).await?;
+    if body.pinned.is_none() && body.fields.is_empty() {
+        return Err(ApiError::bad_request(
+            "nothing to change: give pinned, title, author, authored_at, or tags",
+        ));
+    }
+    let pinned = match body.pinned {
+        Some(pinning) => Some(set_pinned(&app, &access, &doc, pinning).await?),
+        None => None,
+    };
+    let document = if body.fields.is_empty() {
+        pinned
+    } else {
+        Some(set_fields(&app, &access, &doc, body.fields).await?)
+    };
     Ok(Json(serde_json::to_value(document)?))
+}
+
+/// Set a document's own fields, audited with what changed.
+pub(crate) async fn set_fields(
+    app: &App,
+    access: &Access,
+    doc: &DocumentId,
+    fields: DocumentFields,
+) -> ApiResult<DocumentInfo> {
+    let db = app.workspace_db(&access.membership.workspace.id).await?;
+    let (doc_id, detail) = (doc.clone(), serde_json::to_value(FieldsDetail(&fields))?);
+    let document = with_db(db, move |db| {
+        db.set_document_fields(&doc_id, &fields)?;
+        db.document(&doc_id)?
+            .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))
+    })
+    .await?;
+    access
+        .audit(
+            app,
+            AuditAction::Context,
+            Some(ResourceKind::Document.id(doc)),
+            Outcome::Allowed,
+            Some(detail),
+        )
+        .await?;
+    Ok(document)
+}
+
+/// The audit detail of a fields edit: which fields were set, never the
+/// values (a title or a tag is workspace content).
+struct FieldsDetail<'a>(&'a DocumentFields);
+
+impl Serialize for FieldsDetail<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let set: Vec<&str> = [
+            ("title", self.0.title.is_some()),
+            ("author", self.0.author.is_some()),
+            ("authored_at", self.0.authored_at.is_some()),
+            ("tags", self.0.tags.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, given)| given.then_some(name))
+        .collect();
+        serde_json::json!({ "fields": set }).serialize(serializer)
+    }
 }
 
 /// Pin or unpin, audited.

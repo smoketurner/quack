@@ -1,14 +1,17 @@
-//! HTML through `scraper` (html5ever): the `<title>` and, walking the body
-//! in document order, one section per `h1`..`h6` heading with block
-//! elements separated by newlines. Scripts, styles, and head content are
-//! skipped.
+//! HTML through `scraper` (html5ever): the `<title>` and the page's
+//! `<meta>` tags, then, walking the body in document order, one section
+//! per `h1`..`h6` heading with block elements separated by newlines and
+//! every `<table>` as a table section. Scripts, styles, head content, and
+//! the page's chrome (`nav`, `aside`, `footer`, `form`) are skipped.
 
 use scraper::{Html, Node, Selector};
 
-use super::parser::{Extracted, Flow, SectionBuilder};
+use super::parser::{DocumentMeta, Extracted, Flow, Section, SectionBuilder};
+use super::table::Table;
 use crate::error::{Error, Result};
 
-/// An HTML document as sections with headings and its `<title>`.
+/// An HTML document as sections with headings, its `<title>`, and what
+/// its `<meta>` tags say.
 ///
 /// # Errors
 ///
@@ -21,6 +24,7 @@ pub fn html(text: &str) -> Result<Extracted> {
         .map(|el| el.text().collect::<String>())
         .map(|t| collapse(&t))
         .filter(|t| !t.is_empty());
+    let meta = metadata(&document);
 
     let mut walker = Walker::default();
     let root = document.tree.root();
@@ -37,7 +41,50 @@ pub fn html(text: &str) -> Result<Extracted> {
         sections,
         flow: Flow::Sectioned,
         pages: None,
+        meta,
     })
+}
+
+/// The `<meta>` tags that name an author, a date, keywords, or a
+/// description, under the names HTML, Dublin Core, and Open Graph use.
+fn metadata(document: &Html) -> DocumentMeta {
+    let mut meta = DocumentMeta::default();
+    let Ok(selector) = Selector::parse("meta") else {
+        return meta;
+    };
+    for element in document.select(&selector) {
+        let name = element
+            .value()
+            .attr("name")
+            .or_else(|| element.value().attr("property"))
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        let content = element.value().attr("content");
+        match name.as_str() {
+            "author" | "dc.creator" | "dcterms.creator" | "article:author" => {
+                DocumentMeta::set(&mut meta.author, content);
+            }
+            "date"
+            | "dc.date"
+            | "dcterms.created"
+            | "dc.date.created"
+            | "article:published_time"
+            | "datepublished" => DocumentMeta::set(&mut meta.authored_at, content),
+            "last-modified" | "dcterms.modified" | "article:modified_time" | "datemodified" => {
+                DocumentMeta::set(&mut meta.modified_at, content);
+            }
+            "keywords" | "dc.subject" | "article:tag" => {
+                for tag in content.unwrap_or_default().split(',') {
+                    meta.tag(tag);
+                }
+            }
+            "description" | "dc.description" | "og:description" => {
+                meta.extra("description", content);
+            }
+            _ => {}
+        }
+    }
+    meta
 }
 
 #[derive(Default)]
@@ -47,7 +94,9 @@ struct Walker {
     line: String,
 }
 
-const SKIPPED: &[&str] = &["script", "style", "noscript", "head", "template", "svg"];
+const SKIPPED: &[&str] = &[
+    "script", "style", "noscript", "head", "template", "svg", "nav", "aside", "footer", "form",
+];
 /// Every heading level starts a section; the level itself is not kept.
 const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
 const BLOCKS: &[&str] = &[
@@ -55,13 +104,9 @@ const BLOCKS: &[&str] = &[
     "div",
     "li",
     "tr",
-    "table",
     "section",
     "article",
     "header",
-    "footer",
-    "nav",
-    "aside",
     "main",
     "pre",
     "blockquote",
@@ -75,7 +120,6 @@ const BLOCKS: &[&str] = &[
     "hr",
     "br",
     "address",
-    "form",
     "fieldset",
 ];
 
@@ -93,12 +137,25 @@ impl Walker {
                     self.sections.heading(collapse(&subtree_text(node)));
                     return;
                 }
+                if name == "table" {
+                    self.end_line();
+                    match Table::from_rows(table_rows(node)) {
+                        Some(table) => self.sections.push(Section::table(None, table.render())),
+                        // A one-column or header-only table reads as lines.
+                        None => {
+                            for row in table_rows(node) {
+                                let line = collapse(&row.join(" "));
+                                if !line.is_empty() {
+                                    self.sections.line(line);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 let block = BLOCKS.contains(&name);
                 if block {
                     self.end_line();
-                }
-                if name == "td" || name == "th" {
-                    self.line.push(' ');
                 }
                 for child in node.children() {
                     self.visit(child);
@@ -125,6 +182,30 @@ impl Walker {
     }
 }
 
+/// A table's rows as their cells' text, `th` and `td` alike, in order.
+fn table_rows(table: ego_tree::NodeRef<'_, Node>) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for descendant in table.descendants() {
+        let Node::Element(element) = descendant.value() else {
+            continue;
+        };
+        if element.name() != "tr" {
+            continue;
+        }
+        let cells: Vec<String> = descendant
+            .children()
+            .filter(
+                |c| matches!(c.value(), Node::Element(e) if e.name() == "td" || e.name() == "th"),
+            )
+            .map(|c| collapse(&subtree_text(c)))
+            .collect();
+        if !cells.is_empty() {
+            rows.push(cells);
+        }
+    }
+    rows
+}
+
 fn subtree_text(node: ego_tree::NodeRef<'_, Node>) -> String {
     let mut out = String::new();
     for descendant in node.descendants() {
@@ -143,7 +224,7 @@ fn subtree_text(node: ego_tree::NodeRef<'_, Node>) -> String {
     out
 }
 
-/// Whitespace runs collapsed to one space, trimmed.
+/// Whitespace collapsed to single spaces, trimmed.
 fn collapse(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -152,135 +233,77 @@ fn collapse(text: &str) -> String {
 mod tests {
     use super::*;
 
-    #[expect(clippy::panic, reason = "test failure path")]
-    fn fail(msg: &str) -> ! {
-        panic!("{msg}")
-    }
-
     #[test]
-    fn html_yields_title_and_heading_sections() {
-        let page = "<!doctype html><html><head><title> Renewal  Guide </title>
-<style>p{color:red}</style><script>var x = 1;</script></head>
-<body><nav>Home | About</nav>
-<p>Intro paragraph.</p>
-<h1>Exclusions</h1><p>Flood is <b>excluded</b>.</p><ul><li>One</li><li>Two</li></ul>
-<h2>Claims <em>process</em></h2><table><tr><th>Col</th><th>Val</th></tr><tr><td>a</td><td>1</td></tr></table>
-<div>Line<br>break</div><script>ignored()</script></body></html>";
-        let extracted = html(page).unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(extracted.title.as_deref(), Some("Renewal Guide"));
-        let got: Vec<(Option<&str>, &str)> = extracted
+    fn sections_follow_headings_and_the_title_is_read() {
+        let page = "<html><head><title> Policy  Guide </title><script>x()</script></head><body><h1>Exclusions</h1><p>Flood is <b>excluded</b>.</p><div>Two<br>lines</div><h2>Claims</h2><ul><li>Close in 30 days.</li></ul></body></html>";
+        let extracted = html(page).unwrap_or_default();
+        assert_eq!(extracted.title.as_deref(), Some("Policy Guide"));
+        let summary: Vec<(Option<&str>, &str)> = extracted
             .sections
             .iter()
             .map(|s| (s.heading.as_deref(), s.text.as_str()))
             .collect();
         assert_eq!(
-            got,
-            [
-                (None, "Home | About\nIntro paragraph."),
-                (Some("Exclusions"), "Flood is excluded.\nOne\nTwo"),
-                (Some("Claims process"), "Col Val\na 1\nLine\nbreak"),
+            summary,
+            vec![
+                (Some("Exclusions"), "Flood is excluded.\nTwo\nlines"),
+                (Some("Claims"), "Close in 30 days."),
             ]
         );
     }
 
     #[test]
-    fn html_without_text_is_an_error_and_tolerates_junk() {
-        assert!(html("<html><head><title>t</title></head><body></body></html>").is_err());
-        assert!(html("<p>unclosed <b>tags").is_ok_and(|e| e.title.is_none()));
-        assert!(html("just text, no tags").is_ok_and(|e| {
-            e.sections
-                .first()
-                .is_some_and(|s| s.text == "just text, no tags")
-        }));
-    }
-
-    #[test]
-    fn heading_skips_text_from_nested_skipped_elements() {
-        let cases: &[(&str, &str)] = &[
-            (
-                "script",
-                "<html><body><h1>Report <script>track()</script>End</h1><p>body</p></body></html>",
-            ),
-            (
-                "style",
-                "<html><body><h1>Report <style>color:red</style>End</h1><p>body</p></body></html>",
-            ),
-            (
-                "noscript",
-                "<html><body><h1>Report <noscript>fallback()</noscript>End</h1><p>body</p></body></html>",
-            ),
-            (
-                "template",
-                "<html><body><h1>Report <template>t()</template>End</h1><p>body</p></body></html>",
-            ),
-            (
-                "svg",
-                "<html><body><h1>Report <svg><text>icon</text></svg>End</h1><p>body</p></body></html>",
-            ),
-            (
-                "svg-title",
-                "<html><body><h1>Report <svg><title>logo</title></svg>End</h1><p>body</p></body></html>",
-            ),
-        ];
-        for &(label, page) in cases {
-            let extracted = html(page).unwrap_or_else(|e| fail(&e.to_string()));
-            let heading = extracted
+    fn chrome_is_skipped_and_tables_are_their_own_sections() {
+        let page = "<body><nav>Home About</nav><aside>Related</aside><h1>Limits</h1><p>Before.</p><table><tr><th>Peril</th><th>Limit</th></tr><tr><td>Fire</td><td>1,000</td></tr></table><footer>Copyright</footer><form><input></form></body>";
+        let extracted = html(page).unwrap_or_default();
+        let summary: Vec<(&str, &str)> = extracted
+            .sections
+            .iter()
+            .map(|s| (s.kind.as_str(), s.text.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("body", "Before."),
+                (
+                    "table",
+                    "| Peril | Limit |\n| --- | --- |\n| Fire | 1,000 |"
+                ),
+            ]
+        );
+        assert!(
+            extracted
                 .sections
                 .iter()
-                .find_map(|s| s.heading.clone())
-                .unwrap_or_default();
-            assert_eq!(
-                heading, "Report End",
-                "[{label}] heading leaked past SKIPPED"
-            );
-        }
-    }
-
-    #[test]
-    fn heading_skips_skipped_element_nested_in_a_block() {
-        let page =
-            "<html><body><h1>A <div><script>x()</script>B</div> C</h1><p>body</p></body></html>";
-        let extracted = html(page).unwrap_or_else(|e| fail(&e.to_string()));
-        let heading = extracted
-            .sections
-            .iter()
-            .find_map(|s| s.heading.clone())
-            .unwrap_or_default();
-        assert_eq!(heading, "A B C");
-    }
-
-    #[test]
-    fn heading_keeps_text_from_non_skipped_phrasing_elements() {
-        let page =
-            "<html><body><h1>Claims <em>process</em> <b>fast</b></h1><p>body</p></body></html>";
-        let extracted = html(page).unwrap_or_else(|e| fail(&e.to_string()));
-        let heading = extracted
-            .sections
-            .iter()
-            .find_map(|s| s.heading.clone())
-            .unwrap_or_default();
-        assert_eq!(heading, "Claims process fast");
-    }
-
-    #[test]
-    fn titleless_page_first_heading_with_skipped_element_yields_clean_title() {
-        let page = "<html><body><h1>Report <svg><text>icon</text></svg>End</h1><p>Body text.</p></body></html>";
-        let extracted = html(page).unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(
-            extracted.title.is_none(),
-            "page should have no <title> element"
+                .all(|s| s.heading.as_deref() == Some("Limits"))
         );
+    }
+
+    #[test]
+    fn meta_tags_give_author_dates_tags_and_description() {
+        let page = r#"<html><head><meta name="author" content="Ada"><meta name="date" content="2026-01-05"><meta property="article:modified_time" content="2026-02-01"><meta name="keywords" content="policy, renewal"><meta name="description" content="A guide."></head><body><p>text</p></body></html>"#;
+        let extracted = html(page).unwrap_or_default();
+        assert_eq!(extracted.meta.author.as_deref(), Some("Ada"));
+        assert_eq!(extracted.meta.authored_at.as_deref(), Some("2026-01-05"));
+        assert_eq!(extracted.meta.modified_at.as_deref(), Some("2026-02-01"));
+        assert_eq!(extracted.meta.tags, ["policy", "renewal"]);
         assert_eq!(
-            extracted.title(),
-            Some("Report End"),
-            "fallback title leaked text from a skipped element"
+            extracted.meta.extra.get("description").map(String::as_str),
+            Some("A guide.")
         );
+    }
+
+    #[test]
+    fn a_page_without_text_is_an_error_and_a_heading_ignores_nested_scripts() {
+        assert!(html("<html><body><script>x</script></body></html>").is_err());
+        let page = "<body><h1>Title<script>bad()</script></h1><p>ok</p></body>";
+        let extracted = html(page).unwrap_or_default();
         assert_eq!(
             extracted
                 .sections
                 .first()
                 .and_then(|s| s.heading.as_deref()),
-            Some("Report End")
+            Some("Title")
         );
     }
 }

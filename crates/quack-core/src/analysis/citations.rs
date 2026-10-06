@@ -20,6 +20,11 @@ pub struct Citation {
     pub chunk_index: u32,
     pub page: Option<u32>,
     pub heading: Option<String>,
+    /// Where the chunk sits in a source without pages (`line 40`,
+    /// `12:04`, `chapter 3`, `message 2`); `None` for a paged source and
+    /// on answers recorded before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
     /// When the document was ingested (UTC); `None` on answers recorded
     /// before it was kept.
     #[serde(default)]
@@ -51,6 +56,7 @@ impl Citation {
             chunk_index: hit.chunk_index,
             page: hit.page,
             heading: hit.heading.clone(),
+            locator: hit.locator.clone(),
             ingested_at: Some(hit.ingested_at),
             excerpt,
         }
@@ -63,6 +69,7 @@ impl Citation {
         let location = ChunkLocation {
             filename: &self.filename,
             page: self.page,
+            locator: self.locator.as_deref(),
             heading: self.heading.as_deref(),
         };
         match self.ingested_at {
@@ -76,6 +83,9 @@ impl Citation {
 pub struct ChunkLocation<'a> {
     pub filename: &'a str,
     pub page: Option<u32>,
+    /// `line 40`, `12:04`, `chapter 3`, `message 2`: the place in a source
+    /// that has no pages.
+    pub locator: Option<&'a str>,
     pub heading: Option<&'a str>,
 }
 
@@ -84,6 +94,7 @@ impl<'a> From<&'a ChunkSearchResult> for ChunkLocation<'a> {
         Self {
             filename: &chunk.filename,
             page: chunk.page,
+            locator: chunk.locator.as_deref(),
             heading: chunk.heading.as_deref(),
         }
     }
@@ -94,6 +105,9 @@ impl fmt::Display for ChunkLocation<'_> {
         write!(f, "{}", OneLine(self.filename))?;
         if let Some(page) = self.page {
             write!(f, ", page {page}")?;
+        }
+        if let Some(locator) = self.locator {
+            write!(f, ", {}", OneLine(locator))?;
         }
         if let Some(heading) = self.heading {
             write!(f, ", under \"{}\"", OneLine(heading))?;
@@ -266,6 +280,7 @@ fn is_channel_marker(inside: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingestion::parser::SectionKind;
 
     fn hit(id: &str, file: &str, idx: u32) -> ChunkSearchResult {
         ChunkSearchResult {
@@ -277,6 +292,8 @@ mod tests {
             heading: None,
             page: Some(idx.saturating_add(1)),
             score: 1.0,
+            kind: SectionKind::Body,
+            locator: None,
             ingested_at: DateTime::constant(2026, 10, 5, 14, 3, 0, 0),
         }
     }
@@ -404,6 +421,7 @@ mod tests {
             chunk_index: 0,
             page: Some(12),
             heading: Some(String::from("Exclusions")),
+            locator: None,
             ingested_at: Some(DateTime::constant(2026, 10, 5, 14, 3, 0, 0)),
             excerpt: String::new(),
         };
@@ -413,6 +431,11 @@ mod tests {
         );
         c.ingested_at = None;
         assert_eq!(c.label(), "policy.pdf, page 12, under \"Exclusions\"");
+        // A source without pages cites its locator instead.
+        c.page = None;
+        c.locator = Some(String::from("line 40"));
+        c.filename = String::from("main.rs");
+        assert_eq!(c.label(), "main.rs, line 40, under \"Exclusions\"");
     }
 
     /// An answer recorded before the ingestion time was kept still reads.

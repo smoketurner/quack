@@ -15,6 +15,7 @@ use quack_core::error::Error;
 use quack_core::graph::store::{self as graph_store, NewNode};
 use quack_core::graph::{Properties, Standing};
 use quack_core::ids::{ChunkId, ClassId, DocumentId};
+use quack_core::ingestion::parser::SectionKind;
 use quack_core::ingestion::{self, NewFile};
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::{
@@ -105,6 +106,8 @@ fn seed(db: &WorkspaceDb, chunks: u32, width: usize) {
             content: &format!("storm report {i}"),
             heading: Some("Reports"),
             page: None,
+            kind: SectionKind::Body,
+            locator: None,
             embedding: Some(&Vector::from(vector.clone())),
         })
         .unwrap();

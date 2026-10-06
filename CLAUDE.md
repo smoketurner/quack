@@ -94,7 +94,9 @@ cargo run --bin quack -- workspace create ws | workspace list [--format json]  #
 cargo run --bin quack -- workspace rename OLD NEW | delete NAME [-y] | snapshot NAME [--to FILE] | restore FILE|- [--name N]   # storage::backup: one tar (manifest.json, data.duckdb, files/); delete is at once, the audit rows stay
 cargo run --bin quack -- ingest sales.csv -w ws [--replace [ID]]               # file -> table(s) or chunks; --replace supersedes the document with the same name (or ID) once the new one is ready
 cargo run --bin quack -- ingest DIR -w ws [--prune]                            # every supported file under DIR (not a bundle), root and path recorded; re-run skips unchanged, replaces changed, reports gone files of that root (--prune deletes them)
-#   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX
+#   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX, EPUB, ODT, EML/MBOX, VTT/SRT, source code, RTF
+#   --author/--authored/--tag set what the file says about itself; a table inside a document with >= [ingestion].table_rows_as_table rows also loads as <stem>_tableN
+cargo run --bin quack -- docs [--tag ID TAG | --untag ID TAG | --author ID NAME | --authored ID DATE]   # a document's own fields; PATCH .../documents/{doc} over REST
 cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
@@ -236,6 +238,13 @@ the reason (`policy::Hold`) goes on the prompt, the `permission_required` event'
 `Hold::notice`, the sentence the card shows, as `notice`), and
 the refused step. Pinned documents, the workspace context, table rows, and the listing tools do
 not count, so a pinned document or a table cell can still dictate a write under allow-write.
+Every parser yields `parser::Section`s with a `kind` (`body`, `table`, `note`, `code`) and an
+optional `locator` beside the page (`line 40`, `12:04`, `chapter 3`, `message 2`), stored on
+`_quack_chunks` and rendered by every citation label (`analysis::citations::ChunkLocation`);
+tables are `ingestion::table::Table` rendered as pipe Markdown, chunked by rows with the header
+repeated, and loaded as document-owned workspace tables past `[ingestion].table_rows_as_table`.
+`parser::DocumentMeta` (author, dates, tags, other named values) comes from each format and
+lands on `_quack_documents`; `NewFile::fields` (the uploader's `DocumentFields`) wins over it.
 Chunk bodies, graph source excerpts, and pinned text reach the model inside `text::Fenced`
 markers, whose code is a digest of the enclosed text (so the text cannot close its own block),
 after a fixed sentence that it is data; an `always_retrieve` chunk is fenced too, as the `content`

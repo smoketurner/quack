@@ -21,6 +21,7 @@ use quack_core::config::{AnalysisConfig, GraphConfig, RetrievalConfig};
 use quack_core::embedding::{Dimension, Embedder, EmbeddingModel};
 use quack_core::error::Result as TurnResult;
 use quack_core::ids::{ChunkId, DocumentId};
+use quack_core::ingestion::parser::SectionKind;
 use quack_core::storage::sessions::{self, ChatMode, MessageRole};
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, Pinning, WorkspaceDb};
 use quack_core::storage::writer::Writer;
@@ -74,6 +75,8 @@ fn workspace() -> SharedDb {
             content,
             heading: Some("Refunds"),
             page: None,
+            kind: SectionKind::Body,
+            locator: None,
             embedding: None,
         })
         .unwrap();
@@ -223,6 +226,8 @@ async fn workspace_with_a_dictating_document(pinning: Pinning) -> SharedDb {
             ),
             heading: None,
             page: None,
+            kind: SectionKind::Body,
+            locator: None,
             embedding: None,
         })?;
         db.set_document_pinning(&id, pinning)
