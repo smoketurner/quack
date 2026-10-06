@@ -236,7 +236,7 @@ pub fn add_provenance(
 const NODE_COLUMNS: &str =
     "id, label, class_id, CAST(properties AS VARCHAR), provisional FROM _quack_graph_nodes";
 
-/// A node from a row selected with [`NODE_COLUMNS`].
+/// A node from a row selected with `NODE_COLUMNS`.
 impl TryFrom<&duckdb::Row<'_>> for Node {
     type Error = duckdb::Error;
 
@@ -255,7 +255,7 @@ impl TryFrom<&duckdb::Row<'_>> for Node {
 const EDGE_COLUMNS: &str = "id, source_node_id, target_node_id, relation_id, weight, \
      CAST(properties AS VARCHAR), provisional FROM _quack_graph_edges";
 
-/// An edge from a row selected with [`EDGE_COLUMNS`].
+/// An edge from a row selected with `EDGE_COLUMNS`.
 impl TryFrom<&duckdb::Row<'_>> for Edge {
     type Error = duckdb::Error;
 

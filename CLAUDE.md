@@ -522,7 +522,7 @@ with a warning when they do not), and the multi-arch `quack serve` image on GHCR
 prebuilt binaries (`Dockerfile.release`) plus image tarballs for air-gapped hosts. The
 `publish` job only downloads those artifacts, writes `SHA256SUMS`, and creates the release.
 `docker-compose.yml` with `deploy/config.toml` runs the image beside Ollama. Cut a release
-by pushing an annotated `vX.Y.Z` tag after the branch is pushed; `workflow_dispatch` builds
+by pushing an annotated `vYYYY.M.N` tag (`v2026.10.3`) after the branch is pushed and `docs/upgrading.md` has the tag's section (the release notes lead with it, then git-cliff's grouped commits); `workflow_dispatch` builds
 everything and publishes nothing.
 
 ## Where to read more
@@ -530,4 +530,9 @@ everything and publishes nothing.
 `docs/architecture.md` maps the design to the modules; `docs/migrations.md`,
 `docs/crypto.md`, `docs/web-ui.md`, and `docs/ci-cd.md` cover the schema, TLS, web UI, and
 release layers, `docs/authentication.md` covers signing in to quack, and `docs/providers.md`
-covers connecting to and authenticating with model providers. Read the relevant one before changing that layer.
+covers connecting to and authenticating with model providers. `docs/audit.md` lists every
+logged event type (a test keeps it in step with `AuditAction`), `docs/operations.md` the
+erase procedure and hardware sizing, `docs/upgrading.md` each release's upgrade steps (the
+version-bump PR adds the section; the release notes lead with it), `docs/compliance/` the
+control matrix, and `docs/contributing/` the recipes for a new parser, agent tool, or provider
+type. Read the relevant one before changing that layer.

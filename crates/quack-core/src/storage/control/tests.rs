@@ -1199,3 +1199,20 @@ async fn undefined_stored_audit_names_read_back_and_are_never_written() {
         "{refused:?}"
     );
 }
+
+/// `docs/audit.md` names every action the code writes, so the logged event
+/// types a reviewer reads cannot drift from the enum.
+#[test]
+fn every_audit_action_is_documented() {
+    let page = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/audit.md"))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let missing: Vec<&str> = AuditAction::ALL
+        .iter()
+        .map(AuditAction::as_str)
+        .filter(|action| !page.contains(&format!("| `{action}` |")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "docs/audit.md lacks a row for: {missing:?}"
+    );
+}

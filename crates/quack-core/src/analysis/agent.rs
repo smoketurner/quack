@@ -50,7 +50,7 @@ pub struct TokenUsage {
 }
 
 /// A counter the provider did not report counts as zero here; a turn where
-/// it reported none at all is `None` (see [`TokenUsage::reported`]).
+/// it reported none at all is `None` (see `TokenUsage::reported`).
 impl From<rig::completion::Usage> for TokenUsage {
     fn from(usage: rig::completion::Usage) -> Self {
         Self {

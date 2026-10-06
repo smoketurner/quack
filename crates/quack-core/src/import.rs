@@ -123,7 +123,7 @@ pub enum SourceKind {
 
 /// A source URL: `postgres://...`, `sqlite://path` or `sqlite:path`, or an
 /// `http(s)://` URL of a data file. It can carry a password, so `Debug`
-/// and `Display` show it redacted; only [`SourceUrl::expose`] gives the
+/// and `Display` show it redacted; only `SourceUrl::expose` gives the
 /// whole of it, to connect with.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SourceUrl(String);
