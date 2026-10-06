@@ -14,7 +14,7 @@ fn a_failed_revalidation_preview_is_shown_in_the_stale_banner() {
             title: String::from("Graph"),
             tab: Tab::Graph,
             username: String::from("ada"),
-            is_admin: false,
+            kind: UserKind::Standard,
             local: false,
             workspace: Some(WsNav {
                 id: String::from("w1"),

@@ -5,7 +5,7 @@
 /// The conversions a two-valued enum needs where it meets a boolean: a
 /// column or a JSON field that stores the flag, or a command-line switch.
 /// `From` in both directions (so serde's `from`/`into` can carry it) and
-/// `duckdb::ToSql` as the boolean.
+/// `duckdb::ToSql` and `FromSql` as the boolean.
 macro_rules! flag_enum {
     ($name:ident, false => $off:ident, true => $on:ident) => {
         impl From<bool> for $name {
@@ -26,6 +26,14 @@ macro_rules! flag_enum {
         impl ::duckdb::ToSql for $name {
             fn to_sql(&self) -> ::duckdb::Result<::duckdb::types::ToSqlOutput<'_>> {
                 Ok(::duckdb::types::ToSqlOutput::from(bool::from(*self)))
+            }
+        }
+
+        impl ::duckdb::types::FromSql for $name {
+            fn column_result(
+                value: ::duckdb::types::ValueRef<'_>,
+            ) -> ::duckdb::types::FromSqlResult<Self> {
+                bool::column_result(value).map(Self::from)
             }
         }
     };

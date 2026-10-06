@@ -147,7 +147,7 @@
       <ul class="mt-1 space-y-2 text-sm wrap-anywhere">
         {% for n in r.nodes %}
         <li id="node-{{ n.id }}" class="rounded border border-slate-800 bg-slate-900 p-2">
-          <span class="font-medium">{{ n.label }}</span> <span class="text-slate-400">({{ n.class_id }}){% if n.provisional %} · provisional{% endif %}</span>
+          <span class="font-medium">{{ n.label }}</span> <span class="text-slate-400">({{ n.class_id }}){% if n.standing == GraphStanding::Provisional %} · provisional{% endif %}</span>
           {% if !n.properties.is_empty() %}<div class="mt-1 font-mono text-xs text-slate-400">{{ n.properties }}</div>{% endif %}
           {% if !n.sources.is_empty() %}<div class="mt-1 text-xs text-slate-400">from {{ n.sources }}</div>{% endif %}
         </li>

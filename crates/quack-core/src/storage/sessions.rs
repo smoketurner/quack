@@ -65,9 +65,10 @@ text_enum!(MessageRole, "message role", {
     Tool => "tool",
 });
 
-/// Who besides its creator may read a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(from = "bool")]
+/// Who besides its creator may read a session. Serializes as the
+/// `shared` boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "bool", into = "bool")]
 pub enum Sharing {
     Private,
     /// Every member of the workspace.
@@ -85,7 +86,8 @@ pub struct SessionRow {
     /// The server user who started it; `None` from the CLI and TUI.
     pub created_by: Option<UserId>,
     /// Visible to every member of the workspace, not only the creator.
-    pub shared: bool,
+    #[serde(rename = "shared")]
+    pub sharing: Sharing,
     pub created_at: String,
     pub updated_at: String,
     pub message_count: i64,
@@ -106,7 +108,7 @@ impl TryFrom<&duckdb::Row<'_>> for SessionRow {
             updated_at: row.get(5)?,
             message_count: row.get(6)?,
             created_by: row.get(7)?,
-            shared: row.get(8)?,
+            sharing: row.get(8)?,
         })
     }
 }
@@ -120,7 +122,8 @@ impl SessionRow {
         match viewer {
             SessionViewer::All => true,
             SessionViewer::User(user_id) => {
-                self.shared || self.created_by.as_ref().is_none_or(|c| c == user_id)
+                self.sharing == Sharing::Shared
+                    || self.created_by.as_ref().is_none_or(|c| c == user_id)
             }
         }
     }

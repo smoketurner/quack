@@ -210,9 +210,10 @@ pub enum ProviderAllowList {
     Only(BTreeSet<String>),
 }
 
-/// Whether a new server user administers the server.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(from = "bool")]
+/// Whether a server user administers the server. Serializes as the
+/// `is_admin` boolean.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "bool", into = "bool")]
 pub enum UserKind {
     #[default]
     Standard,
@@ -269,7 +270,8 @@ pub struct WorkspaceTimes {
 pub struct UserRow {
     pub id: UserId,
     pub username: String,
-    pub is_admin: bool,
+    #[serde(rename = "is_admin")]
+    pub kind: UserKind,
     pub created_at: String,
 }
 
@@ -278,7 +280,7 @@ impl FromRow<'_, SqliteRow> for UserRow {
         Ok(Self {
             id: row.try_get("id")?,
             username: row.try_get("username")?,
-            is_admin: row.try_get("is_admin")?,
+            kind: UserKind::from(row.try_get::<bool, _>("is_admin")?),
             created_at: row.try_get("created_at")?,
         })
     }

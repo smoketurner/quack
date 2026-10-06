@@ -202,7 +202,7 @@ impl Harness {
             identity: Identity {
                 user_id: owner.clone(),
                 username: String::from("owner"),
-                is_admin: false,
+                kind: UserKind::Standard,
                 credential: Credential::Local,
                 client_addr: None,
                 request_id: None,
@@ -6487,7 +6487,7 @@ impl WaitingWrites {
             identity: Identity {
                 user_id: owner,
                 username: String::from("owner"),
-                is_admin: false,
+                kind: UserKind::Standard,
                 credential: Credential::Local,
                 client_addr: None,
                 request_id: None,

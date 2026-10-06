@@ -214,7 +214,11 @@ pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> 
                 "Created user '{}' ({}){}",
                 user.username,
                 user.id,
-                if user.is_admin { ", admin" } else { "" }
+                if user.kind == UserKind::Admin {
+                    ", admin"
+                } else {
+                    ""
+                }
             )?;
             out.flush()?;
         }
@@ -231,7 +235,11 @@ pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> 
                         "{}  {:<24} {}  {}",
                         user.id,
                         user.username,
-                        if user.is_admin { "admin " } else { "      " },
+                        if user.kind == UserKind::Admin {
+                            "admin "
+                        } else {
+                            "      "
+                        },
                         user.created_at
                     )
                 },

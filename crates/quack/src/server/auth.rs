@@ -22,8 +22,8 @@ use quack_core::llm::egress::Egress;
 use quack_core::oidc::Origin;
 use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditResource, Channel, Outcome, Role, Scope, TokenRow, UserRow,
-    WorkspaceRow,
+    AuditAction, AuditEntry, AuditResource, Channel, Outcome, Role, Scope, TokenRow, UserKind,
+    UserRow, WorkspaceRow,
 };
 use quack_core::storage::sessions::SessionViewer;
 use quack_core::web_sessions::{SessionLookup, SessionToken};
@@ -60,7 +60,7 @@ pub(crate) enum Credential {
 pub(crate) struct Identity {
     pub user_id: UserId,
     pub username: String,
-    pub is_admin: bool,
+    pub kind: UserKind,
     pub credential: Credential,
     pub client_addr: Option<String>,
     pub request_id: Option<String>,
@@ -302,7 +302,7 @@ impl Identity {
             return Ok(Self {
                 user_id: UserId::from(LOCAL_USER_ID),
                 username: String::from(LOCAL_USER_ID),
-                is_admin: true,
+                kind: UserKind::Admin,
                 credential: Credential::Local,
                 client_addr,
                 request_id,
@@ -343,7 +343,7 @@ impl Identity {
                 return Ok(Self {
                     user_id: user.id,
                     username: user.username,
-                    is_admin: user.is_admin,
+                    kind: user.kind,
                     credential: Credential::Session(SessionToken::presented(presented)),
                     client_addr,
                     request_id,
@@ -406,7 +406,7 @@ impl Identity {
         Ok(Self {
             user_id: user.id,
             username: user.username,
-            is_admin: user.is_admin,
+            kind: user.kind,
             credential: Credential::Token(token),
             client_addr,
             request_id,
@@ -427,7 +427,7 @@ impl Identity {
             Ok(user) => Ok(Self {
                 user_id: user.id,
                 username: user.username,
-                is_admin: user.is_admin,
+                kind: user.kind,
                 credential: Credential::IdentityProvider,
                 client_addr,
                 request_id,
@@ -500,7 +500,7 @@ impl Access {
 
     /// Owners and admins see every session; others see their own.
     fn sees_all_sessions(&self) -> bool {
-        self.identity.is_admin || self.role == Some(Role::Owner)
+        self.identity.kind == UserKind::Admin || self.role == Some(Role::Owner)
     }
 
     /// Which sessions the caller may read.
@@ -520,7 +520,7 @@ impl Access {
         }
         match self.role {
             Some(role) => role >= need.role,
-            None => need.admin_ok && self.identity.is_admin,
+            None => need.admin_ok && self.identity.kind == UserKind::Admin,
         }
     }
 
@@ -631,7 +631,9 @@ impl Access {
         };
         if !access.permits(need) {
             let reason = match access.role {
-                None if access.identity.is_admin => "admins read workspace content only as members",
+                None if access.identity.kind == UserKind::Admin => {
+                    "admins read workspace content only as members"
+                }
                 None => "not a member of this workspace",
                 Some(_) if access.identity.lacks_scope(need.scope) => "token lacks the scope",
                 Some(_) => "role does not allow this",
@@ -680,7 +682,7 @@ impl Identity {
 
     /// Server admins only; everything else is 403.
     pub(crate) fn require_admin(&self) -> ApiResult<()> {
-        if self.is_admin {
+        if self.kind == UserKind::Admin {
             Ok(())
         } else {
             Err(ApiError::forbidden("admin only"))

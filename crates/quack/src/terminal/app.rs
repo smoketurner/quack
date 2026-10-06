@@ -2450,7 +2450,11 @@ impl App {
                     "\n  {}  {:<10}  {}  {}{pages}",
                     doc.id.short(),
                     doc.status,
-                    if doc.pinned { "pinned" } else { "      " },
+                    if doc.pinning == Pinning::Pinned {
+                        "pinned"
+                    } else {
+                        "      "
+                    },
                     doc.filename
                 );
                 text.push_str(&line);

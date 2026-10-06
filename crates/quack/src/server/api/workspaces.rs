@@ -10,8 +10,8 @@ use axum::response::IntoResponse;
 use quack_core::ids::WorkspaceId;
 use quack_core::storage::audit;
 use quack_core::storage::control::{
-    AuditAction, Outcome, ProviderAllowList, ResourceKind, Role, WorkspaceChanges, WorkspaceName,
-    WorkspaceRow,
+    AuditAction, Outcome, ProviderAllowList, ResourceKind, Role, UserKind, WorkspaceChanges,
+    WorkspaceName, WorkspaceRow,
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,10 +51,10 @@ pub(crate) async fn list(
             .member_role(&token.workspace_id, &identity.user_id)
             .await?;
         ws.into_iter()
-            .filter(|_| role.is_some() || identity.is_admin)
+            .filter(|_| role.is_some() || identity.kind == UserKind::Admin)
             .map(|w| WorkspaceView::new(w, role))
             .collect()
-    } else if identity.is_admin {
+    } else if identity.kind == UserKind::Admin {
         let mine = app.control.workspaces_for_user(&identity.user_id).await?;
         let all = app.control.list_workspaces().await?;
         all.into_iter()

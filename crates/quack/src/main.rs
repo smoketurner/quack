@@ -42,7 +42,7 @@ use quack_core::prefix::PrefixMatch;
 use quack_core::progress::RunControl;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, ResourceKind, WorkspaceRow};
-use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
+use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
 use quack_core::storage::workspace::{DocumentSource, Pinning, QueryResults, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use quack_core::{config, doctor};
@@ -1548,7 +1548,11 @@ fn list_documents(db: &WorkspaceDb, format: TextOrJson, out: &mut impl Write) ->
             doc.id,
             doc.status,
             doc.source,
-            if doc.pinned { "pinned  " } else { "        " },
+            if doc.pinning == Pinning::Pinned {
+                "pinned  "
+            } else {
+                "        "
+            },
             doc.filename
         )
     })?;
@@ -1580,7 +1584,11 @@ fn list_sessions(db: &WorkspaceDb, format: TextOrJson, limit: u32) -> Result<()>
             row.message_count,
             row.model,
             row.title.as_deref().unwrap_or("(untitled)"),
-            if row.shared { "  (shared)" } else { "" }
+            if row.sharing == Sharing::Shared {
+                "  (shared)"
+            } else {
+                ""
+            }
         )
     })?;
     out.flush()?;

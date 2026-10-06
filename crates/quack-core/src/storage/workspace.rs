@@ -601,8 +601,9 @@ pub struct PinnedDocument {
 }
 
 /// Whether a document is sent to the model in full on every turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(from = "bool")]
+/// Serializes as the `pinned` boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "bool", into = "bool")]
 pub enum Pinning {
     Unpinned,
     /// Injected whole, within `[retrieval].pinned_token_budget`.
@@ -2358,7 +2359,11 @@ impl WorkspaceDb {
     /// Returns an error if the query fails.
     pub fn pinned_documents(&self) -> Result<Vec<PinnedDocument>> {
         let mut out = Vec::new();
-        for doc in self.list_documents()?.into_iter().filter(|d| d.pinned) {
+        for doc in self
+            .list_documents()?
+            .into_iter()
+            .filter(|d| d.pinning == Pinning::Pinned)
+        {
             let mut stmt = self.conn.prepare(
                 "SELECT content FROM _quack_chunks WHERE document_id = ? ORDER BY chunk_index",
             )?;
@@ -2889,7 +2894,8 @@ pub struct DocumentInfo {
     pub source: DocumentSource,
     pub status: DocumentStatus,
     pub error_message: Option<String>,
-    pub pinned: bool,
+    #[serde(rename = "pinned")]
+    pub pinning: Pinning,
     /// Chunks stored once processed; `None` until then and for tables.
     pub chunk_count: Option<i64>,
     /// Server user who uploaded it; `None` from the CLI.
@@ -3019,7 +3025,7 @@ impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
             size_bytes: row.get(3)?,
             status: row.get(4)?,
             error_message: row.get(5)?,
-            pinned: row.get(6)?,
+            pinning: row.get(6)?,
             ingested_at: row.get(7)?,
             title: row.get(8)?,
             sha256: row.get(9)?,

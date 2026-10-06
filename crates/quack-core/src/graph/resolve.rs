@@ -425,7 +425,7 @@ fn merge_nodes_in(db: &WorkspaceDb, keep: &NodeId, drop: &NodeId) -> Result<()> 
     properties.set_aliases(&aliases);
     conn.execute(
         "UPDATE _quack_graph_nodes SET properties = ?, provisional = provisional AND ? WHERE id = ?",
-        duckdb::params![properties.to_json(), drop_node.provisional, keep],
+        duckdb::params![properties.to_json(), drop_node.standing, keep],
     )?;
     // Repoint edges, dropping any that would duplicate an existing triple
     // or become a self-loop.

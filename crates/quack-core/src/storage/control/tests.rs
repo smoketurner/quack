@@ -253,7 +253,7 @@ async fn users_hash_verify_and_reject_duplicates() {
     assert!(
         alice
             .as_ref()
-            .is_ok_and(|u| u.is_admin && u.username == "alice")
+            .is_ok_and(|u| u.kind == UserKind::Admin && u.username == "alice")
     );
     assert!(
         cp.verify_password("alice", "hunter42")
@@ -311,7 +311,7 @@ async fn a_first_sign_in_creates_a_plain_user_and_never_takes_a_name() {
         "{}",
         first.username
     );
-    assert!(!first.is_admin);
+    assert_eq!(first.kind, UserKind::Standard);
     assert!(
         cp.workspaces_for_user(&first.id)
             .await

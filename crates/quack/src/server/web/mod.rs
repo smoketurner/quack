@@ -37,7 +37,7 @@ use quack_core::ontology::{
 use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditAction, AuditCursor, AuditFilter, AuditPage, AuditRow, Expiry, IssuedToken, MemberRow,
-    Membership, Outcome, ProviderAllowList, ResourceKind, Role, Scope, TokenRow, UserRow,
+    Membership, Outcome, ProviderAllowList, ResourceKind, Role, Scope, TokenRow, UserKind, UserRow,
     WorkspaceChanges, WorkspaceTimes,
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
@@ -74,7 +74,8 @@ use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::Revalidation;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    ExtractSource, GraphResult, GraphStatus, Origin, resolve, store as graph_store,
+    ExtractSource, GraphResult, GraphStatus, Origin, Standing as GraphStanding, resolve,
+    store as graph_store,
 };
 use quack_core::import::ImportRequest;
 use quack_core::jobs::JobNumber;
@@ -144,7 +145,7 @@ struct Page {
     /// The header link to mark as current.
     tab: Tab,
     username: String,
-    is_admin: bool,
+    kind: UserKind,
     local: bool,
     workspace: Option<WsNav>,
 }
@@ -255,7 +256,7 @@ impl Page {
             title: tab.label().to_owned(),
             tab,
             username: identity.username.clone(),
-            is_admin: identity.is_admin,
+            kind: identity.kind,
             local: app.mode == ServeMode::Local,
             workspace: None,
         }
@@ -766,7 +767,7 @@ struct GraphNodeView {
     id: NodeId,
     label: String,
     class_id: ClassId,
-    provisional: bool,
+    standing: GraphStanding,
     properties: String,
     sources: String,
 }
@@ -1019,7 +1020,7 @@ async fn workspaces(
     flash: Flashed,
 ) -> WebResult<Response> {
     let mut times = app.control.workspace_times().await?;
-    let items: Vec<WsItem> = if app.mode == ServeMode::Local || identity.is_admin {
+    let items: Vec<WsItem> = if app.mode == ServeMode::Local || identity.kind == UserKind::Admin {
         let mine = if app.mode == ServeMode::Local {
             Vec::new()
         } else {
@@ -1056,7 +1057,7 @@ async fn workspaces(
             .collect()
     };
     html(&WorkspacesPage {
-        can_create: identity.is_admin,
+        can_create: identity.kind == UserKind::Admin,
         page: Page::new(&app, &identity, Tab::Workspaces),
         workspaces: items,
         error: flash.error(),
@@ -2591,7 +2592,7 @@ impl GraphResultView {
                 id: n.id.clone(),
                 label: n.label.clone(),
                 class_id: n.class_id.clone(),
-                provisional: n.provisional,
+                standing: n.standing,
                 properties: n
                     .properties
                     .iter()
