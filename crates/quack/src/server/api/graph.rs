@@ -11,11 +11,14 @@ use quack_core::config::GraphConfig;
 use quack_core::extraction::{Extract, ExtractionRun};
 use quack_core::graph::extract::ChunkPlan;
 use quack_core::graph::resolve::{MergeDecision, MergeProposal, ResolutionSummary};
-use quack_core::graph::store::Revalidation;
-use quack_core::graph::{
-    ExtractSource, GraphStatus, Standing, extract, resolve, store as graph_store, tables,
+use quack_core::graph::store::{
+    Asserted, Assertion, Keep, NewEdge, NewNode, NodeEdit, Revalidation,
 };
-use quack_core::ids::{RunId, WorkspaceId};
+use quack_core::graph::{
+    Edge, ExtractSource, GraphStatus, Node, Properties, Standing, extract, resolve,
+    store as graph_store, tables,
+};
+use quack_core::ids::{ClassId, EdgeId, NodeId, RelationId, RunId, WorkspaceId};
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -132,6 +135,9 @@ pub(crate) struct ExtractRequest {
     pub sample: Option<u32>,
     #[serde(default)]
     pub reset: bool,
+    /// With `reset`: drop what people asserted too.
+    #[serde(default)]
+    pub all: bool,
 }
 
 /// Build the graph. Tables run now; documents run in the background with
@@ -150,7 +156,11 @@ pub(crate) async fn extract(
             &ExtractionPlan {
                 source: request.source,
                 sample: request.sample,
-                reset: request.reset,
+                reset: request.reset.then_some(if request.all {
+                    Keep::Nothing
+                } else {
+                    Keep::Asserted
+                }),
             },
         )
         .await?;
@@ -195,7 +205,8 @@ pub(crate) struct ExtractionCost {
 pub(crate) struct ExtractionPlan {
     pub source: ExtractSource,
     pub sample: Option<u32>,
-    pub reset: bool,
+    /// Clear the graph first, keeping this much.
+    pub reset: Option<Keep>,
 }
 
 impl Access {
@@ -230,8 +241,8 @@ impl Access {
                 Embeddings::from_config(&app.config).await,
             )
             .await?;
-        if reset {
-            with_db(Arc::clone(&db), graph_store::clear).await?;
+        if let Some(keep) = reset {
+            with_db(Arc::clone(&db), move |db| graph_store::clear(db, keep)).await?;
         }
         let table_summaries = if plan.source.includes_tables() {
             extract_tables_in_batches(&db, &ontology, standing).await?
@@ -588,5 +599,286 @@ impl Access {
         )
         .await?;
         Ok(proposal)
+    }
+}
+
+/// A node a person asserts over the API.
+#[derive(Deserialize)]
+pub(crate) struct CreateNode {
+    pub label: String,
+    pub class: ClassId,
+    #[serde(default)]
+    pub properties: Properties,
+    pub note: Option<String>,
+}
+
+/// An edge a person asserts over the API, between nodes by id.
+#[derive(Deserialize)]
+pub(crate) struct CreateEdge {
+    pub source: NodeId,
+    pub target: NodeId,
+    pub relation: RelationId,
+    #[serde(default)]
+    pub properties: Properties,
+    pub note: Option<String>,
+}
+
+/// A node correction over the API: [`NodeEdit`] plus the note.
+#[derive(Deserialize)]
+pub(crate) struct UpdateNode {
+    #[serde(flatten)]
+    pub edit: NodeEdit,
+    pub note: Option<String>,
+}
+
+pub(crate) async fn create_node(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+    Json(body): Json<CreateNode>,
+) -> ApiResult<(StatusCode, Json<Asserted<Node>>)> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let added = access.create_node(&app, body).await?;
+    let status = if added.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(added)))
+}
+
+pub(crate) async fn update_node(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, nid)): Path<(WorkspaceId, NodeId)>,
+    Json(body): Json<UpdateNode>,
+) -> ApiResult<Json<Node>> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    Ok(Json(access.update_node(&app, &nid, body).await?))
+}
+
+pub(crate) async fn delete_node(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, nid)): Path<(WorkspaceId, NodeId)>,
+) -> ApiResult<Json<Node>> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    Ok(Json(access.delete_node(&app, &nid).await?))
+}
+
+pub(crate) async fn create_edge(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+    Json(body): Json<CreateEdge>,
+) -> ApiResult<(StatusCode, Json<Asserted<Edge>>)> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let added = access.create_edge(&app, body).await?;
+    let status = if added.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(added)))
+}
+
+pub(crate) async fn delete_edge(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, eid)): Path<(WorkspaceId, EdgeId)>,
+) -> ApiResult<Json<Edge>> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    Ok(Json(access.delete_edge(&app, &eid).await?))
+}
+
+/// What a graph edit's audit row records.
+struct EditDetail {
+    op: &'static str,
+    label: Option<String>,
+    class: Option<String>,
+    relation: Option<String>,
+    note: Option<String>,
+}
+
+impl EditDetail {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "op": self.op,
+            "label": self.label,
+            "class": self.class,
+            "relation": self.relation,
+            "note": self.note,
+        })
+    }
+}
+
+/// A person's graph edits, shared by the API and the graph page: each
+/// one write on the workspace, audited as `graph_edit` with the node or
+/// edge as its resource. The author is the signed-in user.
+impl Access {
+    fn assertion(&self, note: Option<String>) -> Assertion {
+        Assertion {
+            author: Some(self.identity.username.clone()),
+            note,
+        }
+    }
+
+    /// Record a graph edit that went through.
+    async fn audit_edit(
+        &self,
+        app: &App,
+        kind: ResourceKind,
+        id: &str,
+        detail: EditDetail,
+    ) -> ApiResult<()> {
+        self.audit(
+            app,
+            AuditAction::GraphEdit,
+            Some(kind.id(id)),
+            Outcome::Allowed,
+            Some(detail.json()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn create_node(
+        &self,
+        app: &App,
+        body: CreateNode,
+    ) -> ApiResult<Asserted<Node>> {
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let assertion = self.assertion(body.note.clone());
+        let node = NewNode {
+            label: body.label,
+            class_id: body.class,
+            properties: body.properties,
+            standing: Standing::Reviewed,
+        };
+        let added = with_db(db, move |db| {
+            graph_store::create_node(db, &node, &assertion)
+        })
+        .await?;
+        self.audit_edit(
+            app,
+            ResourceKind::GraphNode,
+            added.subject.id.as_str(),
+            EditDetail {
+                op: if added.created { "create" } else { "assert" },
+                label: Some(added.subject.label.clone()),
+                class: Some(added.subject.class_id.to_string()),
+                relation: None,
+                note: body.note,
+            },
+        )
+        .await?;
+        Ok(added)
+    }
+
+    pub(crate) async fn update_node(
+        &self,
+        app: &App,
+        id: &NodeId,
+        body: UpdateNode,
+    ) -> ApiResult<Node> {
+        if body.edit.is_empty() {
+            return Err(ApiError::bad_request(
+                "nothing to change: give label, class, or properties",
+            ));
+        }
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let assertion = self.assertion(body.note.clone());
+        let (nid, edit) = (id.clone(), body.edit);
+        let node = with_db(db, move |db| {
+            graph_store::update_node(db, &nid, &edit, &assertion)
+        })
+        .await?;
+        self.audit_edit(
+            app,
+            ResourceKind::GraphNode,
+            id.as_str(),
+            EditDetail {
+                op: "update",
+                label: Some(node.label.clone()),
+                class: Some(node.class_id.to_string()),
+                relation: None,
+                note: body.note,
+            },
+        )
+        .await?;
+        Ok(node)
+    }
+
+    pub(crate) async fn delete_node(&self, app: &App, id: &NodeId) -> ApiResult<Node> {
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let nid = id.clone();
+        let node = with_db(db, move |db| graph_store::delete_node(db, &nid)).await?;
+        self.audit_edit(
+            app,
+            ResourceKind::GraphNode,
+            id.as_str(),
+            EditDetail {
+                op: "delete",
+                label: Some(node.label.clone()),
+                class: Some(node.class_id.to_string()),
+                relation: None,
+                note: None,
+            },
+        )
+        .await?;
+        Ok(node)
+    }
+
+    pub(crate) async fn create_edge(
+        &self,
+        app: &App,
+        body: CreateEdge,
+    ) -> ApiResult<Asserted<Edge>> {
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let assertion = self.assertion(body.note.clone());
+        let edge = NewEdge {
+            source: body.source,
+            target: body.target,
+            relation: body.relation,
+            properties: body.properties,
+        };
+        let added = with_db(db, move |db| {
+            graph_store::create_edge(db, &edge, &assertion)
+        })
+        .await?;
+        self.audit_edit(
+            app,
+            ResourceKind::GraphEdge,
+            added.subject.id.as_str(),
+            EditDetail {
+                op: if added.created { "create" } else { "assert" },
+                label: None,
+                class: None,
+                relation: Some(added.subject.relation_id.to_string()),
+                note: body.note,
+            },
+        )
+        .await?;
+        Ok(added)
+    }
+
+    pub(crate) async fn delete_edge(&self, app: &App, id: &EdgeId) -> ApiResult<Edge> {
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let eid = id.clone();
+        let edge = with_db(db, move |db| graph_store::delete_edge(db, &eid)).await?;
+        self.audit_edit(
+            app,
+            ResourceKind::GraphEdge,
+            id.as_str(),
+            EditDetail {
+                op: "delete",
+                label: None,
+                class: None,
+                relation: Some(edge.relation_id.to_string()),
+                note: None,
+            },
+        )
+        .await?;
+        Ok(edge)
     }
 }

@@ -67,8 +67,11 @@ signed-in user and reads no workspace, so it writes no audit row.
   Rename form, which gives a class or relation a new id and moves the graph's nodes and
   edges with it; and the paged review queue with bulk accept and reject.
 - **`graph.html`** shows status banners (provisional, stale, missing mapped tables,
-  drift), the search and path forms, the ECharts result with a node inspector, the merge
-  queue, and the extract, revalidate, and review buttons. The stale banner lists what a
+  chunks and tables the graph has not caught up with, drift), the search and path forms,
+  the ECharts result with a node inspector (each entry carries an edit form and a delete
+  button for people who may write; each edge a delete button), a "Correct the graph"
+  section with add-node and add-edge forms, the merge queue, and the extract, revalidate,
+  and review buttons. The stale banner lists what a
   revalidation would drop (totals, per class id, per relation id). Its button names those
   totals and posts them, and the server drops only when they still match what it counts.
   When the preview cannot be counted, the banner says why and offers no drop.

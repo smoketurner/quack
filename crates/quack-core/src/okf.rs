@@ -896,7 +896,9 @@ const ENTITY_QUERY: &str = concat!(
               to_json(list({'table_name': pr.table_name, 'row_key': pr.row_key, \
                             'chunk_id': pr.chunk_id, \
                             'document': coalesce(d.filename, pr.document_id), \
-                            'confidence': coalesce(pr.confidence, 1.0)} \
+                            'confidence': coalesce(pr.confidence, 1.0), \
+                            'author': pr.author, 'note': pr.note, \
+                            'asserted_at': CAST(pr.asserted_at AS VARCHAR)} \
                            ORDER BY pr.chunk_id, pr.table_name, pr.row_key))::VARCHAR AS sources \
        FROM _quack_provenance pr \
        JOIN _quack_graph_nodes g ON g.id = pr.subject_id \
@@ -924,8 +926,9 @@ struct EntityLink {
     path: String,
 }
 
-/// Where a node came from: a table row, or a document chunk (`document`
-/// is the file name, or the id when the document is gone).
+/// Where a node came from: a table row, a document chunk (`document` is
+/// the file name, or the id when the document is gone), or a person's
+/// assertion.
 #[derive(Deserialize)]
 struct EntitySource {
     table_name: String,
@@ -933,6 +936,12 @@ struct EntitySource {
     chunk_id: String,
     document: Option<String>,
     confidence: f64,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    asserted_at: Option<String>,
 }
 
 impl TryFrom<&duckdb::Row<'_>> for EntityFile {
@@ -1010,6 +1019,16 @@ impl EntityFile {
 impl EntitySource {
     /// The provenance line, linking the table or document stub.
     fn line(&self) -> String {
+        if let Some(asserted_at) = &self.asserted_at {
+            let assertion = graph::Origin::Manual {
+                author: self.author.clone(),
+                note: self.note.clone(),
+                asserted_at: asserted_at.clone(),
+            }
+            .assertion()
+            .unwrap_or_default();
+            return format!("- {assertion} ({asserted_at})");
+        }
         match (self.table_name.is_empty(), &self.document) {
             (false, _) => format!(
                 "- table [{}](../../tables/{}.md) row `{}`",

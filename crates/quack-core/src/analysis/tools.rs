@@ -2001,7 +2001,7 @@ async fn format_graph_result(
                 }
                 .to_string(),
             ),
-            Origin::Chunk { .. } => None,
+            Origin::Chunk { .. } | Origin::Manual { .. } => None,
         })
         .collect();
     if !rows.is_empty() {

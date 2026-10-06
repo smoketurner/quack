@@ -27,6 +27,7 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::graph::follow_up;
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery, UnknownEntity};
 use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
@@ -774,8 +775,18 @@ impl CliJob {
             .map_or(String::new(), |note| {
                 format!("\n{note}; the rest was kept.")
             });
+        let graph = follow_up::after_documents(
+            &env.db,
+            &env.config,
+            embedding_model.as_ref(),
+            std::slice::from_ref(&result.document_id),
+            control,
+        )
+        .await
+        .map_err(|e| anyhow!("graph follow-up failed: {e}"))?
+        .map_or(String::new(), |summary| format!("\n{summary}"));
         Ok(format!(
-            "Loaded {} ({}){tables}{chunks}{pages}\nYou can now ask questions about this data.",
+            "Loaded {} ({}){tables}{chunks}{pages}{graph}\nYou can now ask questions about this data.",
             result.filename, result.file_type
         ))
     }

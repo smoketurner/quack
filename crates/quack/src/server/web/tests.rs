@@ -38,7 +38,6 @@ fn a_failed_revalidation_preview_is_shown_in_the_stale_banner() {
         },
         drift: Vec::new(),
         has_ontology: true,
-        chunk_count: 0,
         revalidation: Some(Err(String::from("no ontology to validate against"))),
         merges: Vec::new(),
         query: GraphQueryView::default(),
