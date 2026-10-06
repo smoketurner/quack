@@ -8799,6 +8799,98 @@ async fn readiness_and_metrics_are_served_outside_the_limiter() {
     );
 }
 
+/// Where [`the_workspace_file_opens_in_another_process`] finds the file.
+const PROBE_FILE: &str = "QUACK_TEST_PROBE_FILE";
+
+/// Run in a child process by [`opens_in_another_process`]: `DuckDB` there
+/// takes the file only when no connection in the parent holds it, on
+/// every OS (a lock on Unix, the share mode on Windows).
+#[test]
+#[ignore = "run in a child process by a snapshot test"]
+fn the_workspace_file_opens_in_another_process() {
+    let Some(path) = std::env::var_os(PROBE_FILE) else {
+        return;
+    };
+    let read_only = duckdb::Config::default()
+        .access_mode(duckdb::AccessMode::ReadOnly)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    duckdb::Connection::open_with_flags(path, read_only).unwrap_or_else(|e| fail(&e.to_string()));
+}
+
+/// Whether another process can open `path` now.
+fn opens_in_another_process(path: &std::path::Path) -> bool {
+    let probe = std::env::current_exe()
+        .and_then(|test| {
+            std::process::Command::new(test)
+                .args([
+                    "--exact",
+                    "server::tests::the_workspace_file_opens_in_another_process",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env(PROBE_FILE, path)
+                .output()
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let report = String::from_utf8_lossy(&probe.stdout);
+    // A filter that matched nothing would pass vacuously.
+    assert!(
+        report.contains("1 passed") || report.contains("1 failed"),
+        "{report}"
+    );
+    probe.status.success()
+}
+
+/// A snapshot copies the file with every connection to it closed, which
+/// Windows requires (#448), and then the workspace serves reads, writes,
+/// and audit rows on its reopened connections.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_copies_the_file_closed_and_the_workspace_reopens() {
+    let h = harness(ServeMode::Login).await;
+    let admin = h.user("root", UserKind::Admin).await;
+    let ws = h.workspace("sales", &admin).await;
+    let token = h.login("root").await;
+    let sql = |s: &str| serde_json::json!({ "sql": s });
+    let path = format!("/api/v1/workspaces/{ws}/sql");
+    let (status, body) = h
+        .post(&path, &token, sql("CREATE TABLE t AS SELECT 7 AS a"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let file = h.app.config.workspace_db_path(ws.as_str());
+    assert!(
+        !opens_in_another_process(&file),
+        "the open workspace let another process in"
+    );
+
+    let probed = file.clone();
+    let closed = h
+        .app
+        .with_workspace_closed(&ws, move || Ok(opens_in_another_process(&probed)))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert!(closed, "a connection held the file during the copy");
+    assert!(
+        !opens_in_another_process(&file),
+        "the workspace did not reopen"
+    );
+
+    let (status, body) = h.post(&path, &token, sql("INSERT INTO t VALUES (8)")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .post(&path, &token, sql("SELECT sum(a) AS s FROM t"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0][0], 15, "{body}");
+    let (status, rows) = h
+        .get(&format!("/api/v1/workspaces/{ws}/audit"), &token)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert!(
+        rows["audit"].as_array().is_some_and(|rows| rows.len() >= 3),
+        "{rows}"
+    );
+}
+
 /// A snapshot carries the file, its members, and its settings; a restore
 /// brings them back under a new id; a rename and a delete follow, the
 /// delete refused while a job of the workspace is active and keeping the

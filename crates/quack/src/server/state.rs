@@ -42,6 +42,95 @@ struct WorkspaceHandle {
     audit: Arc<AuditLog>,
 }
 
+/// What follows work done with a workspace's file closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterClose {
+    /// Open the file again for the handle's connections (a snapshot).
+    Reopen,
+    /// Leave it closed: the workspace is going (a delete).
+    StayClosed,
+}
+
+/// Whether a handle's connections are open after [`WorkspaceHandle::with_file_closed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileState {
+    Open,
+    Closed,
+}
+
+impl WorkspaceHandle {
+    /// Run `work` with every connection to the workspace file closed (the
+    /// writer, the reader pool, the audit connection), since Windows lets no
+    /// other handle open a `DuckDB` file in use (#448); then, for
+    /// [`AfterClose::Reopen`], open it again through `WorkspaceDb::open` in
+    /// place, so whoever holds this handle carries on with the new
+    /// connections. Meanwhile writes and audit rows wait on their threads
+    /// and reads on their locked connections.
+    async fn with_file_closed<T, F>(
+        &self,
+        config: &Config,
+        workspace_id: &WorkspaceId,
+        after: AfterClose,
+        work: F,
+    ) -> (CoreResult<T>, FileState)
+    where
+        T: Send + 'static,
+        F: FnOnce() -> CoreResult<T> + Send + 'static,
+    {
+        // Always writer, then audit, then readers, so two of these never
+        // wait on each other.
+        let mut writer = match self.writer.lend().await {
+            Ok(lease) => lease,
+            Err(e) => return (Err(e), FileState::Open),
+        };
+        let mut audit = match self.audit.lend().await {
+            Ok(lease) => lease,
+            Err(e) => return (Err(e), FileState::Open),
+        };
+        let reader = self.reader.clone();
+        let config = config.clone();
+        let id = workspace_id.clone();
+        let closed = tokio::task::spawn_blocking(move || {
+            let mut readers = reader.lend();
+            // A lease dropped unchanged gives its connection back.
+            if let Err(e) = writer.db().and_then(WorkspaceDb::checkpoint) {
+                return (Err(e), FileState::Open);
+            }
+            readers.close();
+            audit.close();
+            writer.close();
+            let worked = work();
+            if after == AfterClose::StayClosed {
+                return (worked, FileState::Closed);
+            }
+            // On a failure everything stays closed, so a fresh open is the
+            // only one in the process.
+            let reopened = WorkspaceDb::open(&config, id.as_str())
+                .and_then(|db| db.try_clone_reader().map(|clone| (db, clone)));
+            let state = match reopened {
+                Ok((db, clone)) => {
+                    readers.restore(&db);
+                    audit.restore(clone);
+                    writer.restore(db);
+                    FileState::Open
+                }
+                Err(e) => {
+                    tracing::error!(workspace = %id, error = %e, "the workspace did not reopen");
+                    FileState::Closed
+                }
+            };
+            (worked, state)
+        })
+        .await;
+        // Release builds abort on a panic, so a failed join is the runtime
+        // shutting down, and each lease's drop hands back what it held.
+        closed.unwrap_or_else(|e| {
+            let failed = std::io::Error::other(format!("the closed-file task failed: {e}"));
+            (Err(CoreError::Io(failed)), FileState::Open)
+        })
+    }
+}
+
 /// How the server knows who is asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ServeMode {
@@ -257,14 +346,51 @@ impl AppState {
                 .filter_map(|key| mcp.remove(key))
                 .collect::<Vec<_>>()
         };
-        let handle = self.workspaces.lock().await.remove(workspace_id);
+        let cell = self.workspaces.lock().await.remove(workspace_id);
+        // A request that still holds the handle fails from here on rather
+        // than keep the file open under the delete.
+        if let Some(handle) = cell.as_ref().and_then(|cell| cell.get()) {
+            let (closed, _) = handle
+                .with_file_closed(
+                    &self.config,
+                    workspace_id,
+                    AfterClose::StayClosed,
+                    || Ok(()),
+                )
+                .await;
+            closed?;
+        }
         let closed = tokio::task::spawn_blocking(move || {
             drop(transports);
-            drop(handle);
+            drop(cell);
         });
         closed
             .await
             .map_err(|e| ApiError::internal(format!("closing the workspace failed: {e}")))
+    }
+
+    /// Run `work` with the workspace's file closed, then reopen it (see
+    /// [`WorkspaceHandle::with_file_closed`]): this workspace's requests
+    /// wait for it, other workspaces do not. A file that does not reopen
+    /// is forgotten, so the next request opens it afresh.
+    pub(crate) async fn with_workspace_closed<T, F>(
+        &self,
+        workspace_id: &WorkspaceId,
+        work: F,
+    ) -> ApiResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> CoreResult<T> + Send + 'static,
+    {
+        let handle = self.workspace_handle(workspace_id).await?;
+        let (done, state) = handle
+            .with_file_closed(&self.config, workspace_id, AfterClose::Reopen, work)
+            .await;
+        if state == FileState::Closed {
+            let cell = self.workspaces.lock().await.remove(workspace_id);
+            drop(tokio::task::spawn_blocking(move || drop(cell)));
+        }
+        Ok(done?)
     }
 
     /// Whether this server can serve: `control.db` answers, the data

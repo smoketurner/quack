@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use super::*;
 use crate::analysis::chart::ChartKind;
@@ -868,6 +869,47 @@ async fn observe_write_degrades_every_clone_once_a_temp_table_appears() {
             .await
             .is_ok()
     );
+}
+
+/// A read waits on a lent pool; restored, it runs on the new clones, and
+/// closed for good, it fails rather than reach a closed file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_lease_holds_reads_until_its_connections_return() {
+    let db = shared_db();
+    db.run(|db| db.execute_statement("CREATE TABLE t AS SELECT 1 AS a"))
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    let reader_db = ReaderDb::open(&db, 2).await;
+    let read = || {
+        let reader_db = reader_db.clone();
+        tokio::spawn(async move {
+            reader_db
+                .with_db(|db| db.execute_query("SELECT a FROM t").map(|r| r.rows))
+                .await
+        })
+    };
+
+    let writer = db
+        .lend()
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    let mut readers = reader_db.lend();
+    readers.close();
+    let waiting = read();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!waiting.is_finished(), "a read ran on a lent pool");
+    readers.restore(writer.db().unwrap_or_else(|e| fail_test(&e.to_string())));
+    drop(readers);
+    drop(writer);
+    let rows = waiting.await;
+    assert!(
+        rows.as_ref()
+            .is_ok_and(|r| r.as_ref().is_ok_and(|rows| rows == &vec![vec![json!(1)]])),
+        "{rows:?}"
+    );
+
+    reader_db.lend().close();
+    assert!(matches!(read().await, Ok(Err(Error::WriterStopped))));
 }
 
 /// The four `creates_temp_object` bypasses: a leading line comment, a

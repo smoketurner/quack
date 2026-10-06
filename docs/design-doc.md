@@ -2464,8 +2464,13 @@ through that type. Workspaces created before the rule keep their names and still
 `{data_dir}/workspaces/{id}` plus a `control.db` row, and `storage::backup` moves the pair as
 one tar: `manifest.json` first (format version, the quack, schema, and DuckDB versions that
 wrote the file, the embedding profile, the name, classification, provider allow-list, and
-members by username and role; never tokens), then `data.duckdb` after a `CHECKPOINT` on the
-writer's thread, so no write lands between the checkpoint and the copy, then `files/`.
+members by username and role; never tokens), then `data.duckdb`, then `files/`. The file is
+copied closed: a `CHECKPOINT`, then every connection to it closes (the writer, the reader
+pool, and the server's audit connection), the tar is written, and the file opens again
+through `WorkspaceDb::open`. Windows lets no other handle read a DuckDB file in use, so this
+is the one path on every OS (#448). In `quack serve` the tar is spooled to an unnamed file
+under the data directory while the file is closed, and the download streams from it; the
+workspace's requests wait for the copy, not the download, and other workspaces never wait.
 `quack workspace snapshot NAME [--to FILE]`, the Settings page's download, and
 `GET .../snapshot` write it; `quack workspace restore FILE [--name N]` and
 `POST /api/v1/workspaces/restore` read it: a new row (the manifest's name unless given),
@@ -2478,8 +2483,9 @@ The restore is audited as `restore` with the snapshot's date and version in the 
 `quack workspace rename OLD NEW` and `name` on `PATCH .../workspaces/{id}` (the Settings
 page's Name field) change the name the unique index guards. `quack workspace delete NAME`
 (asks; `-y` skips), `DELETE .../workspaces/{id}`, and the Settings page's form (the name
-typed again) delete at once: the server lets go of the open file and its MCP transports
-(409 while a job of the workspace is queued or running), the row goes with its members and
+typed again) delete at once: the server closes the file the same way, its connections staying
+closed, and lets go of its MCP transports (409 while a job of the workspace is queued or
+running), the row goes with its members and
 API tokens in one audited transaction, then the directory. `audit_log` has no foreign key to
 `workspaces`, so the rows stay. There is no archive state and no undo; the snapshot is the
 undo.
@@ -2934,11 +2940,10 @@ properties explicitly.
    half of a hybrid query, so look at the term index before the vector scan at that size.
    All requests on a workspace share one connection, so other requests queue behind these
    latencies while a search runs.
-3. **One file is the boundary, so one file is the backup unit.** Back up a workspace by
-   copying its directory while the server holds no write transaction. A
-   `quack workspace snapshot NAME` that does this through DuckDB's `CHECKPOINT` is still
-   unwritten (section 19, step 13). There is no cross-workspace transaction, and none is
-   needed.
+3. **One file is the boundary, so one file is the backup unit.** Back up a workspace with
+   `quack workspace snapshot NAME`, which checkpoints, closes the file for the length of
+   the copy, and opens it again (section 11). There is no cross-workspace transaction, and
+   none is needed.
 4. **Storage backend seam: not built.** The intent was small traits over retrieval,
    `graph/`, and `ontology/`, so a Postgres + pgvector backend could be added without
    touching the agent or the interfaces. The code takes `&WorkspaceDb` directly; the only
