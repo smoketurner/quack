@@ -28,6 +28,7 @@ needs (config keys, schema moves, `quack embeddings refresh`) are in
 
 ### Build and CI
 
+- **cliff:** End the changelog with exactly one newline
 - **cliff:** End the changelog with a newline
 ## v2026.10.3 (2026-10-05)
 
@@ -427,4 +428,3 @@ needs (config keys, schema moves, `quack embeddings refresh`) are in
 ### Docker
 
 - Bump alpine from 3.22 to 3.24 ([#38](https://github.com/smoketurner/quack/pull/38))
-

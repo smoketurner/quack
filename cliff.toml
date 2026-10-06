@@ -1,6 +1,6 @@
 # git-cliff configuration: release notes and CHANGELOG.md from the
 # Conventional Commits this repository requires (.claude/rules/commits-and-issues.md).
-# `git cliff --latest` renders the newest tag; release.yml renders the tag being
+# `make changelog` renders CHANGELOG.md; release.yml renders the tag being
 # published and puts that version's docs/upgrading.md section above it.
 
 [changelog]
@@ -25,12 +25,8 @@ body = """
 {%- endfor %}
 {% endfor %}
 """
-footer = "\n"
+footer = ""
 trim = true
-# The file ends with exactly one newline, as the end-of-file hook requires.
-postprocessors = [
-  { pattern = '\n+\z', replace = "\n" },
-]
 
 [git]
 # A squash merge's subject ends in "(#N)": link it to the pull request.
