@@ -5,7 +5,7 @@
 use super::budget::DecompressionBudget;
 use super::html;
 use super::parser::{DocumentMeta, Extracted, Flow, Section};
-use super::zipped::{Package, element_attributes, element_text, element_texts};
+use super::zipped::{Package, Xml};
 use crate::error::{Error, Result};
 
 const KIND: &str = "an EPUB";
@@ -19,33 +19,36 @@ const KIND: &str = "an EPUB";
 pub fn extract(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
     let mut package = Package::open(data, KIND, budget)?;
     let container = package.required("META-INF/container.xml", KIND)?;
-    let opf_path = element_attributes(&container, "rootfile", &["full-path"])
+    let opf_path = Xml(&container)
+        .attributes("rootfile", &["full-path"])
         .into_iter()
         .find_map(|attrs| attrs.into_iter().next().flatten())
         .ok_or_else(|| Error::Ingestion(format!("not {KIND}: container.xml names no rootfile")))?;
     let opf = package.required(&opf_path, KIND)?;
     let opf_dir = opf_path.rsplit_once('/').map(|(dir, _)| dir);
-    let manifest: Vec<(String, String)> = element_attributes(&opf, "item", &["id", "href"])
+    let manifest: Vec<(String, String)> = Xml(&opf)
+        .attributes("item", &["id", "href"])
         .into_iter()
         .filter_map(|attrs| {
             let mut attrs = attrs.into_iter();
             Some((attrs.next()??, attrs.next()??))
         })
         .collect();
-    let spine: Vec<String> = element_attributes(&opf, "itemref", &["idref"])
+    let spine: Vec<String> = Xml(&opf)
+        .attributes("itemref", &["idref"])
         .into_iter()
         .filter_map(|attrs| attrs.into_iter().next().flatten())
         .collect();
 
     let mut meta = DocumentMeta::default();
-    DocumentMeta::set(&mut meta.author, element_text(&opf, "creator").as_deref());
-    DocumentMeta::set(&mut meta.authored_at, element_text(&opf, "date").as_deref());
-    meta.extra("description", element_text(&opf, "description").as_deref());
-    meta.extra("publisher", element_text(&opf, "publisher").as_deref());
-    for subject in element_texts(&opf, "subject") {
+    DocumentMeta::set(&mut meta.author, Xml(&opf).text("creator").as_deref());
+    DocumentMeta::set(&mut meta.authored_at, Xml(&opf).text("date").as_deref());
+    meta.extra("description", Xml(&opf).text("description").as_deref());
+    meta.extra("publisher", Xml(&opf).text("publisher").as_deref());
+    for subject in Xml(&opf).texts("subject") {
         meta.tag(&subject);
     }
-    let title = element_text(&opf, "title");
+    let title = Xml(&opf).text("title");
 
     let mut sections = Vec::new();
     let mut chapter = 0u32;

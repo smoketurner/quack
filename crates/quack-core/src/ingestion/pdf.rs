@@ -24,8 +24,9 @@ use crate::error::{Error, Result};
 /// Returns an error when the bytes are not a PDF, it is password-protected,
 /// or no page yields text.
 pub fn extract(data: &[u8]) -> Result<Extracted> {
-    let doc = PdfDocument::from_bytes(data.to_vec())
-        .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))?;
+    let pdf = Pdf(PdfDocument::from_bytes(data.to_vec())
+        .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))?);
+    let doc = &pdf.0;
     if !doc.is_authenticated() {
         return Err(Error::Ingestion(String::from(
             "the PDF is password-protected; remove the password and upload it again",
@@ -34,7 +35,7 @@ pub fn extract(data: &[u8]) -> Result<Extracted> {
     let page_count = doc
         .page_count()
         .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))?;
-    let (meta, title) = info(&doc);
+    let (meta, title) = pdf.meta();
     let pages = Pages::read(page_count, |index| {
         let structured = doc.extract_structured(index).map_err(|e| e.to_string())?;
         // Table detection is best effort: a page whose tables cannot be
@@ -88,6 +89,51 @@ struct Line {
     text: String,
 }
 
+impl Line {
+    /// Spans grouped into lines: a span joins the line whose baseline is
+    /// within half its font size; a line's text is its spans left to right.
+    fn assemble(spans: &[&TextSpan]) -> Vec<Self> {
+        let mut lines: Vec<(Vec<&TextSpan>, f32)> = Vec::new();
+        for span in spans {
+            let y = span.bbox.y;
+            let tolerance = (span.font_size * 0.5).max(1.0);
+            match lines
+                .iter_mut()
+                .find(|(_, line_y)| (*line_y - y).abs() <= tolerance)
+            {
+                Some((members, _)) => members.push(span),
+                None => lines.push((vec![span], y)),
+            }
+        }
+        lines
+            .into_iter()
+            .map(|(mut members, y)| {
+                members.sort_by(|a, b| a.bbox.x.total_cmp(&b.bbox.x));
+                let text = members
+                    .iter()
+                    .map(|s| s.text.trim())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let font_size = members.iter().map(|s| s.font_size).fold(0.0_f32, f32::max);
+                let top = members
+                    .iter()
+                    .map(|s| s.bbox.y + s.bbox.height)
+                    .fold(0.0_f32, f32::max);
+                Self {
+                    y,
+                    top,
+                    font_size,
+                    text,
+                }
+            })
+            .collect()
+    }
+}
+
 /// The real tables on a page, for the spans inside them.
 struct Grids<'a>(Vec<&'a PdfTable>);
 
@@ -102,89 +148,105 @@ impl Grids<'_> {
     }
 }
 
-/// Whether a region is content rather than the page's chrome.
-fn kept(region: &StructuredRegion) -> bool {
-    !matches!(
-        region.kind,
-        RegionRole::Header | RegionRole::Footer | RegionRole::PageNumber | RegionRole::Artifact
-    )
+/// A page with its real tables, read for content: chrome regions dropped,
+/// spans inside the tables left to them.
+struct Page<'a> {
+    page: &'a StructuredPage,
+    grids: Grids<'a>,
 }
 
-/// The body's font size: the one most characters outside tables are set
-/// in; 10 points on a page with none.
-fn body_font_size(page: &StructuredPage, grids: &Grids<'_>) -> f32 {
-    let mut chars_by_size: BTreeMap<u32, usize> = BTreeMap::new();
-    for span in page
-        .regions
-        .iter()
-        .filter(|r| kept(r))
-        .flat_map(|r| &r.spans)
-    {
-        if grids.contains(span) {
-            continue;
+impl<'a> Page<'a> {
+    /// The regions that are content rather than the page's chrome.
+    fn regions(&self) -> impl Iterator<Item = &'a StructuredRegion> {
+        self.page.regions.iter().filter(|region| {
+            !matches!(
+                region.kind,
+                RegionRole::Header
+                    | RegionRole::Footer
+                    | RegionRole::PageNumber
+                    | RegionRole::Artifact
+            )
+        })
+    }
+
+    /// The body's font size: the one most characters outside tables are
+    /// set in; 10 points on a page with none.
+    fn body_font_size(&self) -> f32 {
+        let mut chars_by_size: BTreeMap<u32, usize> = BTreeMap::new();
+        for span in self.regions().flat_map(|r| &r.spans) {
+            if self.grids.contains(span) {
+                continue;
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "font sizes are small positive points"
+            )]
+            let key = (span.font_size * 10.0).round().max(0.0) as u32;
+            let chars = chars_by_size.entry(key).or_default();
+            *chars = chars.saturating_add(span.text.chars().count());
         }
         #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "font sizes are small positive points"
+            clippy::cast_precision_loss,
+            reason = "a font size in tenths of a point"
         )]
-        let key = (span.font_size * 10.0).round().max(0.0) as u32;
-        let chars = chars_by_size.entry(key).or_default();
-        *chars = chars.saturating_add(span.text.chars().count());
+        chars_by_size
+            .iter()
+            .max_by_key(|(_, chars)| **chars)
+            .map_or(10.0, |(size, _)| *size as f32 / 10.0)
     }
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "a font size in tenths of a point"
-    )]
-    chars_by_size
-        .iter()
-        .max_by_key(|(_, chars)| **chars)
-        .map_or(10.0, |(size, _)| *size as f32 / 10.0)
-}
 
-/// The page's lines in reading order, and the headings its structure
-/// tree names with their height on the page. Region order is trusted on
-/// a page whose columns are real; a column the detector saw in a table's
-/// cells is not one, and the page then reads top to bottom.
-fn page_lines(page: &StructuredPage, grids: &Grids<'_>) -> (Vec<Line>, Vec<(f32, String)>) {
-    let columnar = page.regions.iter().any(|r| {
-        kept(r)
-            && r.column_index.is_some_and(|c| c >= 1)
-            && !r.spans.iter().any(|s| grids.contains(s))
-    });
-    let mut lines: Vec<Line> = Vec::new();
-    let mut structural: Vec<(f32, String)> = Vec::new();
-    for region in page.regions.iter().filter(|r| kept(r)) {
-        if let RegionRole::StructuralHeading { .. } = region.kind {
-            let heading = region.text.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !heading.is_empty() {
-                structural.push((region.bbox.y, heading));
+    /// The page's lines in reading order, and the headings its structure
+    /// tree names with their height on the page. Region order is trusted
+    /// on a page whose columns are real; a column the detector saw in a
+    /// table's cells is not one, and the page then reads top to bottom.
+    fn lines(&self) -> (Vec<Line>, Vec<(f32, String)>) {
+        let columnar = self.regions().any(|r| {
+            r.column_index.is_some_and(|c| c >= 1)
+                && !r.spans.iter().any(|s| self.grids.contains(s))
+        });
+        let mut lines: Vec<Line> = Vec::new();
+        let mut structural: Vec<(f32, String)> = Vec::new();
+        for region in self.regions() {
+            if let RegionRole::StructuralHeading { .. } = region.kind {
+                let heading = region.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !heading.is_empty() {
+                    structural.push((region.bbox.y, heading));
+                }
+                continue;
             }
-            continue;
+            let spans: Vec<&TextSpan> = region
+                .spans
+                .iter()
+                .filter(|s| !self.grids.contains(s))
+                .collect();
+            let mut region_lines = Line::assemble(&spans);
+            if !columnar {
+                region_lines.sort_by(|a, b| b.y.total_cmp(&a.y));
+            }
+            lines.extend(region_lines);
         }
-        let spans: Vec<&TextSpan> = region.spans.iter().filter(|s| !grids.contains(s)).collect();
-        let mut region_lines = assemble_lines(&spans);
         if !columnar {
-            region_lines.sort_by(|a, b| b.y.total_cmp(&a.y));
+            lines.sort_by(|a, b| b.y.total_cmp(&a.y));
         }
-        lines.extend(region_lines);
+        structural.sort_by(|a, b| b.0.total_cmp(&a.0));
+        (lines, structural)
     }
-    if !columnar {
-        lines.sort_by(|a, b| b.y.total_cmp(&a.y));
-    }
-    structural.sort_by(|a, b| b.0.total_cmp(&a.0));
-    (lines, structural)
 }
 
 impl PageContent {
     fn of(page: &StructuredPage, tables: &[PdfTable]) -> Self {
-        let grids = Grids(tables.iter().filter(|t| t.is_real_grid()).collect());
-        let body_size = body_font_size(page, &grids);
-        let (lines, mut pending) = page_lines(page, &grids);
+        let page = Page {
+            page,
+            grids: Grids(tables.iter().filter(|t| t.is_real_grid()).collect()),
+        };
+        let body_size = page.body_font_size();
+        let (lines, mut pending) = page.lines();
         let mut out = Self::default();
         let mut current: (Option<String>, Vec<String>) = (None, Vec::new());
         // Tables sit where their top edge is, highest first.
-        let mut placed: Vec<(f32, Table)> = grids
+        let mut placed: Vec<(f32, Table)> = page
+            .grids
             .0
             .iter()
             .filter_map(|table| {
@@ -211,8 +273,8 @@ impl PageContent {
             }
             let chars = line.text.chars().count();
             let chrome = chars < HEADING_CHARS
-                && (line.top < page.page_height * CHROME_BAND
-                    || line.y > page.page_height * (1.0 - CHROME_BAND));
+                && (line.top < page.page.page_height * CHROME_BAND
+                    || line.y > page.page.page_height * (1.0 - CHROME_BAND));
             if chrome || line.text.is_empty() {
                 continue;
             }
@@ -255,49 +317,6 @@ impl PageContent {
             Piece::Table(_) => true,
         })
     }
-}
-
-/// Spans grouped into lines: a span joins the line whose baseline is
-/// within half its font size; a line's text is its spans left to right.
-fn assemble_lines(spans: &[&TextSpan]) -> Vec<Line> {
-    let mut lines: Vec<(Vec<&TextSpan>, f32)> = Vec::new();
-    for span in spans {
-        let y = span.bbox.y;
-        let tolerance = (span.font_size * 0.5).max(1.0);
-        match lines
-            .iter_mut()
-            .find(|(_, line_y)| (*line_y - y).abs() <= tolerance)
-        {
-            Some((members, _)) => members.push(span),
-            None => lines.push((vec![span], y)),
-        }
-    }
-    lines
-        .into_iter()
-        .map(|(mut members, y)| {
-            members.sort_by(|a, b| a.bbox.x.total_cmp(&b.bbox.x));
-            let text = members
-                .iter()
-                .map(|s| s.text.trim())
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ")
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            let font_size = members.iter().map(|s| s.font_size).fold(0.0_f32, f32::max);
-            let top = members
-                .iter()
-                .map(|s| s.bbox.y + s.bbox.height)
-                .fold(0.0_f32, f32::max);
-            Line {
-                y,
-                top,
-                font_size,
-                text,
-            }
-        })
-        .collect()
 }
 
 /// A PDF's pages as sections, and how the pages read.
@@ -365,79 +384,98 @@ impl Pages {
     }
 }
 
-/// The Info dictionary: the metadata, and the title apart.
-fn info(doc: &PdfDocument) -> (DocumentMeta, Option<String>) {
-    let mut meta = DocumentMeta::default();
-    let Some(info) = doc
-        .trailer()
-        .as_dict()
-        .and_then(|t| t.get("Info"))
-        .and_then(pdf_oxide::object::Object::as_reference)
-        .and_then(|r| doc.load_object(r).ok())
-        .map(|object| DocumentInfo::from_object(&object))
-    else {
-        return (meta, None);
-    };
-    DocumentMeta::set(&mut meta.author, info.author.as_deref());
-    DocumentMeta::set(
-        &mut meta.authored_at,
-        info.creation_date.as_deref().map(pdf_date).as_deref(),
-    );
-    DocumentMeta::set(
-        &mut meta.modified_at,
-        info.mod_date.as_deref().map(pdf_date).as_deref(),
-    );
-    meta.extra("subject", info.subject.as_deref());
-    for keyword in info
-        .keywords
-        .as_deref()
-        .unwrap_or_default()
-        .split([',', ';'])
-    {
-        meta.tag(keyword);
+/// A parsed PDF.
+struct Pdf(PdfDocument);
+
+impl Pdf {
+    /// The Info dictionary: the metadata, and the title apart.
+    fn meta(&self) -> (DocumentMeta, Option<String>) {
+        let doc = &self.0;
+        let mut meta = DocumentMeta::default();
+        let Some(info) = doc
+            .trailer()
+            .as_dict()
+            .and_then(|t| t.get("Info"))
+            .and_then(pdf_oxide::object::Object::as_reference)
+            .and_then(|r| doc.load_object(r).ok())
+            .map(|object| DocumentInfo::from_object(&object))
+        else {
+            return (meta, None);
+        };
+        DocumentMeta::set(&mut meta.author, info.author.as_deref());
+        DocumentMeta::set(
+            &mut meta.authored_at,
+            info.creation_date
+                .as_deref()
+                .map(|raw| PdfDate(raw).iso())
+                .as_deref(),
+        );
+        DocumentMeta::set(
+            &mut meta.modified_at,
+            info.mod_date
+                .as_deref()
+                .map(|raw| PdfDate(raw).iso())
+                .as_deref(),
+        );
+        meta.extra("subject", info.subject.as_deref());
+        for keyword in info
+            .keywords
+            .as_deref()
+            .unwrap_or_default()
+            .split([',', ';'])
+        {
+            meta.tag(keyword);
+        }
+        let title = info
+            .title
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty());
+        (meta, title)
     }
-    let title = info
-        .title
-        .map(|t| t.trim().to_owned())
-        .filter(|t| !t.is_empty());
-    (meta, title)
 }
 
-/// A PDF date (`D:YYYYMMDDHHmmSSOHH'mm'`, ISO 32000-1 section 7.9.4) as
-/// ISO 8601 text: the parts given, the zone kept when it is one.
-fn pdf_date(raw: &str) -> String {
-    let digits: String = raw
-        .trim()
-        .trim_start_matches("D:")
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    let part = |from: usize, to: usize| digits.get(from..to);
-    let (Some(year), Some(month), Some(day)) = (part(0, 4), part(4, 6), part(6, 8)) else {
-        return raw.trim().to_owned();
-    };
-    let mut out = format!("{year}-{month}-{day}");
-    if let Some(hour) = part(8, 10) {
-        let minute = part(10, 12).unwrap_or("00");
-        let second = part(12, 14).unwrap_or("00");
-        out = format!("{out}T{hour}:{minute}:{second}");
-        let rest = raw
+/// A date string from a PDF's Info dictionary.
+struct PdfDate<'a>(&'a str);
+
+impl PdfDate<'_> {
+    /// A PDF date (`D:YYYYMMDDHHmmSSOHH'mm'`, ISO 32000-1 section 7.9.4) as
+    /// ISO 8601 text: the parts given, the zone kept when it is one.
+    fn iso(&self) -> String {
+        let raw = self.0;
+        let digits: String = raw
             .trim()
             .trim_start_matches("D:")
-            .get(digits.len()..)
-            .unwrap_or_default();
-        match rest.chars().next() {
-            Some('Z') => out.push('Z'),
-            Some(sign @ ('+' | '-')) => {
-                let offset: String = rest.chars().skip(1).filter(char::is_ascii_digit).collect();
-                if let (Some(h), Some(m)) = (offset.get(0..2), offset.get(2..4)) {
-                    out = format!("{out}{sign}{h}:{m}");
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let part = |from: usize, to: usize| digits.get(from..to);
+        let (Some(year), Some(month), Some(day)) = (part(0, 4), part(4, 6), part(6, 8)) else {
+            return raw.trim().to_owned();
+        };
+        let mut out = format!("{year}-{month}-{day}");
+        if let Some(hour) = part(8, 10) {
+            let minute = part(10, 12).unwrap_or("00");
+            let second = part(12, 14).unwrap_or("00");
+            out = format!("{out}T{hour}:{minute}:{second}");
+            let rest = raw
+                .trim()
+                .trim_start_matches("D:")
+                .get(digits.len()..)
+                .unwrap_or_default();
+            match rest.chars().next() {
+                Some('Z') => out.push('Z'),
+                Some(sign @ ('+' | '-')) => {
+                    let offset: String =
+                        rest.chars().skip(1).filter(char::is_ascii_digit).collect();
+                    if let (Some(h), Some(m)) = (offset.get(0..2), offset.get(2..4)) {
+                        out = format!("{out}{sign}{h}:{m}");
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
+        out
     }
-    out
 }
 
 #[cfg(test)]
@@ -447,13 +485,13 @@ mod tests {
     #[test]
     fn pdf_dates_become_iso_8601() {
         assert_eq!(
-            pdf_date("D:20260105143000+01'00'"),
+            PdfDate("D:20260105143000+01'00'").iso(),
             "2026-01-05T14:30:00+01:00"
         );
-        assert_eq!(pdf_date("D:20260105143000Z"), "2026-01-05T14:30:00Z");
-        assert_eq!(pdf_date("D:20260105"), "2026-01-05");
-        assert_eq!(pdf_date("D:2026010514"), "2026-01-05T14:00:00");
-        assert_eq!(pdf_date("not a date"), "not a date");
+        assert_eq!(PdfDate("D:20260105143000Z").iso(), "2026-01-05T14:30:00Z");
+        assert_eq!(PdfDate("D:20260105").iso(), "2026-01-05");
+        assert_eq!(PdfDate("D:2026010514").iso(), "2026-01-05T14:00:00");
+        assert_eq!(PdfDate("not a date").iso(), "not a date");
     }
 
     #[test]

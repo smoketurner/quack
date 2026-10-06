@@ -12,7 +12,7 @@ use std::time::Duration;
 use quack_core::analysis::tools::SharedDb;
 use quack_core::embedding::refresh;
 use quack_core::graph::extract;
-use quack_core::graph::follow_up::{self, FollowUpSummary};
+use quack_core::graph::follow_up::{FollowUp, FollowUpSummary};
 use quack_core::graph::resolve::ResolutionSummary;
 use quack_core::ids::{DocumentId, RunId};
 use quack_core::jobs::{JobContext, JobId, JobKind, JobSpec, Lane, LaneKey};
@@ -297,9 +297,13 @@ pub(crate) async fn follow_ingest(
             progress: &progress,
             cancel: Some(&cancel),
         };
-        let outcome =
-            follow_up::after_documents(&db, &app.config, embedder.as_ref(), &documents, control)
-                .await;
+        let outcome = FollowUp {
+            db: &db,
+            config: &app.config,
+            embeddings: embedder.as_ref(),
+        }
+        .run(&documents, control)
+        .await;
         drop(slot);
         match outcome {
             Ok(Some(summary)) => Ok(summary),

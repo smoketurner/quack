@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use office_oxide::Document;
 use office_oxide::format::DocumentFormat;
-use office_oxide::ir::{DocumentIR, Element, InlineContent, Metadata, Note, Table as IrTable};
+use office_oxide::ir::{DocumentIR, Element, InlineContent, Note, Table as IrTable};
 
 use super::budget::DecompressionBudget;
 use super::parser::{DocumentMeta, Extracted, FileType, Flow, Section, SectionBuilder};
@@ -24,20 +24,20 @@ use crate::error::{Error, Result};
 /// Returns an error when the bytes are not a Word package, hold no text,
 /// or inflate past `budget`.
 pub fn docx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
-    let ir = open(data, FileType::Docx, DocumentFormat::Docx, budget)?;
-    let mut builder = SectionBuilder::default();
-    for section in &ir.sections {
+    let package = Package::open(data, FileType::Docx, DocumentFormat::Docx, budget)?;
+    let mut walker = Walker::default();
+    for section in &package.0.sections {
         for element in &section.elements {
-            walk(element, &mut builder);
+            walker.walk(element);
         }
     }
-    let sections = builder.finish();
+    let sections = walker.finish();
     if sections.is_empty() {
         return Err(Error::Ingestion(String::from(
             "no extractable text: the DOCX has no paragraphs",
         )));
     }
-    let (meta, title) = metadata(&ir.metadata);
+    let (meta, title) = package.meta();
     Ok(Extracted {
         title,
         sections,
@@ -54,9 +54,9 @@ pub fn docx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
 /// Returns an error when the bytes are not a `PowerPoint` package, hold no
 /// text, or inflate past `budget`.
 pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
-    let ir = open(data, FileType::Pptx, DocumentFormat::Pptx, budget)?;
+    let package = Package::open(data, FileType::Pptx, DocumentFormat::Pptx, budget)?;
     let mut sections = Vec::new();
-    for (index, slide) in ir.sections.iter().enumerate() {
+    for (index, slide) in package.0.sections.iter().enumerate() {
         let number = u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX);
         let heading = slide
             .title
@@ -64,14 +64,14 @@ pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_owned);
-        let mut builder = SectionBuilder::default();
+        let mut walker = Walker::default();
         if let Some(h) = &heading {
-            builder.heading(h.clone());
+            walker.0.heading(h.clone());
         }
         for element in &slide.elements {
-            walk(element, &mut builder);
+            walker.walk(element);
         }
-        let mut body: Vec<Section> = builder
+        let mut body: Vec<Section> = walker
             .finish()
             .into_iter()
             // A slide's own heading is the title; its body headings read as
@@ -106,7 +106,7 @@ pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         )));
     }
     let first_title = sections.first().and_then(|s| s.heading.clone());
-    let (meta, title) = metadata(&ir.metadata);
+    let (meta, title) = package.meta();
     Ok(Extracted {
         title: title.or(first_title),
         sections,
@@ -116,152 +116,174 @@ pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
     })
 }
 
-/// The package's document model. `office_oxide` inflates the zip itself,
-/// so the entries are inflated against `budget` first.
-fn open(
-    data: &[u8],
-    file_type: FileType,
-    format: DocumentFormat,
-    mut budget: DecompressionBudget,
-) -> Result<DocumentIR> {
-    budget.admit_zip(data)?;
-    let document = Document::from_reader(Cursor::new(data.to_vec()), format)
-        .map_err(|e| Error::Ingestion(format!("not a {file_type} file: {e}")))?;
-    Ok(document.to_ir())
-}
+/// A Word or `PowerPoint` package's document model.
+struct Package(DocumentIR);
 
-/// The core properties as metadata, the title apart.
-fn metadata(metadata: &Metadata) -> (DocumentMeta, Option<String>) {
-    let mut meta = DocumentMeta::default();
-    DocumentMeta::set(&mut meta.author, metadata.author.as_deref());
-    DocumentMeta::set(&mut meta.authored_at, metadata.created.as_deref());
-    DocumentMeta::set(&mut meta.modified_at, metadata.modified.as_deref());
-    meta.extra("subject", metadata.subject.as_deref());
-    meta.extra("description", metadata.description.as_deref());
-    for keyword in &metadata.keywords {
-        meta.tag(keyword);
+impl Package {
+    /// `office_oxide` inflates the zip itself, so the entries are inflated
+    /// against `budget` first.
+    fn open(
+        data: &[u8],
+        file_type: FileType,
+        format: DocumentFormat,
+        mut budget: DecompressionBudget,
+    ) -> Result<Self> {
+        budget.admit_zip(data)?;
+        let document = Document::from_reader(Cursor::new(data.to_vec()), format)
+            .map_err(|e| Error::Ingestion(format!("not a {file_type} file: {e}")))?;
+        Ok(Self(document.to_ir()))
     }
-    let title = metadata
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_owned);
-    (meta, title)
+
+    /// The core properties as metadata, the title apart.
+    fn meta(&self) -> (DocumentMeta, Option<String>) {
+        let metadata = &self.0.metadata;
+        let mut meta = DocumentMeta::default();
+        DocumentMeta::set(&mut meta.author, metadata.author.as_deref());
+        DocumentMeta::set(&mut meta.authored_at, metadata.created.as_deref());
+        DocumentMeta::set(&mut meta.modified_at, metadata.modified.as_deref());
+        meta.extra("subject", metadata.subject.as_deref());
+        meta.extra("description", metadata.description.as_deref());
+        for keyword in &metadata.keywords {
+            meta.tag(keyword);
+        }
+        let title = metadata
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned);
+        (meta, title)
+    }
 }
 
-/// One block element into the builder: headings start sections, tables
-/// and notes are sections of their kind, the rest is lines.
-fn walk(element: &Element, out: &mut SectionBuilder) {
-    match element {
-        Element::Heading(heading) => out.heading(inline_text(&heading.content)),
-        Element::Paragraph(paragraph) => {
-            let text = inline_text(&paragraph.content);
-            if !text.trim().is_empty() {
-                out.line(text);
-            }
-        }
-        Element::List(list) => {
-            for item in &list.items {
-                for element in &item.content {
-                    walk(element, out);
+/// Block elements into sections: headings start sections, tables and
+/// notes are sections of their kind, the rest is lines.
+#[derive(Default)]
+struct Walker(SectionBuilder);
+
+impl Walker {
+    fn walk(&mut self, element: &Element) {
+        match element {
+            Element::Heading(heading) => self.0.heading(Inline(&heading.content).text()),
+            Element::Paragraph(paragraph) => {
+                let text = Inline(&paragraph.content).text();
+                if !text.trim().is_empty() {
+                    self.0.line(text);
                 }
-                if let Some(nested) = &item.nested {
-                    walk(&Element::List(nested.clone()), out);
+            }
+            Element::List(list) => {
+                for item in &list.items {
+                    for element in &item.content {
+                        self.walk(element);
+                    }
+                    if let Some(nested) = &item.nested {
+                        self.walk(&Element::List(nested.clone()));
+                    }
                 }
             }
-        }
-        Element::CodeBlock(code) => {
-            for line in code.content.lines() {
-                out.line(line);
-            }
-        }
-        Element::Table(table) => {
-            if let Some(found) = ir_table(table) {
-                out.push(Section::table(None, found.render()));
-            }
-        }
-        Element::Footnote(note) => push_note(out, "Footnote", note),
-        Element::Endnote(note) => push_note(out, "Endnote", note),
-        Element::TextBox(text_box) => {
-            for element in &text_box.content {
-                walk(element, out);
-            }
-        }
-        // Images, breaks, shapes, and any variant a newer library adds
-        // (`Element` is non-exhaustive) read as nothing.
-        _ => {}
-    }
-}
-
-/// A footnote, endnote, or comment (an endnote whose marker is the
-/// comment's author) as a note section: `Footnote 3: ...`.
-fn push_note(out: &mut SectionBuilder, kind: &str, note: &Note) {
-    let text = elements_text(&note.content);
-    if text.trim().is_empty() {
-        return;
-    }
-    let label = match &note.marker {
-        Some(author) if kind == "Endnote" => format!("Comment by {}", author.trim()),
-        Some(marker) => format!("{kind} {}", marker.trim()),
-        None => format!("{kind} {}", note.id),
-    };
-    out.push(Section::note(None, format!("{label}: {}", text.trim())));
-}
-
-/// A table's cells as text.
-fn ir_table(table: &IrTable) -> Option<Table> {
-    Table::from_rows(
-        table
-            .rows
-            .iter()
-            .map(|row| {
-                row.cells
-                    .iter()
-                    .map(|cell| elements_text(&cell.content))
-                    .collect()
-            })
-            .collect(),
-    )
-}
-
-/// Block elements as lines of text.
-fn elements_text(elements: &[Element]) -> String {
-    let mut builder = SectionBuilder::default();
-    for element in elements {
-        walk(element, &mut builder);
-    }
-    builder
-        .finish()
-        .into_iter()
-        .map(|s| match s.heading {
-            Some(h) => format!("{h}\n{}", s.text),
-            None => s.text,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Inline content as one text: spans joined, line breaks as newlines,
-/// note references as their markers.
-fn inline_text(content: &[InlineContent]) -> String {
-    let mut out = String::new();
-    for inline in content {
-        match inline {
-            InlineContent::Text(span) => out.push_str(&span.text.replace('\t', " ")),
-            InlineContent::LineBreak => out.push('\n'),
-            InlineContent::FootnoteRef(r) | InlineContent::EndnoteRef(r) => {
-                out.push('[');
-                match &r.marker {
-                    Some(marker) => out.push_str(marker),
-                    None => out.push_str(&r.note_id.to_string()),
+            Element::CodeBlock(code) => {
+                for line in code.content.lines() {
+                    self.0.line(line);
                 }
-                out.push(']');
             }
+            Element::Table(table) => {
+                if let Some(found) = Table::from_office(table) {
+                    self.0.push(Section::table(None, found.render()));
+                }
+            }
+            Element::Footnote(note) => self.note("Footnote", note),
+            Element::Endnote(note) => self.note("Endnote", note),
+            Element::TextBox(text_box) => {
+                for element in &text_box.content {
+                    self.walk(element);
+                }
+            }
+            // Images, breaks, shapes, and any variant a newer library adds
+            // (`Element` is non-exhaustive) read as nothing.
             _ => {}
         }
     }
-    out
+
+    /// A footnote, endnote, or comment (an endnote whose marker is the
+    /// comment's author) as a note section: `Footnote 3: ...`.
+    fn note(&mut self, kind: &str, note: &Note) {
+        let text = Self::text_of(&note.content);
+        if text.trim().is_empty() {
+            return;
+        }
+        let label = match &note.marker {
+            Some(author) if kind == "Endnote" => format!("Comment by {}", author.trim()),
+            Some(marker) => format!("{kind} {}", marker.trim()),
+            None => format!("{kind} {}", note.id),
+        };
+        self.0
+            .push(Section::note(None, format!("{label}: {}", text.trim())));
+    }
+
+    fn finish(self) -> Vec<Section> {
+        self.0.finish()
+    }
+
+    /// Block elements as lines of text.
+    fn text_of(elements: &[Element]) -> String {
+        let mut walker = Self::default();
+        for element in elements {
+            walker.walk(element);
+        }
+        walker
+            .finish()
+            .into_iter()
+            .map(|s| match s.heading {
+                Some(h) => format!("{h}\n{}", s.text),
+                None => s.text,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+impl Table {
+    /// An `office_oxide` table's cells as text.
+    fn from_office(table: &IrTable) -> Option<Self> {
+        Self::from_rows(
+            table
+                .rows
+                .iter()
+                .map(|row| {
+                    row.cells
+                        .iter()
+                        .map(|cell| Walker::text_of(&cell.content))
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Inline content: spans joined, line breaks as newlines, note references
+/// as their markers.
+struct Inline<'a>(&'a [InlineContent]);
+
+impl Inline<'_> {
+    fn text(&self) -> String {
+        let mut out = String::new();
+        for inline in self.0 {
+            match inline {
+                InlineContent::Text(span) => out.push_str(&span.text.replace('\t', " ")),
+                InlineContent::LineBreak => out.push('\n'),
+                InlineContent::FootnoteRef(r) | InlineContent::EndnoteRef(r) => {
+                    out.push('[');
+                    match &r.marker {
+                        Some(marker) => out.push_str(marker),
+                        None => out.push_str(&r.note_id.to_string()),
+                    }
+                    out.push(']');
+                }
+                _ => {}
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

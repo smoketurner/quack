@@ -29,7 +29,7 @@ use quack_core::config::{Config, Grant, LogFormat};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
-use quack_core::graph::follow_up;
+use quack_core::graph::follow_up::FollowUp;
 use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::PageCounts;
@@ -2099,10 +2099,12 @@ async fn follow_ingest(
     documents: &[DocumentId],
     out: &mut impl Write,
 ) -> Result<()> {
-    let followed = follow_up::after_documents(
+    let followed = FollowUp {
         db,
         config,
-        embedder,
+        embeddings: embedder,
+    }
+    .run(
         documents,
         RunControl {
             progress: &progress_line::to_stderr,

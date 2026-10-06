@@ -579,6 +579,17 @@ pub(crate) struct SectionBuilder {
 }
 
 impl SectionBuilder {
+    /// Take `text` and add each of its non-blank lines: a code block's text
+    /// keeps its own newlines.
+    pub(crate) fn flush_lines(&mut self, text: &mut String) {
+        let text = std::mem::take(text);
+        for l in text.lines() {
+            if !l.trim().is_empty() {
+                self.line(l);
+            }
+        }
+    }
+
     /// Add a line to the current section.
     pub(crate) fn line(&mut self, line: impl Into<String>) {
         self.lines.push(line.into());

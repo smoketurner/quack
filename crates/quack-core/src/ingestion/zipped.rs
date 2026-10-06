@@ -46,100 +46,84 @@ impl<'a> Package<'a> {
     }
 }
 
-/// An attribute's value, by local name, in any namespace prefix.
-pub(crate) fn attribute(element: &BytesStart<'_>, name: &str) -> Option<String> {
-    element.attributes().flatten().find_map(|a| {
-        (a.key.local_name().as_ref() == name).then(|| {
-            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .ok()
-                .map(std::borrow::Cow::into_owned)
-        })?
-    })
-}
+/// A part's XML text, read by local element names in any namespace prefix.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Xml<'a>(pub(crate) &'a str);
 
-/// The text of an entity reference: a character reference or one of the
-/// five predefined entities; anything else is dropped.
-pub(crate) fn entity_text(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
-    if let Ok(Some(c)) = reference.resolve_char_ref() {
-        return Some(c.to_string());
+impl Xml<'_> {
+    /// An attribute's value, by local name, in any namespace prefix.
+    pub(crate) fn attribute(element: &BytesStart<'_>, name: &str) -> Option<String> {
+        element.attributes().flatten().find_map(|a| {
+            (a.key.local_name().as_ref() == name).then(|| {
+                a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                    .ok()
+                    .map(std::borrow::Cow::into_owned)
+            })?
+        })
     }
-    let name = reference.xml10_content();
-    quick_xml::escape::resolve_predefined_entity(&name).map(str::to_owned)
-}
 
-/// The first `element`'s text content in `xml`, by local name.
-pub(crate) fn element_text(xml: &str, element: &str) -> Option<String> {
-    let mut reader = Reader::from_str(xml);
-    let mut inside = false;
-    let mut text = String::new();
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) if e.local_name().as_ref() == element => inside = true,
-            Ok(Event::End(e)) if inside && e.local_name().as_ref() == element => break,
-            Ok(Event::Text(t)) if inside => text.push_str(&t.xml10_content()),
-            Ok(Event::GeneralRef(r)) if inside => {
-                if let Some(t) = entity_text(&r) {
-                    text.push_str(&t);
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            Ok(_) => {}
+    /// The text of an entity reference: a character reference or one of
+    /// the five predefined entities; anything else is dropped.
+    pub(crate) fn entity_text(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
+        if let Ok(Some(c)) = reference.resolve_char_ref() {
+            return Some(c.to_string());
         }
+        let name = reference.xml10_content();
+        quick_xml::escape::resolve_predefined_entity(&name).map(str::to_owned)
     }
-    let text = text.trim();
-    (!text.is_empty()).then(|| text.to_owned())
-}
 
-/// Every `element`'s text content in `xml`, by local name, in order.
-pub(crate) fn element_texts(xml: &str, element: &str) -> Vec<String> {
-    let mut reader = Reader::from_str(xml);
-    let mut inside = false;
-    let mut text = String::new();
-    let mut out = Vec::new();
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) if e.local_name().as_ref() == element => {
-                inside = true;
-                text.clear();
-            }
-            Ok(Event::End(e)) if inside && e.local_name().as_ref() == element => {
-                inside = false;
-                let t = text.trim();
-                if !t.is_empty() {
-                    out.push(t.to_owned());
-                }
-            }
-            Ok(Event::Text(t)) if inside => text.push_str(&t.xml10_content()),
-            Ok(Event::GeneralRef(r)) if inside => {
-                if let Some(t) = entity_text(&r) {
-                    text.push_str(&t);
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            Ok(_) => {}
-        }
+    /// The first `element`'s text content.
+    pub(crate) fn text(self, element: &str) -> Option<String> {
+        self.texts(element).into_iter().next()
     }
-    out
-}
 
-/// The attribute values of every `element` in `xml`, by local names.
-pub(crate) fn element_attributes(
-    xml: &str,
-    element: &str,
-    names: &[&str],
-) -> Vec<Vec<Option<String>>> {
-    let mut reader = Reader::from_str(xml);
-    let mut out = Vec::new();
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e) | Event::Empty(e)) if e.local_name().as_ref() == element => {
-                out.push(names.iter().map(|n| attribute(&e, n)).collect());
+    /// Every `element`'s text content, in order.
+    pub(crate) fn texts(self, element: &str) -> Vec<String> {
+        let mut reader = Reader::from_str(self.0);
+        let mut inside = false;
+        let mut text = String::new();
+        let mut out = Vec::new();
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(e)) if e.local_name().as_ref() == element => {
+                    inside = true;
+                    text.clear();
+                }
+                Ok(Event::End(e)) if inside && e.local_name().as_ref() == element => {
+                    inside = false;
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        out.push(t.to_owned());
+                    }
+                }
+                Ok(Event::Text(t)) if inside => text.push_str(&t.xml10_content()),
+                Ok(Event::GeneralRef(r)) if inside => {
+                    if let Some(t) = Self::entity_text(&r) {
+                        text.push_str(&t);
+                    }
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                Ok(_) => {}
             }
-            Ok(Event::Eof) | Err(_) => break,
-            Ok(_) => {}
         }
+        out
     }
-    out
+
+    /// The `names` attribute values of every `element`.
+    pub(crate) fn attributes(self, element: &str, names: &[&str]) -> Vec<Vec<Option<String>>> {
+        let mut reader = Reader::from_str(self.0);
+        let mut out = Vec::new();
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(e) | Event::Empty(e)) if e.local_name().as_ref() == element => {
+                    out.push(names.iter().map(|n| Self::attribute(&e, n)).collect());
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -171,17 +155,17 @@ pub(crate) mod tests {
     #[test]
     fn xml_helpers_read_text_and_attributes_by_local_name() {
         let xml = r#"<r xmlns:dc="x"><dc:title>A &amp; B</dc:title><dc:subject>s1</dc:subject><dc:subject>s2</dc:subject><item id="i1" href="a.xhtml"/></r>"#;
-        assert_eq!(element_text(xml, "title").as_deref(), Some("A & B"));
-        assert_eq!(element_texts(xml, "subject"), ["s1", "s2"]);
+        assert_eq!(Xml(xml).text("title").as_deref(), Some("A & B"));
+        assert_eq!(Xml(xml).texts("subject"), ["s1", "s2"]);
         assert_eq!(
-            element_attributes(xml, "item", &["id", "href", "none"]),
+            Xml(xml).attributes("item", &["id", "href", "none"]),
             vec![vec![
                 Some(String::from("i1")),
                 Some(String::from("a.xhtml")),
                 None
             ]]
         );
-        assert_eq!(element_text(xml, "missing"), None);
+        assert_eq!(Xml(xml).text("missing"), None);
     }
 
     #[test]

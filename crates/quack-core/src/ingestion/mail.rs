@@ -22,7 +22,7 @@ pub fn eml(data: &[u8]) -> Result<Extracted> {
     let message = MessageParser::default()
         .parse(data)
         .ok_or_else(|| Error::Ingestion(String::from("not an email message")))?;
-    let (section, meta) = message_section(&message);
+    let (section, meta) = Mail(&message).section();
     let section = section.ok_or_else(|| {
         Error::Ingestion(String::from(
             "no extractable text: the message has no text body",
@@ -57,7 +57,7 @@ pub fn mbox(data: &[u8]) -> Result<Extracted> {
         let Some(message) = MessageParser::default().parse(&raw) else {
             continue;
         };
-        if let (Some(section), _) = message_section(&message) {
+        if let (Some(section), _) = Mail(&message).section() {
             sections.push(section.at(format!("message {number}")));
         }
     }
@@ -73,80 +73,87 @@ pub fn mbox(data: &[u8]) -> Result<Extracted> {
     })
 }
 
-/// A message as a section under its subject, with the envelope lines a
-/// reader expects first, and what the envelope says as metadata.
-fn message_section(message: &Message<'_>) -> (Option<Section>, DocumentMeta) {
-    let mut meta = DocumentMeta::default();
-    let from = message.from().map(addresses);
-    let to = message.to().map(addresses);
-    let date = message.date().map(mail_parser::DateTime::to_rfc3339);
-    DocumentMeta::set(&mut meta.author, from.as_deref());
-    DocumentMeta::set(&mut meta.authored_at, date.as_deref());
-    meta.extra("to", to.as_deref());
-    meta.extra("subject", message.subject());
-    let mut text = String::new();
-    for (label, value) in [("From", &from), ("To", &to), ("Date", &date)] {
-        if let Some(v) = value {
-            text.push_str(label);
-            text.push_str(": ");
-            text.push_str(v);
-            text.push('\n');
+/// One parsed message.
+struct Mail<'m, 'x>(&'m Message<'x>);
+
+impl Mail<'_, '_> {
+    /// A message as a section under its subject, with the envelope lines a
+    /// reader expects first, and what the envelope says as metadata.
+    fn section(&self) -> (Option<Section>, DocumentMeta) {
+        let message = self.0;
+        let mut meta = DocumentMeta::default();
+        let from = message.from().map(Self::addresses);
+        let to = message.to().map(Self::addresses);
+        let date = message.date().map(mail_parser::DateTime::to_rfc3339);
+        DocumentMeta::set(&mut meta.author, from.as_deref());
+        DocumentMeta::set(&mut meta.authored_at, date.as_deref());
+        meta.extra("to", to.as_deref());
+        meta.extra("subject", message.subject());
+        let mut text = String::new();
+        for (label, value) in [("From", &from), ("To", &to), ("Date", &date)] {
+            if let Some(v) = value {
+                text.push_str(label);
+                text.push_str(": ");
+                text.push_str(v);
+                text.push('\n');
+            }
         }
+        let body = self.body_text();
+        if body.trim().is_empty() {
+            return (None, meta);
+        }
+        text.push('\n');
+        text.push_str(body.trim());
+        let heading = message
+            .subject()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        (Some(Section::body(heading, text)), meta)
     }
-    let body = body_text(message);
-    if body.trim().is_empty() {
-        return (None, meta);
-    }
-    text.push('\n');
-    text.push_str(body.trim());
-    let heading = message
-        .subject()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-    (Some(Section::body(heading, text)), meta)
-}
 
-/// Every text part, else every HTML part as its text.
-fn body_text(message: &Message<'_>) -> String {
-    let mut parts: Vec<String> = (0..message.text_body_count())
-        .filter_map(|i| message.body_text(i))
-        .map(|t| t.trim().to_owned())
-        .filter(|t| !t.is_empty())
-        .collect();
-    if parts.is_empty() {
-        parts = (0..message.html_body_count())
-            .filter_map(|i| message.body_html(i))
-            .filter_map(|h| html::html(&h).ok())
-            .map(|extracted| {
-                extracted
-                    .sections
-                    .iter()
-                    .map(|s| s.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .filter(|t| !t.trim().is_empty())
+    /// Every text part, else every HTML part as its text.
+    fn body_text(&self) -> String {
+        let message = self.0;
+        let mut parts: Vec<String> = (0..message.text_body_count())
+            .filter_map(|i| message.body_text(i))
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
             .collect();
+        if parts.is_empty() {
+            parts = (0..message.html_body_count())
+                .filter_map(|i| message.body_html(i))
+                .filter_map(|h| html::html(&h).ok())
+                .map(|extracted| {
+                    extracted
+                        .sections
+                        .iter()
+                        .map(|s| s.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|t| !t.trim().is_empty())
+                .collect();
+        }
+        parts.join("\n\n")
     }
-    parts.join("\n\n")
-}
 
-/// `Name <address>, ...` for a header's addresses.
-fn addresses(address: &Address<'_>) -> String {
-    address
-        .clone()
-        .into_list()
-        .iter()
-        .map(|a| match (a.name(), a.address()) {
-            (Some(name), Some(addr)) => format!("{name} <{addr}>"),
-            (Some(name), None) => name.to_owned(),
-            (None, Some(addr)) => addr.to_owned(),
-            (None, None) => String::new(),
-        })
-        .filter(|a| !a.is_empty())
-        .collect::<Vec<_>>()
-        .join(", ")
+    /// `Name <address>, ...` for a header's addresses.
+    fn addresses(address: &Address<'_>) -> String {
+        address
+            .clone()
+            .into_list()
+            .iter()
+            .map(|a| match (a.name(), a.address()) {
+                (Some(name), Some(addr)) => format!("{name} <{addr}>"),
+                (Some(name), None) => name.to_owned(),
+                (None, Some(addr)) => addr.to_owned(),
+                (None, None) => String::new(),
+            })
+            .filter(|a| !a.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 #[cfg(test)]

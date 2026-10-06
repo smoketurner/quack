@@ -24,7 +24,7 @@ pub fn html(text: &str) -> Result<Extracted> {
         .map(|el| el.text().collect::<String>())
         .map(|t| collapse(&t))
         .filter(|t| !t.is_empty());
-    let meta = metadata(&document);
+    let meta = DocumentMeta::from_html(&document);
 
     let mut walker = Walker::default();
     let root = document.tree.root();
@@ -43,48 +43,6 @@ pub fn html(text: &str) -> Result<Extracted> {
         pages: None,
         meta,
     })
-}
-
-/// The `<meta>` tags that name an author, a date, keywords, or a
-/// description, under the names HTML, Dublin Core, and Open Graph use.
-fn metadata(document: &Html) -> DocumentMeta {
-    let mut meta = DocumentMeta::default();
-    let Ok(selector) = Selector::parse("meta") else {
-        return meta;
-    };
-    for element in document.select(&selector) {
-        let name = element
-            .value()
-            .attr("name")
-            .or_else(|| element.value().attr("property"))
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_default();
-        let content = element.value().attr("content");
-        match name.as_str() {
-            "author" | "dc.creator" | "dcterms.creator" | "article:author" => {
-                DocumentMeta::set(&mut meta.author, content);
-            }
-            "date"
-            | "dc.date"
-            | "dcterms.created"
-            | "dc.date.created"
-            | "article:published_time"
-            | "datepublished" => DocumentMeta::set(&mut meta.authored_at, content),
-            "last-modified" | "dcterms.modified" | "article:modified_time" | "datemodified" => {
-                DocumentMeta::set(&mut meta.modified_at, content);
-            }
-            "keywords" | "dc.subject" | "article:tag" => {
-                for tag in content.unwrap_or_default().split(',') {
-                    meta.tag(tag);
-                }
-            }
-            "description" | "dc.description" | "og:description" => {
-                meta.extra("description", content);
-            }
-            _ => {}
-        }
-    }
-    meta
 }
 
 #[derive(Default)]
@@ -139,11 +97,11 @@ impl Walker {
                 }
                 if name == "table" {
                     self.end_line();
-                    match Table::from_rows(table_rows(node)) {
+                    match Table::from_rows(Self::table_rows(node)) {
                         Some(table) => self.sections.push(Section::table(None, table.render())),
                         // A one-column or header-only table reads as lines.
                         None => {
-                            for row in table_rows(node) {
+                            for row in Self::table_rows(node) {
                                 let line = collapse(&row.join(" "));
                                 if !line.is_empty() {
                                     self.sections.line(line);
@@ -182,28 +140,74 @@ impl Walker {
     }
 }
 
-/// A table's rows as their cells' text, `th` and `td` alike, in order.
-fn table_rows(table: ego_tree::NodeRef<'_, Node>) -> Vec<Vec<String>> {
-    let mut rows = Vec::new();
-    for descendant in table.descendants() {
-        let Node::Element(element) = descendant.value() else {
-            continue;
+impl DocumentMeta {
+    /// The `<meta>` tags that name an author, a date, keywords, or a
+    /// description, under the names HTML, Dublin Core, and Open Graph use.
+    fn from_html(document: &Html) -> Self {
+        let mut meta = Self::default();
+        let Ok(selector) = Selector::parse("meta") else {
+            return meta;
         };
-        if element.name() != "tr" {
-            continue;
+        for element in document.select(&selector) {
+            let name = element
+                .value()
+                .attr("name")
+                .or_else(|| element.value().attr("property"))
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            let content = element.value().attr("content");
+            match name.as_str() {
+                "author" | "dc.creator" | "dcterms.creator" | "article:author" => {
+                    Self::set(&mut meta.author, content);
+                }
+                "date"
+                | "dc.date"
+                | "dcterms.created"
+                | "dc.date.created"
+                | "article:published_time"
+                | "datepublished" => Self::set(&mut meta.authored_at, content),
+                "last-modified" | "dcterms.modified" | "article:modified_time" | "datemodified" => {
+                    Self::set(&mut meta.modified_at, content);
+                }
+                "keywords" | "dc.subject" | "article:tag" => {
+                    for tag in content.unwrap_or_default().split(',') {
+                        meta.tag(tag);
+                    }
+                }
+                "description" | "dc.description" | "og:description" => {
+                    meta.extra("description", content);
+                }
+                _ => {}
+            }
         }
-        let cells: Vec<String> = descendant
-            .children()
-            .filter(
-                |c| matches!(c.value(), Node::Element(e) if e.name() == "td" || e.name() == "th"),
-            )
-            .map(|c| collapse(&subtree_text(c)))
-            .collect();
-        if !cells.is_empty() {
-            rows.push(cells);
-        }
+        meta
     }
-    rows
+}
+
+impl Walker {
+    /// A table's rows as their cells' text, `th` and `td` alike, in order.
+    fn table_rows(table: ego_tree::NodeRef<'_, Node>) -> Vec<Vec<String>> {
+        let mut rows = Vec::new();
+        for descendant in table.descendants() {
+            let Node::Element(element) = descendant.value() else {
+                continue;
+            };
+            if element.name() != "tr" {
+                continue;
+            }
+            let cells: Vec<String> = descendant
+                .children()
+                .filter(
+                    |c| matches!(c.value(), Node::Element(e) if e.name() == "td" || e.name() == "th"),
+                )
+                .map(|c| collapse(&subtree_text(c)))
+                .collect();
+            if !cells.is_empty() {
+                rows.push(cells);
+            }
+        }
+        rows
+    }
 }
 
 fn subtree_text(node: ego_tree::NodeRef<'_, Node>) -> String {
