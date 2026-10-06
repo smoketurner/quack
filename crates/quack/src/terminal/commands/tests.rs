@@ -377,10 +377,15 @@ fn a_line_is_a_command_a_file_sql_or_a_question() {
     let spaced = dir.path().join("q3 review (final).md");
     std::fs::write(&spaced, "# hi").unwrap_or_else(|e| fail(&e.to_string()));
     let literal = spaced.display().to_string();
-    let escaped = literal
-        .replace(' ', "\\ ")
-        .replace('(', "\\(")
-        .replace(')', "\\)");
+    // A Unix terminal escapes the spaces; a Windows one quotes the path.
+    let escaped = if cfg!(windows) {
+        format!("\"{literal}\"")
+    } else {
+        literal
+            .replace(' ', "\\ ")
+            .replace('(', "\\(")
+            .replace(')', "\\)")
+    };
     for line in [literal.clone(), escaped.clone(), format!("\"{literal}\"")] {
         assert_eq!(
             Input::classify(line.clone()),
@@ -389,7 +394,7 @@ fn a_line_is_a_command_a_file_sql_or_a_question() {
         );
     }
     assert_eq!(
-        FileLine::of(&format!("{escaped} '{path}'\n")),
+        FileLine::of(&format!("{escaped} {}\n", quoted(&path))),
         Some(FileLine::Files(vec![spaced, file.clone()]))
     );
     // One name that is not a file makes the whole line something else.
@@ -404,8 +409,10 @@ fn a_line_is_a_command_a_file_sql_or_a_question() {
         FileLine::of(&format!("{path} {hash_path}")),
         Some(FileLine::Files(vec![file, hashed]))
     );
-    // A word that starts with `#` ends the names the split returns:
-    // the line is refused whole, whatever follows the `#`.
+    // A word that starts with `#` ends the names the POSIX split returns:
+    // the line is refused whole, whatever follows the `#`. Windows quoting
+    // has no comments.
+    #[cfg(not(windows))]
     for cut in [
         String::from("#drafts.md"),
         String::from("#drafts.md 'more.md"),
@@ -419,7 +426,16 @@ fn a_line_is_a_command_a_file_sql_or_a_question() {
         );
     }
     // Quoted, it is a name again: no such file here, so not a file line.
-    assert!(FileLine::of(&format!("{path} '#drafts.md'")).is_none());
+    assert!(FileLine::of(&format!("{path} {}", quoted("#drafts.md"))).is_none());
     // A question that mentions a file and a `#` word stays a question.
     assert!(FileLine::of(&format!("summarize {path} #urgent")).is_none());
+}
+
+/// A path quoted as the platform's terminal quotes it.
+fn quoted(path: &str) -> String {
+    if cfg!(windows) {
+        format!("\"{path}\"")
+    } else {
+        format!("'{path}'")
+    }
 }

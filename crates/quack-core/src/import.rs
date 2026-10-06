@@ -237,6 +237,31 @@ impl SourceUrl {
         Path::new(rest.split_once('?').map_or(rest, |(path, _)| path))
     }
 
+    /// What sqlx connects to: the URL as given, except a `sqlite:` one,
+    /// which becomes `sqlite:` and the path with `/` separators. sqlx's Any
+    /// driver parses the string as a URL first, which a Windows path
+    /// (`sqlite://C:\data\src.db`) does not survive; `sqlite:C:/data/src.db`
+    /// does, and SQLite opens it. `%`, `?`, and `#` in the path are
+    /// percent-encoded, since sqlx decodes the path and splits off a query.
+    fn connect_url(&self) -> String {
+        if !matches!(self.kind(), Ok(SourceKind::Sqlite)) {
+            return self.0.clone();
+        }
+        let raw = self.0.trim().get("sqlite:".len()..).unwrap_or_default();
+        let query = raw.split_once('?').map(|(_, q)| q);
+        let path = self
+            .sqlite_path()
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('%', "%25")
+            .replace('?', "%3F")
+            .replace('#', "%23");
+        match query {
+            Some(query) => format!("sqlite:{path}?{query}"),
+            None => format!("sqlite:{path}"),
+        }
+    }
+
     /// Whether a `sqlite:` URL points inside `data_dir`: the control
     /// database and the workspace files are quack's own, and nothing in
     /// them belongs in a workspace table, whoever asks.
@@ -401,14 +426,17 @@ impl<M: EmbeddingModel> Importing<'_, M> {
             SourceKind::Postgres | SourceKind::Sqlite => {
                 let sql = request.source_query()?;
                 let fetch = async {
-                    tokio::time::timeout(timeout, fetch_rows(request.url.expose(), &sql, limit))
-                        .await
-                        .map_err(|_| {
-                            Error::Ingestion(format!(
-                                "the source did not answer within {} s",
-                                timeout.as_secs()
-                            ))
-                        })?
+                    tokio::time::timeout(
+                        timeout,
+                        fetch_rows(&request.url.connect_url(), &sql, limit),
+                    )
+                    .await
+                    .map_err(|_| {
+                        Error::Ingestion(format!(
+                            "the source did not answer within {} s",
+                            timeout.as_secs()
+                        ))
+                    })?
                 };
                 let fetched = control.or_cancelled(fetch).await?;
                 Ok(Pulled {

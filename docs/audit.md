@@ -28,6 +28,7 @@ API Activity event with that name.
 | `admin` | A user is created or changed (`quack user`, the Users page, `/admin/users`) | `allowed` | API: Create |
 | `workspace` | A workspace is created, renamed, or its settings change | `allowed` | API: Other |
 | `member` | A membership is added, changed, or removed, by a person or by the identity provider's groups | `allowed`, `error` (removing a non-member) | API: Update |
+| `break_glass` | An admin who is not a member of the workspace grants themself a role; the request must carry a reason, which the detail records with the role and `acting_as: admin` | `allowed` | API: Create, severity Medium |
 | `token` | An API token is created, listed, or revoked; or a bearer is refused (unknown, expired, a rejected issuer token) | `allowed`, `denied` | API: Other; a denied row is Authentication: Logon |
 | `open` | One resource is opened: a document, a table, a session, a passage, the workspace itself | `allowed`, `denied` | API: Read |
 | `list` | Resources of a kind are listed (documents, tables, members, sessions, jobs) | `allowed`, `denied` | API: Read |

@@ -14,14 +14,24 @@ fn fail(msg: &str) -> ! {
 }
 
 fn server(dir: &std::path::Path, policy: WritePolicy) -> McpServer {
+    server_on(&workspace(dir), policy)
+}
+
+/// The workspace a test's servers share: opened once, since Windows locks
+/// the file exclusively and a second open in the process is refused.
+fn workspace(dir: &std::path::Path) -> (Config, SharedDb) {
     let mut config = Config::default();
     config.general.data_dir = dir.to_path_buf();
     let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
     let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
-    let reader = ReaderDb::new(Arc::clone(&db));
+    (config, db)
+}
+
+fn server_on((config, db): &(Config, SharedDb), policy: WritePolicy) -> McpServer {
+    let reader = ReaderDb::new(Arc::clone(db));
     McpServer::new(McpSetup {
-        config,
-        db,
+        config: config.clone(),
+        db: Arc::clone(db),
         reader,
         workspace: WorkspaceRow {
             id: WorkspaceId::from("ws"),
@@ -124,7 +134,8 @@ async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stdio_tools_gate_writes_and_serve_resources() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-    let read_only = server(dir.path(), WritePolicy::Deny);
+    let shared = workspace(dir.path());
+    let read_only = server_on(&shared, WritePolicy::Deny);
     let denied = read_only
         .sql(
             Parameters(SqlArgs {
@@ -156,7 +167,7 @@ async fn stdio_tools_gate_writes_and_serve_resources() {
         .unwrap_or_else(|e| fail(&e.message));
     assert_eq!(bad.is_error, Some(true));
 
-    let writer = server(dir.path(), WritePolicy::Allow(Approver::Nobody));
+    let writer = server_on(&shared, WritePolicy::Allow(Approver::Nobody));
     let created = writer
         .sql(
             Parameters(SqlArgs {

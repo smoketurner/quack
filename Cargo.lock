@@ -4268,6 +4268,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "winsplit",
 ]
 
 [[package]]
@@ -7035,6 +7036,12 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "winsplit"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ab703352da6a72f35c39a533526393725640575bb211f61987a2748323ad956"
 
 [[package]]
 name = "wit-bindgen"
