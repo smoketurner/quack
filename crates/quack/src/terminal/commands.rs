@@ -15,6 +15,7 @@ use quack_core::storage::workspace::{SqlName, looks_like_direct_sql};
 use crate::embeddings_cli::EmbeddingsAction;
 use crate::graph_cli::GraphAction;
 use crate::ontology_cli::OntologyAction;
+use crate::saved_cli::SavedAction;
 use crate::{ExportFlags, ModeArg};
 
 /// The argument id of a command that takes the rest of the line as typed
@@ -124,6 +125,12 @@ pub(crate) enum SlashCommand {
     Embeddings {
         #[command(subcommand)]
         action: EmbeddingsAction,
+    },
+    /// Saved questions: list them, or add NAME (this session's last answer), run NAME, show NAME, remove NAME
+    #[command(name = "/saved")]
+    Saved {
+        #[command(subcommand)]
+        action: Option<SavedAction>,
     },
     /// Pick a recent session to resume
     #[command(name = "/sessions")]
@@ -402,9 +409,11 @@ const HELP_COLUMN: usize = 18;
 /// more read as `VERB ...` and the popup lists them.
 const INLINE_VERBS: usize = 3;
 
-/// Arguments the terminal supplies itself (`--yes`: it never asks), or
-/// clap's own, so offering them would mislead.
-const IMPLIED_ARGS: &[&str] = &["yes", "help"];
+/// Arguments the terminal supplies itself (`--yes`: it never asks), has no
+/// use for (`/saved run`'s `--exit-code`, and `--refresh`, which asks the
+/// model from the command line), or clap's own, so offering them would
+/// mislead.
+const IMPLIED_ARGS: &[&str] = &["yes", "help", "exit_code", "refresh"];
 
 impl SlashCommand {
     /// The `/help` text: every command with its aliases and arguments,
@@ -751,7 +760,7 @@ mod tests {
         assert_eq!(words("/sch"), ["/schema"]);
         assert_eq!(
             words("/s"),
-            ["/sql", "/schema", "/sessions", "/share", "/steps"]
+            ["/sql", "/schema", "/saved", "/sessions", "/share", "/steps"]
         );
         assert!(words("/nothing").is_empty());
         assert!(words("hello").is_empty());
@@ -864,6 +873,55 @@ mod tests {
             assert!(help.contains(line), "{line} missing from\n{help}");
         }
         assert!(help.contains("Shortcuts:"));
+    }
+
+    /// `/saved` is the CLI's verbs: bare, it lists; `add` takes the
+    /// session's last answer, so `--from-session` is optional here; the
+    /// flags the terminal has no use for are not offered.
+    #[test]
+    fn saved_verbs_parse_and_hide_the_command_line_only_flags() {
+        assert!(matches!(
+            SlashCommand::parse("/saved"),
+            Ok(SlashCommand::Saved { action: None })
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/saved add overdue"),
+            Ok(SlashCommand::Saved {
+                action: Some(SavedAction::Add {
+                    from_session: None,
+                    message: None,
+                    ..
+                })
+            })
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/saved add overdue --message 5"),
+            Ok(SlashCommand::Saved {
+                action: Some(SavedAction::Add {
+                    message: Some(5),
+                    ..
+                })
+            })
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/saved run overdue"),
+            Ok(SlashCommand::Saved {
+                action: Some(SavedAction::Run { refresh: false, .. })
+            })
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/saved remove overdue"),
+            Ok(SlashCommand::Saved {
+                action: Some(SavedAction::Remove { .. })
+            })
+        ));
+        assert!(parses("/saved show overdue"));
+        assert!(parses("/saved list --format json"));
+        assert!(!parses("/saved run"));
+        assert!(!parses("/saved forget overdue"));
+        assert_eq!(words("/saved "), ["list", "add", "run", "show", "remove"]);
+        assert_eq!(words("/saved run overdue --"), ["--format"]);
+        assert_eq!(words("/saved add x --"), ["--from-session", "--message"]);
     }
 
     #[test]

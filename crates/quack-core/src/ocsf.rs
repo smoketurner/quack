@@ -68,6 +68,8 @@ impl EventClass {
             | AuditAction::Import
             | AuditAction::Propose
             | AuditAction::GraphExtract
+            | AuditAction::Save
+            | AuditAction::SavedRun
             | AuditAction::Admin => Self::Api(Create),
             AuditAction::Context
             | AuditAction::Member

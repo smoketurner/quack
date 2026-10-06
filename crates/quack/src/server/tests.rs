@@ -6978,3 +6978,289 @@ async fn a_restricted_workspace_refuses_every_path_to_a_disallowed_provider() {
         .await;
     assert!(status.is_server_error(), "{status}: {body}");
 }
+
+/// Saved questions over the API: saving needs the source session to be
+/// visible, anyone who may read runs and lists, a run says whether the
+/// data changed, a failed run is answered and audited as such, and
+/// removal follows a session's rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_questions_are_saved_run_and_removed_over_the_api() {
+    use quack_core::analysis::agent::AgentResponse;
+    use quack_core::analysis::events::{ToolName, ToolStep};
+    use quack_core::storage::sessions::{self, ChatMode};
+    const OVERDUE: &str = "SELECT id FROM invoices WHERE NOT paid ORDER BY id";
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let viewer = h.user("viewer", UserKind::Standard).await;
+    let other = h.user("other", UserKind::Standard).await;
+    let ws = h.workspace("s", &owner).await;
+    for u in [&viewer, &other] {
+        h.app
+            .control
+            .set_member(&ws, u, Role::Viewer, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let (answered, no_sql) = {
+        let viewer = viewer.clone();
+        db.run(move |db| {
+            db.execute_statement(
+                "CREATE TABLE invoices (id INTEGER, paid BOOLEAN); \
+                 INSERT INTO invoices VALUES (1, false), (2, true)",
+            )?;
+            let answered = sessions::create_session(db, "m", ChatMode::Query, Some(&viewer))?;
+            let response = AgentResponse {
+                content: String::from("Invoice 1 is overdue."),
+                steps: vec![ToolStep {
+                    tool: ToolName::RunSql,
+                    detail: String::from(OVERDUE),
+                    summary: String::from("1 rows"),
+                    rows: Some(1),
+                    duration_ms: 1,
+                }],
+                ..AgentResponse::default()
+            };
+            sessions::record_turn(
+                db,
+                &answered.id,
+                "overdue?",
+                jiff::Timestamp::now(),
+                &response,
+            )?;
+            let no_sql = sessions::create_session(db, "m", ChatMode::Chat, Some(&viewer))?;
+            sessions::record_turn(
+                db,
+                &no_sql.id,
+                "hello",
+                jiff::Timestamp::now(),
+                &AgentResponse {
+                    content: String::from("Hello."),
+                    ..AgentResponse::default()
+                },
+            )?;
+            Ok((answered.id, no_sql.id))
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    let viewer_token = h.login("viewer").await;
+    let other_token = h.login("other").await;
+    let owner_token = h.login("owner").await;
+    let base = format!("/api/v1/workspaces/{ws}/saved");
+
+    // Another member cannot see the session, so cannot save from it.
+    let (status, _) = h
+        .post(
+            &base,
+            &other_token,
+            serde_json::json!({ "name": "overdue", "session_id": answered }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = h
+        .post(
+            &base,
+            &viewer_token,
+            serde_json::json!({ "name": "overdue", "session_id": answered }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["name"], "overdue");
+    assert_eq!(body["statements"], serde_json::json!([OVERDUE]));
+    assert_eq!(body["created_by"], viewer.as_str());
+    let saved = body["id"].as_str().unwrap_or_default().to_owned();
+    let (status, _) = h
+        .post(
+            &base,
+            &viewer_token,
+            serde_json::json!({ "name": "overdue", "session_id": answered }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "the name is taken");
+    let (status, body) = h
+        .post(
+            &base,
+            &viewer_token,
+            serde_json::json!({ "name": "hello", "session_id": no_sql }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("ran no SQL"))
+    );
+    let (status, body) = h
+        .post(
+            &base,
+            &viewer_token,
+            serde_json::json!({ "name": "q", "session_id": answered, "message": 1 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let saves = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("save")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(saves.len(), 4, "one allowed, three refused: {saves:?}");
+    assert_eq!(
+        saves.iter().filter(|r| r.outcome == Outcome::Error).count(),
+        3
+    );
+
+    // Anyone who may read lists, shows, and runs.
+    let (status, body) = h.get(&base, &other_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["saved"][0]["id"], saved);
+    let (status, body) = h.get(&format!("{base}/{saved}"), &other_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["question"]["name"], "overdue");
+    assert_eq!(body["last_run"], serde_json::Value::Null);
+    let (status, body) = h
+        .post(
+            &format!("{base}/{saved}/run"),
+            &other_token,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["changed"], false);
+    assert_eq!(body["statements"][0]["rows"], 1);
+    assert_eq!(body["statements"][0]["result"], serde_json::json!([[1]]));
+    let first_run = body["id"].as_str().unwrap_or_default().to_owned();
+    db.run(|db| db.execute_statement("UPDATE invoices SET paid = false"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body) = h
+        .post(
+            &format!("{base}/{saved}/run"),
+            &viewer_token,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["changed"], true);
+    assert_eq!(body["statements"][0]["rows"], 2);
+    assert_eq!(body["statements"][0]["previous_rows"], 1);
+    let (status, body) = h.get(&format!("{base}/{saved}/runs"), &viewer_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["runs"].as_array().map(Vec::len), Some(2));
+    assert_eq!(body["runs"][1]["id"], first_run, "newest first");
+    let (status, body) = h
+        .get(&format!("{base}/{saved}/runs?limit=1"), &viewer_token)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["runs"].as_array().map(Vec::len), Some(1));
+    let (status, body) = h.get(&format!("{base}/{saved}"), &viewer_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["last_run"]["changed"], true);
+
+    // A run whose table is gone is answered, with the error, and audited
+    // as an error; it is not an unchanged result.
+    db.run(|db| db.execute_statement("DROP TABLE invoices"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body) = h
+        .post(
+            &format!("{base}/{saved}/run"),
+            &viewer_token,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "failed");
+    assert_eq!(body["changed"], false);
+    assert!(
+        body["statements"][0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("invoices")),
+        "{body}"
+    );
+    let runs = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("saved_run")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(runs.len(), 3, "{runs:?}");
+    assert_eq!(
+        runs.iter().filter(|r| r.outcome == Outcome::Error).count(),
+        1
+    );
+    assert!(
+        runs.iter()
+            .all(|r| r.resource_type.as_deref() == Some("saved_question"))
+    );
+
+    // Removal: the creator or an owner; anyone else is refused and audited.
+    let (status, _) = h
+        .call(
+            Method::DELETE,
+            &format!("{base}/{saved}"),
+            Some(&other_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h
+        .call(
+            Method::DELETE,
+            &format!("{base}/{saved}"),
+            Some(&owner_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = h
+        .call(
+            Method::DELETE,
+            &format!("{base}/{saved}"),
+            Some(&viewer_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = h
+        .post(
+            &format!("{base}/nope/run"),
+            &viewer_token,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, body) = h.get(&base, &viewer_token).await;
+    assert_eq!(body["saved"], serde_json::json!([]));
+    let deletes = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("delete")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(deletes.len(), 2, "one denied, one allowed: {deletes:?}");
+    assert_eq!(
+        deletes
+            .iter()
+            .filter(|r| r.outcome == Outcome::Denied)
+            .count(),
+        1
+    );
+    let detail = db
+        .run(|db| audit::list(db, 100))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        detail.iter().any(|row| row.action == "saved_run"),
+        "the workspace keeps the run's detail row"
+    );
+}

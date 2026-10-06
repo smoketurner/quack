@@ -1496,7 +1496,8 @@ the session they came from, and a `pin` counter) and `_quack_saved_runs` (one ro
 
 - **Saving pins SQL.** A saved question is made from an answered turn: the person names the
   answer they just got (`quack saved add NAME --from-session ID [--message N]`, the
-  terminal's `/saved add NAME` for its last answer, `POST .../saved`). quack keeps the
+  terminal's `/saved add NAME` for its last answer, `POST .../saved`; the terminal's other
+  `/saved` verbs and the `.../saved` routes in 11.2 list, show, run, and remove). quack keeps the
   question text and the `run_sql` statements that returned rows, in order, each classified
   again as a read. An answer that ran no such statement, or one that ran a write, cannot be
   saved; the refusal says which (`Unsavable`). Only someone who can read the source session
@@ -1956,6 +1957,16 @@ PATCH  /api/v1/workspaces/{id}/sessions/{sid}     {shared} | {mode} (creator or 
                                                   a session's mode is set when it is created;
                                                   `mode` on a later query is ignored
 GET    /api/v1/workspaces/{id}/sessions/{sid}/export?format=sql|markdown
+GET    /api/v1/workspaces/{id}/saved             saved questions (section 8.1; anyone who may read)
+POST   /api/v1/workspaces/{id}/saved             {name, session_id, message?}: pin that answer's SQL -> 201;
+                                                  404 for a session the caller cannot see, 409 for a name in use,
+                                                  422 for an answer that ran no read or ran a write
+GET    /api/v1/workspaces/{id}/saved/{saved}     the question with its last run
+DELETE /api/v1/workspaces/{id}/saved/{saved}     creator or owner
+POST   /api/v1/workspaces/{id}/saved/{saved}/run runs the saved SQL now, no model, no job: the run
+                                                  (`changed`, `status`, each statement's digest, counts, rows, error);
+                                                  200 with `status: "failed"` when a statement failed
+GET    /api/v1/workspaces/{id}/saved/{saved}/runs[?limit=20]   newest first
 GET    /api/v1/workspaces/{id}/audit              detail rows, members only
 GET    /api/v1/workspaces/{id}/members  POST/DELETE ...   (owner)
 GET    /api/v1/admin/users  POST ...  GET /api/v1/admin/audit   (admin; skeletal log)
@@ -2040,13 +2051,15 @@ into text already typed it is inserted like any other paste.
 
 Slash commands: `/help`, `/tables`, `/schema TABLE`, `/sql`, `/ingest PATH` (`/attach`),
 `/import`, `/docs`, `/pin`, `/unpin`, `/delete`, `/ontology ...` and `/graph ...`, `/graph
-ENTITY`, `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/sessions`,
+ENTITY`, `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/saved [add NAME |
+run NAME | show NAME | remove NAME]` (`add` pins this session's last answer; a refresh is
+`quack saved run --refresh` on the command line), `/sessions`,
 `/resume`, `/new`, `/mode`, `/share`, `/unshare`, `/export [--sql|--markdown] [FILE]`,
 `/jobs`, `/cancel N`, `/steps`, `/model`, `/workspace`, `/clear`, `/quit`.
 `/model` shows the configured models, then lists each provider's models as a job
 (`llm::ModelCatalog`).
-`/ontology` and `/graph` are the `quack ontology` and `quack graph` verbs, parsed by the
-same clap definitions; they run in the background, print to the transcript, and answer yes
+`/ontology`, `/graph`, and `/saved` are the `quack ontology`, `quack graph`, and `quack
+saved` verbs, parsed by the same clap definitions; they run in the background, print to the transcript, and answer yes
 to anything that would ask on stdin.
 
 **Command parsing.** One clap definition (`terminal::commands::SlashCommand`) drives

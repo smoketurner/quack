@@ -54,6 +54,7 @@ use crate::confirm::Confirm;
 use crate::embeddings_cli::{self, EmbeddingsAction};
 use crate::graph_cli::{self, GraphAction};
 use crate::ontology_cli::{self, OntologyAction};
+use crate::saved_cli::{self, SavedAction};
 use crate::terminal::SessionSetup;
 use crate::terminal::chart::ChartData;
 use crate::terminal::clipboard::{Clipboard, CopyStatus};
@@ -63,6 +64,7 @@ use crate::terminal::commands::{
 use crate::terminal::picker::{Picked, Picker};
 use crate::terminal::selection::{Edge, Located, Selection, TranscriptView};
 use crate::terminal::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
+use crate::text_or_json::TextOrJson;
 
 /// The spinner's frame interval; it ticks only while a job is active.
 const SPINNER_MS: u64 = 80;
@@ -551,6 +553,8 @@ struct JobEnv {
     db: SharedDb,
     workspace_id: WorkspaceId,
     workspace_name: String,
+    /// The session `/saved add` takes its last answer from.
+    session_id: SessionId,
 }
 
 /// A command the terminal runs as a job, reporting what it printed.
@@ -558,6 +562,7 @@ enum CliJob {
     Ontology(OntologyAction),
     Graph(GraphAction),
     Embeddings(EmbeddingsAction),
+    Saved(SavedAction),
     Okf(String),
     ContextImport(String),
     ContextExport(String),
@@ -571,6 +576,7 @@ impl CliJob {
             Self::Ontology(_) => JobKind::Ontology,
             Self::Graph(_) => JobKind::Graph,
             Self::Embeddings(_) => JobKind::Embeddings,
+            Self::Saved(_) => JobKind::Sql,
             Self::Okf(_) | Self::ContextExport(_) => JobKind::Export,
             Self::ContextImport(_) | Self::Import(_) => JobKind::Import,
             Self::Ingest(_) => JobKind::Ingest,
@@ -583,6 +589,7 @@ impl CliJob {
             Self::Ontology(_) => String::from("Running ontology command"),
             Self::Graph(_) => String::from("Running graph command"),
             Self::Embeddings(_) => String::from("Refreshing embeddings"),
+            Self::Saved(_) => String::from("Running saved question command"),
             Self::Okf(_) => String::from("Exporting the bundle"),
             Self::ContextImport(_) => String::from("Importing the context"),
             Self::ContextExport(_) => String::from("Exporting the context"),
@@ -607,6 +614,7 @@ impl CliJob {
             Self::Ontology(_)
             | Self::Graph(_)
             | Self::Embeddings(_)
+            | Self::Saved(_)
             | Self::Okf(_)
             | Self::ContextImport(_)
             | Self::ContextExport(_) => {
@@ -657,6 +665,17 @@ impl CliJob {
                     Confirm::Assume,
                     &mut out,
                     control,
+                )
+                .await?;
+            }
+            Self::Saved(action) => {
+                saved_cli::run(
+                    &env.config,
+                    &env.db,
+                    action,
+                    Some(&env.session_id),
+                    None,
+                    &mut out,
                 )
                 .await?;
             }
@@ -2050,6 +2069,12 @@ impl App {
             SlashCommand::Export { flags, file } => self.export_session(flags.format(), file),
             SlashCommand::Okf { dir } => self.run_job(CliJob::Okf(dir)),
             SlashCommand::Embeddings { action } => self.run_job(CliJob::Embeddings(action)),
+            SlashCommand::Saved { action } => {
+                let list = SavedAction::List {
+                    format: TextOrJson::Text,
+                };
+                self.run_job(CliJob::Saved(action.unwrap_or(list)));
+            }
             SlashCommand::Steps => self.toggle_steps(),
             SlashCommand::Model => self.show_models(),
         }
@@ -2256,6 +2281,7 @@ impl App {
             db: Arc::clone(&self.db),
             workspace_id: self.workspace_id.clone(),
             workspace_name: self.workspace_name.clone(),
+            session_id: self.session_id.clone(),
         };
         let announcement = job.announcement();
         self.submit_work(

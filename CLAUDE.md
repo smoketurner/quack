@@ -119,7 +119,10 @@ again without the model, each classified again and under the agent's row cap and
 records in `_quack_saved_runs` the SHA-256 of every result set and the row counts, and says
 `changed` when any digest differs from the newest completed run of the same pin
 (`--refresh` asks the model again, writes denied, and pins the new answer's statements). There
-is no scheduler: cron runs it, and `--exit-code` exits 5 on a change.
+is no scheduler: cron runs it, and `--exit-code` exits 5 on a change. The terminal's `/saved`
+verbs run as jobs through `saved_cli` (`add` pins the session's last answer), and the REST
+routes under `.../saved` (`server/api/saved.rs`) list, save, show, run, and remove, audited
+as `save`, `saved_run`, `open`, `list`, and `delete`; a run answers directly, no job.
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
 file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model through
 rig's conversation memory (`llm::memory::History`: `SessionMemory` under `TranscriptWindow`,
