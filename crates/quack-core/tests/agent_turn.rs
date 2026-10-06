@@ -170,6 +170,7 @@ async fn run_turn_answering(
             context: None,
             context_max_tokens: Tokens::new(1_000),
             ollama_context_cap: None,
+            question: None,
         },
         history,
         message,

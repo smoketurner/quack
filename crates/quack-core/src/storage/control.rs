@@ -690,6 +690,10 @@ pub enum AuditAction {
     Save,
     /// A saved question's SQL run again without the model.
     SavedRun,
+    /// A table's note was set or removed.
+    TableNote,
+    /// A table column was given another type.
+    Retype,
     /// A stored name this build does not define, as a newer build wrote
     /// it. Read only: the one write path refuses it.
     Unknown(String),
@@ -737,6 +741,8 @@ history_enum!(AuditAction, Unknown, {
     Permission => "permission",
     Save => "save",
     SavedRun => "saved_run",
+    TableNote => "table_note",
+    Retype => "retype",
 });
 
 /// The kinds of resource an audit row names by opaque id. Like

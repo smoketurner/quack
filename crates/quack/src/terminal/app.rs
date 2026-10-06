@@ -44,6 +44,7 @@ use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
 use quack_core::storage::control::ResourceKind;
+use quack_core::storage::profile::{ColumnTypes, TableProfile};
 use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, MessageRole, Sharing, Transcript,
 };
@@ -822,7 +823,10 @@ impl DirectSql {
             Side::Write => {
                 let result = db
                     .run(move |db| {
-                        db.cancellable(&canceller, |db| db.execute_query_capped(&sql, max_rows))
+                        let result = db
+                            .cancellable(&canceller, |db| db.execute_query_capped(&sql, max_rows));
+                        TableProfile::after_write(db);
+                        result
                     })
                     .await;
                 reader.observe_write().await;
@@ -2052,6 +2056,7 @@ impl App {
                 query,
                 source_table,
                 limit: None,
+                types: ColumnTypes::default(),
             })),
             SlashCommand::Path { route } => self.show_path(&route),
             SlashCommand::Sql {

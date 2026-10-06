@@ -26,11 +26,13 @@ use crate::config::Config;
 use crate::crypto::sha256_hex;
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
+use crate::graph::views;
 use crate::ids::{ChunkId, DocumentId};
 use crate::progress::{ChunkDone, RunControl};
+use crate::storage::profile::ColumnTypes;
 use crate::storage::workspace::{
-    DocumentFields, DocumentInfo, DocumentSource, DocumentStatus, NewChunk, NewDocument,
-    WorkspaceDb, quote_ident,
+    DocumentFields, DocumentInfo, DocumentSource, DocumentStatus, INTERNAL_PREFIX, NewChunk,
+    NewDocument, WorkspaceDb, quote_ident,
 };
 use crate::storage::writer::Writer;
 use crate::text::NonBlankText;
@@ -118,6 +120,8 @@ pub struct NewFile<'a> {
     /// What the uploader says about the document; given values win over
     /// what the file says about itself.
     pub fields: DocumentFields,
+    /// Types to give columns of the table a structured file loads as.
+    pub types: ColumnTypes,
 }
 
 impl<'a> NewFile<'a> {
@@ -135,6 +139,7 @@ impl<'a> NewFile<'a> {
             source_root: None,
             source_path: None,
             fields: DocumentFields::default(),
+            types: ColumnTypes::default(),
         }
     }
 
@@ -183,6 +188,13 @@ impl<'a> NewFile<'a> {
     #[must_use]
     pub fn fields(mut self, fields: DocumentFields) -> Self {
         self.fields = fields;
+        self
+    }
+
+    /// Give the loaded table's columns these types (`--types col=TYPE`).
+    #[must_use]
+    pub fn types(mut self, types: ColumnTypes) -> Self {
+        self.types = types;
         self
     }
 }
@@ -398,7 +410,14 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     data: data.to_vec(),
                     reader,
                 };
-                let table_name = db.run(move |db| step.load(db)).await?;
+                let types = self.file.types.clone();
+                let table_name = db
+                    .run(move |db| {
+                        let table = step.load(db)?;
+                        types.finish_load(db, std::slice::from_ref(&table))?;
+                        Ok(table)
+                    })
+                    .await?;
                 Ok(IngestResult {
                     tables: vec![table_name],
                     ..IngestResult::of(doc_id, filename, file_type)
@@ -417,7 +436,14 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     sheets,
                     suffixed: false,
                 };
-                let tables = db.run(move |db| load.load(db)).await?;
+                let types = self.file.types.clone();
+                let tables = db
+                    .run(move |db| {
+                        let tables = load.load(db)?;
+                        types.finish_load(db, &tables)?;
+                        Ok(tables)
+                    })
+                    .await?;
                 Ok(IngestResult {
                     tables,
                     ..IngestResult::of(doc_id, filename, file_type)
@@ -470,7 +496,12 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 sheets: found,
                 suffixed: true,
             };
-            db.run(move |db| load.load(db)).await?
+            db.run(move |db| {
+                let tables = load.load(db)?;
+                ColumnTypes::default().finish_load(db, &tables)?;
+                Ok(tables)
+            })
+            .await?
         };
         if let Some(note) = pages.and_then(PageCounts::note) {
             tracing::warn!(
@@ -1139,6 +1170,7 @@ impl TableName {
     /// One document per table: refuse when a live document other than
     /// `owner`, or the one `owner` is replacing, already loaded this one.
     fn check_free(&self, db: &WorkspaceDb, owner: Option<&DocumentId>) -> Result<()> {
+        self.check_unreserved()?;
         match db.table_owner(&self.0)? {
             Some(doc)
                 if owner.is_none_or(|owner| {
@@ -1153,6 +1185,28 @@ impl TableName {
             }
             _ => Ok(()),
         }
+    }
+}
+
+impl TableName {
+    /// Refuse a name quack keeps for itself: its internal tables and the
+    /// graph's views.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Ingestion` error naming the prefix.
+    pub fn check_unreserved(&self) -> Result<()> {
+        let lower = self.0.to_ascii_lowercase();
+        for prefix in [INTERNAL_PREFIX, views::PREFIX] {
+            if lower.starts_with(prefix) {
+                return Err(Error::Ingestion(format!(
+                    "table '{}' starts with '{prefix}', which quack reserves; rename the file or \
+                     choose another table name",
+                    self.0
+                )));
+            }
+        }
+        Ok(())
     }
 }
 

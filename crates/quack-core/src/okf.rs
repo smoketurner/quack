@@ -6,6 +6,7 @@
 //! bundle imports as documents whose front matter and links feed ontology
 //! induction. Design doc section 17, issue #36.
 
+use crate::analysis::table_search;
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::io::{Cursor, Read, Write};
@@ -600,8 +601,8 @@ impl<S: BundleSink> Exporter<'_, S> {
     }
 
     fn tables(&mut self, ontology: Option<&Ontology>) -> Result<()> {
-        for table in &self.db.list_tables()? {
-            let described = self.db.describe_table(table)?;
+        for table in &table_search::user_tables(self.db)? {
+            let described = self.db.describe_table_under(table, ontology)?;
             let mapping = ontology.and_then(|o| o.mapping_for_table(table));
             let mut text = FrontMatter::generated(ConceptType::Table)
                 .field("title", table.clone())
@@ -1121,12 +1122,7 @@ pub fn propose(bundle: &Bundle, current: Option<&Ontology>) -> Vec<Candidate> {
         candidates.push(Candidate {
             proposal: Proposal::Property {
                 class: String::from("document"),
-                property: Property {
-                    id: String::from("resource"),
-                    label: None,
-                    kind: PropertyType::String,
-                    values: Vec::new(),
-                },
+                property: Property::new(String::from("resource"), PropertyType::String, Vec::new()),
             },
             evidence: serde_json::json!({ "source": "okf", "files": 1, "examples": ["resource"] }),
             confidence: 0.6,

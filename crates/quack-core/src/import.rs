@@ -27,6 +27,7 @@ use crate::ingestion::parser::{FileType, Load};
 use crate::ingestion::{self, IngestOutcome, NewFile, TableName};
 use crate::progress::RunControl;
 use crate::proxy::{Proxies, Route};
+use crate::storage::profile::{ColumnTypes, TableProfile};
 use crate::storage::workspace::{DocumentSource, WorkspaceDb, quote_ident};
 use crate::storage::writer::Writer;
 
@@ -41,6 +42,8 @@ pub struct ImportRequest {
     pub source_table: Option<String>,
     /// Rows to pull at most; capped by `[import].max_rows`.
     pub limit: Option<u64>,
+    /// Types to give the loaded table's columns.
+    pub types: ColumnTypes,
 }
 
 /// Which sources a caller may reach (issue #42). The owner's interfaces
@@ -343,6 +346,7 @@ impl<M: EmbeddingModel> Importing<'_, M> {
     pub async fn run(self) -> Result<ImportSummary> {
         let (config, db, request) = (self.config, self.db, self.request);
         let table = TableName::given(&request.table)?;
+        table.check_unreserved()?;
         let limit = request
             .limit
             .unwrap_or(config.import.max_rows)
@@ -357,6 +361,7 @@ impl<M: EmbeddingModel> Importing<'_, M> {
             &NewFile::new(&pulled.filename, &pulled.bytes)
                 .source(DocumentSource::Import)
                 .title(Some(&source))
+                .types(request.types.clone())
                 .control(self.control),
             self.embedder,
         )
@@ -382,8 +387,12 @@ impl<M: EmbeddingModel> Importing<'_, M> {
             }
         } else {
             let table = loaded.clone();
-            db.run(move |db| cap_loaded_table(db, &table, limit))
-                .await?
+            db.run(move |db| {
+                let kept = cap_loaded_table(db, &table, limit)?;
+                TableProfile::refresh_or_warn(db, &table);
+                Ok(kept)
+            })
+            .await?
         };
         tracing::info!(table = %loaded, rows, source = %source, "imported external data");
         Ok(ImportSummary {

@@ -1,6 +1,7 @@
 use super::*;
 use crate::llm::Embeddings;
 use crate::proxy::{Environment, Variable};
+use crate::storage::profile::ColumnTypes;
 
 #[test]
 fn urls_classify_and_redact() {
@@ -187,6 +188,7 @@ fn queries_come_from_the_request_and_tables_are_checked() {
         query: None,
         source_table: None,
         limit: None,
+        types: ColumnTypes::default(),
     };
     assert!(base.source_query().is_err());
     let by_table = ImportRequest {
@@ -475,6 +477,7 @@ async fn downloaded_files_are_cut_to_the_row_cap() {
         query: None,
         source_table: None,
         limit: Some(2),
+        types: ColumnTypes::default(),
     };
     let summary = Importing {
         config: &config,
@@ -527,6 +530,7 @@ async fn an_http_import_with_a_raw_at_in_the_password_masks_the_source() {
         query: None,
         source_table: None,
         limit: None,
+        types: ColumnTypes::default(),
     };
     let summary = Importing {
         config: &config,
@@ -598,6 +602,7 @@ async fn sqlite_imports_refuse_quacks_own_data_directory() {
             query: None,
             source_table: Some(String::from("users")),
             limit: None,
+            types: ColumnTypes::default(),
         };
         let err = Importing {
             config: &config,

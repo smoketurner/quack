@@ -12,7 +12,9 @@ use super::{
     Class, IdRenames, Mapping, MappingRelation, Ontology, Property, PropertyType, Relation, SnakeId,
 };
 use crate::error::{Error, Result};
+use crate::graph;
 use crate::ids::{ClassId, RelationId};
+use crate::storage::profile::{ColumnKind, ColumnProfile, TableProfile};
 use crate::storage::workspace::{WorkspaceDb, quote_ident};
 
 /// Tuning for table evidence.
@@ -110,148 +112,28 @@ pub struct Candidate {
     pub low_support: bool,
 }
 
-/// What a column's `DuckDB` type says about the property it becomes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColumnKind {
-    Boolean,
-    /// A date or timestamp.
-    Temporal,
-    /// An integer, float, or decimal type.
-    Numeric,
-    /// Text or anything else: the values decide.
-    Other,
-}
-
-impl ColumnKind {
-    fn of(duckdb_type: &str) -> Self {
-        const NUMERIC: [&str; 11] = [
-            "TINYINT",
-            "SMALLINT",
-            "INTEGER",
-            "BIGINT",
-            "HUGEINT",
-            "UTINYINT",
-            "USMALLINT",
-            "UINTEGER",
-            "UBIGINT",
-            "FLOAT",
-            "DOUBLE",
-        ];
-        let t = duckdb_type.to_ascii_uppercase();
-        if t == "BOOLEAN" {
-            Self::Boolean
-        } else if t.starts_with("DATE") || t.starts_with("TIMESTAMP") {
-            Self::Temporal
-        } else if NUMERIC.contains(&t.as_str()) || t.starts_with("DECIMAL") {
-            Self::Numeric
-        } else {
-            Self::Other
-        }
-    }
-}
-
-struct ColumnProfile {
-    name: String,
-    duckdb_type: String,
-    kind: ColumnKind,
+/// The property type a column's type and values suggest.
+fn property_type(
+    column: &ColumnProfile,
     rows: u64,
-    non_null: u64,
-    distinct: u64,
-    samples: Vec<String>,
-    /// Share of non-null values that cast to a date.
-    date_share: f64,
-}
-
-impl ColumnProfile {
-    /// The property type the column's type and values suggest.
-    fn property_type(&self, options: &TableEvidenceOptions) -> PropertyType {
-        match self.kind {
-            ColumnKind::Boolean => return PropertyType::Boolean,
-            ColumnKind::Temporal => return PropertyType::Date,
-            ColumnKind::Numeric => return PropertyType::Number,
-            ColumnKind::Other => {}
-        }
-        if self.non_null > 0 && self.date_share >= 0.9 {
-            return PropertyType::Date;
-        }
-        if self.rows >= options.enum_min_rows
-            && self.distinct > 1
-            && self.distinct <= u64::from(options.enum_max_values)
-        {
-            return PropertyType::Enum;
-        }
-        PropertyType::String
+    options: &TableEvidenceOptions,
+) -> PropertyType {
+    match column.kind() {
+        ColumnKind::Boolean => return PropertyType::Boolean,
+        ColumnKind::Temporal => return PropertyType::Date,
+        ColumnKind::Numeric => return PropertyType::Number,
+        ColumnKind::Text | ColumnKind::Other => {}
     }
-}
-
-struct TableProfile {
-    name: String,
-    rows: u64,
-    columns: Vec<ColumnProfile>,
-    key: Option<String>,
-}
-
-impl TableProfile {
-    /// Profile a table: its row count, each column's counts and samples,
-    /// and the column that looks like its key.
-    fn read(db: &WorkspaceDb, table: &str) -> Result<Self> {
-        let described = db.describe_table(table)?;
-        let conn = db.connection();
-        let quoted = quote_ident(table);
-        let rows: i64 =
-            conn.query_row(&format!("SELECT count(*) FROM {quoted}"), [], |r| r.get(0))?;
-        let rows = u64::try_from(rows).unwrap_or(0);
-        let mut columns = Vec::new();
-        for column in &described.columns {
-            let q = quote_ident(&column.name);
-            let (non_null, distinct, date_share): (i64, i64, Option<f64>) = conn.query_row(
-                &format!(
-                    "SELECT count({q}), count(DISTINCT {q}), \
-                     avg(CASE WHEN {q} IS NULL THEN NULL WHEN TRY_CAST({q} AS DATE) IS NOT NULL THEN 1.0 ELSE 0.0 END) \
-                     FROM {quoted}"
-                ),
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-            let mut stmt = conn.prepare(&format!(
-                "SELECT DISTINCT CAST({q} AS VARCHAR) FROM {quoted} WHERE {q} IS NOT NULL ORDER BY 1 LIMIT 3"
-            ))?;
-            let samples: Vec<String> = stmt
-                .query_map([], |r| r.get::<_, String>(0))?
-                .flatten()
-                .collect();
-            columns.push(ColumnProfile {
-                name: column.name.clone(),
-                duckdb_type: column.column_type.to_ascii_uppercase(),
-                kind: ColumnKind::of(&column.column_type),
-                rows,
-                non_null: u64::try_from(non_null).unwrap_or(0),
-                distinct: u64::try_from(distinct).unwrap_or(0),
-                samples,
-                date_share: date_share.unwrap_or(0.0),
-            });
-        }
-        let key = columns
-            .iter()
-            .filter(|c| rows > 0 && c.non_null == rows && c.distinct == rows)
-            .min_by_key(|c| {
-                let lower = c.name.to_ascii_lowercase();
-                if lower == "id" {
-                    0
-                } else if lower.ends_with("_id") || lower.ends_with("id") {
-                    1
-                } else {
-                    2
-                }
-            })
-            .map(|c| c.name.clone());
-        Ok(Self {
-            name: table.to_owned(),
-            rows,
-            columns,
-            key,
-        })
+    if column.non_null > 0 && column.date_share >= 0.9 {
+        return PropertyType::Date;
     }
+    if rows >= options.enum_min_rows
+        && column.distinct > 1
+        && column.distinct <= u64::from(options.enum_max_values)
+    {
+        return PropertyType::Enum;
+    }
+    PropertyType::String
 }
 
 /// A relation name from a foreign-key-like column: `policy_id` becomes
@@ -310,9 +192,10 @@ pub fn propose_from_tables(
     current: Option<&Ontology>,
     options: &TableEvidenceOptions,
 ) -> Result<Vec<Candidate>> {
+    let views = graph::views::names(db)?;
     let mut profiles = Vec::new();
-    for table in &db.list_tables()? {
-        profiles.push(TableProfile::read(db, table)?);
+    for table in db.list_tables()?.iter().filter(|t| !views.contains(*t)) {
+        profiles.push(TableProfile::compute(db, table)?);
     }
     let mut pass = InductionPass {
         db,
@@ -385,38 +268,33 @@ impl InductionPass<'_> {
     /// Propose a table's class, its properties, the relations its columns
     /// imply, and its mapping.
     fn table(&mut self, profile: &TableProfile) -> Result<()> {
-        let class_id = self.known.class_for_table(&profile.name);
+        let class_id = self.known.class_for_table(&profile.table);
         let mut property_ids = Vec::new();
         let mut property_map = BTreeMap::new();
         let mut relations = Vec::new();
 
         for column in &profile.columns {
             let property_id = SnakeId::from_name(&column.name).into_string();
-            let kind = column.property_type(self.options);
+            let kind = property_type(column, profile.row_count, self.options);
             let values = if kind == PropertyType::Enum {
-                enum_values(self.db, &profile.name, &column.name)?
+                enum_values(self.db, &profile.table, &column.name)?
             } else {
                 Vec::new()
             };
             property_ids.push(property_id.clone());
             property_map.insert(column.name.clone(), property_id.clone());
-            let is_key = profile.key.as_deref() == Some(column.name.as_str());
+            let is_key = profile.key_column() == Some(column.name.as_str());
             if !self.known.property(&class_id, &property_id) {
                 self.candidates.push(Candidate {
                     proposal: Proposal::Property {
                         class: class_id.clone(),
-                        property: Property {
-                            id: property_id.clone(),
-                            label: None,
-                            kind,
-                            values,
-                        },
+                        property: Property::new(property_id.clone(), kind, values),
                     },
                     evidence: serde_json::json!({
-                        "table": profile.name,
+                        "table": profile.table,
                         "column": column.name,
                         "duckdb_type": column.duckdb_type,
-                        "rows": column.rows,
+                        "rows": profile.row_count,
                         "non_null": column.non_null,
                         "distinct": column.distinct,
                         "samples": column.samples,
@@ -432,7 +310,7 @@ impl InductionPass<'_> {
                     low_support: false,
                 });
             }
-            if !is_key && !self.known.mapped_relation(&profile.name, &column.name) {
+            if !is_key && !self.known.mapped_relation(&profile.table, &column.name) {
                 self.relations(profile, column, &mut relations)?;
             }
         }
@@ -443,35 +321,34 @@ impl InductionPass<'_> {
                     id: ClassId::from(class_id.clone()),
                     parent: ClassId::from(super::ROOT_CLASS),
                     label: None,
-                    description: Some(format!("Rows of table {}", profile.name)),
+                    description: Some(format!("Rows of table {}", profile.table)),
                     key: profile
-                        .key
-                        .as_deref()
+                        .key_column()
                         .map(|key| SnakeId::from_name(key).into_string()),
                     properties: property_ids,
                 }),
                 evidence: serde_json::json!({
-                    "table": profile.name,
-                    "rows": profile.rows,
+                    "table": profile.table,
+                    "rows": profile.row_count,
                     "columns": profile.columns.len(),
-                    "key_column": profile.key,
+                    "key_column": profile.key_column(),
                 }),
                 confidence: 1.0,
                 low_support: false,
             });
         }
-        if let Some(key) = &profile.key
-            && !self.known.mapping(&profile.name)
+        if let Some(key) = profile.key_column()
+            && !self.known.mapping(&profile.table)
         {
             self.candidates.push(Candidate {
                 proposal: Proposal::Mapping(Mapping {
-                    table: profile.name.clone(),
+                    table: profile.table.clone(),
                     class: ClassId::from(class_id),
-                    key: key.clone(),
+                    key: key.to_owned(),
                     properties: property_map,
                     relations,
                 }),
-                evidence: serde_json::json!({ "table": profile.name, "rows": profile.rows }),
+                evidence: serde_json::json!({ "table": profile.table, "rows": profile.row_count }),
                 confidence: 1.0,
                 low_support: false,
             });
@@ -487,16 +364,22 @@ impl InductionPass<'_> {
         column: &ColumnProfile,
         relations: &mut Vec<MappingRelation>,
     ) -> Result<()> {
-        let class_id = self.known.class_for_table(&profile.name);
-        for other in self.profiles.iter().filter(|p| p.name != profile.name) {
-            let Some(other_key) = other.key.as_deref() else {
+        let class_id = self.known.class_for_table(&profile.table);
+        for other in self.profiles.iter().filter(|p| p.table != profile.table) {
+            let Some(other_key) = other.key_column() else {
                 continue;
             };
-            let share = overlap(self.db, &profile.name, &column.name, &other.name, other_key)?;
+            let share = overlap(
+                self.db,
+                &profile.table,
+                &column.name,
+                &other.table,
+                other_key,
+            )?;
             if share < self.options.key_overlap_threshold || column.distinct == 0 {
                 continue;
             }
-            let target_class = self.known.class_for_table(&other.name);
+            let target_class = self.known.class_for_table(&other.table);
             let (relation_id, new) =
                 match self.relation_name(&column.name, &class_id, &target_class) {
                     RelationName::New(id) => (id, true),
@@ -518,9 +401,9 @@ impl InductionPass<'_> {
                         range: ClassId::from(target_class),
                     }),
                     evidence: serde_json::json!({
-                        "table": profile.name,
+                        "table": profile.table,
                         "column": column.name,
-                        "target_table": other.name,
+                        "target_table": other.table,
                         "target_key": other_key,
                         "overlap": share,
                         "distinct": column.distinct,

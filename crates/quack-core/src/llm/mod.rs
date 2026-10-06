@@ -1339,6 +1339,7 @@ async fn start_turn<'c>(
                 context: context::combined(guard)?,
                 context_max_tokens,
                 ollama_context_cap,
+                question: None,
             };
             Ok(prompt)
         })

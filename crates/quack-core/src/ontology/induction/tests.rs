@@ -49,7 +49,7 @@ fn column_types_sort_into_kinds() {
         ("BIGINT", ColumnKind::Numeric),
         ("DECIMAL(18,3)", ColumnKind::Numeric),
         ("double", ColumnKind::Numeric),
-        ("VARCHAR", ColumnKind::Other),
+        ("VARCHAR", ColumnKind::Text),
         ("INTEGER[]", ColumnKind::Other),
     ] {
         assert_eq!(ColumnKind::of(duckdb_type), kind, "{duckdb_type}");

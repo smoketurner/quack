@@ -92,10 +92,11 @@ cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # S
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
 cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use
 cargo run --bin quack -- workspace rename OLD NEW | delete NAME [-y] | snapshot NAME [--to FILE] | restore FILE|- [--name N]   # storage::backup: one tar (manifest.json, data.duckdb, files/); delete is at once, the audit rows stay
-cargo run --bin quack -- ingest sales.csv -w ws [--replace [ID]]               # file -> table(s) or chunks; --replace supersedes the document with the same name (or ID) once the new one is ready
+cargo run --bin quack -- ingest sales.csv -w ws [--replace [ID]] [--types amount=DOUBLE]   # file -> table(s) or chunks; --replace supersedes the document with the same name (or ID) once the new one is ready; --types retypes columns strictly after the load
 cargo run --bin quack -- ingest DIR -w ws [--prune]                            # every supported file under DIR (not a bundle), root and path recorded; re-run skips unchanged, replaces changed, reports gone files of that root (--prune deletes them)
 #   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX, EPUB, ODT, EML/MBOX, VTT/SRT, source code, RTF
 #   --author/--authored/--tag set what the file says about itself; a table inside a document with >= [ingestion].table_rows_as_table rows also loads as <stem>_tableN
+cargo run --bin quack -- tables [TABLE [--note TEXT] [--retype COL=TYPE]] [--format json]   # row counts, owner notes, profile warnings; a note or a strict retype (PUT .../tables/note, POST .../tables/retype, the Tables page)
 cargo run --bin quack -- docs [--tag ID TAG | --untag ID TAG | --author ID NAME | --authored ID DATE]   # a document's own fields; PATCH .../documents/{doc} over REST
 cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
@@ -108,7 +109,7 @@ cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | pat
 cargo run --bin quack -- graph add node LABEL --class C [--property K=V] | add edge FROM REL TO | set NODE [--label L] [--to-class C] [--property K=V] [--unset K] | delete node NODE | delete edge ID   # a person's assertions, recorded with author and note
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
-cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
+cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders [--types col=TYPE]   # snapshot a Postgres/SQLite query or an http(s) data file as a table
 cargo run --bin quack -- auth login|status|logout PROVIDER ; auth jwks [PROVIDER] [--rotate [--activate]]  # OAuth tokens; a client's public key
 cargo run --bin quack -- auth register [--issuer URL] [--device-code|--token-env VAR|--open] [--replace] [--print] | unregister   # RFC 7591/7592 client registration
 cargo run --bin quack -- config [--changed] [--format json]                      # every recognized setting, its value and origin, the file's unknown keys, the env vars read
@@ -375,6 +376,26 @@ total it was capped from (`GraphResult::total_nodes`, `truncated`). Provenance t
 table renders as a predicate `run_sql` can run, since the mapping knows the key column. The
 tool guidance in the system prompt gains a numbered graph procedure whenever those tools
 are registered.
+
+What the agent knows of a table (issue #403): `storage::profile::TableProfile` (per column
+present and distinct counts, three common values, the share of a text column that casts to a
+number or a date) is stored in `_quack_table_profiles` at load, import, and after any write that
+changed the row count (`TableProfile::after_write`, called by every interface that runs a write),
+and shown only while its row count matches; `profile::ColumnWarning` (all empty, half empty,
+numbers or dates stored as text, a repeating key) is worked out when read, with the
+`ColumnType` that fixes it when every value converts (`profile::Retype`, a strict `CAST`;
+`--types` at ingest and import). Owners' notes are `profile::TableNote` (`_quack_table_notes`).
+The ontology's `Property` carries `description`, `unit`, `synonyms`, and `Ontology::measures`
+(a SQL expression over one table, checked as a read at save); `WorkspaceDb::describe_table`
+returns all of it on `TableDescription` (`to_json` is the one REST, MCP, and CLI shape). Past
+`table_search::DETAILED_TABLES` (25) user tables, `find_tables` registers and the prompt ranks
+tables against the question after the workspace context (`analysis::table_search`: a card per
+table, BM25 with `tokenize`, plus cosine over card vectors in `_quack_table_cards` refreshed at
+turn start, fused by RRF). The graph is readable in SQL through `graph::views` (issue #406):
+`graph_<class>` with one typed column per property and `graph_edges`, made by `views::ensure` at
+every ontology save and open, marked by a comment; `table_search::user_tables` is
+`list_tables` without them. A write naming `graph_` is refused (`views::write_names_reserved`),
+and ingest and import refuse `graph_` and `_quack_` table names (`TableName::check_unreserved`).
 
 Every embedding goes through `quack_core::embedding::Embedder` as an `Input`, which names
 its role: `Query` (search), `Document { title, text }` (a chunk under its heading), or

@@ -93,6 +93,11 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/workspaces/{id}/tables/describe", post(tables::describe))
         .route("/workspaces/{id}/tables/schema", get(tables::schema))
         .route(
+            "/workspaces/{id}/tables/note",
+            axum::routing::put(tables::note),
+        )
+        .route("/workspaces/{id}/tables/retype", post(tables::retype))
+        .route(
             "/workspaces/{id}/context",
             get(context::show).put(context::replace),
         )

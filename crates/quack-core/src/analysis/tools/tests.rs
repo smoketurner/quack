@@ -13,6 +13,7 @@ use crate::ingestion::parser::SectionKind;
 use crate::llm::EmbedModel;
 use crate::ontology::Mapping;
 use crate::ontology::store::Revision;
+use crate::storage::profile::{TableNote, TableProfile};
 use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 
 #[expect(clippy::panic, reason = "test failure path")]
@@ -1812,4 +1813,178 @@ async fn run_sql_keeps_the_first_rows_on_its_step() {
     );
     assert_eq!(kept.map(|r| r.rows.len()), Some(2));
     assert!(steps.get(1).is_some_and(|s| s.result.is_none()));
+}
+
+/// Thirty tables, the one that matters sorting last, with a note, a
+/// mapping whose property says `amount` is in cents, and a measure.
+async fn wide_workspace(db: &SharedDb) {
+    let seeded = db
+        .run(|db| {
+            for i in 0..30 {
+                db.execute_statement(&format!(
+                    "CREATE TABLE filler_{i:02} AS SELECT 'x{i}' AS code"
+                ))?;
+            }
+            db.execute_statement(
+                "CREATE TABLE zz_orders AS SELECT * FROM (VALUES ('o1', '1250'), ('o1', '300')) t(order_id, amount)",
+            )?;
+            TableProfile::refresh_stale(db)?;
+            TableNote::set(db, "zz_orders", "One row per order line", Some("owner"))?;
+            let json = r#"{"classes": [{"id": "order", "properties": ["order_id", "amount"]}],
+                "properties": [{"id": "order_id", "type": "string"},
+                               {"id": "amount", "type": "number", "description": "line total", "unit": "cents"}],
+                "mappings": [{"table": "zz_orders", "class": "order", "key": "order_id", "properties": {"amount": "amount"}}],
+                "measures": [{"id": "revenue", "table": "zz_orders", "expression": "sum(CAST(amount AS BIGINT)) / 100.0"}]}"#;
+            ontology_store::save(db, &Ontology::from_json(json)?, Revision::reviewed(None, None))?;
+            Ok(())
+        })
+        .await;
+    assert!(seeded.is_ok(), "{seeded:?}");
+}
+
+#[tokio::test]
+async fn find_tables_ranks_a_late_table_first_with_its_columns() {
+    let db = shared_db();
+    wide_workspace(&db).await;
+    let (sink, _rx) = events::channel();
+    let turn = Turn::new(TurnRecorder::new(sink), WritePolicy::Deny);
+    let tool = FindTablesTool::<EmbedModel>::new(ReaderDb::new(Arc::clone(&db)), None, 60);
+    let found = tool
+        .call(
+            &mut turn.context(),
+            FindTablesArgs {
+                query: String::from("total order amount last month"),
+                top_k: Some(3),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    let first = found.lines().nth(1).unwrap_or_default();
+    assert!(first.starts_with("- zz_orders (2 rows)"), "{found}");
+    assert!(
+        found.contains("Note (from the owner): One row per order line"),
+        "{found}"
+    );
+    assert!(
+        found.contains("- amount (VARCHAR): line total [cents]"),
+        "{found}"
+    );
+    assert!(
+        found.contains("! amount: numbers stored as text"),
+        "{found}"
+    );
+    assert!(
+        found.contains("! order_id: key column is not unique (1 repeated)"),
+        "{found}"
+    );
+    assert!(found.contains("measure revenue = sum("), "{found}");
+    assert_eq!(
+        turn.recorder.steps().last().map(|s| s.tool),
+        Some(ToolName::FindTables)
+    );
+
+    let none = tool
+        .call(
+            &mut turn.context(),
+            FindTablesArgs {
+                query: String::from("zebra"),
+                top_k: None,
+            },
+        )
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    assert!(none.starts_with("No table matched"), "{none}");
+}
+
+#[tokio::test]
+async fn describe_table_carries_the_note_meaning_warnings_and_measures() {
+    let db = shared_db();
+    wide_workspace(&db).await;
+    let (sink, _rx) = events::channel();
+    let turn = Turn::new(TurnRecorder::new(sink), WritePolicy::Deny);
+    let text = DescribeTableTool(ReaderDb::new(Arc::clone(&db)))
+        .call(
+            &mut turn.context(),
+            DescribeTableArgs {
+                table_name: String::from("zz_orders"),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    assert!(
+        text.contains("Note (from the owner): One row per order line"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  - amount (VARCHAR): line total [cents]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\n  - amount: numbers stored as text"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  - revenue = sum(CAST(amount AS BIGINT)) / 100.0"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn graph_views_read_through_run_sql_and_refuse_changes() {
+    let db = shared_db();
+    let seeded = db
+        .run(|db| {
+            ontology_store::save(db, &Ontology::builtin_default(), Revision::reviewed(None, None))?;
+            db.connection().execute(
+                "INSERT INTO _quack_graph_nodes (id, label, normalized_label, class_id, properties) \
+                 VALUES ('n1', 'Acme', 'acme', 'organization', '{\"country\": \"NL\"}')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await;
+    assert!(seeded.is_ok(), "{seeded:?}");
+    let (sink, _rx) = events::channel();
+    let turn = Turn::new(
+        TurnRecorder::new(sink),
+        WritePolicy::Allow(Approver::Nobody),
+    );
+    let tool = RunSqlTool::new(Arc::clone(&db), ReaderDb::new(Arc::clone(&db)), 100);
+    let run = |query: &str| {
+        let query = query.to_owned();
+        let tool = &tool;
+        let turn = &turn;
+        async move {
+            tool.call(&mut turn.context(), RunSqlArgs { query })
+                .await
+                .unwrap_or_else(|e| fail_test(&e.to_string()))
+        }
+    };
+    let counted = run("SELECT country, count(*) AS n FROM graph_organization GROUP BY ALL").await;
+    assert!(
+        counted.contains("NL") && !counted.starts_with(SQL_ERROR_PREFIX),
+        "{counted}"
+    );
+    assert_eq!(
+        run("DROP VIEW graph_organization").await,
+        graph::views::RESERVED_REFUSED
+    );
+    assert_eq!(
+        run("CREATE VIEW v AS SELECT * FROM _quack_graph_nodes").await,
+        INTERNAL_TABLE_REFUSED
+    );
+
+    let described = DescribeClassTool(ReaderDb::new(Arc::clone(&db)))
+        .call(
+            &mut turn.context(),
+            DescribeClassArgs {
+                class_id: String::from("organization"),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    assert!(
+        described.contains("SQL view: graph_organization (id VARCHAR, label VARCHAR, class_id VARCHAR, provisional BOOLEAN, country VARCHAR, industry VARCHAR)"),
+        "{described}"
+    );
 }
