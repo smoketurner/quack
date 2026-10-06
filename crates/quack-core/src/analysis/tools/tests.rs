@@ -1448,7 +1448,7 @@ async fn allow_write_refuses_a_write_after_a_graph_search() {
     let tools = GraphTools::<EmbedModel> {
         db: ReaderDb::new(Arc::clone(&db)),
         embedding_model: None,
-        options: graph::GraphOptions::default(),
+        options: GraphConfig::default(),
         mode: ChatMode::Chat,
     };
     let args = |class: &str| {

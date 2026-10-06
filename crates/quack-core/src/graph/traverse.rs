@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use super::store::{self, EdgeScope, IdList};
-use super::{GraphOptions, GraphResult, Node, NormalizedLabel, Properties};
+use super::{GraphResult, Node, NormalizedLabel, Properties, Standing};
+use crate::config::GraphConfig;
 use crate::embedding::Vector;
 use crate::error::Result;
 use crate::ids::{ClassId, EdgeId, NodeId};
@@ -204,7 +205,7 @@ pub fn neighborhood(
     roots: &[Node],
     hops: Hops,
     relation: Option<&str>,
-    options: &GraphOptions,
+    options: &GraphConfig,
 ) -> Result<GraphResult> {
     if roots.is_empty() {
         return Ok(GraphResult::default());
@@ -272,7 +273,7 @@ pub fn path(
     from: &Node,
     to: &Node,
     max_hops: Hops,
-    options: &GraphOptions,
+    options: &GraphConfig,
 ) -> Result<GraphResult> {
     if from.id == to.id {
         let mut result = collect(db, std::slice::from_ref(&from.id))?;
@@ -361,7 +362,7 @@ pub fn by_class(
     ontology: Option<&Ontology>,
     class_id: &str,
     limit: u32,
-    options: &GraphOptions,
+    options: &GraphConfig,
 ) -> Result<GraphResult> {
     let classes = ontology.map_or_else(
         || vec![ClassId::from(class_id)],
@@ -438,7 +439,11 @@ impl fmt::Display for GraphResult {
             self.edges.len(),
             self.provenance.len()
         )?;
-        if self.nodes.iter().any(|n| n.provisional) {
+        if self
+            .nodes
+            .iter()
+            .any(|n| n.standing == Standing::Provisional)
+        {
             f.write_str(" (provisional: built from an unreviewed ontology)")?;
         }
         if self.truncated {
@@ -544,7 +549,7 @@ mod tests {
             label: String::from(label),
             class_id: ClassId::from("organization"),
             properties: Properties::from(properties),
-            provisional: false,
+            standing: Standing::Reviewed,
         }
     }
 
@@ -562,7 +567,7 @@ mod tests {
                 relation_id: RelationId::from("supplies"),
                 weight: 1.0,
                 properties: Properties::from(json!({ "since": "2020" })),
-                provisional: false,
+                standing: Standing::Reviewed,
             }],
             provenance: Vec::new(),
             roots: vec![NodeId::from("a")],
@@ -604,7 +609,7 @@ mod tests {
             relation_id: RelationId::from("knows"),
             weight: 1.0,
             properties: Properties::default(),
-            provisional: false,
+            standing: Standing::Reviewed,
         };
         let result = GraphResult {
             nodes: vec![node("a", "A", json!({})), node("b", "B", json!({}))],

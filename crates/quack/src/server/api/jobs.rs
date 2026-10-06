@@ -40,7 +40,7 @@ impl Access {
     pub(crate) fn visible_jobs(&self, app: &App) -> Vec<JobInfo> {
         let mut jobs: Vec<JobInfo> = app
             .jobs
-            .list_workspace(&self.workspace.id)
+            .list_workspace(&self.membership.workspace.id)
             .into_iter()
             .map(|job| self.redact(job))
             .collect();
@@ -59,7 +59,7 @@ impl Access {
         job.parse::<JobId>()
             .ok()
             .and_then(|id| app.jobs.get(id))
-            .filter(|j| j.workspace_id.as_ref() == Some(&self.workspace.id))
+            .filter(|j| j.workspace_id.as_ref() == Some(&self.membership.workspace.id))
             .ok_or_else(|| ApiError::not_found(format!("job '{job}' not found")))
     }
 
@@ -160,7 +160,7 @@ pub(crate) async fn stream(
                 received = receiver.recv() => received,
             };
             match received {
-                Ok(job) if job.workspace_id.as_ref() == Some(&access.workspace.id) => {
+                Ok(job) if job.workspace_id.as_ref() == Some(&access.membership.workspace.id) => {
                     let event = StreamEvent::Job
                         .event()
                         .json_data(access.redact(job))

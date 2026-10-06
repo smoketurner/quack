@@ -213,7 +213,7 @@ impl TryFrom<&duckdb::Row<'_>> for Node {
             label: row.get(1)?,
             class_id: row.get(2)?,
             properties: Properties::from_column(properties.as_deref()),
-            provisional: row.get(4)?,
+            standing: row.get(4)?,
         })
     }
 }
@@ -234,7 +234,7 @@ impl TryFrom<&duckdb::Row<'_>> for Edge {
             relation_id: row.get(3)?,
             weight: row.get::<_, Option<f64>>(4)?.unwrap_or(1.0),
             properties: Properties::from_column(properties.as_deref()),
-            provisional: row.get(6)?,
+            standing: row.get(6)?,
         })
     }
 }

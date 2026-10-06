@@ -15,7 +15,7 @@ use super::{Renewal, SignIn, UserTokens};
 use crate::error::Result;
 use crate::ids::UserId;
 use crate::llm::oauth::CachedToken;
-use crate::storage::control::{AuditAction, AuditEntry, Channel, ControlPlane, Outcome};
+use crate::storage::control::{ControlPlane, Origin};
 use crate::web_sessions::WebSessions;
 
 /// A token is renewed this long before it expires.
@@ -34,27 +34,6 @@ pub enum Stored {
     Missing,
     /// The issuer refused the renewal, and the stored token is gone.
     Revoked,
-}
-
-/// Where the request that meets an issuer's refusal came from, for the
-/// denied `session` row it records.
-#[derive(Debug, Clone)]
-pub struct Origin {
-    pub channel: Channel,
-    pub client_addr: Option<String>,
-    pub request_id: Option<String>,
-}
-
-impl Origin {
-    /// The denied `session` row for `user`, when their sign-in has ended.
-    #[must_use]
-    pub fn denied_session(&self, user: &UserId) -> AuditEntry {
-        let mut entry = AuditEntry::new(AuditAction::Session, Outcome::Denied, self.channel);
-        entry.user_id = Some(user.clone());
-        entry.client_addr.clone_from(&self.client_addr);
-        entry.request_id.clone_from(&self.request_id);
-        entry
-    }
 }
 
 /// How many times the issuer has ended a person's sign-in: a provider token

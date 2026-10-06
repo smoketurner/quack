@@ -29,12 +29,12 @@ use super::state::{App, AppState, ServeMode, with_db};
 use crate::server::auth::{Access, Credential, Identity};
 use crate::server::queue::UploadJob;
 use crate::server::run::{BackgroundRun, RunKind, RunReport};
-use quack_core::jobs::LaneKey;
+use quack_core::jobs::{JobKind, LaneKey};
 use quack_core::okf::{Bundle, BundleSink, TarSink};
 use quack_core::storage::audit;
 use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, IssuedToken, Outcome,
-    Role, Scope, UserKind,
+    AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, IssuedToken, Membership,
+    Origin, Outcome, ResourceKind, Role, Scope, Standing, UserKind,
 };
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 use quack_core::web_sessions::WebSessions;
@@ -202,14 +202,14 @@ impl Harness {
             identity: Identity {
                 user_id: owner.clone(),
                 username: String::from("owner"),
-                is_admin: false,
+                kind: UserKind::Standard,
                 credential: Credential::Local,
-                client_addr: None,
-                request_id: None,
-                channel: None,
+                origin: Origin::from(Channel::Web),
             },
-            workspace,
-            role: Some(Role::Owner),
+            membership: Membership {
+                workspace,
+                standing: Standing::Member(Role::Owner),
+            },
         }
     }
 
@@ -245,7 +245,10 @@ async fn unauthenticated_requests_are_rejected() {
         })
         .await;
     assert_eq!(denied.len(), 1);
-    assert_eq!(denied.first().map(|r| r.outcome.as_str()), Some("denied"));
+    assert_eq!(
+        denied.first().map(|r| r.entry.outcome.as_str()),
+        Some("denied")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -298,9 +301,13 @@ async fn login_sets_a_cookie_and_audits_both_outcomes() {
             ..AuditFilter::default()
         })
         .await;
-    let outcomes: Vec<&str> = logins.iter().map(|r| r.outcome.as_str()).collect();
+    let outcomes: Vec<&str> = logins.iter().map(|r| r.entry.outcome.as_str()).collect();
     assert_eq!(outcomes, ["allowed", "denied"]);
-    assert!(logins.iter().all(|r| r.user_id.as_ref() == Some(&alice)));
+    assert!(
+        logins
+            .iter()
+            .all(|r| r.entry.user_id.as_ref() == Some(&alice))
+    );
     let (status, _) = h
         .call(Method::POST, "/api/v1/auth/logout", Some(&token), None)
         .await;
@@ -367,7 +374,8 @@ async fn workspaces_follow_membership_roles_and_admin_limits() {
     assert!(
         denied
             .iter()
-            .any(|r| r.workspace_id.as_ref() == Some(&ws) && r.channel == Channel::Web)
+            .any(|r| r.entry.workspace_id.as_ref() == Some(&ws)
+                && r.entry.origin.channel == Channel::Web)
     );
     let (status, _) = h.get("/api/v1/workspaces/nope", &bob_token).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -528,8 +536,8 @@ async fn workspaces_follow_membership_roles_and_admin_limits() {
     // carol: added (Allowed), removed (Allowed), removed again, a no-op (Error).
     let mut carol_outcomes: Vec<Outcome> = member_rows
         .iter()
-        .filter(|r| r.resource_id.as_deref() == Some(carol.as_str()))
-        .map(|r| r.outcome)
+        .filter(|r| r.entry.resource_id.as_deref() == Some(carol.as_str()))
+        .map(|r| r.entry.outcome)
         .collect();
     carol_outcomes.sort_by_key(|o| o.as_str());
     assert_eq!(
@@ -708,14 +716,22 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
         })
         .await;
     assert!(access_rows.len() >= 4);
-    assert!(access_rows.iter().all(|r| r.resource_id.is_none()));
+    assert!(access_rows.iter().all(|r| r.entry.resource_id.is_none()));
+    assert!(
+        access_rows.iter().any(
+            |r| r.entry.outcome == Outcome::Denied && r.entry.user_id.as_ref() == Some(&viewer)
+        )
+    );
     assert!(
         access_rows
             .iter()
-            .any(|r| r.outcome == Outcome::Denied && r.user_id.as_ref() == Some(&viewer))
+            .any(|r| r.entry.outcome == Outcome::Error)
     );
-    assert!(access_rows.iter().any(|r| r.outcome == Outcome::Error));
-    assert!(access_rows.iter().all(|r| r.request_id.is_some()));
+    assert!(
+        access_rows
+            .iter()
+            .all(|r| r.entry.origin.request_id.is_some())
+    );
 }
 
 /// A document's chunks page in order through the API and open on the web
@@ -800,9 +816,9 @@ async fn a_documents_chunks_page_through_the_api_and_open_on_the_passage_page() 
         })
         .await;
     assert!(
-        opened.iter().any(|r| r.outcome == Outcome::Allowed
-            && r.user_id.as_ref() == Some(&owner)
-            && r.resource_id.as_deref() == Some("d")),
+        opened.iter().any(|r| r.entry.outcome == Outcome::Allowed
+            && r.entry.user_id.as_ref() == Some(&owner)
+            && r.entry.resource_id.as_deref() == Some("d")),
         "{opened:?}"
     );
     let denied = h
@@ -813,7 +829,9 @@ async fn a_documents_chunks_page_through_the_api_and_open_on_the_passage_page() 
         })
         .await;
     assert!(
-        denied.iter().any(|r| r.user_id.as_ref() == Some(&outsider)),
+        denied
+            .iter()
+            .any(|r| r.entry.user_id.as_ref() == Some(&outsider)),
         "{denied:?}"
     );
 
@@ -910,7 +928,7 @@ async fn a_replacement_supersedes_its_predecessor_once_ready() {
     assert!(
         ingests
             .iter()
-            .any(|r| r.resource_id.as_deref() == Some(new.as_str())),
+            .any(|r| r.entry.resource_id.as_deref() == Some(new.as_str())),
         "{ingests:?}"
     );
 
@@ -1041,8 +1059,9 @@ async fn the_sql_schema_is_for_members_and_names_no_internal_table() {
         })
         .await;
     assert!(
-        rows.iter()
-            .any(|r| r.outcome == Outcome::Allowed && r.user_id.as_ref() == Some(&owner)),
+        rows.iter().any(
+            |r| r.entry.outcome == Outcome::Allowed && r.entry.user_id.as_ref() == Some(&owner)
+        ),
         "{rows:?}"
     );
     let denied = h
@@ -1053,7 +1072,9 @@ async fn the_sql_schema_is_for_members_and_names_no_internal_table() {
         })
         .await;
     assert!(
-        denied.iter().any(|r| r.user_id.as_ref() == Some(&outsider)),
+        denied
+            .iter()
+            .any(|r| r.entry.user_id.as_ref() == Some(&outsider)),
         "{denied:?}"
     );
 }
@@ -1405,7 +1426,7 @@ async fn uploads_are_queued_processed_pinned_and_deleted() {
         })
         .await;
     assert_eq!(
-        deletes.first().and_then(|r| r.resource_id.clone()),
+        deletes.first().and_then(|r| r.entry.resource_id.clone()),
         Some(csv_id)
     );
 }
@@ -1490,7 +1511,7 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
     assert!(
         api_rows
             .iter()
-            .all(|r| r.channel == Channel::Api && r.token_hash.is_some())
+            .all(|r| r.entry.origin.channel == Channel::Api && r.entry.token_hash.is_some())
     );
 
     let expired = h
@@ -1520,7 +1541,11 @@ async fn api_tokens_are_scoped_to_one_workspace_and_expire() {
             ..AuditFilter::default()
         })
         .await;
-    assert!(denied.iter().any(|r| r.user_id.as_ref() == Some(&owner)));
+    assert!(
+        denied
+            .iter()
+            .any(|r| r.entry.user_id.as_ref() == Some(&owner))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1639,7 +1664,10 @@ async fn a_failed_first_turn_leaves_no_empty_session_behind() {
             ..AuditFilter::default()
         })
         .await;
-    assert_eq!(errors.first().map(|r| r.outcome.as_str()), Some("error"));
+    assert_eq!(
+        errors.first().map(|r| r.entry.outcome.as_str()),
+        Some("error")
+    );
 }
 
 /// An authorized search whose embedding provider is unreachable still writes
@@ -1690,11 +1718,11 @@ async fn a_failed_authorized_search_is_audited_as_error() {
         })
         .await;
     assert!(
-        rows.iter().any(|r| r.outcome == Outcome::Error),
+        rows.iter().any(|r| r.entry.outcome == Outcome::Error),
         "expected an Outcome::Error Search row for the failed authorized search, got {rows:?}"
     );
     assert!(
-        rows.iter().all(|r| r.request_id.is_some()),
+        rows.iter().all(|r| r.entry.origin.request_id.is_some()),
         "the row carries the request id, like the sql rows"
     );
 
@@ -1754,7 +1782,7 @@ async fn a_failed_authorized_search_on_a_db_error_is_audited_as_error() {
         })
         .await;
     assert!(
-        rows.iter().any(|r| r.outcome == Outcome::Error),
+        rows.iter().any(|r| r.entry.outcome == Outcome::Error),
         "expected an Outcome::Error Search row for the failed DB search, got {rows:?}"
     );
 }
@@ -1803,7 +1831,9 @@ async fn a_failed_authorized_graph_search_is_audited_as_error() {
         })
         .await;
     assert_eq!(
-        rows.iter().filter(|r| r.outcome == Outcome::Error).count(),
+        rows.iter()
+            .filter(|r| r.entry.outcome == Outcome::Error)
+            .count(),
         2,
         "expected an Outcome::Error Graph row for each failed request, got {rows:?}"
     );
@@ -2002,14 +2032,14 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
     assert_eq!(
         deletes
             .iter()
-            .filter(|r| r.outcome == Outcome::Denied)
+            .filter(|r| r.entry.outcome == Outcome::Denied)
             .count(),
         1
     );
     assert!(
         deletes
             .iter()
-            .all(|r| r.resource_type.as_deref() == Some("session"))
+            .all(|r| r.entry.resource_type == Some(ResourceKind::Session))
     );
 
     // The web button redirects back to the chat page; a missing session is a 404 page.
@@ -2485,7 +2515,7 @@ async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
     assert_eq!(
         proposes
             .iter()
-            .filter(|r| r.outcome == Outcome::Error)
+            .filter(|r| r.entry.outcome == Outcome::Error)
             .count(),
         1
     );
@@ -2736,7 +2766,7 @@ async fn local_mode_needs_no_login_and_owns_everything() {
         .await;
     assert!(
         rows.iter()
-            .all(|r| r.user_id == Some(UserId::from("local")))
+            .all(|r| r.entry.user_id == Some(UserId::from("local")))
     );
 }
 
@@ -3673,7 +3703,7 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
         })
         .await
         .into_iter()
-        .map(|r| r.resource_id)
+        .map(|r| r.entry.resource_id)
         .collect();
     assert!(
         opened.contains(&Some(String::from(
@@ -3699,13 +3729,15 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
         "denied write, allowed write, allowed read"
     );
     assert!(
-        sql_rows.iter().all(|r| r.channel == Channel::Mcp),
+        sql_rows
+            .iter()
+            .all(|r| r.entry.origin.channel == Channel::Mcp),
         "{sql_rows:?}"
     );
     assert_eq!(
         sql_rows
             .iter()
-            .filter(|r| r.outcome == Outcome::Denied)
+            .filter(|r| r.entry.outcome == Outcome::Denied)
             .count(),
         1
     );
@@ -3759,11 +3791,11 @@ async fn a_failed_authorized_mcp_search_is_audited_as_error() {
         })
         .await;
     assert!(
-        rows.iter().any(|r| r.outcome == Outcome::Error),
+        rows.iter().any(|r| r.entry.outcome == Outcome::Error),
         "expected an Outcome::Error Search row for the failed authorized MCP search, got {rows:?}"
     );
     assert!(
-        rows.iter().all(|r| r.channel == Channel::Mcp),
+        rows.iter().all(|r| r.entry.origin.channel == Channel::Mcp),
         "the MCP search rows are audited on the mcp channel, {rows:?}"
     );
 }
@@ -3828,11 +3860,11 @@ async fn a_successful_mcp_search_is_audited_as_allowed() {
         })
         .await;
     assert!(
-        rows.iter().any(|r| r.outcome == Outcome::Allowed),
+        rows.iter().any(|r| r.entry.outcome == Outcome::Allowed),
         "expected an Outcome::Allowed Search row for the successful MCP search, got {rows:?}"
     );
     assert!(
-        rows.iter().all(|r| r.channel == Channel::Mcp),
+        rows.iter().all(|r| r.entry.origin.channel == Channel::Mcp),
         "the MCP search rows are audited on the mcp channel, {rows:?}"
     );
 }
@@ -3915,8 +3947,8 @@ async fn concurrent_mcp_calls_by_one_user_audit_their_own_token_and_request_id()
         .await;
     assert_eq!(rows.len(), CALLS * 2, "one row per call, {rows:?}");
     for row in &rows {
-        assert_eq!(row.channel, Channel::Mcp, "{row:?}");
-        let request_id = row.request_id.as_deref().unwrap_or_default();
+        assert_eq!(row.entry.origin.channel, Channel::Mcp, "{row:?}");
+        let request_id = row.entry.origin.request_id.as_deref().unwrap_or_default();
         let which = match request_id.split('-').nth(1) {
             Some("0") => 0,
             Some("1") => 1,
@@ -3924,14 +3956,14 @@ async fn concurrent_mcp_calls_by_one_user_audit_their_own_token_and_request_id()
         };
         let expected = tokens.get(which).map(|(_, hash)| hash.as_str());
         assert_eq!(
-            row.token_hash.as_deref(),
+            row.entry.token_hash.as_deref(),
             expected,
             "request {request_id} was audited with another request's token"
         );
     }
     let mut ids: Vec<&str> = rows
         .iter()
-        .filter_map(|r| r.request_id.as_deref())
+        .filter_map(|r| r.entry.origin.request_id.as_deref())
         .collect();
     ids.sort_unstable();
     ids.dedup();
@@ -4004,18 +4036,23 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
             ..AuditFilter::default()
         })
         .await;
-    let lists = rows.iter().filter(|r| r.action == "list").count();
+    let lists = rows
+        .iter()
+        .filter(|r| r.entry.action == AuditAction::List)
+        .count();
     assert!(lists >= 7, "{rows:?}");
     // The API's describe and the web table page: two opens, neither
     // naming the table in control.db.
     assert_eq!(
-        rows.iter().filter(|r| r.action == "open").count(),
+        rows.iter()
+            .filter(|r| r.entry.action == AuditAction::Open)
+            .count(),
         2,
         "{rows:?}"
     );
     assert!(
         rows.iter()
-            .all(|r| r.resource_id.as_deref() != Some("customer_secrets")),
+            .all(|r| r.entry.resource_id.as_deref() != Some("customer_secrets")),
         "{rows:?}"
     );
     // Both halves, under the same ids: the workspace detail names the
@@ -4032,8 +4069,8 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
     // The harness's setup rows are the CLI's, which writes no detail.
     assert!(
         rows.iter()
-            .filter(|r| r.channel != Channel::Cli)
-            .all(|r| ids.contains(r.id.as_str())),
+            .filter(|r| r.entry.origin.channel != Channel::Cli)
+            .all(|r| ids.contains(r.entry.id.as_str())),
         "{rows:?}"
     );
     assert!(
@@ -4696,7 +4733,7 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
             })
             .await
             .iter()
-            .any(|r| r.outcome == Outcome::Allowed);
+            .any(|r| r.entry.outcome == Outcome::Allowed);
         if exported {
             break;
         }
@@ -4800,9 +4837,12 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         1,
         "one ontology audit row for the restore: {ont:?}"
     );
-    assert_eq!(ont[0].resource_type.as_deref(), Some("ontology_version"));
-    assert_eq!(ont[0].resource_id.as_deref(), Some("1"));
-    assert_eq!(ont[0].outcome, Outcome::Allowed);
+    assert_eq!(
+        ont[0].entry.resource_type,
+        Some(ResourceKind::OntologyVersion)
+    );
+    assert_eq!(ont[0].entry.resource_id.as_deref(), Some("1"));
+    assert_eq!(ont[0].entry.outcome, Outcome::Allowed);
     let proposed = h
         .audit(AuditFilter {
             workspace_id: Some(ws3.clone()),
@@ -4902,9 +4942,12 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         1,
         "one propose audit row for the run: {proposed:?}"
     );
-    assert_eq!(proposed[0].resource_type.as_deref(), Some("induction_run"));
-    assert_eq!(proposed[0].outcome, Outcome::Allowed);
-    let run_id = proposed[0].resource_id.clone().unwrap_or_default();
+    assert_eq!(
+        proposed[0].entry.resource_type,
+        Some(ResourceKind::InductionRun)
+    );
+    assert_eq!(proposed[0].entry.outcome, Outcome::Allowed);
+    let run_id = proposed[0].entry.resource_id.clone().unwrap_or_default();
     assert!(
         !run_id.is_empty(),
         "the run id is the audit resource: {proposed:?}"
@@ -5005,9 +5048,12 @@ async fn import_bundle_audits_both_the_ontology_restore_and_the_candidate_run() 
         })
         .await;
     assert_eq!(ont.len(), 1, "one ontology audit row: {ont:?}");
-    assert_eq!(ont[0].resource_type.as_deref(), Some("ontology_version"));
-    assert_eq!(ont[0].resource_id.as_deref(), Some("1"));
-    assert_eq!(ont[0].outcome, Outcome::Allowed);
+    assert_eq!(
+        ont[0].entry.resource_type,
+        Some(ResourceKind::OntologyVersion)
+    );
+    assert_eq!(ont[0].entry.resource_id.as_deref(), Some("1"));
+    assert_eq!(ont[0].entry.outcome, Outcome::Allowed);
 
     // The candidate run is audited as `propose`, keyed by the run id the
     // pending candidate carries as `proposed_by`.
@@ -5019,9 +5065,12 @@ async fn import_bundle_audits_both_the_ontology_restore_and_the_candidate_run() 
         })
         .await;
     assert_eq!(proposed.len(), 1, "one propose audit row: {proposed:?}");
-    assert_eq!(proposed[0].resource_type.as_deref(), Some("induction_run"));
-    assert_eq!(proposed[0].outcome, Outcome::Allowed);
-    let run_id = proposed[0].resource_id.clone().unwrap_or_default();
+    assert_eq!(
+        proposed[0].entry.resource_type,
+        Some(ResourceKind::InductionRun)
+    );
+    assert_eq!(proposed[0].entry.outcome, Outcome::Allowed);
+    let run_id = proposed[0].entry.resource_id.clone().unwrap_or_default();
     assert!(
         !run_id.is_empty(),
         "the run id is the audit resource: {proposed:?}"
@@ -5187,7 +5236,7 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
     assert_eq!(
         imports
             .iter()
-            .filter(|r| r.outcome == Outcome::Error)
+            .filter(|r| r.entry.outcome == Outcome::Error)
             .count(),
         2
     );
@@ -5232,7 +5281,10 @@ async fn an_idle_session_expires_and_is_audited() {
         })
         .await;
     assert_eq!(denied.len(), 1);
-    assert_eq!(denied.first().map(|r| r.outcome.as_str()), Some("denied"));
+    assert_eq!(
+        denied.first().map(|r| r.entry.outcome.as_str()),
+        Some("denied")
+    );
     // The second attempt finds nothing left to expire, so it falls through
     // to the token path: the entry really was dropped.
     let (status, body) = h.get("/api/v1/workspaces", &token).await;
@@ -5674,7 +5726,7 @@ async fn a_large_batch_of_uploads_is_spooled_and_processed() {
         let ready = h.wait_ready(&ws, id, &token).await;
         assert_eq!(ready["status"], "ready", "{ready}");
     }
-    let lane = LaneKey::Ingest(ws.clone());
+    let lane = LaneKey::Workspace(JobKind::Ingest, ws.clone());
     for _ in 0..100 {
         if h.app.jobs.lane_active(&lane) == 0 {
             break;
@@ -5895,11 +5947,11 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
         .await;
     let for_run: Vec<&AuditRow> = rows
         .iter()
-        .filter(|r| r.resource_id.as_deref() == Some(run.as_str()))
+        .filter(|r| r.entry.resource_id.as_deref() == Some(run.as_str()))
         .collect();
     assert_eq!(for_run.len(), 2, "{rows:?}");
     assert!(
-        for_run.iter().any(|r| r.outcome == Outcome::Error),
+        for_run.iter().any(|r| r.entry.outcome == Outcome::Error),
         "{rows:?}"
     );
     // The vector is still stale.
@@ -5949,7 +6001,7 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
             BackgroundRun::start(
                 &app,
                 &access,
-                RunKind::Graph,
+                RunKind::GRAPH,
                 serde_json::json!({ "step": detail }),
             )
             .await
@@ -5991,7 +6043,7 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
             })
             .await
             .into_iter()
-            .filter(|r| r.resource_type.as_deref() == Some("graph_run"))
+            .filter(|r| r.entry.resource_type == Some(ResourceKind::GraphRun))
             .collect();
         if rows.len() == 6 {
             break;
@@ -6001,8 +6053,8 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
     let outcomes = |run: &RunId| -> Vec<Outcome> {
         let mut found: Vec<Outcome> = rows
             .iter()
-            .filter(|r| r.resource_id.as_deref() == Some(run.as_str()))
-            .map(|r| r.outcome)
+            .filter(|r| r.entry.resource_id.as_deref() == Some(run.as_str()))
+            .map(|r| r.entry.outcome)
             .collect();
         found.sort_by_key(|o| o.as_str());
         found
@@ -6010,7 +6062,10 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
     assert_eq!(outcomes(&holder_id), [Outcome::Allowed, Outcome::Allowed]);
     assert_eq!(outcomes(&failing_id), [Outcome::Allowed, Outcome::Error]);
     assert_eq!(outcomes(&queued_id), [Outcome::Allowed, Outcome::Error]);
-    assert!(rows.iter().all(|r| r.action == "graph_extract"));
+    assert!(
+        rows.iter()
+            .all(|r| r.entry.action == AuditAction::GraphExtract)
+    );
 
     let details = h
         .app
@@ -6078,7 +6133,7 @@ async fn a_stopping_server_closes_its_runs_and_refuses_new_work_on_the_record() 
     let token = h.login("owner").await;
     let access = h.owner_access(&ws, &owner).await;
     let start = || async {
-        BackgroundRun::start(&h.app, &access, RunKind::Graph, serde_json::json!({}))
+        BackgroundRun::start(&h.app, &access, RunKind::GRAPH, serde_json::json!({}))
             .await
             .unwrap_or_else(|e| fail(&e.message))
     };
@@ -6091,8 +6146,8 @@ async fn a_stopping_server_closes_its_runs_and_refuses_new_work_on_the_record() 
             })
             .await
             .into_iter()
-            .filter(|r| r.resource_id.as_deref() == Some(run.as_str()))
-            .filter(|r| r.outcome == Outcome::Error)
+            .filter(|r| r.entry.resource_id.as_deref() == Some(run.as_str()))
+            .filter(|r| r.entry.outcome == Outcome::Error)
             .count()
     };
 
@@ -6516,7 +6571,7 @@ async fn only_a_session_logout_is_audited_as_a_logout() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
         rows.iter()
-            .all(|r| r.token_hash.is_none() && r.outcome == Outcome::Allowed),
+            .all(|r| r.entry.token_hash.is_none() && r.entry.outcome == Outcome::Allowed),
         "{rows:?}"
     );
 }
@@ -6635,7 +6690,9 @@ async fn list_token_branch_filters_removed_non_admin_member() {
         })
         .await
         .into_iter()
-        .filter(|r| r.action == "open" && r.workspace_id.as_ref() == Some(&ws))
+        .filter(|r| {
+            r.entry.action == AuditAction::Open && r.entry.workspace_id.as_ref() == Some(&ws)
+        })
         .count();
     assert_eq!(
         denied_open_after_list, 0,
@@ -6657,7 +6714,9 @@ async fn list_token_branch_filters_removed_non_admin_member() {
         })
         .await
         .into_iter()
-        .filter(|r| r.action == "open" && r.workspace_id.as_ref() == Some(&ws))
+        .filter(|r| {
+            r.entry.action == AuditAction::Open && r.entry.workspace_id.as_ref() == Some(&ws)
+        })
         .count();
     assert_eq!(
         denied_open_after_show, 1,
@@ -6762,14 +6821,14 @@ impl WaitingWrites {
             identity: Identity {
                 user_id: owner,
                 username: String::from("owner"),
-                is_admin: false,
+                kind: UserKind::Standard,
                 credential: Credential::Local,
-                client_addr: None,
-                request_id: None,
-                channel: None,
+                origin: Origin::from(Channel::Web),
             },
-            workspace,
-            role: Some(Role::Owner),
+            membership: Membership {
+                workspace,
+                standing: Standing::Member(Role::Owner),
+            },
         };
         Self {
             owner: h.login("owner").await,
@@ -6832,7 +6891,9 @@ impl WaitingWrites {
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         (
-            rows.iter().map(|r| r.outcome.as_str().to_owned()).collect(),
+            rows.iter()
+                .map(|r| r.entry.outcome.as_str().to_owned())
+                .collect(),
             body.to_string(),
         )
     }
@@ -7101,7 +7162,7 @@ async fn a_restricted_workspace_refuses_every_path_to_a_disallowed_provider() {
             })
             .await;
         rows.iter()
-            .filter(|r| r.outcome == Outcome::Denied && r.channel == channel)
+            .filter(|r| r.entry.outcome == Outcome::Denied && r.entry.origin.channel == channel)
             .count()
     };
     for (path, request, action) in [
@@ -7387,7 +7448,10 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
         .await;
     assert_eq!(saves.len(), 4, "one allowed, three refused: {saves:?}");
     assert_eq!(
-        saves.iter().filter(|r| r.outcome == Outcome::Error).count(),
+        saves
+            .iter()
+            .filter(|r| r.entry.outcome == Outcome::Error)
+            .count(),
         3
     );
 
@@ -7477,12 +7541,14 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
         .await;
     assert_eq!(runs.len(), 3, "{runs:?}");
     assert_eq!(
-        runs.iter().filter(|r| r.outcome == Outcome::Error).count(),
+        runs.iter()
+            .filter(|r| r.entry.outcome == Outcome::Error)
+            .count(),
         1
     );
     assert!(
         runs.iter()
-            .all(|r| r.resource_type.as_deref() == Some("saved_question"))
+            .all(|r| r.entry.resource_type == Some(ResourceKind::SavedQuestion))
     );
 
     // Removal: the creator or an owner; anyone else is refused and audited.
@@ -7534,7 +7600,7 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
     assert_eq!(
         deletes
             .iter()
-            .filter(|r| r.outcome == Outcome::Denied)
+            .filter(|r| r.entry.outcome == Outcome::Denied)
             .count(),
         1
     );

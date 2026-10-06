@@ -36,8 +36,8 @@ use quack_core::ontology::{
 };
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditAction, AuditCursor, AuditFilter, AuditPage, AuditRow, Expiry, IssuedToken, MemberRow,
-    Membership, Outcome, ProviderAllowList, ResourceKind, Role, Scope, TokenRow, UserRow,
+    AuditAction, AuditFilter, AuditPage, AuditRow, Expiry, IssuedToken, MemberRow, Membership,
+    Outcome, ProviderAllowList, ResourceKind, Role, Scope, Standing, TokenRow, UserKind, UserRow,
     WorkspaceChanges, WorkspaceTimes,
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
@@ -67,22 +67,24 @@ use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, passwo
 use super::error::ApiError;
 use super::oidc::Oidc;
 use super::state::{App, ServeMode};
-use quack_core::config::OidcConfig;
+use quack_core::analysis::tools::{FindPathArgs, NonBlank, SearchGraphArgs};
+use quack_core::config::{GraphConfig, OidcConfig};
 use quack_core::embedding::Vector;
-use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
+use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery};
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::Revalidation;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    ExtractSource, GraphOptions, GraphResult, GraphStatus, Origin, resolve, store as graph_store,
+    ExtractSource, GraphResult, GraphStatus, Origin, Standing as GraphStanding, resolve,
+    store as graph_store,
 };
 use quack_core::import::ImportRequest;
 use quack_core::jobs::JobNumber;
 use quack_core::llm::Embeddings;
 use quack_core::ontology::ROOT_CLASS;
 use quack_core::storage::workspace::WorkspaceDb;
-use quack_core::text::NonBlankText;
+use quack_core::text::blank_as_none;
 
 #[derive(Embed)]
 #[folder = "static/"]
@@ -145,7 +147,7 @@ struct Page {
     /// The header link to mark as current.
     tab: Tab,
     username: String,
-    is_admin: bool,
+    kind: UserKind,
     local: bool,
     workspace: Option<WsNav>,
 }
@@ -218,35 +220,9 @@ impl Tab {
 }
 
 struct WsNav {
-    id: String,
-    name: String,
-    role: Standing,
+    membership: Membership,
     can_write: bool,
     can_manage: bool,
-}
-
-/// Where the caller stands in a workspace, as the pages show it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Standing {
-    Member(Role),
-    /// A server admin without membership: settings and members, never
-    /// content.
-    Admin,
-}
-
-impl Standing {
-    fn of(role: Option<Role>) -> Self {
-        role.map_or(Self::Admin, Self::Member)
-    }
-}
-
-impl fmt::Display for Standing {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Member(role) => role.fmt(f),
-            Self::Admin => f.write_str("admin"),
-        }
-    }
 }
 
 impl Page {
@@ -256,7 +232,7 @@ impl Page {
             title: tab.label().to_owned(),
             tab,
             username: identity.username.clone(),
-            is_admin: identity.is_admin,
+            kind: identity.kind,
             local: app.mode == ServeMode::Local,
             workspace: None,
         }
@@ -266,9 +242,7 @@ impl Page {
     fn in_workspace(app: &App, tab: Tab, access: &Access) -> Self {
         Self {
             workspace: Some(WsNav {
-                id: access.workspace.id.to_string(),
-                name: access.workspace.name.clone(),
-                role: Standing::of(access.role),
+                membership: access.membership.clone(),
                 can_write: access.permits(Need::WRITE),
                 can_manage: access.permits(Need::OWN),
             }),
@@ -299,10 +273,7 @@ struct LoginPage {
 }
 
 struct WsItem {
-    id: String,
-    name: String,
-    classification: String,
-    role: Standing,
+    membership: Membership,
     times: Option<WorkspaceTimes>,
 }
 
@@ -615,7 +586,7 @@ impl SqlRun {
     async fn statement(&self, app: &App, access: &Access) -> Statement {
         let (sql, sort) = (self.sql.clone(), self.result_sort());
         let planned = app
-            .read(&access.workspace.id, move |db| {
+            .read(&access.membership.workspace.id, move |db| {
                 let Some(sortable) = db.sortable(&sql)? else {
                     return Ok(None);
                 };
@@ -784,7 +755,7 @@ struct GraphNodeView {
     id: NodeId,
     label: String,
     class_id: ClassId,
-    provisional: bool,
+    standing: GraphStanding,
     properties: String,
     sources: String,
 }
@@ -1039,7 +1010,7 @@ async fn workspaces(
     flash: Flashed,
 ) -> WebResult<Response> {
     let mut times = app.control.workspace_times().await?;
-    let items: Vec<WsItem> = if app.mode == ServeMode::Local || identity.is_admin {
+    let items: Vec<WsItem> = if app.mode == ServeMode::Local || identity.kind == UserKind::Admin {
         let mine = if app.mode == ServeMode::Local {
             Vec::new()
         } else {
@@ -1050,15 +1021,17 @@ async fn workspaces(
             .await?
             .into_iter()
             .map(|w| WsItem {
-                role: if app.mode == ServeMode::Local {
-                    Standing::Member(Role::Owner)
-                } else {
-                    Standing::of(mine.iter().find(|m| m.workspace.id == w.id).map(|m| m.role))
-                },
                 times: times.remove(&w.id),
-                id: w.id.into_string(),
-                name: w.name,
-                classification: w.classification,
+                membership: Membership {
+                    standing: if app.mode == ServeMode::Local {
+                        Standing::Member(Role::Owner)
+                    } else {
+                        mine.iter()
+                            .find(|m| m.workspace.id == w.id)
+                            .map_or(Standing::Admin, |m| m.standing)
+                    },
+                    workspace: w,
+                },
             })
             .collect()
     } else {
@@ -1066,17 +1039,14 @@ async fn workspaces(
             .workspaces_for_user(&identity.user_id)
             .await?
             .into_iter()
-            .map(|Membership { workspace: w, role }| WsItem {
-                times: times.remove(&w.id),
-                id: w.id.into_string(),
-                name: w.name,
-                classification: w.classification,
-                role: Standing::Member(role),
+            .map(|membership| WsItem {
+                times: times.remove(&membership.workspace.id),
+                membership,
             })
             .collect()
     };
     html(&WorkspacesPage {
-        can_create: identity.is_admin,
+        can_create: identity.kind == UserKind::Admin,
         page: Page::new(&app, &identity, Tab::Workspaces),
         workspaces: items,
         error: flash.error(),
@@ -1277,7 +1247,7 @@ impl DocumentRows {
     async fn load(app: &App, access: &Access, shown: Shown) -> WebResult<Self> {
         let documents = app
             .read(
-                &access.workspace.id,
+                &access.membership.workspace.id,
                 match shown {
                     Shown::Live => WorkspaceDb::list_documents,
                     Shown::All => WorkspaceDb::list_all_documents,
@@ -1286,7 +1256,7 @@ impl DocumentRows {
             .await?;
         let pending = documents.iter().any(|d| d.status.is_in_flight());
         Ok(Self {
-            ws_id: access.workspace.id.to_string(),
+            ws_id: access.membership.workspace.id.to_string(),
             can_write: access.permits(Need::WRITE),
             documents,
             pending,
@@ -1319,7 +1289,7 @@ impl JobRows {
             .collect();
         let pending = jobs.iter().any(|j| j.active);
         Self {
-            ws_id: access.workspace.id.to_string(),
+            ws_id: access.membership.workspace.id.to_string(),
             jobs,
             pending,
         }
@@ -1540,7 +1510,9 @@ async fn passage(
         docs_api::read_chunks(&app, &access, &doc, docs_api::ChunkPage::around(n)).await?;
     let at = |position: u32| chunks.iter().find(|c| c.chunk_index == position);
     let Some(chunk) = at(n).cloned() else {
-        return Err(Record::Chunk.missing(format!("{doc} chunk {n}")).into());
+        return Err(ResourceKind::Chunk
+            .missing(format!("{doc} chunk {n}"))
+            .into());
     };
     let previous = n.checked_sub(1).filter(|p| at(*p).is_some());
     let next = n.checked_add(1).filter(|p| at(*p).is_some());
@@ -1679,7 +1651,7 @@ impl SqlResult {
             rewritten,
         } = run.statement(app, access).await;
         let sort = run.result_sort().filter(|_| rewritten);
-        let ws_id = access.workspace.id.to_string();
+        let ws_id = access.membership.workspace.id.to_string();
         match access.execute_sql(app, &sql).await {
             Ok(outcome) => Self {
                 ws_id,
@@ -2191,7 +2163,7 @@ impl SettingsPage {
         new_token: Option<String>,
         error: Option<String>,
     ) -> WebResult<Self> {
-        let allowed = &access.workspace.allowed_providers;
+        let allowed = &access.membership.workspace.allowed_providers;
         let providers = app
             .config
             .providers
@@ -2200,15 +2172,19 @@ impl SettingsPage {
             .collect();
         let (members, tokens) = if access.permits(Need::OWN) {
             (
-                app.control.list_members(&access.workspace.id).await?,
-                app.control.list_tokens(&access.workspace.id).await?,
+                app.control
+                    .list_members(&access.membership.workspace.id)
+                    .await?,
+                app.control
+                    .list_tokens(&access.membership.workspace.id)
+                    .await?,
             )
         } else {
             (Vec::new(), Vec::new())
         };
         Ok(Self {
             page: Page::in_workspace(app, Tab::Settings, access),
-            classification: access.workspace.classification.clone(),
+            classification: access.membership.workspace.classification.clone(),
             providers,
             members,
             tokens,
@@ -2374,60 +2350,22 @@ async fn admin_user_add(
     Ok(Flash::after("/admin/users", created, |_| None).into_response())
 }
 
-#[derive(Deserialize)]
-struct AuditQuery {
-    action: Option<String>,
-    #[serde(default, deserialize_with = "blank_as_none")]
-    outcome: Option<Outcome>,
-    workspace_id: Option<String>,
-    #[serde(default, deserialize_with = "blank_as_none")]
-    cursor: Option<AuditCursor>,
-}
-
-/// The page's filter form: a blank field is no filter; 200 rows a page.
-impl From<AuditQuery> for AuditFilter {
-    fn from(q: AuditQuery) -> Self {
-        let given = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-        Self {
-            action: given(q.action),
-            outcome: q.outcome,
-            workspace_id: given(q.workspace_id).map(WorkspaceId::from),
-            limit: 200,
-            after: q.cursor,
-            ..Self::default()
-        }
-    }
-}
-
-/// A query or form value where blank means "not given", as the filter's
-/// "any" option sends it; anything else must parse.
-fn blank_as_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: std::str::FromStr,
-    T::Err: fmt::Display,
-{
-    match Option::<String>::deserialize(deserializer)?
-        .as_deref()
-        .map(str::trim)
-    {
-        None | Some("") => Ok(None),
-        Some(text) => text.parse().map(Some).map_err(serde::de::Error::custom),
-    }
-}
-
 async fn admin_audit(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Query(q): Query<AuditQuery>,
+    Query(filter): Query<AuditFilter>,
 ) -> WebResult<Response> {
     identity.require_admin()?;
-    let filter = AuditFilter::from(q);
+    // The page's own size; the form never sends one.
+    let filter = AuditFilter {
+        limit: 200,
+        ..filter
+    };
     let AuditPage { rows, next } = app.control.query_audit(&filter).await?;
     html(&AdminAuditPage {
         page: Page::new(&app, &identity, Tab::Audit),
         rows,
-        continued: filter.after.is_some(),
+        continued: filter.cursor.is_some(),
         next_cursor: next.map(|c| c.to_string()),
         action: filter.action.unwrap_or_default(),
         outcome: filter.outcome,
@@ -2456,33 +2394,51 @@ mod tests;
 /// The graph page's explore or path form. Posted, never a query string:
 /// entity names are workspace content, and a URL ends up in logs.
 #[derive(Deserialize, Default)]
+#[serde(default)]
 struct GraphSearch {
-    entity: Option<String>,
-    class: Option<String>,
-    relation: Option<String>,
+    entity: NonBlank,
+    class: NonBlank,
+    relation: NonBlank,
     hops: Option<u32>,
-    from: Option<String>,
-    to: Option<String>,
+    from: NonBlank,
+    to: NonBlank,
     max_hops: Option<u32>,
+}
+
+impl GraphSearch {
+    /// The search half of the form, as the graph takes it.
+    fn search(&self) -> SearchGraphArgs {
+        SearchGraphArgs {
+            entity: self.entity.clone(),
+            class: self.class.clone(),
+            relation: self.relation.clone(),
+            hops: self.hops,
+        }
+    }
+
+    /// The path half of the form, as the graph takes it; a blank end is
+    /// an empty string, which the query refuses.
+    fn path(&self) -> FindPathArgs {
+        FindPathArgs {
+            from: self.from.get().unwrap_or_default().to_owned(),
+            to: self.to.get().unwrap_or_default().to_owned(),
+            max_hops: self.max_hops,
+        }
+    }
 }
 
 impl GraphQueryView {
     /// The page's query: blank fields are empty strings, which the form
     /// shows as they are; hops at their defaults when not given.
     fn from_query(q: &GraphSearch) -> Self {
-        let given = |value: Option<&String>| {
-            value
-                .and_then(|v| v.non_blank())
-                .unwrap_or_default()
-                .to_owned()
-        };
+        let given = |value: &NonBlank| value.get().unwrap_or_default().to_owned();
         Self {
-            entity: given(q.entity.as_ref()),
-            class: given(q.class.as_ref()),
-            relation: given(q.relation.as_ref()),
+            entity: given(&q.entity),
+            class: given(&q.class),
+            relation: given(&q.relation),
             hops: Hops::neighborhood(q.hops).get(),
-            from: given(q.from.as_ref()),
-            to: given(q.to.as_ref()),
+            from: given(&q.from),
+            to: given(&q.to),
             max_hops: Hops::path(q.max_hops).get(),
         }
     }
@@ -2517,7 +2473,7 @@ async fn render_graph(
 ) -> WebResult<Response> {
     let access = Access::resolve(app, identity, id, Need::READ).await?;
     access.audit_read(app, AuditAction::Page, "graph").await?;
-    let options = app.config.graph.options();
+    let options = app.config.graph;
     let query = GraphQueryView::from_query(q);
     let ask = GraphAsk::of(q, app, &access).await?;
     let data = app
@@ -2580,17 +2536,8 @@ impl GraphAsk {
     /// A path when both ends are given, else a search when an entity or a
     /// class is.
     async fn of(q: &GraphSearch, app: &App, access: &Access) -> WebResult<Self> {
-        let path = PathQuery::new(
-            q.from.as_deref().unwrap_or_default(),
-            q.to.as_deref().unwrap_or_default(),
-            q.max_hops,
-        );
-        let search = GraphQuery::new(
-            q.entity.as_deref(),
-            q.class.as_deref(),
-            q.relation.as_deref(),
-            q.hops,
-        );
+        let path = q.path().query();
+        let search = q.search().query();
         if path.is_err() && search.is_err() {
             return Ok(Self::Nothing);
         }
@@ -2615,7 +2562,7 @@ impl GraphAsk {
     }
 
     /// Its title and result, or why it could not run.
-    fn run(&self, db: &WorkspaceDb, options: &GraphOptions) -> Option<GraphAnswer> {
+    fn run(&self, db: &WorkspaceDb, options: &GraphConfig) -> Option<GraphAnswer> {
         match self {
             Self::Nothing => None,
             Self::Path(path, ends) => Some(GraphAnswer {
@@ -2658,7 +2605,7 @@ struct GraphAnswer {
 }
 
 impl GraphPageData {
-    fn read(db: &WorkspaceDb, ask: &GraphAsk, options: &GraphOptions) -> CoreResult<Self> {
+    fn read(db: &WorkspaceDb, ask: &GraphAsk, options: &GraphConfig) -> CoreResult<Self> {
         let status = graph_store::status(db)?;
         let ontology = ontology_store::current(db)?;
         let chunk_count =
@@ -2717,7 +2664,7 @@ impl GraphResultView {
                 id: n.id.clone(),
                 label: n.label.clone(),
                 class_id: n.class_id.clone(),
-                provisional: n.provisional,
+                standing: n.standing,
                 properties: n
                     .properties
                     .iter()

@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use crate::embedding::Dimension;
 use crate::error::{Error, Result};
-use crate::graph::GraphOptions;
 use crate::ingestion::budget::DecompressionBudget;
 use crate::ontology::documents::DocumentEvidenceOptions;
 use crate::ontology::induction::TableEvidenceOptions;
@@ -1108,8 +1107,9 @@ impl Default for ImportConfig {
     }
 }
 
-/// Knowledge graph traversal and resolution (design doc 6.4 and 13).
-#[derive(Debug, Clone, Deserialize)]
+/// Knowledge graph traversal and resolution (design doc 6.4 and 13), as
+/// `[graph]` sets it and the graph module takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GraphConfig {
     /// Hops a neighborhood or path query may take.
@@ -1125,25 +1125,11 @@ pub struct GraphConfig {
 
 impl Default for GraphConfig {
     fn default() -> Self {
-        let defaults = GraphOptions::default();
         Self {
-            max_traversal_depth: defaults.max_traversal_depth,
-            max_nodes: defaults.max_nodes,
-            merge_threshold: defaults.merge_threshold,
-            auto_merge_threshold: defaults.auto_merge_threshold,
-        }
-    }
-}
-
-impl GraphConfig {
-    /// The tuning as the core module takes it.
-    #[must_use]
-    pub fn options(&self) -> GraphOptions {
-        GraphOptions {
-            max_traversal_depth: self.max_traversal_depth,
-            max_nodes: self.max_nodes,
-            merge_threshold: self.merge_threshold,
-            auto_merge_threshold: self.auto_merge_threshold,
+            max_traversal_depth: 3,
+            max_nodes: 200,
+            merge_threshold: 0.08,
+            auto_merge_threshold: 0.02,
         }
     }
 }

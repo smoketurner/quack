@@ -6,7 +6,6 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use quack_core::error::Record;
 use quack_core::ids::{SavedId, SessionId, WorkspaceId};
 use quack_core::saved::{self, Answer, RunStatus, SavedQuestion};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -76,9 +75,11 @@ impl Access {
     async fn saved_question(&self, app: &App, saved: &SavedId) -> ApiResult<SavedQuestion> {
         let wanted = saved.clone();
         let found = app
-            .read(&self.workspace.id, move |db| saved::by_id(db, &wanted))
+            .read(&self.membership.workspace.id, move |db| {
+                saved::by_id(db, &wanted)
+            })
             .await?;
-        found.ok_or_else(|| Record::SavedQuestion.missing(saved.as_str()).into())
+        found.ok_or_else(|| ResourceKind::SavedQuestion.missing(saved.as_str()).into())
     }
 }
 

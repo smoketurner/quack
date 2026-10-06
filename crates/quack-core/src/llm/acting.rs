@@ -14,7 +14,8 @@ use secrecy::SecretString;
 
 use super::slot::Slot;
 use crate::ids::UserId;
-use crate::oidc::{Origin, Revocations, SubjectTokens};
+use crate::oidc::{Revocations, SubjectTokens};
+use crate::storage::control::Origin;
 
 /// The person model requests are made for.
 #[derive(Clone)]

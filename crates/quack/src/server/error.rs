@@ -119,9 +119,7 @@ impl From<CoreError> for ApiError {
             CoreError::AuthRequired { .. }
             | CoreError::WorkspaceLocked { .. }
             | CoreError::WorkspaceTooNew { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            CoreError::WorkspaceNotFound(_)
-            | CoreError::NoWorkspaceNamed(_)
-            | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
+            CoreError::NoWorkspaceNamed(_) | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
             CoreError::SignIn(_) | CoreError::Bearer(_) => StatusCode::UNAUTHORIZED,
             // The caller is known; this provider cannot act for them, or
             // the workspace's allow-list keeps its content from the provider.

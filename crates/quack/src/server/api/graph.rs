@@ -7,14 +7,13 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use quack_core::config::GraphConfig;
 use quack_core::extraction::{Extract, ExtractionRun};
 use quack_core::graph::extract::ChunkPlan;
-use quack_core::graph::query::{GraphQuery, PathQuery};
 use quack_core::graph::resolve::{MergeDecision, MergeProposal, ResolutionSummary};
 use quack_core::graph::store::Revalidation;
 use quack_core::graph::{
-    ExtractSource, GraphOptions, GraphStatus, Standing, extract, resolve, store as graph_store,
-    tables,
+    ExtractSource, GraphStatus, Standing, extract, resolve, store as graph_store, tables,
 };
 use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::llm::{self, Embeddings};
@@ -26,36 +25,25 @@ use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::run::{BackgroundRun, GraphReport, RunKind};
 use crate::server::state::{App, ExtractionSlot, with_db};
-use quack_core::analysis::tools::SharedDb;
+use quack_core::analysis::tools::{FindPathArgs, SearchGraphArgs, SharedDb};
 use quack_core::jobs::JobId;
 use quack_core::ontology::{Ontology, OntologyVersion};
 use quack_core::progress::{ChunkDone, RunControl};
 
-/// A graph search, in the body: entity names are workspace content, and a
-/// URL ends up in logs.
-#[derive(Deserialize, Default)]
-pub(crate) struct SearchQuery {
-    pub entity: Option<String>,
-    pub class: Option<String>,
-    pub relation: Option<String>,
-    pub hops: Option<u32>,
-}
-
+/// The search and path bodies are [`SearchGraphArgs`] and [`FindPathArgs`]:
+/// in the body, never the query string, since entity names are workspace
+/// content and a URL ends up in logs.
 pub(crate) async fn search(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-    Json(q): Json<SearchQuery>,
+    Json(q): Json<SearchGraphArgs>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let query = GraphQuery::new(
-        q.entity.as_deref(),
-        q.class.as_deref(),
-        q.relation.as_deref(),
-        q.hops,
-    )
-    .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let options = app.config.graph.options();
+    let query = q
+        .query()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let options = app.config.graph;
     let detail = serde_json::to_value(&query)?;
     let model = access
         .model(
@@ -84,24 +72,17 @@ pub(crate) async fn search(
     Ok(Json(serde_json::to_value(result?)?))
 }
 
-/// A path's two ends, in the body for the same reason as [`SearchQuery`].
-#[derive(Deserialize)]
-pub(crate) struct PathParams {
-    pub from: String,
-    pub to: String,
-    pub max_hops: Option<u32>,
-}
-
 pub(crate) async fn path(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-    Json(q): Json<PathParams>,
+    Json(q): Json<FindPathArgs>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let query = PathQuery::new(&q.from, &q.to, q.max_hops)
+    let query = q
+        .query()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let options = app.config.graph.options();
+    let options = app.config.graph;
     let detail = serde_json::to_value(&query)?;
     let model = access
         .model(
@@ -225,7 +206,7 @@ impl Access {
         app: &App,
         plan: &ExtractionPlan,
     ) -> ApiResult<ExtractionStarted> {
-        let (access, id) = (self, &self.workspace.id);
+        let (access, id) = (self, &self.membership.workspace.id);
         let (sample, reset) = (plan.sample, plan.reset);
         let slot = app.begin_extraction(id).ok_or_else(|| {
             ApiError::conflict("a graph extraction is already running for this workspace")
@@ -241,7 +222,7 @@ impl Access {
             .await?;
         let ontology = ontology.ok_or_else(|| ApiError::bad_request("no ontology yet"))?;
         let version = ontology.saved_version()?;
-        let options = app.config.graph.options();
+        let options = app.config.graph;
         let embeddings = access
             .model(
                 app,
@@ -297,7 +278,7 @@ impl Access {
         let run = BackgroundRun::start(
             app,
             access,
-            RunKind::Graph,
+            RunKind::GRAPH,
             serde_json::json!({ "tables": table_summaries, "cost": cost }),
         )
         .await?;
@@ -367,7 +348,7 @@ struct DocumentJob {
     embeddings: Option<Embeddings>,
     /// Freed when the pass ends.
     slot: ExtractionSlot,
-    options: GraphOptions,
+    options: GraphConfig,
 }
 
 impl DocumentJob {
@@ -550,7 +531,7 @@ impl Access {
         app: &App,
         approval: DropApproval,
     ) -> ApiResult<Revalidation> {
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let outcome = with_db(db, move |db| {
             if let Some(refusal) = approval.refusal(&Revalidation::preview(db)?) {
                 return Ok(Err(refusal));
@@ -573,7 +554,7 @@ impl Access {
 
     /// Mark the provisional graph reviewed.
     pub(crate) async fn review_graph(&self, app: &App) -> ApiResult<GraphStatus> {
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let status = with_db(db, |db| {
             graph_store::mark_reviewed(db)?;
             graph_store::status(db)
@@ -591,7 +572,7 @@ impl Access {
         merge: &str,
         decision: MergeDecision,
     ) -> ApiResult<MergeProposal> {
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let author = self.identity.username.clone();
         let merge_id = merge.to_owned();
         let proposal = with_db(db, move |db| {

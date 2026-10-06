@@ -253,7 +253,7 @@ async fn users_hash_verify_and_reject_duplicates() {
     assert!(
         alice
             .as_ref()
-            .is_ok_and(|u| u.is_admin && u.username == "alice")
+            .is_ok_and(|u| u.kind == UserKind::Admin && u.username == "alice")
     );
     assert!(
         cp.verify_password("alice", "hunter42")
@@ -311,7 +311,7 @@ async fn a_first_sign_in_creates_a_plain_user_and_never_takes_a_name() {
         "{}",
         first.username
     );
-    assert!(!first.is_admin);
+    assert_eq!(first.kind, UserKind::Standard);
     assert!(
         cp.workspaces_for_user(&first.id)
             .await
@@ -633,8 +633,9 @@ async fn members_need_a_user_and_a_workspace() {
     let mine = cp.workspaces_for_user(&bob.id).await;
     assert!(mine.is_ok_and(|w| {
         w.len() == 1
-            && w.first()
-                .is_some_and(|m| m.workspace.name == "w" && m.role == Role::Owner)
+            && w.first().is_some_and(|m| {
+                m.workspace.name == "w" && m.standing == Standing::Member(Role::Owner)
+            })
     }));
     assert!(
         cp.remove_member(&ws.id, &bob.id, setup_audit())
@@ -678,21 +679,24 @@ async fn an_audited_change_names_what_it_changed_and_a_no_op_is_an_error() {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()))
         .rows;
-    let named = |id: &str| rows.iter().find(|r| r.resource_id.as_deref() == Some(id));
+    let named = |id: &str| {
+        rows.iter()
+            .find(|r| r.entry.resource_id.as_deref() == Some(id))
+    };
     assert!(
-        named(ws.id.as_str()).is_some_and(
-            |r| r.workspace_id.as_ref() == Some(&ws.id) && r.outcome == Outcome::Allowed
-        ),
+        named(ws.id.as_str()).is_some_and(|r| r.entry.workspace_id.as_ref() == Some(&ws.id)
+            && r.entry.outcome == Outcome::Allowed),
         "{rows:?}"
     );
     assert!(
-        named(&issued.row.token_hash).is_some_and(|r| r.workspace_id.as_ref() == Some(&ws.id)),
+        named(&issued.row.token_hash)
+            .is_some_and(|r| r.entry.workspace_id.as_ref() == Some(&ws.id)),
         "{rows:?}"
     );
     let bob_rows: Vec<_> = rows
         .iter()
-        .filter(|r| r.resource_id.as_deref() == Some(bob.id.as_str()))
-        .map(|r| r.outcome)
+        .filter(|r| r.entry.resource_id.as_deref() == Some(bob.id.as_str()))
+        .map(|r| r.entry.outcome)
         .collect();
     assert_eq!(bob_rows, [Outcome::Error, Outcome::Allowed], "{rows:?}");
 }
@@ -873,7 +877,11 @@ async fn audit_rows_append_and_filter() {
         })
         .await
         .map(|page| page.rows);
-    assert!(all.is_ok_and(|r| r.len() == 3 && r.first().is_some_and(|r| r.action == "login")));
+    assert!(all.is_ok_and(|r| {
+        r.len() == 3
+            && r.first()
+                .is_some_and(|r| r.entry.action == AuditAction::Login)
+    }));
     let denied_only = cp
         .query_audit(&AuditFilter {
             outcome: Some(Outcome::Denied),
@@ -885,7 +893,7 @@ async fn audit_rows_append_and_filter() {
     assert!(denied_only.is_ok_and(|r| {
         r.len() == 1
             && r.first()
-                .is_some_and(|r| r.user_id == Some(UserId::from("u2")))
+                .is_some_and(|r| r.entry.user_id == Some(UserId::from("u2")))
     }));
     let for_ws = cp
         .query_audit(&AuditFilter {
@@ -896,7 +904,9 @@ async fn audit_rows_append_and_filter() {
         })
         .await
         .map(|page| page.rows);
-    assert!(for_ws.is_ok_and(|r| r.len() == 1 && r.first().is_some_and(|r| r.id == allowed.id)));
+    assert!(
+        for_ws.is_ok_and(|r| r.len() == 1 && r.first().is_some_and(|r| r.entry.id == allowed.id))
+    );
     let none = cp
         .query_audit(&AuditFilter {
             until: Some(String::from("1990-01-01")),
@@ -990,7 +1000,7 @@ async fn a_named_workspace_must_exist_and_the_default_is_created_on_first_use() 
         .unwrap()
         .rows;
     assert!(
-        matches!(audited.as_slice(), [row] if row.channel == Channel::Cli),
+        matches!(audited.as_slice(), [row] if row.entry.origin.channel == Channel::Cli),
         "{audited:?}"
     );
     let again = cp
@@ -1083,13 +1093,13 @@ async fn audit_pages_walk_the_log_once_in_order() {
     loop {
         let page = cp
             .query_audit(&AuditFilter {
-                after,
+                cursor: after,
                 ..filter.clone()
             })
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         pages += 1;
-        seen.extend(page.rows.into_iter().map(|r| r.id));
+        seen.extend(page.rows.into_iter().map(|r| r.entry.id));
         match page.next {
             Some(next) => after = Some(next),
             None => break,
@@ -1112,7 +1122,7 @@ async fn audit_pages_walk_the_log_once_in_order() {
     let elsewhere = cp
         .query_audit(&AuditFilter {
             action: Some(String::from("open")),
-            after: Some(cursor),
+            cursor: Some(cursor),
             ..filter.clone()
         })
         .await;
@@ -1125,4 +1135,67 @@ async fn audit_pages_walk_the_log_once_in_order() {
 fn dummy_hash_parses_as_argon2id() {
     assert!(PasswordHash::new(StoredPasswordHash::DUMMY).is_ok());
     assert!(!StoredPasswordHash::stored_or_dummy(None).verifies("anything"));
+}
+
+/// A stored action or resource kind this build does not define reads back
+/// as `Unknown` carrying the name, so history written by a newer build
+/// still lists; nothing writes such a name back.
+#[tokio::test]
+async fn undefined_stored_audit_names_read_back_and_are_never_written() {
+    let (_dir, cp) = open().await;
+    let known = AuditEntry::new(AuditAction::Open, Outcome::Allowed, Channel::Api)
+        .on(ResourceKind::Document.id("d1"));
+    assert!(cp.record_audit(&known).await.is_ok());
+    for statement in [
+        "UPDATE audit_log SET action = 'retired_action'",
+        "UPDATE audit_log SET resource_type = 'widget'",
+    ] {
+        sqlx::query(statement)
+            .execute(&cp.pool)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let filter = AuditFilter {
+        limit: 10,
+        ..AuditFilter::default()
+    };
+    let rows = cp
+        .query_audit(&filter)
+        .await
+        .map_or_else(|e| fail(&e.to_string()), |p| p.rows);
+    let entry = &rows
+        .first()
+        .unwrap_or_else(|| fail("the row is gone"))
+        .entry;
+    assert_eq!(
+        entry.action,
+        AuditAction::Unknown(String::from("retired_action"))
+    );
+    assert_eq!(
+        entry.resource_type,
+        Some(ResourceKind::Unknown(String::from("widget")))
+    );
+    let mut back = entry.clone();
+    back.id = AuditId::generate();
+    let refused = cp.record_audit(&back).await.err().map(|e| e.to_string());
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|e| e.contains("audit action") && e.contains("retired_action")),
+        "{refused:?}"
+    );
+    let mut kind_only = known.clone();
+    kind_only.id = AuditId::generate();
+    kind_only.resource_type = Some(ResourceKind::Unknown(String::from("widget")));
+    let refused = cp
+        .record_audit(&kind_only)
+        .await
+        .err()
+        .map(|e| e.to_string());
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|e| e.contains("resource kind") && e.contains("widget")),
+        "{refused:?}"
+    );
 }

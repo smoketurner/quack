@@ -2027,7 +2027,7 @@ async fn ingest_markdown_stores_headings_and_pinned_flag() {
     );
 
     let doc = db.list_documents().unwrap().into_iter().next().unwrap();
-    assert!(!doc.pinned);
+    assert_eq!(doc.pinning, Pinning::Unpinned);
     db.set_document_pinning(&doc.id, Pinning::Pinned).unwrap();
     let pinned = db.pinned_documents().unwrap();
     assert_eq!(pinned.len(), 1);
@@ -3619,7 +3619,10 @@ async fn a_changed_file_replaces_its_predecessor() {
     assert_eq!(old.status, DocumentStatus::Superseded);
     assert_eq!(old.superseded_by.as_ref(), Some(&second.document_id));
     let new = db.document(&second.document_id).unwrap().unwrap();
-    assert_eq!((new.status, new.pinned), (DocumentStatus::Ready, true));
+    assert_eq!(
+        (new.status, new.pinning),
+        (DocumentStatus::Ready, Pinning::Pinned)
+    );
     assert_eq!(
         db.list_documents()
             .unwrap()

@@ -8,12 +8,14 @@ use std::time::Instant;
 
 use crate::embedding::EmbeddingModel;
 
-use super::{GraphOptions, Node, store};
+use super::{Node, store};
+use crate::config::GraphConfig;
 use crate::embedding::{Embedder, Input};
-use crate::error::{Error, Record, Result};
+use crate::error::{Error, Result};
 use crate::ids::{MergeId, NodeId};
 use crate::prefix::PrefixMatch;
 use crate::progress::{ChunkDone, RunControl};
+use crate::storage::control::ResourceKind;
 use crate::storage::workspace::{WorkspaceDb, tokenize};
 use crate::storage::writer::Writer;
 
@@ -92,7 +94,7 @@ pub struct ResolutionSummary {
 pub async fn resolve<M: EmbeddingModel>(
     db: &Writer,
     embedder: Option<&Embedder<M>>,
-    options: &GraphOptions,
+    options: &GraphConfig,
 ) -> Result<ResolutionSummary> {
     let mut summary = ResolutionSummary::default();
     let Some(embedder) = embedder else {
@@ -249,7 +251,7 @@ struct MergeCounts {
 /// alike their labels (issue #41: WEST VIRGINIA is not VIRGINIA). A pair
 /// with one keyed side is only ever proposed; auto-merge is reserved for
 /// two model-extracted nodes.
-fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<MergeCounts> {
+fn propose_merges(db: &WorkspaceDb, options: &GraphConfig) -> Result<MergeCounts> {
     // The keyed flag is computed per node before the join: a correlated
     // EXISTS per pair row, or a window over the pairs, made DuckDB run
     // out of its 256 MiB on 3,667 nodes, while this streams in seconds.
@@ -423,7 +425,7 @@ fn merge_nodes_in(db: &WorkspaceDb, keep: &NodeId, drop: &NodeId) -> Result<()> 
     properties.set_aliases(&aliases);
     conn.execute(
         "UPDATE _quack_graph_nodes SET properties = ?, provisional = provisional AND ? WHERE id = ?",
-        duckdb::params![properties.to_json(), drop_node.provisional, keep],
+        duckdb::params![properties.to_json(), drop_node.standing, keep],
     )?;
     // Repoint edges, dropping any that would duplicate an existing triple
     // or become a self-loop.
@@ -524,7 +526,7 @@ pub fn pending(db: &WorkspaceDb) -> Result<Vec<MergeProposal>> {
 ///
 /// Returns an error when nothing or more than one proposal matches.
 pub fn find(db: &WorkspaceDb, prefix: &str) -> Result<MergeProposal> {
-    PrefixMatch::of(pending(db)?, prefix, |m| m.id.as_str()).one(Record::MergeProposal, prefix)
+    PrefixMatch::of(pending(db)?, prefix, |m| m.id.as_str()).one(ResourceKind::GraphMerge, prefix)
 }
 
 /// Record a reviewer's answer to a pending proposal (full id or unique

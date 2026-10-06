@@ -5,8 +5,9 @@
 //! Nothing here schedules anything: cron runs `quack saved run`.
 
 use crate::analysis::events::ToolName;
-use crate::error::{Error, Record, Result};
+use crate::error::{Error, Result};
 use crate::ids::{RunId, SavedId, SessionId, UserId};
+use crate::storage::control::ResourceKind;
 use crate::storage::sessions::{self, ChatMode, MessageRole, MessageRow, SessionRow};
 use crate::storage::workspace::{DigestedResults, StatementKind, WorkspaceDb};
 
@@ -116,7 +117,7 @@ impl Pinned {
                 let at = messages
                     .iter()
                     .position(|m| m.seq == seq)
-                    .ok_or_else(|| Record::Message.missing(seq.to_string()))?;
+                    .ok_or_else(|| ResourceKind::Message.missing(seq.to_string()))?;
                 if messages
                     .get(at)
                     .is_some_and(|m| m.role != MessageRole::Assistant)
@@ -191,7 +192,7 @@ pub fn save(
         return Err(Error::SavedQuestionExists(name.to_owned()));
     }
     let session = sessions::get_session(db, session_id)?
-        .ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
+        .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))?;
     let pinned = Pinned::from_session(db, &session, answer)?;
     let id = SavedId::generate();
     db.connection().execute(
@@ -208,7 +209,7 @@ pub fn save(
             created_by
         ],
     )?;
-    by_id(db, &id)?.ok_or_else(|| Record::SavedQuestion.missing(id.as_str()))
+    by_id(db, &id)?.ok_or_else(|| ResourceKind::SavedQuestion.missing(id.as_str()))
 }
 
 /// Pin the statements of `answer` in `session_id` to the saved question
@@ -226,7 +227,7 @@ pub fn repin(
     answer: Answer,
 ) -> Result<SavedQuestion> {
     let session = sessions::get_session(db, session_id)?
-        .ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
+        .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))?;
     let pinned = Pinned::from_session(db, &session, answer)?;
     let changed = db.connection().execute(
         "UPDATE _quack_saved_questions \
@@ -234,9 +235,9 @@ pub fn repin(
         duckdb::params![serde_json::to_string(&pinned.statements)?, session_id, id],
     )?;
     if changed == 0 {
-        return Err(Record::SavedQuestion.missing(id.as_str()));
+        return Err(ResourceKind::SavedQuestion.missing(id.as_str()));
     }
-    by_id(db, id)?.ok_or_else(|| Record::SavedQuestion.missing(id.as_str()))
+    by_id(db, id)?.ok_or_else(|| ResourceKind::SavedQuestion.missing(id.as_str()))
 }
 
 /// Every saved question, by name.

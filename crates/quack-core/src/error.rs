@@ -5,6 +5,7 @@ use thiserror::Error;
 
 use crate::llm::egress::Refusal;
 use crate::saved::Unsavable;
+use crate::storage::control::ResourceKind;
 use crate::storage::workspace::DuckDbMessage;
 
 #[derive(Debug, Error)]
@@ -19,9 +20,6 @@ pub enum Error {
     /// walks the error chain prints the raw report with its suggestions.
     #[error("{}", DuckDbMessage(.0))]
     DuckDb(duckdb::Error),
-
-    #[error("workspace not found: {0}")]
-    WorkspaceNotFound(String),
 
     /// A command named a workspace that does not exist.
     #[error("no workspace named '{0}'; create it with: quack workspace create {0}")]
@@ -101,13 +99,13 @@ pub enum Error {
     NoChatModel { config_file: PathBuf },
 
     /// A record the caller named does not exist.
-    #[error("{record} '{id}' does not exist")]
-    NotFound { record: Record, id: String },
+    #[error("{} '{id}' does not exist", kind.label())]
+    NotFound { kind: ResourceKind, id: String },
 
     /// An id prefix the caller gave names more than one record.
-    #[error("'{prefix}' matches {count} {record}s; use more of the id")]
+    #[error("'{prefix}' matches {count} {}s; use more of the id", kind.label())]
     Ambiguous {
-        record: Record,
+        kind: ResourceKind,
         prefix: String,
         count: usize,
     },
@@ -279,45 +277,6 @@ impl WrittenBy {
         match &self.0 {
             Some(version) => format!("run quack {version} or newer, or {RESTORE}"),
             None => format!("run a newer quack, or {RESTORE}"),
-        }
-    }
-}
-
-/// The kinds of record a caller names by id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Record {
-    Session,
-    /// A message in a session, named by its sequence number.
-    Message,
-    SavedQuestion,
-    Document,
-    /// A chunk of a document, named by the document and its position.
-    Chunk,
-    OntologyVersion,
-    MergeProposal,
-    Candidate,
-    Token,
-}
-
-text_enum!(Record, "record", {
-    Session => "session",
-    Message => "message",
-    SavedQuestion => "saved question",
-    Document => "document",
-    Chunk => "chunk",
-    OntologyVersion => "ontology version",
-    MergeProposal => "merge proposal",
-    Candidate => "candidate",
-    Token => "token",
-});
-
-impl Record {
-    /// The error for this kind of record with `id` missing.
-    #[must_use]
-    pub fn missing(self, id: impl Into<String>) -> Error {
-        Error::NotFound {
-            record: self,
-            id: id.into(),
         }
     }
 }

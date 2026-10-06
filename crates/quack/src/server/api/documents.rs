@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use axum::extract::{FromRequest, Multipart, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
-use quack_core::error::Record;
 use quack_core::ids::{DocumentId, WorkspaceId};
 use quack_core::ingestion;
 use quack_core::jobs::JobId;
@@ -60,7 +59,7 @@ pub(crate) async fn show(
     let document = app
         .read(&id, move |db| {
             db.document(&doc)?
-                .ok_or_else(|| Record::Document.missing(doc.as_str()))
+                .ok_or_else(|| ResourceKind::Document.missing(doc.as_str()))
         })
         .await?;
     Ok(Json(serde_json::to_value(document)?))
@@ -119,10 +118,10 @@ pub(crate) async fn read_chunks(
         )
         .await?;
     let doc = doc.clone();
-    app.read(&access.workspace.id, move |db| {
+    app.read(&access.membership.workspace.id, move |db| {
         let document = db
             .document(&doc)?
-            .ok_or_else(|| Record::Document.missing(doc.as_str()))?;
+            .ok_or_else(|| ResourceKind::Document.missing(doc.as_str()))?;
         let chunks = db.document_chunks(&doc, page.from, limit)?;
         Ok(Chunks { document, chunks })
     })
@@ -239,7 +238,7 @@ async fn import_bundle(
     } else {
         enqueue(app, access, DocumentSource::Upload, files, None).await?
     };
-    let db = app.workspace_db(&access.workspace.id).await?;
+    let db = app.workspace_db(&access.membership.workspace.id).await?;
     let for_candidates = bundle.clone();
     let author = access.identity.username.clone();
     let report = with_db(db, move |db| {
@@ -386,7 +385,7 @@ pub(crate) async fn enqueue(
     if replaces.is_some() && files.len() != 1 {
         return Err(ApiError::bad_request("replace takes exactly one file"));
     }
-    let id = access.workspace.id.clone();
+    let id = access.membership.workspace.id.clone();
     // Fail now, not in the background, when no model can be built.
     let embedder = access
         .model(
@@ -431,7 +430,7 @@ impl Lane<'_> {
             data,
         } = file;
         let (app, access) = (self.app, self.access);
-        let id = &access.workspace.id;
+        let id = &access.membership.workspace.id;
         let filename = std::path::Path::new(&filename)
             .file_name()
             .and_then(|n| n.to_str())
@@ -564,12 +563,12 @@ pub(crate) async fn set_pinned(
     doc: &DocumentId,
     pinning: Pinning,
 ) -> ApiResult<DocumentInfo> {
-    let db = app.workspace_db(&access.workspace.id).await?;
+    let db = app.workspace_db(&access.membership.workspace.id).await?;
     let doc_id = doc.clone();
     let document = with_db(db, move |db| {
         db.set_document_pinning(&doc_id, pinning)?;
         db.document(&doc_id)?
-            .ok_or_else(|| Record::Document.missing(doc_id.as_str()))
+            .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))
     })
     .await?;
     access
@@ -601,12 +600,12 @@ pub(crate) async fn delete_document(
     access: &Access,
     doc: &DocumentId,
 ) -> ApiResult<String> {
-    let db = app.workspace_db(&access.workspace.id).await?;
+    let db = app.workspace_db(&access.membership.workspace.id).await?;
     let doc_id = doc.clone();
     let filename = with_db(db, move |db| {
         let document = db
             .document(&doc_id)?
-            .ok_or_else(|| Record::Document.missing(doc_id.as_str()))?;
+            .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))?;
         db.delete_document(&doc_id)?;
         Ok(document.filename)
     })

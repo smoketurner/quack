@@ -19,9 +19,9 @@ use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::CachedToken;
 use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::oidc::{
-    Origin, Pending, RENEW_MARGIN, SignIn, SignedIn, Stored, SubjectTokens, UserTokens,
+    Pending, RENEW_MARGIN, SignIn, SignedIn, Stored, SubjectTokens, UserTokens,
 };
-use quack_core::storage::control::{ControlPlane, UserRow};
+use quack_core::storage::control::{ControlPlane, Origin, UserRow};
 use quack_core::vault::Vault;
 use quack_core::web_sessions::{SessionToken, WebSessions};
 

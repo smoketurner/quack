@@ -27,6 +27,7 @@ use crate::crypto::sha256_hex;
 use crate::error::{Error, Result};
 use crate::ids::{AuditId, UserId, WorkspaceId};
 use crate::oidc::OidcSubject;
+use crate::text::blank_as_none;
 use crate::vault::Sealed;
 
 /// The `control.db` schema, as plain SQL files embedded at compile time.
@@ -210,9 +211,10 @@ pub enum ProviderAllowList {
     Only(BTreeSet<String>),
 }
 
-/// Whether a new server user administers the server.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(from = "bool")]
+/// Whether a server user administers the server. Serializes as the
+/// `is_admin` boolean.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "bool", into = "bool")]
 pub enum UserKind {
     #[default]
     Standard,
@@ -249,11 +251,52 @@ impl fmt::Debug for TokenSecret {
     }
 }
 
-/// A workspace a user belongs to, with their role in it.
-#[derive(Debug, Clone)]
+/// A workspace and where one person stands in it. Serializes as the
+/// workspace's fields plus `role`: the role, or `null` for an admin
+/// without membership.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Membership {
+    #[serde(flatten)]
     pub workspace: WorkspaceRow,
-    pub role: Role,
+    #[serde(rename = "role")]
+    pub standing: Standing,
+}
+
+/// Where a person stands in a workspace: a member with a role, or a
+/// server admin without membership, who reaches settings and members but
+/// never content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(into = "Option<Role>")]
+pub enum Standing {
+    Member(Role),
+    Admin,
+}
+
+impl Standing {
+    /// A membership's role, or `Admin` where there is none.
+    #[must_use]
+    pub fn of(role: Option<Role>) -> Self {
+        role.map_or(Self::Admin, Self::Member)
+    }
+}
+
+/// The role, when there is a membership.
+impl From<Standing> for Option<Role> {
+    fn from(standing: Standing) -> Self {
+        match standing {
+            Standing::Member(role) => Some(role),
+            Standing::Admin => None,
+        }
+    }
+}
+
+impl fmt::Display for Standing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Member(role) => role.fmt(f),
+            Self::Admin => f.write_str("admin"),
+        }
+    }
 }
 
 /// When a workspace was created and last reached, as stored UTC text.
@@ -269,7 +312,8 @@ pub struct WorkspaceTimes {
 pub struct UserRow {
     pub id: UserId,
     pub username: String,
-    pub is_admin: bool,
+    #[serde(rename = "is_admin")]
+    pub kind: UserKind,
     pub created_at: String,
 }
 
@@ -278,7 +322,7 @@ impl FromRow<'_, SqliteRow> for UserRow {
         Ok(Self {
             id: row.try_get("id")?,
             username: row.try_get("username")?,
-            is_admin: row.try_get("is_admin")?,
+            kind: UserKind::from(row.try_get::<bool, _>("is_admin")?),
             created_at: row.try_get("created_at")?,
         })
     }
@@ -428,8 +472,39 @@ impl FromStr for Expiry {
     }
 }
 
-/// One access-audit row to record: who, what, outcome, channel.
-#[derive(Debug, Clone)]
+/// Where a request came from: the channel it arrived over, and the
+/// client address and request id the server saw, when it recorded them.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Origin {
+    pub channel: Channel,
+    pub client_addr: Option<String>,
+    pub request_id: Option<String>,
+}
+
+/// A request over `channel` with no address or id: the CLI, or a row the
+/// server writes before it has read either.
+impl From<Channel> for Origin {
+    fn from(channel: Channel) -> Self {
+        Self {
+            channel,
+            client_addr: None,
+            request_id: None,
+        }
+    }
+}
+
+impl Origin {
+    /// The denied `session` row for `user`, when their sign-in has ended.
+    #[must_use]
+    pub fn denied_session(&self, user: &UserId) -> AuditEntry {
+        let mut entry = AuditEntry::new(AuditAction::Session, Outcome::Denied, self.clone());
+        entry.user_id = Some(user.clone());
+        entry
+    }
+}
+
+/// One access-audit row to record: who, what, outcome, origin.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditEntry {
     /// UUID v7; the same id keys `_quack_audit` inside the workspace.
     pub id: AuditId,
@@ -441,15 +516,14 @@ pub struct AuditEntry {
     /// An opaque id or a table name; never content.
     pub resource_id: Option<String>,
     pub outcome: Outcome,
-    pub channel: Channel,
-    pub client_addr: Option<String>,
-    pub request_id: Option<String>,
+    #[serde(flatten)]
+    pub origin: Origin,
 }
 
 impl AuditEntry {
     /// A fresh entry with a new UUID v7 and nothing else set.
     #[must_use]
-    pub fn new(action: AuditAction, outcome: Outcome, channel: Channel) -> Self {
+    pub fn new(action: AuditAction, outcome: Outcome, origin: impl Into<Origin>) -> Self {
         Self {
             id: AuditId::generate(),
             user_id: None,
@@ -459,9 +533,7 @@ impl AuditEntry {
             resource_type: None,
             resource_id: None,
             outcome,
-            channel,
-            client_addr: None,
-            request_id: None,
+            origin: origin.into(),
         }
     }
 
@@ -481,11 +553,11 @@ impl AuditEntry {
     }
 }
 
-/// What an access-audit row records was done. Rows are written with one of
-/// these; they are read back as text, since the log is history and keeps
-/// what older versions wrote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// What an access-audit row records was done. The log is history: a
+/// stored name this build does not define reads back as `Unknown`, which
+/// is never written.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(into = "String", from = "String")]
 pub enum AuditAction {
     Login,
     Logout,
@@ -531,9 +603,12 @@ pub enum AuditAction {
     Save,
     /// A saved question's SQL run again without the model.
     SavedRun,
+    /// A stored name this build does not define, as a newer build wrote
+    /// it. Read only: the one write path refuses it.
+    Unknown(String),
 }
 
-text_enum!(AuditAction, "audit action", {
+history_enum!(AuditAction, Unknown, {
     Login => "login",
     Logout => "logout",
     Session => "session",
@@ -572,12 +647,18 @@ text_enum!(AuditAction, "audit action", {
     SavedRun => "saved_run",
 });
 
-/// The kinds of resource an audit row names by opaque id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// The kinds of resource an audit row names by opaque id. Like
+/// [`AuditAction`], a stored kind this build does not define reads back as
+/// `Unknown` and is never written.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(into = "String", from = "String")]
 pub enum ResourceKind {
     Session,
+    /// A message in a session, named by its sequence number.
+    Message,
     Document,
+    /// A chunk of a document, named by the document and its position.
+    Chunk,
     User,
     Workspace,
     Token,
@@ -593,11 +674,16 @@ pub enum ResourceKind {
     Resource,
     Audit,
     SavedQuestion,
+    /// A stored name this build does not define, as a newer build wrote
+    /// it. Read only: the one write path refuses it.
+    Unknown(String),
 }
 
-text_enum!(ResourceKind, "resource kind", {
+history_enum!(ResourceKind, Unknown, {
     Session => "session",
+    Message => "message",
     Document => "document",
+    Chunk => "chunk",
     User => "user",
     Workspace => "workspace",
     Token => "token",
@@ -615,6 +701,21 @@ text_enum!(ResourceKind, "resource kind", {
 });
 
 impl ResourceKind {
+    /// The text form with spaces, for a sentence: "ontology version".
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.as_str().replace('_', " ")
+    }
+
+    /// The error for this kind of resource with `id` missing.
+    #[must_use]
+    pub fn missing(self, id: impl Into<String>) -> Error {
+        Error::NotFound {
+            kind: self,
+            id: id.into(),
+        }
+    }
+
     /// This kind of resource with `id`, as an audit row names it.
     #[must_use]
     pub fn id(self, id: &(impl AsRef<str> + ?Sized)) -> AuditResource<'_> {
@@ -626,7 +727,7 @@ impl ResourceKind {
 }
 
 /// The resource an audit row names: its kind and opaque id, never content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditResource<'a> {
     pub kind: ResourceKind,
     pub id: &'a str,
@@ -687,55 +788,78 @@ text_enum!(Channel, "channel", {
     Cli => "cli",
 });
 
-/// A stored access-audit row.
+/// A stored access-audit row: the entry as it was recorded, and when.
+/// Serializes flat, the timestamp beside the entry's fields.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditRow {
-    pub id: AuditId,
     pub timestamp: String,
-    pub user_id: Option<UserId>,
-    pub token_hash: Option<String>,
-    pub workspace_id: Option<WorkspaceId>,
-    pub action: String,
-    pub resource_type: Option<String>,
-    pub resource_id: Option<String>,
-    pub outcome: Outcome,
-    pub channel: Channel,
-    pub client_addr: Option<String>,
-    pub request_id: Option<String>,
+    #[serde(flatten)]
+    pub entry: AuditEntry,
 }
 
 impl FromRow<'_, SqliteRow> for AuditRow {
     fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
         Ok(Self {
-            id: row.try_get("id")?,
             timestamp: row.try_get("timestamp")?,
-            user_id: row.try_get("user_id")?,
-            token_hash: row.try_get("token_hash")?,
-            workspace_id: row.try_get("workspace_id")?,
-            action: row.try_get("action")?,
-            resource_type: row.try_get("resource_type")?,
-            resource_id: row.try_get("resource_id")?,
-            outcome: parsed(row, "outcome")?,
-            channel: parsed(row, "channel")?,
-            client_addr: row.try_get("client_addr")?,
-            request_id: row.try_get("request_id")?,
+            entry: AuditEntry {
+                id: row.try_get("id")?,
+                user_id: row.try_get("user_id")?,
+                token_hash: row.try_get("token_hash")?,
+                workspace_id: row.try_get("workspace_id")?,
+                action: AuditAction::from(row.try_get::<String, _>("action")?),
+                resource_type: row
+                    .try_get::<Option<String>, _>("resource_type")?
+                    .map(ResourceKind::from),
+                resource_id: row.try_get("resource_id")?,
+                outcome: parsed(row, "outcome")?,
+                origin: Origin {
+                    channel: parsed(row, "channel")?,
+                    client_addr: row.try_get("client_addr")?,
+                    request_id: row.try_get("request_id")?,
+                },
+            },
         })
     }
 }
 
-/// Filters for reading the audit log; every field is optional.
-#[derive(Debug, Clone, Default)]
+/// Filters for reading the audit log, as a query string or a form sends
+/// them: every field is optional, a blank one is "any", and `limit`
+/// defaults to 100 rows a page.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
 pub struct AuditFilter {
+    #[serde(deserialize_with = "blank_as_none")]
     pub user_id: Option<UserId>,
+    #[serde(deserialize_with = "blank_as_none")]
     pub workspace_id: Option<WorkspaceId>,
+    #[serde(deserialize_with = "blank_as_none")]
     pub action: Option<String>,
+    #[serde(deserialize_with = "blank_as_none")]
     pub outcome: Option<Outcome>,
     /// Inclusive lower bound on `timestamp` (SQLite text form).
+    #[serde(deserialize_with = "blank_as_none")]
     pub since: Option<String>,
     /// Exclusive upper bound on `timestamp`.
+    #[serde(deserialize_with = "blank_as_none")]
     pub until: Option<String>,
     pub limit: u32,
-    pub after: Option<AuditCursor>,
+    #[serde(deserialize_with = "blank_as_none")]
+    pub cursor: Option<AuditCursor>,
+}
+
+impl Default for AuditFilter {
+    fn default() -> Self {
+        Self {
+            user_id: None,
+            workspace_id: None,
+            action: None,
+            outcome: None,
+            since: None,
+            until: None,
+            limit: Self::DEFAULT_LIMIT,
+            cursor: None,
+        }
+    }
 }
 
 /// A page of the audit log, newest first; `next` is `None` on the last page.
@@ -1236,7 +1360,7 @@ impl ControlPlane {
         bound.query().execute(&self.pool).await?;
         self.get_workspace(id)
             .await?
-            .ok_or_else(|| Error::WorkspaceNotFound(id.to_string()))
+            .ok_or_else(|| ResourceKind::Workspace.missing(id.to_string()))
     }
 
     /// List all workspaces.
@@ -1278,7 +1402,7 @@ impl ControlPlane {
             .map(|r| {
                 Ok(Membership {
                     workspace: WorkspaceRow::from_row(r)?,
-                    role: parsed(r, "role")?,
+                    standing: Standing::Member(parsed(r, "role")?),
                 })
             })
             .collect()
@@ -2195,6 +2319,30 @@ impl ControlPlane {
     }
 
     fn audit_insert(entry: &AuditEntry) -> Result<Bound> {
+        // Only what this build defines is written; a name read from history
+        // never goes back in under this build's name.
+        if !entry.action.is_defined() {
+            return Err(Error::UnknownValue {
+                what: "audit action",
+                value: entry.action.as_str().to_owned(),
+                allowed: AuditAction::ALL
+                    .iter()
+                    .map(AuditAction::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+        if let Some(kind) = entry.resource_type.as_ref().filter(|k| !k.is_defined()) {
+            return Err(Error::UnknownValue {
+                what: "resource kind",
+                value: kind.as_str().to_owned(),
+                allowed: ResourceKind::ALL
+                    .iter()
+                    .map(ResourceKind::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
         Ok(Bound::new(
             Query::insert()
                 .into_table(AuditLog::Table)
@@ -2217,12 +2365,16 @@ impl ControlPlane {
                     entry.token_hash.as_deref().into(),
                     entry.workspace_id.as_ref().map(WorkspaceId::as_str).into(),
                     entry.action.as_str().into(),
-                    entry.resource_type.map(ResourceKind::as_str).into(),
+                    entry
+                        .resource_type
+                        .as_ref()
+                        .map(ResourceKind::as_str)
+                        .into(),
                     entry.resource_id.as_deref().into(),
                     entry.outcome.as_str().into(),
-                    entry.channel.as_str().into(),
-                    entry.client_addr.as_deref().into(),
-                    entry.request_id.as_deref().into(),
+                    entry.origin.channel.as_str().into(),
+                    entry.origin.client_addr.as_deref().into(),
+                    entry.origin.request_id.as_deref().into(),
                 ])?,
         )?)
     }
@@ -2234,7 +2386,7 @@ impl ControlPlane {
     /// Returns an error if the query fails.
     pub async fn query_audit(&self, filter: &AuditFilter) -> Result<AuditPage> {
         let digest = filter.digest();
-        if let Some(after) = &filter.after
+        if let Some(after) = &filter.cursor
             && after.filter != digest
         {
             return Err(Error::Config(String::from(
@@ -2247,7 +2399,7 @@ impl ControlPlane {
             rows.truncate(limit);
             rows.last().map(|last| AuditCursor {
                 timestamp: last.timestamp.clone(),
-                id: last.id.clone(),
+                id: last.entry.id.clone(),
                 filter: digest,
             })
         } else {
@@ -2258,8 +2410,12 @@ impl ControlPlane {
 }
 
 impl AuditFilter {
+    pub const DEFAULT_LIMIT: u32 = 100;
+    /// Rows a page holds at most, whatever `limit` asks.
+    pub const MAX_LIMIT: u32 = 1_000;
+
     fn page_size(&self) -> u32 {
-        Ord::max(self.limit, 1)
+        self.limit.clamp(1, Self::MAX_LIMIT)
     }
 
     /// Identifies the filter so a cursor only continues the same query.
@@ -2302,7 +2458,7 @@ impl AuditFilter {
             .order_by(AuditLog::Timestamp, Order::Desc)
             .order_by(AuditLog::Id, Order::Desc)
             .limit(u64::from(filter.page_size()).saturating_add(1));
-        if let Some(after) = &filter.after {
+        if let Some(after) = &filter.cursor {
             select.cond_where(
                 Cond::any()
                     .add(Expr::col(AuditLog::Timestamp).lt(after.timestamp.as_str()))

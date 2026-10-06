@@ -14,9 +14,10 @@ use crate::analysis::agent::{AgentResponse, TokenUsage};
 use crate::analysis::chart::ChartSpec;
 use crate::analysis::citations::Citation;
 use crate::analysis::events::{ToolName, ToolStep};
-use crate::error::{Error, Record, Result};
+use crate::error::{Error, Result};
 use crate::graph::GraphResult;
 use crate::ids::{MessageId, SessionId, SummaryId, UserId};
+use crate::storage::control::ResourceKind;
 use crate::text::Tokens;
 use rig::id::ConversationId;
 use rig::memory::{ConversationMemory, MemoryError, MemoryPolicy, TokenWindowMemory};
@@ -64,9 +65,10 @@ text_enum!(MessageRole, "message role", {
     Tool => "tool",
 });
 
-/// Who besides its creator may read a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(from = "bool")]
+/// Who besides its creator may read a session. Serializes as the
+/// `shared` boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "bool", into = "bool")]
 pub enum Sharing {
     Private,
     /// Every member of the workspace.
@@ -84,7 +86,8 @@ pub struct SessionRow {
     /// The server user who started it; `None` from the CLI and TUI.
     pub created_by: Option<UserId>,
     /// Visible to every member of the workspace, not only the creator.
-    pub shared: bool,
+    #[serde(rename = "shared")]
+    pub sharing: Sharing,
     pub created_at: String,
     pub updated_at: String,
     pub message_count: i64,
@@ -105,7 +108,7 @@ impl TryFrom<&duckdb::Row<'_>> for SessionRow {
             updated_at: row.get(5)?,
             message_count: row.get(6)?,
             created_by: row.get(7)?,
-            shared: row.get(8)?,
+            sharing: row.get(8)?,
         })
     }
 }
@@ -119,7 +122,8 @@ impl SessionRow {
         match viewer {
             SessionViewer::All => true,
             SessionViewer::User(user_id) => {
-                self.shared || self.created_by.as_ref().is_none_or(|c| c == user_id)
+                self.sharing == Sharing::Shared
+                    || self.created_by.as_ref().is_none_or(|c| c == user_id)
             }
         }
     }
@@ -327,7 +331,7 @@ pub fn set_session_mode(db: &WorkspaceDb, session_id: &SessionId, mode: ChatMode
         duckdb::params![mode.as_str(), session_id],
     )?;
     if changed == 0 {
-        return Err(Record::Session.missing(session_id.as_str()));
+        return Err(ResourceKind::Session.missing(session_id.as_str()));
     }
     Ok(())
 }
@@ -413,7 +417,7 @@ pub fn set_session_sharing(
         duckdb::params![sharing, session_id],
     )?;
     if changed == 0 {
-        return Err(Record::Session.missing(session_id.as_str()));
+        return Err(ResourceKind::Session.missing(session_id.as_str()));
     }
     Ok(())
 }
@@ -431,7 +435,7 @@ pub fn append_message(
     metadata: Option<&MessageMeta>,
 ) -> Result<i64> {
     if get_session(db, session_id)?.is_none() {
-        return Err(Record::Session.missing(session_id.as_str()));
+        return Err(ResourceKind::Session.missing(session_id.as_str()));
     }
     let conn = db.connection();
     let seq: i64 = conn.query_row(
@@ -494,8 +498,8 @@ pub fn record_turn(
     asked_at: Timestamp,
     response: &AgentResponse,
 ) -> Result<()> {
-    let session =
-        get_session(db, session_id)?.ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
+    let session = get_session(db, session_id)?
+        .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))?;
 
     // The turn is recorded once it ends; the question keeps the time it was asked.
     let seq = append_message(db, session_id, MessageRole::User, user_message, None)?;

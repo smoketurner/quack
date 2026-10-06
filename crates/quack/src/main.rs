@@ -28,7 +28,7 @@ use quack_core::config::inspect::SettingFilter;
 use quack_core::config::{Config, Grant};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
-use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
+use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::PageCounts;
@@ -42,8 +42,8 @@ use quack_core::ontology::store::Revision;
 use quack_core::prefix::PrefixMatch;
 use quack_core::progress::RunControl;
 use quack_core::storage::context;
-use quack_core::storage::control::{ControlPlane, WorkspaceRow};
-use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
+use quack_core::storage::control::{ControlPlane, ResourceKind, WorkspaceRow};
+use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
 use quack_core::storage::workspace::{DocumentSource, Pinning, QueryResults, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use quack_core::{config, doctor};
@@ -1585,7 +1585,7 @@ fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
 /// Resolve a full document id or a unique prefix.
 fn find_document(db: &WorkspaceDb, prefix: &str) -> CoreResult<DocumentId> {
     let document = PrefixMatch::of(db.list_documents()?, prefix, |d| d.id.as_str())
-        .one(Record::Document, prefix)?;
+        .one(ResourceKind::Document, prefix)?;
     Ok(document.id)
 }
 
@@ -1627,7 +1627,11 @@ fn list_documents(
             doc.id,
             doc.status,
             doc.source,
-            if doc.pinned { "pinned  " } else { "        " },
+            if doc.pinning == Pinning::Pinned {
+                "pinned  "
+            } else {
+                "        "
+            },
             doc.filename
         )
     })?;
@@ -1643,7 +1647,7 @@ pub(crate) fn find_session(db: &WorkspaceDb, prefix: &str) -> CoreResult<session
     PrefixMatch::of(sessions::list_sessions(db, 1000)?, prefix, |s| {
         s.id.as_str()
     })
-    .one(Record::Session, prefix)
+    .one(ResourceKind::Session, prefix)
 }
 
 fn list_sessions(db: &WorkspaceDb, format: TextOrJson, limit: u32) -> Result<()> {
@@ -1659,7 +1663,11 @@ fn list_sessions(db: &WorkspaceDb, format: TextOrJson, limit: u32) -> Result<()>
             row.message_count,
             row.model,
             row.title.as_deref().unwrap_or("(untitled)"),
-            if row.shared { "  (shared)" } else { "" }
+            if row.sharing == Sharing::Shared {
+                "  (shared)"
+            } else {
+                ""
+            }
         )
     })?;
     out.flush()?;

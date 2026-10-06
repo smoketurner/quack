@@ -38,13 +38,14 @@ use crate::config::{
     ProviderConfig, ProviderName, ProviderType, RerankMode, config_file_path,
 };
 use crate::embedding::{Embedder, EmbeddingModel, Profile};
-use crate::error::{Error, Record, Result};
+use crate::error::{Error, Result};
 use crate::extraction::{Extract, ExtractFuture};
 use crate::graph::extract::{Extraction, ExtractionAnswer};
 use crate::ids::SessionId;
 use crate::ontology::Ontology;
 use crate::ontology::documents::{self, OpenExtraction};
 use crate::priority::Priority;
+use crate::storage::control::ResourceKind;
 use crate::storage::{context, sessions};
 use egress::Egress;
 use sampling::{Sampled, Wire};
@@ -1251,7 +1252,7 @@ impl TurnRequest<'_> {
             rerank_model,
             config: &config.analysis,
             retrieval_config: &config.retrieval,
-            graph_options: config.graph.options(),
+            graph_options: config.graph,
             write_policy: policy,
             prompt,
             history,
@@ -1329,7 +1330,7 @@ async fn start_turn<'c>(
         .run(move |guard| {
             let session_id = read;
             let session = sessions::get_session(guard, &session_id)?
-                .ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
+                .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))?;
             let prompt = PromptOptions {
                 mode: session.mode,
                 today: Zoned::now().date(),

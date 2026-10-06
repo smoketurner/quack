@@ -36,7 +36,7 @@ pub(crate) async fn export(
 ) -> ApiResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let reader = app.reader_db(&id).await?;
-    let name = access.workspace.name.clone();
+    let name = access.membership.workspace.name.clone();
     let filename = format!("{}.okf.tar", okf::slug(&name));
     let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(CHUNKS_IN_FLIGHT);
     let failed = tx.clone();

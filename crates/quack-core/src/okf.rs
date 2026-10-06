@@ -681,7 +681,7 @@ impl<S: BundleSink> Exporter<'_, S> {
                 document.status,
                 document.source,
                 document.chunk_count.unwrap_or(0),
-                document.pinned
+                bool::from(document.pinning)
             )?;
             if let Some(tables) = &document.tables {
                 for table in tables {
@@ -963,7 +963,7 @@ impl EntityFile {
             .field("generator", GENERATOR)
             .field("id", node.id.to_string())
             .field("title", node.label.clone());
-        if node.provisional {
+        if node.standing == graph::Standing::Provisional {
             front = front.tag("provisional");
         }
         let mut text = front.to_string();

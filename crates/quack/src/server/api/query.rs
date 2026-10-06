@@ -15,7 +15,6 @@ use quack_core::analysis::events::{self, AgentEvent, FailureKind, TurnFailure};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::embedding::{Input, Vector};
-use quack_core::error::Record;
 use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
@@ -90,7 +89,7 @@ impl PreparedTurn {
                 // A session the caller may not see reads as missing, not forbidden.
                 sessions::get_session(db, &id)?
                     .filter(|s| s.visible_to(&viewer))
-                    .ok_or_else(|| Record::Session.missing(id.as_str()))?;
+                    .ok_or_else(|| ResourceKind::Session.missing(id.as_str()))?;
                 // A session's mode is set when it is created; `mode` on a
                 // later turn is ignored, and PATCH .../sessions/{sid} changes
                 // it explicitly (issue #57).
@@ -138,7 +137,7 @@ impl PreparedTurn {
         let config = app.config.clone();
         let (session, text) = (session_id.clone(), prompt.clone());
         let spec = JobSpec::new(JobKind::Chat, prompt.chars().take(80).collect::<String>())
-            .workspace(access.workspace.id.clone())
+            .workspace(access.membership.workspace.id.clone())
             .owner(Some(access.identity.user_id.clone()))
             .lane(Lane::serial(&lane));
         let job = app
@@ -250,7 +249,7 @@ impl Turn {
             TurnEnd::Failed(_) => (Outcome::Error, Vec::new()),
         };
         if outcome != Outcome::Allowed
-            && let Ok(db) = app.workspace_db(&self.access.workspace.id).await
+            && let Ok(db) = app.workspace_db(&self.access.membership.workspace.id).await
         {
             let sid = self.session_id.clone();
             if let Err(e) = with_db(db, move |db| sessions::delete_if_empty(db, &sid)).await {
@@ -435,7 +434,7 @@ impl Access {
         let sql = statement.to_owned();
         // Classifying parses the statement: a read, never in the writer's line.
         let kind = app
-            .read(&access.workspace.id, move |db| {
+            .read(&access.membership.workspace.id, move |db| {
                 db.classify_user_statement(&sql)
             })
             .await
@@ -456,7 +455,7 @@ impl Access {
                 "writes need the member role and the write scope",
             ));
         }
-        let reader_db = app.reader_db(&access.workspace.id).await?;
+        let reader_db = app.reader_db(&access.membership.workspace.id).await?;
         let sql = statement.to_owned();
         let max_rows = app.config.analysis.max_query_rows;
         let timed = move |db: &WorkspaceDb| {
@@ -465,7 +464,7 @@ impl Access {
                 .map(|capped| (capped, began.elapsed()))
         };
         let result = if is_write {
-            let db = app.workspace_db(&access.workspace.id).await?;
+            let db = app.workspace_db(&access.membership.workspace.id).await?;
             let result = with_db(db, timed).await;
             // Whatever ran might have created a temp object the check above
             // did not catch (a leading comment, a multi-statement batch);

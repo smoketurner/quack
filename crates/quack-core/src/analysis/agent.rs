@@ -6,7 +6,7 @@ use futures::StreamExt;
 use rig::prelude::*;
 use rig::streaming::{Item, PartKind, StreamEvent};
 
-use crate::config::{AnalysisConfig, RetrievalConfig};
+use crate::config::{AnalysisConfig, GraphConfig, RetrievalConfig};
 use crate::embedding::{Embedder, EmbeddingModel};
 use crate::error::{Error, Result};
 use crate::ids::SessionId;
@@ -25,7 +25,7 @@ use super::tools::{
     SearchGraphTool, SharedDb, Turn,
 };
 use super::vector_index::DuckDbVectorIndex;
-use crate::graph::{GraphOptions, GraphResult, store as graph_store};
+use crate::graph::{GraphResult, store as graph_store};
 use crate::llm::{ChatModel, OLLAMA_KEEP_ALIVE, RerankModel, SchemaCall};
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
@@ -178,7 +178,7 @@ pub struct Analysis<'a, M> {
     pub rerank_model: Option<RerankModel>,
     pub config: &'a AnalysisConfig,
     pub retrieval_config: &'a RetrievalConfig,
-    pub graph_options: GraphOptions,
+    pub graph_options: GraphConfig,
     pub write_policy: WritePolicy,
     pub prompt: PromptOptions,
     pub history: Vec<Message>,
@@ -734,7 +734,7 @@ struct BuildContext<'a> {
     reader_db: ReaderDb,
     analysis_config: &'a AnalysisConfig,
     retrieval_config: &'a RetrievalConfig,
-    graph_options: GraphOptions,
+    graph_options: GraphConfig,
     modeled: Modeled,
     mode: ChatMode,
     window: Window,

@@ -24,7 +24,7 @@ use super::events::{DetailPreview, ToolName, TurnRecorder};
 use super::policy::{Exposure, Hold, RefusalFlag, WriteDecision, WritePolicy};
 use super::rerank::{self, ModelReranker, RerankAnswer, Reranker, ScoredReranker};
 use super::text_to_sql::Modeled;
-use crate::config::{RerankMode, RetrievalConfig};
+use crate::config::{GraphConfig, RerankMode, RetrievalConfig};
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
 use crate::ingestion::parser::PageCounts;
@@ -419,6 +419,12 @@ impl JsonSchema for NoArgs {
 pub struct NonBlank(Option<String>);
 
 impl NonBlank {
+    /// Text as a caller gave it, trimmed, and absent when blank.
+    #[must_use]
+    pub fn new(text: Option<&str>) -> Self {
+        Self(text.and_then(str::non_blank).map(str::to_owned))
+    }
+
     #[must_use]
     pub fn get(&self) -> Option<&str> {
         self.0.as_deref()
@@ -428,9 +434,7 @@ impl NonBlank {
 impl<'de> Deserialize<'de> for NonBlank {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = Option::<String>::deserialize(deserializer)?;
-        Ok(Self(
-            text.as_deref().and_then(str::non_blank).map(str::to_owned),
-        ))
+        Ok(Self::new(text.as_deref()))
     }
 }
 
@@ -1562,7 +1566,7 @@ pub struct GraphTools<M> {
     pub db: ReaderDb,
     /// `None` resolves entities by exact label and alias only.
     pub embedding_model: Option<Embedder<M>>,
-    pub options: graph::GraphOptions,
+    pub options: GraphConfig,
     /// Query mode does not answer from provisional nodes.
     pub mode: ChatMode,
 }
@@ -1598,7 +1602,10 @@ impl<M> GraphTools<M> {
 
 pub struct SearchGraphTool<M>(pub GraphTools<M>);
 
-#[derive(Deserialize, JsonSchema)]
+/// A graph search as every interface takes it: the agent tool's
+/// arguments, the MCP tool's, the REST body, and what the CLI and the
+/// web form fill in.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct SearchGraphArgs {
     /// The entity to start from (its name as it appears in the data); omit
     /// to list every entity of `class`
@@ -1612,6 +1619,22 @@ pub struct SearchGraphArgs {
     pub relation: NonBlank,
     /// How many hops out from the entity (default 2)
     pub hops: Option<u32>,
+}
+
+impl SearchGraphArgs {
+    /// The query these arguments ask for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when there is neither an entity nor a class.
+    pub fn query(&self) -> Result<GraphQuery, Error> {
+        GraphQuery::new(
+            self.entity.get(),
+            self.class.get(),
+            self.relation.get(),
+            self.hops,
+        )
+    }
 }
 
 impl<M> Tool for SearchGraphTool<M>
@@ -1650,12 +1673,7 @@ where
             (None, None) => String::new(),
         };
         let step = turn.recorder.start(ToolName::SearchGraph, &detail);
-        let query = match GraphQuery::new(
-            args.entity.get(),
-            args.class.get(),
-            args.relation.get(),
-            args.hops,
-        ) {
+        let query = match args.query() {
             Ok(query) => query,
             Err(e) => return Err(step.fail(e.into())),
         };
@@ -1723,7 +1741,8 @@ where
 
 pub struct FindPathTool<M>(pub GraphTools<M>);
 
-#[derive(Deserialize, JsonSchema)]
+/// A path request as every interface takes it, like [`SearchGraphArgs`].
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct FindPathArgs {
     /// The entity to start from
     pub from: String,
@@ -1731,6 +1750,17 @@ pub struct FindPathArgs {
     pub to: String,
     /// Longest path to consider (default 4)
     pub max_hops: Option<u32>,
+}
+
+impl FindPathArgs {
+    /// The query these arguments ask for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either end is blank.
+    pub fn query(&self) -> Result<PathQuery, Error> {
+        PathQuery::new(&self.from, &self.to, self.max_hops)
+    }
 }
 
 impl<M> Tool for FindPathTool<M>
@@ -1764,7 +1794,7 @@ where
             ToolName::FindPath,
             &format!("{} -> {}", args.from.trim(), args.to.trim()),
         );
-        let query = match PathQuery::new(&args.from, &args.to, args.max_hops) {
+        let query = match args.query() {
             Ok(query) => query,
             Err(e) => return Err(step.fail(e.into())),
         };

@@ -74,7 +74,12 @@ impl Access {
             .ok_or_else(|| ApiError::not_found("no such user"))?;
         let entry = self.entry(AuditAction::Member, Outcome::Allowed);
         app.control
-            .set_member(&self.workspace.id, &user.id, member.role, entry.clone())
+            .set_member(
+                &self.membership.workspace.id,
+                &user.id,
+                member.role,
+                entry.clone(),
+            )
             .await?;
         self.record_detail(app, &entry, None).await?;
         Ok(NewMember {
@@ -92,7 +97,7 @@ impl Access {
         let entry = self.entry(AuditAction::Member, Outcome::Allowed);
         let removed = app
             .control
-            .remove_member(&self.workspace.id, user_id, entry.clone())
+            .remove_member(&self.membership.workspace.id, user_id, entry.clone())
             .await?;
         let detail = (!removed).then(|| serde_json::json!({ "reason": "not a member" }));
         self.record_detail(app, &entry, detail).await?;

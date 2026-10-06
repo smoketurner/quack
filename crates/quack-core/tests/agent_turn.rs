@@ -17,10 +17,9 @@ use quack_core::analysis::events::{self, AgentEvent, ToolName};
 use quack_core::analysis::policy::{Approver, Hold, WritePolicy};
 use quack_core::analysis::text_to_sql::PromptOptions;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
-use quack_core::config::{AnalysisConfig, RetrievalConfig};
+use quack_core::config::{AnalysisConfig, GraphConfig, RetrievalConfig};
 use quack_core::embedding::{Dimension, Embedder, EmbeddingModel};
 use quack_core::error::Result as TurnResult;
-use quack_core::graph::GraphOptions;
 use quack_core::ids::{ChunkId, DocumentId};
 use quack_core::storage::sessions::{self, ChatMode, MessageRole};
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, Pinning, WorkspaceDb};
@@ -158,7 +157,7 @@ async fn run_turn_answering(
         rerank_model: None,
         config: &analysis_config,
         retrieval_config: &retrieval_config,
-        graph_options: GraphOptions::default(),
+        graph_options: GraphConfig::default(),
         write_policy: policy,
         prompt: PromptOptions {
             mode: ChatMode::Chat,
