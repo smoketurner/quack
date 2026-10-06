@@ -40,11 +40,8 @@ enum ApiActivity {
 impl EventClass {
     /// Where a row's action lands. A denied `token` is a rejected bearer,
     /// so it is a failed logon rather than token management.
-    fn of(action: Option<AuditAction>, outcome: Outcome) -> Self {
+    fn of(action: &AuditAction, outcome: Outcome) -> Self {
         use ApiActivity::{Create, Delete, Other, Read, Update};
-        let Some(action) = action else {
-            return Self::Api(Other);
-        };
         match action {
             AuditAction::Login | AuditAction::Session => Self::Authentication(AuthActivity::Logon),
             AuditAction::Logout => Self::Authentication(AuthActivity::Logoff),
@@ -82,7 +79,10 @@ impl EventClass {
             | AuditAction::GraphMerge
             | AuditAction::EmbeddingsRefresh => Self::Api(Update),
             AuditAction::Delete => Self::Api(Delete),
-            AuditAction::Workspace | AuditAction::Ontology => Self::Api(Other),
+            // A name a newer build wrote is an API event under its own name.
+            AuditAction::Workspace | AuditAction::Ontology | AuditAction::Unknown(_) => {
+                Self::Api(Other)
+            }
         }
     }
 
@@ -114,15 +114,15 @@ impl AuditRow {
     ///
     /// Returns an error if the stored timestamp does not parse.
     pub fn to_ocsf(&self) -> Result<Value> {
-        let action = self.action.parse::<AuditAction>().ok();
-        let class = EventClass::of(action, self.outcome);
+        let entry = &self.entry;
+        let class = EventClass::of(&entry.action, entry.outcome);
         let (class_uid, class_name, category_uid, category_name) = class.class();
         let (activity_id, known_activity) = class.activity();
         let activity_name = match class {
-            EventClass::Api(ApiActivity::Other) => self.action.as_str(),
+            EventClass::Api(ApiActivity::Other) => entry.action.as_str(),
             EventClass::Authentication(_) | EventClass::Api(_) => known_activity,
         };
-        let (status_id, status) = match self.outcome {
+        let (status_id, status) = match entry.outcome {
             Outcome::Allowed => (1, "Success"),
             Outcome::Denied | Outcome::Error => (2, "Failure"),
         };
@@ -130,22 +130,23 @@ impl AuditRow {
             .and_then(|dt| dt.to_zoned(TimeZone::UTC))
             .map_err(|e| Error::Config(format!("audit timestamp {:?}: {e}", self.timestamp)))?
             .timestamp();
-        let user = self.user_id.as_ref().map(|id| json!({ "uid": id }));
+        let user = entry.user_id.as_ref().map(|id| json!({ "uid": id }));
         // An operator at the shell has no user row: the CLI is the actor.
         let actor = user.clone().map_or_else(
-            || json!({ "application": { "name": format!("quack {}", self.channel) } }),
+            || json!({ "application": { "name": format!("quack {}", entry.origin.channel) } }),
             |user| json!({ "user": user }),
         );
         // CLI and terminal rows have no client address: they ran on the host.
-        let src_endpoint = self
+        let src_endpoint = entry
+            .origin
             .client_addr
             .as_ref()
             .map_or_else(|| json!({ "name": "local" }), |ip| json!({ "ip": ip }));
         let mut resources = Vec::new();
-        if let Some(workspace) = &self.workspace_id {
+        if let Some(workspace) = &entry.workspace_id {
             resources.push(json!({ "type": "workspace", "uid": workspace }));
         }
-        if let (Some(kind), Some(uid)) = (&self.resource_type, &self.resource_id) {
+        if let (Some(kind), Some(uid)) = (&entry.resource_type, &entry.resource_id) {
             resources.push(json!({ "type": kind, "uid": uid }));
         }
         let mut event = json!({
@@ -160,13 +161,13 @@ impl AuditRow {
             "severity": "Informational",
             "status_id": status_id,
             "status": status,
-            "status_detail": self.outcome.as_str(),
+            "status_detail": entry.outcome.as_str(),
             "time": time.as_millisecond(),
             "time_dt": time.to_string(),
             "metadata": {
                 "version": OCSF_VERSION,
-                "uid": self.id,
-                "correlation_uid": self.request_id,
+                "uid": entry.id,
+                "correlation_uid": entry.origin.request_id,
                 "profiles": ["datetime"],
                 "product": {
                     "name": "quack",
@@ -176,8 +177,8 @@ impl AuditRow {
             },
             "src_endpoint": src_endpoint,
             "unmapped": {
-                "channel": self.channel.as_str(),
-                "token_hash": self.token_hash,
+                "channel": entry.origin.channel.as_str(),
+                "token_hash": entry.token_hash,
             },
         });
         let fields = match class {
@@ -188,7 +189,7 @@ impl AuditRow {
             }),
             EventClass::Api(_) => json!({
                 "actor": actor,
-                "api": { "operation": self.action },
+                "api": { "operation": entry.action },
                 "resources": resources,
             }),
         };
@@ -221,22 +222,26 @@ fn without_nulls(value: Value) -> Value {
 mod tests {
     use super::*;
     use crate::ids::{AuditId, UserId, WorkspaceId};
-    use crate::storage::control::Channel;
+    use crate::storage::control::{AuditEntry, Channel, Origin, ResourceKind};
 
-    fn row(action: &str, outcome: Outcome) -> AuditRow {
+    fn row(action: AuditAction, outcome: Outcome) -> AuditRow {
         AuditRow {
-            id: AuditId::from("0199aaaa-0000-7000-8000-000000000001"),
             timestamp: String::from("2026-09-24 12:34:56"),
-            user_id: Some(UserId::from("u1")),
-            token_hash: None,
-            workspace_id: Some(WorkspaceId::from("w1")),
-            action: action.to_owned(),
-            resource_type: Some(String::from("document")),
-            resource_id: Some(String::from("d1")),
-            outcome,
-            channel: Channel::Api,
-            client_addr: Some(String::from("10.0.0.7")),
-            request_id: Some(String::from("req-1")),
+            entry: AuditEntry {
+                id: AuditId::from("0199aaaa-0000-7000-8000-000000000001"),
+                user_id: Some(UserId::from("u1")),
+                token_hash: None,
+                workspace_id: Some(WorkspaceId::from("w1")),
+                action,
+                resource_type: Some(ResourceKind::Document),
+                resource_id: Some(String::from("d1")),
+                outcome,
+                origin: Origin {
+                    channel: Channel::Api,
+                    client_addr: Some(String::from("10.0.0.7")),
+                    request_id: Some(String::from("req-1")),
+                },
+            },
         }
     }
 
@@ -279,14 +284,14 @@ mod tests {
 
     #[test]
     fn logins_are_authentication_events() {
-        let event = render(&row("login", Outcome::Allowed));
+        let event = render(&row(AuditAction::Login, Outcome::Allowed));
         assert_required(&event);
         assert_eq!(event["type_uid"], 300_201);
         assert_eq!(event["status_id"], 1);
         assert_eq!(event["user"]["uid"], "u1");
 
-        let mut unknown = row("token", Outcome::Denied);
-        unknown.user_id = None;
+        let mut unknown = row(AuditAction::Token, Outcome::Denied);
+        unknown.entry.user_id = None;
         let event = render(&unknown);
         assert_required(&event);
         assert_eq!(
@@ -297,14 +302,14 @@ mod tests {
         assert_eq!(event["user"]["type_id"], 0);
 
         assert_eq!(
-            render(&row("logout", Outcome::Allowed))["type_uid"],
+            render(&row(AuditAction::Logout, Outcome::Allowed))["type_uid"],
             300_202
         );
     }
 
     #[test]
     fn workspace_actions_are_api_activity() {
-        let event = render(&row("sql", Outcome::Allowed));
+        let event = render(&row(AuditAction::Sql, Outcome::Allowed));
         assert_required(&event);
         assert_eq!(event["type_uid"], 600_302);
         assert_eq!(event["api"]["operation"], "sql");
@@ -321,22 +326,25 @@ mod tests {
         assert_eq!(event["time"], 1_790_253_296_000_i64);
         assert_eq!(event["time_dt"], "2026-09-24T12:34:56Z");
         assert_eq!(
-            render(&row("ingest", Outcome::Allowed))["type_uid"],
+            render(&row(AuditAction::Ingest, Outcome::Allowed))["type_uid"],
             600_301
         );
-        assert_eq!(render(&row("delete", Outcome::Error))["type_uid"], 600_304);
         assert_eq!(
-            render(&row("delete", Outcome::Error))["status_detail"],
+            render(&row(AuditAction::Delete, Outcome::Error))["type_uid"],
+            600_304
+        );
+        assert_eq!(
+            render(&row(AuditAction::Delete, Outcome::Error))["status_detail"],
             "error"
         );
         // A membership change is API activity/Update; a failed no-op removal
         // audited as `Error` is a `Failure` event, never a `Success` one.
-        let allowed = render(&row("member", Outcome::Allowed));
+        let allowed = render(&row(AuditAction::Member, Outcome::Allowed));
         assert_eq!(allowed["type_uid"], 600_303);
         assert_eq!(allowed["activity_name"], "Update");
         assert_eq!(allowed["status_id"], 1);
         assert_eq!(allowed["status"], "Success");
-        let failed = render(&row("member", Outcome::Error));
+        let failed = render(&row(AuditAction::Member, Outcome::Error));
         assert_eq!(failed["type_uid"], 600_303);
         assert_eq!(failed["status_id"], 2);
         assert_eq!(failed["status"], "Failure");
@@ -345,11 +353,11 @@ mod tests {
 
     #[test]
     fn unmapped_actions_and_local_rows_stay_valid() {
-        let mut cli = row("workspace", Outcome::Allowed);
-        cli.client_addr = None;
-        cli.channel = Channel::Cli;
-        cli.user_id = None;
-        cli.request_id = None;
+        let mut cli = row(AuditAction::Workspace, Outcome::Allowed);
+        cli.entry.origin.client_addr = None;
+        cli.entry.origin.channel = Channel::Cli;
+        cli.entry.user_id = None;
+        cli.entry.origin.request_id = None;
         let event = render(&cli);
         assert_required(&event);
         assert_eq!(event["type_uid"], 600_399);
@@ -363,11 +371,15 @@ mod tests {
         );
         assert!(event["unmapped"].get("token_hash").is_none(), "{event}");
 
-        let retired = render(&row("retired_action", Outcome::Allowed));
+        let retired = render(&row(
+            AuditAction::Unknown(String::from("retired_action")),
+            Outcome::Allowed,
+        ));
         assert_eq!(retired["type_uid"], 600_399);
         assert_eq!(retired["activity_name"], "retired_action");
+        assert_eq!(retired["api"]["operation"], "retired_action");
 
-        let mut broken = row("open", Outcome::Allowed);
+        let mut broken = row(AuditAction::Open, Outcome::Allowed);
         broken.timestamp = String::from("yesterday");
         assert!(broken.to_ocsf().is_err());
     }

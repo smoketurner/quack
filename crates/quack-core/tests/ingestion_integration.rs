@@ -2026,7 +2026,7 @@ async fn ingest_markdown_stores_headings_and_pinned_flag() {
     );
 
     let doc = db.list_documents().unwrap().into_iter().next().unwrap();
-    assert!(!doc.pinned);
+    assert_eq!(doc.pinning, Pinning::Unpinned);
     db.set_document_pinning(&doc.id, Pinning::Pinned).unwrap();
     let pinned = db.pinned_documents().unwrap();
     assert_eq!(pinned.len(), 1);

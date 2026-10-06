@@ -29,8 +29,9 @@ use crate::text::OneLine;
 
 /// Whether a graph write rests on a reviewed ontology, or on one that was
 /// auto-accepted and so is provisional until someone reviews it. Binds
-/// as the `provisional` column's boolean.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// as the `provisional` column's boolean, and serializes as it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "bool", into = "bool")]
 pub enum Standing {
     #[default]
     Reviewed,
@@ -47,7 +48,8 @@ pub struct Node {
     pub class_id: ClassId,
     #[serde(default)]
     pub properties: Properties,
-    pub provisional: bool,
+    #[serde(rename = "provisional")]
+    pub standing: Standing,
 }
 
 /// `label (class)`, how every listing names a node.
@@ -80,7 +82,8 @@ pub struct Edge {
     pub weight: f64,
     #[serde(default)]
     pub properties: Properties,
-    pub provisional: bool,
+    #[serde(rename = "provisional")]
+    pub standing: Standing,
 }
 
 /// Properties past this many are counted rather than rendered: a node
@@ -328,11 +331,11 @@ impl GraphResult {
     /// unreviewed graph).
     #[must_use]
     pub fn without_provisional(mut self) -> Self {
-        self.nodes.retain(|n| !n.provisional);
+        self.nodes.retain(|n| n.standing == Standing::Reviewed);
         let kept: std::collections::BTreeSet<&str> =
             self.nodes.iter().map(|n| n.id.as_str()).collect();
         self.edges.retain(|e| {
-            !e.provisional
+            e.standing == Standing::Reviewed
                 && kept.contains(e.source_node_id.as_str())
                 && kept.contains(e.target_node_id.as_str())
         });
@@ -550,29 +553,6 @@ impl ExtractSource {
     }
 }
 
-/// Tuning for traversal and resolution, from `[graph]`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct GraphOptions {
-    pub max_traversal_depth: u32,
-    pub max_nodes: u32,
-    /// Cosine distance under which two labels of one class are proposed
-    /// as a merge.
-    pub merge_threshold: f64,
-    /// Cosine distance under which the merge happens without review.
-    pub auto_merge_threshold: f64,
-}
-
-impl Default for GraphOptions {
-    fn default() -> Self {
-        Self {
-            max_traversal_depth: 3,
-            max_nodes: 200,
-            merge_threshold: 0.08,
-            auto_merge_threshold: 0.02,
-        }
-    }
-}
-
 /// The graph tables, created with the workspace's embedding dimension.
 #[must_use]
 pub fn ddl(dimension: Dimension) -> String {
@@ -756,15 +736,19 @@ mod tests {
 
     #[test]
     fn provisional_results_are_dropped_with_their_edges_and_provenance() {
-        let node = |id: &str, provisional: bool| Node {
+        let node = |id: &str, standing: Standing| Node {
             id: NodeId::from(id.to_owned()),
             label: id.to_owned(),
             class_id: ClassId::from("entity"),
             properties: Properties::default(),
-            provisional,
+            standing,
         };
         let result = GraphResult {
-            nodes: vec![node("a", false), node("b", true), node("c", false)],
+            nodes: vec![
+                node("a", Standing::Reviewed),
+                node("b", Standing::Provisional),
+                node("c", Standing::Reviewed),
+            ],
             edges: vec![
                 Edge {
                     id: EdgeId::from("ab"),
@@ -773,7 +757,7 @@ mod tests {
                     relation_id: RelationId::from("mentions"),
                     weight: 1.0,
                     properties: Properties::default(),
-                    provisional: false,
+                    standing: Standing::Reviewed,
                 },
                 Edge {
                     id: EdgeId::from("ac"),
@@ -782,7 +766,7 @@ mod tests {
                     relation_id: RelationId::from("mentions"),
                     weight: 1.0,
                     properties: Properties::default(),
-                    provisional: false,
+                    standing: Standing::Reviewed,
                 },
             ],
             provenance: vec![

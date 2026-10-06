@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use axum::extract::{FromRequest, Multipart, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
-use quack_core::error::Record;
 use quack_core::ids::{DocumentId, WorkspaceId};
 use quack_core::ingestion;
 use quack_core::jobs::JobId;
@@ -57,7 +56,7 @@ pub(crate) async fn show(
     let document = app
         .read(&id, move |db| {
             db.document(&doc)?
-                .ok_or_else(|| Record::Document.missing(doc.as_str()))
+                .ok_or_else(|| ResourceKind::Document.missing(doc.as_str()))
         })
         .await?;
     Ok(Json(serde_json::to_value(document)?))
@@ -139,7 +138,7 @@ async fn import_bundle(
     } else {
         enqueue(app, access, DocumentSource::Upload, files).await?
     };
-    let db = app.workspace_db(&access.workspace.id).await?;
+    let db = app.workspace_db(&access.membership.workspace.id).await?;
     let for_candidates = bundle.clone();
     let author = access.identity.username.clone();
     let report = with_db(db, move |db| {
@@ -281,7 +280,7 @@ pub(crate) async fn enqueue(
     if files.is_empty() {
         return Err(ApiError::bad_request("no file or text in the request"));
     }
-    let id = access.workspace.id.clone();
+    let id = access.membership.workspace.id.clone();
     // Fail now, not in the background, when no model can be built.
     let embedder = access
         .model(
@@ -418,12 +417,12 @@ pub(crate) async fn set_pinned(
     doc: &DocumentId,
     pinning: Pinning,
 ) -> ApiResult<DocumentInfo> {
-    let db = app.workspace_db(&access.workspace.id).await?;
+    let db = app.workspace_db(&access.membership.workspace.id).await?;
     let doc_id = doc.clone();
     let document = with_db(db, move |db| {
         db.set_document_pinning(&doc_id, pinning)?;
         db.document(&doc_id)?
-            .ok_or_else(|| Record::Document.missing(doc_id.as_str()))
+            .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))
     })
     .await?;
     access
@@ -455,12 +454,12 @@ pub(crate) async fn delete_document(
     access: &Access,
     doc: &DocumentId,
 ) -> ApiResult<String> {
-    let db = app.workspace_db(&access.workspace.id).await?;
+    let db = app.workspace_db(&access.membership.workspace.id).await?;
     let doc_id = doc.clone();
     let filename = with_db(db, move |db| {
         let document = db
             .document(&doc_id)?
-            .ok_or_else(|| Record::Document.missing(doc_id.as_str()))?;
+            .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))?;
         db.delete_document(&doc_id)?;
         Ok(document.filename)
     })

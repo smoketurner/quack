@@ -13,9 +13,10 @@ use super::{
     Class, IdRenames, Mapping, MappingRelation, Ontology, OntologyVersion, Property, PropertyType,
     ROOT_CLASS, Relation, candidates,
 };
-use crate::error::{Error, Record, Result};
+use crate::error::{Error, Result};
 use crate::graph::{Standing, store as graph_store};
 use crate::ids::ClassId;
+use crate::storage::control::ResourceKind;
 use crate::storage::workspace::WorkspaceDb;
 
 /// Whether a person reviewed a version before it was saved. A graph
@@ -556,8 +557,8 @@ pub fn restore(
     target: OntologyVersion,
     author: Option<&str>,
 ) -> Result<Ontology> {
-    let snapshot =
-        version(db, target)?.ok_or_else(|| Record::OntologyVersion.missing(target.to_string()))?;
+    let snapshot = version(db, target)?
+        .ok_or_else(|| ResourceKind::OntologyVersion.missing(target.to_string()))?;
     save(
         db,
         &snapshot,

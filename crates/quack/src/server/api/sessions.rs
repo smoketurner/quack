@@ -5,7 +5,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use quack_core::error::Record;
+use quack_core::analysis::events::Decision;
 use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
@@ -13,7 +13,6 @@ use serde::Deserialize;
 
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::permissions::Answer;
 use crate::server::state::{App, with_db};
 
 #[derive(Deserialize)]
@@ -57,11 +56,11 @@ impl Access {
         let sid = session_id.to_owned();
         let viewer = self.session_viewer();
         let found = app
-            .read(&self.workspace.id, move |db| {
+            .read(&self.membership.workspace.id, move |db| {
                 Ok(sessions::get_session(db, &sid)?.filter(|s| s.visible_to(&viewer)))
             })
             .await?;
-        found.ok_or_else(|| Record::Session.missing(session_id.as_str()).into())
+        found.ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()).into())
     }
 }
 
@@ -117,7 +116,8 @@ pub(crate) async fn update(
         Some(mode) => Some(access.set_session_mode(&app, &sid, mode).await?),
         None => shared,
     };
-    let session = session.ok_or_else(|| ApiError::from(Record::Session.missing(sid.as_str())))?;
+    let session =
+        session.ok_or_else(|| ApiError::from(ResourceKind::Session.missing(sid.as_str())))?;
     Ok(Json(serde_json::to_value(session)?))
 }
 
@@ -174,12 +174,12 @@ impl Access {
                 "only the session's creator or an owner may change its mode",
             )
             .await?;
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let session_id = session.id;
         let updated = with_db(db, move |db| {
             sessions::set_session_mode(db, &session_id, mode)?;
             sessions::get_session(db, &session_id)?
-                .ok_or_else(|| Record::Session.missing(session_id.as_str()))
+                .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))
         })
         .await?;
         self.audit(
@@ -208,12 +208,12 @@ impl Access {
                 "only the session's creator or an owner may share it",
             )
             .await?;
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let session_id = session.id;
         let updated = with_db(db, move |db| {
             sessions::set_session_sharing(db, &session_id, sharing)?;
             sessions::get_session(db, &session_id)?
-                .ok_or_else(|| Record::Session.missing(session_id.as_str()))
+                .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))
         })
         .await?;
         self.audit(
@@ -237,7 +237,7 @@ impl Access {
                 "only the session's creator or an owner may delete it",
             )
             .await?;
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let session_id = session.id;
         with_db(db, move |db| sessions::delete_session(db, &session_id)).await?;
         self.audit(
@@ -287,8 +287,8 @@ pub(crate) async fn export(
 
 /// A person's answer to a write their streamed turn is waiting on.
 #[derive(Deserialize)]
-pub(crate) struct Decision {
-    pub decision: Answer,
+pub(crate) struct PermissionAnswer {
+    pub decision: Decision,
 }
 
 /// Answer the write `request` that the caller's turn in session `sid` is
@@ -298,7 +298,7 @@ pub(crate) async fn decide(
     State(app): State<App>,
     identity: Identity,
     Path((id, sid, request)): Path<(WorkspaceId, SessionId, PermissionId)>,
-    Json(body): Json<Decision>,
+    Json(body): Json<PermissionAnswer>,
 ) -> ApiResult<axum::http::StatusCode> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let answer = body.decision;
@@ -311,7 +311,9 @@ pub(crate) async fn decide(
                     AuditAction::Permission,
                     resource,
                     answer.outcome(),
-                    Some(answer.detail(&request, &sql)),
+                    Some(serde_json::json!({
+                        "request": request, "sql": sql, "decision": answer.as_str(),
+                    })),
                 )
                 .await?;
             Ok(axum::http::StatusCode::NO_CONTENT)

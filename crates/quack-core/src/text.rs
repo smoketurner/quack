@@ -18,6 +18,29 @@ impl NonBlankText for str {
     }
 }
 
+/// A query or form value where blank means "not given", as a filter's
+/// "any" option sends it; anything else must parse.
+///
+/// # Errors
+///
+/// Returns the deserializer's error when the text is given and does not
+/// parse as `T`.
+pub fn blank_as_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr,
+    T::Err: fmt::Display,
+{
+    use serde::Deserialize as _;
+    match Option::<String>::deserialize(deserializer)?
+        .as_deref()
+        .and_then(str::non_blank)
+    {
+        None => Ok(None),
+        Some(text) => text.parse().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
 /// `1 table`, `3 tables`: a count and its noun, plural past one.
 pub struct Count<'a>(pub usize, pub &'a str);
 

@@ -105,7 +105,7 @@ impl std::str::FromStr for JobNumber {
 }
 
 /// What a job does, for display and filtering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
     /// An agent turn.
@@ -224,24 +224,16 @@ pub struct Lane {
 pub enum LaneKey {
     /// One chat session's turns, answered in the order asked.
     Session(SessionId),
-    /// A workspace's uploads.
-    Ingest(WorkspaceId),
-    /// A workspace's graph extraction.
-    Graph(WorkspaceId),
-    /// A workspace's ontology document pass.
-    Ontology(WorkspaceId),
-    /// A workspace's embedding refresh.
-    Embeddings(WorkspaceId),
+    /// One kind of work in one workspace: its uploads, its graph
+    /// extraction, its ontology document pass, its embedding refresh.
+    Workspace(JobKind, WorkspaceId),
 }
 
 impl fmt::Display for LaneKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Session(id) => write!(f, "session:{id}"),
-            Self::Ingest(workspace) => write!(f, "ingest:{workspace}"),
-            Self::Graph(workspace) => write!(f, "graph:{workspace}"),
-            Self::Ontology(workspace) => write!(f, "ontology:{workspace}"),
-            Self::Embeddings(workspace) => write!(f, "embeddings:{workspace}"),
+            Self::Workspace(kind, workspace) => write!(f, "{kind}:{workspace}"),
         }
     }
 }

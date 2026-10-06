@@ -24,7 +24,8 @@ use quack_core::ids::UserId;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::client_key::{ClientKeyName, ClientKeys, PublicJwk};
 use quack_core::llm::oauth::{CachedToken, KeySource, TokenManager};
-use quack_core::oidc::{OidcSubject, Origin};
+use quack_core::oidc::OidcSubject;
+use quack_core::storage::control::Origin;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, SealedOwner, UserKind,
     WorkspaceName,
@@ -436,7 +437,7 @@ impl Harness {
             .map(|page| {
                 page.rows
                     .into_iter()
-                    .map(|r| (r.outcome, r.user_id))
+                    .map(|r| (r.entry.outcome, r.entry.user_id))
                     .collect()
             })
             .unwrap_or_default()
@@ -1617,11 +1618,11 @@ async fn an_on_behalf_of_refusal_ends_the_sessions_and_records_a_denied_session_
     let [row] = rows.as_slice() else {
         fail(&format!("one denied session row, not {rows:?}"));
     };
-    assert_eq!(row.outcome, Outcome::Denied);
-    assert_eq!(row.user_id.as_ref(), Some(&user));
-    assert_eq!(row.channel, Channel::Api);
-    assert_eq!(row.client_addr.as_deref(), Some("203.0.113.9"));
-    assert_eq!(row.request_id.as_deref(), Some("req-obo"));
+    assert_eq!(row.entry.outcome, Outcome::Denied);
+    assert_eq!(row.entry.user_id.as_ref(), Some(&user));
+    assert_eq!(row.entry.origin.channel, Channel::Api);
+    assert_eq!(row.entry.origin.client_addr.as_deref(), Some("203.0.113.9"));
+    assert_eq!(row.entry.origin.request_id.as_deref(), Some("req-obo"));
 
     // The cookie names no session now, so no second row is written.
     assert_eq!(h.me(&session).await.0, StatusCode::UNAUTHORIZED);

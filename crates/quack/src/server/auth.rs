@@ -19,11 +19,10 @@ use quack_core::crypto::sha256_hex;
 use quack_core::error::Error as CoreError;
 use quack_core::ids::{AuditId, UserId, WorkspaceId};
 use quack_core::llm::egress::Egress;
-use quack_core::oidc::Origin;
 use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditResource, Channel, Outcome, Role, Scope, TokenRow, UserRow,
-    WorkspaceRow,
+    AuditAction, AuditEntry, AuditResource, Channel, Membership, Origin, Outcome, Role, Scope,
+    Standing, TokenRow, UserKind, UserRow, WorkspaceRow,
 };
 use quack_core::storage::sessions::SessionViewer;
 use quack_core::web_sessions::{SessionLookup, SessionToken};
@@ -60,33 +59,15 @@ pub(crate) enum Credential {
 pub(crate) struct Identity {
     pub user_id: UserId,
     pub username: String,
-    pub is_admin: bool,
+    pub kind: UserKind,
     pub credential: Credential,
-    pub client_addr: Option<String>,
-    pub request_id: Option<String>,
-    /// Set for requests that arrived over a transport of their own (MCP),
-    /// so audit rows name that channel rather than the credential's.
-    pub channel: Option<Channel>,
+    /// Where the request came from; its channel is the credential's (a
+    /// session or local mode is `Web`, a token `Api`) unless the request
+    /// arrived over a transport of its own (MCP).
+    pub origin: Origin,
 }
 
 impl Identity {
-    pub(crate) fn channel(&self) -> Channel {
-        self.channel.unwrap_or(match self.credential {
-            Credential::Token(_) | Credential::IdentityProvider => Channel::Api,
-            Credential::Local | Credential::Session(_) => Channel::Web,
-        })
-    }
-
-    /// Where this request came from, for an audit row recorded later on its
-    /// behalf.
-    pub(crate) fn origin(&self) -> Origin {
-        Origin {
-            channel: self.channel(),
-            client_addr: self.client_addr.clone(),
-            request_id: self.request_id.clone(),
-        }
-    }
-
     fn token_hash(&self) -> Option<String> {
         match &self.credential {
             Credential::Token(t) => Some(t.token_hash.clone()),
@@ -96,11 +77,9 @@ impl Identity {
 
     /// An audit entry attributed to this caller.
     pub(crate) fn audit(&self, action: AuditAction, outcome: Outcome) -> AuditEntry {
-        let mut entry = AuditEntry::new(action, outcome, self.channel());
+        let mut entry = AuditEntry::new(action, outcome, self.origin.clone());
         entry.user_id = Some(self.user_id.clone());
         entry.token_hash = self.token_hash();
-        entry.client_addr.clone_from(&self.client_addr);
-        entry.request_id.clone_from(&self.request_id);
         entry
     }
 
@@ -231,6 +210,11 @@ pub(crate) async fn password_login(
     password: &str,
 ) -> ApiResult<Login> {
     let verified = app.control.verify_password(username, password).await?;
+    let origin = Origin {
+        channel: Channel::Web,
+        client_addr: peer.ip(),
+        request_id,
+    };
     let mut entry = AuditEntry::new(
         LOGIN_ACTION,
         if verified.is_some() {
@@ -238,7 +222,7 @@ pub(crate) async fn password_login(
         } else {
             Outcome::Denied
         },
-        Channel::Web,
+        origin,
     );
     entry.user_id = match &verified {
         Some(user) => Some(user.id.clone()),
@@ -249,8 +233,6 @@ pub(crate) async fn password_login(
             .await?
             .map(|u| u.id),
     };
-    entry.client_addr = peer.ip();
-    entry.request_id = request_id;
     app.control.record_audit(&entry).await?;
 
     let Some(user) = verified else {
@@ -288,7 +270,8 @@ impl FromRequestParts<App> for Identity {
         if state.mode != ServeMode::Local
             && let Some(oidc) = &state.oidc
         {
-            oidc.acting(&identity.user_id, identity.origin()).enter();
+            oidc.acting(&identity.user_id, identity.origin.clone())
+                .enter();
         }
         Ok(identity)
     }
@@ -296,17 +279,19 @@ impl FromRequestParts<App> for Identity {
 
 impl Identity {
     async fn resolve(parts: &Parts, app: &App) -> ApiResult<Self> {
-        let client_addr = Peer::of(parts).ip();
         let RequestId(request_id) = RequestId::of(&parts.headers);
+        let origin = Origin {
+            channel: Channel::Web,
+            client_addr: Peer::of(parts).ip(),
+            request_id,
+        };
         if app.mode == ServeMode::Local {
             return Ok(Self {
                 user_id: UserId::from(LOCAL_USER_ID),
                 username: String::from(LOCAL_USER_ID),
-                is_admin: true,
+                kind: UserKind::Admin,
                 credential: Credential::Local,
-                client_addr,
-                request_id,
-                channel: None,
+                origin,
             });
         }
 
@@ -327,11 +312,6 @@ impl Identity {
                 renewal_due,
             } => {
                 if renewal_due && let Some(oidc) = &app.oidc {
-                    let origin = Origin {
-                        channel: Channel::Web,
-                        client_addr: client_addr.clone(),
-                        request_id: request_id.clone(),
-                    };
                     oidc.require_current(&app.control, &user_id, &presented, &origin)
                         .await?;
                 }
@@ -343,57 +323,47 @@ impl Identity {
                 return Ok(Self {
                     user_id: user.id,
                     username: user.username,
-                    is_admin: user.is_admin,
+                    kind: user.kind,
                     credential: Credential::Session(SessionToken::presented(presented)),
-                    client_addr,
-                    request_id,
-                    channel: None,
+                    origin,
                 });
             }
             // Saying so, rather than falling through to "unknown token",
             // is what lets a browser tell an expired login from a bad one.
             SessionLookup::Expired => {
-                let mut entry =
-                    AuditEntry::new(AuditAction::Session, Outcome::Denied, Channel::Web);
-                entry.client_addr = client_addr;
-                entry.request_id = request_id;
+                let entry = AuditEntry::new(AuditAction::Session, Outcome::Denied, origin);
                 app.control.record_audit(&entry).await?;
                 return Err(ApiError::unauthorized("session expired; log in again"));
             }
             SessionLookup::Unknown => {}
         }
 
+        let origin = Origin {
+            channel: Channel::Api,
+            ..origin
+        };
         if let Some(oidc) = app.oidc.as_ref().filter(|o| o.accepts_bearers())
             && presented.split('.').count() == 3
         {
-            return Self::from_access_token(app, oidc, &presented, client_addr, request_id).await;
+            return Self::from_access_token(app, oidc, &presented, origin).await;
         }
 
-        Self::from_api_token(app, &presented, client_addr, request_id).await
+        Self::from_api_token(app, &presented, origin).await
     }
 
     /// A bearer that is one of quack's API tokens.
-    async fn from_api_token(
-        app: &App,
-        presented: &str,
-        client_addr: Option<String>,
-        request_id: Option<String>,
-    ) -> ApiResult<Self> {
+    async fn from_api_token(app: &App, presented: &str, origin: Origin) -> ApiResult<Self> {
         let hash = sha256_hex(presented.as_bytes());
         let Some(token) = app.control.find_token(&hash).await? else {
-            let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, Channel::Api);
-            entry.client_addr = client_addr;
-            entry.request_id = request_id;
+            let entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, origin);
             app.control.record_audit(&entry).await?;
             return Err(ApiError::unauthorized("unknown token"));
         };
         if token.is_expired(jiff::Timestamp::now()) {
-            let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, Channel::Api);
+            let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, origin);
             entry.user_id = Some(token.user_id.clone());
             entry.token_hash = Some(token.token_hash.clone());
             entry = entry.in_workspace(&token.workspace_id);
-            entry.client_addr = client_addr;
-            entry.request_id = request_id;
             app.control.record_audit(&entry).await?;
             return Err(ApiError::unauthorized("token expired"));
         }
@@ -406,11 +376,9 @@ impl Identity {
         Ok(Self {
             user_id: user.id,
             username: user.username,
-            is_admin: user.is_admin,
+            kind: user.kind,
             credential: Credential::Token(token),
-            client_addr,
-            request_id,
-            channel: None,
+            origin,
         })
     }
 
@@ -420,24 +388,19 @@ impl Identity {
         app: &App,
         oidc: &Oidc,
         token: &str,
-        client_addr: Option<String>,
-        request_id: Option<String>,
+        origin: Origin,
     ) -> ApiResult<Self> {
         match oidc.bearer_user(&app.control, token).await {
             Ok(user) => Ok(Self {
                 user_id: user.id,
                 username: user.username,
-                is_admin: user.is_admin,
+                kind: user.kind,
                 credential: Credential::IdentityProvider,
-                client_addr,
-                request_id,
-                channel: None,
+                origin,
             }),
             Err(CoreError::Bearer(reason)) => {
                 tracing::info!(%reason, "access token refused");
-                let mut entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, Channel::Api);
-                entry.client_addr = client_addr;
-                entry.request_id = request_id;
+                let entry = AuditEntry::new(AuditAction::Token, Outcome::Denied, origin);
                 app.control.record_audit(&entry).await?;
                 Err(ApiError::unauthorized(format!(
                     "access token refused: {reason}"
@@ -486,9 +449,8 @@ impl Need {
 #[derive(Debug, Clone)]
 pub(crate) struct Access {
     pub identity: Identity,
-    pub workspace: WorkspaceRow,
-    /// `None` for an admin acting without membership.
-    pub role: Option<Role>,
+    /// The workspace, and where the caller stands in it.
+    pub membership: Membership,
 }
 
 impl Access {
@@ -500,7 +462,8 @@ impl Access {
 
     /// Owners and admins see every session; others see their own.
     fn sees_all_sessions(&self) -> bool {
-        self.identity.is_admin || self.role == Some(Role::Owner)
+        self.identity.kind == UserKind::Admin
+            || self.membership.standing == Standing::Member(Role::Owner)
     }
 
     /// Which sessions the caller may read.
@@ -518,9 +481,9 @@ impl Access {
         if self.identity.lacks_scope(need.scope) {
             return false;
         }
-        match self.role {
-            Some(role) => role >= need.role,
-            None => need.admin_ok && self.identity.is_admin,
+        match self.membership.standing {
+            Standing::Member(role) => role >= need.role,
+            Standing::Admin => need.admin_ok && self.identity.kind == UserKind::Admin,
         }
     }
 
@@ -551,7 +514,7 @@ impl Access {
     pub(crate) fn entry(&self, action: AuditAction, outcome: Outcome) -> AuditEntry {
         self.identity
             .audit(action, outcome)
-            .in_workspace(&self.workspace.id)
+            .in_workspace(&self.membership.workspace.id)
     }
 
     /// The `_quack_audit` half of an `audit_log` row already written.
@@ -563,7 +526,7 @@ impl Access {
     ) -> ApiResult<()> {
         // Its own connection: a request never waits for a write in
         // progress on the writer just to record that it happened.
-        app.audit_log(&self.workspace.id)
+        app.audit_log(&self.membership.workspace.id)
             .await?
             .record(AuditDetail {
                 id: entry.id.clone(),
@@ -610,12 +573,14 @@ impl Access {
             app.control.record_audit(&entry).await?;
             return Err(ApiError::not_found("no such workspace"));
         };
-        let role = if app.mode == ServeMode::Local {
-            Some(Role::Owner)
+        let standing = if app.mode == ServeMode::Local {
+            Standing::Member(Role::Owner)
         } else {
-            app.control
-                .member_role(&workspace.id, &identity.user_id)
-                .await?
+            Standing::of(
+                app.control
+                    .member_role(&workspace.id, &identity.user_id)
+                    .await?,
+            )
         };
         if let Credential::Token(token) = &identity.credential
             && token.workspace_id != workspace.id
@@ -626,21 +591,30 @@ impl Access {
         }
         let access = Self {
             identity,
-            workspace,
-            role,
+            membership: Membership {
+                workspace,
+                standing,
+            },
         };
         if !access.permits(need) {
-            let reason = match access.role {
-                None if access.identity.is_admin => "admins read workspace content only as members",
-                None => "not a member of this workspace",
-                Some(_) if access.identity.lacks_scope(need.scope) => "token lacks the scope",
-                Some(_) => "role does not allow this",
+            let reason = match access.membership.standing {
+                Standing::Admin if access.identity.kind == UserKind::Admin => {
+                    "admins read workspace content only as members"
+                }
+                Standing::Admin => "not a member of this workspace",
+                Standing::Member(_) if access.identity.lacks_scope(need.scope) => {
+                    "token lacks the scope"
+                }
+                Standing::Member(_) => "role does not allow this",
             };
-            access.identity.deny(app, &access.workspace, reason).await?;
+            access
+                .identity
+                .deny(app, &access.membership.workspace, reason)
+                .await?;
         }
         // From here on the request, and every job it submits, sends only
         // to the model providers the workspace allows.
-        Egress::Workspace(access.workspace.allowed_providers.clone()).enter();
+        Egress::Workspace(access.membership.workspace.allowed_providers.clone()).enter();
         Ok(access)
     }
 
@@ -680,7 +654,7 @@ impl Identity {
 
     /// Server admins only; everything else is 403.
     pub(crate) fn require_admin(&self) -> ApiResult<()> {
-        if self.is_admin {
+        if self.kind == UserKind::Admin {
             Ok(())
         } else {
             Err(ApiError::forbidden("admin only"))

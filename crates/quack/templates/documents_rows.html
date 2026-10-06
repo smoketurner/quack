@@ -7,14 +7,14 @@
   <tbody>
   {% for d in documents %}
   <tr id="doc-{{ d.id }}" class="border-b border-slate-800">
-    <td class="font-medium wrap-anywhere">{{ d.filename }}{% if let Some(title) = d.title %} <span class="font-normal text-slate-400">{{ title }}</span>{% endif %}{% if d.pinned %} <span class="rounded bg-amber-900 px-1.5 py-0.5 text-xs text-amber-200">pinned</span>{% endif %}</td>
+    <td class="font-medium wrap-anywhere">{{ d.filename }}{% if let Some(title) = d.title %} <span class="font-normal text-slate-400">{{ title }}</span>{% endif %}{% if d.pinning == Pinning::Pinned %} <span class="rounded bg-amber-900 px-1.5 py-0.5 text-xs text-amber-200">pinned</span>{% endif %}</td>
     <td class="whitespace-nowrap text-slate-400">{{ d.source }}</td>
     <td class="wrap-anywhere"><span id="status-{{ d.id }}">{% include "document_status.html" %}</span></td>
     <td class="whitespace-nowrap text-right tabular-nums">{{ d.size_bytes.unwrap_or(0) }}</td>
     <td class="whitespace-nowrap text-slate-400">{{ When::Relative.html(d.ingested_at.as_str())|safe }}</td>
     <td class="whitespace-nowrap text-right">
       {% if can_write %}
-      {% if d.pinned %}
+      {% if d.pinning == Pinning::Pinned %}
       <button class="text-blue-400 hover:underline" hx-post="/w/{{ ws_id }}/documents/{{ d.id }}/unpin" hx-target="#rows" hx-swap="innerHTML">Unpin</button>
       {% else %}
       <button class="text-blue-400 hover:underline" hx-post="/w/{{ ws_id }}/documents/{{ d.id }}/pin" hx-target="#rows" hx-swap="innerHTML">Pin</button>

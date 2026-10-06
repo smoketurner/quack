@@ -13,11 +13,11 @@
   <tbody>
   {% for ws in workspaces %}
   <tr class="border-b border-slate-800 last:border-0">
-    <td class="truncate"><a class="font-medium text-blue-400 hover:underline" href="/w/{{ ws.id }}/chat" title="{{ ws.name }}">{{ ws.name }}</a></td>
-    <td class="whitespace-nowrap text-slate-400">{{ ws.classification }}</td>
+    <td class="truncate"><a class="font-medium text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/chat" title="{{ ws.membership.workspace.name }}">{{ ws.membership.workspace.name }}</a></td>
+    <td class="whitespace-nowrap text-slate-400">{{ ws.membership.workspace.classification }}</td>
     <td class="whitespace-nowrap text-slate-400">{% if let Some(t) = ws.times %}{{ When::Relative.html(t.created_at.as_str())|safe }}{% endif %}</td>
     <td class="whitespace-nowrap text-slate-400">{% if let Some(t) = ws.times %}{% if let Some(at) = t.last_accessed_at %}{{ When::Relative.html(at.as_str())|safe }}{% else %}never{% endif %}{% endif %}</td>
-    <td class="text-right"><span class="rounded bg-slate-800 px-2 py-0.5 text-xs">{{ ws.role }}</span></td>
+    <td class="text-right"><span class="rounded bg-slate-800 px-2 py-0.5 text-xs">{{ ws.membership.standing }}</span></td>
   </tr>
   {% endfor %}
   </tbody>

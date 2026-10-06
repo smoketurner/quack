@@ -150,7 +150,7 @@ fn created_by_filters_the_listing_unless_the_viewer_sees_all() {
             && cli.visible_to(&SessionViewer::User(UserId::from("u1")))
     );
     assert_eq!(mine.created_by, Some(UserId::from("u1")));
-    assert!(!mine.shared);
+    assert_eq!(mine.sharing, Sharing::Private);
 
     // Sharing opens the session to other members; unsharing closes it.
     set_session_sharing(&db, &theirs.id, Sharing::Shared).unwrap_or_else(|e| fail(&e.to_string()));
@@ -158,7 +158,8 @@ fn created_by_filters_the_listing_unless_the_viewer_sees_all() {
         .ok()
         .flatten()
         .unwrap_or_else(|| fail("session vanished"));
-    assert!(theirs.shared && theirs.visible_to(&SessionViewer::User(UserId::from("u1"))));
+    assert_eq!(theirs.sharing, Sharing::Shared);
+    assert!(theirs.visible_to(&SessionViewer::User(UserId::from("u1"))));
     assert!(
         list_sessions_for(&db, 10, &SessionViewer::User(UserId::from("u1")))
             .is_ok_and(|v| v.len() == 3)
@@ -434,7 +435,7 @@ fn append_to_missing_session_is_an_error() {
     assert!(err.is_some_and(|e| matches!(
         e,
         Error::NotFound {
-            record: Record::Session,
+            kind: ResourceKind::Session,
             ..
         }
     )));

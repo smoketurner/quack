@@ -75,7 +75,7 @@ impl Access {
         }
         let table = name.to_owned();
         let described = app
-            .read(&self.workspace.id, move |db| {
+            .read(&self.membership.workspace.id, move |db| {
                 if !db.list_tables()?.contains(&table) {
                     return Ok(None);
                 }

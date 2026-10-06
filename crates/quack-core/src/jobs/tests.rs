@@ -13,10 +13,14 @@ fn lane_keys_read_as_kind_and_id() {
     let id = || WorkspaceId::from("w1");
     for (key, text) in [
         (LaneKey::Session(SessionId::from("w1")), "session:w1"),
-        (LaneKey::Ingest(id()), "ingest:w1"),
-        (LaneKey::Graph(id()), "graph:w1"),
-        (LaneKey::Ontology(id()), "ontology:w1"),
-        (LaneKey::Embeddings(id()), "embeddings:w1"),
+        (LaneKey::Workspace(JobKind::Ingest, id()), "ingest:w1"),
+        (LaneKey::Workspace(JobKind::Graph, id()), "graph:w1"),
+        (LaneKey::Workspace(JobKind::Ontology, id()), "ontology:w1"),
+        (
+            LaneKey::Workspace(JobKind::Embeddings, id()),
+            "embeddings:w1",
+        ),
+        (LaneKey::Workspace(JobKind::Import, id()), "import:w1"),
     ] {
         assert_eq!(key.to_string(), text);
         assert_eq!(Lane::serial(&key).key(), text);
@@ -227,8 +231,10 @@ async fn a_serial_lane_runs_in_order_and_other_work_is_not_held_up() {
         let gate = Arc::clone(&gate);
         held.push(
             wide.submit(
-                JobSpec::new(JobKind::Ingest, format!("{n}"))
-                    .lane(Lane::new(&LaneKey::Ingest(WorkspaceId::from("w")), 2)),
+                JobSpec::new(JobKind::Ingest, format!("{n}")).lane(Lane::new(
+                    &LaneKey::Workspace(JobKind::Ingest, WorkspaceId::from("w")),
+                    2,
+                )),
                 move |_| async move {
                     gate.notified().await;
                     Ok(String::new())
@@ -247,7 +253,7 @@ async fn a_serial_lane_runs_in_order_and_other_work_is_not_held_up() {
     let counts = wide.counts(None);
     assert_eq!((counts.running, counts.queued), (2, 1));
     assert_eq!(
-        wide.lane_active(&LaneKey::Ingest(WorkspaceId::from("w"))),
+        wide.lane_active(&LaneKey::Workspace(JobKind::Ingest, WorkspaceId::from("w"))),
         3
     );
     for _ in 0..3 {
@@ -258,7 +264,7 @@ async fn a_serial_lane_runs_in_order_and_other_work_is_not_held_up() {
         assert_eq!(finished(&wide, id).await.state, JobState::Succeeded);
     }
     assert_eq!(
-        wide.lane_active(&LaneKey::Ingest(WorkspaceId::from("w"))),
+        wide.lane_active(&LaneKey::Workspace(JobKind::Ingest, WorkspaceId::from("w"))),
         0
     );
 }
@@ -824,7 +830,7 @@ async fn cancel_after_finish_is_refused_without_an_event() {
 #[tokio::test]
 async fn shutdown_cancels_queued_jobs_unrun_and_waits_for_their_records() {
     let queue = JobQueue::new(10);
-    let lane = || Lane::serial(&LaneKey::Graph(WorkspaceId::from("ws")));
+    let lane = || Lane::serial(&LaneKey::Workspace(JobKind::Graph, WorkspaceId::from("ws")));
     let running = queue
         .submit(
             JobSpec::new(JobKind::Graph, "running").lane(lane()),
@@ -885,8 +891,10 @@ async fn a_job_submitted_after_shutdown_is_recorded_as_cancelled_and_never_runs(
     let ran = Arc::new(AtomicBool::new(false));
     let work_ran = Arc::clone(&ran);
     let refused = queue.submit(
-        JobSpec::new(JobKind::Ingest, "late.pdf")
-            .lane(Lane::serial(&LaneKey::Ingest(WorkspaceId::from("ws")))),
+        JobSpec::new(JobKind::Ingest, "late.pdf").lane(Lane::serial(&LaneKey::Workspace(
+            JobKind::Ingest,
+            WorkspaceId::from("ws"),
+        ))),
         move |_| async move {
             work_ran.store(true, Ordering::SeqCst);
             Ok(String::new())

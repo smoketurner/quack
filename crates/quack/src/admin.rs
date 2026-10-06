@@ -7,12 +7,11 @@ use std::io::{IsTerminal, Write};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use quack_core::config::Config;
-use quack_core::error::Record;
-use quack_core::ids::WorkspaceId;
+use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, Expiry, IssuedToken,
-    Outcome, Role, Scope, UserKind, WorkspaceName, WorkspaceRow,
+    Outcome, ResourceKind, Role, Scope, UserKind, WorkspaceName, WorkspaceRow,
 };
 
 use crate::text_or_json::TextOrJson;
@@ -215,7 +214,11 @@ pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> 
                 "Created user '{}' ({}){}",
                 user.username,
                 user.id,
-                if user.is_admin { ", admin" } else { "" }
+                if user.kind == UserKind::Admin {
+                    ", admin"
+                } else {
+                    ""
+                }
             )?;
             out.flush()?;
         }
@@ -232,7 +235,11 @@ pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> 
                         "{}  {:<24} {}  {}",
                         user.id,
                         user.username,
-                        if user.is_admin { "admin " } else { "      " },
+                        if user.kind == UserKind::Admin {
+                            "admin "
+                        } else {
+                            "      "
+                        },
                         user.created_at
                     )
                 },
@@ -335,7 +342,7 @@ async fn revoke_token(control: &ControlPlane, ws: &WorkspaceRow, prefix: &str) -
     let hash = PrefixMatch::of(control.list_tokens(&ws.id).await?, prefix, |t| {
         t.token_hash.as_str()
     })
-    .one(Record::Token, prefix)?
+    .one(ResourceKind::Token, prefix)?
     .token_hash;
     let entry =
         AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli).in_workspace(&ws.id);
@@ -442,7 +449,7 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
         since: args.since,
         until: args.until,
         limit: AUDIT_PAGE,
-        after: None,
+        cursor: None,
     };
     let mut remaining = (args.limit != 0).then_some(args.limit);
     let stdout = std::io::stdout();
@@ -454,8 +461,8 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
         remaining = remaining
             .map(|left| left.saturating_sub(u32::try_from(page.rows.len()).unwrap_or(u32::MAX)));
         match (page.next, remaining) {
-            (Some(next), None) => filter.after = Some(next),
-            (Some(next), Some(left)) if left > 0 => filter.after = Some(next),
+            (Some(next), None) => filter.cursor = Some(next),
+            (Some(next), Some(left)) if left > 0 => filter.cursor = Some(next),
             (Some(_) | None, _) => break,
         }
     }
@@ -504,7 +511,21 @@ impl<W: Write> AuditOutput<W> {
         match self {
             Self::Csv(writer) => {
                 for r in rows {
-                    writer.serialize(r)?;
+                    let e = &r.entry;
+                    writer.write_record([
+                        e.id.as_str(),
+                        r.timestamp.as_str(),
+                        e.user_id.as_ref().map_or("", UserId::as_str),
+                        e.token_hash.as_deref().unwrap_or(""),
+                        e.workspace_id.as_ref().map_or("", WorkspaceId::as_str),
+                        e.action.as_str(),
+                        e.resource_type.as_ref().map_or("", ResourceKind::as_str),
+                        e.resource_id.as_deref().unwrap_or(""),
+                        e.outcome.as_str(),
+                        e.origin.channel.as_str(),
+                        e.origin.client_addr.as_deref().unwrap_or(""),
+                        e.origin.request_id.as_deref().unwrap_or(""),
+                    ])?;
                 }
             }
             Self::Ocsf(out) => {
@@ -519,14 +540,18 @@ impl<W: Write> AuditOutput<W> {
                         out,
                         "{}  {:<7} {:<5} {:<12} {:<10} {:<36} {}",
                         r.timestamp,
-                        r.outcome,
-                        r.channel,
-                        r.action,
-                        r.user_id
+                        r.entry.outcome,
+                        r.entry.origin.channel,
+                        r.entry.action,
+                        r.entry
+                            .user_id
                             .as_ref()
                             .map_or("-", |u| u.as_str().get(..8).unwrap_or(u.as_str())),
-                        r.workspace_id.as_ref().map_or("-", WorkspaceId::as_str),
-                        r.resource_id.as_deref().unwrap_or("")
+                        r.entry
+                            .workspace_id
+                            .as_ref()
+                            .map_or("-", WorkspaceId::as_str),
+                        r.entry.resource_id.as_deref().unwrap_or("")
                     )
                 })?;
             }

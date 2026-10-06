@@ -5,9 +5,8 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use quack_core::error::Result as CoreResult;
-use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::storage::control::{
-    AuditAction, AuditCursor, AuditFilter, AuditRow, Outcome, UserKind, UserRow,
+    AuditAction, AuditFilter, AuditRow, Outcome, UserKind, UserRow,
 };
 use serde::Deserialize;
 
@@ -57,21 +56,6 @@ impl Identity {
     }
 }
 
-#[derive(Deserialize)]
-pub(crate) struct AuditQuery {
-    pub user_id: Option<UserId>,
-    pub workspace_id: Option<WorkspaceId>,
-    pub action: Option<String>,
-    pub outcome: Option<Outcome>,
-    pub since: Option<String>,
-    pub until: Option<String>,
-    #[serde(default = "default_limit")]
-    pub limit: u32,
-    pub cursor: Option<AuditCursor>,
-    #[serde(default)]
-    pub format: AuditShape,
-}
-
 /// How each row of an audit page is shaped.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -83,35 +67,22 @@ pub(crate) enum AuditShape {
     Ocsf,
 }
 
-fn default_limit() -> u32 {
-    100
-}
-
-/// At most 1000 rows per page.
-impl From<AuditQuery> for AuditFilter {
-    fn from(q: AuditQuery) -> Self {
-        Self {
-            user_id: q.user_id,
-            workspace_id: q.workspace_id,
-            action: q.action,
-            outcome: q.outcome,
-            since: q.since,
-            until: q.until,
-            limit: q.limit.min(1000),
-            after: q.cursor,
-        }
-    }
+/// Which shape `GET /audit` answers with.
+#[derive(Deserialize)]
+pub(crate) struct AuditShapeQuery {
+    #[serde(default)]
+    pub format: AuditShape,
 }
 
 pub(crate) async fn audit(
     State(app): State<App>,
     identity: Identity,
-    Query(q): Query<AuditQuery>,
+    Query(filter): Query<AuditFilter>,
+    Query(shape): Query<AuditShapeQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     identity.require_admin()?;
-    let shape = q.format;
-    let page = app.control.query_audit(&AuditFilter::from(q)).await?;
-    let audit = match shape {
+    let page = app.control.query_audit(&filter).await?;
+    let audit = match shape.format {
         AuditShape::Quack => serde_json::to_value(&page.rows)?,
         AuditShape::Ocsf => serde_json::Value::Array(
             page.rows

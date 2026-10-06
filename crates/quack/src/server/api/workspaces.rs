@@ -10,28 +10,14 @@ use axum::response::IntoResponse;
 use quack_core::ids::WorkspaceId;
 use quack_core::storage::audit;
 use quack_core::storage::control::{
-    AuditAction, Outcome, ProviderAllowList, ResourceKind, Role, WorkspaceChanges, WorkspaceName,
-    WorkspaceRow,
+    AuditAction, Membership, Outcome, ProviderAllowList, ResourceKind, Role, Standing, UserKind,
+    WorkspaceChanges, WorkspaceName, WorkspaceRow,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::server::auth::{Access, Credential, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, ServeMode};
-
-/// A workspace as the API shows it: its row, and the caller's role in it.
-#[derive(Debug, Serialize)]
-pub(crate) struct WorkspaceView {
-    #[serde(flatten)]
-    workspace: WorkspaceRow,
-    role: Option<Role>,
-}
-
-impl WorkspaceView {
-    fn new(workspace: WorkspaceRow, role: Option<Role>) -> Self {
-        Self { workspace, role }
-    }
-}
 
 pub(crate) async fn list(
     State(app): State<App>,
@@ -42,7 +28,10 @@ pub(crate) async fn list(
             .list_workspaces()
             .await?
             .into_iter()
-            .map(|w| WorkspaceView::new(w, Some(Role::Owner)))
+            .map(|w| Membership {
+                workspace: w,
+                standing: Standing::Member(Role::Owner),
+            })
             .collect::<Vec<_>>()
     } else if let Credential::Token(token) = &identity.credential {
         let ws = app.control.get_workspace(&token.workspace_id).await?;
@@ -51,25 +40,29 @@ pub(crate) async fn list(
             .member_role(&token.workspace_id, &identity.user_id)
             .await?;
         ws.into_iter()
-            .filter(|_| role.is_some() || identity.is_admin)
-            .map(|w| WorkspaceView::new(w, role))
+            .filter(|_| role.is_some() || identity.kind == UserKind::Admin)
+            .map(|w| Membership {
+                workspace: w,
+                standing: Standing::of(role),
+            })
             .collect()
-    } else if identity.is_admin {
+    } else if identity.kind == UserKind::Admin {
         let mine = app.control.workspaces_for_user(&identity.user_id).await?;
         let all = app.control.list_workspaces().await?;
         all.into_iter()
             .map(|w| {
-                let role = mine.iter().find(|m| m.workspace.id == w.id).map(|m| m.role);
-                WorkspaceView::new(w, role)
+                let standing = mine
+                    .iter()
+                    .find(|m| m.workspace.id == w.id)
+                    .map_or(Standing::Admin, |m| m.standing);
+                Membership {
+                    workspace: w,
+                    standing,
+                }
             })
             .collect()
     } else {
-        app.control
-            .workspaces_for_user(&identity.user_id)
-            .await?
-            .into_iter()
-            .map(|m| WorkspaceView::new(m.workspace, Some(m.role)))
-            .collect()
+        app.control.workspaces_for_user(&identity.user_id).await?
     };
     Ok(Json(serde_json::json!({ "workspaces": rows })))
 }
@@ -87,7 +80,10 @@ pub(crate) async fn create(
     let ws = identity.create_workspace(&app, &body.name).await?;
     Ok((
         StatusCode::CREATED,
-        Json(WorkspaceView::new(ws, Some(Role::Owner))),
+        Json(Membership {
+            workspace: ws,
+            standing: Standing::Member(Role::Owner),
+        }),
     ))
 }
 
@@ -108,12 +104,12 @@ pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-) -> ApiResult<Json<WorkspaceView>> {
+) -> ApiResult<Json<Membership>> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
     access
         .audit(&app, AuditAction::Open, None, Outcome::Allowed, None)
         .await?;
-    Ok(Json(WorkspaceView::new(access.workspace, access.role)))
+    Ok(Json(access.membership))
 }
 
 #[derive(Deserialize)]
@@ -128,7 +124,7 @@ pub(crate) async fn update(
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Json(body): Json<UpdateWorkspace>,
-) -> ApiResult<Json<WorkspaceView>> {
+) -> ApiResult<Json<Membership>> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
     let changes = WorkspaceChanges {
         classification: body.classification,
@@ -139,7 +135,10 @@ pub(crate) async fn update(
         },
     };
     let ws = update_settings(&app, &access, changes).await?;
-    Ok(Json(WorkspaceView::new(ws, access.role)))
+    Ok(Json(Membership {
+        workspace: ws,
+        standing: access.membership.standing,
+    }))
 }
 
 /// Change a workspace's settings for its owner, from the API or the web
@@ -165,7 +164,7 @@ pub(crate) async fn update_settings(
     };
     let ws = app
         .control
-        .update_workspace(&access.workspace.id, &changes)
+        .update_workspace(&access.membership.workspace.id, &changes)
         .await?;
     access
         .audit(

@@ -4,9 +4,10 @@
 use super::induction::{Candidate, Decision, ItemKind, Proposal, apply};
 use super::store::{self, Acceptance, Revision};
 use super::{Class, IdRenames, Ontology, ROOT_CLASS};
-use crate::error::{Error, Record, Result};
+use crate::error::{Error, Result};
 use crate::ids::{CandidateId, ClassId, RunId};
 use crate::prefix::PrefixMatch;
+use crate::storage::control::ResourceKind;
 use crate::storage::workspace::WorkspaceDb;
 use crate::text::NonBlankText;
 
@@ -371,7 +372,7 @@ pub fn find(db: &WorkspaceDb, prefix: &str) -> Result<CandidateRow> {
         .query_map(duckdb::params![prefix, prefix], row_from)?
         .flatten()
         .collect();
-    PrefixMatch::of(rows, prefix, |r| r.id.as_str()).one(Record::Candidate, prefix)
+    PrefixMatch::of(rows, prefix, |r| r.id.as_str()).one(ResourceKind::Candidate, prefix)
 }
 
 /// A new ontology version built by auto-accepting one run's candidates

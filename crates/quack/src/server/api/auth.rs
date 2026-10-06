@@ -78,7 +78,7 @@ pub(crate) async fn me(identity: Identity) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "id": identity.user_id,
         "username": identity.username,
-        "is_admin": identity.is_admin,
+        "is_admin": identity.kind,
         "via": match identity.credential {
             Credential::Local => "local",
             Credential::Session(_) => "session",

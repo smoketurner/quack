@@ -8,7 +8,7 @@ use axum_extra::extract::cookie::{Cookie, SameSite};
 use quack_core::config::OidcConfig;
 use quack_core::error::Error as CoreError;
 use quack_core::oidc::SignedIn;
-use quack_core::storage::control::{AuditAction, AuditEntry, Channel, Outcome};
+use quack_core::storage::control::{AuditAction, AuditEntry, Channel, Origin, Outcome};
 use serde::Deserialize;
 
 use super::WebResult;
@@ -127,9 +127,12 @@ pub(super) async fn finish(
     let oidc = configured(&app)?;
     let started_here = jar.get(STATE_COOKIE).map(|c| c.value().to_owned());
     let jar = jar.remove(cleared_state());
-    let mut entry = AuditEntry::new(AuditAction::Login, Outcome::Denied, Channel::Web);
-    entry.client_addr = peer.ip();
-    entry.request_id = request_id;
+    let origin = Origin {
+        channel: Channel::Web,
+        client_addr: peer.ip(),
+        request_id,
+    };
+    let mut entry = AuditEntry::new(AuditAction::Login, Outcome::Denied, origin);
 
     let signed_in = match callback.complete(oidc, started_here.as_deref()).await {
         Ok(signed_in) => signed_in,

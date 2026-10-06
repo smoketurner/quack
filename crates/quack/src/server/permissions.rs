@@ -8,10 +8,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use jiff::{SignedDuration, Timestamp};
-use quack_core::analysis::events::{Delivery, PermissionRequest};
+use quack_core::analysis::events::{Decision, Delivery, PermissionRequest};
 use quack_core::ids::{PermissionId, SessionId, UserId, WorkspaceId};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
-use serde::Deserialize;
 
 use super::auth::Access;
 use super::error::ApiError;
@@ -43,55 +42,6 @@ pub(crate) struct Held {
     pub expires_at: Timestamp,
 }
 
-/// The person's answer to a waiting write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Answer {
-    /// Run this statement.
-    Allow,
-    Deny,
-    /// Run this one and every later write of the same turn.
-    AllowTurn,
-}
-
-impl Answer {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Allow => "allow",
-            Self::Deny => "deny",
-            Self::AllowTurn => "allow_turn",
-        }
-    }
-
-    /// The audit detail for this answer to `request` on `sql`.
-    pub(crate) fn detail(self, request: &PermissionId, sql: &str) -> serde_json::Value {
-        serde_json::json!({ "request": request, "sql": sql, "decision": self.as_str() })
-    }
-
-    pub(crate) const fn outcome(self) -> Outcome {
-        match self {
-            Self::Allow | Self::AllowTurn => Outcome::Allowed,
-            Self::Deny => Outcome::Denied,
-        }
-    }
-
-    /// Hand the answer to the turn. `TurnGone` means the turn had stopped
-    /// waiting (its stream disconnected, or it was cancelled) and nothing
-    /// ran.
-    fn give(self, request: PermissionRequest) -> Delivery {
-        match self {
-            Self::Allow => request.allow(),
-            Self::AllowTurn => request.allow_for_turn(),
-            // A refusal needs no turn to take it: an unanswered write is
-            // refused either way.
-            Self::Deny => {
-                request.deny();
-                Delivery::Delivered
-            }
-        }
-    }
-}
-
 /// Why an answer was not taken.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -113,7 +63,7 @@ impl Refusal {
     pub(crate) fn detail(
         &self,
         request: &PermissionId,
-        answer: Answer,
+        answer: Decision,
     ) -> Option<serde_json::Value> {
         match self {
             Self::Gone { sql } => Some(serde_json::json!({
@@ -153,7 +103,7 @@ impl Permissions {
         let timeout = app.config.server.permission_timeout();
         let id = PermissionId::generate();
         let waiting = Waiting {
-            workspace: access.workspace.id.clone(),
+            workspace: access.membership.workspace.id.clone(),
             session: session.clone(),
             user: access.identity.user_id.clone(),
             sql: request.sql.clone(),
@@ -211,20 +161,22 @@ impl Permissions {
         request: &PermissionId,
         access: &Access,
         session: &SessionId,
-        answer: Answer,
+        answer: Decision,
     ) -> Result<String, Refusal> {
         let mut waiting = self.lock();
         let entry = waiting
             .get_mut(request)
-            .filter(|w| w.workspace == access.workspace.id && w.session == *session)
+            .filter(|w| w.workspace == access.membership.workspace.id && w.session == *session)
             .ok_or(Refusal::Unknown)?;
         if entry.user != access.identity.user_id {
             return Err(Refusal::NotYours);
         }
         match std::mem::replace(&mut entry.state, State::Decided) {
-            State::Open(open) => match answer.give(open) {
-                Delivery::Delivered => Ok(entry.sql.clone()),
-                Delivery::TurnGone => Err(Refusal::Gone {
+            // A refusal needs no turn to take it: an unanswered write is
+            // refused either way.
+            State::Open(open) => match (answer, open.answer(answer)) {
+                (Decision::Deny, _) | (_, Delivery::Delivered) => Ok(entry.sql.clone()),
+                (Decision::Allow | Decision::AllowTurn, Delivery::TurnGone) => Err(Refusal::Gone {
                     sql: entry.sql.clone(),
                 }),
             },

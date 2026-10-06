@@ -19,7 +19,7 @@ use axum::http::request::Parts;
 use quack_core::analysis::citations::Sources;
 use quack_core::analysis::events;
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::{ReaderDb, SharedDb};
+use quack_core::analysis::tools::{FindPathArgs, ReaderDb, SearchGraphArgs, SharedDb};
 use quack_core::config::Config;
 use quack_core::embedding::Input;
 use quack_core::ids::{SessionId, UserId};
@@ -50,7 +50,7 @@ use serde::Deserialize;
 use crate::server::auth::Access;
 use crate::server::state::{App, with_db};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
-use quack_core::graph::query::{GraphQuery, PathQuery};
+use quack_core::graph::query::PathQuery;
 
 /// Where audit rows go: nowhere for stdio (the CLI is unaudited), or the
 /// server's access log and the workspace detail table for HTTP.
@@ -95,7 +95,7 @@ impl Caller {
         };
         caller
             .access
-            .audit(app, action, resource, outcome, detail)
+            .audit(app, action.clone(), resource, outcome, detail)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e.message, %action, "audit write failed");
@@ -195,26 +195,6 @@ pub(crate) struct SearchArgs {
 pub(crate) struct SqlArgs {
     /// One `DuckDB` statement over the workspace tables.
     pub sql: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub(crate) struct SearchGraphArgs {
-    /// The entity to start from; omit to list every entity of `class`.
-    pub entity: Option<String>,
-    /// An ontology class id: the entry point's class, or the class to list.
-    pub class: Option<String>,
-    /// Follow only this relation id.
-    pub relation: Option<String>,
-    /// Hops out from the entity (default 2).
-    pub hops: Option<u32>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub(crate) struct FindPathArgs {
-    pub from: String,
-    pub to: String,
-    /// Longest path to consider (default 4).
-    pub max_hops: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -709,16 +689,11 @@ impl McpServer {
         args: SearchGraphArgs,
         caller: &Caller,
     ) -> Result<CallToolResult, McpError> {
-        let query = match GraphQuery::new(
-            args.entity.as_deref(),
-            args.class.as_deref(),
-            args.relation.as_deref(),
-            args.hops,
-        ) {
+        let query = match args.query() {
             Ok(query) => query,
             Err(e) => return Ok(failure(e.to_string())),
         };
-        let options = self.inner.config.graph.options();
+        let options = self.inner.config.graph;
         let detail = serde_json::to_value(&query).map_err(internal)?;
         let model = match Embeddings::from_config(&self.inner.config).await {
             Ok(model) => model,
@@ -761,11 +736,11 @@ impl McpServer {
     /// `find_path`, as its caller: embedding each end's name is a model
     /// request.
     async fn path(&self, args: FindPathArgs, caller: &Caller) -> Result<CallToolResult, McpError> {
-        let query = match PathQuery::new(&args.from, &args.to, args.max_hops) {
+        let query = match args.query() {
             Ok(query) => query,
             Err(e) => return Ok(failure(e.to_string())),
         };
-        let options = self.inner.config.graph.options();
+        let options = self.inner.config.graph;
         let detail = serde_json::to_value(&query).map_err(internal)?;
         let PathQuery { from, to, max_hops } = query.clone();
         let model = match Embeddings::from_config(&self.inner.config).await {
@@ -828,7 +803,7 @@ impl McpServer {
     async fn as_caller<F: Future>(&self, caller: &Caller, work: F) -> F::Output {
         let workspace = match caller {
             Caller::Unaudited => &self.inner.workspace,
-            Caller::Audited { caller, .. } => &caller.access.workspace,
+            Caller::Audited { caller, .. } => &caller.access.membership.workspace,
         };
         let egress = Egress::Workspace(workspace.allowed_providers.clone());
         Acting::scope(caller.acting(), Egress::scope(Some(egress), work)).await

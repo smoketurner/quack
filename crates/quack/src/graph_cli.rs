@@ -6,10 +6,11 @@ use std::io::Write;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use quack_core::analysis::tools::{FindPathArgs, NonBlank, SearchGraphArgs};
 use quack_core::config::Config;
 use quack_core::extraction::ExtractionRun;
 use quack_core::graph::extract::ChunkPlan;
-use quack_core::graph::query::{GraphQuery, PathQuery, UnknownEntity};
+use quack_core::graph::query::UnknownEntity;
 use quack_core::graph::store::Revalidation;
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{ExtractSource, extract, resolve, store as graph_store, tables};
@@ -221,13 +222,14 @@ async fn run_search(
         hops,
         format,
     } = args;
-    let options = config.graph.options();
-    let query = GraphQuery::new(
-        entity.as_deref(),
-        class.as_deref(),
-        relation.as_deref(),
-        Some(hops),
-    )?;
+    let options = config.graph;
+    let query = SearchGraphArgs {
+        entity: NonBlank::new(entity.as_deref()),
+        class: NonBlank::new(class.as_deref()),
+        relation: NonBlank::new(relation.as_deref()),
+        hops: Some(hops),
+    }
+    .query()?;
     let model = Embeddings::from_config(config).await?;
     let embedding = query.embedding(model.as_ref()).await?;
     let result = db
@@ -258,8 +260,13 @@ async fn run_path(
         max_hops,
         format,
     } = args;
-    let options = config.graph.options();
-    let query = PathQuery::new(&from, &to, Some(max_hops))?;
+    let options = config.graph;
+    let query = FindPathArgs {
+        from,
+        to,
+        max_hops: Some(max_hops),
+    }
+    .query()?;
     let model = Embeddings::from_config(config).await?;
     let ends = query.embeddings(model.as_ref()).await?;
     let max_hops = query.max_hops;
@@ -395,7 +402,7 @@ async fn run_extract(
         }
     }
     let embeddings = Embeddings::from_config(config).await?;
-    let resolved = resolve::resolve(db, embeddings.as_ref(), &config.graph.options()).await?;
+    let resolved = resolve::resolve(db, embeddings.as_ref(), &config.graph).await?;
     if resolved.auto_merged > 0 || resolved.proposed > 0 {
         writeln!(
             out,

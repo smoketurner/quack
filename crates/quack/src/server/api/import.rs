@@ -62,7 +62,7 @@ pub(crate) async fn run_import(
         .url
         .kind()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let db = app.workspace_db(&access.workspace.id).await?;
+    let db = app.workspace_db(&access.membership.workspace.id).await?;
     let embeddings = access
         .model(
             app,
@@ -80,7 +80,7 @@ pub(crate) async fn run_import(
     let outcome = import::Importing {
         config: &app.config,
         db: &db,
-        workspace_id: access.workspace.id.as_str(),
+        workspace_id: access.membership.workspace.id.as_str(),
         request,
         policy,
         embedder: embeddings.as_ref(),
