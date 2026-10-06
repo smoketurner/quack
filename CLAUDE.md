@@ -96,6 +96,7 @@ cargo run --bin quack -- ingest sales.csv -w ws                                #
 cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
 cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
+cargo run --bin quack -- saved list | add NAME --from-session ID | run NAME [--refresh] [--exit-code] | show NAME | remove NAME   # an answer's SQL re-run without the model; exit 5 when changed; cron schedules it
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
 cargo run --bin quack -- ontology rename class|relation OLD NEW                   # a new id as a new version; the graph's nodes and edges move with it
 cargo run --bin quack -- ontology propose [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
@@ -111,6 +112,22 @@ cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|r
 cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1, MCP under /mcp/v1/{workspace}
 cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors
 ```
+
+A saved question (`quack_core::saved`, design doc 8.1) is an answered turn's `run_sql`
+read statements pinned under a name in `_quack_saved_questions`, visible to everyone who may
+read the workspace; `quack saved run` runs them again without the model, each classified
+again and under the agent's row cap and timeout, records in `_quack_saved_runs` a digest of
+every result set and the row counts (never the rows; the run that produced them returns them
+once), and says `changed` when any digest differs from the newest completed run that ran the
+same statements. The digest (`WorkspaceDb::execute_query_digested`) is order-insensitive, the
+sum of every row's SHA-256, since parallel DuckDB returns unordered rows in varying order
+(`--refresh` asks the model again as a `PrintTurn`, writes denied, and pins the new answer's
+statements). There is no scheduler: cron runs it, and `--exit-code` exits 5 on a change;
+`-f` takes `-q`'s `QueryFormat` and default. The terminal's `/saved` verbs run as jobs
+through `saved_cli` (`add` pins the session's last answer; `--refresh` and `--exit-code` are
+parse errors there), and the REST routes under `.../saved` (`server/api/saved.rs`) list, save,
+show, run, and remove, audited as `save`, `saved_run`, `open`, `list`, and `delete`; a run
+answers directly, no job.
 
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
 file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model through

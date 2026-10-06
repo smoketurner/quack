@@ -207,9 +207,15 @@ id_type!(
 );
 
 id_type!(
-    /// One background run: an induction run whose candidates are stored
-    /// together, or a server run from its start audit row to its closing one.
+    /// One run: an induction run whose candidates are stored together, a
+    /// server run from its start audit row to its closing one, or one run
+    /// of a saved question.
     RunId
+);
+
+id_type!(
+    /// A saved question in a workspace.
+    SavedId
 );
 
 id_type!(

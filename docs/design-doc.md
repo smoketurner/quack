@@ -531,6 +531,26 @@ CREATE TABLE _quack_messages (
     created_at TIMESTAMP DEFAULT now(),
     UNIQUE (session_id, seq)
 );
+-- saved questions (section 8.1): an answer's read statements, re-run without the model
+CREATE TABLE _quack_saved_questions (
+    id         TEXT PRIMARY KEY,             -- UUID v7
+    name       TEXT NOT NULL UNIQUE,
+    question   TEXT NOT NULL,
+    mode       TEXT NOT NULL,                -- chat | query, the source session's
+    statements JSON NOT NULL,                -- the pinned read statements, in order
+    session_id TEXT NOT NULL,                -- the session they were pinned from
+    created_by TEXT,
+    created_at TIMESTAMP DEFAULT now(),
+    pinned_at  TIMESTAMP DEFAULT now()
+);
+CREATE TABLE _quack_saved_runs (
+    id         TEXT PRIMARY KEY,             -- UUID v7
+    saved_id   TEXT NOT NULL,
+    ran_at     TIMESTAMP DEFAULT now(),
+    status     TEXT NOT NULL,                -- ok | failed
+    changed    BOOLEAN NOT NULL,
+    statements JSON NOT NULL                 -- per statement: sql, digest, rows, changed, columns, error; never the rows themselves
+);
 -- [analysis].compact_history: summaries of the turns the history window leaves out
 CREATE TABLE _quack_session_summaries (
     id TEXT PRIMARY KEY,                        -- UUID v7
@@ -1465,6 +1485,50 @@ message.
   any with no creator (started from the CLI or the TUI). `owner` sees all sessions in the
   workspace for audit.
 
+### 8.1 Saved questions
+
+A question a team asks repeatedly is saved once and re-run without the model, and each run
+says whether the data changed. `quack_core::saved` keeps it in the workspace file:
+`_quack_saved_questions` (the name, the question, the session's mode, the pinned statements,
+and the session they came from) and `_quack_saved_runs` (one row per run).
+
+- **Saving pins SQL.** A saved question is made from an answered turn: the person names the
+  answer they just got (`quack saved add NAME --from-session ID [--message N]`, the
+  terminal's `/saved add NAME` for its last answer, `POST .../saved`; the terminal's other
+  `/saved` verbs and the `.../saved` routes in 11.2 list, show, run, and remove). quack keeps the
+  question text and the `run_sql` statements that returned rows, in order, each classified
+  again as a read. An answer that ran no such statement, or one that ran a write, cannot be
+  saved; the refusal says which (`Unsavable`). Only someone who can read the source session
+  may save from it. Saving publishes: the question text and its SQL become visible to
+  everyone who may read the workspace, even when the session they came from is private, and
+  so do every run's row counts.
+- **A run executes the saved SQL and no model.** Each statement is classified again
+  (`classify_user_statement`: no `_quack_` tables, a read) and runs inside a read-only
+  transaction with the agent's row cap (`[analysis].max_query_rows`) and query timeout. The
+  run records, per statement, a digest of the whole result set and the row count; the run
+  that produced them also carries the rows when they fit the cap, but no run stores rows.
+  The digest (`WorkspaceDb::execute_query_digested`) is the SHA-256 of the column names in
+  order, then the sum modulo 2^256 of every row's SHA-256, each row as a JSON array: pinned
+  SQL is model-written and often has no `ORDER BY`, and DuckDB returns `GROUP BY`,
+  `DISTINCT`, join, and `UNION` rows in a different order from one parallel run to the
+  next, so row order must not count, while a repeated row still does. A float aggregate
+  (`sum`, `avg`) can still differ in its last bit between parallel runs over the same data,
+  and such a question may report `changed` when nothing moved; a `round()` in the pinned
+  SQL settles it. `changed` is true when any digest differs from the newest completed run,
+  and only when that run ran the same statements; the first run is not changed. A
+  statement that fails (its table was dropped) is recorded with its error, the run's
+  status is `failed`, and it compares nothing; the next completed run compares with the
+  last completed one.
+- **`--refresh` asks the model again** as a print-mode turn (`PrintTurn`): a new session of
+  the saved question's mode, writes denied, the steps on stderr, the answer on stdout. The
+  statements that answer ran replace the pinned ones; when they differ from the ones before,
+  the next run compares with nothing. Without `--refresh`, no model is ever called.
+- **cron is the scheduler.** Nothing in quack runs a saved question on a timer or delivers
+  a result: `quack saved run NAME --exit-code` exits 5 when the result changed, 1 when it
+  failed, 0 otherwise, and `-f json` carries `changed`, the run id, and every statement's
+  digest and counts for a script to read. `-f` takes `-q`'s formats and default: a table on
+  a terminal, ndjson into a pipe.
+
 ---
 
 ## 9. Charts
@@ -1901,6 +1965,16 @@ PATCH  /api/v1/workspaces/{id}/sessions/{sid}     {shared} | {mode} (creator or 
                                                   a session's mode is set when it is created;
                                                   `mode` on a later query is ignored
 GET    /api/v1/workspaces/{id}/sessions/{sid}/export?format=sql|markdown
+GET    /api/v1/workspaces/{id}/saved             saved questions (section 8.1; anyone who may read)
+POST   /api/v1/workspaces/{id}/saved             {name, session_id, message?}: pin that answer's SQL -> 201;
+                                                  404 for a session the caller cannot see, 409 for a name in use,
+                                                  422 for an answer that ran no read or ran a write
+GET    /api/v1/workspaces/{id}/saved/{saved}     the question with its last run
+DELETE /api/v1/workspaces/{id}/saved/{saved}     creator or owner
+POST   /api/v1/workspaces/{id}/saved/{saved}/run runs the saved SQL now, no model, no job: the run
+                                                  (`changed`, `status`, each statement's digest, counts, rows, error);
+                                                  200 with `status: "failed"` when a statement failed
+GET    /api/v1/workspaces/{id}/saved/{saved}/runs[?limit=20]   newest first
 GET    /api/v1/workspaces/{id}/audit              detail rows, members only
 GET    /api/v1/workspaces/{id}/members  POST/DELETE ...   (owner)
 GET    /api/v1/admin/users  POST ...  GET /api/v1/admin/audit   (admin; skeletal log)
@@ -1985,13 +2059,15 @@ into text already typed it is inserted like any other paste.
 
 Slash commands: `/help`, `/tables`, `/schema TABLE`, `/sql`, `/ingest PATH` (`/attach`),
 `/import`, `/docs`, `/pin`, `/unpin`, `/delete`, `/ontology ...` and `/graph ...`, `/graph
-ENTITY`, `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/sessions`,
+ENTITY`, `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/saved [list | add
+NAME | run NAME | show NAME | remove NAME]` (`add` pins this session's last answer;
+`--refresh` and `--exit-code` are refused as command-line flags), `/sessions`,
 `/resume`, `/new`, `/mode`, `/share`, `/unshare`, `/export [--sql|--markdown] [FILE]`,
 `/jobs`, `/cancel N`, `/steps`, `/model`, `/workspace`, `/clear`, `/quit`.
 `/model` shows the configured models, then lists each provider's models as a job
 (`llm::ModelCatalog`).
-`/ontology` and `/graph` are the `quack ontology` and `quack graph` verbs, parsed by the
-same clap definitions; they run in the background, print to the transcript, and answer yes
+`/ontology`, `/graph`, and `/saved` are the `quack ontology`, `quack graph`, and `quack
+saved` verbs, parsed by the same clap definitions; they run in the background, print to the transcript, and answer yes
 to anything that would ask on stdin.
 
 **Command parsing.** One clap definition (`terminal::commands::SlashCommand`) drives
@@ -2083,6 +2159,11 @@ quack context show | edit | history | export FILE | import FILE
 # `graph revalidate` asks before it drops anything; with no terminal it fails
 # with what it would drop, and -y / --yes goes ahead.
 quack sessions [--format json] [--limit N] | export SESSION [--sql|--markdown]
+quack saved list [--format text|json] | add NAME --from-session ID [--message N]
+            | run NAME [--refresh] [--exit-code] [-f table|json|ndjson|csv|markdown] | show NAME [--format json]
+            | remove NAME
+# A saved question re-runs an answer's SQL without the model (section 8.1); cron is the
+# scheduler, and --exit-code exits 5 when the result changed.
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
 quack okf export DIR|-
 quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
@@ -2124,7 +2205,8 @@ name is a `WorkspaceName`: trimmed, non-empty, and without `/`, `\`, or `.`. The
 through that type. Workspaces created before the rule keep their names and still open.
 
 **Exit codes:** 0 ok, 1 runtime error, 2 usage (an unknown `-w` included), 3 write refused,
-4 auth required. A reader that closes stdout early (`| head`) ends the command quietly with 0.
+4 auth required, 5 the result of `quack saved run --exit-code` changed. A reader that closes
+stdout early (`| head`) ends the command quietly with 0.
 
 **`quack config`** and `quack doctor` are the only commands that skip `Config::load`.
 `config` reads the file itself, so it describes even a configuration every other command

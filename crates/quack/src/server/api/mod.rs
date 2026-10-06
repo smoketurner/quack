@@ -14,6 +14,7 @@ pub(crate) mod members;
 pub(crate) mod okf;
 pub(crate) mod ontology;
 pub(crate) mod query;
+mod saved;
 mod sessions;
 mod tables;
 pub(crate) mod workspaces;
@@ -122,6 +123,16 @@ pub(crate) fn router() -> Router<App> {
         .route("/workspaces/{id}/jobs/stream", get(jobs::stream))
         .route("/workspaces/{id}/jobs/{job}", get(jobs::show))
         .route("/workspaces/{id}/jobs/{job}/cancel", post(jobs::cancel))
+        .route(
+            "/workspaces/{id}/saved",
+            get(saved::list).post(saved::create),
+        )
+        .route(
+            "/workspaces/{id}/saved/{saved}",
+            get(saved::show).delete(saved::remove),
+        )
+        .route("/workspaces/{id}/saved/{saved}/run", post(saved::run))
+        .route("/workspaces/{id}/saved/{saved}/runs", get(saved::runs))
         .route("/workspaces/{id}/sessions", get(sessions::list))
         .route(
             "/workspaces/{id}/sessions/{sid}",
