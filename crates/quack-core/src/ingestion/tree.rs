@@ -13,7 +13,7 @@ use crate::ids::DocumentId;
 use crate::ingestion::parser::FileType;
 use crate::ingestion::{IngestOutcome, NewFile, ingest_file, parse_off_runtime};
 use crate::progress::{ChunkDone, RunControl};
-use crate::storage::workspace::{DocumentInfo, DocumentSource, WorkspaceDb};
+use crate::storage::workspace::{DocumentInfo, DocumentSource};
 use crate::storage::writer::Writer;
 
 /// One file quack can load, where it is and its path under the root.
@@ -21,7 +21,7 @@ use crate::storage::writer::Writer;
 pub struct TreeFile {
     pub path: PathBuf,
     /// Root-relative, `/`-separated: what the document records as its
-    /// `source_path`, and what a later run matches it by.
+    /// `source_path`, and what a later run of the same root matches it by.
     pub relative: String,
 }
 
@@ -141,11 +141,13 @@ impl FolderReport {
 }
 
 /// A folder to ingest into a workspace: every file quack can load becomes
-/// a document named after it, recording its root-relative path. On a later
-/// run an unchanged file is skipped by its bytes, a changed file replaces
-/// the ready document at its path, and a path with no file left is
-/// reported, or deleted with `Prune::Delete`. Progress is one unit per
-/// file, and a cancel stops between files or inside one.
+/// a document named after it, recording the folder's canonical path and
+/// the file's path under it. On a later run of the same folder an
+/// unchanged file is skipped by its bytes, a changed file replaces the
+/// ready document at its path, and a path with no file left is reported,
+/// or deleted with `Prune::Delete`; documents from any other folder are
+/// never touched. Progress is one unit per file, and a cancel stops
+/// between files or inside one.
 pub struct Folder<'a, M> {
     pub config: &'a Config,
     pub db: &'a Writer,
@@ -166,6 +168,9 @@ impl<M: EmbeddingModel> Folder<'_, M> {
     /// `Failed` outcome, not an error.
     pub async fn run(self) -> Result<FolderReport> {
         let tree = Tree::walk(self.root)?;
+        let source_root = std::fs::canonicalize(self.root)?
+            .to_string_lossy()
+            .into_owned();
         let total = u32::try_from(tree.files.len()).unwrap_or(u32::MAX);
         let started = Instant::now();
         let mut results = Vec::with_capacity(tree.files.len());
@@ -173,7 +178,7 @@ impl<M: EmbeddingModel> Folder<'_, M> {
         for (index, file) in tree.files.iter().enumerate() {
             self.control.check()?;
             let unit = Instant::now();
-            let outcome = match self.one(file).await {
+            let outcome = match self.one(&source_root, file).await {
                 Ok(outcome) => outcome,
                 Err(Error::Cancelled) => return Err(Error::Cancelled),
                 Err(e) => {
@@ -194,9 +199,10 @@ impl<M: EmbeddingModel> Folder<'_, M> {
             });
         }
         let present: BTreeSet<&str> = tree.files.iter().map(|f| f.relative.as_str()).collect();
+        let root = source_root.clone();
         let gone: Vec<DocumentInfo> = self
             .db
-            .run(WorkspaceDb::documents_with_source_path)
+            .run(move |db| db.documents_under(&root))
             .await?
             .into_iter()
             .filter(|d| {
@@ -219,14 +225,15 @@ impl<M: EmbeddingModel> Folder<'_, M> {
         })
     }
 
-    /// Ingest one file, replacing the ready document at its path.
-    async fn one(&self, file: &TreeFile) -> Result<Outcome> {
+    /// Ingest one file, replacing the ready document at its path under
+    /// `source_root`.
+    async fn one(&self, source_root: &str, file: &TreeFile) -> Result<Outcome> {
         let path = file.path.clone();
         let data = parse_off_runtime(move || Ok(std::fs::read(path)?)).await?;
-        let relative = file.relative.clone();
+        let (root, relative) = (source_root.to_owned(), file.relative.clone());
         let predecessor = self
             .db
-            .run(move |db| db.newest_document_at_path(&relative))
+            .run(move |db| db.newest_document_at_path(&root, &relative))
             .await?;
         // The run reports one unit per file; a file's own chunk progress
         // stays inside it, its cancel does not.
@@ -236,7 +243,7 @@ impl<M: EmbeddingModel> Folder<'_, M> {
         };
         let new_file = NewFile::new(file.name(), &data)
             .source(DocumentSource::Path)
-            .source_path(Some(&file.relative))
+            .in_folder(source_root, &file.relative)
             .replaces(predecessor.as_ref().map(|d| &d.id))
             .control(per_file);
         let outcome = ingest_file(

@@ -778,19 +778,21 @@ extract` rebuilds the graph once the tables and documents are back.
 `index.md` or `log.md` at its top, `okf::Bundle::is_dir`) walks it (`ingestion::tree::Tree`:
 every file in path order, directories and files whose name starts with `.` skipped) and
 ingests each file `FileType::of` recognizes as a document named after it, recording the
-file's root-relative `/`-separated path as `_quack_documents.source_path`
-(`ingestion::tree::Folder`). The command prints one line per file (`ingested`, `replaced`,
+folder's canonical absolute path as `_quack_documents.source_root` and the file's
+root-relative `/`-separated path as `source_path` (`ingestion::tree::Folder`). The command prints one line per file (`ingested`, `replaced`,
 `skipped`, `failed`), then the unsupported files, then the documents whose file is gone.
 Running it again on the same folder: an unchanged file is skipped by the SHA-256 dedup; a
-changed file replaces the ready document at its path through the supersede operation
-above (`WorkspaceDb::newest_document_at_path`), keeping its pin; a ready document with a
-`source_path` no file in the folder has now is reported, and deleted only with `--prune`. A
+changed file replaces the ready document at its path under the same root through the
+supersede operation above (`WorkspaceDb::newest_document_at_path`), keeping its pin; a
+ready document of that root (`documents_under`) whose path no file has now is reported,
+and deleted only with `--prune`. A
 file that fails to parse is reported and fails the command after the rest have run. The
 walk reports one progress unit per file through the run's `RunControl`; a cancel stops
 between files or inside one. There is no watcher or daemon: a cron line re-runs the
-command. The workspace records paths relative to the folder, not the folder itself, so one
-workspace is fed from one folder; a second folder's paths would read as that folder's.
-The web form and the API take files, not folders; the terminal's `/ingest` takes files.
+command. Replacement, "gone", and pruning look only at documents of the folder being
+run: a workspace fed from several folders keeps them apart, and the same relative path
+under two folders is two documents. The web form and the API take files, not folders; the
+terminal's `/ingest` takes files.
 
 **Parsing.**
 

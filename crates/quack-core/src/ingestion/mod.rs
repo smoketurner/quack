@@ -96,8 +96,10 @@ pub struct NewFile<'a> {
     /// one is ready, and untouched if this one fails. A table file takes
     /// over its table.
     pub replaces: Option<&'a DocumentId>,
-    /// The file's path under the folder it came from (`ingestion::tree`),
-    /// recorded so a later run of the folder finds the document again.
+    /// The folder the file came from (`ingestion::tree`, its canonical
+    /// absolute path) and the file's path under it, recorded so a later
+    /// run of that folder finds the document again.
+    pub source_root: Option<&'a str>,
     pub source_path: Option<&'a str>,
 }
 
@@ -113,6 +115,7 @@ impl<'a> NewFile<'a> {
             ingested_by: None,
             control: RunControl::unobserved(),
             replaces: None,
+            source_root: None,
             source_path: None,
         }
     }
@@ -149,10 +152,11 @@ impl<'a> NewFile<'a> {
         self
     }
 
-    /// Record where the file sat in the folder it came from.
+    /// Record the folder the file came from and where it sat under it.
     #[must_use]
-    pub fn source_path(mut self, path: Option<&'a str>) -> Self {
-        self.source_path = path;
+    pub fn in_folder(mut self, root: &'a str, path: &'a str) -> Self {
+        self.source_root = Some(root);
+        self.source_path = Some(path);
         self
     }
 }
@@ -221,6 +225,7 @@ struct Pending {
     sha256: String,
     file_type: FileType,
     replaces: Option<DocumentId>,
+    source_root: Option<String>,
     source_path: Option<String>,
 }
 
@@ -243,6 +248,7 @@ impl Pending {
             sha256: sha256_hex(file.data),
             file_type,
             replaces: file.replaces.cloned(),
+            source_root: file.source_root.map(str::to_owned),
             source_path: file.source_path.map(str::to_owned),
         })
     }
@@ -282,6 +288,7 @@ impl Pending {
             source: self.source,
             status: DocumentStatus::Queued,
             ingested_by: self.ingested_by.as_deref(),
+            source_root: self.source_root.as_deref(),
             source_path: self.source_path.as_deref(),
         })?;
         Ok(Registration::New(doc_id))

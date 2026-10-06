@@ -74,6 +74,7 @@ const DOCUMENTS_DDL: &str = "
         pages_unreadable INTEGER,
         pages_empty INTEGER,
         superseded_by TEXT,
+        source_root TEXT,
         source_path TEXT
     );
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;
@@ -87,6 +88,7 @@ const DOCUMENTS_DDL: &str = "
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_unreadable INTEGER;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_empty INTEGER;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS superseded_by TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_root TEXT;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_path TEXT;";
 
 /// Summaries of the turns a session's history window leaves out
@@ -1494,8 +1496,8 @@ impl WorkspaceDb {
             .map_err(|_| Error::Ingestion("file size overflow".into()))?;
 
         self.conn.execute(
-            "INSERT INTO _quack_documents (id, filename, title, mime_type, size_bytes, sha256, source, status, ingested_by, source_path) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO _quack_documents (id, filename, title, mime_type, size_bytes, sha256, source, status, ingested_by, source_root, source_path) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             duckdb::params![
                 doc.id,
                 doc.filename,
@@ -1506,6 +1508,7 @@ impl WorkspaceDb {
                 doc.source.as_str(),
                 doc.status,
                 doc.ingested_by,
+                doc.source_root,
                 doc.source_path,
             ],
         )?;
@@ -1569,38 +1572,49 @@ impl WorkspaceDb {
         }
     }
 
-    /// The ready document a folder run stored from `source_path`, if one
-    /// is: what a changed file at that path replaces.
+    /// The ready document a run of the folder `source_root` stored from
+    /// `source_path` under it, if one is: what a changed file at that path
+    /// replaces. The same relative path under another folder is another
+    /// document.
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn newest_document_at_path(&self, source_path: &str) -> Result<Option<DocumentInfo>> {
+    pub fn newest_document_at_path(
+        &self,
+        source_root: &str,
+        source_path: &str,
+    ) -> Result<Option<DocumentInfo>> {
         let sql = format!(
-            "{DOCUMENT_SELECT} WHERE source_path = ? AND status = ? \
+            "{DOCUMENT_SELECT} WHERE source_root = ? AND source_path = ? AND status = ? \
              ORDER BY ingested_at DESC, id DESC LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(duckdb::params![source_path, DocumentStatus::Ready])?;
+        let mut rows = stmt.query(duckdb::params![
+            source_root,
+            source_path,
+            DocumentStatus::Ready
+        ])?;
         match rows.next()? {
             Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
             None => Ok(None),
         }
     }
 
-    /// Every ready document a folder run stored, by its path: what a run
-    /// compares the folder against to find the files that are gone.
+    /// Every ready document a run of the folder `source_root` stored, by
+    /// its path: what a run compares that folder against to find the files
+    /// that are gone. Documents from any other folder are not touched.
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn documents_with_source_path(&self) -> Result<Vec<DocumentInfo>> {
+    pub fn documents_under(&self, source_root: &str) -> Result<Vec<DocumentInfo>> {
         let sql = format!(
-            "{DOCUMENT_SELECT} WHERE source_path IS NOT NULL AND status = ? \
+            "{DOCUMENT_SELECT} WHERE source_root = ? AND source_path IS NOT NULL AND status = ? \
              ORDER BY source_path, ingested_at DESC, id DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let docs = stmt.query_map(duckdb::params![DocumentStatus::Ready], |row| {
+        let docs = stmt.query_map(duckdb::params![source_root, DocumentStatus::Ready], |row| {
             DocumentInfo::try_from(row)
         })?;
         Ok(docs.collect::<duckdb::Result<_>>()?)
@@ -3100,9 +3114,11 @@ pub struct DocumentInfo {
     /// The document replacing this one: on its way while this one is
     /// still `ready`, in place once this one is `superseded`.
     pub superseded_by: Option<DocumentId>,
-    /// Where the file was in the folder it was ingested from, relative to
-    /// that folder with `/` separators; a later run of the folder matches
-    /// the file by it. `None` for a document from anywhere else.
+    /// The folder the file was ingested from, as its canonical absolute
+    /// path; `None` for a document from anywhere else.
+    pub source_root: Option<String>,
+    /// Where the file was under that folder, with `/` separators; a later
+    /// run of the folder matches the file by root and path together.
     pub source_path: Option<String>,
 }
 
@@ -3204,7 +3220,9 @@ pub struct NewDocument<'a> {
     pub source: DocumentSource,
     pub status: DocumentStatus,
     pub ingested_by: Option<&'a str>,
-    /// The file's path under the folder it came from, when it came from one.
+    /// The folder the file came from and its path under it, when it came
+    /// from one.
+    pub source_root: Option<&'a str>,
     pub source_path: Option<&'a str>,
 }
 
@@ -3228,6 +3246,7 @@ impl<'a> NewDocument<'a> {
             source: DocumentSource::Upload,
             status: DocumentStatus::Queued,
             ingested_by: None,
+            source_root: None,
             source_path: None,
         }
     }
@@ -3242,7 +3261,7 @@ impl<'a> NewDocument<'a> {
 const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, status, error_message, \
      COALESCE(pinned, false), CAST(ingested_at AS VARCHAR), title, sha256, source, chunk_count, \
      ingested_by, CAST(tables AS VARCHAR), page_count, pages_unreadable, pages_empty, \
-     superseded_by, source_path \
+     superseded_by, source_root, source_path \
      FROM _quack_documents";
 
 /// The `WHERE` clause that keeps a document that still stands for its
@@ -3285,7 +3304,8 @@ impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
                 None => None,
             },
             superseded_by: row.get(17)?,
-            source_path: row.get(18)?,
+            source_root: row.get(18)?,
+            source_path: row.get(19)?,
         })
     }
 }

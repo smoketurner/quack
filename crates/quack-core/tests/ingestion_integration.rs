@@ -3362,6 +3362,8 @@ async fn a_folder_run_ingests_supported_files_and_skips_them_next_time() {
     write_under(&root, "rates/sales.csv", "region,total\nnorth,1\n");
     write_under(&root, "notes.xyz", "?");
     write_under(&root, "broken.csv", "a,b\n1,2,3,4\n\"unterminated,5\n6\n");
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let root_text = canonical.to_string_lossy();
 
     let first = folder_run(&config, &writer, &root, Prune::Keep).await;
     assert_eq!(
@@ -3375,17 +3377,30 @@ async fn a_folder_run_ingests_supported_files_and_skips_them_next_time() {
     assert_eq!(first.unsupported, ["notes.xyz"]);
     assert!(first.gone.is_empty());
     assert_eq!(first.failed(), 1);
-    let policy = db.newest_document_at_path("policy.md").unwrap().unwrap();
+    let policy = db
+        .newest_document_at_path(&root_text, "policy.md")
+        .unwrap()
+        .unwrap();
     assert_eq!(policy.source_path.as_deref(), Some("policy.md"));
+    assert_eq!(policy.source_root.as_deref(), Some(root_text.as_ref()));
     assert_eq!(policy.filename, "policy.md");
     assert_eq!(
-        db.newest_document_at_path("rates/sales.csv")
+        db.newest_document_at_path(&root_text, "rates/sales.csv")
             .unwrap()
             .unwrap()
             .tables,
         Some(vec![String::from("sales")])
     );
-    assert!(db.newest_document_at_path("broken.csv").unwrap().is_none());
+    assert!(
+        db.newest_document_at_path(&root_text, "broken.csv")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.newest_document_at_path("/elsewhere", "policy.md")
+            .unwrap()
+            .is_none()
+    );
 
     let again = folder_run(&config, &writer, &root, Prune::Keep).await;
     assert_eq!(
@@ -3411,7 +3426,12 @@ async fn a_folder_rerun_replaces_changed_files_and_reports_or_prunes_gone_ones()
     write_under(&root, "policy.md", "Flood is excluded.");
     write_under(&root, "rates/sales.csv", "region,total\nnorth,1\n");
     folder_run(&config, &writer, &root, Prune::Keep).await;
-    let policy = db.newest_document_at_path("policy.md").unwrap().unwrap();
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let root_text = canonical.to_string_lossy();
+    let policy = db
+        .newest_document_at_path(&root_text, "policy.md")
+        .unwrap()
+        .unwrap();
 
     write_under(&root, "policy.md", "Flood is covered.");
     std::fs::remove_file(root.join("rates/sales.csv")).unwrap();
@@ -3429,7 +3449,10 @@ async fn a_folder_rerun_replaces_changed_files_and_reports_or_prunes_gone_ones()
         db.document(&policy.id).unwrap().unwrap().status,
         DocumentStatus::Superseded
     );
-    let successor = db.newest_document_at_path("policy.md").unwrap().unwrap();
+    let successor = db
+        .newest_document_at_path(&root_text, "policy.md")
+        .unwrap()
+        .unwrap();
     assert_ne!(successor.id, policy.id);
     assert_eq!(
         changed
@@ -3446,7 +3469,7 @@ async fn a_folder_rerun_replaces_changed_files_and_reports_or_prunes_gone_ones()
     assert_eq!(pruned.gone.len(), 1);
     assert_eq!(pruned.pruned, Prune::Delete);
     assert!(
-        db.newest_document_at_path("rates/sales.csv")
+        db.newest_document_at_path(&root_text, "rates/sales.csv")
             .unwrap()
             .is_none()
     );
@@ -3457,6 +3480,87 @@ async fn a_folder_rerun_replaces_changed_files_and_reports_or_prunes_gone_ones()
             .gone
             .is_empty()
     );
+}
+
+/// Two folders fed into one workspace keep to themselves: the same
+/// relative path under each is its own document, a run of one folder
+/// never reports or prunes the other's documents, and a change replaces
+/// only within its root.
+#[tokio::test]
+async fn folders_sharing_a_relative_path_are_separate_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-folder").unwrap();
+    let writer = writer_of(&db);
+    let (east, west) = (dir.path().join("east"), dir.path().join("west"));
+    write_under(&east, "policy.md", "East: flood is excluded.");
+    write_under(&east, "only-east.md", "East only.");
+    write_under(&west, "policy.md", "West: flood is covered.");
+    let east_run = folder_run(&config, &writer, &east, Prune::Keep).await;
+    let west_run = folder_run(&config, &writer, &west, Prune::Keep).await;
+    assert_eq!(
+        outcome_kinds(&east_run),
+        [
+            (String::from("only-east.md"), "ingested"),
+            (String::from("policy.md"), "ingested"),
+        ]
+    );
+    assert_eq!(
+        outcome_kinds(&west_run),
+        [(String::from("policy.md"), "ingested")]
+    );
+    assert!(east_run.gone.is_empty() && west_run.gone.is_empty());
+    let root_of = |path: &Path| -> String {
+        std::fs::canonicalize(path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let (east_root, west_root) = (root_of(&east), root_of(&west));
+    let east_policy = db
+        .newest_document_at_path(&east_root, "policy.md")
+        .unwrap()
+        .unwrap();
+    let west_policy = db
+        .newest_document_at_path(&west_root, "policy.md")
+        .unwrap()
+        .unwrap();
+    assert_ne!(east_policy.id, west_policy.id);
+    assert_eq!(db.documents_under(&east_root).unwrap().len(), 2);
+    assert_eq!(db.documents_under(&west_root).unwrap().len(), 1);
+
+    // A change in west replaces west's copy only, and a pruning run of
+    // west touches nothing of east's.
+    write_under(&west, "policy.md", "West: flood is now excluded.");
+    let west_again = folder_run(&config, &writer, &west, Prune::Delete).await;
+    assert!(
+        matches!(
+            west_again.results.first().map(|r| &r.outcome),
+            Some(Outcome::Replaced { old, .. }) if *old == west_policy.id
+        ),
+        "{west_again:?}"
+    );
+    assert!(west_again.gone.is_empty());
+    assert_eq!(
+        db.document(&east_policy.id).unwrap().unwrap().status,
+        DocumentStatus::Ready
+    );
+    assert_eq!(db.documents_under(&east_root).unwrap().len(), 2);
+
+    // Removing east's extra file and pruning east deletes that one alone.
+    std::fs::remove_file(east.join("only-east.md")).unwrap();
+    let east_pruned = folder_run(&config, &writer, &east, Prune::Delete).await;
+    assert_eq!(
+        east_pruned
+            .gone
+            .iter()
+            .map(|d| d.source_path.clone())
+            .collect::<Vec<_>>(),
+        [Some(String::from("only-east.md"))]
+    );
+    assert_eq!(db.documents_under(&east_root).unwrap().len(), 1);
+    assert_eq!(db.documents_under(&west_root).unwrap().len(), 1);
+    assert_eq!(db.list_documents().unwrap().len(), 2);
 }
 
 /// `ingest_file` into `ws-replace` without an embedding model, for the

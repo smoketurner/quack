@@ -59,6 +59,7 @@ fn docs_json_carries_every_document_field() {
         "source",
         "pages",
         "superseded_by",
+        "source_root",
         "source_path",
     ] {
         assert!(row.get(key).is_some(), "{key} missing: {row}");
