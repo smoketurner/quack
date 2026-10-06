@@ -43,7 +43,7 @@ use quack_core::progress::RunControl;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
-use quack_core::storage::workspace::{DocumentSource, Pinning, WorkspaceDb};
+use quack_core::storage::workspace::{DocumentSource, Pinning, QueryResults, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use quack_core::{config, doctor};
 use std::io::{IsTerminal, Read, Write};
@@ -541,14 +541,6 @@ pub(crate) enum OutputFormat {
 }
 
 impl OutputFormat {
-    fn default_for(stdout_is_tty: bool) -> Self {
-        if stdout_is_tty {
-            Self::Table
-        } else {
-            Self::Ndjson
-        }
-    }
-
     /// The format for `-p`, which prints an answer: text or JSON.
     const fn for_prompt(self) -> Option<TextOrJson> {
         match self {
@@ -571,14 +563,42 @@ impl OutputFormat {
     }
 }
 
-/// How `-q` prints a result set.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum QueryFormat {
+/// How `-q` and `saved run` print a result set: [`OutputFormat`] without
+/// `text`, which prints an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum QueryFormat {
+    /// Aligned text table
     Table,
+    /// One JSON document
     Json,
+    /// One JSON object per line
     Ndjson,
+    /// Comma-separated values with a header row
     Csv,
+    /// GitHub-flavored Markdown table
     Markdown,
+}
+
+impl QueryFormat {
+    /// Without `--format`: a table on a terminal, ndjson into a pipe.
+    pub(crate) fn default_for(stdout_is_tty: bool) -> Self {
+        if stdout_is_tty {
+            Self::Table
+        } else {
+            Self::Ndjson
+        }
+    }
+
+    /// Print `results` in this format.
+    pub(crate) fn write(self, results: &QueryResults, out: &mut impl Write) -> CoreResult<()> {
+        match self {
+            Self::Table => results.write_table(out),
+            Self::Json => results.write_json(out),
+            Self::Ndjson => results.write_ndjson(out),
+            Self::Csv => results.write_csv(out),
+            Self::Markdown => results.write_markdown(out),
+        }
+    }
 }
 
 #[tokio::main]
@@ -648,11 +668,10 @@ async fn run() -> Result<ExitCode> {
 
     if let Some(sql) = cli.query.as_deref() {
         init_logging();
-        let Some(format) = cli
-            .format
-            .unwrap_or_else(|| OutputFormat::default_for(stdout_is_tty))
-            .for_query()
-        else {
+        let Some(format) = cli.format.map_or_else(
+            || Some(QueryFormat::default_for(stdout_is_tty)),
+            OutputFormat::for_query,
+        ) else {
             tracing::error!("-q accepts --format table, json, ndjson, csv, or markdown");
             return Ok(ExitCode::from(Exit::Usage));
         };
@@ -1011,8 +1030,9 @@ async fn run_saved(cli: &Cli, action: saved_cli::SavedAction) -> Result<ExitCode
         reader_db,
         verbose: cli.verbose,
     };
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
+    // Not the lock: a refresh is a print-mode turn, which writes its own
+    // answer to stdout before the run is printed.
+    let mut out = std::io::BufWriter::new(std::io::stdout());
     let ran = saved_cli::run(&opened.config, &db, action, None, Some(model), &mut out).await?;
     out.flush()?;
     let Some(run) = ran else {
@@ -1673,14 +1693,7 @@ async fn run_query(
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
-    match format {
-        QueryFormat::Table => results.write_table(&mut out)?,
-        QueryFormat::Json => results.write_json(&mut out)?,
-        QueryFormat::Ndjson => results.write_ndjson(&mut out)?,
-        QueryFormat::Csv => results.write_csv(&mut out)?,
-        QueryFormat::Markdown => results.write_markdown(&mut out)?,
-    }
-
+    format.write(&results, &mut out)?;
     out.flush()?;
     Ok(())
 }

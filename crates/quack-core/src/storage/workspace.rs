@@ -459,13 +459,56 @@ impl CappedResults {
     }
 }
 
-/// Query results with the SHA-256 of the whole result set: the column
-/// names, then every row in result order, each as one JSON array per line.
+/// Query results with a digest of the whole result set ([`ResultDigest`]).
 /// Rows past the cap are digested and counted but not kept.
 #[derive(Debug, Clone)]
 pub struct DigestedResults {
     pub results: CappedResults,
     pub digest: String,
+}
+
+/// A digest of a result set that does not depend on row order: the SHA-256
+/// of the column names in order, then the sum modulo 2^256 of every row's
+/// SHA-256, each row as one JSON array. A statement without `ORDER BY` can
+/// return the same rows in a different order from one run to the next, so
+/// row order must not count; a sum, unlike XOR, keeps a repeated row
+/// distinct from a single one, and unlike sorting the row hashes needs no
+/// memory per row.
+struct ResultDigest {
+    columns: digest::Context,
+    /// The row-hash sum, 64-bit limbs least significant first.
+    rows: [u64; 4],
+}
+
+impl ResultDigest {
+    fn new(columns: &[String]) -> Result<Self> {
+        let mut context = digest::Context::new(&digest::SHA256);
+        context.update(&serde_json::to_vec(columns)?);
+        Ok(Self {
+            columns: context,
+            rows: [0; 4],
+        })
+    }
+
+    fn add_row(&mut self, values: &[serde_json::Value]) -> Result<()> {
+        let hash = digest::digest(&digest::SHA256, &serde_json::to_vec(values)?);
+        let mut carry = false;
+        let (words, _) = hash.as_ref().as_chunks::<8>();
+        for (limb, word) in self.rows.iter_mut().zip(words) {
+            let (sum, overflowed) = limb.overflowing_add(u64::from_le_bytes(*word));
+            let (sum, overflowed_again) = sum.overflowing_add(u64::from(carry));
+            *limb = sum;
+            carry = overflowed || overflowed_again;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> String {
+        for limb in self.rows {
+            self.columns.update(&limb.to_le_bytes());
+        }
+        crypto::hex_lower(self.columns.finish().as_ref())
+    }
 }
 
 /// The ontology tables (design doc 5.4), created with the other internal
@@ -2352,67 +2395,60 @@ impl WorkspaceDb {
         self.read_rows(sql, Some(max_rows as usize))
     }
 
-    /// [`Self::execute_query_capped`], with the SHA-256 of the whole
-    /// result set: every row is read and digested, and only the first
-    /// `max_rows` are kept.
+    /// [`Self::execute_query_capped`], with a [`ResultDigest`] of the
+    /// whole result set: every row is read and digested, and only the
+    /// first `max_rows` are kept.
     ///
     /// # Errors
     ///
     /// Returns an error if the SQL is invalid or execution fails.
     pub fn execute_query_digested(&self, sql: &str, max_rows: u32) -> Result<DigestedResults> {
         self.under_timeout(|db| {
-            let mut context = digest::Context::new(&digest::SHA256);
-            let results = db.read_rows_untimed(sql, Some(max_rows as usize), Some(&mut context))?;
+            let (results, digest) = db.read_rows_untimed(sql, Some(max_rows as usize), true)?;
             Ok(DigestedResults {
                 results,
-                digest: crypto::hex_lower(context.finish().as_ref()),
+                digest: digest.unwrap_or_default(),
             })
         })
     }
 
     fn read_rows(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
-        self.under_timeout(|db| db.read_rows_untimed(sql, keep, None))
+        self.under_timeout(|db| Ok(db.read_rows_untimed(sql, keep, false)?.0))
     }
 
-    /// Read `sql`'s rows, keeping `keep` of them, and feed every row,
-    /// kept or not, to `digest` when one is given: a digest covers the
-    /// whole result, so rows past the cap are converted only then.
+    /// Read `sql`'s rows, keeping `keep` of them, and when `digested`,
+    /// digest every row, kept or not: a digest covers the whole result, so
+    /// rows past the cap are converted only then.
     fn read_rows_untimed(
         &self,
         sql: &str,
         keep: Option<usize>,
-        mut digest: Option<&mut digest::Context>,
-    ) -> Result<CappedResults> {
+        digested: bool,
+    ) -> Result<(CappedResults, Option<String>)> {
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
 
-        let empty = CappedResults {
+        let (columns, column_count) = match rows.as_ref() {
+            Some(stmt_ref) if stmt_ref.column_count() > 0 => {
+                (stmt_ref.column_names(), stmt_ref.column_count())
+            }
+            _ => (Vec::new(), 0),
+        };
+        let mut digest = digested.then(|| ResultDigest::new(&columns)).transpose()?;
+        let mut results = CappedResults {
             results: QueryResults {
-                columns: Vec::new(),
+                columns,
                 rows: Vec::new(),
             },
             total_rows: 0,
         };
-        let (columns, column_count) = {
-            let Some(stmt_ref) = rows.as_ref() else {
-                return Ok(empty);
-            };
-            let count = stmt_ref.column_count();
-            if count == 0 {
-                return Ok(empty);
-            }
-            (stmt_ref.column_names(), count)
-        };
-        if let Some(digest) = digest.as_deref_mut() {
-            digest.update(&serde_json::to_vec(&columns)?);
-            digest.update(b"\n");
+        if column_count == 0 {
+            return Ok((results, digest.map(ResultDigest::finish)));
         }
 
-        let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
-        let mut total_rows: usize = 0;
         while let Some(row) = rows.next()? {
-            total_rows = total_rows.saturating_add(1);
-            let kept = keep.is_none_or(|keep| result_rows.len() < keep);
+            results.total_rows = results.total_rows.saturating_add(1);
+            let kept = keep.is_none_or(|keep| results.results.rows.len() < keep);
             if !kept && digest.is_none() {
                 continue;
             }
@@ -2420,22 +2456,14 @@ impl WorkspaceDb {
             for i in 0..column_count {
                 values.push(extract_value(row, i));
             }
-            if let Some(digest) = digest.as_deref_mut() {
-                digest.update(&serde_json::to_vec(&values)?);
-                digest.update(b"\n");
+            if let Some(digest) = digest.as_mut() {
+                digest.add_row(&values)?;
             }
             if kept {
-                result_rows.push(values);
+                results.results.rows.push(values);
             }
         }
-
-        Ok(CappedResults {
-            results: QueryResults {
-                columns,
-                rows: result_rows,
-            },
-            total_rows,
-        })
+        Ok((results, digest.map(ResultDigest::finish)))
     }
 
     /// Execute a SQL statement that does not return rows.
@@ -4751,10 +4779,10 @@ mod tests {
     }
 
     /// The digest covers every row, kept or not, and the column names,
-    /// so a change past the cap, a renamed column, or a reordered result
-    /// changes it, and the same result gives the same digest.
+    /// so a change past the cap, a renamed column, or a repeated row
+    /// changes it; the same rows in another order give the same digest.
     #[test]
-    fn digested_query_covers_the_rows_past_the_cap() {
+    fn digested_query_covers_the_rows_past_the_cap_in_any_order() {
         let db =
             WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         let digested = |sql: &str, cap: u32| {
@@ -4777,14 +4805,54 @@ mod tests {
             digested("SELECT range AS m FROM range(10)", 3).digest,
             ten.digest
         );
-        assert_ne!(
+        assert_eq!(
             digested("SELECT range AS n FROM range(10) ORDER BY n DESC", 3).digest,
-            ten.digest
+            ten.digest,
+            "row order does not count"
+        );
+        assert_ne!(
+            digested("SELECT 1 AS n UNION ALL SELECT 1", 3).digest,
+            digested("SELECT 1 AS n", 3).digest,
+            "a repeated row counts"
+        );
+        assert_ne!(
+            digested("SELECT 1 AS n UNION ALL SELECT 1 UNION ALL SELECT 2", 3).digest,
+            digested("SELECT 2 AS n", 3).digest,
+            "a repeated row does not cancel out"
         );
         assert_eq!(
             digested("SELECT 1 AS n WHERE false", 3).digest,
             digested("SELECT 2 AS n WHERE false", 3).digest
         );
+    }
+
+    /// A `GROUP BY` without `ORDER BY` returns its groups in whatever
+    /// order the threads finish, so two runs over the same data must
+    /// digest the same.
+    #[test]
+    fn digested_group_by_is_the_same_across_runs() {
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        db.execute_statement(
+            "CREATE TABLE events (bucket INTEGER, n INTEGER); \
+             INSERT INTO events SELECT range % 64, range FROM range(100000)",
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let sql = "SELECT bucket, count(*) AS c, sum(n) AS s FROM events GROUP BY bucket";
+        let first = db
+            .execute_query_digested(sql, 10)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        for _ in 0..5 {
+            let again = db
+                .execute_query_digested(sql, 10)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            assert_eq!(again.digest, first.digest);
+            assert_eq!(again.results.total_rows, 64);
+        }
+        let ordered = db
+            .execute_query_digested(&format!("{sql} ORDER BY bucket DESC"), 10)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(ordered.digest, first.digest);
     }
 
     #[test]

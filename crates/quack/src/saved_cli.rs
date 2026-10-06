@@ -3,25 +3,23 @@
 //! saying whether the data changed. cron is the scheduler: `quack saved
 //! run NAME --exit-code` exits 5 when the result changed.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
-use clap::{Subcommand, ValueEnum};
-use quack_core::analysis::events::{self, AgentEvent};
+use anyhow::{Result, anyhow};
+use clap::Subcommand;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::error::Record;
 use quack_core::ids::SessionId;
-use quack_core::llm::egress::Egress;
-use quack_core::llm::{self, TurnRequest};
 use quack_core::saved::{self, Answer, RunStatus, SavedQuestion, SavedRun, StatementRun};
 use quack_core::storage::sessions;
 use quack_core::storage::workspace::QueryResults;
 use quack_core::storage::writer::Writer;
 
-use crate::print;
+use crate::QueryFormat;
+use crate::print::PrintTurn;
 use crate::text_or_json::TextOrJson;
 
 #[derive(Debug, Clone, Subcommand)]
@@ -56,9 +54,10 @@ pub(crate) enum SavedAction {
         /// Exit 5 when the result changed
         #[arg(long)]
         exit_code: bool,
-        /// How to print the run
-        #[arg(short = 'f', long, value_enum, default_value_t = RunFormat::Table)]
-        format: RunFormat,
+        /// How to print the run. Default: table on a terminal, ndjson when
+        /// piped
+        #[arg(short = 'f', long, value_enum)]
+        format: Option<QueryFormat>,
     },
     /// The pinned SQL and the last run
     Show {
@@ -71,21 +70,9 @@ pub(crate) enum SavedAction {
     Remove { name: String },
 }
 
-/// How `run` prints a run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum RunFormat {
-    /// Each statement, its rows as an aligned table, and the verdict
-    Table,
-    /// The run as one JSON document: the verdict, each statement's digest
-    /// and counts, and the run id
-    Json,
-    /// Each statement's rows as CSV, a blank line between statements
-    Csv,
-}
-
-/// What `--refresh` needs beyond the writer: the handles an agent turn
-/// takes. The command line has them; the terminal refreshes through its
-/// own chat instead.
+/// What `--refresh` needs beyond the writer: the handles a print-mode
+/// turn takes. The command line has them; the terminal refreshes through
+/// its own chat instead.
 pub(crate) struct Model {
     pub db: SharedDb,
     pub reader_db: ReaderDb,
@@ -166,6 +153,9 @@ pub(crate) async fn run(
             let run = db
                 .run(move |db| saved::run(db, &question, max_rows))
                 .await?;
+            // The terminal runs on a terminal, so its transcript gets a table.
+            let format =
+                format.unwrap_or_else(|| QueryFormat::default_for(std::io::stdout().is_terminal()));
             write_run(out, &run, format)?;
             return Ok(Some(run));
         }
@@ -198,9 +188,10 @@ async fn find(db: &Writer, name: &str) -> Result<SavedQuestion> {
         .ok_or_else(|| Record::SavedQuestion.missing(name))?)
 }
 
-/// Ask `question` again in a new session of its mode, writes denied, the
-/// steps on stderr, and pin the statements the answer ran. A turn that
-/// fails leaves no empty session behind.
+/// Ask `question` again as a print-mode turn in a new session of its
+/// mode, writes denied (the steps on stderr, the answer on stdout), and
+/// pin the statements the answer ran. A turn that fails leaves no empty
+/// session behind.
 async fn refresh_pin(
     config: &Config,
     model: &Model,
@@ -213,42 +204,19 @@ async fn refresh_pin(
         .run(move |db| sessions::create_session(db, &chat_model, mode, None))
         .await?
         .id;
-    let (sink, mut events) = events::channel();
-    let turn = tokio::spawn({
-        let config = config.clone();
-        let (db, reader_db) = (Arc::clone(&model.db), model.reader_db.clone());
-        let (session_id, prompt) = (session_id.clone(), question.question.clone());
-        Egress::scope(Egress::current(), async move {
-            TurnRequest {
-                db,
-                reader_db,
-                session_id: &session_id,
-                policy: WritePolicy::Deny,
-                message: &prompt,
-                sink,
-                cancel: llm::CancellationToken::new(),
-            }
-            .run(&config)
-            .await
-        })
-    });
-    let mut err = std::io::stderr();
-    while let Some(event) = events.recv().await {
-        match event {
-            AgentEvent::ToolStarted { tool, detail } => {
-                print::write_started(&mut err, tool, &detail, model.verbose)?;
-            }
-            AgentEvent::ToolFinished(step) => print::write_finished(&mut err, &step)?,
-            AgentEvent::PermissionRequired(request) => request.deny(),
-            AgentEvent::Status(_)
-            | AgentEvent::Reasoning
-            | AgentEvent::TextDelta(_)
-            | AgentEvent::TurnComplete(_)
-            | AgentEvent::Failed(_) => {}
-        }
+    let outcome = PrintTurn {
+        config,
+        db: Arc::clone(&model.db),
+        reader_db: model.reader_db.clone(),
+        session_id: &session_id,
+        policy: WritePolicy::Deny,
+        prompt: &question.question,
+        format: TextOrJson::Text,
+        verbose: model.verbose,
     }
-    let answered = turn.await.context("agent task panicked")?;
-    if answered.is_err() {
+    .run()
+    .await;
+    if outcome.is_err() {
         let id = session_id.clone();
         drop(
             model
@@ -257,14 +225,14 @@ async fn refresh_pin(
                 .await,
         );
     }
-    answered.context("the refresh turn failed")?;
+    outcome?;
     let id = question.id;
     let pinned = model
         .db
         .run(move |db| saved::repin(db, &id, &session_id, Answer::Last))
         .await?;
     writeln!(
-        err,
+        std::io::stderr(),
         "refreshed '{}': {} statement{} pinned from session {}",
         pinned.name,
         pinned.statements.len(),
@@ -298,8 +266,8 @@ fn write_show(
             writeln!(out, "{}: {}", question.name, question.question)?;
             writeln!(
                 out,
-                "mode {}, pinned from session {} ({}, pin {})",
-                question.mode, question.session_id, question.pinned_at, question.pin
+                "mode {}, pinned from session {} ({})",
+                question.mode, question.session_id, question.pinned_at
             )?;
             for (n, sql) in question.statements.iter().enumerate() {
                 writeln!(
@@ -310,10 +278,18 @@ fn write_show(
                 )?;
             }
             writeln!(out)?;
+            // A stored run has counts and digests, never rows.
             match last_run {
                 Some(run) => {
-                    writeln!(out, "last run {}:", run.ran_at)?;
-                    write_run(out, run, RunFormat::Table)?;
+                    writeln!(out, "last run {}: {}", run.ran_at, run.verdict())?;
+                    for (n, statement) in run.statements.iter().enumerate() {
+                        writeln!(
+                            out,
+                            "  statement {}: {}",
+                            n.saturating_add(1),
+                            outcome(statement)
+                        )?;
+                    }
                 }
                 None => writeln!(out, "never run")?,
             }
@@ -330,18 +306,55 @@ fn kept_rows(statement: &StatementRun) -> Option<QueryResults> {
     })
 }
 
-/// Print a run in `format`. The table form ends with one word a person
-/// reads: `changed`, `unchanged`, or `failed`.
-fn write_run(out: &mut impl Write, run: &SavedRun, format: RunFormat) -> Result<()> {
+/// One line for how a statement went: its error, or its row count and
+/// whether it changed.
+fn outcome(statement: &StatementRun) -> String {
+    match (&statement.error, statement.rows) {
+        (Some(error), _) => format!("error: {error}"),
+        (None, rows) => {
+            let state = if statement.changed {
+                "changed"
+            } else {
+                "unchanged"
+            };
+            format!("{} rows, {state}", rows.unwrap_or_default())
+        }
+    }
+}
+
+/// Print a run in `format`: `json` is the run as one document (the
+/// verdict, each statement's digest and counts, the rows within the cap,
+/// and the run id); `table` is each statement with its rows and ends with
+/// one word a person reads, `changed`, `unchanged`, or `failed`; the rest
+/// are each statement's rows in that format, a blank line between
+/// statements, with a failed or uncapped statement noted on stderr.
+fn write_run(out: &mut impl Write, run: &SavedRun, format: QueryFormat) -> Result<()> {
     match format {
-        RunFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(run)?)?,
-        RunFormat::Csv => {
+        QueryFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(run)?)?,
+        QueryFormat::Table => {
+            for (n, statement) in run.statements.iter().enumerate() {
+                writeln!(out, "-- statement {}", n.saturating_add(1))?;
+                writeln!(out, "{}", statement.sql.trim())?;
+                if let Some(rows) = kept_rows(statement) {
+                    rows.write_table(out)?;
+                }
+                let kept = if statement.result.is_some() || statement.error.is_some() {
+                    ""
+                } else {
+                    " (past the row cap, so not kept)"
+                };
+                writeln!(out, "{}{kept}", outcome(statement))?;
+                writeln!(out)?;
+            }
+            writeln!(out, "run {}: {}", run.id, run.verdict())?;
+        }
+        QueryFormat::Ndjson | QueryFormat::Csv | QueryFormat::Markdown => {
             for (n, statement) in run.statements.iter().enumerate() {
                 if n > 0 {
                     writeln!(out)?;
                 }
                 match (kept_rows(statement), &statement.error) {
-                    (Some(rows), _) => rows.write_csv(out)?,
+                    (Some(rows), _) => format.write(&rows, out)?,
                     (None, Some(error)) => {
                         tracing::error!("statement {}: {error}", n.saturating_add(1));
                     }
@@ -352,36 +365,6 @@ fn write_run(out: &mut impl Write, run: &SavedRun, format: RunFormat) -> Result<
                     ),
                 }
             }
-        }
-        RunFormat::Table => {
-            for (n, statement) in run.statements.iter().enumerate() {
-                writeln!(out, "-- statement {}", n.saturating_add(1))?;
-                writeln!(out, "{}", statement.sql.trim())?;
-                if let Some(rows) = kept_rows(statement) {
-                    rows.write_table(out)?;
-                }
-                let was = statement
-                    .previous_rows
-                    .map_or(String::new(), |p| format!(" (was {p})"));
-                match (&statement.error, statement.rows) {
-                    (Some(error), _) => writeln!(out, "error: {error}{was}")?,
-                    (None, rows) => {
-                        let kept = if statement.result.is_some() {
-                            ""
-                        } else {
-                            ", past the row cap so not kept"
-                        };
-                        let state = if statement.changed {
-                            "changed"
-                        } else {
-                            "unchanged"
-                        };
-                        writeln!(out, "{} rows{was}{kept}, {state}", rows.unwrap_or_default())?;
-                    }
-                }
-                writeln!(out)?;
-            }
-            writeln!(out, "run {}: {}", run.id, run.verdict())?;
         }
     }
     Ok(())
@@ -418,6 +401,7 @@ mod tests {
     use quack_core::analysis::agent::AgentResponse;
     use quack_core::analysis::events::{ToolName, ToolStep};
     use quack_core::embedding::Dimension;
+    use quack_core::llm::egress::Egress;
     use quack_core::storage::control::AllowedProviders;
     use quack_core::storage::sessions::ChatMode;
     use quack_core::storage::workspace::WorkspaceDb;
@@ -479,12 +463,19 @@ mod tests {
         }
     }
 
-    fn run_named(name: &str, format: RunFormat) -> SavedAction {
+    fn show(name: &str, format: TextOrJson) -> SavedAction {
+        SavedAction::Show {
+            name: name.to_owned(),
+            format,
+        }
+    }
+
+    fn run_named(name: &str, format: QueryFormat) -> SavedAction {
         SavedAction::Run {
             name: name.to_owned(),
             refresh: false,
             exit_code: true,
-            format,
+            format: Some(format),
         }
     }
 
@@ -529,7 +520,7 @@ mod tests {
         assert_eq!(row["name"], "overdue");
         assert_eq!(row["statements"], serde_json::json!([OVERDUE]));
 
-        let (text, first) = quack(&db, run_named("overdue", RunFormat::Table)).await;
+        let (text, first) = quack(&db, run_named("overdue", QueryFormat::Table)).await;
         let first = first.unwrap().unwrap();
         assert!(!first.changed);
         assert!(failure(&first).is_none());
@@ -543,46 +534,39 @@ mod tests {
         db.run(|db| db.execute_statement("UPDATE invoices SET paid = false WHERE id = 2"))
             .await
             .unwrap();
-        let (json, second) = quack(&db, run_named("overdue", RunFormat::Json)).await;
+        let (json, second) = quack(&db, run_named("overdue", QueryFormat::Json)).await;
         let second = second.unwrap().unwrap();
         assert!(second.changed);
         let object: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(object["changed"], true);
         assert_eq!(object["id"], second.id.as_str());
         assert_eq!(object["statements"][0]["rows"], 2);
-        assert_eq!(object["statements"][0]["previous_rows"], 1);
         assert_eq!(
             object["statements"][0]["digest"].as_str().map(str::len),
             Some(64)
         );
 
-        let (csv, _) = quack(&db, run_named("overdue", RunFormat::Csv)).await;
+        let (csv, _) = quack(&db, run_named("overdue", QueryFormat::Csv)).await;
         assert_eq!(csv, "id\n1\n2\n");
+        let (ndjson, _) = quack(&db, run_named("overdue", QueryFormat::Ndjson)).await;
+        assert_eq!(ndjson, "{\"id\":1}\n{\"id\":2}\n");
+        let (markdown, _) = quack(&db, run_named("overdue", QueryFormat::Markdown)).await;
+        assert!(markdown.starts_with("| id |\n"), "{markdown}");
 
-        let (text, _) = quack(
-            &db,
-            SavedAction::Show {
-                name: String::from("overdue"),
-                format: TextOrJson::Text,
-            },
-        )
-        .await;
+        let (text, _) = quack(&db, show("overdue", TextOrJson::Text)).await;
         assert!(text.starts_with("overdue: overdue?\n"), "{text}");
         assert!(text.contains(OVERDUE), "{text}");
         assert!(text.contains("last run "), "{text}");
-        let (json, _) = quack(
-            &db,
-            SavedAction::Show {
-                name: String::from("overdue"),
-                format: TextOrJson::Json,
-            },
-        )
-        .await;
+        assert!(
+            text.ends_with(": unchanged\n  statement 1: 2 rows, unchanged\n"),
+            "{text}"
+        );
+        let (json, _) = quack(&db, show("overdue", TextOrJson::Json)).await;
         let object: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(object["question"]["name"], "overdue");
         assert_eq!(object["last_run"]["changed"], false);
 
-        let (_, missing) = quack(&db, run_named("nope", RunFormat::Table)).await;
+        let (_, missing) = quack(&db, run_named("nope", QueryFormat::Table)).await;
         assert_eq!(
             missing.unwrap_err().to_string(),
             "saved question 'nope' does not exist"
@@ -613,7 +597,7 @@ mod tests {
         db.run(|db| db.execute_statement("DROP TABLE invoices"))
             .await
             .unwrap();
-        let (text, failed) = quack(&db, run_named("overdue", RunFormat::Table)).await;
+        let (text, failed) = quack(&db, run_named("overdue", QueryFormat::Table)).await;
         let failed = failed.unwrap().unwrap();
         assert_eq!(failed.status, RunStatus::Failed);
         assert!(text.contains("error: "), "{text}");
@@ -632,7 +616,7 @@ mod tests {
                 name: String::from("overdue"),
                 refresh: true,
                 exit_code: false,
-                format: RunFormat::Table,
+                format: Some(QueryFormat::Table),
             },
         )
         .await;
@@ -684,7 +668,7 @@ mod tests {
                     name: String::from("overdue"),
                     refresh: true,
                     exit_code: false,
-                    format: RunFormat::Table,
+                    format: Some(QueryFormat::Table),
                 },
                 None,
                 Some(model),
@@ -694,8 +678,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(refreshed.pin, 2);
-        assert!(!refreshed.changed, "the new pin's first run");
+        assert!(!refreshed.changed, "the refresh changed the SQL");
         assert_eq!(
             refreshed.statements.len(),
             1,
@@ -711,7 +694,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(question.session_id, session, "pinned from the new session");
-        assert_eq!(question.pin, 2);
         let paid: i64 = db
             .run(|db| {
                 Ok(db.connection().query_row(

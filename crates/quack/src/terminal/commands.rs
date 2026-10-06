@@ -280,7 +280,22 @@ impl SlashCommand {
             })?;
             words.extend(split);
         }
-        SlashLine::try_parse_from(words).map(|line| line.command)
+        let command = SlashLine::try_parse_from(words)?.command;
+        if let Self::Saved {
+            action: Some(SavedAction::Run {
+                refresh, exit_code, ..
+            }),
+        } = &command
+            && let Some(flag) = [("--refresh", *refresh), ("--exit-code", *exit_code)]
+                .into_iter()
+                .find_map(|(flag, given)| given.then_some(flag))
+        {
+            return Err(SlashLine::command().error(
+                ErrorKind::UnknownArgument,
+                format!("{flag} is a command-line flag: quack saved run NAME {flag}"),
+            ));
+        }
+        Ok(command)
     }
 }
 
@@ -409,10 +424,9 @@ const HELP_COLUMN: usize = 18;
 /// more read as `VERB ...` and the popup lists them.
 const INLINE_VERBS: usize = 3;
 
-/// Arguments the terminal supplies itself (`--yes`: it never asks), has no
-/// use for (`/saved run`'s `--exit-code`, and `--refresh`, which asks the
-/// model from the command line), or clap's own, so offering them would
-/// mislead.
+/// Arguments the terminal supplies itself (`--yes`: it never asks), refuses
+/// (`/saved run`'s `--exit-code` and `--refresh` are command-line flags),
+/// or clap's own, so offering them would mislead.
 const IMPLIED_ARGS: &[&str] = &["yes", "help", "exit_code", "refresh"];
 
 impl SlashCommand {
@@ -877,9 +891,9 @@ mod tests {
 
     /// `/saved` is the CLI's verbs: bare, it lists; `add` takes the
     /// session's last answer, so `--from-session` is optional here; the
-    /// flags the terminal has no use for are not offered.
+    /// command-line flags are neither offered nor accepted.
     #[test]
-    fn saved_verbs_parse_and_hide_the_command_line_only_flags() {
+    fn saved_verbs_parse_and_refuse_the_command_line_only_flags() {
         assert!(matches!(
             SlashCommand::parse("/saved"),
             Ok(SlashCommand::Saved { action: None })
@@ -917,8 +931,22 @@ mod tests {
         ));
         assert!(parses("/saved show overdue"));
         assert!(parses("/saved list --format json"));
+        assert!(parses("/saved run overdue -f csv"));
         assert!(!parses("/saved run"));
         assert!(!parses("/saved forget overdue"));
+        for flag in ["--refresh", "--exit-code"] {
+            let refused = SlashCommand::parse(&format!("/saved run overdue {flag}"))
+                .err()
+                .map(|e| (e.kind(), e.to_string()));
+            let Some((kind, text)) = refused else {
+                fail(&format!("{flag} was accepted"));
+            };
+            assert_eq!(kind, ErrorKind::UnknownArgument);
+            assert!(
+                text.contains(&format!("quack saved run NAME {flag}")),
+                "{text}"
+            );
+        }
         assert_eq!(words("/saved "), ["list", "add", "run", "show", "remove"]);
         assert_eq!(words("/saved run overdue --"), ["--format"]);
         assert_eq!(words("/saved add x --"), ["--from-session", "--message"]);

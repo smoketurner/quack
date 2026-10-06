@@ -7,12 +7,12 @@
 use crate::analysis::events::ToolName;
 use crate::error::{Error, Record, Result};
 use crate::ids::{RunId, SavedId, SessionId, UserId};
-use crate::storage::sessions::{self, ChatMode, MessageRole, MessageRow};
+use crate::storage::sessions::{self, ChatMode, MessageRole, MessageRow, SessionRow};
 use crate::storage::workspace::{DigestedResults, StatementKind, WorkspaceDb};
 
 /// The saved questions and their runs, created with the other internal
-/// tables. `pin` counts each time a question's statements are pinned; a
-/// run compares itself only with runs of the same pin.
+/// tables. A run's `statements` carry each statement's SQL and digest,
+/// never its rows.
 pub const DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_saved_questions (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -20,7 +20,6 @@ pub const DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_saved_questions (
     mode TEXT NOT NULL,
     statements JSON NOT NULL,
     session_id TEXT NOT NULL,
-    pin INTEGER NOT NULL DEFAULT 1,
     created_by TEXT,
     created_at TIMESTAMP DEFAULT now(),
     pinned_at TIMESTAMP DEFAULT now()
@@ -28,7 +27,6 @@ pub const DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_saved_questions (
 CREATE TABLE IF NOT EXISTS _quack_saved_runs (
     id TEXT PRIMARY KEY,
     saved_id TEXT NOT NULL,
-    pin INTEGER NOT NULL,
     ran_at TIMESTAMP DEFAULT now(),
     status TEXT NOT NULL,
     changed BOOLEAN NOT NULL,
@@ -46,16 +44,13 @@ pub struct SavedQuestion {
     pub statements: Vec<String>,
     /// The session the statements were pinned from.
     pub session_id: SessionId,
-    /// How many times the statements were pinned; runs of an earlier pin
-    /// are history, never compared with.
-    pub pin: i64,
     pub created_by: Option<UserId>,
     pub created_at: String,
     pub pinned_at: String,
 }
 
 const QUESTION_COLUMNS: &str = "id, name, question, mode, CAST(statements AS VARCHAR), \
-     session_id, pin, created_by, CAST(created_at AS VARCHAR), CAST(pinned_at AS VARCHAR)";
+     session_id, created_by, CAST(created_at AS VARCHAR), CAST(pinned_at AS VARCHAR)";
 
 /// A row selected with [`QUESTION_COLUMNS`].
 impl TryFrom<&duckdb::Row<'_>> for SavedQuestion {
@@ -71,10 +66,9 @@ impl TryFrom<&duckdb::Row<'_>> for SavedQuestion {
             mode: mode.parse()?,
             statements: serde_json::from_str(&statements)?,
             session_id: row.get(5)?,
-            pin: row.get(6)?,
-            created_by: row.get(7)?,
-            created_at: row.get(8)?,
-            pinned_at: row.get(9)?,
+            created_by: row.get(6)?,
+            created_at: row.get(7)?,
+            pinned_at: row.get(8)?,
         })
     }
 }
@@ -108,14 +102,11 @@ struct Pinned {
 }
 
 impl Pinned {
-    /// The turn that ends with `answer` in `session_id`: the question it
+    /// The turn that ends with `answer` in `session`: the question it
     /// answered, and the `run_sql` statements that returned rows, each
     /// classified again as a read.
-    fn from_session(db: &WorkspaceDb, session_id: &SessionId, answer: Answer) -> Result<Self> {
-        if sessions::get_session(db, session_id)?.is_none() {
-            return Err(Record::Session.missing(session_id.as_str()));
-        }
-        let messages = sessions::messages(db, session_id)?;
+    fn from_session(db: &WorkspaceDb, session: &SessionRow, answer: Answer) -> Result<Self> {
+        let messages = sessions::messages(db, &session.id)?;
         let end = match answer {
             Answer::Last => messages
                 .iter()
@@ -201,7 +192,7 @@ pub fn save(
     }
     let session = sessions::get_session(db, session_id)?
         .ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
-    let pinned = Pinned::from_session(db, session_id, answer)?;
+    let pinned = Pinned::from_session(db, &session, answer)?;
     let id = SavedId::generate();
     db.connection().execute(
         "INSERT INTO _quack_saved_questions \
@@ -222,7 +213,8 @@ pub fn save(
 
 /// Pin the statements of `answer` in `session_id` to the saved question
 /// `id` in place of the ones it has: a refresh asked the question again.
-/// The next run compares with nothing older than this pin.
+/// The next run compares with the run before only if the statements came
+/// out the same.
 ///
 /// # Errors
 ///
@@ -233,10 +225,12 @@ pub fn repin(
     session_id: &SessionId,
     answer: Answer,
 ) -> Result<SavedQuestion> {
-    let pinned = Pinned::from_session(db, session_id, answer)?;
+    let session = sessions::get_session(db, session_id)?
+        .ok_or_else(|| Record::Session.missing(session_id.as_str()))?;
+    let pinned = Pinned::from_session(db, &session, answer)?;
     let changed = db.connection().execute(
         "UPDATE _quack_saved_questions \
-         SET statements = ?, session_id = ?, pin = pin + 1, pinned_at = now() WHERE id = ?",
+         SET statements = ?, session_id = ?, pinned_at = now() WHERE id = ?",
         duckdb::params![serde_json::to_string(&pinned.statements)?, session_id, id],
     )?;
     if changed == 0 {
@@ -291,15 +285,17 @@ pub fn by_id(db: &WorkspaceDb, id: &SavedId) -> Result<Option<SavedQuestion>> {
 ///
 /// Returns an error if a delete fails.
 pub fn remove(db: &WorkspaceDb, id: &SavedId) -> Result<bool> {
-    db.connection().execute(
-        "DELETE FROM _quack_saved_runs WHERE saved_id = ?",
-        duckdb::params![id],
-    )?;
-    let removed = db.connection().execute(
-        "DELETE FROM _quack_saved_questions WHERE id = ?",
-        duckdb::params![id],
-    )?;
-    Ok(removed > 0)
+    db.write_transaction(|db| {
+        db.connection().execute(
+            "DELETE FROM _quack_saved_runs WHERE saved_id = ?",
+            duckdb::params![id],
+        )?;
+        let removed = db.connection().execute(
+            "DELETE FROM _quack_saved_questions WHERE id = ?",
+            duckdb::params![id],
+        )?;
+        Ok(removed > 0)
+    })
 }
 
 /// How a run ended.
@@ -318,16 +314,17 @@ text_enum!(RunStatus, "run status", { Ok => "ok", Failed => "failed" });
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementRun {
     pub sql: String,
-    /// SHA-256 of the columns and every row; absent when the statement failed.
+    /// The digest of the columns and every row in any order
+    /// (`WorkspaceDb::execute_query_digested`); absent when the statement
+    /// failed.
     pub digest: Option<String>,
     /// Rows the statement produced; absent when it failed.
     pub rows: Option<u64>,
-    /// Rows the same statement produced in the run compared with.
-    pub previous_rows: Option<u64>,
-    /// Whether the digest differs from that run's.
+    /// Whether the digest differs from the run compared with.
     pub changed: bool,
     pub columns: Vec<String>,
-    /// The rows, when the result fit the row cap.
+    /// The rows, when the result fit the row cap. Only the run that
+    /// produced them carries them; a run read back from storage has none.
     pub result: Option<Vec<Vec<serde_json::Value>>>,
     pub error: Option<String>,
 }
@@ -336,7 +333,6 @@ impl StatementRun {
     /// What `sql` produced, against `previous`, the same statement in the
     /// run compared with.
     fn of(sql: &str, outcome: Result<DigestedResults>, previous: Option<&Self>) -> Self {
-        let previous_rows = previous.and_then(|p| p.rows);
         match outcome {
             Ok(digested) => {
                 let kept = digested.results;
@@ -347,7 +343,6 @@ impl StatementRun {
                     sql: sql.to_owned(),
                     digest: Some(digested.digest),
                     rows: Some(u64::try_from(kept.total_rows).unwrap_or(u64::MAX)),
-                    previous_rows,
                     changed,
                     columns: kept.results.columns,
                     result: (!truncated).then_some(kept.results.rows),
@@ -358,7 +353,6 @@ impl StatementRun {
                 sql: sql.to_owned(),
                 digest: None,
                 rows: None,
-                previous_rows,
                 changed: false,
                 columns: Vec::new(),
                 result: None,
@@ -373,12 +367,12 @@ impl StatementRun {
 pub struct SavedRun {
     pub id: RunId,
     pub saved_id: SavedId,
-    pub pin: i64,
     pub ran_at: String,
     pub status: RunStatus,
     /// Whether any statement's result differs from the run compared with:
-    /// the newest completed run of the same pin. The first run is not
-    /// changed, nor is a failed one.
+    /// the newest completed run, when it ran the same statements. The
+    /// first run is not changed, nor is a failed one, nor the first after
+    /// a refresh that changed the SQL.
     pub changed: bool,
     pub statements: Vec<StatementRun>,
 }
@@ -395,23 +389,22 @@ impl SavedRun {
     }
 }
 
-const RUN_COLUMNS: &str = "id, saved_id, pin, CAST(ran_at AS VARCHAR), status, changed, \
-     CAST(statements AS VARCHAR)";
+const RUN_COLUMNS: &str =
+    "id, saved_id, CAST(ran_at AS VARCHAR), status, changed, CAST(statements AS VARCHAR)";
 
 /// A row selected with [`RUN_COLUMNS`].
 impl TryFrom<&duckdb::Row<'_>> for SavedRun {
     type Error = Error;
 
     fn try_from(row: &duckdb::Row<'_>) -> Result<Self> {
-        let status: String = row.get(4)?;
-        let statements: String = row.get(6)?;
+        let status: String = row.get(3)?;
+        let statements: String = row.get(5)?;
         Ok(Self {
             id: row.get(0)?,
             saved_id: row.get(1)?,
-            pin: row.get(2)?,
-            ran_at: row.get(3)?,
+            ran_at: row.get(2)?,
             status: status.parse()?,
-            changed: row.get(5)?,
+            changed: row.get(4)?,
             statements: serde_json::from_str(&statements)?,
         })
     }
@@ -433,15 +426,22 @@ fn execute(db: &WorkspaceDb, sql: &str, max_rows: u32) -> Result<DigestedResults
 }
 
 /// Run every statement of `question` and record the run: each result's
-/// digest and row count, the rows when they fit `max_rows`, and whether
-/// any digest differs from the newest completed run of the same pin. A
-/// statement that fails is recorded with its error and fails the run.
+/// digest and row count, and whether any digest differs from the newest
+/// completed run, when that run ran the same statements. The returned run
+/// carries each result's rows when they fit `max_rows`; the record does
+/// not. A statement that fails is recorded with its error and fails the
+/// run.
 ///
 /// # Errors
 ///
 /// Returns an error if the run cannot be recorded.
 pub fn run(db: &WorkspaceDb, question: &SavedQuestion, max_rows: u32) -> Result<SavedRun> {
-    let previous = last_completed(db, &question.id, question.pin)?;
+    let previous = last_completed(db, &question.id)?.filter(|run| {
+        run.statements
+            .iter()
+            .map(|s| &s.sql)
+            .eq(&question.statements)
+    });
     let mut statements = Vec::with_capacity(question.statements.len());
     for (n, sql) in question.statements.iter().enumerate() {
         let before = previous.as_ref().and_then(|p| p.statements.get(n));
@@ -453,34 +453,38 @@ pub fn run(db: &WorkspaceDb, question: &SavedQuestion, max_rows: u32) -> Result<
         RunStatus::Ok
     };
     let changed = status == RunStatus::Ok && statements.iter().any(|s| s.changed);
+    let rows: Vec<_> = statements.iter_mut().map(|s| s.result.take()).collect();
     let id = RunId::generate();
     db.connection().execute(
-        "INSERT INTO _quack_saved_runs (id, saved_id, pin, status, changed, statements) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO _quack_saved_runs (id, saved_id, status, changed, statements) \
+         VALUES (?, ?, ?, ?, ?)",
         duckdb::params![
             id,
             question.id,
-            question.pin,
             status.as_str(),
             changed,
             serde_json::to_string(&statements)?
         ],
     )?;
-    runs(db, &question.id, 1)?
+    let mut run = runs(db, &question.id, 1)?
         .into_iter()
         .next()
-        .ok_or_else(|| Error::Analysis(String::from("run vanished after insert")))
+        .ok_or_else(|| Error::Analysis(String::from("run vanished after insert")))?;
+    for (statement, rows) in run.statements.iter_mut().zip(rows) {
+        statement.result = rows;
+    }
+    Ok(run)
 }
 
-/// The newest run of `pin` that every statement of ran: what the next
-/// run compares with.
-fn last_completed(db: &WorkspaceDb, id: &SavedId, pin: i64) -> Result<Option<SavedRun>> {
+/// The newest run that every statement of ran: what the next run
+/// compares with.
+fn last_completed(db: &WorkspaceDb, id: &SavedId) -> Result<Option<SavedRun>> {
     let sql = format!(
         "SELECT {RUN_COLUMNS} FROM _quack_saved_runs \
-         WHERE saved_id = ? AND pin = ? AND status = ? ORDER BY id DESC LIMIT 1"
+         WHERE saved_id = ? AND status = ? ORDER BY id DESC LIMIT 1"
     );
     let mut stmt = db.connection().prepare(&sql)?;
-    let mut rows = stmt.query(duckdb::params![id, pin, RunStatus::Ok.as_str()])?;
+    let mut rows = stmt.query(duckdb::params![id, RunStatus::Ok.as_str()])?;
     rows.next()?.map(SavedRun::try_from).transpose()
 }
 
@@ -575,7 +579,6 @@ mod tests {
         assert_eq!(saved.question, "which invoices are overdue?");
         assert_eq!(saved.mode, ChatMode::Query);
         assert_eq!(saved.statements, ["SELECT count(*) FROM invoices", OVERDUE]);
-        assert_eq!(saved.pin, 1);
         assert_eq!(by_name(&db, "overdue").unwrap(), Some(saved.clone()));
         assert_eq!(by_id(&db, &saved.id).unwrap(), Some(saved.clone()));
         assert_eq!(list(&db).unwrap(), std::slice::from_ref(&saved));
@@ -648,7 +651,6 @@ mod tests {
         assert!(!first.changed, "the first run compares with nothing");
         let statement = &first.statements[0];
         assert_eq!(statement.rows, Some(1));
-        assert_eq!(statement.previous_rows, None);
         assert_eq!(statement.columns, ["id"]);
         assert_eq!(statement.result, Some(vec![vec![serde_json::json!(1)]]));
         assert_eq!(statement.digest.as_ref().map(String::len), Some(64));
@@ -656,7 +658,6 @@ mod tests {
         let second = run(&db, &saved, 100).unwrap();
         assert!(!second.changed);
         assert_eq!(second.statements[0].digest, statement.digest);
-        assert_eq!(second.statements[0].previous_rows, Some(1));
 
         db.execute_statement("INSERT INTO invoices VALUES (3, '2026-10-01', false)")
             .unwrap();
@@ -664,7 +665,6 @@ mod tests {
         assert!(third.changed);
         assert_eq!(third.verdict(), "changed");
         assert_eq!(third.statements[0].rows, Some(2));
-        assert_eq!(third.statements[0].previous_rows, Some(1));
         assert_ne!(third.statements[0].digest, statement.digest);
 
         let fourth = run(&db, &saved, 100).unwrap();
@@ -679,6 +679,11 @@ mod tests {
         let history = runs(&db, &saved.id, 10).unwrap();
         assert_eq!(history.len(), 5);
         assert_eq!(history[0].id, capped.id, "newest first");
+        assert!(
+            history.iter().all(|r| r.statements[0].result.is_none()),
+            "rows are returned once, never stored"
+        );
+        assert_eq!(history[1].statements[0].digest, fourth.statements[0].digest);
         assert!(remove(&db, &saved.id).unwrap());
         assert!(runs(&db, &saved.id, 10).unwrap().is_empty());
     }
@@ -705,7 +710,6 @@ mod tests {
             "{statement:?}"
         );
         assert_eq!(statement.rows, None);
-        assert_eq!(statement.previous_rows, Some(1));
         assert_eq!(
             runs(&db, &saved.id, 10).unwrap()[0].status,
             RunStatus::Failed
@@ -720,7 +724,6 @@ mod tests {
         let back = run(&db, &saved, 100).unwrap();
         assert_eq!(back.status, RunStatus::Ok);
         assert!(!back.changed);
-        assert_eq!(back.statements[0].previous_rows, Some(1));
     }
 
     /// A pinned statement is classified again when it runs, so a write or
@@ -768,41 +771,56 @@ mod tests {
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn repin_replaces_the_statements_and_starts_comparison_over() {
+    fn repin_replaces_the_statements_and_compares_only_with_a_run_of_the_same_sql() {
         let db = db();
         let session = session_with(&db, "overdue?", vec![step(OVERDUE, Some(1))]);
         let saved = save(&db, "overdue", &session, Answer::Last, None).unwrap();
         run(&db, &saved, 100).unwrap();
 
-        let again = session_with(
+        // The same SQL pinned again: the next run still compares with the
+        // run before it.
+        let same = session_with(&db, "overdue?", vec![step(OVERDUE, Some(1))]);
+        let repinned = repin(&db, &saved.id, &same, Answer::Last).unwrap();
+        assert_eq!(repinned.session_id, same);
+        assert_eq!(repinned.statements, saved.statements);
+        db.execute_statement("INSERT INTO invoices VALUES (3, '2026-10-01', false)")
+            .unwrap();
+        assert!(run(&db, &repinned, 100).unwrap().changed);
+
+        let other = session_with(
             &db,
             "overdue?",
-            vec![step("SELECT id, due FROM invoices WHERE NOT paid", Some(1))],
+            vec![step("SELECT id, due FROM invoices WHERE NOT paid", Some(2))],
         );
-        let repinned = repin(&db, &saved.id, &again, Answer::Last).unwrap();
-        assert_eq!(repinned.pin, 2);
-        assert_eq!(repinned.session_id, again);
+        let repinned = repin(&db, &saved.id, &other, Answer::Last).unwrap();
+        assert_eq!(repinned.session_id, other);
         assert_eq!(
             repinned.statements,
             ["SELECT id, due FROM invoices WHERE NOT paid"]
         );
         assert_eq!(repinned.question, saved.question);
-        let first_of_pin = run(&db, &repinned, 100).unwrap();
+        let first_of_new_sql = run(&db, &repinned, 100).unwrap();
         assert!(
-            !first_of_pin.changed,
-            "the new pin's first run compares with nothing"
+            !first_of_new_sql.changed,
+            "the run before ran other SQL, so there is nothing to compare with"
         );
-        assert_eq!(first_of_pin.statements[0].previous_rows, None);
-        assert_eq!(first_of_pin.pin, 2);
+        db.execute_statement("INSERT INTO invoices VALUES (4, '2026-10-02', false)")
+            .unwrap();
+        assert!(
+            run(&db, &repinned, 100).unwrap().changed,
+            "the second run of the new SQL compares with the first"
+        );
 
-        let missing = repin(&db, &SavedId::from("nope"), &again, Answer::Last).unwrap_err();
+        let missing = repin(&db, &SavedId::from("nope"), &other, Answer::Last).unwrap_err();
         assert_eq!(missing.to_string(), "saved question 'nope' does not exist");
         let no_sql = session_with(&db, "hi", vec![]);
         assert!(repin(&db, &saved.id, &no_sql, Answer::Last).is_err());
         assert_eq!(
-            by_id(&db, &saved.id).unwrap().unwrap().pin,
-            2,
+            by_id(&db, &saved.id).unwrap().unwrap().session_id,
+            other,
             "a refused repin changes nothing"
         );
+        let gone = repin(&db, &saved.id, &SessionId::from("nope"), Answer::Last).unwrap_err();
+        assert_eq!(gone.to_string(), "session 'nope' does not exist");
     }
 }

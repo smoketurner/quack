@@ -7150,11 +7150,19 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["changed"], true);
     assert_eq!(body["statements"][0]["rows"], 2);
-    assert_eq!(body["statements"][0]["previous_rows"], 1);
+    assert_eq!(
+        body["statements"][0]["result"],
+        serde_json::json!([[1], [2]])
+    );
     let (status, body) = h.get(&format!("{base}/{saved}/runs"), &viewer_token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["runs"].as_array().map(Vec::len), Some(2));
     assert_eq!(body["runs"][1]["id"], first_run, "newest first");
+    assert_eq!(
+        body["runs"][0]["statements"][0]["result"],
+        serde_json::Value::Null,
+        "rows are answered once, never stored"
+    );
     let (status, body) = h
         .get(&format!("{base}/{saved}/runs?limit=1"), &viewer_token)
         .await;
