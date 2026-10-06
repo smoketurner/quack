@@ -1476,6 +1476,20 @@ async fn check_sign_in(report: &mut Report, config: &Config, probing: Probing) {
         )
         .fix("check [server.oidc].issuer_url, and that this host can reach the issuer"),
     });
+    if let Some(claim) = &oidc.groups_claim
+        && matches!(sign_in.claim_supported(claim).await, Ok(Some(false)))
+    {
+        report.push(
+            Check::new(
+                Area::Server,
+                Status::Warn,
+                format!(
+                    "[server.oidc].groups_claim = \"{claim}\", but the issuer's claims_supported does not list it; sign-ins would revoke every provider-granted membership"
+                ),
+            )
+            .fix("check the claim's name, and that the issuer is configured to put groups in its tokens"),
+        );
+    }
 }
 
 /// Warn about the temporary sign-in clients an interrupted `quack auth

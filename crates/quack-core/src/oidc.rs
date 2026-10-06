@@ -126,6 +126,32 @@ pub struct SignedIn {
     /// subject.
     pub username: String,
     pub token: CachedToken,
+    /// The person's groups, when `[server.oidc].groups_claim` names a claim.
+    pub groups: Groups,
+}
+
+/// What a token said about the person's groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Groups {
+    /// No `groups_claim` is configured: memberships are by hand.
+    NotRead,
+    /// The claim's values, a string or an array of strings; absent from
+    /// the token means none.
+    Listed(Vec<String>),
+    /// Entra left the groups out (`_claim_names` names the claim) because
+    /// the person is in too many; nothing is known, so nothing changes.
+    Overage,
+}
+
+impl Groups {
+    /// The groups to reconcile memberships against, when they are known.
+    #[must_use]
+    pub fn listed(&self) -> Option<&[String]> {
+        match self {
+            Self::Listed(groups) => Some(groups),
+            Self::NotRead | Self::Overage => None,
+        }
+    }
 }
 
 /// What renewing a signed-in user's token found.
@@ -169,6 +195,37 @@ impl Person {
             .find_map(|claim| self.text(claim))
             .unwrap_or(subject.as_str())
             .to_owned()
+    }
+
+    /// The person's groups under `claim`: a string, an array of strings,
+    /// or absent (none). An Entra overage marker, `_claim_names` naming
+    /// the claim, means the groups were left out, not that there are none.
+    fn groups(&self, claim: Option<&str>) -> Groups {
+        let Some(claim) = claim else {
+            return Groups::NotRead;
+        };
+        let overage = self
+            .claims
+            .get("_claim_names")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|names| names.contains_key(claim));
+        if overage {
+            tracing::warn!(
+                claim,
+                "the token names the groups claim in _claim_names (an overage); memberships are left as they are"
+            );
+            return Groups::Overage;
+        }
+        let groups = match self.claims.get(claim) {
+            Some(serde_json::Value::String(one)) => vec![one.trim().to_owned()],
+            Some(serde_json::Value::Array(many)) => many
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|g| g.trim().to_owned())
+                .collect(),
+            Some(_) | None => Vec::new(),
+        };
+        Groups::Listed(groups.into_iter().filter(|g| !g.is_empty()).collect())
     }
 }
 
@@ -328,6 +385,8 @@ pub struct Bearer {
     pub username: String,
     /// When the token stops being accepted.
     pub expires_at: Timestamp,
+    /// The person's groups, when `[server.oidc].groups_claim` names a claim.
+    pub groups: Groups,
 }
 
 impl std::fmt::Debug for SignIn {
@@ -387,6 +446,21 @@ impl SignIn {
     /// Returns an error when discovery fails or names another issuer.
     pub async fn discover(&self) -> Result<()> {
         self.endpoints().await.map(drop)
+    }
+
+    /// Whether discovery's `claims_supported` lists `claim`; `None` when
+    /// the issuer publishes no such list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery fails.
+    pub async fn claim_supported(&self, claim: &str) -> Result<Option<bool>> {
+        Ok(self
+            .endpoints()
+            .await?
+            .claims_supported
+            .as_ref()
+            .map(|claims| claims.iter().any(|c| c == claim)))
     }
 
     /// Check the callback's `iss` against the issuer (RFC 9207).
@@ -580,6 +654,7 @@ impl SignIn {
         }
         Ok(SignedIn {
             username: claims.person.username(&subject),
+            groups: claims.person.groups(self.config.groups_claim.as_deref()),
             subject,
             token: CachedToken::from_response(&response),
         })
@@ -665,6 +740,7 @@ impl SignIn {
             .ok_or_else(|| bearer_error(format!("the token has no {claim} claim")))?;
         Ok(Bearer {
             username: claims.person.username(&subject),
+            groups: claims.person.groups(self.config.groups_claim.as_deref()),
             subject,
             expires_at: Timestamp::from_second(claims.exp).unwrap_or(Timestamp::MIN),
         })

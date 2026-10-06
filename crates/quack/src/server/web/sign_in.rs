@@ -15,7 +15,7 @@ use super::WebResult;
 use super::flash::Flash;
 use crate::server::auth::{Peer, RequestId, SessionCookie};
 use crate::server::error::ApiError;
-use crate::server::oidc::{Oidc, PENDING_TTL, STATE_COOKIE};
+use crate::server::oidc::{self as oidc_server, Oidc, PENDING_TTL, STATE_COOKIE};
 use crate::server::state::App;
 
 /// What the issuer's redirect carries.
@@ -151,11 +151,19 @@ pub(super) async fn finish(
         .control
         .oidc_user(&signed_in.subject, &signed_in.username)
         .await?;
+    if user.is_disabled() {
+        entry.user_id = Some(user.id.clone());
+        app.control.record_audit(&entry).await?;
+        return Ok(Flash::error("/login", "this account is disabled").into_response());
+    }
     entry.outcome = Outcome::Allowed;
     entry.user_id = Some(user.id.clone());
     // Audited before the token and session commit, so a failed audit write
     // leaves no credential.
     app.control.record_audit(&entry).await?;
+    if let Some(groups) = signed_in.groups.listed() {
+        oidc_server::reconcile_groups(&app.control, &user, groups, &entry.origin).await?;
+    }
     // The token and the session it serves appear together.
     let token = oidc.keep_and_open(&user.id, &signed_in.token).await?;
     Ok((

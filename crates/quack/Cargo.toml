@@ -54,6 +54,7 @@ uuid               = { workspace = true, features = ["std", "v7"] }
 # Tests sign access tokens the way an issuer would; the binary itself signs
 # nothing and gets its crypto through quack-core.
 aws-lc-rs    = { workspace = true, features = ["aws-lc-sys"] }
+ipnet        = { workspace = true, features = ["std"] }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 proptest     = { workspace = true, features = ["std"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
