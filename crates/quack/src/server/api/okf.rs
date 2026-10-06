@@ -25,9 +25,9 @@ use crate::server::error::ApiResult;
 use crate::server::state::App;
 
 /// Bytes gathered before one is sent to the body.
-const CHUNK_BYTES: usize = 64 * 1024;
+pub(crate) const CHUNK_BYTES: usize = 64 * 1024;
 /// Chunks the export may run ahead of the client.
-const CHUNKS_IN_FLIGHT: usize = 8;
+pub(crate) const CHUNKS_IN_FLIGHT: usize = 8;
 
 pub(crate) async fn export(
     State(app): State<App>,
@@ -99,13 +99,13 @@ pub(crate) async fn export(
 /// A `Write` on the export's blocking thread that sends what it gathers
 /// to the response body in `CHUNK_BYTES` pieces. A closed channel (the
 /// client went away) is a broken pipe, which ends the export.
-struct BodyWriter {
+pub(crate) struct BodyWriter {
     tx: mpsc::Sender<io::Result<Bytes>>,
     pending: Vec<u8>,
 }
 
 impl BodyWriter {
-    fn new(tx: mpsc::Sender<io::Result<Bytes>>) -> Self {
+    pub(crate) fn new(tx: mpsc::Sender<io::Result<Bytes>>) -> Self {
         Self {
             tx,
             pending: Vec::with_capacity(CHUNK_BYTES),

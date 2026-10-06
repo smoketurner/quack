@@ -48,7 +48,7 @@ use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, MessageRole, Sharing, Transcript,
 };
 use quack_core::storage::workspace::{
-    Pinning, QueryCanceller, SqlSchema, StatementKind, WorkspaceDb,
+    Pinning, QueryCanceller, QueryResults, SqlSchema, StatementKind, WorkspaceDb,
 };
 
 use crate::ModeArg;
@@ -127,6 +127,9 @@ pub(crate) struct Message {
     pub(crate) chart: Option<ChartData>,
     /// A step's full tool detail, shown whole when steps are expanded.
     pub(crate) detail: Option<String>,
+    /// The rows a `run_sql` or `create_chart` step kept, shown as a
+    /// table when steps are expanded.
+    pub(crate) result: Option<QueryResults>,
 }
 
 impl Message {
@@ -136,6 +139,7 @@ impl Message {
             content: content.into(),
             chart: None,
             detail: None,
+            result: None,
         }
     }
 
@@ -160,6 +164,7 @@ impl From<&ToolStep> for Message {
     fn from(step: &ToolStep) -> Self {
         Self {
             detail: Some(step.detail.clone()),
+            result: step.result.clone(),
             ..Self::new(
                 MessageKind::Step,
                 format!(
@@ -1454,6 +1459,7 @@ impl App {
                 {
                     let line = format!("\n  {}, {} ms", step.summary, step.duration_ms);
                     msg.content.push_str(&line);
+                    msg.result = step.result;
                 } else {
                     self.post(Message::from(&step));
                 }

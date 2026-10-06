@@ -223,9 +223,11 @@ fn write_text_answer(out: &mut impl Write, streamed: &str, response: &AgentRespo
         writeln!(out)?;
         writeln!(
             out,
-            "Chart: {} ({} chart, {} points; --format json carries the spec)",
+            "Chart: {} ({}{} chart of {}, {} points; --format json carries the spec)",
             chart.title,
+            if chart.stacked { "stacked " } else { "" },
             chart.kind.as_str(),
+            chart.series_names().join(", "),
             chart.points()
         )?;
     }
@@ -472,6 +474,7 @@ mod tests {
                 detail: String::new(),
                 summary: String::from("3 rows"),
                 rows: Some(3),
+                result: None,
                 duration_ms: 12,
             },
         )

@@ -39,10 +39,11 @@ pub(crate) struct SeriesData {
     pub(crate) values: Vec<u64>,
 }
 
-/// A line or scatter chart's points, already scaled to its axes.
+/// A line or scatter chart's series, already scaled to shared axes.
 #[derive(Debug, Clone)]
 pub(crate) struct LineData {
-    pub(crate) points: Vec<(f64, f64)>,
+    /// Each series' name and its points against the label index.
+    pub(crate) series: Vec<(String, Vec<(f64, f64)>)>,
     x_bounds: [f64; 2],
     pub(crate) y_bounds: [f64; 2],
     x_labels: Vec<String>,
@@ -98,6 +99,21 @@ impl ChartData {
             .map(|s| s.values.as_slice())
             .unwrap_or_default();
         let plot = match spec.kind {
+            // Stacked bars: one bar per label of the series' sum, the
+            // parts named in the title, since the widget draws no stacks.
+            ChartKind::Bar if spec.stacked && spec.series.len() > 1 => Plot::Bars {
+                values: (0..labels.len())
+                    .map(|i| {
+                        to_u64(
+                            spec.series
+                                .iter()
+                                .map(|s| s.values.get(i).copied().unwrap_or(0.0))
+                                .sum(),
+                        )
+                    })
+                    .collect(),
+                labels,
+            },
             ChartKind::Bar if spec.series.len() > 1 => Plot::Grouped {
                 labels,
                 series: spec
@@ -125,6 +141,11 @@ impl ChartData {
                     })
                     .collect(),
             ),
+        };
+        let title = if spec.stacked && spec.series.len() > 1 {
+            format!("{title} (stacked: {})", spec.series_names().join(" + "))
+        } else {
+            title
         };
         Self { title, plot }
     }
@@ -190,41 +211,57 @@ impl ChartData {
 }
 
 impl LineData {
-    /// The first series against its index, bounded to include zero with a
-    /// tenth of the range as margin.
+    /// Every series against the label index on shared axes, bounded to
+    /// include zero with a tenth of the range as margin. A stacked chart
+    /// draws each series on top of the ones before it.
     fn of(spec: &ChartSpec, graph_type: GraphType) -> Self {
-        let y_values = spec
+        let mut rows: Vec<(String, Vec<f64>)> = spec
             .series
-            .first()
-            .map(|s| s.values.as_slice())
-            .unwrap_or_default();
-
+            .iter()
+            .map(|s| (s.name.clone(), s.values.clone()))
+            .collect();
+        if spec.stacked {
+            let mut below: Vec<f64> = Vec::new();
+            for (_, values) in &mut rows {
+                for (i, value) in values.iter_mut().enumerate() {
+                    let under = below.get(i).copied().unwrap_or(0.0);
+                    *value += under;
+                    if below.len() <= i {
+                        below.resize(i.saturating_add(1), 0.0);
+                    }
+                    if let Some(slot) = below.get_mut(i) {
+                        *slot = *value;
+                    }
+                }
+            }
+        }
         #[expect(
             clippy::cast_precision_loss,
             reason = "index-to-f64 for chart coordinates"
         )]
-        let points: Vec<(f64, f64)> = y_values
+        let series: Vec<(String, Vec<(f64, f64)>)> = rows
             .iter()
-            .enumerate()
-            .map(|(i, &y)| (i as f64, y))
+            .map(|(name, values)| {
+                (
+                    name.clone(),
+                    values
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &y)| (i as f64, y))
+                        .collect(),
+                )
+            })
             .collect();
+        let all = rows.iter().flat_map(|(_, values)| values.iter().copied());
 
         #[expect(clippy::cast_precision_loss, reason = "length-to-f64 for chart bounds")]
-        let x_max = points.len().saturating_sub(1) as f64;
-        let y_min = y_values
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min)
-            .min(0.0);
-        let y_max = y_values
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max)
-            .max(0.0);
+        let x_max = spec.points().saturating_sub(1) as f64;
+        let y_min = all.clone().fold(f64::INFINITY, f64::min).min(0.0);
+        let y_max = all.fold(f64::NEG_INFINITY, f64::max).max(0.0);
         let y_pad = (y_max - y_min).abs() * 0.1;
 
         Self {
-            points,
+            series,
             x_bounds: [0.0, x_max.max(1.0)],
             y_bounds: [y_min - y_pad, y_max + y_pad],
             x_labels: spec.x.values.clone(),
@@ -237,21 +274,34 @@ impl LineData {
         }
     }
 
-    /// The chart widget: the points against the first and last x labels
-    /// (or the bounds when there are none).
+    /// The chart widget: one dataset per series in the colour cycle,
+    /// against the first and last x labels (or the bounds when there are
+    /// none). The legend names the series when there are several.
     fn chart(&self) -> Chart<'_> {
-        let dataset = Dataset::default()
-            .marker(symbols::Marker::Braille)
-            .graph_type(self.graph_type)
-            .style(Style::default().fg(Color::Cyan))
-            .data(&self.points);
+        let datasets: Vec<Dataset<'_>> = self
+            .series
+            .iter()
+            .zip(COLORS.iter().cycle())
+            .map(|((name, points), &color)| {
+                let dataset = Dataset::default()
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(self.graph_type)
+                    .style(Style::default().fg(color))
+                    .data(points);
+                if self.series.len() > 1 {
+                    dataset.name(name.as_str())
+                } else {
+                    dataset
+                }
+            })
+            .collect();
         let [x_min, x_max] = self.x_bounds;
         let x_labels: Vec<Line<'_>> = match (self.x_labels.first(), self.x_labels.last()) {
             (Some(first), Some(last)) => vec![first.as_str().into(), last.as_str().into()],
             _ => vec![format!("{x_min:.0}").into(), format!("{x_max:.0}").into()],
         };
         let y_labels: Vec<Line<'_>> = self.y_labels.iter().map(|s| s.as_str().into()).collect();
-        Chart::new(vec![dataset])
+        Chart::new(datasets)
             .x_axis(
                 Axis::default()
                     .style(Style::default().fg(Color::DarkGray))
@@ -512,7 +562,37 @@ mod tests {
                     values: values.to_vec(),
                 })
                 .collect(),
+            stacked: false,
         }
+    }
+
+    #[test]
+    fn several_series_are_several_datasets_and_stacking_accumulates() {
+        let two = spec(
+            ChartKind::Line,
+            &["a", "b"],
+            &[("x", &[1.0, 2.0]), ("y", &[3.0, 4.0])],
+        );
+        let data = ChartData::from_spec(&two);
+        assert!(matches!(
+            &data.plot,
+            Plot::Line(line) if line.series.len() == 2 && line.series.get(1).is_some_and(|s| s.1 == vec![(0.0, 3.0), (1.0, 4.0)])
+        ));
+        let stacked = ChartData::from_spec(&two.stacked(true));
+        assert!(stacked.title.contains("stacked: x + y"));
+        assert!(matches!(
+            &stacked.plot,
+            Plot::Line(line) if line.series.get(1).is_some_and(|s| s.1 == vec![(0.0, 4.0), (1.0, 6.0)])
+        ));
+        let bars = ChartData::from_spec(
+            &spec(
+                ChartKind::Bar,
+                &["a", "b"],
+                &[("x", &[1.0, 2.0]), ("y", &[3.0, 4.0])],
+            )
+            .stacked(true),
+        );
+        assert!(matches!(&bars.plot, Plot::Bars { values, .. } if values == &[4, 6]));
     }
 
     #[test]
@@ -552,7 +632,7 @@ mod tests {
         ));
         assert!(matches!(
             &line.plot,
-            Plot::Line(data) if data.graph_type == GraphType::Line && data.points.len() == 3
+            Plot::Line(data) if data.graph_type == GraphType::Line && data.series.len() == 1 && data.series.first().is_some_and(|s| s.1.len() == 3)
         ));
         let scatter = ChartData::from_spec(&spec(ChartKind::Scatter, &["a"], &[("y", &[-5.0])]));
         assert!(matches!(
