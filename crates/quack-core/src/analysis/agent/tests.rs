@@ -84,6 +84,7 @@ fn to_json_carries_every_field_and_derives_queries() {
             chunk_index: 2,
             page: Some(4),
             heading: None,
+            locator: None,
             ingested_at: Some(jiff::civil::DateTime::constant(2026, 10, 5, 14, 3, 0, 0)),
             excerpt: String::new(),
         }],

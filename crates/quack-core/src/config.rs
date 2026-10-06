@@ -992,6 +992,11 @@ pub struct IngestionConfig {
     /// inflate to while it is parsed. The upload limit counts compressed
     /// bytes only.
     pub max_decompressed_mb: u64,
+    /// A table found inside a document (a PDF, DOCX, ODT, HTML, or
+    /// Markdown table) with at least this many data rows is also loaded
+    /// as a table of the workspace, owned by the document, so `run_sql`
+    /// can query it. Zero loads none.
+    pub table_rows_as_table: u32,
 }
 
 impl IngestionConfig {
@@ -1014,6 +1019,7 @@ impl Default for IngestionConfig {
             // Twice the upload limit: a package of stored media at that
             // limit still has as much again for its XML.
             max_decompressed_mb: 1024,
+            table_rows_as_table: 20,
         }
     }
 }

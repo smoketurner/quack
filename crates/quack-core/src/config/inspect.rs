@@ -353,6 +353,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "tokenizer_encoding",
             "upload_max_mb",
             "max_decompressed_mb",
+            "table_rows_as_table",
         ],
     ),
     (
@@ -684,6 +685,11 @@ fn ingestion(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) 
         "max_decompressed_mb",
         ingestion.max_decompressed_mb,
         default.max_decompressed_mb,
+    );
+    s.literal(
+        "table_rows_as_table",
+        ingestion.table_rows_as_table,
+        default.table_rows_as_table,
     );
 }
 

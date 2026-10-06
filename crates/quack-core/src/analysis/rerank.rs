@@ -226,6 +226,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::ids::{ChunkId, DocumentId};
+    use crate::ingestion::parser::SectionKind;
     use crate::llm::egress::Egress;
     use schemars::schema_for;
 
@@ -239,6 +240,8 @@ mod tests {
             heading: None,
             page: None,
             score: 1.0,
+            kind: SectionKind::Body,
+            locator: None,
             ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
         }
     }

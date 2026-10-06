@@ -8,6 +8,8 @@ use std::time::Duration;
 use aws_lc_rs::digest;
 use jiff::civil::DateTime;
 
+use std::collections::BTreeMap;
+
 use crate::config::Config;
 use crate::crypto;
 use crate::embedding::{
@@ -17,7 +19,7 @@ use crate::error::{Error, Result, WrittenBy};
 use crate::graph;
 use crate::ids::{ChunkId, DocumentId, NodeId, UserId};
 use crate::ingestion::TableName;
-use crate::ingestion::parser::{FileType, Load, PageCounts};
+use crate::ingestion::parser::{DocumentMeta, FileType, Load, PageCounts, SectionKind};
 use crate::ontology::store::Acceptance;
 use crate::saved;
 use crate::storage::control::ResourceKind;
@@ -94,7 +96,12 @@ const DOCUMENTS_DDL: &str = "
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_empty INTEGER;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS superseded_by TEXT;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_root TEXT;
-    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_path TEXT;";
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_path TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS author TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS authored_at TIMESTAMP;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS modified_at TIMESTAMP;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS tags JSON;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS metadata JSON;";
 
 /// Summaries of the turns a session's history window leaves out
 /// (`[analysis].compact_history`), each with how many replayable messages,
@@ -1199,6 +1206,8 @@ impl WorkspaceDb {
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS heading TEXT;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS page INTEGER;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS embedding_profile TEXT;
+            ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS kind TEXT;
+            ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS locator TEXT;
             CREATE TABLE IF NOT EXISTS _quack_embedding_profiles (
                 fingerprint TEXT PRIMARY KEY,
                 profile JSON NOT NULL,
@@ -1932,6 +1941,118 @@ impl WorkspaceDb {
         Ok(())
     }
 
+    /// Record what a parse found the document says about itself. A date
+    /// the database cannot read as a timestamp is kept in `metadata`
+    /// under its key instead of being lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn set_document_meta(&self, id: &DocumentId, meta: &DocumentMeta) -> Result<()> {
+        let mut extra = meta.extra.clone();
+        for (key, value) in [
+            ("authored_at", &meta.authored_at),
+            ("modified_at", &meta.modified_at),
+        ] {
+            if let Some(v) = value
+                && !self.parses_as_timestamp(v)?
+            {
+                extra.insert(key.to_owned(), v.clone());
+            }
+        }
+        self.conn.execute(
+            "UPDATE _quack_documents SET \
+                author = COALESCE(author, ?), \
+                authored_at = COALESCE(authored_at, TRY_CAST(? AS TIMESTAMP)), \
+                modified_at = COALESCE(modified_at, TRY_CAST(? AS TIMESTAMP)), \
+                tags = CASE WHEN tags IS NULL OR CAST(tags AS VARCHAR) = '[]' THEN ?::JSON ELSE tags END, \
+                metadata = ?::JSON \
+             WHERE id = ?",
+            duckdb::params![
+                meta.author,
+                meta.authored_at,
+                meta.modified_at,
+                serde_json::to_string(&meta.tags)?,
+                serde_json::to_string(&extra)?,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn parses_as_timestamp(&self, text: &str) -> Result<bool> {
+        let parsed: Option<String> = self.conn.query_row(
+            "SELECT CAST(TRY_CAST(? AS TIMESTAMP) AS VARCHAR)",
+            duckdb::params![text],
+            |r| r.get(0),
+        )?;
+        Ok(parsed.is_some())
+    }
+
+    /// A person's edit of a document's own fields: each given value
+    /// replaces the stored one (an empty text clears it), tags replace the
+    /// list whole.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document is missing, a date does not read
+    /// as one, or the update fails.
+    pub fn set_document_fields(&self, id: &DocumentId, fields: &DocumentFields) -> Result<()> {
+        if self.document(id)?.is_none() {
+            return Err(ResourceKind::Document.missing(id.as_str()));
+        }
+        if let Some(date) = fields
+            .authored_at
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+            && !self.parses_as_timestamp(date)?
+        {
+            return Err(Error::Analysis(format!(
+                "'{date}' is not a date; give one as YYYY-MM-DD or an ISO 8601 timestamp"
+            )));
+        }
+        let clear = |value: &Option<String>| value.as_deref().map(str::trim).map(str::is_empty);
+        if let Some(title) = &fields.title {
+            self.conn.execute(
+                "UPDATE _quack_documents SET title = ? WHERE id = ?",
+                duckdb::params![
+                    (clear(&fields.title) != Some(true)).then_some(title.trim()),
+                    id
+                ],
+            )?;
+        }
+        if let Some(author) = &fields.author {
+            self.conn.execute(
+                "UPDATE _quack_documents SET author = ? WHERE id = ?",
+                duckdb::params![
+                    (clear(&fields.author) != Some(true)).then_some(author.trim()),
+                    id
+                ],
+            )?;
+        }
+        if let Some(date) = &fields.authored_at {
+            self.conn.execute(
+                "UPDATE _quack_documents SET authored_at = TRY_CAST(? AS TIMESTAMP) WHERE id = ?",
+                duckdb::params![
+                    (clear(&fields.authored_at) != Some(true)).then_some(date.trim()),
+                    id
+                ],
+            )?;
+        }
+        if let Some(tags) = &fields.tags {
+            let tags: Vec<String> = tags
+                .iter()
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .collect();
+            self.conn.execute(
+                "UPDATE _quack_documents SET tags = ?::JSON WHERE id = ?",
+                duckdb::params![serde_json::to_string(&tags)?, id],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Record how many chunks a processed document produced.
     ///
     /// # Errors
@@ -2162,8 +2283,8 @@ impl WorkspaceDb {
             Some(emb) => {
                 self.check_vector_width(emb.len())?;
                 let sql = format!(
-                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, embedding, embedding_profile) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?::{}, ?)",
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, embedding, embedding_profile, kind, locator) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?::{}, ?, ?, ?)",
                     self.vector_type()
                 );
                 self.conn.execute(
@@ -2177,14 +2298,16 @@ impl WorkspaceDb {
                         page,
                         length,
                         emb.sql_literal(),
-                        self.embedding_fingerprint()
+                        self.embedding_fingerprint(),
+                        chunk.kind,
+                        chunk.locator
                     ],
                 )?;
             }
             None => {
                 self.conn.execute(
-                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, kind, locator) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     duckdb::params![
                         chunk.id,
                         chunk.document_id,
@@ -2192,7 +2315,9 @@ impl WorkspaceDb {
                         chunk.content,
                         chunk.heading,
                         page,
-                        length
+                        length,
+                        chunk.kind,
+                        chunk.locator
                     ],
                 )?;
             }
@@ -2434,7 +2559,7 @@ impl WorkspaceDb {
                          JOIN _quack_chunks ch ON ch.id = t.chunk_id, stats s \
                          GROUP BY t.chunk_id) \
              SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, sc.score, \
-                    CAST(d.ingested_at AS VARCHAR) \
+                    CAST(d.ingested_at AS VARCHAR), c.kind, c.locator \
              FROM scored sc \
              JOIN _quack_chunks c ON c.id = sc.chunk_id \
              JOIN _quack_documents d ON d.id = c.document_id \
@@ -2514,7 +2639,7 @@ impl WorkspaceDb {
         let sql = format!(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, \
                     1.0 / (1.0 + array_cosine_distance(c.embedding, ?::{})) AS score, \
-                    CAST(d.ingested_at AS VARCHAR) \
+                    CAST(d.ingested_at AS VARCHAR), c.kind, c.locator \
              FROM _quack_chunks c \
              JOIN _quack_documents d ON d.id = c.document_id \
              WHERE c.embedding IS NOT NULL AND c.embedding_profile IS NOT DISTINCT FROM ? \
@@ -2620,7 +2745,7 @@ impl WorkspaceDb {
     ) -> Result<Vec<ChunkSearchResult>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0, \
-                    CAST(d.ingested_at AS VARCHAR) \
+                    CAST(d.ingested_at AS VARCHAR), c.kind, c.locator \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
              WHERE d.status = ? AND {} AND (?::VARCHAR IS NULL OR c.id > ?) \
              ORDER BY c.id LIMIT ?",
@@ -2649,7 +2774,7 @@ impl WorkspaceDb {
     ) -> Result<Vec<ChunkSearchResult>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0, \
-                    CAST(d.ingested_at AS VARCHAR) \
+                    CAST(d.ingested_at AS VARCHAR), c.kind, c.locator \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
              WHERE c.document_id = ? AND c.chunk_index >= ? \
              ORDER BY c.chunk_index LIMIT ?",
@@ -2671,7 +2796,7 @@ impl WorkspaceDb {
         let mut out = Vec::with_capacity(ids.len());
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0, \
-                    CAST(d.ingested_at AS VARCHAR) \
+                    CAST(d.ingested_at AS VARCHAR), c.kind, c.locator \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id WHERE c.id = ?",
         )?;
         for id in ids {
@@ -3335,6 +3460,22 @@ pub struct DocumentInfo {
     /// Where the file was under that folder, with `/` separators; a later
     /// run of the folder matches the file by root and path together.
     pub source_path: Option<String>,
+    /// Who wrote the document, as the file says or a person set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// When it was written (the file's creation date, front matter's
+    /// `date`, a mail's `Date`), as `YYYY-MM-DD HH:MM:SS` when the source
+    /// gave a date the store could parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Other named values the file carried (a subject, recipients, a
+    /// description).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl DocumentInfo {
@@ -3423,6 +3564,27 @@ impl DocumentSource {
     }
 }
 
+/// What a person may change on a document: each `Some` is applied, an
+/// empty text clears the field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentFields {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub authored_at: Option<String>,
+    pub tags: Option<Vec<String>>,
+}
+
+impl DocumentFields {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.author.is_none()
+            && self.authored_at.is_none()
+            && self.tags.is_none()
+    }
+}
+
 /// A document row to insert.
 #[derive(Debug, Clone, Copy)]
 pub struct NewDocument<'a> {
@@ -3476,7 +3638,8 @@ impl<'a> NewDocument<'a> {
 const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, status, error_message, \
      COALESCE(pinned, false), CAST(ingested_at AS VARCHAR), title, sha256, source, chunk_count, \
      ingested_by, CAST(tables AS VARCHAR), page_count, pages_unreadable, pages_empty, \
-     superseded_by, source_root, source_path \
+     superseded_by, source_root, source_path, author, CAST(authored_at AS VARCHAR), \
+     CAST(modified_at AS VARCHAR), CAST(tags AS VARCHAR), CAST(metadata AS VARCHAR) \
      FROM _quack_documents";
 
 /// The `WHERE` clause that keeps a document that still stands for its
@@ -3521,6 +3684,17 @@ impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
             superseded_by: row.get(17)?,
             source_root: row.get(18)?,
             source_path: row.get(19)?,
+            author: row.get(20)?,
+            authored_at: row.get(21)?,
+            modified_at: row.get(22)?,
+            tags: row
+                .get::<_, Option<String>>(23)?
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default(),
+            metadata: row
+                .get::<_, Option<String>>(24)?
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default(),
         })
     }
 }
@@ -3568,6 +3742,10 @@ pub struct NewChunk<'a> {
     pub heading: Option<&'a str>,
     pub page: Option<u32>,
     pub embedding: Option<&'a Vector>,
+    pub kind: SectionKind,
+    /// Where the chunk sits in a source without pages (`line 40`, `12:04`,
+    /// `chapter 3`, `message 2`).
+    pub locator: Option<&'a str>,
 }
 
 /// A chunk returned from retrieval, with what a citation needs.
@@ -3585,10 +3763,17 @@ pub struct ChunkSearchResult {
     pub score: f64,
     /// When the chunk's document was ingested (UTC).
     pub ingested_at: DateTime,
+    /// What the chunk holds: body text, a table, a note, or code.
+    #[serde(default)]
+    pub kind: SectionKind,
+    /// Where it sits in a source without pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
 }
 
 /// A row of `id, content, document_id, chunk_index, filename, heading,
-/// page, score, ingested_at`, the columns every search selects.
+/// page, score, ingested_at, kind, locator`, the columns every search
+/// selects. A chunk stored before `kind` existed reads as body text.
 impl TryFrom<&duckdb::Row<'_>> for ChunkSearchResult {
     type Error = duckdb::Error;
 
@@ -3608,6 +3793,8 @@ impl TryFrom<&duckdb::Row<'_>> for ChunkSearchResult {
             page: page.and_then(|p| u32::try_from(p).ok()),
             score: row.get(7)?,
             ingested_at,
+            kind: row.get::<_, Option<SectionKind>>(9)?.unwrap_or_default(),
+            locator: row.get(10)?,
         })
     }
 }
@@ -3725,7 +3912,7 @@ struct TermFrequencies(Vec<(String, u32)>);
 
 impl TermFrequencies {
     fn of(content: &str, heading: Option<&str>) -> Self {
-        let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        let mut counts: BTreeMap<String, u32> = BTreeMap::new();
         for term in tokenize(content)
             .into_iter()
             .chain(heading.map(tokenize).unwrap_or_default())

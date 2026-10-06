@@ -118,6 +118,7 @@ where
 mod tests {
     use super::*;
     use crate::ids::{ChunkId, DocumentId};
+    use crate::ingestion::parser::SectionKind;
 
     /// A retrieved chunk goes into the prompt fenced like any other
     /// document text, whatever it says.
@@ -132,6 +133,8 @@ mod tests {
             heading: None,
             page: None,
             score: 1.0,
+            kind: SectionKind::Body,
+            locator: None,
             ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
         };
         let value = ContextDocument(&chunk).value();

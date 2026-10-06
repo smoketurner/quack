@@ -8,6 +8,12 @@ dataset `examples/storms/` uses.
   scales, storm data preparation guidance, tornado safety and damage notation, ten
   episode narratives each carrying a unique `SR-nnnn` report identifier and at least one
   quotable phrase, four forecast office pages, and eight decoy documents (see below).
+  Three more documents exercise the structured parsers: `readiness-review.html` (chrome to
+  skip, headings, a `<table>` of office contacts, meta tags), `shelter-supply.docx`
+  (outline-level headings, a table, core properties), and `dam-inspection.pdf` (a tagged
+  PDF exported by LibreOffice from a Word document: headings set larger than the body, a
+  ruled table, a running footer). Their gold questions ask for table cells, which must
+  come back as the table's own chunk, and for section-scoped passages.
 - `tables/` — `events.csv` (25 rows), `fatalities.csv` (39 rows, referencing
   `events.event_id`), and `states.csv` (6 rows), shaped like `examples/storms` but tiny.
 - `gold_questions.json` — questions mapped to the document filename and a content

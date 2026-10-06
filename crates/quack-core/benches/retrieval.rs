@@ -29,6 +29,7 @@ use std::time::Duration;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use quack_core::embedding::{Dimension, Vector};
 use quack_core::ids::{ChunkId, DocumentId};
+use quack_core::ingestion::parser::SectionKind;
 use quack_core::storage::workspace::{
     ChunkScope, DocumentStatus, HybridLimits, NewChunk, NewDocument, WorkspaceDb,
 };
@@ -93,6 +94,8 @@ fn fill(db: &WorkspaceDb, from: usize, to: usize, dim: usize) {
                 content: &content(n),
                 heading: None,
                 page: None,
+                kind: SectionKind::Body,
+                locator: None,
                 embedding: Some(&embedding(n, dim)),
             })
             .unwrap();

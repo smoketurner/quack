@@ -22,6 +22,7 @@ use quack_core::embedding::{Dimension, Vector};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::ids::{AuditId, ChunkId, DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use quack_core::ingestion::parser::PageCounts;
+use quack_core::ingestion::parser::SectionKind;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -792,6 +793,8 @@ async fn a_documents_chunks_page_through_the_api_and_open_on_the_passage_page() 
                 content: text,
                 heading: (i == 1).then_some("Perils"),
                 page: Some(2),
+                kind: SectionKind::Body,
+                locator: None,
                 embedding: None,
             })?;
         }
@@ -5911,6 +5914,8 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
             content: "levee report",
             heading: None,
             page: None,
+            kind: SectionKind::Body,
+            locator: None,
             embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
         })?;
         db.execute_statement("UPDATE _quack_chunks SET embedding_profile = 'older'")
@@ -8647,4 +8652,88 @@ async fn forwarded_headers_count_only_from_trusted_proxies() {
     assert!(addrs.contains(&Some("203.0.113.9")), "{addrs:?}");
     assert!(addrs.contains(&Some("198.51.100.4")), "{addrs:?}");
     assert!(!addrs.contains(&Some("10.0.0.1")), "{addrs:?}");
+}
+
+/// `PATCH .../documents/{doc}` sets a document's own fields (title,
+/// author, authored date, tags) beside its pin, audited by field name;
+/// an empty body is refused; the listing and the page show them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_documents_fields_are_set_over_the_api_and_shown() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("meta", &owner).await;
+    let token = h.login("owner").await;
+    let base = format!("/api/v1/workspaces/{ws}/documents");
+    let (status, body) = h
+        .post(
+            &base,
+            &token,
+            serde_json::json!({ "text": "Flood is excluded.", "title": "policy" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let doc = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(h.wait_ready(&ws, &doc, &token).await["status"], "ready");
+
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &format!("{base}/{doc}"),
+            Some(&token),
+            Some(serde_json::json!({
+                "author": "Ada",
+                "authored_at": "2026-01-05",
+                "tags": ["policy", "flood"],
+                "pinned": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["author"], "Ada");
+    assert_eq!(body["authored_at"], "2026-01-05 00:00:00");
+    assert_eq!(body["tags"], serde_json::json!(["policy", "flood"]));
+    assert_eq!(body["pinned"], true);
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &format!("{base}/{doc}"),
+            Some(&token),
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &format!("{base}/{doc}"),
+            Some(&token),
+            Some(serde_json::json!({ "authored_at": "soon" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let (_, listed) = h.get(&base, &token).await;
+    assert_eq!(listed["documents"][0]["author"], "Ada", "{listed}");
+    let cookie = web_session(&h, "owner").await;
+    let (status, html, _) = h.page(&format!("/w/{ws}/documents"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Ada") && html.contains("flood"), "{html}");
+
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let details = with_db(db, |db| audit::list(db, 100))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert!(
+        details.iter().any(|d| d.action == "context"
+            && d.detail.as_ref().is_some_and(
+                |v| v["fields"] == serde_json::json!(["author", "authored_at", "tags"])
+            )),
+        "{details:?}"
+    );
 }

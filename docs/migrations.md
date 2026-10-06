@@ -72,7 +72,9 @@ and rows written earlier read as `NULL`. `_quack_documents.page_count`, `pages_u
 `pages_empty`, `superseded_by` (the id of the document replacing this one; the status
 `superseded` joined the four above with it), and `source_root` with `source_path` (the
 canonical path of the folder `quack ingest DIR` read the file from, and the file's path
-under it) arrived this way.
+under it) arrived this way, as did `author`, `authored_at`, `modified_at`, `tags`, and
+`metadata` (what a file says about itself) and `_quack_chunks.kind` and `locator` (a chunk
+stored before them reads as body text with no locator).
 
 Phrase search (`"..."` in a keyword query) needed no bump: it post-filters candidates by
 substring instead of adding term positions to `_quack_terms`.

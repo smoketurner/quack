@@ -1,10 +1,20 @@
 pub mod budget;
+pub mod captions;
 pub mod chunker;
+pub mod code;
+pub mod epub;
 pub mod html;
+pub mod mail;
+pub mod markdown;
+pub mod odt;
 pub mod office;
 pub mod parser;
+pub mod pdf;
+pub mod rtf;
+pub mod table;
 pub mod tree;
 pub mod xlsx;
+pub mod zipped;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -19,13 +29,17 @@ use crate::error::{Error, Result};
 use crate::ids::{ChunkId, DocumentId};
 use crate::progress::{ChunkDone, RunControl};
 use crate::storage::workspace::{
-    DocumentInfo, DocumentSource, DocumentStatus, NewChunk, NewDocument, WorkspaceDb, quote_ident,
+    DocumentFields, DocumentInfo, DocumentSource, DocumentStatus, NewChunk, NewDocument,
+    WorkspaceDb, quote_ident,
 };
 use crate::storage::writer::Writer;
 use crate::text::NonBlankText;
 use budget::DecompressionBudget;
 use chunker::Chunker;
-use parser::{FileType, Load, PageCounts, Reader, Separator, TextFormat};
+use parser::{
+    DocumentMeta, FileType, Load, PageCounts, Reader, SectionKind, Separator, TextFormat,
+};
+use table::Table;
 
 /// Result of ingesting a single file into a workspace.
 #[derive(Debug)]
@@ -82,7 +96,7 @@ impl IngestOutcome {
 
 /// A file to ingest: its name and bytes, where it came from, an optional
 /// title (else parsed from the content), and the server user uploading it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct NewFile<'a> {
     pub filename: &'a str,
     pub data: &'a [u8],
@@ -101,6 +115,9 @@ pub struct NewFile<'a> {
     /// run of that folder finds the document again.
     pub source_root: Option<&'a str>,
     pub source_path: Option<&'a str>,
+    /// What the uploader says about the document; given values win over
+    /// what the file says about itself.
+    pub fields: DocumentFields,
 }
 
 impl<'a> NewFile<'a> {
@@ -117,6 +134,7 @@ impl<'a> NewFile<'a> {
             replaces: None,
             source_root: None,
             source_path: None,
+            fields: DocumentFields::default(),
         }
     }
 
@@ -157,6 +175,14 @@ impl<'a> NewFile<'a> {
     pub fn in_folder(mut self, root: &'a str, path: &'a str) -> Self {
         self.source_root = Some(root);
         self.source_path = Some(path);
+        self
+    }
+
+    /// The author, date, and tags the uploader gives, which win over the
+    /// file's own.
+    #[must_use]
+    pub fn fields(mut self, fields: DocumentFields) -> Self {
+        self.fields = fields;
         self
     }
 }
@@ -354,14 +380,9 @@ impl<M: EmbeddingModel> Processing<'_, M> {
     }
 
     async fn run_inner(&self) -> Result<IngestResult> {
-        let (config, db, workspace_id, doc_id, embedder) = (
-            self.config,
-            self.db,
-            self.workspace_id,
-            self.document_id,
-            self.embedder,
-        );
-        let (filename, data, control) = (self.file.filename, self.file.data, self.file.control);
+        let (config, db, workspace_id, doc_id) =
+            (self.config, self.db, self.workspace_id, self.document_id);
+        let (filename, data) = (self.file.filename, self.file.data);
         let Some(file_type) = FileType::of(filename) else {
             return Err(Error::UnsupportedFileType(filename.to_owned()));
         };
@@ -394,6 +415,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     doc_id: doc_id.clone(),
                     filename: filename.to_owned(),
                     sheets,
+                    suffixed: false,
                 };
                 let tables = db.run(move |db| load.load(db)).await?;
                 Ok(IngestResult {
@@ -401,49 +423,83 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     ..IngestResult::of(doc_id, filename, file_type)
                 })
             }
-            Load::Chunks(format) => {
-                // Parsing and chunking are the slow, CPU-bound part: off the
-                // runtime's workers, and not on the writer.
-                let parsing = Parsing::new(config, format, filename, data);
-                let Parsed {
-                    title,
-                    pages,
-                    chunks,
-                } = parse_off_runtime(move || parsing.run()).await?;
-                if let Some(title) = title {
-                    let id = doc_id.to_owned();
-                    db.run(move |db| db.set_document_title_if_empty(&id, &title))
-                        .await?;
-                }
-                if let Some(note) = pages.and_then(PageCounts::note) {
-                    tracing::warn!(
-                        document = %doc_id,
-                        file = %filename,
-                        pages = %note,
-                        "ingested with pages missing from the text"
-                    );
-                }
-                control.check()?;
-                let stored = embed_and_store(
-                    db,
-                    doc_id,
-                    &chunks,
-                    embedder,
-                    EmbedPlan {
-                        batch_size: config.ingestion.embedding_batch_size,
-                        concurrency: config.ingestion.embedding_concurrency,
-                        control,
-                    },
-                )
-                .await?;
-                Ok(IngestResult {
-                    chunks_stored: stored.chunks,
-                    pages,
-                    embedding_time: stored.embedding_time,
-                    ..IngestResult::of(doc_id, filename, file_type)
-                })
-            }
+            Load::Chunks(format) => self.chunk(format, file_type).await,
         }
+    }
+
+    /// Parse and chunk a text document, record what it says about itself,
+    /// load the tables inside it that are big enough, and embed the chunks.
+    async fn chunk(&self, format: TextFormat, file_type: FileType) -> Result<IngestResult> {
+        let (config, db, workspace_id, doc_id, embedder) = (
+            self.config,
+            self.db,
+            self.workspace_id,
+            self.document_id,
+            self.embedder,
+        );
+        let (filename, data, control) = (self.file.filename, self.file.data, self.file.control);
+        // Parsing and chunking are the slow, CPU-bound part: off the
+        // runtime's workers, and not on the writer.
+        let parsing = Parsing::new(config, format, filename, data);
+        let Parsed {
+            title,
+            pages,
+            chunks,
+            meta,
+            tables: found,
+        } = parse_off_runtime(move || parsing.run()).await?;
+        let (id, fields) = (doc_id.to_owned(), self.file.fields.clone());
+        db.run(move |db| {
+            if let Some(title) = title {
+                db.set_document_title_if_empty(&id, &title)?;
+            }
+            db.set_document_meta(&id, &meta)?;
+            if !fields.is_empty() {
+                db.set_document_fields(&id, &fields)?;
+            }
+            Ok(())
+        })
+        .await?;
+        let tables = if found.is_empty() {
+            Vec::new()
+        } else {
+            let load = WorkbookLoad {
+                files_dir: config.workspace_files_dir(workspace_id),
+                doc_id: doc_id.clone(),
+                filename: filename.to_owned(),
+                sheets: found,
+                suffixed: true,
+            };
+            db.run(move |db| load.load(db)).await?
+        };
+        if let Some(note) = pages.and_then(PageCounts::note) {
+            tracing::warn!(
+                document = %doc_id,
+                file = %filename,
+                pages = %note,
+                "ingested with pages missing from the text"
+            );
+        }
+        control.check()?;
+        let stored = embed_and_store(
+            db,
+            doc_id,
+            &chunks,
+            embedder,
+            EmbedPlan {
+                batch_size: config.ingestion.embedding_batch_size,
+                concurrency: config.ingestion.embedding_concurrency,
+                control,
+            },
+        )
+        .await?;
+        Ok(IngestResult {
+            chunks_stored: stored.chunks,
+            pages,
+            embedding_time: stored.embedding_time,
+            tables,
+            ..IngestResult::of(doc_id, filename, file_type)
+        })
     }
 }
 
@@ -456,6 +512,7 @@ struct Parsing {
     chunk_size: u32,
     chunk_overlap: u32,
     encoding: String,
+    table_rows_as_table: u32,
 }
 
 /// What parsing a document found.
@@ -463,6 +520,10 @@ struct Parsed {
     title: Option<String>,
     pages: Option<PageCounts>,
     chunks: Vec<chunker::Chunk>,
+    meta: DocumentMeta,
+    /// Tables inside the document big enough to load as tables of the
+    /// workspace, as the workbook loader takes them: `table1`, `table2`, ...
+    tables: Vec<xlsx::SheetCsv>,
 }
 
 impl Parsing {
@@ -478,6 +539,7 @@ impl Parsing {
             chunk_size: config.ingestion.chunk_size_tokens,
             chunk_overlap: config.ingestion.chunk_overlap_tokens,
             encoding: config.ingestion.tokenizer_encoding.clone(),
+            table_rows_as_table: config.ingestion.table_rows_as_table,
         }
     }
 
@@ -485,10 +547,50 @@ impl Parsing {
         let extracted = self.format.extract(&self.data, self.budget)?;
         let chunks = Chunker::new(self.chunk_size, self.chunk_overlap, &self.encoding)?
             .document(&extracted, self.stem.as_deref())?;
+        let mut tables = Vec::new();
+        if self.table_rows_as_table > 0 {
+            for section in extracted
+                .sections
+                .iter()
+                .filter(|s| s.kind == SectionKind::Table)
+            {
+                let Some((_, rows)) = Table::split_rendered(&section.text) else {
+                    continue;
+                };
+                if rows.len() < self.table_rows_as_table as usize {
+                    continue;
+                }
+                let Some(table) = Table::from_rows(
+                    section
+                        .text
+                        .lines()
+                        .enumerate()
+                        .filter(|(i, _)| *i != 1)
+                        .map(|(_, line)| {
+                            line.trim()
+                                .trim_start_matches('|')
+                                .trim_end_matches('|')
+                                .split(" | ")
+                                .map(|c| c.trim().to_owned())
+                                .collect()
+                        })
+                        .collect(),
+                ) else {
+                    continue;
+                };
+                tables.push(xlsx::SheetCsv {
+                    sheet: format!("table{}", tables.len().saturating_add(1)),
+                    csv: table.csv()?,
+                    rows: table.rows.len(),
+                });
+            }
+        }
         Ok(Parsed {
             title: extracted.title().map(str::to_owned),
             pages: extracted.pages,
             chunks,
+            meta: extracted.meta,
+            tables,
         })
     }
 }
@@ -694,6 +796,9 @@ struct WorkbookLoad {
     doc_id: DocumentId,
     filename: String,
     sheets: Vec<xlsx::SheetCsv>,
+    /// Name every table `<stem>_<sheet>`, a lone sheet included: the
+    /// tables found inside a document, which never take the file's name.
+    suffixed: bool,
 }
 
 impl WorkbookLoad {
@@ -715,7 +820,7 @@ impl WorkbookLoad {
     fn load(self, db: &WorkspaceDb) -> Result<Vec<String>> {
         std::fs::create_dir_all(&self.files_dir)?;
         let stem = TableName::of_file(&self.filename);
-        let single = self.sheets.len() == 1;
+        let single = self.sheets.len() == 1 && !self.suffixed;
         let names: Vec<TableName> = self
             .sheets
             .iter()
@@ -922,6 +1027,8 @@ async fn embed_and_store<M: EmbeddingModel>(
                         content: &chunk.content,
                         heading: chunk.heading.as_deref(),
                         page: chunk.page,
+                        kind: chunk.kind,
+                        locator: chunk.locator.as_deref(),
                         embedding: None,
                     })?;
                     ids.push(chunk_id);

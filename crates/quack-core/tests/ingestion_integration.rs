@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{MAIN_SEPARATOR, Path};
 
+use quack_core::analysis::citations::Citation;
 use quack_core::config::{
     AnalysisConfig, BaseUrl, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
     ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig, ProviderType,
@@ -14,14 +15,15 @@ use quack_core::error::Error;
 use quack_core::graph::{Properties, Standing, store as graph_store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId};
 use quack_core::import::{HostReach, ImportPolicy, ImportRequest};
+use quack_core::ingestion::parser::SectionKind;
 use quack_core::ingestion::parser::{FileType, PageCounts};
 use quack_core::ingestion::tree::{Folder, FolderReport, Outcome, Prune};
 use quack_core::llm::CancellationToken;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::{ControlPlane, WorkspaceName};
 use quack_core::storage::workspace::{
-    ChunkScope, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk, NewDocument,
-    Pinning, StatementKind, WorkspaceDb,
+    ChunkScope, DocumentFields, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk,
+    NewDocument, Pinning, StatementKind, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use quack_core::{import, ingestion};
@@ -130,6 +132,7 @@ fn test_config(data_dir: &Path) -> Config {
         },
         providers,
         ingestion: IngestionConfig {
+            table_rows_as_table: 20,
             chunk_size_tokens: 50,
             chunk_overlap_tokens: 10,
             embedding_batch_size: 64,
@@ -961,6 +964,8 @@ fn workspace_db_chunk_without_embedding() {
         content: "hello world",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: None,
     })
     .unwrap();
@@ -994,6 +999,8 @@ fn workspace_db_chunk_with_embedding() {
         content: "embedded chunk",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&embedding),
     })
     .unwrap();
@@ -1024,6 +1031,8 @@ fn workspace_db_set_chunk_embedding() {
         content: "hello world",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: None,
     })
     .unwrap();
@@ -1097,6 +1106,8 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
         content: "flood exclusion",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
     })
     .unwrap();
@@ -1107,6 +1118,8 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
         content: "claims timeline",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&Vector::from(vec![0.9, 0.1, 0.0, 0.0])),
     })
     .unwrap();
@@ -1164,6 +1177,8 @@ fn workspace_db_search_similar_chunks() {
         content: "first chunk",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
     })
     .unwrap();
@@ -1174,6 +1189,8 @@ fn workspace_db_search_similar_chunks() {
         content: "second chunk",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&Vector::from(vec![0.0, 1.0, 0.0, 0.0])),
     })
     .unwrap();
@@ -1184,6 +1201,8 @@ fn workspace_db_search_similar_chunks() {
         content: "third chunk",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&Vector::from(vec![0.7, 0.7, 0.0, 0.0])),
     })
     .unwrap();
@@ -1445,6 +1464,8 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_refresh() {
             content: "x",
             heading: None,
             page: None,
+            kind: SectionKind::Body,
+            locator: None,
             embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
         })
         .unwrap();
@@ -1519,6 +1540,8 @@ fn dimension_change_without_embeddings_adopts_new_width() {
             content: "x",
             heading: None,
             page: None,
+            kind: SectionKind::Body,
+            locator: None,
             embedding: None,
         })
         .unwrap();
@@ -1573,6 +1596,8 @@ fn dimension_change_without_embeddings_adopts_new_width() {
         content: "y",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
     })
     .unwrap();
@@ -1583,6 +1608,8 @@ fn dimension_change_without_embeddings_adopts_new_width() {
         content: "y",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&Vector::from(vec![0.5; 8])),
     })
     .unwrap();
@@ -1717,6 +1744,8 @@ fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
         content: "Flood damage is excluded from coverage.",
         heading: Some("Exclusions"),
         page: Some(12),
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
     })
     .unwrap();
@@ -1727,6 +1756,8 @@ fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
         content: "Policy POL-8841 renews every March.",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&Vector::from(vec![0.0, 1.0, 0.0, 0.0])),
     })
     .unwrap();
@@ -1737,6 +1768,8 @@ fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
         content: "Claims close within thirty days of filing.",
         heading: Some("Claims"),
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&Vector::from(vec![0.0, 0.0, 1.0, 0.0])),
     })
     .unwrap();
@@ -1913,6 +1946,8 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
             content: "renewal POL-8841 notice",
             heading: None,
             page: None,
+            kind: SectionKind::Body,
+            locator: None,
             embedding: None,
         })
         .unwrap();
@@ -2668,17 +2703,55 @@ fn padded_xlsx(megabytes: usize) -> Vec<u8> {
 
 /// A Word or `PowerPoint` package of one part: a word, then `megabytes` of
 /// spaces.
+/// A DOCX or PPTX package (by `part`, its main content part) whose text is
+/// padded with `megabytes` of spaces, so it inflates far past its size.
 fn padded_package(part: &str, megabytes: usize) -> Vec<u8> {
     use std::io::Write as _;
     let padding = " ".repeat(megabytes.saturating_mul(1024 * 1024));
-    let xml = format!(
-        r#"<w:document xmlns:w="x" xmlns:a="y"><w:body><w:p><w:r><w:t>Padded{padding}</w:t></w:r></w:p><a:p><a:r><a:t>Padded</a:t></a:r></a:p></w:body></w:document>"#
-    );
+    let docx = part.starts_with("word/");
+    let main = if docx {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">Padded{padding}</w:t></w:r></w:p></w:body></w:document>"#
+        )
+    } else {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Body"/><p:cNvSpPr/><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Padded{padding}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+        )
+    };
+    let (types, rels): (String, &str) = if docx {
+        (
+            String::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+            ),
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        )
+    } else {
+        (
+            String::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#,
+            ),
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#,
+        )
+    };
+    let mut parts: Vec<(&str, &str)> = vec![("[Content_Types].xml", &types), ("_rels/.rels", rels)];
+    if !docx {
+        parts.push((
+            "ppt/presentation.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst></p:presentation>"#,
+        ));
+        parts.push((
+            "ppt/_rels/presentation.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#,
+        ));
+    }
+    parts.push((part, &main));
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
-    writer.start_file(part, options).unwrap();
-    writer.write_all(xml.as_bytes()).unwrap();
+    for (name, content) in parts {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(content.as_bytes()).unwrap();
+    }
     writer.finish().unwrap().into_inner()
 }
 
@@ -2884,6 +2957,8 @@ fn keyword_search_treats_null_as_a_word() {
         content: "The null hypothesis was rejected.",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: None,
     })
     .unwrap();
@@ -2921,6 +2996,8 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
         content: "zebra crossing",
         heading: None,
         page: None,
+        kind: SectionKind::Body,
+        locator: None,
         embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
     })
     .unwrap();
@@ -3778,4 +3855,218 @@ async fn a_table_replacement_swaps_the_table_and_a_failed_one_changes_nothing() 
     assert!(db.delete_document(&sales.document_id).unwrap());
     assert_eq!(rows(), 2);
     assert!(db.list_tables().unwrap().contains(&String::from("sales")));
+}
+
+/// Captions and source code are chunked with locators that reach the
+/// stored chunk, the search hit, and the citation label.
+#[tokio::test]
+async fn captions_and_code_cite_their_locators() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-locators").unwrap();
+    let writer = writer_of(&db);
+    let vtt = "WEBVTT\n\n00:12:04.000 --> 00:12:06.000\nThe renewal grace period is thirty days.\n\n00:30:00.000 --> 00:30:02.000\nUnrelated closing remarks.\n";
+    let code: String = (1..=80)
+        .map(|i| format!("fn step_{i}() {{ let renewal_period = {i}; }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (name, data) in [
+        ("meeting.vtt", vtt.as_bytes()),
+        ("main.rs", code.as_bytes()),
+    ] {
+        ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-locators",
+            &ingestion::NewFile::new(name, data),
+            None::<&Embedder<MockEmbeddingModel>>,
+        )
+        .await
+        .unwrap()
+        .ingested()
+        .unwrap();
+    }
+    let rows = db
+        .execute_query(
+            "SELECT d.filename, c.kind, c.locator FROM _quack_chunks c \
+             JOIN _quack_documents d ON d.id = c.document_id ORDER BY d.filename, c.chunk_index",
+        )
+        .unwrap();
+    let placed: Vec<(String, String, String)> = rows
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r.first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                r.get(1)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                r.get(2)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        placed
+            .iter()
+            .any(|(f, k, l)| f == "meeting.vtt" && k == "body" && l == "12:04"),
+        "{placed:?}"
+    );
+    assert!(
+        placed
+            .iter()
+            .any(|(f, _, l)| f == "meeting.vtt" && l == "30:00"),
+        "{placed:?}"
+    );
+    let code_chunks: Vec<&(String, String, String)> =
+        placed.iter().filter(|(f, _, _)| f == "main.rs").collect();
+    assert!(code_chunks.len() > 1, "{placed:?}");
+    assert!(code_chunks.iter().all(|(_, k, _)| k == "code"));
+    assert_eq!(
+        code_chunks.first().map(|(_, _, l)| l.as_str()),
+        Some("line 1")
+    );
+    assert!(
+        code_chunks
+            .iter()
+            .skip(1)
+            .all(|(_, _, l)| l.starts_with("line ") && l != "line 1")
+    );
+
+    let hits = db
+        .search_keyword_chunks("grace period", 5, &ChunkScope::all())
+        .unwrap();
+    let hit = hits.first().unwrap();
+    assert_eq!(hit.locator.as_deref(), Some("12:04"));
+    let label = Citation::new(1, hit).label();
+    assert!(
+        label.starts_with("meeting.vtt, 12:04, ingested "),
+        "{label}"
+    );
+}
+
+/// A Markdown file's front matter lands on the document row, a table big
+/// enough becomes a table of the workspace owned by the document, the
+/// uploader's own fields win, and a person's edits replace them.
+#[tokio::test]
+async fn front_matter_tables_and_edits_land_on_the_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config_no_provider(dir.path());
+    config.ingestion.table_rows_as_table = 2;
+    let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
+    let writer = writer_of(&db);
+    let md = "---\ntitle: Limits\nauthor: Ada\ndate: 2026-01-05\ntags: [policy, limits]\nowner: claims\n---\n\n# Limits\n\n| Peril | Limit |\n|---|---|\n| Fire | 1000 |\n| Flood | 0 |\n| Wind | 250 |\n\nAfter the table.\n";
+    let result = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-meta",
+        &ingestion::NewFile::new("notes.md", md.as_bytes()),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(result.tables, ["notes_table1"]);
+    let count = db
+        .execute_query("SELECT count(*) FROM notes_table1 WHERE \"Limit\" > 0")
+        .unwrap();
+    assert_eq!(
+        count
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(serde_json::Value::as_i64),
+        Some(2)
+    );
+    let doc = db.document(&result.document_id).unwrap().unwrap();
+    assert_eq!(doc.title.as_deref(), Some("Limits"));
+    assert_eq!(doc.author.as_deref(), Some("Ada"));
+    assert_eq!(doc.authored_at.as_deref(), Some("2026-01-05 00:00:00"));
+    assert_eq!(doc.tags, ["policy", "limits"]);
+    assert_eq!(
+        doc.metadata.get("owner").map(String::as_str),
+        Some("claims")
+    );
+    assert_eq!(
+        doc.tables.as_deref(),
+        Some(&[String::from("notes_table1")][..])
+    );
+    let kinds = db
+        .execute_query("SELECT kind FROM _quack_chunks ORDER BY chunk_index")
+        .unwrap();
+    let kinds: Vec<&str> = kinds
+        .rows
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(kinds, ["table", "body"]);
+}
+
+/// The uploader's fields win over the file's own, and a person's edits
+/// replace them: an empty text clears, a bad date is refused, a missing
+/// document is not found.
+#[tokio::test]
+async fn the_uploaders_fields_win_and_a_person_edits_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-meta-edits").unwrap();
+    let writer = writer_of(&db);
+    let second = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-meta-edits",
+        &ingestion::NewFile::new("again.md", b"---\nauthor: Ada\n---\n\ntext\n").fields(
+            DocumentFields {
+                author: Some(String::from("Grace")),
+                tags: Some(vec![String::from("given")]),
+                ..DocumentFields::default()
+            },
+        ),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    let doc = db.document(&second.document_id).unwrap().unwrap();
+    assert_eq!(doc.author.as_deref(), Some("Grace"));
+    assert_eq!(doc.tags, ["given"]);
+    db.set_document_fields(
+        &second.document_id,
+        &DocumentFields {
+            title: Some(String::from("Edited")),
+            author: Some(String::new()),
+            authored_at: Some(String::from("2026-02-01")),
+            tags: Some(vec![String::from(" one "), String::new()]),
+        },
+    )
+    .unwrap();
+    let doc = db.document(&second.document_id).unwrap().unwrap();
+    assert_eq!(doc.title.as_deref(), Some("Edited"));
+    assert_eq!(doc.author, None);
+    assert_eq!(doc.authored_at.as_deref(), Some("2026-02-01 00:00:00"));
+    assert_eq!(doc.tags, ["one"]);
+    let bad = db
+        .set_document_fields(
+            &second.document_id,
+            &DocumentFields {
+                authored_at: Some(String::from("yesterday")),
+                ..DocumentFields::default()
+            },
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(bad.contains("is not a date"), "{bad}");
+    assert!(
+        db.set_document_fields(&DocumentId::from("absent"), &DocumentFields::default())
+            .is_err()
+    );
 }

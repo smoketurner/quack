@@ -328,9 +328,23 @@ impl SystemPrompt {
             // A partly read document says so, so the model can tell the
             // person why a search of it may miss.
             let pages = PageCounts::suffix(doc.pages);
+            let author = doc
+                .author
+                .as_deref()
+                .map_or(String::new(), |a| format!(", by {}", OneLine(a)));
+            let authored = doc
+                .authored_at
+                .as_deref()
+                .and_then(|d| d.get(..10))
+                .map_or(String::new(), |d| format!(", dated {d}"));
+            let tags = if doc.tags.is_empty() {
+                String::new()
+            } else {
+                format!(", tags: {}", OneLine(&doc.tags.join(", ")))
+            };
             writeln!(
                 self.text,
-                "- {}{title} (status: {}, type: {}{pages})",
+                "- {}{title} (status: {}, type: {}{author}{authored}{tags}{pages})",
                 OneLine(&doc.filename),
                 doc.status,
                 doc.mime_type.as_deref().unwrap_or("unknown"),

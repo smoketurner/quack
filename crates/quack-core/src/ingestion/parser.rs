@@ -1,12 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use pdf_oxide::PdfDocument;
-use pdf_oxide::editor::DocumentInfo;
-
 use super::budget::DecompressionBudget;
-use super::{html, office};
+use super::{captions, code, epub, html, mail, markdown, odt, office, pdf, rtf};
 use crate::error::{Error, Result};
-use crate::okf::{WithFrontMatter, parse_front_matter};
 use crate::text::NonBlankText;
 
 /// Recognized file types for ingestion.
@@ -23,6 +20,19 @@ pub enum FileType {
     Html,
     Docx,
     Pptx,
+    Epub,
+    Odt,
+    /// One RFC 5322 message.
+    Eml,
+    /// A mailbox of messages, `From ` separated.
+    Mbox,
+    /// `WebVTT` captions.
+    Vtt,
+    /// `SubRip` captions.
+    Srt,
+    /// Source code, chunked by line with line-number locators.
+    Code,
+    Rtf,
 }
 
 /// How a file type loads into a workspace.
@@ -45,6 +55,14 @@ pub enum TextFormat {
     Html,
     Docx,
     Pptx,
+    Epub,
+    Odt,
+    Eml,
+    Mbox,
+    Vtt,
+    Srt,
+    Code,
+    Rtf,
 }
 
 /// A `DuckDB` reader for a data file.
@@ -153,6 +171,14 @@ impl FileType {
             Self::Html => Load::Chunks(TextFormat::Html),
             Self::Docx => Load::Chunks(TextFormat::Docx),
             Self::Pptx => Load::Chunks(TextFormat::Pptx),
+            Self::Epub => Load::Chunks(TextFormat::Epub),
+            Self::Odt => Load::Chunks(TextFormat::Odt),
+            Self::Eml => Load::Chunks(TextFormat::Eml),
+            Self::Mbox => Load::Chunks(TextFormat::Mbox),
+            Self::Vtt => Load::Chunks(TextFormat::Vtt),
+            Self::Srt => Load::Chunks(TextFormat::Srt),
+            Self::Code => Load::Chunks(TextFormat::Code),
+            Self::Rtf => Load::Chunks(TextFormat::Rtf),
         }
     }
 
@@ -180,6 +206,14 @@ impl FileType {
             Self::Pptx => {
                 "application/vnd.openxmlformats-officedocument.presentationml.presentation"
             }
+            Self::Epub => "application/epub+zip",
+            Self::Odt => "application/vnd.oasis.opendocument.text",
+            Self::Eml => "message/rfc822",
+            Self::Mbox => "application/mbox",
+            Self::Vtt => "text/vtt",
+            Self::Srt => "application/x-subrip",
+            Self::Code => "text/x-source",
+            Self::Rtf => "application/rtf",
         }
     }
 }
@@ -198,6 +232,14 @@ impl std::fmt::Display for FileType {
             Self::Html => "HTML",
             Self::Docx => "Word",
             Self::Pptx => "PowerPoint",
+            Self::Epub => "EPUB",
+            Self::Odt => "OpenDocument text",
+            Self::Eml => "Email",
+            Self::Mbox => "Mailbox",
+            Self::Vtt => "WebVTT captions",
+            Self::Srt => "SubRip captions",
+            Self::Code => "Source code",
+            Self::Rtf => "Rich Text",
         };
         f.write_str(label)
     }
@@ -205,10 +247,11 @@ impl std::fmt::Display for FileType {
 
 /// How a document's sections relate: real divisions of the text, or the
 /// pages of one continuous text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Flow {
     /// Sections are headings, slides, or the whole file: a chunk never
     /// crosses one.
+    #[default]
     Sectioned,
     /// Sections are pages of one running text: chunks are windowed over
     /// the whole text and carry the page they start on, so a paragraph
@@ -218,8 +261,9 @@ pub enum Flow {
 
 /// What a parse yields: the document's own title when the format carries
 /// one (`<title>`, Office core properties, a PDF's Info dictionary), its
-/// sections and how they relate, and how its pages read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// sections and how they relate, how its pages read, and the metadata
+/// the file carries about itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Extracted {
     pub title: Option<String>,
     pub sections: Vec<Section>,
@@ -227,6 +271,59 @@ pub struct Extracted {
     /// How the pages read; `None` for a source without pages (only a PDF
     /// has them).
     pub pages: Option<PageCounts>,
+    pub meta: DocumentMeta,
+}
+
+/// What a file says about itself: who wrote it and when, its tags, and
+/// any other named value the format carries (a PDF's subject, a mail's
+/// recipients). Dates are kept as the source wrote them, trimmed; the
+/// store casts what parses as a timestamp and keeps the text otherwise.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DocumentMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, String>,
+}
+
+impl DocumentMeta {
+    /// Set a text field from a value that may be blank.
+    pub(crate) fn set(slot: &mut Option<String>, value: Option<&str>) {
+        if let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) {
+            *slot = Some(v.to_owned());
+        }
+    }
+
+    /// Add a tag, trimmed, once.
+    pub(crate) fn tag(&mut self, tag: &str) {
+        let tag = tag.trim();
+        if !tag.is_empty() && !self.tags.iter().any(|t| t == tag) {
+            self.tags.push(tag.to_owned());
+        }
+    }
+
+    /// Keep a named value, trimmed, when it is not blank.
+    pub(crate) fn extra(&mut self, key: &str, value: Option<&str>) {
+        if let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) {
+            self.extra.insert(key.to_owned(), v.to_owned());
+        }
+    }
+
+    /// Whether nothing was found.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.author.is_none()
+            && self.authored_at.is_none()
+            && self.modified_at.is_none()
+            && self.tags.is_empty()
+            && self.extra.is_empty()
+    }
 }
 
 /// How a paginated document's pages read. A page left out of the text is
@@ -282,15 +379,86 @@ impl Extracted {
     }
 }
 
-/// A run of text that shares one heading and one page.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A run of text that shares one heading, one page, and one kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Section {
     /// Nearest preceding heading, if the source has headings.
     pub heading: Option<String>,
     /// 1-based page number for paginated sources.
     pub page: Option<u32>,
     pub text: String,
+    pub kind: SectionKind,
+    /// Where the text sits in a source without pages, as a citation says
+    /// it: `line 40`, `12:04`, `chapter 3`, `message 2`.
+    pub locator: Option<String>,
 }
+
+impl Section {
+    /// Body text under `heading`.
+    #[must_use]
+    pub fn body(heading: Option<String>, text: impl Into<String>) -> Self {
+        Self {
+            heading,
+            text: text.into(),
+            ..Self::default()
+        }
+    }
+
+    /// A table's Markdown rendering under `heading`.
+    #[must_use]
+    pub fn table(heading: Option<String>, markdown: String) -> Self {
+        Self {
+            heading,
+            text: markdown,
+            kind: SectionKind::Table,
+            ..Self::default()
+        }
+    }
+
+    /// A footnote, endnote, comment, or speaker note under `heading`.
+    #[must_use]
+    pub fn note(heading: Option<String>, text: impl Into<String>) -> Self {
+        Self {
+            heading,
+            text: text.into(),
+            kind: SectionKind::Note,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn on_page(mut self, page: Option<u32>) -> Self {
+        self.page = page;
+        self
+    }
+
+    #[must_use]
+    pub fn at(mut self, locator: impl Into<String>) -> Self {
+        self.locator = Some(locator.into());
+        self
+    }
+}
+
+/// What a section (and the chunks cut from it) holds: running text, a
+/// table rendered as Markdown, a note (footnote, endnote, comment,
+/// speaker note), or source code.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SectionKind {
+    #[default]
+    Body,
+    Table,
+    Note,
+    Code,
+}
+
+text_enum!(SectionKind, "section kind", {
+    Body => "body",
+    Table => "table",
+    Note => "note",
+    Code => "code",
+});
+text_enum_sql!(SectionKind);
 
 /// Every extension quack reads, lowercase, and the type it is read as.
 const EXTENSIONS: &[(&str, FileType)] = &[
@@ -316,47 +484,72 @@ const EXTENSIONS: &[(&str, FileType)] = &[
     ("xhtml", FileType::Html),
     ("docx", FileType::Docx),
     ("pptx", FileType::Pptx),
+    ("epub", FileType::Epub),
+    ("odt", FileType::Odt),
+    ("eml", FileType::Eml),
+    ("mbox", FileType::Mbox),
+    ("vtt", FileType::Vtt),
+    ("srt", FileType::Srt),
+    ("rtf", FileType::Rtf),
+    ("rs", FileType::Code),
+    ("py", FileType::Code),
+    ("js", FileType::Code),
+    ("ts", FileType::Code),
+    ("tsx", FileType::Code),
+    ("jsx", FileType::Code),
+    ("go", FileType::Code),
+    ("java", FileType::Code),
+    ("kt", FileType::Code),
+    ("c", FileType::Code),
+    ("h", FileType::Code),
+    ("cpp", FileType::Code),
+    ("hpp", FileType::Code),
+    ("cs", FileType::Code),
+    ("rb", FileType::Code),
+    ("php", FileType::Code),
+    ("swift", FileType::Code),
+    ("scala", FileType::Code),
+    ("sh", FileType::Code),
+    ("sql", FileType::Code),
+    ("toml", FileType::Code),
+    ("yaml", FileType::Code),
+    ("yml", FileType::Code),
 ];
 
 impl TextFormat {
-    /// Extract a file's text: PDFs one section per page, Markdown one per
-    /// heading, HTML one per heading with the `<title>`, DOCX one per
-    /// heading style with the core title, PPTX one per slide, plain text a
-    /// single section.
+    /// Extract a file's text: PDFs one section per page under the page's
+    /// structural headings, Markdown one per heading, HTML one per heading
+    /// with the `<title>`, DOCX one per heading with the core title, PPTX
+    /// one per slide, EPUB one per chapter, ODT one per heading, mail one
+    /// per message, captions in timed runs, source code one section with
+    /// line locators, plain text and RTF a single section. Tables in any of
+    /// them are their own sections, rendered as Markdown.
     ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be parsed, or if it has no text
     /// at all (a scanned PDF without a text layer needs OCR, which is not
-    /// supported), or if a DOCX or PPTX inflates past `budget`.
+    /// supported), or if a zipped format inflates past `budget`.
     pub fn extract(self, data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         match self {
-            Self::Pdf => extract_pdf(data),
-            Self::Markdown => {
-                let text = utf8(data)?;
-                // YAML front matter (Obsidian, Jekyll, OKF) is metadata, not
-                // prose: its `title` is the document's, the rest is dropped.
-                let WithFrontMatter { front, body } = parse_front_matter(&text);
-                Ok(Extracted {
-                    title: front.get("title").map(str::to_owned),
-                    sections: markdown_sections(body),
-                    flow: Flow::Sectioned,
-                    pages: None,
-                })
-            }
+            Self::Pdf => pdf::extract(data),
+            Self::Markdown => Ok(markdown::extract(&utf8(data)?)),
             Self::Text => Ok(Extracted {
-                title: None,
-                sections: vec![Section {
-                    heading: None,
-                    page: None,
-                    text: utf8(data)?,
-                }],
+                sections: vec![Section::body(None, utf8(data)?)],
                 flow: Flow::Sectioned,
-                pages: None,
+                ..Extracted::default()
             }),
             Self::Html => html::html(&utf8(data)?),
             Self::Docx => office::docx(data, budget),
             Self::Pptx => office::pptx(data, budget),
+            Self::Epub => epub::extract(data, budget),
+            Self::Odt => odt::extract(data, budget),
+            Self::Eml => mail::eml(data),
+            Self::Mbox => mail::mbox(data),
+            Self::Vtt => captions::vtt(&utf8(data)?),
+            Self::Srt => captions::srt(&utf8(data)?),
+            Self::Code => Ok(code::extract(&utf8(data)?)),
+            Self::Rtf => rtf::extract(&utf8(data)?),
         }
     }
 }
@@ -373,122 +566,6 @@ fn title_of(sections: &[Section]) -> Option<&str> {
 
 fn utf8(data: &[u8]) -> Result<String> {
     String::from_utf8(data.to_vec()).map_err(|e| Error::Ingestion(format!("invalid UTF-8: {e}")))
-}
-
-/// A PDF, one section per page. A page the parser cannot read is skipped
-/// and counted rather than ending the document there, so one bad font
-/// never drops every page after it.
-fn extract_pdf(data: &[u8]) -> Result<Extracted> {
-    let doc = PdfDocument::from_bytes(data.to_vec())
-        .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))?;
-    if !doc.is_authenticated() {
-        return Err(Error::Ingestion(String::from(
-            "the PDF is password-protected; remove the password and upload it again",
-        )));
-    }
-    let page_count = doc
-        .page_count()
-        .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))?;
-    let PdfPages { sections, counts } = extract_pdf_pages(page_count, |index| {
-        doc.extract_text(index).map_err(|e| e.to_string())
-    })?;
-    Ok(Extracted {
-        title: pdf_title(&doc),
-        sections,
-        flow: Flow::Continuous,
-        pages: Some(counts),
-    })
-}
-
-/// A PDF's pages as sections, and how the pages read.
-struct PdfPages {
-    sections: Vec<Section>,
-    counts: PageCounts,
-}
-
-/// Read `page_count` pages with `read`, one section per page that has
-/// text, counting the pages that fail and the pages that hold none.
-///
-/// # Errors
-///
-/// Returns an error when no page yields text: every page failed, or the
-/// file has no text layer (a scanned PDF).
-fn extract_pdf_pages(
-    page_count: usize,
-    read: impl Fn(usize) -> std::result::Result<String, String>,
-) -> Result<PdfPages> {
-    let mut sections = Vec::new();
-    let mut counts = PageCounts {
-        total: u32::try_from(page_count).unwrap_or(u32::MAX),
-        unreadable: 0,
-        empty: 0,
-    };
-    for index in 0..page_count {
-        let page = u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX);
-        match read(index) {
-            Ok(text) if !text.trim().is_empty() => sections.push(Section {
-                heading: None,
-                page: Some(page),
-                text,
-            }),
-            Ok(_) => counts.empty = counts.empty.saturating_add(1),
-            Err(error) => {
-                tracing::warn!(page, error = %error, "skipping an unreadable PDF page");
-                counts.unreadable = counts.unreadable.saturating_add(1);
-            }
-        }
-    }
-    if sections.is_empty() {
-        if counts.unreadable > 0 {
-            return Err(Error::Ingestion(format!(
-                "no readable text: {} of {page_count} pages failed to parse",
-                counts.unreadable
-            )));
-        }
-        return Err(Error::Ingestion(String::from(
-            "no extractable text: the PDF has no text layer (scanned pages need OCR)",
-        )));
-    }
-    Ok(PdfPages { sections, counts })
-}
-
-/// The Info dictionary's `/Title`, when the file carries one.
-fn pdf_title(doc: &PdfDocument) -> Option<String> {
-    let info_ref = doc.trailer().as_dict()?.get("Info")?.as_reference()?;
-    let info = doc.load_object(info_ref).ok()?;
-    DocumentInfo::from_object(&info)
-        .title
-        .map(|t| t.trim().to_owned())
-        .filter(|t| !t.is_empty())
-}
-
-/// Split Markdown at ATX (`# Title`) and setext (underlined) headings. Text
-/// before the first heading becomes a section without one.
-fn markdown_sections(text: &str) -> Vec<Section> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut sections = SectionBuilder::default();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines.get(i).copied().unwrap_or_default();
-        let next = lines.get(i.saturating_add(1)).copied();
-        if let Some(title) = atx_heading(line) {
-            sections.heading(title);
-            i = i.saturating_add(1);
-            continue;
-        }
-        if let Some(underline) = next
-            && is_setext_underline(underline)
-            && !line.trim().is_empty()
-            && !line.trim_start().starts_with(['-', '*', '+', '>', '|'])
-        {
-            sections.heading(line.trim().to_owned());
-            i = i.saturating_add(2);
-            continue;
-        }
-        sections.line(line);
-        i = i.saturating_add(1);
-    }
-    sections.finish()
 }
 
 /// Sections built a line at a time: the lines under the current heading
@@ -515,15 +592,24 @@ impl SectionBuilder {
         self.heading = (!heading.trim().is_empty()).then_some(heading);
     }
 
+    /// End the current body section and add `section` whole, under the
+    /// current heading when it has none.
+    pub(crate) fn push(&mut self, mut section: Section) {
+        self.flush();
+        if section.heading.is_none() {
+            section.heading.clone_from(&self.heading);
+        }
+        if !section.text.trim().is_empty() {
+            self.sections.push(section);
+        }
+    }
+
     fn flush(&mut self) {
         let text = self.lines.join("\n").trim().to_owned();
         self.lines.clear();
         if !text.is_empty() {
-            self.sections.push(Section {
-                heading: self.heading.clone(),
-                page: None,
-                text,
-            });
+            self.sections
+                .push(Section::body(self.heading.clone(), text));
         }
     }
 
@@ -534,29 +620,6 @@ impl SectionBuilder {
     }
 }
 
-fn atx_heading(line: &str) -> Option<String> {
-    let trimmed = line.trim_start();
-    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
-    if hashes == 0 || hashes > 6 {
-        return None;
-    }
-    let rest = trimmed.get(hashes..)?;
-    if !rest.starts_with([' ', '\t']) {
-        return None;
-    }
-    let title = rest.trim().trim_end_matches('#').trim();
-    if title.is_empty() {
-        None
-    } else {
-        Some(title.to_owned())
-    }
-}
-
-fn is_setext_underline(line: &str) -> bool {
-    let t = line.trim();
-    t.len() >= 3 && (t.chars().all(|c| c == '=') || t.chars().all(|c| c == '-'))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,115 +627,55 @@ mod tests {
     const BUDGET: DecompressionBudget = DecompressionBudget::megabytes(64);
 
     #[test]
-    fn markdown_front_matter_gives_the_title_and_is_not_chunked() {
-        let extracted = TextFormat::Markdown
-            .extract(
-                b"---\ntitle: Renewal Guide\ntags: [a]\n---\n\n# Terms\n\nThirty days.\n",
-                BUDGET,
-            )
-            .unwrap_or_else(|_| Extracted {
-                title: None,
-                sections: Vec::new(),
-                flow: Flow::Sectioned,
-                pages: None,
-            });
-        assert_eq!(extracted.title(), Some("Renewal Guide"));
-        assert_eq!(extracted.sections.len(), 1);
-        assert!(extracted.sections.iter().all(|s| !s.text.contains("tags:")));
-    }
-
-    #[test]
     fn title_is_the_first_heading_when_there_is_one() {
-        let md = markdown_sections("# Renewal terms\n\nBody.\n\n## Detail\n\nMore.\n");
+        let md = markdown::sections("# Renewal terms\n\nBody.\n\n## Detail\n\nMore.\n");
         assert_eq!(title_of(&md), Some("Renewal terms"));
-        let plain = vec![Section {
-            heading: None,
-            page: None,
-            text: String::from("no headings"),
-        }];
+        let plain = vec![Section::body(None, "no headings")];
         assert_eq!(title_of(&plain), None);
         assert_eq!(title_of(&[]), None);
     }
 
     #[test]
-    fn detects_csv() {
+    fn detects_every_extension_family() {
         assert_eq!(FileType::of("sales.csv"), Some(FileType::Csv));
         assert_eq!(FileType::of("DATA.CSV"), Some(FileType::Csv));
-    }
-
-    #[test]
-    fn detects_parquet() {
         assert_eq!(FileType::of("data.parquet"), Some(FileType::Parquet));
         assert_eq!(FileType::of("data.pq"), Some(FileType::Parquet));
-    }
-
-    #[test]
-    fn detects_json() {
         assert_eq!(FileType::of("config.json"), Some(FileType::Json));
         assert_eq!(FileType::of("events.jsonl"), Some(FileType::Json));
         assert_eq!(FileType::of("stream.ndjson"), Some(FileType::Json));
-    }
-
-    #[test]
-    fn detects_pdf() {
         assert_eq!(FileType::of("report.pdf"), Some(FileType::Pdf));
-    }
-
-    #[test]
-    fn detects_text() {
         assert_eq!(FileType::of("notes.txt"), Some(FileType::Text));
         assert_eq!(FileType::of("readme.md"), Some(FileType::Markdown));
-    }
-
-    #[test]
-    fn unknown_extension() {
+        assert_eq!(FileType::of("book.epub"), Some(FileType::Epub));
+        assert_eq!(FileType::of("letter.odt"), Some(FileType::Odt));
+        assert_eq!(FileType::of("thread.eml"), Some(FileType::Eml));
+        assert_eq!(FileType::of("inbox.mbox"), Some(FileType::Mbox));
+        assert_eq!(FileType::of("meeting.vtt"), Some(FileType::Vtt));
+        assert_eq!(FileType::of("film.srt"), Some(FileType::Srt));
+        assert_eq!(FileType::of("main.rs"), Some(FileType::Code));
+        assert_eq!(FileType::of("app.PY"), Some(FileType::Code));
+        assert_eq!(FileType::of("memo.rtf"), Some(FileType::Rtf));
         assert_eq!(FileType::of("image.png"), None);
         assert_eq!(FileType::of("noext"), None);
+        assert!(FileType::table_extensions().any(|e| e == "xlsx"));
+        assert!(!FileType::table_extensions().any(|e| e == "epub"));
     }
 
     #[test]
-    fn extracts_plain_text() {
-        let data = b"Hello, world!";
+    fn extracts_plain_text_and_code() {
         let text = TextFormat::Text
-            .extract(data, BUDGET)
+            .extract(b"Hello, world!", BUDGET)
             .ok()
             .and_then(|e| e.sections.into_iter().next())
             .map(|s| s.text);
         assert_eq!(text, Some(String::from("Hello, world!")));
-    }
-
-    #[test]
-    fn markdown_splits_on_atx_and_setext_headings() {
-        let md = "intro line\n\n# Exclusions\n\nFlood is excluded.\n\nClaims\n------\n\nClose in 30 days.\n\n## Not a heading\ntext\n#nope\n- list\n---\n";
-        let sections = markdown_sections(md);
-        let summary: Vec<(Option<&str>, &str)> = sections
-            .iter()
-            .map(|s| (s.heading.as_deref(), s.text.as_str()))
-            .collect();
-        assert_eq!(
-            summary,
-            vec![
-                (None, "intro line"),
-                (Some("Exclusions"), "Flood is excluded."),
-                (Some("Claims"), "Close in 30 days."),
-                (Some("Not a heading"), "text\n#nope\n- list\n---"),
-            ]
-        );
-    }
-
-    #[test]
-    fn markdown_without_headings_is_one_section() {
-        let sections = markdown_sections("just\n\ntext");
-        assert_eq!(sections.len(), 1);
-        assert_eq!(sections.first().and_then(|s| s.heading.as_deref()), None);
-    }
-
-    #[test]
-    fn atx_heading_requires_space_and_trims_closing_hashes() {
-        assert_eq!(atx_heading("## Title ##"), Some(String::from("Title")));
-        assert_eq!(atx_heading("#nospace"), None);
-        assert_eq!(atx_heading("####### seven"), None);
-        assert_eq!(atx_heading("# "), None);
+        let code = TextFormat::Code
+            .extract(b"fn main() {}\n", BUDGET)
+            .ok()
+            .and_then(|e| e.sections.into_iter().next());
+        assert_eq!(code.as_ref().map(|s| s.kind), Some(SectionKind::Code));
+        assert!(TextFormat::Text.extract(&[0xff, 0xfe], BUDGET).is_err());
     }
 
     #[test]
@@ -683,7 +686,9 @@ mod tests {
 
     /// A PDF with `pages` pages, each carrying one line naming its number.
     fn long_pdf(pages: u32, title: &str) -> Vec<u8> {
-        let mut doc = pdf_oxide::writer::DocumentBuilder::new().title(title);
+        let mut doc = pdf_oxide::writer::DocumentBuilder::new()
+            .title(title)
+            .author("Ada");
         for page in 1..=pages {
             doc.letter_page()
                 .at(72.0, 720.0)
@@ -700,6 +705,7 @@ mod tests {
             .extract(&long_pdf(60, "Long Report"), BUDGET)
             .unwrap();
         assert_eq!(extracted.title.as_deref(), Some("Long Report"));
+        assert_eq!(extracted.meta.author.as_deref(), Some("Ada"));
         assert_eq!(
             extracted.pages,
             Some(PageCounts {
@@ -720,28 +726,6 @@ mod tests {
             page_40.is_some_and(|(text, heading)| text.contains("Page 40") && heading.is_none()),
             "{page_40:?}"
         );
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn a_page_that_fails_to_read_is_skipped_and_counted_not_the_rest() {
-        let PdfPages { sections, counts } = extract_pdf_pages(4, |index| match index {
-            1 => Err(String::from("bad font")),
-            2 => Ok(String::from("   ")),
-            _ => Ok(format!("text {index}")),
-        })
-        .unwrap();
-        assert_eq!(
-            counts,
-            PageCounts {
-                total: 4,
-                unreadable: 1,
-                empty: 1
-            }
-        );
-        let pages: Vec<Option<u32>> = sections.iter().map(|s| s.page).collect();
-        assert_eq!(pages, vec![Some(1), Some(4)]);
-        assert_eq!(sections.get(1).map(|s| s.text.as_str()), Some("text 3"));
     }
 
     #[test]
@@ -774,22 +758,22 @@ mod tests {
     }
 
     #[test]
-    fn a_pdf_whose_every_page_fails_reports_the_count() {
-        let err = extract_pdf_pages(3, |_| Err(String::from("bad"))).err();
-        assert!(
-            err.as_ref()
-                .is_some_and(|e| e.to_string().contains("3 of 3 pages failed")),
-            "{err:?}"
+    fn document_meta_trims_dedups_and_knows_when_it_is_empty() {
+        let mut meta = DocumentMeta::default();
+        assert!(meta.is_empty());
+        DocumentMeta::set(&mut meta.author, Some("  "));
+        assert!(meta.is_empty());
+        DocumentMeta::set(&mut meta.author, Some(" Ada "));
+        meta.tag(" policy ");
+        meta.tag("policy");
+        meta.extra("subject", Some(""));
+        meta.extra("subject", Some(" Renewals "));
+        assert_eq!(meta.author.as_deref(), Some("Ada"));
+        assert_eq!(meta.tags, ["policy"]);
+        assert_eq!(
+            meta.extra.get("subject").map(String::as_str),
+            Some("Renewals")
         );
-    }
-
-    #[test]
-    fn a_pdf_whose_every_page_is_blank_is_a_scanned_document() {
-        let err = extract_pdf_pages(2, |_| Ok(String::new())).err();
-        assert!(
-            err.as_ref()
-                .is_some_and(|e| e.to_string().contains("no text layer")),
-            "{err:?}"
-        );
+        assert!(!meta.is_empty());
     }
 }

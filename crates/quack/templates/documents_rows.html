@@ -7,7 +7,8 @@
   <tbody>
   {% for d in documents %}
   <tr id="doc-{{ d.id }}" class="border-b border-slate-800">
-    <td class="font-medium wrap-anywhere">{{ d.filename }}{% if let Some(title) = d.title %} <span class="font-normal text-slate-400">{{ title }}</span>{% endif %}{% if d.pinning == Pinning::Pinned %} <span class="rounded bg-amber-900 px-1.5 py-0.5 text-xs text-amber-200">pinned</span>{% endif %}</td>
+    <td class="font-medium wrap-anywhere">{{ d.filename }}{% if let Some(title) = d.title %} <span class="font-normal text-slate-400">{{ title }}</span>{% endif %}{% if d.pinning == Pinning::Pinned %} <span class="rounded bg-amber-900 px-1.5 py-0.5 text-xs text-amber-200">pinned</span>{% endif %}
+      {% if d.author.is_some() || d.authored_at.is_some() || !d.tags.is_empty() %}<div class="mt-0.5 text-xs font-normal text-slate-400">{% if let Some(author) = d.author %}{{ author }}{% endif %}{% if let Some(at) = d.authored_at %}{% if d.author.is_some() %}, {% endif %}{{ at }}{% endif %}{% for tag in d.tags %} <span class="rounded bg-slate-800 px-1.5 py-0.5">{{ tag }}</span>{% endfor %}</div>{% endif %}</td>
     <td class="whitespace-nowrap text-slate-400">{{ d.source }}</td>
     <td class="wrap-anywhere"><span id="status-{{ d.id }}">{% include "document_status.html" %}</span>{% if let Some(by) = d.superseded_by %} <a class="text-slate-400 hover:underline" href="#doc-{{ by }}">{% if d.status == DocumentStatus::Superseded %}replaced by{% else %}being replaced by{% endif %} {{ by }}</a>{% endif %}</td>
     <td class="whitespace-nowrap text-right tabular-nums">{{ d.size_bytes.unwrap_or(0) }}</td>

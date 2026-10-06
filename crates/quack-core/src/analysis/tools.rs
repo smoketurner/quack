@@ -1378,7 +1378,8 @@ impl Tool for ListDocumentsTool {
     fn description(&self) -> String {
         String::from(
             "List every ingested document with its id, file name, status (queued, processing, \
-             ready, or error), MIME type, source, and title when it has one. A document's text is \
+             ready, or error), MIME type, source, title, author, authored date, and tags when it \
+             has them. A document's text is \
              searchable once its status is ready; a tabular file is loaded as a table instead. A \
              document marked with unreadable pages or pages without text was only partly read: \
              those pages are not searchable. To \
@@ -1410,9 +1411,22 @@ impl Tool for ListDocumentsTool {
                 .as_deref()
                 .map_or(String::new(), |t| format!(", title: {}", OneLine(t)));
             let pages = PageCounts::suffix(doc.pages);
+            let author = doc
+                .author
+                .as_deref()
+                .map_or(String::new(), |a| format!(", author: {}", OneLine(a)));
+            let authored = doc
+                .authored_at
+                .as_deref()
+                .map_or(String::new(), |d| format!(", authored: {d}"));
+            let tags = if doc.tags.is_empty() {
+                String::new()
+            } else {
+                format!(", tags: {}", OneLine(&doc.tags.join(", ")))
+            };
             writeln!(
                 output,
-                "- {} (id: {}, status: {}, type: {}, source: {}{title}{pages})",
+                "- {} (id: {}, status: {}, type: {}, source: {}{title}{author}{authored}{tags}{pages})",
                 OneLine(&doc.filename),
                 doc.id,
                 doc.status,
