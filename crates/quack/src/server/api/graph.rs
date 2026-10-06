@@ -225,7 +225,7 @@ impl Access {
         app: &App,
         plan: &ExtractionPlan,
     ) -> ApiResult<ExtractionStarted> {
-        let (access, id) = (self, &self.workspace.id);
+        let (access, id) = (self, &self.membership.workspace.id);
         let (sample, reset) = (plan.sample, plan.reset);
         let slot = app.begin_extraction(id).ok_or_else(|| {
             ApiError::conflict("a graph extraction is already running for this workspace")
@@ -550,7 +550,7 @@ impl Access {
         app: &App,
         approval: DropApproval,
     ) -> ApiResult<Revalidation> {
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let outcome = with_db(db, move |db| {
             if let Some(refusal) = approval.refusal(&Revalidation::preview(db)?) {
                 return Ok(Err(refusal));
@@ -573,7 +573,7 @@ impl Access {
 
     /// Mark the provisional graph reviewed.
     pub(crate) async fn review_graph(&self, app: &App) -> ApiResult<GraphStatus> {
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let status = with_db(db, |db| {
             graph_store::mark_reviewed(db)?;
             graph_store::status(db)
@@ -591,7 +591,7 @@ impl Access {
         merge: &str,
         decision: MergeDecision,
     ) -> ApiResult<MergeProposal> {
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let author = self.identity.username.clone();
         let merge_id = merge.to_owned();
         let proposal = with_db(db, move |db| {

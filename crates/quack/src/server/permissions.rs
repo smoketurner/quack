@@ -103,7 +103,7 @@ impl Permissions {
         let timeout = app.config.server.permission_timeout();
         let id = PermissionId::generate();
         let waiting = Waiting {
-            workspace: access.workspace.id.clone(),
+            workspace: access.membership.workspace.id.clone(),
             session: session.clone(),
             user: access.identity.user_id.clone(),
             sql: request.sql.clone(),
@@ -166,7 +166,7 @@ impl Permissions {
         let mut waiting = self.lock();
         let entry = waiting
             .get_mut(request)
-            .filter(|w| w.workspace == access.workspace.id && w.session == *session)
+            .filter(|w| w.workspace == access.membership.workspace.id && w.session == *session)
             .ok_or(Refusal::Unknown)?;
         if entry.user != access.identity.user_id {
             return Err(Refusal::NotYours);

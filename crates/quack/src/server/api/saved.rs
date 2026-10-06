@@ -75,7 +75,9 @@ impl Access {
     async fn saved_question(&self, app: &App, saved: &SavedId) -> ApiResult<SavedQuestion> {
         let wanted = saved.clone();
         let found = app
-            .read(&self.workspace.id, move |db| saved::by_id(db, &wanted))
+            .read(&self.membership.workspace.id, move |db| {
+                saved::by_id(db, &wanted)
+            })
             .await?;
         found.ok_or_else(|| ResourceKind::SavedQuestion.missing(saved.as_str()).into())
     }

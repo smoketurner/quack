@@ -24,7 +24,7 @@
 {% if status.provisional() %}
 <div class="mt-3 flex flex-wrap items-center gap-3 rounded border border-amber-900 bg-amber-950 px-3 py-2 text-sm text-amber-200">
   <span>Provisional: built from an ontology accepted without review. Query mode ignores it until someone reviews.</span>
-  {% if ws.can_write %}<form method="post" action="/w/{{ ws.id }}/graph/review"><button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Mark reviewed</button></form>{% endif %}
+  {% if ws.can_write %}<form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/review"><button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Mark reviewed</button></form>{% endif %}
 </div>
 {% endif %}
 {% if status.stale %}
@@ -35,7 +35,7 @@
   {% endif %}
   {% if let Some(Ok(r)) = revalidation %}
   {% if r.is_empty() %}
-  {% if ws.can_write %}<form method="post" action="/w/{{ ws.id }}/graph/revalidate"><button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Revalidate (no model calls)</button></form>{% endif %}
+  {% if ws.can_write %}<form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/revalidate"><button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Revalidate (no model calls)</button></form>{% endif %}
   <span>Every node and edge fits the new version: revalidating drops nothing.</span>
   {% else %}
   <div class="w-full">
@@ -45,9 +45,9 @@
       {% for (relation, edges) in r.relations %}<li>relation <span class="font-mono">{{ relation }}</span>, which the ontology no longer defines: {{ edges }} edges</li>{% endfor %}
       {% if r.misfit_edges() > 0 %}<li>{{ r.misfit_edges() }} edges that lose an end or no longer fit their relation's domain and range</li>{% endif %}
     </ul>
-    <p class="mt-1">If a class or relation was renamed, restore the earlier version and <a class="underline" href="/w/{{ ws.id }}/ontology">rename it on the ontology page</a>, which moves its nodes and edges. Dropped document nodes come back only by extracting again from an empty graph.</p>
+    <p class="mt-1">If a class or relation was renamed, restore the earlier version and <a class="underline" href="/w/{{ ws.membership.workspace.id }}/ontology">rename it on the ontology page</a>, which moves its nodes and edges. Dropped document nodes come back only by extracting again from an empty graph.</p>
     {% if ws.can_write %}
-    <form method="post" action="/w/{{ ws.id }}/graph/revalidate" class="mt-2">
+    <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/revalidate" class="mt-2">
       <input type="hidden" name="dropped_nodes" value="{{ r.dropped_nodes }}">
       <input type="hidden" name="dropped_edges" value="{{ r.dropped_edges }}">
       <button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Drop {{ r.dropped_nodes }} nodes and {{ r.dropped_edges }} edges and revalidate</button>
@@ -60,17 +60,17 @@
 {% endif %}
 {% if !status.missing_tables.is_empty() %}
 <div class="mt-3 rounded border border-amber-900 bg-amber-950 px-3 py-2 text-sm text-amber-200">
-  The ontology maps tables that are no longer in the workspace: {{ status.missing_tables.join(", ") }}. Extraction skips them; <a class="underline" href="/w/{{ ws.id }}/ontology">remove the mapping on the ontology page</a> or ingest the data again.
+  The ontology maps tables that are no longer in the workspace: {{ status.missing_tables.join(", ") }}. Extraction skips them; <a class="underline" href="/w/{{ ws.membership.workspace.id }}/ontology">remove the mapping on the ontology page</a> or ingest the data again.
 </div>
 {% endif %}
 {% if !drift.is_empty() %}
 <div class="mt-3 rounded border border-blue-900 bg-blue-950 px-3 py-2 text-sm text-blue-200">
-  The documents expressed {{ drift.len() }} things the ontology lacks: {{ drift.join(", ") }}. <a class="underline" href="/w/{{ ws.id }}/ontology">Propose extensions on the ontology page.</a>
+  The documents expressed {{ drift.len() }} things the ontology lacks: {{ drift.join(", ") }}. <a class="underline" href="/w/{{ ws.membership.workspace.id }}/ontology">Propose extensions on the ontology page.</a>
 </div>
 {% endif %}
 
 <div class="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
-  <form method="post" action="/w/{{ ws.id }}/graph" class="rounded border border-slate-800 bg-slate-900 p-3 text-sm">
+  <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph" class="rounded border border-slate-800 bg-slate-900 p-3 text-sm">
     <h2 class="font-medium">Explore</h2>
     <div class="mt-2 flex flex-wrap items-center gap-2">
       <input aria-label="Entity" name="entity" value="{{ query.entity }}" placeholder="entity (as named in the data)" class="w-56 rounded border border-slate-700 px-2 py-1">
@@ -81,7 +81,7 @@
     </div>
     <p class="mt-1 text-xs text-slate-400">An entity shows its neighbourhood; a class alone lists its entities (subclasses included).</p>
   </form>
-  <form method="post" action="/w/{{ ws.id }}/graph" class="rounded border border-slate-800 bg-slate-900 p-3 text-sm">
+  <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph" class="rounded border border-slate-800 bg-slate-900 p-3 text-sm">
     <h2 class="font-medium">Path</h2>
     <div class="mt-2 flex flex-wrap items-center gap-2">
       <input aria-label="Path start" name="from" value="{{ query.from }}" placeholder="from" class="w-40 rounded border border-slate-700 px-2 py-1">
@@ -93,7 +93,7 @@
 </div>
 
 {% if ws.can_write && has_ontology %}
-<form method="post" action="/w/{{ ws.id }}/graph/extract" class="mt-4 flex flex-wrap items-center gap-3 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
+<form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/extract" class="mt-4 flex flex-wrap items-center gap-3 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
   <span class="font-medium">Build</span>
   <select aria-label="What to extract from" name="source" class="rounded border border-slate-700 px-2 py-1">
     <option value="all">tables and documents</option>
@@ -107,7 +107,7 @@
 </form>
 {% endif %}
 {% if !has_ontology %}
-<p class="mt-4 text-sm text-slate-400">No ontology yet: the graph needs one. <a class="text-blue-400 hover:underline" href="/w/{{ ws.id }}/ontology">Install or propose an ontology first.</a></p>
+<p class="mt-4 text-sm text-slate-400">No ontology yet: the graph needs one. <a class="text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/ontology">Install or propose an ontology first.</a></p>
 {% endif %}
 
 {% if !merges.is_empty() %}
@@ -123,8 +123,8 @@
       <td class="tabular-nums">{{ m.distance }}</td>
       <td class="text-right whitespace-nowrap">
         {% if ws.can_write %}
-        <form method="post" action="/w/{{ ws.id }}/graph/merges/{{ m.id }}" class="inline"><input type="hidden" name="action" value="accept"><button type="submit" class="rounded bg-blue-600 px-2 py-0.5 text-xs text-white hover:bg-blue-500">Merge</button></form>
-        <form method="post" action="/w/{{ ws.id }}/graph/merges/{{ m.id }}" class="inline"><input type="hidden" name="action" value="reject"><button type="submit" class="ml-1 rounded border border-slate-700 px-2 py-0.5 text-xs hover:bg-slate-800">Keep apart</button></form>
+        <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/merges/{{ m.id }}" class="inline"><input type="hidden" name="action" value="accept"><button type="submit" class="rounded bg-blue-600 px-2 py-0.5 text-xs text-white hover:bg-blue-500">Merge</button></form>
+        <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/merges/{{ m.id }}" class="inline"><input type="hidden" name="action" value="reject"><button type="submit" class="ml-1 rounded border border-slate-700 px-2 py-0.5 text-xs hover:bg-slate-800">Keep apart</button></form>
         {% endif %}
       </td>
     </tr>

@@ -37,7 +37,7 @@ use quack_core::ontology::{
 use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditAction, AuditFilter, AuditPage, AuditRow, Expiry, IssuedToken, MemberRow, Membership,
-    Outcome, ProviderAllowList, ResourceKind, Role, Scope, TokenRow, UserKind, UserRow,
+    Outcome, ProviderAllowList, ResourceKind, Role, Scope, Standing, TokenRow, UserKind, UserRow,
     WorkspaceChanges, WorkspaceTimes,
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
@@ -218,35 +218,9 @@ impl Tab {
 }
 
 struct WsNav {
-    id: String,
-    name: String,
-    role: Standing,
+    membership: Membership,
     can_write: bool,
     can_manage: bool,
-}
-
-/// Where the caller stands in a workspace, as the pages show it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Standing {
-    Member(Role),
-    /// A server admin without membership: settings and members, never
-    /// content.
-    Admin,
-}
-
-impl Standing {
-    fn of(role: Option<Role>) -> Self {
-        role.map_or(Self::Admin, Self::Member)
-    }
-}
-
-impl fmt::Display for Standing {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Member(role) => role.fmt(f),
-            Self::Admin => f.write_str("admin"),
-        }
-    }
 }
 
 impl Page {
@@ -266,9 +240,7 @@ impl Page {
     fn in_workspace(app: &App, tab: Tab, access: &Access) -> Self {
         Self {
             workspace: Some(WsNav {
-                id: access.workspace.id.to_string(),
-                name: access.workspace.name.clone(),
-                role: Standing::of(access.role),
+                membership: access.membership.clone(),
                 can_write: access.permits(Need::WRITE),
                 can_manage: access.permits(Need::OWN),
             }),
@@ -299,10 +271,7 @@ struct LoginPage {
 }
 
 struct WsItem {
-    id: String,
-    name: String,
-    classification: String,
-    role: Standing,
+    membership: Membership,
     times: Option<WorkspaceTimes>,
 }
 
@@ -598,7 +567,7 @@ impl SqlRun {
     async fn statement(&self, app: &App, access: &Access) -> Statement {
         let (sql, sort) = (self.sql.clone(), self.result_sort());
         let planned = app
-            .read(&access.workspace.id, move |db| {
+            .read(&access.membership.workspace.id, move |db| {
                 let Some(sortable) = db.sortable(&sql)? else {
                     return Ok(None);
                 };
@@ -1031,15 +1000,17 @@ async fn workspaces(
             .await?
             .into_iter()
             .map(|w| WsItem {
-                role: if app.mode == ServeMode::Local {
-                    Standing::Member(Role::Owner)
-                } else {
-                    Standing::of(mine.iter().find(|m| m.workspace.id == w.id).map(|m| m.role))
-                },
                 times: times.remove(&w.id),
-                id: w.id.into_string(),
-                name: w.name,
-                classification: w.classification,
+                membership: Membership {
+                    standing: if app.mode == ServeMode::Local {
+                        Standing::Member(Role::Owner)
+                    } else {
+                        mine.iter()
+                            .find(|m| m.workspace.id == w.id)
+                            .map_or(Standing::Admin, |m| m.standing)
+                    },
+                    workspace: w,
+                },
             })
             .collect()
     } else {
@@ -1047,12 +1018,9 @@ async fn workspaces(
             .workspaces_for_user(&identity.user_id)
             .await?
             .into_iter()
-            .map(|Membership { workspace: w, role }| WsItem {
-                times: times.remove(&w.id),
-                id: w.id.into_string(),
-                name: w.name,
-                classification: w.classification,
-                role: Standing::Member(role),
+            .map(|membership| WsItem {
+                times: times.remove(&membership.workspace.id),
+                membership,
             })
             .collect()
     };
@@ -1234,11 +1202,11 @@ impl DocumentRows {
     /// The workspace's documents as the caller may act on them.
     async fn load(app: &App, access: &Access) -> WebResult<Self> {
         let documents = app
-            .read(&access.workspace.id, WorkspaceDb::list_documents)
+            .read(&access.membership.workspace.id, WorkspaceDb::list_documents)
             .await?;
         let pending = documents.iter().any(|d| d.status.is_in_flight());
         Ok(Self {
-            ws_id: access.workspace.id.to_string(),
+            ws_id: access.membership.workspace.id.to_string(),
             can_write: access.permits(Need::WRITE),
             documents,
             pending,
@@ -1271,7 +1239,7 @@ impl JobRows {
             .collect();
         let pending = jobs.iter().any(|j| j.active);
         Self {
-            ws_id: access.workspace.id.to_string(),
+            ws_id: access.membership.workspace.id.to_string(),
             jobs,
             pending,
         }
@@ -1554,7 +1522,7 @@ impl SqlResult {
             rewritten,
         } = run.statement(app, access).await;
         let sort = run.result_sort().filter(|_| rewritten);
-        let ws_id = access.workspace.id.to_string();
+        let ws_id = access.membership.workspace.id.to_string();
         match access.execute_sql(app, &sql).await {
             Ok(outcome) => Self {
                 ws_id,
@@ -2066,7 +2034,7 @@ impl SettingsPage {
         new_token: Option<String>,
         error: Option<String>,
     ) -> WebResult<Self> {
-        let allowed = &access.workspace.allowed_providers;
+        let allowed = &access.membership.workspace.allowed_providers;
         let providers = app
             .config
             .providers
@@ -2075,15 +2043,19 @@ impl SettingsPage {
             .collect();
         let (members, tokens) = if access.permits(Need::OWN) {
             (
-                app.control.list_members(&access.workspace.id).await?,
-                app.control.list_tokens(&access.workspace.id).await?,
+                app.control
+                    .list_members(&access.membership.workspace.id)
+                    .await?,
+                app.control
+                    .list_tokens(&access.membership.workspace.id)
+                    .await?,
             )
         } else {
             (Vec::new(), Vec::new())
         };
         Ok(Self {
             page: Page::in_workspace(app, Tab::Settings, access),
-            classification: access.workspace.classification.clone(),
+            classification: access.membership.workspace.classification.clone(),
             providers,
             members,
             tokens,

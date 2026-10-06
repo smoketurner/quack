@@ -29,19 +29,19 @@ pub(crate) async fn handle(
     let access = Access::resolve(&app, identity, &workspace, Need::READ).await?;
     let policy = WritePolicy::Deny.allowed_if(access.permits(Need::WRITE));
     let key = McpKey {
-        workspace_id: access.workspace.id.clone(),
+        workspace_id: access.membership.workspace.id.clone(),
         user_id: access.identity.user_id.clone(),
         policy,
     };
-    let db = app.workspace_db(&access.workspace.id).await?;
-    let reader = app.reader_db(&access.workspace.id).await?;
+    let db = app.workspace_db(&access.membership.workspace.id).await?;
+    let reader = app.reader_db(&access.membership.workspace.id).await?;
     let transport = app
         .mcp_transport(key, || {
             McpServer::new(McpSetup {
                 config: app.config.clone(),
                 db,
                 reader,
-                workspace: access.workspace.clone(),
+                workspace: access.membership.workspace.clone(),
                 policy,
                 user_id: Some(access.identity.user_id.clone()),
                 auditor: Auditor::Server(std::sync::Arc::clone(&app)),

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 {% if let Some(ws) = page.workspace %}
-<h1 class="text-xl font-semibold">Settings · {{ ws.name }}</h1>
+<h1 class="text-xl font-semibold">Settings · {{ ws.membership.workspace.name }}</h1>
 {% if let Some(error) = error %}<p role="alert" class="mt-3 rounded border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}
 {% if let Some(token) = new_token %}
 <div class="mt-3 rounded border border-emerald-900 bg-emerald-950 px-3 py-2 text-sm">
@@ -9,7 +9,7 @@
   <code class="mt-1 block break-all font-mono">{{ token }}</code>
 </div>
 {% endif %}
-<form method="post" action="/w/{{ ws.id }}/settings" class="mt-4 rounded border border-slate-800 bg-slate-900 p-4">
+<form method="post" action="/w/{{ ws.membership.workspace.id }}/settings" class="mt-4 rounded border border-slate-800 bg-slate-900 p-4">
   <label class="block text-sm"><span class="text-slate-300">Classification label</span>
     <input name="classification" value="{{ classification }}" class="mt-1 block rounded border border-slate-700 px-3 py-2" {% if !ws.can_manage %}disabled{% endif %}></label>
   <fieldset class="mt-3 text-sm"><legend class="text-slate-300">Allowed providers</legend>
@@ -21,9 +21,9 @@
 <section class="mt-8">
   <h2 class="text-sm font-semibold uppercase text-slate-400">Members</h2>
   <table class="data-table mt-2 w-full text-sm" aria-label="Members"><tbody>
-    {% for m in members %}<tr class="border-b border-slate-800"><td class="wrap-anywhere">{{ m.username }}</td><td>{{ m.role }}</td><td class="text-right"><form method="post" action="/w/{{ ws.id }}/members/{{ m.user_id }}/remove"><button class="text-red-400 hover:underline">Remove</button></form></td></tr>{% endfor %}
+    {% for m in members %}<tr class="border-b border-slate-800"><td class="wrap-anywhere">{{ m.username }}</td><td>{{ m.role }}</td><td class="text-right"><form method="post" action="/w/{{ ws.membership.workspace.id }}/members/{{ m.user_id }}/remove"><button class="text-red-400 hover:underline">Remove</button></form></td></tr>{% endfor %}
   </tbody></table>
-  <form method="post" action="/w/{{ ws.id }}/members" class="mt-3 flex flex-wrap items-end gap-2 text-sm">
+  <form method="post" action="/w/{{ ws.membership.workspace.id }}/members" class="mt-3 flex flex-wrap items-end gap-2 text-sm">
     <input aria-label="Username" name="username" required placeholder="username" class="rounded border border-slate-700 px-3 py-2">
     <select aria-label="Role" name="role" class="rounded border border-slate-700 px-2 py-2"><option>viewer</option><option selected>member</option><option>owner</option></select>
     <button type="submit" class="rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500">Add member</button>
@@ -32,9 +32,9 @@
 <section class="mt-8">
   <h2 class="text-sm font-semibold uppercase text-slate-400">API tokens</h2>
   <table class="data-table mt-2 w-full text-sm" aria-label="API tokens"><tbody>
-    {% for t in tokens %}<tr class="border-b border-slate-800"><td class="wrap-anywhere">{{ t.name }}</td><td class="font-mono text-xs"><div class="max-w-[12rem] truncate" title="{{ t.token_hash }}">{{ t.token_hash }}</div></td><td class="whitespace-nowrap">{% if let Some(at) = t.expires_at %}expires {{ When::Clock.html(at.as_str())|safe }}{% else %}no expiry{% endif %}</td><td class="whitespace-nowrap">{% if let Some(at) = t.last_used_at %}used {{ When::Relative.html(at.as_str())|safe }}{% else %}never used{% endif %}</td><td class="text-right"><form method="post" action="/w/{{ ws.id }}/tokens/{{ t.token_hash }}/revoke"><button class="text-red-400 hover:underline">Revoke</button></form></td></tr>{% endfor %}
+    {% for t in tokens %}<tr class="border-b border-slate-800"><td class="wrap-anywhere">{{ t.name }}</td><td class="font-mono text-xs"><div class="max-w-[12rem] truncate" title="{{ t.token_hash }}">{{ t.token_hash }}</div></td><td class="whitespace-nowrap">{% if let Some(at) = t.expires_at %}expires {{ When::Clock.html(at.as_str())|safe }}{% else %}no expiry{% endif %}</td><td class="whitespace-nowrap">{% if let Some(at) = t.last_used_at %}used {{ When::Relative.html(at.as_str())|safe }}{% else %}never used{% endif %}</td><td class="text-right"><form method="post" action="/w/{{ ws.membership.workspace.id }}/tokens/{{ t.token_hash }}/revoke"><button class="text-red-400 hover:underline">Revoke</button></form></td></tr>{% endfor %}
   </tbody></table>
-  <form method="post" action="/w/{{ ws.id }}/tokens" class="mt-3 flex flex-wrap items-end gap-2 text-sm">
+  <form method="post" action="/w/{{ ws.membership.workspace.id }}/tokens" class="mt-3 flex flex-wrap items-end gap-2 text-sm">
     <input aria-label="Token name" name="name" required placeholder="token name" class="rounded border border-slate-700 px-3 py-2">
     <label class="inline-flex items-center gap-1"><input type="checkbox" name="scopes" value="read" checked> read scope</label>
     <label class="inline-flex items-center gap-1"><input type="checkbox" name="scopes" value="write"> write scope</label>

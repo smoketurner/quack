@@ -828,7 +828,7 @@ impl McpServer {
     async fn as_caller<F: Future>(&self, caller: &Caller, work: F) -> F::Output {
         let workspace = match caller {
             Caller::Unaudited => &self.inner.workspace,
-            Caller::Audited { caller, .. } => &caller.access.workspace,
+            Caller::Audited { caller, .. } => &caller.access.membership.workspace,
         };
         let egress = Egress::Workspace(workspace.allowed_providers.clone());
         Acting::scope(caller.acting(), Egress::scope(Some(egress), work)).await

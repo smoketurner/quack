@@ -5,7 +5,7 @@
   <aside aria-label="Tables">
     <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-400">Tables</h2>
     {% if tables.is_empty() %}<p class="mt-2 text-sm text-slate-400">No tables. Upload a CSV, TSV, Parquet, JSON, or Excel file, or import from a database.</p>{% endif %}
-    <form method="post" action="/w/{{ ws.id }}/tables">
+    <form method="post" action="/w/{{ ws.membership.workspace.id }}/tables">
       <ul class="mt-2 space-y-1 text-sm">
         {% for t in tables %}<li><button type="submit" name="name" value="{{ t }}" class="block w-full truncate rounded px-2 py-1 text-left font-mono hover:bg-slate-800{% if let Some(s) = selected %}{% if s.name == *t %} bg-slate-800{% endif %}{% endif %}" title="{{ t }}"{% if let Some(s) = selected %}{% if s.name == *t %} aria-current="page"{% endif %}{% endif %}>{{ t }}</button></li>{% endfor %}
       </ul>
@@ -25,12 +25,12 @@
         <tbody>{% for r in t.sample_rows %}<tr class="border-b border-slate-800">{% for v in r %}<td class="px-3 py-1"><div class="max-w-xs truncate" title="{{ v }}">{{ v }}</div></td>{% endfor %}</tr>{% endfor %}</tbody>
       </table>
     </div>
-    <p class="mt-4 text-sm"><a class="text-blue-400 hover:underline" href="/w/{{ ws.id }}/sql">Query it in SQL</a></p>
+    <p class="mt-4 text-sm"><a class="text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/sql">Query it in SQL</a></p>
     {% else %}
     <p class="text-slate-400">Pick a table to see its schema and sample rows.</p>
     {% endif %}
     {% if ws.can_write %}
-    <form method="post" action="/w/{{ ws.id }}/import" class="mt-6 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
+    <form method="post" action="/w/{{ ws.membership.workspace.id }}/import" class="mt-6 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
       <h2 class="font-medium">Import from a database or a URL</h2>
       <p class="mt-1 text-xs text-slate-400">postgres://user:password@host/db, sqlite:/path/to.db, or https://host/file.csv (also .parquet, .json, .xlsx). The password is used once and never stored.</p>
       {% if let Some(error) = error %}<p role="alert" class="mt-2 rounded border border-red-900 bg-red-950 px-2 py-1 text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}

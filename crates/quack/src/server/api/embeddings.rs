@@ -85,7 +85,7 @@ impl Access {
             )
             .await?;
         let status = app
-            .read(&self.workspace.id, WorkspaceDb::embedding_status)
+            .read(&self.membership.workspace.id, WorkspaceDb::embedding_status)
             .await?;
         let plan = Plan::from_status(&status);
         if plan.is_empty() {
@@ -107,7 +107,12 @@ impl Access {
         )
         .await?;
         let run_id = run.id().clone();
-        let job = refresh_in_background(run, Arc::clone(app), self.workspace.id.clone(), embedder);
+        let job = refresh_in_background(
+            run,
+            Arc::clone(app),
+            self.membership.workspace.id.clone(),
+            embedder,
+        );
         Ok(RefreshStarted::Running {
             plan,
             run: run_id,

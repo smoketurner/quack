@@ -633,8 +633,9 @@ async fn members_need_a_user_and_a_workspace() {
     let mine = cp.workspaces_for_user(&bob.id).await;
     assert!(mine.is_ok_and(|w| {
         w.len() == 1
-            && w.first()
-                .is_some_and(|m| m.workspace.name == "w" && m.role == Role::Owner)
+            && w.first().is_some_and(|m| {
+                m.workspace.name == "w" && m.standing == Standing::Member(Role::Owner)
+            })
     }));
     assert!(
         cp.remove_member(&ws.id, &bob.id, setup_audit())

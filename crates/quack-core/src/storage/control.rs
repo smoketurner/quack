@@ -251,11 +251,52 @@ impl fmt::Debug for TokenSecret {
     }
 }
 
-/// A workspace a user belongs to, with their role in it.
-#[derive(Debug, Clone)]
+/// A workspace and where one person stands in it. Serializes as the
+/// workspace's fields plus `role`: the role, or `null` for an admin
+/// without membership.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Membership {
+    #[serde(flatten)]
     pub workspace: WorkspaceRow,
-    pub role: Role,
+    #[serde(rename = "role")]
+    pub standing: Standing,
+}
+
+/// Where a person stands in a workspace: a member with a role, or a
+/// server admin without membership, who reaches settings and members but
+/// never content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(into = "Option<Role>")]
+pub enum Standing {
+    Member(Role),
+    Admin,
+}
+
+impl Standing {
+    /// A membership's role, or `Admin` where there is none.
+    #[must_use]
+    pub fn of(role: Option<Role>) -> Self {
+        role.map_or(Self::Admin, Self::Member)
+    }
+}
+
+/// The role, when there is a membership.
+impl From<Standing> for Option<Role> {
+    fn from(standing: Standing) -> Self {
+        match standing {
+            Standing::Member(role) => Some(role),
+            Standing::Admin => None,
+        }
+    }
+}
+
+impl fmt::Display for Standing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Member(role) => role.fmt(f),
+            Self::Admin => f.write_str("admin"),
+        }
+    }
 }
 
 /// When a workspace was created and last reached, as stored UTC text.
@@ -1356,7 +1397,7 @@ impl ControlPlane {
             .map(|r| {
                 Ok(Membership {
                     workspace: WorkspaceRow::from_row(r)?,
-                    role: parsed(r, "role")?,
+                    standing: Standing::Member(parsed(r, "role")?),
                 })
             })
             .collect()

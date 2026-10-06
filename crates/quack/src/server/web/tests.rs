@@ -1,5 +1,6 @@
 use quack_core::analysis::events::ToolName;
-use quack_core::ids::MessageId;
+use quack_core::ids::{MessageId, WorkspaceId};
+use quack_core::storage::control::{AllowedProviders, WorkspaceRow};
 use quack_core::storage::sessions::{AssistantMeta, MessageMeta, ToolMeta};
 
 use super::*;
@@ -17,9 +18,15 @@ fn a_failed_revalidation_preview_is_shown_in_the_stale_banner() {
             kind: UserKind::Standard,
             local: false,
             workspace: Some(WsNav {
-                id: String::from("w1"),
-                name: String::from("sales"),
-                role: Standing::Member(Role::Owner),
+                membership: Membership {
+                    workspace: WorkspaceRow {
+                        id: WorkspaceId::from("w1"),
+                        name: String::from("sales"),
+                        classification: String::new(),
+                        allowed_providers: AllowedProviders::All,
+                    },
+                    standing: Standing::Member(Role::Owner),
+                },
                 can_write: true,
                 can_manage: true,
             }),

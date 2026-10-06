@@ -56,7 +56,7 @@ impl Access {
         let sid = session_id.to_owned();
         let viewer = self.session_viewer();
         let found = app
-            .read(&self.workspace.id, move |db| {
+            .read(&self.membership.workspace.id, move |db| {
                 Ok(sessions::get_session(db, &sid)?.filter(|s| s.visible_to(&viewer)))
             })
             .await?;
@@ -174,7 +174,7 @@ impl Access {
                 "only the session's creator or an owner may change its mode",
             )
             .await?;
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let session_id = session.id;
         let updated = with_db(db, move |db| {
             sessions::set_session_mode(db, &session_id, mode)?;
@@ -208,7 +208,7 @@ impl Access {
                 "only the session's creator or an owner may share it",
             )
             .await?;
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let session_id = session.id;
         let updated = with_db(db, move |db| {
             sessions::set_session_sharing(db, &session_id, sharing)?;
@@ -237,7 +237,7 @@ impl Access {
                 "only the session's creator or an owner may delete it",
             )
             .await?;
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let session_id = session.id;
         with_db(db, move |db| sessions::delete_session(db, &session_id)).await?;
         self.audit(

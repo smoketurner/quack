@@ -33,8 +33,8 @@ use quack_core::jobs::{JobKind, LaneKey};
 use quack_core::okf::{Bundle, BundleSink, TarSink};
 use quack_core::storage::audit;
 use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, IssuedToken, Origin,
-    Outcome, ResourceKind, Role, Scope, UserKind,
+    AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, IssuedToken, Membership,
+    Origin, Outcome, ResourceKind, Role, Scope, Standing, UserKind,
 };
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
 use quack_core::web_sessions::WebSessions;
@@ -206,8 +206,10 @@ impl Harness {
                 credential: Credential::Local,
                 origin: Origin::from(Channel::Web),
             },
-            workspace,
-            role: Some(Role::Owner),
+            membership: Membership {
+                workspace,
+                standing: Standing::Member(Role::Owner),
+            },
         }
     }
 
@@ -6546,8 +6548,10 @@ impl WaitingWrites {
                 credential: Credential::Local,
                 origin: Origin::from(Channel::Web),
             },
-            workspace,
-            role: Some(Role::Owner),
+            membership: Membership {
+                workspace,
+                standing: Standing::Member(Role::Owner),
+            },
         };
         Self {
             owner: h.login("owner").await,

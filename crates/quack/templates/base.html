@@ -17,9 +17,9 @@
 {% endif %}{% endfor %}</pre>quack</a>
       {% if let Some(ws) = page.workspace %}
       <nav aria-label="Workspace" class="flex flex-wrap items-center gap-1 text-sm">
-        <span class="mr-2 max-w-[16rem] truncate rounded bg-slate-800 px-2 py-1 font-medium" title="{{ ws.name }}">{{ ws.name }} <span class="text-slate-400">· {{ ws.role }}</span></span>
+        <span class="mr-2 max-w-[16rem] truncate rounded bg-slate-800 px-2 py-1 font-medium" title="{{ ws.membership.workspace.name }}">{{ ws.membership.workspace.name }} <span class="text-slate-400">· {{ ws.membership.standing }}</span></span>
         {% for tab in Tab::WORKSPACE %}
-        <a class="rounded px-2 py-1 {% if page.tab == tab %}bg-blue-500/15 font-medium text-blue-300{% else %}hover:bg-slate-800{% endif %}" href="/w/{{ ws.id }}/{{ tab.path() }}"{% if page.tab == tab %} aria-current="page"{% endif %}>{{ tab.label() }}</a>
+        <a class="rounded px-2 py-1 {% if page.tab == tab %}bg-blue-500/15 font-medium text-blue-300{% else %}hover:bg-slate-800{% endif %}" href="/w/{{ ws.membership.workspace.id }}/{{ tab.path() }}"{% if page.tab == tab %} aria-current="page"{% endif %}>{{ tab.label() }}</a>
         {% endfor %}
       </nav>
       {% endif %}

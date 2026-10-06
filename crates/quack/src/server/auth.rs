@@ -21,8 +21,8 @@ use quack_core::ids::{AuditId, UserId, WorkspaceId};
 use quack_core::llm::egress::Egress;
 use quack_core::storage::audit::AuditDetail;
 use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditResource, Channel, Origin, Outcome, Role, Scope, TokenRow,
-    UserKind, UserRow, WorkspaceRow,
+    AuditAction, AuditEntry, AuditResource, Channel, Membership, Origin, Outcome, Role, Scope,
+    Standing, TokenRow, UserKind, UserRow, WorkspaceRow,
 };
 use quack_core::storage::sessions::SessionViewer;
 use quack_core::web_sessions::{SessionLookup, SessionToken};
@@ -449,9 +449,8 @@ impl Need {
 #[derive(Debug, Clone)]
 pub(crate) struct Access {
     pub identity: Identity,
-    pub workspace: WorkspaceRow,
-    /// `None` for an admin acting without membership.
-    pub role: Option<Role>,
+    /// The workspace, and where the caller stands in it.
+    pub membership: Membership,
 }
 
 impl Access {
@@ -463,7 +462,8 @@ impl Access {
 
     /// Owners and admins see every session; others see their own.
     fn sees_all_sessions(&self) -> bool {
-        self.identity.kind == UserKind::Admin || self.role == Some(Role::Owner)
+        self.identity.kind == UserKind::Admin
+            || self.membership.standing == Standing::Member(Role::Owner)
     }
 
     /// Which sessions the caller may read.
@@ -481,9 +481,9 @@ impl Access {
         if self.identity.lacks_scope(need.scope) {
             return false;
         }
-        match self.role {
-            Some(role) => role >= need.role,
-            None => need.admin_ok && self.identity.kind == UserKind::Admin,
+        match self.membership.standing {
+            Standing::Member(role) => role >= need.role,
+            Standing::Admin => need.admin_ok && self.identity.kind == UserKind::Admin,
         }
     }
 
@@ -514,7 +514,7 @@ impl Access {
     pub(crate) fn entry(&self, action: AuditAction, outcome: Outcome) -> AuditEntry {
         self.identity
             .audit(action, outcome)
-            .in_workspace(&self.workspace.id)
+            .in_workspace(&self.membership.workspace.id)
     }
 
     /// The `_quack_audit` half of an `audit_log` row already written.
@@ -526,7 +526,7 @@ impl Access {
     ) -> ApiResult<()> {
         // Its own connection: a request never waits for a write in
         // progress on the writer just to record that it happened.
-        app.audit_log(&self.workspace.id)
+        app.audit_log(&self.membership.workspace.id)
             .await?
             .record(AuditDetail {
                 id: entry.id.clone(),
@@ -573,12 +573,14 @@ impl Access {
             app.control.record_audit(&entry).await?;
             return Err(ApiError::not_found("no such workspace"));
         };
-        let role = if app.mode == ServeMode::Local {
-            Some(Role::Owner)
+        let standing = if app.mode == ServeMode::Local {
+            Standing::Member(Role::Owner)
         } else {
-            app.control
-                .member_role(&workspace.id, &identity.user_id)
-                .await?
+            Standing::of(
+                app.control
+                    .member_role(&workspace.id, &identity.user_id)
+                    .await?,
+            )
         };
         if let Credential::Token(token) = &identity.credential
             && token.workspace_id != workspace.id
@@ -589,23 +591,30 @@ impl Access {
         }
         let access = Self {
             identity,
-            workspace,
-            role,
+            membership: Membership {
+                workspace,
+                standing,
+            },
         };
         if !access.permits(need) {
-            let reason = match access.role {
-                None if access.identity.kind == UserKind::Admin => {
+            let reason = match access.membership.standing {
+                Standing::Admin if access.identity.kind == UserKind::Admin => {
                     "admins read workspace content only as members"
                 }
-                None => "not a member of this workspace",
-                Some(_) if access.identity.lacks_scope(need.scope) => "token lacks the scope",
-                Some(_) => "role does not allow this",
+                Standing::Admin => "not a member of this workspace",
+                Standing::Member(_) if access.identity.lacks_scope(need.scope) => {
+                    "token lacks the scope"
+                }
+                Standing::Member(_) => "role does not allow this",
             };
-            access.identity.deny(app, &access.workspace, reason).await?;
+            access
+                .identity
+                .deny(app, &access.membership.workspace, reason)
+                .await?;
         }
         // From here on the request, and every job it submits, sends only
         // to the model providers the workspace allows.
-        Egress::Workspace(access.workspace.allowed_providers.clone()).enter();
+        Egress::Workspace(access.membership.workspace.allowed_providers.clone()).enter();
         Ok(access)
     }
 

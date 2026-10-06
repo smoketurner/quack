@@ -152,7 +152,7 @@ impl BackgroundRun {
         Fut: Future<Output = Result<R, String>> + Send + 'static,
         R: RunReport,
     {
-        let workspace_id = self.access.workspace.id.clone();
+        let workspace_id = self.access.membership.workspace.id.clone();
         let spec = JobSpec::new(self.kind.job, self.kind.label)
             .workspace(workspace_id.clone())
             .owner(Some(self.access.identity.user_id.clone()))
