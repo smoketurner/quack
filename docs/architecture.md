@@ -100,3 +100,7 @@ make deny    # cargo deny check (advisories, licenses, bans)
 
 Add new dependencies to the root `[workspace.dependencies]` menu, pinned to the current
 version, never inline in a member crate.
+
+A source file over 1,000 lines keeps its unit tests in a sibling file: the module declares
+`#[cfg(test)] mod tests;` and the tests live in `tests.rs` beside it (`foo/tests.rs` for
+`foo.rs`, `tests.rs` in the same directory for a `mod.rs`).
