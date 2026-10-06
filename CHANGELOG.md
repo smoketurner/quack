@@ -21,6 +21,10 @@ needs (config keys, schema moves, `quack embeddings refresh`) are in
 
 - Merge nine duplicated types into the ones that already existed ([#437](https://github.com/smoketurner/quack/pull/437))
 - Move inline tests of files over 1,000 lines beside their modules ([#436](https://github.com/smoketurner/quack/pull/436))
+
+### Documentation
+
+- Upgrade notes, contributor setup and recipes, review documents, rustdoc gate
 ## v2026.10.3 (2026-10-05)
 
 ### Features

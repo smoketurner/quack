@@ -25,7 +25,8 @@ body = """
 {%- endfor %}
 {% endfor %}
 """
-footer = ""
+# The file ends with a newline, as the end-of-file hook requires.
+footer = "\n"
 trim = true
 
 [git]
