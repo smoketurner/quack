@@ -589,7 +589,7 @@ impl Access {
         let run = BackgroundRun::start(
             app,
             access,
-            RunKind::Ontology,
+            RunKind::ONTOLOGY,
             serde_json::json!({ "documents": true, "cost": cost }),
         )
         .await?;

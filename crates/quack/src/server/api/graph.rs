@@ -297,7 +297,7 @@ impl Access {
         let run = BackgroundRun::start(
             app,
             access,
-            RunKind::Graph,
+            RunKind::GRAPH,
             serde_json::json!({ "tables": table_summaries, "cost": cost }),
         )
         .await?;

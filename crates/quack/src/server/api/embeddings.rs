@@ -102,7 +102,7 @@ impl Access {
         let run = BackgroundRun::start(
             app,
             self,
-            RunKind::Embeddings,
+            RunKind::EMBEDDINGS,
             serde_json::json!({ "plan": plan, "profile": embedder.profile() }),
         )
         .await?;

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use quack_core::embedding::refresh;
 use quack_core::graph::extract;
 use quack_core::graph::resolve::ResolutionSummary;
-use quack_core::ids::{RunId, WorkspaceId};
+use quack_core::ids::RunId;
 use quack_core::jobs::{JobContext, JobId, JobKind, JobSpec, Lane, LaneKey};
 use quack_core::ontology::documents;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -20,56 +20,35 @@ use crate::server::auth::Access;
 use crate::server::error::ApiResult;
 use crate::server::state::App;
 
-/// What a background run is: how it is audited, which queue it takes, and
-/// what the job list calls it.
+/// What a background run is: the job kind whose workspace lane it takes,
+/// how it is audited, and what the job list calls it. One row per run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RunKind {
-    Embeddings,
-    Graph,
-    Ontology,
+pub(crate) struct RunKind {
+    job: JobKind,
+    action: AuditAction,
+    resource: ResourceKind,
+    label: &'static str,
 }
 
 impl RunKind {
-    fn action(self) -> AuditAction {
-        match self {
-            Self::Embeddings => AuditAction::EmbeddingsRefresh,
-            Self::Graph => AuditAction::GraphExtract,
-            Self::Ontology => AuditAction::Propose,
-        }
-    }
-
-    fn resource(self) -> ResourceKind {
-        match self {
-            Self::Embeddings => ResourceKind::EmbeddingsRun,
-            Self::Graph => ResourceKind::GraphRun,
-            Self::Ontology => ResourceKind::InductionRun,
-        }
-    }
-
-    fn job(self) -> JobKind {
-        match self {
-            Self::Embeddings => JobKind::Embeddings,
-            Self::Graph => JobKind::Graph,
-            Self::Ontology => JobKind::Ontology,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Embeddings => "embeddings refresh",
-            Self::Graph => "graph extraction",
-            Self::Ontology => "ontology document pass",
-        }
-    }
-
-    fn lane(self, workspace_id: &WorkspaceId) -> LaneKey {
-        let workspace = workspace_id.clone();
-        match self {
-            Self::Embeddings => LaneKey::Embeddings(workspace),
-            Self::Graph => LaneKey::Graph(workspace),
-            Self::Ontology => LaneKey::Ontology(workspace),
-        }
-    }
+    pub(crate) const EMBEDDINGS: Self = Self {
+        job: JobKind::Embeddings,
+        action: AuditAction::EmbeddingsRefresh,
+        resource: ResourceKind::EmbeddingsRun,
+        label: "embeddings refresh",
+    };
+    pub(crate) const GRAPH: Self = Self {
+        job: JobKind::Graph,
+        action: AuditAction::GraphExtract,
+        resource: ResourceKind::GraphRun,
+        label: "graph extraction",
+    };
+    pub(crate) const ONTOLOGY: Self = Self {
+        job: JobKind::Ontology,
+        action: AuditAction::Propose,
+        resource: ResourceKind::InductionRun,
+        label: "ontology document pass",
+    };
 }
 
 /// What a finished run reports: the closing audit row's detail (beside
@@ -146,8 +125,8 @@ impl BackgroundRun {
         access
             .audit(
                 app,
-                kind.action(),
-                Some(kind.resource().id(&id)),
+                kind.action,
+                Some(kind.resource.id(&id)),
                 Outcome::Allowed,
                 Some(detail),
             )
@@ -174,10 +153,13 @@ impl BackgroundRun {
         R: RunReport,
     {
         let workspace_id = self.access.workspace.id.clone();
-        let spec = JobSpec::new(self.kind.job(), self.kind.label())
+        let spec = JobSpec::new(self.kind.job, self.kind.label)
             .workspace(workspace_id.clone())
             .owner(Some(self.access.identity.user_id.clone()))
-            .lane(Lane::serial(&self.kind.lane(&workspace_id)));
+            .lane(Lane::serial(&LaneKey::Workspace(
+                self.kind.job,
+                workspace_id,
+            )));
         let jobs = self.app.jobs.clone();
         let unstarted = self.clone();
         let id = jobs.submit(spec, move |ctx| async move {
@@ -192,7 +174,7 @@ impl BackgroundRun {
                     Ok(report.message())
                 }
                 Err(e) => {
-                    tracing::warn!(run = %self.id, kind = ?self.kind, error = %e, "background run failed");
+                    tracing::warn!(run = %self.id, kind = self.kind.label, error = %e, "background run failed");
                     self.finish(
                         Outcome::Error,
                         serde_json::json!({ "finished": true, "error": e }),
@@ -222,14 +204,14 @@ impl BackgroundRun {
             .access
             .audit(
                 &self.app,
-                self.kind.action(),
-                Some(self.kind.resource().id(&self.id)),
+                self.kind.action,
+                Some(self.kind.resource.id(&self.id)),
                 outcome,
                 Some(detail),
             )
             .await
         {
-            tracing::error!(run = %self.id, kind = ?self.kind, error = %e.message, "audit write failed at the end of a background run");
+            tracing::error!(run = %self.id, kind = self.kind.label, error = %e.message, "audit write failed at the end of a background run");
         }
     }
 }

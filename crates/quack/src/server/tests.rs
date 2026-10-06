@@ -29,7 +29,7 @@ use super::state::{App, AppState, ServeMode, with_db};
 use crate::server::auth::{Access, Credential, Identity};
 use crate::server::queue::UploadJob;
 use crate::server::run::{BackgroundRun, RunKind, RunReport};
-use quack_core::jobs::LaneKey;
+use quack_core::jobs::{JobKind, LaneKey};
 use quack_core::okf::{Bundle, BundleSink, TarSink};
 use quack_core::storage::audit;
 use quack_core::storage::control::{
@@ -5399,7 +5399,7 @@ async fn a_large_batch_of_uploads_is_spooled_and_processed() {
         let ready = h.wait_ready(&ws, id, &token).await;
         assert_eq!(ready["status"], "ready", "{ready}");
     }
-    let lane = LaneKey::Ingest(ws.clone());
+    let lane = LaneKey::Workspace(JobKind::Ingest, ws.clone());
     for _ in 0..100 {
         if h.app.jobs.lane_active(&lane) == 0 {
             break;
@@ -5674,7 +5674,7 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
             BackgroundRun::start(
                 &app,
                 &access,
-                RunKind::Graph,
+                RunKind::GRAPH,
                 serde_json::json!({ "step": detail }),
             )
             .await
@@ -5803,7 +5803,7 @@ async fn a_stopping_server_closes_its_runs_and_refuses_new_work_on_the_record() 
     let token = h.login("owner").await;
     let access = h.owner_access(&ws, &owner).await;
     let start = || async {
-        BackgroundRun::start(&h.app, &access, RunKind::Graph, serde_json::json!({}))
+        BackgroundRun::start(&h.app, &access, RunKind::GRAPH, serde_json::json!({}))
             .await
             .unwrap_or_else(|e| fail(&e.message))
     };
