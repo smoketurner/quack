@@ -66,6 +66,7 @@ use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, passwo
 use super::error::ApiError;
 use super::oidc::Oidc;
 use super::state::{App, ServeMode};
+use quack_core::analysis::tools::{FindPathArgs, NonBlank, SearchGraphArgs};
 use quack_core::config::{GraphConfig, OidcConfig};
 use quack_core::embedding::Vector;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
@@ -82,7 +83,7 @@ use quack_core::jobs::JobNumber;
 use quack_core::llm::Embeddings;
 use quack_core::ontology::ROOT_CLASS;
 use quack_core::storage::workspace::WorkspaceDb;
-use quack_core::text::{NonBlankText, blank_as_none};
+use quack_core::text::blank_as_none;
 
 #[derive(Embed)]
 #[folder = "static/"]
@@ -2265,33 +2266,51 @@ mod tests;
 /// The graph page's explore or path form. Posted, never a query string:
 /// entity names are workspace content, and a URL ends up in logs.
 #[derive(Deserialize, Default)]
+#[serde(default)]
 struct GraphSearch {
-    entity: Option<String>,
-    class: Option<String>,
-    relation: Option<String>,
+    entity: NonBlank,
+    class: NonBlank,
+    relation: NonBlank,
     hops: Option<u32>,
-    from: Option<String>,
-    to: Option<String>,
+    from: NonBlank,
+    to: NonBlank,
     max_hops: Option<u32>,
+}
+
+impl GraphSearch {
+    /// The search half of the form, as the graph takes it.
+    fn search(&self) -> SearchGraphArgs {
+        SearchGraphArgs {
+            entity: self.entity.clone(),
+            class: self.class.clone(),
+            relation: self.relation.clone(),
+            hops: self.hops,
+        }
+    }
+
+    /// The path half of the form, as the graph takes it; a blank end is
+    /// an empty string, which the query refuses.
+    fn path(&self) -> FindPathArgs {
+        FindPathArgs {
+            from: self.from.get().unwrap_or_default().to_owned(),
+            to: self.to.get().unwrap_or_default().to_owned(),
+            max_hops: self.max_hops,
+        }
+    }
 }
 
 impl GraphQueryView {
     /// The page's query: blank fields are empty strings, which the form
     /// shows as they are; hops at their defaults when not given.
     fn from_query(q: &GraphSearch) -> Self {
-        let given = |value: Option<&String>| {
-            value
-                .and_then(|v| v.non_blank())
-                .unwrap_or_default()
-                .to_owned()
-        };
+        let given = |value: &NonBlank| value.get().unwrap_or_default().to_owned();
         Self {
-            entity: given(q.entity.as_ref()),
-            class: given(q.class.as_ref()),
-            relation: given(q.relation.as_ref()),
+            entity: given(&q.entity),
+            class: given(&q.class),
+            relation: given(&q.relation),
             hops: Hops::neighborhood(q.hops).get(),
-            from: given(q.from.as_ref()),
-            to: given(q.to.as_ref()),
+            from: given(&q.from),
+            to: given(&q.to),
             max_hops: Hops::path(q.max_hops).get(),
         }
     }
@@ -2389,17 +2408,8 @@ impl GraphAsk {
     /// A path when both ends are given, else a search when an entity or a
     /// class is.
     async fn of(q: &GraphSearch, app: &App, access: &Access) -> WebResult<Self> {
-        let path = PathQuery::new(
-            q.from.as_deref().unwrap_or_default(),
-            q.to.as_deref().unwrap_or_default(),
-            q.max_hops,
-        );
-        let search = GraphQuery::new(
-            q.entity.as_deref(),
-            q.class.as_deref(),
-            q.relation.as_deref(),
-            q.hops,
-        );
+        let path = q.path().query();
+        let search = q.search().query();
         if path.is_err() && search.is_err() {
             return Ok(Self::Nothing);
         }

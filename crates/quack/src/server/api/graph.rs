@@ -10,7 +10,6 @@ use axum::http::StatusCode;
 use quack_core::config::GraphConfig;
 use quack_core::extraction::{Extract, ExtractionRun};
 use quack_core::graph::extract::ChunkPlan;
-use quack_core::graph::query::{GraphQuery, PathQuery};
 use quack_core::graph::resolve::{MergeDecision, MergeProposal, ResolutionSummary};
 use quack_core::graph::store::Revalidation;
 use quack_core::graph::{
@@ -26,35 +25,24 @@ use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::run::{BackgroundRun, GraphReport, RunKind};
 use crate::server::state::{App, ExtractionSlot, with_db};
-use quack_core::analysis::tools::SharedDb;
+use quack_core::analysis::tools::{FindPathArgs, SearchGraphArgs, SharedDb};
 use quack_core::jobs::JobId;
 use quack_core::ontology::{Ontology, OntologyVersion};
 use quack_core::progress::{ChunkDone, RunControl};
 
-/// A graph search, in the body: entity names are workspace content, and a
-/// URL ends up in logs.
-#[derive(Deserialize, Default)]
-pub(crate) struct SearchQuery {
-    pub entity: Option<String>,
-    pub class: Option<String>,
-    pub relation: Option<String>,
-    pub hops: Option<u32>,
-}
-
+/// The search and path bodies are [`SearchGraphArgs`] and [`FindPathArgs`]:
+/// in the body, never the query string, since entity names are workspace
+/// content and a URL ends up in logs.
 pub(crate) async fn search(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-    Json(q): Json<SearchQuery>,
+    Json(q): Json<SearchGraphArgs>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let query = GraphQuery::new(
-        q.entity.as_deref(),
-        q.class.as_deref(),
-        q.relation.as_deref(),
-        q.hops,
-    )
-    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let query = q
+        .query()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let options = app.config.graph;
     let detail = serde_json::to_value(&query)?;
     let model = access
@@ -84,22 +72,15 @@ pub(crate) async fn search(
     Ok(Json(serde_json::to_value(result?)?))
 }
 
-/// A path's two ends, in the body for the same reason as [`SearchQuery`].
-#[derive(Deserialize)]
-pub(crate) struct PathParams {
-    pub from: String,
-    pub to: String,
-    pub max_hops: Option<u32>,
-}
-
 pub(crate) async fn path(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-    Json(q): Json<PathParams>,
+    Json(q): Json<FindPathArgs>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let query = PathQuery::new(&q.from, &q.to, q.max_hops)
+    let query = q
+        .query()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let options = app.config.graph;
     let detail = serde_json::to_value(&query)?;
