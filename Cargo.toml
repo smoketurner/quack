@@ -76,6 +76,8 @@ jiff                 = { version = "=0.2.37", default-features = false } # date/
 jsonwebtoken         = { version = "=11.1.0", default-features = false } # JWT verification of identity-provider access tokens; aws_lc_rs backend only
 keyring-core         = { version = "=1.0.0", default-features = false }
 linux-keyutils-keyring-store = { version = "=1.0.0", default-features = false }
+metrics              = { version = "=0.24.6", default-features = false } # the metrics facade quack_core::telemetry records through
+metrics-exporter-prometheus = { version = "=0.18.3", default-features = false } # renders them for GET /metrics; no listener of its own
 mimalloc             = { version = "=0.1.52", default-features = false }
 mime_guess           = { version = "=2.0.5", default-features = false }
 oauth2               = { version = "=5.0.0", default-features = false }

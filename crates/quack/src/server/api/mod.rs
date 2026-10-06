@@ -63,17 +63,7 @@ impl StreamEvent {
 
 pub(crate) fn router() -> Router<App> {
     Router::new()
-        .route("/auth/login", super::throttled_login(post(auth::login)))
-        .route("/auth/logout", post(auth::logout))
-        .route("/auth/me", get(auth::me))
-        .route(
-            "/workspaces",
-            get(workspaces::list).post(workspaces::create),
-        )
-        .route(
-            "/workspaces/{id}",
-            get(workspaces::show).patch(workspaces::update),
-        )
+        .merge(control_routes())
         .route("/workspaces/{id}/audit", get(workspaces::audit_detail))
         .route("/workspaces/{id}/query", post(query::query))
         .route("/workspaces/{id}/query/stream", post(query::stream))
@@ -159,6 +149,27 @@ pub(crate) fn router() -> Router<App> {
         .route("/workspaces/{id}/members/{user}", delete(members::remove))
         .route("/admin/users", get(admin::users).post(admin::create_user))
         .route("/admin/audit", get(admin::audit))
+}
+
+/// Signing in, and the workspaces themselves: listing, creating,
+/// restoring, settings, snapshots, deletion.
+fn control_routes() -> Router<App> {
+    Router::new()
+        .route("/auth/login", super::throttled_login(post(auth::login)))
+        .route("/auth/logout", post(auth::logout))
+        .route("/auth/me", get(auth::me))
+        .route(
+            "/workspaces",
+            get(workspaces::list).post(workspaces::create),
+        )
+        .route("/workspaces/restore", post(workspaces::restore))
+        .route(
+            "/workspaces/{id}",
+            get(workspaces::show)
+                .patch(workspaces::update)
+                .delete(workspaces::delete),
+        )
+        .route("/workspaces/{id}/snapshot", get(workspaces::snapshot))
 }
 
 /// The ontology's routes: the current one, its candidates, and its versions.

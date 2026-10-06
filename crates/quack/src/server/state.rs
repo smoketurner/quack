@@ -11,8 +11,11 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::jobs::JobQueue;
+use quack_core::llm::oauth::KeySource;
 use quack_core::storage::audit::AuditLog;
 use quack_core::storage::workspace::WorkspaceDb;
+use quack_core::telemetry;
+use quack_core::vault::Vault;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
@@ -86,6 +89,39 @@ pub(crate) struct AppState {
     pub stopping: CancellationToken,
 }
 
+/// What `GET /readyz` answers: each component `ok`, or why it is not.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct Readiness {
+    pub control_db: Probe,
+    pub data_dir: Probe,
+    pub vault_key: Probe,
+}
+
+impl Readiness {
+    pub(crate) fn ready(&self) -> bool {
+        [&self.control_db, &self.data_dir, &self.vault_key]
+            .into_iter()
+            .all(|p| matches!(p, Probe::Ok))
+    }
+}
+
+/// One readiness component.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub(crate) enum Probe {
+    Ok,
+    Fail { error: String },
+}
+
+impl Probe {
+    fn of(outcome: Result<(), String>) -> Self {
+        match outcome {
+            Ok(()) => Self::Ok,
+            Err(error) => Self::Fail { error },
+        }
+    }
+}
+
 /// Holds a workspace's extraction slot; dropping it frees the slot.
 pub(crate) struct ExtractionSlot {
     app: App,
@@ -122,6 +158,9 @@ impl AppState {
         oidc: Option<Oidc>,
     ) -> Self {
         let resource = ProtectedResource::of(&config, mode);
+        // The recorder lives for the process; a second state in one
+        // process (tests) keeps the first.
+        telemetry::install();
         Self {
             jobs: JobQueue::from_config(&config.jobs),
             config,
@@ -195,6 +234,88 @@ impl AppState {
         if let Err(e) = closed.await {
             tracing::error!(error = %e, "closing the workspaces failed");
         }
+    }
+
+    /// Let go of one workspace before it is deleted: its MCP transports
+    /// and its open file, once no job of it is queued or running. A
+    /// request that still holds a handle finishes on the unlinked file.
+    pub(crate) async fn close_workspace(&self, workspace_id: &WorkspaceId) -> ApiResult<()> {
+        let active = self.jobs.counts(Some(workspace_id)).active();
+        if active > 0 {
+            return Err(ApiError::conflict(format!(
+                "{active} job(s) of this workspace are queued or running; cancel them first"
+            )));
+        }
+        let transports = {
+            let mut mcp = self.mcp.lock().await;
+            let keys: Vec<McpKey> = mcp
+                .keys()
+                .filter(|key| key.workspace_id == *workspace_id)
+                .cloned()
+                .collect();
+            keys.iter()
+                .filter_map(|key| mcp.remove(key))
+                .collect::<Vec<_>>()
+        };
+        let handle = self.workspaces.lock().await.remove(workspace_id);
+        let closed = tokio::task::spawn_blocking(move || {
+            drop(transports);
+            drop(handle);
+        });
+        closed
+            .await
+            .map_err(|e| ApiError::internal(format!("closing the workspace failed: {e}")))
+    }
+
+    /// Whether this server can serve: `control.db` answers, the data
+    /// directory takes a write, and the vault key is where it should be.
+    pub(crate) async fn readiness(&self) -> Readiness {
+        let control_db = self.control.ping().await.map_err(|e| e.to_string());
+        let data_dir = {
+            let probe = self
+                .config
+                .data_dir()
+                .join(format!(".readyz-{}", uuid::Uuid::now_v7()));
+            tokio::fs::write(&probe, b"ok")
+                .await
+                .and_then(|()| std::fs::remove_file(&probe))
+                .map_err(|e| e.to_string())
+        };
+        let vault_key = Vault::new(self.config.data_dir(), KeySource::Keychain)
+            .key_location()
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        Readiness {
+            control_db: Probe::of(control_db),
+            data_dir: Probe::of(data_dir),
+            vault_key: Probe::of(vault_key),
+        }
+    }
+
+    /// Read the gauges `GET /metrics` reports: jobs by kind and state, the
+    /// writers' queues, and the open workspaces.
+    pub(crate) async fn refresh_gauges(&self) {
+        for (kind, state, count) in self.jobs.tally() {
+            telemetry::set_jobs(kind.as_str(), state.as_str(), count);
+        }
+        let (mut interactive, mut background) = (0_usize, 0_usize);
+        let open = {
+            let workspaces = self.workspaces.lock().await;
+            let mut open = 0_usize;
+            for cell in workspaces.values() {
+                if let Some(handle) = cell.get() {
+                    open = open.saturating_add(1);
+                    let (i, b) = handle.writer.waiting();
+                    interactive = interactive.saturating_add(i);
+                    background = background.saturating_add(b);
+                }
+            }
+            open
+        };
+        telemetry::set_writer_waiting("interactive", interactive);
+        telemetry::set_writer_waiting("background", background);
+        telemetry::set_open_workspaces(open);
     }
 
     /// Claim the workspace's extraction slot, or `None` while another

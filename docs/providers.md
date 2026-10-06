@@ -45,6 +45,13 @@ Three settings apply to every type:
   bills on one. quack refuses `Authorization` and `x-api-key`, since the credential comes
   from `auth`. `quack config` shows header names, never values. Bedrock's `api = "converse"`
   takes no headers, because the AWS SDK sends those requests.
+- `max_retries` (3) and `retry_backoff_ms` (500) say how a failed request is sent again: a
+  429, a 5xx, or a connection that dropped before the response head is retried after the
+  wait, which doubles each time with up to 25% jitter and never exceeds 60 seconds; a
+  `Retry-After` header sets the wait when the provider sends one. A stream that fails after
+  its head is not retried, since part of it was delivered. `max_retries = 0` sends once.
+  Bedrock's `converse` API hands the same numbers to the AWS SDK's standard retry mode.
+  Each retry counts in `quack_provider_retries_total` on `/metrics`.
 
 `type = "openai"` also takes `api`: `"responses"` (the default for OpenAI itself) or
 `"chat-completions"` (the default with a `base_url`, since many compatible servers offer

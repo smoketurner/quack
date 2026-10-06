@@ -185,7 +185,9 @@ Three consequences for operators:
 - A locked keychain stops quack with an error; quack does not fall back to `vault.key`.
   Unlock the keychain and retry.
 - A backup of `control.db` without the vault key cannot decrypt its tokens. Restore both, or
-  expect everyone to sign in again.
+  expect everyone to sign in again. `quack vault export-key --to FILE` writes the key to a
+  file only its owner can read (or prints it after a yes); on the new host, put it at
+  `<data_dir>/vault.key` before the first start. `quack doctor` reports where the key is.
 
 ## Troubleshooting
 

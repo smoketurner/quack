@@ -25,7 +25,7 @@ use crate::error;
 use super::{
     AuthMode, AwsRegion, BaseUrl, ClientAuth, Config, ENV_BIND, ENV_CONFIG_DIR, ENV_DATA_DIR,
     ENV_MODEL, Effort, Exchange, Grant, ModelSettings, ModelSpec, OAuthConfig, OidcConfig,
-    Overrides, ProviderType, config_file_path,
+    Overrides, ProviderType, RetryPolicy, config_file_path,
 };
 
 /// How an unset optional setting is rendered.
@@ -407,6 +407,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "secure_cookies",
             "permission_timeout_seconds",
             "shutdown_grace_seconds",
+            "log_format",
         ],
     ),
     (
@@ -453,6 +454,8 @@ const PROVIDER_KEYS: &[&str] = &[
     "api",
     "region",
     "max_concurrent_requests",
+    "max_retries",
+    "retry_backoff_ms",
     "headers",
     "oauth",
     "temperature",
@@ -586,6 +589,16 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
                 provider.max_concurrent_requests.map(|n| n.to_string()),
                 Some(provider.default_request_limit().to_string()),
             );
+            s.literal(
+                "max_retries",
+                provider.retry.max_retries,
+                RetryPolicy::DEFAULT_RETRIES,
+            );
+            s.literal(
+                "retry_backoff_ms",
+                provider.retry.backoff.as_millis(),
+                u128::from(RetryPolicy::DEFAULT_BACKOFF_MS),
+            );
             s.names_only("headers", provider.headers.as_ref());
             s.model_settings(provider.model_defaults);
         }
@@ -597,6 +610,12 @@ fn providers(inventory: &mut Inventory<'_>, config: &Config) {
         let Some(oauth) = provider.auth.oauth() else {
             continue;
         };
+        oauth_section(inventory, &section, oauth);
+    }
+}
+
+fn oauth_section(inventory: &mut Inventory<'_>, section: &str, oauth: &OAuthConfig) {
+    {
         let mut s = inventory.section(format!("{section}.oauth"));
         s.required_text("issuer_url", &oauth.issuer_url);
         s.optional_text("client_id", oauth.client_id.as_deref(), None);
@@ -850,6 +869,12 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "shutdown_grace_seconds",
         server.shutdown_grace_seconds,
         default.shutdown_grace_seconds,
+    );
+    s.text(
+        "log_format",
+        server.log_format.as_str(),
+        default.log_format.as_str(),
+        None,
     );
     let Some(oidc) = &server.oidc else {
         return;

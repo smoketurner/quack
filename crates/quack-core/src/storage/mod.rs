@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod backup;
 pub mod context;
 pub mod control;
 pub mod queries;

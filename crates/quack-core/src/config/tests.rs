@@ -70,6 +70,7 @@ fn default_config_values() {
     assert_eq!(config.ontology.min_support_documents, 3);
     assert!(err_of("[ontology]\nsample = 1\n").contains("sample"));
     assert_eq!(Config::default().graph.max_traversal_depth, 3);
+    assert_eq!(Config::default().server.log_format, LogFormat::Text);
     assert_eq!(Config::default().graph.max_nodes, 200);
     assert!(err_of("[graph]\nenabled = true\n").contains("enabled"));
     assert_eq!(Config::default().import.max_rows, 1_000_000);

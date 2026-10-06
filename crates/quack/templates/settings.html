@@ -10,7 +10,9 @@
 </div>
 {% endif %}
 <form method="post" action="/w/{{ ws.membership.workspace.id }}/settings" class="mt-4 rounded border border-slate-800 bg-slate-900 p-4">
-  <label class="block text-sm"><span class="text-slate-300">Classification label</span>
+  <label class="block text-sm"><span class="text-slate-300">Name</span>
+    <input name="name" value="{{ ws.membership.workspace.name }}" required class="mt-1 block rounded border border-slate-700 px-3 py-2" {% if !ws.can_manage %}disabled{% endif %}></label>
+  <label class="mt-3 block text-sm"><span class="text-slate-300">Classification label</span>
     <input name="classification" value="{{ classification }}" class="mt-1 block rounded border border-slate-700 px-3 py-2" {% if !ws.can_manage %}disabled{% endif %}></label>
   <fieldset class="mt-3 text-sm"><legend class="text-slate-300">Allowed providers</legend>
     {% for p in providers %}<label class="mr-4 inline-flex items-center gap-1"><input type="checkbox" name="providers" value="{{ p.0 }}" {% if p.1 %}checked{% endif %} {% if !ws.can_manage %}disabled{% endif %}> {{ p.0 }}</label>{% endfor %}
@@ -41,6 +43,20 @@
     <label class="inline-flex items-center gap-1"><input type="checkbox" name="scopes" value="admin"> admin scope</label>
     <input aria-label="Days until the token expires" name="expires_days" type="number" min="0" placeholder="days" class="w-24 rounded border border-slate-700 px-3 py-2">
     <button type="submit" class="rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500">Create token</button>
+  </form>
+</section>
+<section class="mt-8">
+  <h2 class="text-sm font-semibold uppercase text-slate-400">Snapshot</h2>
+  <p class="mt-1 text-sm text-slate-400">The workspace as one tar: its file, its uploaded files, and a manifest naming its members and settings. <code>quack workspace restore FILE</code> or <code>POST /api/v1/workspaces/restore</code> brings it back.</p>
+  <a href="/api/v1/workspaces/{{ ws.membership.workspace.id }}/snapshot" class="mt-2 inline-block rounded border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800">Download snapshot</a>
+</section>
+<section class="mt-8 rounded border border-red-900 p-4">
+  <h2 class="text-sm font-semibold uppercase text-red-400">Delete workspace</h2>
+  <p class="mt-1 text-sm text-slate-400">Deletes the file, its members, and its API tokens at once; the access audit log keeps its rows. Take a snapshot first if you may want it back.</p>
+  <form method="post" action="/w/{{ ws.membership.workspace.id }}/delete" class="mt-3 flex flex-wrap items-end gap-2 text-sm">
+    <label class="block"><span class="text-slate-300">Type <strong>{{ ws.membership.workspace.name }}</strong> to confirm</span>
+      <input name="confirm" required autocomplete="off" class="mt-1 block rounded border border-slate-700 px-3 py-2"></label>
+    <button type="submit" class="rounded bg-red-700 px-3 py-2 text-white hover:bg-red-600">Delete</button>
   </form>
 </section>
 {% endif %}

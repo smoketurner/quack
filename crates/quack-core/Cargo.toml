@@ -34,6 +34,8 @@ hyper-util    = { workspace = true, features = ["client-proxy"] }
 jiff          = { workspace = true, features = ["std", "serde", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
 jsonwebtoken  = { workspace = true, features = ["aws_lc_rs"] }
 keyring-core  = { workspace = true }
+metrics       = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 oauth2        = { workspace = true }
 office_oxide  = { workspace = true }
 pdf_oxide     = { workspace = true, features = ["legacy-crypto"] }

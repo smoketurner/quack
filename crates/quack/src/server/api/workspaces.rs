@@ -1,20 +1,29 @@
-//! Workspaces: listing by membership, creation by admins, settings by
-//! owners, and the content half of the audit for members.
+//! Workspaces: listing by membership, creation, restoring, and deletion by
+//! admins, settings and snapshots by owners, and the content half of the
+//! audit for members.
 
 use std::collections::BTreeSet;
+use std::io::{self, Write};
+use std::sync::Arc;
 
 use axum::Json;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use quack_core::error::Error as CoreError;
 use quack_core::ids::WorkspaceId;
+use quack_core::okf;
 use quack_core::storage::audit;
+use quack_core::storage::backup::{self, Described, Manifest, RestoreRequest};
 use quack_core::storage::control::{
     AuditAction, Membership, Outcome, ProviderAllowList, ResourceKind, Role, Standing, UserKind,
     WorkspaceChanges, WorkspaceName, WorkspaceRow,
 };
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
+use crate::server::api::okf::{BodyWriter, CHUNKS_IN_FLIGHT};
 use crate::server::auth::{Access, Credential, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, ServeMode};
@@ -114,6 +123,8 @@ pub(crate) async fn show(
 
 #[derive(Deserialize)]
 pub(crate) struct UpdateWorkspace {
+    /// A new name, which `-w` and the URL bar then use.
+    pub name: Option<String>,
     pub classification: Option<String>,
     /// Absent keeps the list; an empty list allows every provider.
     pub allowed_providers: Option<BTreeSet<String>>,
@@ -135,10 +146,175 @@ pub(crate) async fn update(
         },
     };
     let ws = update_settings(&app, &access, changes).await?;
+    let ws = match body.name {
+        Some(name) => rename(&app, &access, &name).await?,
+        None => ws,
+    };
     Ok(Json(Membership {
         workspace: ws,
         standing: access.membership.standing,
     }))
+}
+
+/// Rename the workspace for its owner, audited as a settings change; a
+/// name that is already the workspace's own changes nothing.
+pub(crate) async fn rename(app: &App, access: &Access, name: &str) -> ApiResult<WorkspaceRow> {
+    let name: WorkspaceName = name.parse()?;
+    if name.as_str() == access.membership.workspace.name {
+        return Ok(access.membership.workspace.clone());
+    }
+    let entry = access.entry(AuditAction::Workspace, Outcome::Allowed);
+    let ws = app
+        .control
+        .rename_workspace(&access.membership.workspace.id, &name, entry.clone())
+        .await?;
+    access
+        .record_detail(
+            app,
+            &entry,
+            Some(serde_json::json!({ "renamed_to": name.as_str() })),
+        )
+        .await?;
+    Ok(ws)
+}
+
+/// `GET .../snapshot`: the workspace as a tar for its owner, written on
+/// the writer's thread after a checkpoint and streamed to the body as
+/// the OKF export is. Audited as `snapshot`, since it moves the whole
+/// workspace across the boundary.
+pub(crate) async fn snapshot(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+) -> ApiResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
+    let writer = app.workspace_db(&id).await?;
+    let described = Described::of(&app.control, &access.membership.workspace).await?;
+    let filename = format!("{}.snapshot.tar", okf::slug(&described.name));
+    let dir = app.config.workspace_dir(id.as_str());
+    let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(CHUNKS_IN_FLIGHT);
+    let failed = tx.clone();
+    let audit_app = Arc::clone(&app);
+    tokio::spawn(async move {
+        let written = writer
+            .run(move |db| {
+                let manifest = Manifest::of(db, described)?;
+                backup::snapshot(db, &dir, &manifest, BodyWriter::new(tx))?.flush()?;
+                Ok(())
+            })
+            .await;
+        let (outcome, detail) = match written {
+            Ok(()) => (
+                Outcome::Allowed,
+                serde_json::json!({ "format": "snapshot" }),
+            ),
+            Err(e) => {
+                tracing::warn!(workspace = %id, error = %e, "snapshot failed partway");
+                drop(failed.send(Err(io::Error::other(e.to_string()))).await);
+                (
+                    Outcome::Error,
+                    serde_json::json!({ "format": "snapshot", "error": e.to_string() }),
+                )
+            }
+        };
+        drop(failed);
+        let recorded = access
+            .audit(
+                &audit_app,
+                AuditAction::Snapshot,
+                Some(ResourceKind::Workspace.id(id.as_str())),
+                outcome,
+                Some(detail),
+            )
+            .await;
+        if let Err(e) = recorded {
+            tracing::error!(workspace = %id, error = %e.message, "could not audit a snapshot");
+        }
+    });
+    let body = Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    }));
+    Ok((
+        [
+            (header::CONTENT_TYPE, String::from("application/x-tar")),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RestoreQuery {
+    /// The new workspace's name; the snapshot's own when absent.
+    pub name: Option<String>,
+}
+
+/// `POST /workspaces/restore`: a snapshot's tar as the body becomes a new
+/// workspace, for admins; in login mode the admin owns it beside the
+/// snapshot's members. The body is bounded by `[server].max_upload_mb`.
+pub(crate) async fn restore(
+    State(app): State<App>,
+    identity: Identity,
+    Query(query): Query<RestoreQuery>,
+    body: Bytes,
+) -> ApiResult<impl IntoResponse> {
+    identity.require_admin()?;
+    let name = query.name.map(|n| n.parse::<WorkspaceName>()).transpose()?;
+    let owner = (app.mode == ServeMode::Login).then(|| identity.user_id.clone());
+    let audit = |action| identity.audit(action, Outcome::Allowed);
+    let restored = backup::restore(
+        &app.control,
+        &app.config,
+        move || Ok(io::Cursor::new(body.clone())),
+        RestoreRequest {
+            name,
+            owner: owner.as_ref(),
+            audit: &audit,
+        },
+    )
+    .await
+    .map_err(|e| match e {
+        e @ CoreError::Ingestion(_) => ApiError::bad_request(e.to_string()),
+        e => ApiError::from(e),
+    })?;
+    Ok((StatusCode::CREATED, Json(restored)))
+}
+
+/// `DELETE /workspaces/{id}`: the workspace's row (its members and
+/// tokens with it) and its directory, for an owner, once no job of it is
+/// active. The access row is committed with the row; no detail row can
+/// follow it into a file that no longer exists.
+pub(crate) async fn delete(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+) -> ApiResult<StatusCode> {
+    let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
+    delete_workspace(&app, &access).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Delete the workspace an `Access` names, from the API or the web
+/// console; see [`delete`].
+pub(crate) async fn delete_workspace(app: &App, access: &Access) -> ApiResult<()> {
+    let id = &access.membership.workspace.id;
+    app.close_workspace(id).await?;
+    let entry = access.entry(AuditAction::Delete, Outcome::Allowed);
+    app.control.delete_workspace(id, entry).await?;
+    let dir = app.config.workspace_dir(id.as_str());
+    if dir.exists()
+        && let Err(e) = tokio::fs::remove_dir_all(&dir).await
+    {
+        tracing::error!(workspace = %id, error = %e, "the deleted workspace's directory remains");
+        return Err(ApiError::internal(format!(
+            "the workspace is gone from control.db, but its directory could not be removed: {e}"
+        )));
+    }
+    Ok(())
 }
 
 /// Change a workspace's settings for its owner, from the API or the web

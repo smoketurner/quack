@@ -105,7 +105,7 @@ impl std::str::FromStr for JobNumber {
 }
 
 /// What a job does, for display and filtering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
     /// An agent turn.
@@ -129,6 +129,19 @@ pub enum JobKind {
 }
 
 impl JobKind {
+    /// Every kind, in declaration order.
+    pub const ALL: &'static [Self] = &[
+        Self::Chat,
+        Self::Sql,
+        Self::Ingest,
+        Self::Import,
+        Self::Ontology,
+        Self::Graph,
+        Self::Embeddings,
+        Self::Export,
+        Self::Models,
+    ];
+
     /// The kind as it serializes.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -172,7 +185,7 @@ impl fmt::Display for JobKind {
 
 /// Where a job is in its life. `Queued` and `Running` are active; the other
 /// three are final.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     /// Waiting for its lane or a worker slot.
@@ -186,6 +199,15 @@ pub enum JobState {
 }
 
 impl JobState {
+    /// Every state, in declaration order.
+    pub const ALL: &'static [Self] = &[
+        Self::Queued,
+        Self::Running,
+        Self::Succeeded,
+        Self::Failed,
+        Self::Cancelled,
+    ];
+
     /// Whether the job has ended.
     #[must_use]
     pub const fn is_finished(self) -> bool {
@@ -844,6 +866,31 @@ impl JobQueue {
             }
         }
         counts
+    }
+
+    /// How many jobs there are of each kind in each state, every kind and
+    /// state listed (zero included), so a gauge set from it never keeps a
+    /// stale count.
+    #[must_use]
+    pub fn tally(&self) -> Vec<(JobKind, JobState, usize)> {
+        let registry = self.inner.registry();
+        let mut counts: std::collections::BTreeMap<(JobKind, JobState), usize> =
+            std::collections::BTreeMap::new();
+        for kind in JobKind::ALL {
+            for state in JobState::ALL {
+                counts.insert((*kind, *state), 0);
+            }
+        }
+        for entry in registry.jobs.values() {
+            let count = counts
+                .entry((entry.info.kind, entry.info.state))
+                .or_default();
+            *count = count.saturating_add(1);
+        }
+        counts
+            .into_iter()
+            .map(|((kind, state), count)| (kind, state, count))
+            .collect()
     }
 
     /// Every change from now on, as snapshots.

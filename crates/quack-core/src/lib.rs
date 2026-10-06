@@ -24,6 +24,7 @@ pub mod progress;
 pub mod proxy;
 pub mod saved;
 pub mod storage;
+pub mod telemetry;
 pub mod text;
 pub mod vault;
 pub mod web_sessions;

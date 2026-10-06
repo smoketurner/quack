@@ -630,6 +630,12 @@ pub struct WorkspaceDb {
 }
 
 impl WorkspaceDb {
+    /// The schema version this build writes.
+    #[must_use]
+    pub const fn schema_version() -> u32 {
+        WORKSPACE_SCHEMA_VERSION
+    }
+
     /// Open an in-memory `DuckDB` database (for tests).
     ///
     /// # Errors

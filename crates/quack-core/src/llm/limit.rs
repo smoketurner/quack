@@ -24,6 +24,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::Stream;
@@ -35,11 +36,14 @@ use tokio::sync::oneshot;
 
 use super::bedrock::Signer;
 use super::egress::Egress;
-use crate::config::{BaseUrl, ProviderConfig, ProviderName, ProviderType, RequestLimit};
+use crate::config::{
+    BaseUrl, ProviderConfig, ProviderName, ProviderType, RequestLimit, RetryPolicy,
+};
 use crate::error::{self, Error};
 
 use crate::priority::Priority;
 use crate::proxy::Proxies;
+use crate::telemetry;
 
 /// Permits of one provider and model, handed to interactive waiters first.
 struct Gate {
@@ -194,6 +198,85 @@ struct Gated {
     limit: RequestLimit,
 }
 
+/// How a request's attempts are counted and waited out: the provider's
+/// `RetryPolicy`, and its name for the log and the metrics.
+#[derive(Clone, Debug)]
+pub(crate) struct Attempts {
+    provider: String,
+    policy: RetryPolicy,
+}
+
+impl Attempts {
+    pub(crate) fn new(name: &ProviderName, policy: RetryPolicy) -> Self {
+        Self {
+            provider: name.to_string(),
+            policy,
+        }
+    }
+
+    /// Whether `status` is worth another attempt, and how long to wait
+    /// first: `Retry-After` in seconds when the response names it, else
+    /// the policy's backoff for retry `attempt`. `None` when the response
+    /// stands (a success, a client error) or the attempts are used up.
+    fn wait_for_status(
+        &self,
+        attempt: u32,
+        status: http::StatusCode,
+        headers: &http::HeaderMap,
+    ) -> Option<Duration> {
+        if attempt >= self.policy.max_retries
+            || !rig::error::retryable_status(Some(status.as_u16()))
+        {
+            return None;
+        }
+        let named = headers
+            .get(http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .filter(|d| *d <= RetryPolicy::MAX_WAIT);
+        Some(named.unwrap_or_else(|| self.policy.wait(attempt.saturating_add(1), jitter())))
+    }
+
+    /// Whether a failure is worth another attempt, and the wait: a failing
+    /// status (rig's client turns one into an error, headers kept) as for
+    /// a response, a dropped transport by the backoff.
+    fn wait_for_error(&self, attempt: u32, error: &http_client::Error) -> Option<Duration> {
+        if let http_client::Error::InvalidStatusCodeWithDetails {
+            status, headers, ..
+        } = error
+        {
+            return self.wait_for_status(attempt, *status, headers);
+        }
+        if attempt >= self.policy.max_retries || !rig::error::transient_transport(error) {
+            return None;
+        }
+        Some(self.policy.wait(attempt.saturating_add(1), jitter()))
+    }
+
+    /// Note a retry: one `warn!` per attempt, and the counter.
+    fn note(&self, model: Option<&str>, attempt: u32, wait: Duration, why: &str) {
+        tracing::warn!(
+            provider = %self.provider,
+            model = model.unwrap_or("-"),
+            attempt = attempt.saturating_add(1),
+            of = self.policy.max_retries,
+            wait_ms = wait.as_millis(),
+            "{why}; retrying the model request"
+        );
+        telemetry::provider_retry(&self.provider, model);
+    }
+}
+
+/// A fraction of a second's nanoseconds, so two waiters back off apart.
+fn jitter() -> f64 {
+    f64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos()),
+    ) / 1_000_000_000.0
+}
+
 impl std::fmt::Debug for ProviderGates {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderGates")
@@ -273,6 +356,8 @@ pub struct LimitedHttp {
     headers: http::HeaderMap,
     /// Replaces the credential rig set, once the request has its permit.
     authorize: Option<Authorize>,
+    /// How a throttled or failed request is tried again; `None` sends once.
+    attempts: Option<Attempts>,
 }
 
 /// How a client authorizes each request in place of rig's own header.
@@ -314,7 +399,15 @@ impl LimitedHttp {
             gates: ProviderGates::for_provider(name, provider),
             headers: http::HeaderMap::new(),
             authorize: None,
+            attempts: Some(Attempts::new(name, provider.retry)),
         }
+    }
+
+    /// The provider's name for the metrics, `-` for the default client.
+    fn provider_name(&self) -> String {
+        self.attempts
+            .as_ref()
+            .map_or_else(|| String::from("-"), |a| a.provider.clone())
     }
 
     /// This client, sending `headers` (a provider's `headers`) on every
@@ -408,6 +501,32 @@ impl Stream for Holding {
     }
 }
 
+/// The parts of a request that every attempt is rebuilt from: the
+/// headers and body as rig gave them, before the provider's headers and
+/// credential go on (a signature is time-bound, so each attempt signs
+/// anew).
+struct Blueprint {
+    parts: http::request::Parts,
+    body: Bytes,
+}
+
+impl Blueprint {
+    /// A fresh request: `Parts` is not `Clone`, so one is rebuilt from the
+    /// method, URI, version, and headers.
+    fn request(&self) -> Request<Bytes> {
+        let mut builder = Request::builder()
+            .method(self.parts.method.clone())
+            .uri(self.parts.uri.clone())
+            .version(self.parts.version);
+        for (name, value) in &self.parts.headers {
+            builder = builder.header(name, value);
+        }
+        builder
+            .body(self.body.clone())
+            .unwrap_or_else(|_| Request::new(self.body.clone()))
+    }
+}
+
 impl HttpClientExt for LimitedHttp {
     fn send<T, U>(
         &self,
@@ -422,15 +541,63 @@ impl HttpClientExt for LimitedHttp {
         // is chosen by the model it names.
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
-        let permit = self.gates.permit(GateKey::model_of(&body));
+        let model = GateKey::model_of(&body);
+        let permit = self.gates.permit(model.clone());
         let authorize = self.authorize.clone();
         let headers = self.headers.clone();
+        let attempts = self.attempts.clone();
+        let provider = self.provider_name();
         async move {
+            let waited = Instant::now();
             let permit = permit.await.map_err(http_client::Error::instance)?;
-            let request =
-                Self::prepare(authorize, &headers, Request::from_parts(parts, body)).await?;
-            let response = inner.send(request).await?;
-            Ok(body_holding(response, permit))
+            telemetry::provider_permit_wait(&provider, model.as_deref(), waited.elapsed());
+            let blueprint = Blueprint { parts, body };
+            let mut attempt = 0_u32;
+            loop {
+                let request =
+                    Self::prepare(authorize.clone(), &headers, blueprint.request()).await?;
+                let started = Instant::now();
+                match inner.send(request).await {
+                    Ok(response) => {
+                        let status = response.status();
+                        telemetry::provider_request(
+                            &provider,
+                            model.as_deref(),
+                            status.as_str(),
+                            started.elapsed(),
+                        );
+                        let again = attempts
+                            .as_ref()
+                            .and_then(|a| a.wait_for_status(attempt, status, response.headers()));
+                        let Some(wait) = again else {
+                            return Ok(body_holding(response, permit));
+                        };
+                        if let Some(a) = &attempts {
+                            a.note(model.as_deref(), attempt, wait, &format!("HTTP {status}"));
+                        }
+                        tokio::time::sleep(wait).await;
+                    }
+                    Err(error) => {
+                        telemetry::provider_request(
+                            &provider,
+                            model.as_deref(),
+                            "error",
+                            started.elapsed(),
+                        );
+                        let again = attempts
+                            .as_ref()
+                            .and_then(|a| a.wait_for_error(attempt, &error));
+                        let Some(wait) = again else {
+                            return Err(error);
+                        };
+                        if let Some(a) = &attempts {
+                            a.note(model.as_deref(), attempt, wait, &error.to_string());
+                        }
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+                attempt = attempt.saturating_add(1);
+            }
         }
     }
 
@@ -464,6 +631,9 @@ impl HttpClientExt for LimitedHttp {
         }
     }
 
+    /// A streamed request is tried again only until its head arrives:
+    /// once the response status is good, the stream is the model's answer
+    /// and a break in it ends the turn rather than restarting it.
     fn send_streaming<T>(
         &self,
         req: Request<T>,
@@ -474,20 +644,68 @@ impl HttpClientExt for LimitedHttp {
         let inner = self.inner.clone();
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
-        let permit = self.gates.permit(GateKey::model_of(&body));
+        let model = GateKey::model_of(&body);
+        let permit = self.gates.permit(model.clone());
         let authorize = self.authorize.clone();
         let headers = self.headers.clone();
+        let attempts = self.attempts.clone();
+        let provider = self.provider_name();
         async move {
+            let waited = Instant::now();
             let permit = permit.await.map_err(http_client::Error::instance)?;
-            let request =
-                Self::prepare(authorize, &headers, Request::from_parts(parts, body)).await?;
-            let response = inner.send_streaming(request).await?;
-            Ok(response.map(|stream| -> BoxedStream {
-                Box::pin(Holding {
-                    inner: stream,
-                    permit,
-                })
-            }))
+            telemetry::provider_permit_wait(&provider, model.as_deref(), waited.elapsed());
+            let blueprint = Blueprint { parts, body };
+            let mut attempt = 0_u32;
+            loop {
+                let request =
+                    Self::prepare(authorize.clone(), &headers, blueprint.request()).await?;
+                let started = Instant::now();
+                match inner.send_streaming(request).await {
+                    Ok(response) => {
+                        let status = response.status();
+                        telemetry::provider_request(
+                            &provider,
+                            model.as_deref(),
+                            status.as_str(),
+                            started.elapsed(),
+                        );
+                        let again = attempts
+                            .as_ref()
+                            .and_then(|a| a.wait_for_status(attempt, status, response.headers()));
+                        let Some(wait) = again else {
+                            return Ok(response.map(|stream| -> BoxedStream {
+                                Box::pin(Holding {
+                                    inner: stream,
+                                    permit,
+                                })
+                            }));
+                        };
+                        if let Some(a) = &attempts {
+                            a.note(model.as_deref(), attempt, wait, &format!("HTTP {status}"));
+                        }
+                        tokio::time::sleep(wait).await;
+                    }
+                    Err(error) => {
+                        telemetry::provider_request(
+                            &provider,
+                            model.as_deref(),
+                            "error",
+                            started.elapsed(),
+                        );
+                        let again = attempts
+                            .as_ref()
+                            .and_then(|a| a.wait_for_error(attempt, &error));
+                        let Some(wait) = again else {
+                            return Err(error);
+                        };
+                        if let Some(a) = &attempts {
+                            a.note(model.as_deref(), attempt, wait, &error.to_string());
+                        }
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+                attempt = attempt.saturating_add(1);
+            }
         }
     }
 }
@@ -778,6 +996,159 @@ mod tests {
         assert!(headers.get("x-api-key").is_none());
         assert!(headers.get("anthropic-version").is_some());
         assert_eq!(sent.body().as_ref(), b"{}");
+    }
+
+    /// One HTTP server on loopback answering each request with the next
+    /// status in `statuses` (the last one from then on), with
+    /// `Retry-After: 0` on a 429, counting the requests it served.
+    async fn status_server(statuses: Vec<u16>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let served = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&served);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let n = served.fetch_add(1, Ordering::SeqCst);
+                let status = statuses
+                    .get(n)
+                    .or_else(|| statuses.last())
+                    .copied()
+                    .unwrap_or(200);
+                let mut buf = [0_u8; 2048];
+                drop(socket.read(&mut buf).await);
+                let retry_after = if status == 429 {
+                    "retry-after: 0\r\n"
+                } else {
+                    ""
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: 2\r\n{retry_after}connection: close\r\n\r\nok"
+                );
+                drop(socket.write_all(response.as_bytes()).await);
+            }
+        });
+        (format!("http://{addr}/"), seen)
+    }
+
+    /// A client of `url` that retries `retries` times with a short backoff.
+    fn retrying(url: &str, retries: u32) -> LimitedHttp {
+        LimitedHttp::for_provider(
+            &name("retry-test"),
+            &ProviderConfig {
+                retry: RetryPolicy {
+                    max_retries: retries,
+                    backoff: Duration::from_millis(5),
+                },
+                ..provider(ProviderType::Openai, Some(2), url)
+            },
+        )
+    }
+
+    /// The status of `client`'s answer to a POST naming a model.
+    async fn status_of(client: LimitedHttp, url: String) -> Result<u16, String> {
+        let request = Request::post(url)
+            .body(Bytes::from_static(br#"{"model":"m"}"#))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let sent = async { client.send::<_, Bytes>(request).await };
+        Egress::scope(Some(Egress::NoWorkspace), sent)
+            .await
+            .map(|r| r.status().as_u16())
+            .map_err(|e| e.to_string())
+    }
+
+    /// A throttled or failing request is sent again until it succeeds or
+    /// the retries run out; a client error stands at once; no retries
+    /// means one attempt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn throttled_and_failing_requests_are_retried_within_the_policy() {
+        use std::sync::atomic::Ordering;
+
+        let (url, served) = status_server(vec![429, 503, 200]).await;
+        assert_eq!(status_of(retrying(&url, 3), url.clone()).await, Ok(200));
+        assert_eq!(served.load(Ordering::SeqCst), 3);
+
+        // rig's client turns a failing status into an error; the last
+        // attempt's error is what the caller gets.
+        let (url, served) = status_server(vec![500, 500, 500, 500]).await;
+        let failed = status_of(retrying(&url, 2), url.clone()).await;
+        assert!(
+            failed.as_ref().is_err_and(|e| e.contains("500")),
+            "{failed:?}"
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 3, "one try and two retries");
+
+        let (url, served) = status_server(vec![400, 200]).await;
+        let refused = status_of(retrying(&url, 3), url.clone()).await;
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("400")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "a client error is not retried"
+        );
+
+        let (url, served) = status_server(vec![429, 200]).await;
+        let once = status_of(retrying(&url, 0), url.clone()).await;
+        assert!(once.as_ref().is_err_and(|e| e.contains("429")), "{once:?}");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "no retries means one attempt"
+        );
+
+        // A streamed request is retried the same way until its head arrives.
+        let (url, served) = status_server(vec![503, 200]).await;
+        let client = retrying(&url, 1);
+        let request = Request::post(url)
+            .body(Bytes::from_static(br#"{"model":"m"}"#))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let streamed = Egress::scope(Some(Egress::NoWorkspace), async {
+            client.send_streaming(request).await
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(streamed.status().as_u16(), 200);
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_wait_doubles_with_jitter_and_stops_at_a_minute() {
+        let policy = RetryPolicy {
+            max_retries: 3,
+            backoff: Duration::from_millis(500),
+        };
+        assert_eq!(policy.wait(1, 0.0), Duration::from_millis(500));
+        assert_eq!(policy.wait(2, 0.0), Duration::from_millis(1000));
+        assert_eq!(policy.wait(3, 1.0), Duration::from_millis(2500));
+        assert_eq!(policy.wait(20, 0.0), RetryPolicy::MAX_WAIT);
+        assert_eq!(RetryPolicy::none().wait(1, 0.5), Duration::ZERO);
+        let attempts = Attempts::new(&name("p"), policy);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RETRY_AFTER,
+            http::HeaderValue::from_static("7"),
+        );
+        assert_eq!(
+            attempts.wait_for_status(0, http::StatusCode::TOO_MANY_REQUESTS, &headers),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            attempts.wait_for_status(3, http::StatusCode::TOO_MANY_REQUESTS, &headers),
+            None
+        );
+        assert_eq!(
+            attempts.wait_for_status(0, http::StatusCode::BAD_REQUEST, &headers),
+            None
+        );
     }
 
     #[test]
