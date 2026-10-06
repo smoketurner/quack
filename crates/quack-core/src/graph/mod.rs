@@ -9,6 +9,7 @@
 //! Everything lives in `_quack_graph_*` and `_quack_provenance` inside the
 //! workspace file.
 
+pub mod export;
 pub mod extract;
 pub mod follow_up;
 pub mod query;
@@ -448,6 +449,28 @@ pub struct GraphResult {
     /// check it reads a capped listing as the whole population.
     #[serde(default)]
     pub truncated: bool,
+    /// The graph this result came from, so a reader can judge the answer
+    /// without asking for the status separately.
+    #[serde(default)]
+    pub status: GraphStatusSummary,
+}
+
+/// What a reader of one graph result needs to know about the whole graph:
+/// which ontology built it, whether it lags the current one, how much of
+/// it is provisional, how much the corpus expressed that the ontology
+/// lacks, and how many provisional nodes this result left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphStatusSummary {
+    pub built_with_version: Option<OntologyVersion>,
+    pub ontology_version: Option<OntologyVersion>,
+    pub stale: bool,
+    pub provisional_nodes: u64,
+    /// Distinct classes and relations the corpus expressed that the
+    /// ontology lacks ([`Drift::total`]).
+    pub drift_total: u64,
+    /// Provisional nodes query mode dropped from this result.
+    #[serde(default)]
+    pub dropped_provisional: u64,
 }
 
 impl GraphResult {
@@ -457,10 +480,16 @@ impl GraphResult {
     }
 
     /// Drop provisional nodes and edges (query mode never answers from an
-    /// unreviewed graph).
+    /// unreviewed graph), counting the nodes dropped in the status.
     #[must_use]
     pub fn without_provisional(mut self) -> Self {
+        let before = self.nodes.len();
         self.nodes.retain(|n| n.standing == Standing::Reviewed);
+        let dropped = before.saturating_sub(self.nodes.len());
+        self.status.dropped_provisional = self
+            .status
+            .dropped_provisional
+            .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
         let kept: std::collections::BTreeSet<&str> =
             self.nodes.iter().map(|n| n.id.as_str()).collect();
         self.edges.retain(|e| {
@@ -975,6 +1004,8 @@ mod tests {
         );
         assert_eq!(kept.provenance.len(), 1);
         assert_eq!(kept.roots, [NodeId::from("a")]);
+        assert_eq!(kept.status.dropped_provisional, 1);
+        assert_eq!(kept.without_provisional().status.dropped_provisional, 1);
     }
 
     #[test]

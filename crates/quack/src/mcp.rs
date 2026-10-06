@@ -7,7 +7,8 @@
 //! `sql` (classified, writes need permission), `list_tables`,
 //! `describe_table`, `list_documents`. Resources: `quack://workspace/tables`,
 //! `quack://workspace/tables/{name}/schema`, `quack://workspace/documents`,
-//! `quack://workspace/ontology`, `quack://workspace/context`.
+//! `quack://workspace/ontology`, `quack://workspace/ontology/schema`,
+//! `quack://workspace/context`.
 //!
 //! Over HTTP every call is audited through the request's `Access`, like
 //! the REST API; over stdio nothing is audited, like the CLI.
@@ -26,7 +27,7 @@ use quack_core::ids::{SessionId, UserId};
 use quack_core::llm::acting::Acting;
 use quack_core::llm::egress::Egress;
 use quack_core::llm::{self, Embeddings};
-use quack_core::ontology::store as ontology_store;
+use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditAction, AuditResource, Outcome, ResourceKind, WorkspaceRow,
@@ -245,12 +246,13 @@ fn failure(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
 
-/// A `quack://workspace/...` resource: four fixed ones and one schema per table.
+/// A `quack://workspace/...` resource: five fixed ones and one schema per table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceResource<'a> {
     Tables,
     Documents,
     Ontology,
+    OntologySchema,
     Context,
     Schema(&'a str),
 }
@@ -258,10 +260,11 @@ enum WorkspaceResource<'a> {
 impl<'a> WorkspaceResource<'a> {
     const PREFIX: &'static str = "quack://workspace/";
     const SCHEMA_TEMPLATE: &'static str = "quack://workspace/tables/{name}/schema";
-    const FIXED: [WorkspaceResource<'static>; 4] = [
+    const FIXED: [WorkspaceResource<'static>; 5] = [
         WorkspaceResource::Tables,
         WorkspaceResource::Documents,
         WorkspaceResource::Ontology,
+        WorkspaceResource::OntologySchema,
         WorkspaceResource::Context,
     ];
 
@@ -271,6 +274,7 @@ impl<'a> WorkspaceResource<'a> {
             "tables" => Some(Self::Tables),
             "documents" => Some(Self::Documents),
             "ontology" => Some(Self::Ontology),
+            "ontology/schema" => Some(Self::OntologySchema),
             "context" => Some(Self::Context),
             _ => path
                 .strip_prefix("tables/")?
@@ -284,13 +288,18 @@ impl<'a> WorkspaceResource<'a> {
     fn audit_id(self) -> String {
         match self {
             Self::Schema(_) => String::from(Self::SCHEMA_TEMPLATE),
-            Self::Tables | Self::Documents | Self::Ontology | Self::Context => self.uri(),
+            Self::Tables
+            | Self::Documents
+            | Self::Ontology
+            | Self::OntologySchema
+            | Self::Context => self.uri(),
         }
     }
 
     fn uri(self) -> String {
         match self {
             Self::Schema(table) => format!("{}tables/{table}/schema", Self::PREFIX),
+            Self::OntologySchema => format!("{}ontology/schema", Self::PREFIX),
             Self::Tables | Self::Documents | Self::Ontology | Self::Context => {
                 format!("{}{}", Self::PREFIX, self.name())
             }
@@ -302,6 +311,7 @@ impl<'a> WorkspaceResource<'a> {
             Self::Tables => String::from("tables"),
             Self::Documents => String::from("documents"),
             Self::Ontology => String::from("ontology"),
+            Self::OntologySchema => String::from("ontology schema"),
             Self::Context => String::from("context"),
             Self::Schema(table) => format!("{table} schema"),
         }
@@ -316,6 +326,9 @@ impl<'a> WorkspaceResource<'a> {
             Self::Ontology => {
                 String::from("The ontology (classes, relations, properties, mappings) as JSON")
             }
+            Self::OntologySchema => String::from(
+                "The JSON Schema of the ontology's interchange form, for writing one to import",
+            ),
             Self::Context => {
                 String::from("The owner's instructions and definitions for the agent, as Markdown")
             }
@@ -326,7 +339,11 @@ impl<'a> WorkspaceResource<'a> {
     fn mime_type(self) -> &'static str {
         match self {
             Self::Context => "text/markdown",
-            Self::Tables | Self::Documents | Self::Ontology | Self::Schema(_) => "application/json",
+            Self::Tables
+            | Self::Documents
+            | Self::Ontology
+            | Self::OntologySchema
+            | Self::Schema(_) => "application/json",
         }
     }
 
@@ -907,6 +924,9 @@ impl McpServer {
                 Some(ontology) => ontology.to_json().map_err(internal)?,
                 None => String::from("{}"),
             },
+            WorkspaceResource::OntologySchema => {
+                serde_json::to_string(&Ontology::json_schema()).map_err(internal)?
+            }
             WorkspaceResource::Context => {
                 let current = self.reader_db(context::current).await?;
                 current.map(|c| c.content).unwrap_or_default()

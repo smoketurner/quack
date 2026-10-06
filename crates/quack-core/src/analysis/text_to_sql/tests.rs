@@ -1,8 +1,10 @@
 use super::*;
 use crate::analysis::policy::Approver;
+use crate::config::GraphConfig;
 use crate::embedding::Dimension;
+use crate::graph::query::{GraphQuery, PathEnds, PathQuery};
 use crate::graph::store::NewNode;
-use crate::graph::{Properties, Standing};
+use crate::graph::{Drift, GraphStatusSummary, Properties, Standing};
 use crate::ids::{ChunkId, ClassId, DocumentId};
 use crate::ingestion::parser::PageCounts;
 use crate::ingestion::parser::SectionKind;
@@ -641,6 +643,41 @@ fn the_stale_parenthetical_fires_for_a_genuinely_stale_graph() {
         prompt.contains(STALE),
         "the stale parenthetical is missing for a genuinely stale graph:\n{prompt}"
     );
+    assert!(!prompt.contains("(drift:"), "{prompt}");
+
+    let mut drift = Drift::default();
+    drift.classes.bump("vessel");
+    drift.relations.bump("docked_at");
+    drift.relations.bump("docked_at");
+    graph_store::record_drift(&db, &drift).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    assert!(
+        prompt
+            .contains("(drift: the documents expressed 2 classes or relations the ontology lacks)"),
+        "{prompt}"
+    );
+
+    // Every graph result carries the same judgement.
+    let result = GraphQuery::new(Some("Acme"), None, None, None)
+        .unwrap()
+        .run(&db, None, &GraphConfig::default())
+        .unwrap();
+    assert_eq!(
+        result.status,
+        GraphStatusSummary {
+            built_with_version: Some(first),
+            ontology_version: status.ontology_version,
+            stale: true,
+            provisional_nodes: 0,
+            drift_total: 2,
+            dropped_provisional: 0,
+        }
+    );
+    let path = PathQuery::new("Acme", "Acme", None)
+        .unwrap()
+        .run(&db, &PathEnds::default(), &GraphConfig::default())
+        .unwrap();
+    assert_eq!(path.status, result.status);
 }
 
 #[test]

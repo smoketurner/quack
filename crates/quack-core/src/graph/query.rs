@@ -9,6 +9,7 @@ use crate::embedding::EmbeddingModel;
 use serde::Serialize;
 
 use super::GraphResult;
+use super::store;
 use super::traverse::{self, Hops};
 use crate::config::GraphConfig;
 use crate::embedding::{Embedder, Vector};
@@ -98,10 +99,10 @@ impl GraphQuery {
         if let Some(relation) = self.relation.as_deref() {
             OntologyId::Relation(relation).check(ontology.as_ref())?;
         }
-        match self.entity.as_deref() {
+        let mut result = match self.entity.as_deref() {
             Some(entity) => {
                 let roots = traverse::resolve_entry(db, entity, self.class.as_deref(), embedding)?;
-                traverse::neighborhood(db, &roots, self.hops, self.relation.as_deref(), options)
+                traverse::neighborhood(db, &roots, self.hops, self.relation.as_deref(), options)?
             }
             None => traverse::by_class(
                 db,
@@ -109,8 +110,10 @@ impl GraphQuery {
                 self.class.as_deref().unwrap_or_default(),
                 options.max_nodes,
                 options,
-            ),
-        }
+            )?,
+        };
+        result.status = store::summary(db)?;
+        Ok(result)
     }
 
     /// Labels close to the entity, to offer when the search found nothing.
@@ -195,11 +198,13 @@ impl PathQuery {
     ) -> Result<GraphResult> {
         let from = traverse::resolve_entry(db, &self.from, None, ends.from.as_ref())?;
         let to = traverse::resolve_entry(db, &self.to, None, ends.to.as_ref())?;
-        match (from.first(), to.first()) {
-            (Some(a), Some(b)) => traverse::path(db, a, b, self.max_hops, options),
-            (None, _) => Err(UnknownEntity::find(db, &self.from, ends.from.as_ref()).into()),
-            (_, None) => Err(UnknownEntity::find(db, &self.to, ends.to.as_ref()).into()),
-        }
+        let mut result = match (from.first(), to.first()) {
+            (Some(a), Some(b)) => traverse::path(db, a, b, self.max_hops, options)?,
+            (None, _) => return Err(UnknownEntity::find(db, &self.from, ends.from.as_ref()).into()),
+            (_, None) => return Err(UnknownEntity::find(db, &self.to, ends.to.as_ref()).into()),
+        };
+        result.status = store::summary(db)?;
+        Ok(result)
     }
 }
 

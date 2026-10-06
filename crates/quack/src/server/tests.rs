@@ -34,6 +34,7 @@ use crate::server::queue::UploadJob;
 use crate::server::run::{BackgroundRun, RunKind, RunReport};
 use quack_core::jobs::{JobKind, LaneKey};
 use quack_core::okf::{Bundle, BundleSink, TarSink};
+use quack_core::ontology::Ontology;
 use quack_core::storage::audit;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, IssuedToken, Membership,
@@ -9342,5 +9343,134 @@ async fn table_notes_profiles_and_retypes_over_rest_and_the_web() {
     assert!(
         html.contains("role=\"alert\"") && html.contains("does not convert"),
         "{html}"
+    );
+}
+
+/// `GET .../graph/export` streams the whole graph in the format asked for,
+/// with the provenance of a person's assertions, and audits `export` with
+/// the counts once the stream ends; `.../ontology/schema` is the published
+/// schema.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_graph_exports_as_a_download_audited_with_its_counts() {
+    let h = harness(ServeMode::Local).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "graph-export" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    let base = format!("/api/v1/workspaces/{ws}");
+    let (status, _) = h
+        .post(&format!("{base}/ontology/init"), "", serde_json::json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut ids = Vec::new();
+    for (label, class) in [("Ada <Lovelace>", "person"), ("Acme, Inc.", "organization")] {
+        let (status, body) = h
+            .post(
+                &format!("{base}/graph/nodes"),
+                "",
+                serde_json::json!({ "label": label, "class": class, "note": "from the filing" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        ids.push(body["id"].as_str().unwrap_or_default().to_owned());
+    }
+    let (status, body) = h
+        .post(
+            &format!("{base}/graph/edges"),
+            "",
+            serde_json::json!({ "source": ids.first(), "target": ids.get(1), "relation": "works_at" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let request = Request::builder()
+        .uri(format!("{base}/graph/export?format=graphml"))
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let response = h
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(response.status(), StatusCode::OK);
+    let header_of = |name| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        header_of(header::CONTENT_TYPE).as_deref(),
+        Some("application/graphml+xml")
+    );
+    assert_eq!(
+        header_of(header::CONTENT_DISPOSITION).as_deref(),
+        Some("attachment; filename=\"graph-export.graph.graphml\"")
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("Ada &lt;Lovelace&gt;"), "{text}");
+    assert!(text.contains("from the filing"), "{text}");
+
+    // Audited when the stream ends, with what went.
+    let mut row = None;
+    for _ in 0..100 {
+        row = h
+            .audit(AuditFilter {
+                workspace_id: Some(ws.clone()),
+                action: Some(String::from("export")),
+                ..AuditFilter::default()
+            })
+            .await
+            .into_iter()
+            .find(|r| r.entry.outcome == Outcome::Allowed);
+        if row.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let row = row.unwrap_or_else(|| fail("the finished export is audited as allowed"));
+    let details = h
+        .app
+        .read(&ws, |db| audit::list(db, 50))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let detail = details
+        .iter()
+        .find(|d| d.id == row.entry.id)
+        .and_then(|d| d.detail.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        detail,
+        serde_json::json!({ "format": "graphml", "nodes": 2, "edges": 1, "provenance": 3 })
+    );
+
+    // A format quack does not write is refused before anything streams.
+    let (status, _) = h
+        .call(
+            Method::GET,
+            &format!("{base}/graph/export?format=gexf"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body) = h
+        .call(Method::GET, &format!("{base}/ontology/schema"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        Some(body),
+        serde_json::to_value(Ontology::json_schema()).ok()
     );
 }

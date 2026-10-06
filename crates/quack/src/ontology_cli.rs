@@ -33,6 +33,9 @@ pub(crate) enum OntologyAction {
         #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
         format: TextOrJson,
     },
+    /// Print the JSON Schema of the interchange form that export writes and
+    /// import reads (docs/ontology.schema.json)
+    Schema,
     /// Install the built-in general ontology as version 1
     Init,
     /// Write the current ontology as JSON to a file (- for stdout)
@@ -140,6 +143,17 @@ impl AcceptArgs {
     }
 }
 
+/// `quack ontology schema`: the interchange form's JSON Schema, which needs
+/// no workspace.
+pub(crate) fn write_schema(out: &mut impl Write) -> Result<()> {
+    writeln!(
+        out,
+        "{}",
+        serde_json::to_string_pretty(&Ontology::json_schema())?
+    )?;
+    Ok(())
+}
+
 /// Run one ontology action, writing what the user should see to `out`
 /// (stdout for the CLI, the transcript for the terminal session).
 ///
@@ -160,6 +174,7 @@ pub(crate) async fn run(
         OntologyAction::Show { format } => {
             db.render(out, move |db, out| show(db, format, out)).await?;
         }
+        OntologyAction::Schema => write_schema(out)?,
         OntologyAction::Init => db.render(out, init).await?,
         OntologyAction::Export { file } => {
             db.render(out, move |db, out| export(db, &file, out))

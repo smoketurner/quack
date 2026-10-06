@@ -105,9 +105,11 @@ cargo run --bin quack -- sessions | export ID [--sql]                          #
 cargo run --bin quack -- saved list | add NAME --from-session ID | run NAME [--refresh] [--exit-code] | show NAME | remove NAME   # an answer's SQL re-run without the model; exit 5 when changed; cron schedules it
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
 cargo run --bin quack -- ontology rename class|relation OLD NEW                   # a new id as a new version; the graph's nodes and edges move with it
+cargo run --bin quack -- ontology schema                                          # the interchange form's JSON Schema (docs/ontology.schema.json, kept equal by a test)
 cargo run --bin quack -- ontology propose [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
 cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] [--reset [--all]] | revalidate [-y] | review | merges | merge ID..
 cargo run --bin quack -- graph add node LABEL --class C [--property K=V] | add edge FROM REL TO | set NODE [--label L] [--to-class C] [--property K=V] [--unset K] | delete node NODE | delete edge ID   # a person's assertions, recorded with author and note
+cargo run --bin quack -- graph export DIR|- [--format csv|graphml|jsonld] [--include-provisional]   # the whole graph (graph::export); csv to stdout is a tar
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
 cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders [--types col=TYPE]   # snapshot a Postgres/SQLite query or an http(s) data file as a table
@@ -384,7 +386,15 @@ ontology does not define is refused with the ids that do exist, a name that matc
 entity comes back with the closest labels (`traverse::suggest_entities`), and a result
 query mode emptied by dropping provisional nodes says so rather than claiming the graph
 is empty. A result cut short by `max_nodes` says so too, and a class listing carries the
-total it was capped from (`GraphResult::total_nodes`, `truncated`). Provenance to a mapped
+total it was capped from (`GraphResult::total_nodes`, `truncated`). Every result carries
+`status` (`GraphStatusSummary`: versions, `stale`, `provisional_nodes`, `drift_total`,
+`dropped_provisional`), filled by `GraphQuery::run` and `PathQuery::run` (`store::summary`)
+and counted by `without_provisional`, so every interface's `graph` says how current it is;
+the prompt's graph line names the drift count. `graph::export::GraphExport` writes the whole
+graph as a CSV bundle (to a directory, or a tar whose parts are staged in
+`WorkspaceDb::spool_file`), GraphML (`quick-xml`), or JSON-LD, each part streamed from one
+ordered statement; `GET .../graph/export?format=` streams it through `api::okf::Download`
+(shared with the OKF export) and audits `export` with the counts when the stream ends. Provenance to a mapped
 table renders as a predicate `run_sql` can run, since the mapping knows the key column. The
 tool guidance in the system prompt gains a numbered graph procedure whenever those tools
 are registered.

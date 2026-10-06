@@ -249,8 +249,8 @@ impl SystemPrompt {
             if graph.enabled() {
                 writeln!(
                     prompt.text,
-                    "Knowledge graph: {} nodes, {} edges typed by this ontology{}{}. search_graph \
-                     and find_path read it; both return provenance to cite.",
+                    "Knowledge graph: {} nodes, {} edges typed by this ontology{}{}{}. \
+                     search_graph and find_path read it; both return provenance to cite.",
                     graph.nodes,
                     graph.edges,
                     if graph.provisional() {
@@ -262,6 +262,13 @@ impl SystemPrompt {
                         " (stale: the ontology changed since it was built)"
                     } else {
                         ""
+                    },
+                    match graph.drift.total() {
+                        0 => String::new(),
+                        drift => format!(
+                            " (drift: the documents expressed {drift} classes or relations the \
+                             ontology lacks)"
+                        ),
                     }
                 )?;
             }

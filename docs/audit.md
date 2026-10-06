@@ -34,14 +34,14 @@ API Activity event with that name.
 | `open` | One resource is opened: a document, a table, a session, a passage, the workspace itself | `allowed`, `denied` | API: Read |
 | `list` | Resources of a kind are listed (documents, tables, members, sessions, jobs) | `allowed`, `denied` | API: Read |
 | `page` | A web console page is rendered | `allowed`, `denied` | API: Read |
-| `show` | An ontology or graph status is shown | `allowed` | API: Read |
+| `show` | An ontology, its JSON Schema, or graph status is shown | `allowed` | API: Read |
 | `stream` | A job or MCP event stream is opened | `allowed`, `denied` | API: Read |
 | `query` | An agent turn, over REST, the web chat, or MCP (`-p` and the terminal are unaudited) | `allowed`, `denied` (the provider is not allowed for the workspace), `error` | API: Read; with the content half, the `ai_operation` profile |
 | `search` | A document search without the agent (`POST .../search`, the web Search page, the MCP `search` tool); the detail holds the query and what it was limited to | `allowed`, `denied`, `error` | API: Read |
 | `sql` | A statement run directly (`/sql`, the SQL page, the MCP `sql` tool) | `allowed`, `denied` (a write without the write scope, an internal table), `error` | API: Read |
 | `ingest` | A file is uploaded, a document replaced, a bundle imported | `allowed`, `denied`, `error` | API: Create |
 | `import` | A Postgres, SQLite, or URL import is started | `allowed`, `error` | API: Create |
-| `export` | A workspace is exported as an OKF bundle, or a statement's rows are streamed out | `allowed`, `denied` (a write statement), `error` | API: Read |
+| `export` | A workspace is exported as an OKF bundle, the graph as CSV, GraphML, or JSON-LD (the detail holds `format`, `nodes`, `edges`, `provenance`), or a statement's rows are streamed out | `allowed`, `denied` (a write statement), `error` | API: Read |
 | `delete` | A document, session, saved question, workspace, or other resource is deleted | `allowed`, `denied`, `error` | API: Delete |
 | `snapshot` | A workspace is written out as a snapshot (`quack workspace snapshot`, `GET .../snapshot`, the Settings page) | `allowed`, `error` | API: Update |
 | `restore` | A snapshot is restored as a new workspace (`quack workspace restore`, `POST /workspaces/restore`) | `allowed` | API: Update |

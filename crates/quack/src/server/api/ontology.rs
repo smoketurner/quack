@@ -37,6 +37,19 @@ pub(crate) async fn show(
     Ok(Json(serde_json::to_value(ontology)?))
 }
 
+/// The JSON Schema of the interchange form `PUT .../ontology` accepts.
+pub(crate) async fn schema(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access
+        .audit_read(&app, AuditAction::Show, "ontology_schema")
+        .await?;
+    Ok(Json(serde_json::to_value(Ontology::json_schema())?))
+}
+
 /// Validate the body and store it as the next version.
 pub(crate) async fn replace(
     State(app): State<App>,
