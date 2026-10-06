@@ -8127,7 +8127,7 @@ async fn sql_export_streams_every_row_and_refuses_writes() {
     assert!(
         text.ends_with("999\n"),
         "{}",
-        &text[text.len().saturating_sub(40)..]
+        text.lines().last().unwrap_or_default()
     );
     let (status, bytes, _) = h
         .send_bytes(export("SELECT n FROM big WHERE n < 3", "ndjson"))
