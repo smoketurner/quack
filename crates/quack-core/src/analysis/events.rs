@@ -65,6 +65,7 @@ pub enum ToolName {
     ListDocuments,
     ListTables,
     DescribeTable,
+    FindTables,
     CreateChart,
     SearchGraph,
     FindPath,
@@ -78,6 +79,7 @@ text_enum!(ToolName, "tool", {
     ListDocuments => "list_documents",
     ListTables => "list_tables",
     DescribeTable => "describe_table",
+    FindTables => "find_tables",
     CreateChart => "create_chart",
     SearchGraph => "search_graph",
     FindPath => "find_path",
@@ -95,6 +97,7 @@ impl ToolName {
             | Self::ListDocuments
             | Self::ListTables
             | Self::DescribeTable
+            | Self::FindTables
             | Self::SearchGraph
             | Self::FindPath
             | Self::DescribeClass => false,

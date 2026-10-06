@@ -20,6 +20,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{Error, Result};
 use crate::ids::{ClassId, RelationId};
+use crate::storage::workspace::quote_ident;
+use crate::text::OneLine;
 use induction::ItemKind;
 
 /// The implicit root class every class descends from.
@@ -116,7 +118,7 @@ pub struct NotSnakeCase(String);
 impl NotSnakeCase {
     /// The refusal as the ontology error for an id of `kind`.
     #[must_use]
-    pub fn for_item(self, kind: ItemKind) -> Error {
+    pub fn for_item(self, kind: impl std::fmt::Display) -> Error {
         Error::Ontology(format!(
             "{kind} id '{}' must be snake_case: a lowercase letter, then lowercase letters, digits, or underscores",
             self.0
@@ -274,6 +276,70 @@ pub struct Property {
     /// Allowed values for `enum`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
+    /// What a value means, shown beside every column mapped to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The unit a number is in (`cents`, `USD`, `kg`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Other words people use for it, which the table search matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
+}
+
+impl Property {
+    /// A property with no label, description, unit, or synonyms.
+    #[must_use]
+    pub fn new(id: impl Into<String>, kind: PropertyType, values: Vec<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: None,
+            kind,
+            values,
+            description: None,
+            unit: None,
+            synonyms: Vec::new(),
+        }
+    }
+}
+
+/// A named calculation over one table: a SQL expression such as
+/// `sum(amount) / 100.0`, checked as a read of that table when the
+/// ontology is saved, so the agent and people compute it one way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Measure {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The table the expression reads.
+    pub table: String,
+    /// What goes after `SELECT` and before `FROM table`.
+    pub expression: String,
+}
+
+impl Measure {
+    /// The statement that checks the expression: it must parse as one read
+    /// of its table, and plan.
+    #[must_use]
+    pub fn check_statement(&self) -> String {
+        format!(
+            "SELECT {} AS measure FROM {}",
+            self.expression,
+            quote_ident(&self.table)
+        )
+    }
+}
+
+/// `- revenue = sum(amount) / 100.0: net revenue in dollars`.
+impl std::fmt::Display for Measure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} = {}", self.id, OneLine(&self.expression))?;
+        if let Some(description) = &self.description {
+            write!(f, ": {}", OneLine(description))?;
+        }
+        Ok(())
+    }
 }
 
 /// One foreign-key-like column of a mapped table.
@@ -328,6 +394,8 @@ pub struct Ontology {
     pub properties: Vec<Property>,
     #[serde(default)]
     pub mappings: Vec<Mapping>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub measures: Vec<Measure>,
 }
 
 /// The relations one class takes part in.
@@ -611,6 +679,12 @@ impl Ontology {
         self.mappings.iter().find(|m| m.table == table)
     }
 
+    /// The measures defined over `table`.
+    #[must_use]
+    pub fn measures_on(&self, table: &str) -> Vec<&Measure> {
+        self.measures.iter().filter(|m| m.table == table).collect()
+    }
+
     /// Whether `id` names a class: the root, or one defined here.
     #[must_use]
     pub fn defines_class(&self, id: &str) -> bool {
@@ -671,7 +745,28 @@ impl Ontology {
         self.validate_properties()?;
         self.validate_classes()?;
         self.validate_relations()?;
-        self.validate_mappings()
+        self.validate_mappings()?;
+        self.validate_measures()
+    }
+
+    fn validate_measures(&self) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        for measure in &self.measures {
+            SnakeId::try_from(measure.id.as_str()).map_err(|e| e.for_item("measure"))?;
+            if !seen.insert(measure.id.as_str()) {
+                return Err(Error::Ontology(format!(
+                    "measure '{}' is declared twice",
+                    measure.id
+                )));
+            }
+            if measure.table.trim().is_empty() || measure.expression.trim().is_empty() {
+                return Err(Error::Ontology(format!(
+                    "measure '{}' needs a table and an expression",
+                    measure.id
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn validate_properties(&self) -> Result<()> {
@@ -939,6 +1034,7 @@ impl Ontology {
         out.relations.sort_by(|a, b| a.id.cmp(&b.id));
         out.properties.sort_by(|a, b| a.id.cmp(&b.id));
         out.mappings.sort_by(|a, b| a.table.cmp(&b.table));
+        out.measures.sort_by(|a, b| a.id.cmp(&b.id));
         for class in &mut out.classes {
             class.properties.sort();
             class.properties.dedup();
@@ -955,6 +1051,8 @@ impl Ontology {
             if property.label.as_deref() == Some(property.id.as_str()) {
                 property.label = None;
             }
+            property.synonyms.sort();
+            property.synonyms.dedup();
         }
         out
     }
@@ -995,6 +1093,7 @@ impl Ontology {
             relations: Changes::between(&older.relations, &this.relations, |r| r.id.as_str()),
             properties: Changes::between(&older.properties, &this.properties, |p| p.id.as_str()),
             mappings: Changes::between(&older.mappings, &this.mappings, Mapping::id),
+            measures: Changes::between(&older.measures, &this.measures, |m| m.id.as_str()),
         }
     }
 
@@ -1016,12 +1115,7 @@ impl Ontology {
             domain: ClassId::from(domain.to_owned()),
             range: ClassId::from(range.to_owned()),
         };
-        let property = |id: &str, kind: PropertyType| Property {
-            id: id.to_owned(),
-            label: None,
-            kind,
-            values: Vec::new(),
-        };
+        let property = |id: &str, kind: PropertyType| Property::new(id, kind, Vec::new());
         Self {
             version: None,
             classes: vec![
@@ -1048,6 +1142,7 @@ impl Ontology {
                 property("date", PropertyType::Date),
             ],
             mappings: Vec::new(),
+            measures: Vec::new(),
         }
     }
 }
@@ -1095,6 +1190,8 @@ pub struct OntologyDiff {
     pub relations: Changes,
     pub properties: Changes,
     pub mappings: Changes,
+    #[serde(default)]
+    pub measures: Changes,
 }
 
 impl Ontology {
@@ -1140,7 +1237,19 @@ impl Ontology {
             } else {
                 format!(" [{}]", p.values.join(", "))
             };
-            lines.push(format!("  - {}: {}{values}", p.id, p.kind.as_str()));
+            let unit = p
+                .unit
+                .as_deref()
+                .map_or(String::new(), |u| format!(" [{u}]"));
+            let description = p
+                .description
+                .as_deref()
+                .map_or(String::new(), |d| format!(": {d}"));
+            lines.push(format!(
+                "  - {}: {}{values}{unit}{description}",
+                p.id,
+                p.kind.as_str()
+            ));
         }
         if !self.mappings.is_empty() {
             lines.push(String::from("mappings:"));
@@ -1153,6 +1262,12 @@ impl Ontology {
                     m.properties.len(),
                     m.relations.len()
                 ));
+            }
+        }
+        if !self.measures.is_empty() {
+            lines.push(String::from("measures:"));
+            for m in &self.measures {
+                lines.push(format!("  - {m} (on {})", m.table));
             }
         }
         let mut text = lines.join("\n");
@@ -1168,6 +1283,7 @@ impl OntologyDiff {
             && self.relations.is_empty()
             && self.properties.is_empty()
             && self.mappings.is_empty()
+            && self.measures.is_empty()
     }
 }
 
@@ -1185,6 +1301,7 @@ impl std::fmt::Display for OntologyDiff {
             ("relations", &self.relations),
             ("properties", &self.properties),
             ("mappings", &self.mappings),
+            ("measures", &self.measures),
         ] {
             if changes.is_empty() {
                 continue;

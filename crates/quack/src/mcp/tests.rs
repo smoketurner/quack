@@ -195,6 +195,12 @@ async fn stdio_tools_gate_writes_and_serve_resources() {
         .unwrap_or_else(|e| fail(&e.message));
     assert_eq!(field(&described, "row_count"), 2);
     assert_eq!(
+        field(&described, "profile").get("row_count"),
+        Some(&serde_json::json!(2)),
+        "a table a statement made is profiled at once"
+    );
+    assert!(field(&described, "warnings").is_array());
+    assert_eq!(
         field(&described, "columns")
             .get(0)
             .and_then(|c| c.get("name")),

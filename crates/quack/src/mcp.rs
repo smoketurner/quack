@@ -31,6 +31,7 @@ use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditAction, AuditResource, Outcome, ResourceKind, WorkspaceRow,
 };
+use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{self, ChatMode, SessionViewer};
 use quack_core::storage::workspace::{
     DocumentFilter, SearchMode, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
@@ -600,7 +601,11 @@ impl McpServer {
         let max_rows = self.inner.config.analysis.max_query_rows;
         let result = if is_write {
             let result = self
-                .db(move |db| db.execute_query_capped(&sql, max_rows))
+                .db(move |db| {
+                    let result = db.execute_query_capped(&sql, max_rows);
+                    TableProfile::after_write(db);
+                    result
+                })
                 .await;
             // Whatever ran might have created a temp object the check
             // above did not catch (a leading comment, a multi-statement
@@ -658,7 +663,7 @@ impl McpServer {
 
     #[tool(
         name = "describe_table",
-        description = "Columns, types, row count, and three sample rows of a table."
+        description = "A table's columns with their types and, when the owner gave them, their meaning, unit, and synonyms; its row count; the owner's note; its profile (per column: values present, distinct values, common values) with warnings such as numbers stored as text or a key that repeats; the measures defined over it; and three sample rows."
     )]
     async fn describe_table(
         &self,
@@ -882,19 +887,7 @@ impl McpServer {
                 db.describe_table(&table).map(Some)
             })
             .await?;
-        Ok(described.map(|d| {
-            let columns: Vec<serde_json::Value> = d
-                .columns
-                .iter()
-                .map(|c| serde_json::json!({ "name": c.name, "type": c.column_type }))
-                .collect();
-            serde_json::json!({
-                "table": d.table_name,
-                "columns": columns,
-                "row_count": d.row_count,
-                "sample": { "columns": d.sample_rows.columns, "rows": d.sample_rows.rows },
-            })
-        }))
+        Ok(described.map(|d| d.to_json()))
     }
 
     async fn resource_text(

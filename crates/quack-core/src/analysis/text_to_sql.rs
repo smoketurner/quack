@@ -1,11 +1,14 @@
+use super::table_search::{DETAILED_TABLES, RankedTable, TableCards, TableLayout, user_tables};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::search::DocumentScope;
+use crate::embedding::Vector;
 use crate::error::Result;
+use crate::graph::views as graph_views;
 use crate::graph::{GraphStatus, store as graph_store};
 use crate::ingestion::parser::PageCounts;
 use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
-use crate::storage::workspace::{PinnedDocument, WorkspaceDb};
+use crate::storage::workspace::{ColumnInfo, PinnedDocument, TableDescription, WorkspaceDb};
 use crate::text::{Fenced, OneLine, Tokens};
 use jiff::civil::Date;
 use std::fmt::Write;
@@ -70,6 +73,18 @@ pub struct PromptOptions {
     pub ollama_context_cap: Option<Tokens>,
     /// The documents the person limited the question to.
     pub scope: DocumentScope,
+    /// The turn's question, which ranks the tables in a workspace with
+    /// more than the prompt describes; `None` leaves the ranking out.
+    pub question: Option<Question>,
+}
+
+/// The question a turn asks, and its embedding when a model made one.
+#[derive(Debug, Clone)]
+pub struct Question {
+    pub text: String,
+    pub vector: Option<Vector>,
+    /// `[retrieval].rrf_k`, which fuses the keyword and vector rankings.
+    pub rrf_k: u32,
 }
 
 /// The system prompt, assembled in the order the design fixes (section
@@ -96,8 +111,12 @@ what the document asked for.\n\n";
 /// block has had since issue #40).
 const PROMPT_ONTOLOGY_ITEMS: usize = 30;
 
-/// Tables past this many are listed by name and row count only.
-const DETAILED_TABLES: usize = 25;
+/// Question-ranked tables the prompt names after the workspace context.
+const RANKED_TABLES: usize = 5;
+/// Measures past this many are counted; `describe_table` lists a table's.
+const PROMPT_MEASURES: usize = 30;
+/// Graph views past this many are counted.
+const PROMPT_GRAPH_VIEWS: usize = 30;
 /// Columns past this many per table are counted, not listed.
 const LISTED_COLUMNS: usize = 40;
 /// Sample rows are shown only for tables up to this wide.
@@ -108,6 +127,19 @@ const SAMPLE_CELL_CHARS: usize = 60;
 const LISTED_DOCUMENTS: usize = 40;
 /// A document title longer than this is cut, with an ellipsis.
 const DOCUMENT_TITLE_CHARS: usize = 80;
+
+/// A column as the model reads it: `amount (BIGINT): order total [cents]`.
+pub struct ColumnLine<'a>(pub &'a ColumnInfo);
+
+impl std::fmt::Display for ColumnLine<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.0.name, self.0.column_type)?;
+        if let Some(meaning) = &self.0.meaning {
+            write!(f, "{meaning}")?;
+        }
+        Ok(())
+    }
+}
 
 /// How far the workspace's knowledge model goes, which decides the
 /// ontology and graph tools a turn registers and the guidance the prompt
@@ -187,7 +219,10 @@ impl SystemPrompt {
 
         let ontology = ontology_store::current(db)?;
         let graph = graph_store::status(db)?;
-        prompt.tool_guidance(Modeled::of(ontology.as_ref(), &graph));
+        prompt.tool_guidance(
+            Modeled::of(ontology.as_ref(), &graph),
+            TableLayout::of(user_tables(db)?.len()),
+        );
 
         let version = db.duckdb_version()?;
         writeln!(
@@ -198,7 +233,8 @@ impl SystemPrompt {
         prompt.text.push_str(DIALECT_REFERENCE);
         prompt.text.push('\n');
 
-        let tables = prompt.tables(db)?;
+        let modeled = Modeled::of(ontology.as_ref(), &graph);
+        let tables = prompt.tables(db, ontology.as_ref(), modeled)?;
         let documents = prompt.documents(db)?;
         if let Some(note) = options.scope.prompt_note() {
             writeln!(prompt.text, "{note}")?;
@@ -206,7 +242,7 @@ impl SystemPrompt {
         }
         prompt.pinned_documents(db, options.pinned_token_budget)?;
 
-        if let Some(ontology) = ontology {
+        if let Some(ontology) = &ontology {
             prompt
                 .text
                 .push_str(&ontology.render_capped(PROMPT_ONTOLOGY_ITEMS));
@@ -241,6 +277,7 @@ impl SystemPrompt {
         }
 
         prompt.context(options)?;
+        prompt.ranked_tables(db, ontology.as_ref(), &tables, options)?;
 
         prompt.text.push_str(TRUST_RULE);
         prompt
@@ -255,13 +292,26 @@ impl SystemPrompt {
     /// only when the graph tools do and the `describe_class` line only when
     /// an ontology exists (design doc 7.2), since guidance for a tool the
     /// model cannot call is worse than none.
-    fn tool_guidance(&mut self, modeled: Modeled) {
+    fn tool_guidance(&mut self, modeled: Modeled, layout: TableLayout) {
+        self.text.push_str(match layout {
+            TableLayout::AllDescribed => {
+                "When answering analytical questions about structured data:\n\
+                 1. The tables block below describes the data: columns with their meaning and \
+                 unit when the owner gave one, notes, and warnings about the values. Follow the \
+                 notes and warnings, call describe_table for a table it lists without columns, and \
+                 run SUMMARIZE <table> when you need min, max, or distinct counts per column\n"
+            }
+            TableLayout::Ranked => {
+                "When answering analytical questions about structured data:\n\
+                 1. The workspace has more tables than the tables block describes. The tables \
+                 ranked for this question are listed after the workspace context; if none fits, \
+                 call find_tables with the question in other words, which returns each match's \
+                 columns, so describe_table is rarely needed. Follow the notes and warnings, and \
+                 run SUMMARIZE <table> when you need min, max, or distinct counts per column\n"
+            }
+        });
         self.text.push_str(
-            "When answering analytical questions about structured data:\n\
-             1. The tables block below describes the data; call describe_table for a table it \
-             lists without columns or sample rows, and run SUMMARIZE <table> when you need min, \
-             max, null share, or distinct counts per column before choosing a filter\n\
-             2. Write and execute SQL queries using run_sql\n\
+            "2. Write and execute SQL queries using run_sql\n\
              3. If run_sql returns an error, read it: DuckDB names candidate columns for a \
              misspelled one and describe_table shows the real names. Fix the statement and run \
              it again; do not give up after one error and do not ask the user to correct SQL\n\
@@ -308,7 +358,10 @@ impl SystemPrompt {
                  5. A result that says it was cut off at the node limit is not the whole answer; \
                  narrow the class or count with describe_class instead of counting the lines\n\
                  6. If the graph has nothing, search the documents before telling the user the \
-                 workspace does not cover the question\n\n",
+                 workspace does not cover the question\n\
+                 7. To count, filter, aggregate, or join entities, run_sql over the graph_<class> \
+                 view (one row per entity, one typed column per property; describe_class lists \
+                 them) and graph_edges; in query mode add WHERE NOT provisional\n\n",
             );
         }
     }
@@ -368,25 +421,30 @@ impl SystemPrompt {
         Ok(total)
     }
 
-    /// The tables block: every user table with its row count, columns, and
+    /// The tables block: every user table with its row count, columns and
+    /// what they mean, the owner's note, warnings from its profile, and
     /// three sample rows, bounded so a wide or narrative table cannot crowd
     /// the tool guidance and the question out of a small context window
-    /// (issue #40): the model has `describe_table` for the rest. Returns
-    /// the table names so the caller knows whether the workspace is empty.
-    fn tables(&mut self, db: &WorkspaceDb) -> Result<Vec<String>> {
-        let tables = db.list_tables()?;
-        if tables.is_empty() {
-            return Ok(tables);
+    /// (issue #40): the model has `describe_table` and `find_tables` for
+    /// the rest. Then the measures and, when the graph has nodes, its views.
+    /// Returns the user tables, so the caller knows whether the workspace
+    /// is empty. The block depends on the workspace alone, never on the
+    /// question, so a provider's prefix cache keeps it.
+    fn tables(
+        &mut self,
+        db: &WorkspaceDb,
+        ontology: Option<&Ontology>,
+        modeled: Modeled,
+    ) -> Result<Vec<String>> {
+        let views = graph_views::names(db)?;
+        let tables = user_tables(db)?;
+        if !tables.is_empty() {
+            writeln!(self.text, "Available tables:")?;
         }
-        writeln!(self.text, "Available tables:")?;
         for (index, table) in tables.iter().enumerate() {
             // Tables past the detail cap only ever print their row count,
-            // so only ask for that: `describe_table` also runs `DESCRIBE`
-            // and a sample-row `SELECT`, whose output would be thrown away
-            // below. A workspace with far more tables than the cap (a
-            // per-table induced ontology, say) otherwise pays for a full
-            // describe and sample of every excess table on every turn for
-            // nothing.
+            // so only ask for that: describing one also samples rows,
+            // whose output would be thrown away.
             if index >= DETAILED_TABLES {
                 let Ok(row_count) = db.count_rows(table) else {
                     writeln!(self.text, "- {table}")?;
@@ -395,55 +453,172 @@ impl SystemPrompt {
                 writeln!(self.text, "- {table} ({row_count} rows)")?;
                 continue;
             }
-            let Ok(desc) = db.describe_table(table) else {
+            let Ok(desc) = db.describe_table_under(table, ontology) else {
                 writeln!(self.text, "- {table}")?;
                 continue;
             };
-            writeln!(self.text, "- {table} ({} rows)", desc.row_count)?;
-            writeln!(self.text, "  Columns:")?;
-            for col in desc.columns.iter().take(LISTED_COLUMNS) {
-                writeln!(self.text, "    - {} ({})", col.name, col.column_type)?;
-            }
-            if desc.columns.len() > LISTED_COLUMNS {
-                writeln!(
-                    self.text,
-                    "    ... and {} more columns; describe_table lists them all",
-                    desc.columns.len().saturating_sub(LISTED_COLUMNS)
-                )?;
-            }
-            if desc.sample_rows.rows.is_empty() {
-                continue;
-            }
-            if desc.columns.len() > SAMPLED_COLUMNS {
-                writeln!(
-                    self.text,
-                    "  Sample rows omitted ({} columns); describe_table shows them",
-                    desc.columns.len()
-                )?;
-                continue;
-            }
-            writeln!(self.text, "  Sample data:")?;
-            let mut buf = Vec::new();
-            if desc
-                .sample_rows
-                .with_cells_cut(SAMPLE_CELL_CHARS)
-                .write_table(&mut buf)
-                .is_ok()
-                && let Ok(text) = String::from_utf8(buf)
-            {
-                for line in text.lines() {
-                    writeln!(self.text, "    {line}")?;
-                }
-            }
+            self.table_detail(&desc)?;
         }
         if tables.len() > DETAILED_TABLES {
             writeln!(
                 self.text,
-                "Only the first {DETAILED_TABLES} tables are described here; use describe_table for the others."
+                "Only the first {DETAILED_TABLES} tables are described here; find_tables ranks \
+                 every table against a question, and describe_table shows one."
+            )?;
+        }
+        if !tables.is_empty() {
+            writeln!(self.text)?;
+        }
+        if let Some(ontology) = ontology {
+            self.measures(ontology)?;
+        }
+        if modeled.has_graph() && !views.is_empty() {
+            let shown: Vec<&str> = views
+                .iter()
+                .take(PROMPT_GRAPH_VIEWS)
+                .map(String::as_str)
+                .collect();
+            write!(
+                self.text,
+                "Graph views (read-only SQL over the knowledge graph; describe_class lists a \
+                 class view's columns): {}",
+                shown.join(", ")
+            )?;
+            if views.len() > PROMPT_GRAPH_VIEWS {
+                write!(
+                    self.text,
+                    ", and {} more",
+                    views.len().saturating_sub(PROMPT_GRAPH_VIEWS)
+                )?;
+            }
+            writeln!(self.text)?;
+            writeln!(self.text)?;
+        }
+        Ok(tables)
+    }
+
+    /// One table in full: row count, note, columns with their meaning,
+    /// the profile's warnings, and sample rows.
+    fn table_detail(&mut self, desc: &TableDescription) -> Result<()> {
+        writeln!(self.text, "- {} ({} rows)", desc.table_name, desc.row_count)?;
+        if let Some(note) = &desc.note {
+            writeln!(self.text, "  Note (from the owner): {}", OneLine(note))?;
+        }
+        writeln!(self.text, "  Columns:")?;
+        for col in desc.columns.iter().take(LISTED_COLUMNS) {
+            writeln!(self.text, "    - {}", ColumnLine(col))?;
+        }
+        if desc.columns.len() > LISTED_COLUMNS {
+            writeln!(
+                self.text,
+                "    ... and {} more columns; describe_table lists them all",
+                desc.columns.len().saturating_sub(LISTED_COLUMNS)
+            )?;
+        }
+        if !desc.warnings.is_empty() {
+            writeln!(self.text, "  Warnings:")?;
+            for flagged in &desc.warnings {
+                writeln!(self.text, "    - {}: {}", flagged.column, flagged.warning)?;
+            }
+        }
+        if desc.sample_rows.rows.is_empty() {
+            return Ok(());
+        }
+        if desc.columns.len() > SAMPLED_COLUMNS {
+            writeln!(
+                self.text,
+                "  Sample rows omitted ({} columns); describe_table shows them",
+                desc.columns.len()
+            )?;
+            return Ok(());
+        }
+        writeln!(self.text, "  Sample data:")?;
+        let mut buf = Vec::new();
+        if desc
+            .sample_rows
+            .with_cells_cut(SAMPLE_CELL_CHARS)
+            .write_table(&mut buf)
+            .is_ok()
+            && let Ok(text) = String::from_utf8(buf)
+        {
+            for line in text.lines() {
+                writeln!(self.text, "    {line}")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The ontology's measures, bounded; `describe_table` lists a table's.
+    fn measures(&mut self, ontology: &Ontology) -> Result<()> {
+        if ontology.measures.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            self.text,
+            "Measures (named calculations; compute them with the expression as given):"
+        )?;
+        for measure in ontology.measures.iter().take(PROMPT_MEASURES) {
+            writeln!(self.text, "- {measure} (SELECT ... FROM {})", measure.table)?;
+        }
+        if ontology.measures.len() > PROMPT_MEASURES {
+            writeln!(
+                self.text,
+                "- ... and {} more; describe_table lists a table's measures",
+                ontology.measures.len().saturating_sub(PROMPT_MEASURES)
             )?;
         }
         writeln!(self.text)?;
-        Ok(tables)
+        Ok(())
+    }
+
+    /// The tables ranked against the question, after the workspace context
+    /// so everything before it stays the same from question to question.
+    /// Only for a workspace with more tables than the tables block
+    /// describes; one the block already described is named, not repeated.
+    fn ranked_tables(
+        &mut self,
+        db: &WorkspaceDb,
+        ontology: Option<&Ontology>,
+        tables: &[String],
+        options: &PromptOptions,
+    ) -> Result<()> {
+        let Some(question) = &options.question else {
+            return Ok(());
+        };
+        if TableLayout::of(tables.len()) == TableLayout::AllDescribed {
+            return Ok(());
+        }
+        let ranked = TableCards::read(db, ontology)?.rank(
+            db,
+            &question.text,
+            question.vector.as_ref(),
+            RANKED_TABLES,
+            question.rrf_k,
+        )?;
+        if ranked.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            self.text,
+            "Tables most related to this question, best first (call find_tables to rank them for \
+             other words):"
+        )?;
+        for RankedTable { table, .. } in &ranked {
+            let described = tables
+                .iter()
+                .position(|t| t == table)
+                .is_some_and(|i| i < DETAILED_TABLES);
+            if described {
+                writeln!(self.text, "- {table} (described above)")?;
+                continue;
+            }
+            match db.describe_table_under(table, ontology) {
+                Ok(desc) => self.table_detail(&desc)?,
+                Err(_) => writeln!(self.text, "- {table}")?,
+            }
+        }
+        writeln!(self.text)?;
+        Ok(())
     }
 
     /// The owner-written context, truncated to `context_max_tokens` with a

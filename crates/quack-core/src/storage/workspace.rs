@@ -10,6 +10,7 @@ use jiff::civil::DateTime;
 
 use std::collections::BTreeMap;
 
+use crate::analysis::table_search;
 use crate::config::Config;
 use crate::crypto;
 use crate::embedding::{
@@ -20,9 +21,11 @@ use crate::graph;
 use crate::ids::{ChunkId, DocumentId, NodeId, UserId};
 use crate::ingestion::TableName;
 use crate::ingestion::parser::{DocumentMeta, FileType, Load, PageCounts, SectionKind};
-use crate::ontology::store::Acceptance;
+use crate::ontology::store::{self as ontology_store, Acceptance};
+use crate::ontology::{Measure, Ontology, Property};
 use crate::saved;
 use crate::storage::control::ResourceKind;
+use crate::storage::profile::{self, TableNote, TableProfile};
 use crate::text::OneLine;
 
 mod terms;
@@ -61,10 +64,13 @@ const ONTOLOGY_ACCEPTANCE: u32 = 10;
 /// as `(keep, drop)` and once as `(drop, keep)`; collapse each pair to one
 /// row, keeping the more-decided one so a reviewer's rejection is not lost.
 const MERGE_DEDUP: u32 = 11;
+/// Every user table is profiled (`storage::profile`), and the graph is
+/// readable through `graph_` views.
+const TABLE_PROFILES: u32 = 12;
 /// Each document records the language it was detected as, and its chunks
 /// are stemmed under it, with unspaced scripts as bigrams (issue #395):
 /// every document is detected and every chunk reindexed.
-const DOCUMENT_LANGUAGES: u32 = 12;
+const DOCUMENT_LANGUAGES: u32 = 13;
 
 /// The documents table, and the columns older files gain on open.
 const DOCUMENTS_DDL: &str = "
@@ -699,6 +705,16 @@ const ONTOLOGY_DDL: &str = "            CREATE TABLE IF NOT EXISTS _quack_ontolo
                 since_version INTEGER NOT NULL,
                 PRIMARY KEY (id, class_id)
             );
+            ALTER TABLE _quack_ontology_properties ADD COLUMN IF NOT EXISTS description TEXT;
+            ALTER TABLE _quack_ontology_properties ADD COLUMN IF NOT EXISTS unit TEXT;
+            ALTER TABLE _quack_ontology_properties ADD COLUMN IF NOT EXISTS synonyms JSON;
+            CREATE TABLE IF NOT EXISTS _quack_ontology_measures (
+                id TEXT PRIMARY KEY,
+                description TEXT,
+                table_name TEXT NOT NULL,
+                expression TEXT NOT NULL,
+                since_version INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS _quack_ontology_mappings (
                 id TEXT PRIMARY KEY,
                 table_name TEXT NOT NULL,
@@ -1198,7 +1214,13 @@ impl WorkspaceDb {
                 "internal tables are not accessible",
             )));
         }
-        self.classify_statement(sql)
+        let kind = self.classify_statement(sql)?;
+        if graph::views::write_names_reserved(sql, &kind) {
+            return Err(Error::Analysis(String::from(
+                graph::views::RESERVED_REFUSED,
+            )));
+        }
+        Ok(kind)
     }
 
     /// Whether a statement touches any of quack's internal tables.
@@ -1293,7 +1315,12 @@ impl WorkspaceDb {
         self.conn.execute_batch(saved::DDL)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&graph::ddl(dim))?;
+        self.conn.execute_batch(profile::DDL)?;
+        self.conn.execute_batch(table_search::DDL)?;
         self.upgrade_data(dim)?;
+        if let Some(ontology) = ontology_store::current(self)? {
+            graph::views::ensure(self, &ontology)?;
+        }
         self.set_meta(MetaKey::EmbeddingDimension, &dim.to_string())?;
         self.set_meta(MetaKey::WrittenByQuack, env!("CARGO_PKG_VERSION"))?;
         self.set_meta(MetaKey::WrittenByDuckDb, &self.duckdb_version()?)?;
@@ -1350,6 +1377,12 @@ impl WorkspaceDb {
         // twice and a rejected pair stays rejected.
         if recorded < MERGE_DEDUP {
             self.collapse_duplicate_merge_proposals()?;
+        }
+        if recorded < TABLE_PROFILES {
+            let profiled = TableProfile::refresh_stale(self)?;
+            if profiled > 0 {
+                tracing::info!(tables = profiled, "profiled existing tables");
+            }
         }
         self.set_meta(
             MetaKey::SchemaVersion,
@@ -3389,12 +3422,12 @@ impl WorkspaceDb {
             .collect())
     }
 
-    /// Describe a table's columns (name, type) and return up to 3 sample rows.
+    /// A table's columns, name and `DuckDB` type, in order.
     ///
     /// # Errors
     ///
     /// Returns an error if the table does not exist or the query fails.
-    pub fn describe_table(&self, table_name: &str) -> Result<TableDescription> {
+    pub fn describe_columns(&self, table_name: &str) -> Result<Vec<ColumnInfo>> {
         let describe_sql = format!("DESCRIBE {}", quote_ident(table_name));
         let mut stmt = self.conn.prepare(&describe_sql)?;
         let columns = stmt
@@ -3402,19 +3435,67 @@ impl WorkspaceDb {
                 Ok(ColumnInfo {
                     name: row.get(0)?,
                     column_type: row.get(1)?,
+                    meaning: None,
                 })
             })?
             .collect::<duckdb::Result<Vec<_>>>()?;
+        Ok(columns)
+    }
 
+    /// Describe a table: its columns with what the ontology says of them,
+    /// up to 3 sample rows, the owner's note, its profile when current,
+    /// and the measures defined over it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table does not exist or the query fails.
+    pub fn describe_table(&self, table_name: &str) -> Result<TableDescription> {
+        let ontology = ontology_store::current(self)?;
+        self.describe_table_under(table_name, ontology.as_ref())
+    }
+
+    /// [`Self::describe_table`] with the ontology already read, for a
+    /// caller describing many tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table does not exist or the query fails.
+    pub fn describe_table_under(
+        &self,
+        table_name: &str,
+        ontology: Option<&Ontology>,
+    ) -> Result<TableDescription> {
+        let mut columns = self.describe_columns(table_name)?;
         let sample_sql = format!("SELECT * FROM {} LIMIT 3", quote_ident(table_name));
         let sample = self.execute_query(&sample_sql)?;
         let row_count = self.count_rows(table_name)?;
-
+        let mapping = ontology.and_then(|o| o.mapping_for_table(table_name));
+        if let (Some(ontology), Some(mapping)) = (ontology, mapping) {
+            for column in &mut columns {
+                column.meaning = mapping
+                    .properties
+                    .get(&column.name)
+                    .and_then(|id| ontology.property(id))
+                    .and_then(ColumnMeaning::of);
+            }
+        }
+        let profile =
+            TableProfile::current(self, table_name, u64::try_from(row_count).unwrap_or(0))?;
+        let warnings = profile
+            .as_ref()
+            .map(|p| p.warnings(mapping.map(|m| m.key.as_str())))
+            .unwrap_or_default();
         Ok(TableDescription {
             table_name: table_name.to_owned(),
             columns,
             row_count,
             sample_rows: sample,
+            note: TableNote::get(self, table_name)?.map(|n| n.note),
+            profile,
+            warnings,
+            measures: ontology
+                .map(|o| o.measures_on(table_name).into_iter().cloned().collect())
+                .unwrap_or_default(),
         })
     }
 
@@ -3524,11 +3605,58 @@ impl WorkspaceDb {
     }
 }
 
-/// Column metadata from DESCRIBE.
-#[derive(Debug)]
+/// Column metadata from DESCRIBE, with what the ontology says of it.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ColumnInfo {
     pub name: String,
+    #[serde(rename = "type")]
     pub column_type: String,
+    /// From the property a table mapping gives the column; `None` when the
+    /// table is not mapped or the property says nothing.
+    #[serde(flatten)]
+    pub meaning: Option<ColumnMeaning>,
+}
+
+/// What a column means, from its ontology property.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ColumnMeaning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
+}
+
+impl ColumnMeaning {
+    /// What `property` says, or `None` when it says nothing.
+    #[must_use]
+    pub fn of(property: &Property) -> Option<Self> {
+        let meaning = Self {
+            description: property.description.clone(),
+            unit: property.unit.clone(),
+            synonyms: property.synonyms.clone(),
+        };
+        (meaning.description.is_some() || meaning.unit.is_some() || !meaning.synonyms.is_empty())
+            .then_some(meaning)
+    }
+}
+
+/// `: monthly revenue [USD] (also: sales, turnover)`, the suffix a column
+/// line carries.
+impl fmt::Display for ColumnMeaning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(description) = &self.description {
+            write!(f, ": {}", OneLine(description))?;
+        }
+        if let Some(unit) = &self.unit {
+            write!(f, " [{}]", OneLine(unit))?;
+        }
+        if !self.synonyms.is_empty() {
+            write!(f, " (also: {})", OneLine(&self.synonyms.join(", ")))?;
+        }
+        Ok(())
+    }
 }
 
 /// The user tables and columns SQL completion offers.
@@ -3596,6 +3724,51 @@ pub struct TableDescription {
     /// Exact row count at describe time.
     pub row_count: i64,
     pub sample_rows: QueryResults,
+    /// The owner's note on the table.
+    pub note: Option<String>,
+    /// The stored profile, when it was taken at the current row count.
+    pub profile: Option<TableProfile>,
+    /// The profile's warnings, the mapped key column held to the key rule.
+    pub warnings: Vec<profile::Flagged>,
+    /// The ontology's measures over this table.
+    pub measures: Vec<Measure>,
+}
+
+impl TableDescription {
+    /// The description as every interface sends it: columns with their
+    /// meaning, the note, the profile's counts per column, each warning with
+    /// its sentence and the type that fixes it, the measures, and the
+    /// sample rows.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        let warnings: Vec<serde_json::Value> = self
+            .warnings
+            .iter()
+            .map(|f| {
+                let mut value = serde_json::json!({
+                    "column": f.column,
+                    "message": f.warning.to_string(),
+                    "fix": f.warning.fix(),
+                });
+                if let (Some(object), Ok(serde_json::Value::Object(kind))) =
+                    (value.as_object_mut(), serde_json::to_value(f.warning))
+                {
+                    object.extend(kind);
+                }
+                value
+            })
+            .collect();
+        serde_json::json!({
+            "table": self.table_name,
+            "row_count": self.row_count,
+            "note": self.note,
+            "columns": self.columns,
+            "profile": self.profile,
+            "warnings": warnings,
+            "measures": self.measures,
+            "sample": { "columns": self.sample_rows.columns, "rows": self.sample_rows.rows },
+        })
+    }
 }
 
 /// Where a document is in ingestion.

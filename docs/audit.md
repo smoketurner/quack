@@ -63,6 +63,8 @@ API Activity event with that name.
 | `permission` | A person answers a write the agent waits on, or the wait expires | `allowed`, `denied` | API: Update |
 | `save` | An answer's SQL is saved as a question | `allowed`, `error` | API: Create |
 | `saved_run` | A saved question runs without the model | `allowed`, `error` | API: Read |
+| `table_note` | A table's note is set or removed (`PUT .../tables/note`, the Tables page) | `allowed`, `error` | API: Update |
+| `retype` | A table column is given another type (`POST .../tables/retype`, the Tables page's Fix type) | `allowed`, `error` | API: Update |
 
 Channels are `web` (a browser session or local mode), `api` (a bearer), `mcp`, `tui`,
 `desktop`, and `cli` (an operator at the shell, whose rows carry no user). The client

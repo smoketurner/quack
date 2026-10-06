@@ -66,7 +66,13 @@ open:
   matched a node pair in either orientation, a pair whose provenance flipped between
   resolution passes could land twice (`(keep, drop)` and `(drop, keep)`). Each pair keeps
   one row, the more-decided one, so a reviewer's rejection survives.
-- **12**: Detects each document's language (`_quack_documents.language`, an ISO 639-3
+- **12**: Profiles every user table (`_quack_table_profiles`, issue #403), so the prompt, the
+  Tables page, and the agent's tools carry column warnings for tables loaded before profiles.
+  The same release adds `_quack_table_notes`, `_quack_table_cards`, `_quack_ontology_measures`,
+  and `description`, `unit`, and `synonyms` on `_quack_ontology_properties`, which need no
+  backfill, and the graph's `graph_` views (issue #406), which every open makes to match the
+  ontology.
+- **13**: Detects each document's language (`_quack_documents.language`, an ISO 639-3
   code) from its first chunks under `[retrieval].languages`, records the workspace's
   stemmings in `_quack_meta.languages`, and rebuilds the term index: each chunk stemmed
   under its document's language, runs of Chinese, Japanese, and Korean as character
@@ -102,7 +108,9 @@ every open replays `CREATE TABLE IF NOT EXISTS` plus `ADD COLUMN IF NOT EXISTS`.
 - The ontology and the workspace context are versioned as data
   (`_quack_ontology_versions`, `_quack_context`), not by schema versions.
 - A workspace directory is portable: every version must open a file an older binary created
-  on another machine. User tables and views are never touched.
+  on another machine. User tables and views are never touched; the one exception is the
+  `graph_` views quack itself makes and marks with a comment (`graph::views`), which it
+  replaces and drops to match the ontology.
 
 ### Upgrading and rolling back
 
@@ -117,8 +125,8 @@ file: no table definition, no rebuild, no version write. The message names the f
 schema versions, and the quack that wrote it:
 
 ```
-workspace file .../data.duckdb has schema version 12, written by quack 2026.11.0; this quack
-(2026.10.3) reads up to version 11: run quack 2026.11.0 or newer, or restore the copy of the
+workspace file .../data.duckdb has schema version 13, written by quack 2026.11.0; this quack
+(2026.10.3) reads up to version 12: run quack 2026.11.0 or newer, or restore the copy of the
 workspace made before the upgrade
 ```
 

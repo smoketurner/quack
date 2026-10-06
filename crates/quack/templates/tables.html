@@ -14,10 +14,49 @@
   <section class="min-w-0">
     {% if let Some(t) = selected %}
     <h1 class="font-mono text-xl font-semibold wrap-anywhere">{{ t.name }}</h1>
+    {% if let Some(error) = error %}<p role="alert" class="mt-3 rounded border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}
+    {% if let Some(notice) = notice %}<p role="status" class="mt-3 rounded border border-green-900 bg-green-950 px-3 py-2 text-sm text-green-300 wrap-anywhere">{{ notice }}</p>{% endif %}
+    <h2 class="mt-4 text-sm font-semibold uppercase text-slate-400">Note</h2>
+    {% if let Some(note) = t.note %}<p class="mt-1 whitespace-pre-line text-sm wrap-anywhere">{{ note }}</p>{% else %}<p class="mt-1 text-sm text-slate-400">No note. A note says what the table holds and how to read it; the assistant reads it with the table.</p>{% endif %}
+    {% if ws.can_write %}
+    <form method="post" action="/w/{{ ws.membership.workspace.id }}/tables/note" class="mt-2 text-sm">
+      <input type="hidden" name="name" value="{{ t.name }}">
+      <textarea aria-label="Note on {{ t.name }}" name="note" rows="2" maxlength="2000" placeholder="One row per order; amounts are in cents" class="w-full rounded border border-slate-700 px-2 py-1">{% if let Some(note) = t.note %}{{ note }}{% endif %}</textarea>
+      <button type="submit" class="mt-1 rounded bg-blue-600 px-3 py-1 text-white hover:bg-blue-500">Save note</button>
+      <span class="text-xs text-slate-400">An empty note removes it.</span>
+    </form>
+    {% endif %}
     <h2 class="mt-4 text-sm font-semibold uppercase text-slate-400">Schema</h2>
-    <table class="data-table mt-1 text-sm" aria-label="Columns of {{ t.name }}"><tbody>
-      {% for c in t.columns %}<tr><td class="font-mono wrap-anywhere">{{ c.0 }}</td><td class="font-mono text-slate-400"><div class="max-w-[24rem] truncate" title="{{ c.1 }}">{{ c.1 }}</div></td></tr>{% endfor %}
-    </tbody></table>
+    {% if let Some(at) = t.profiled_at %}<p class="mt-1 text-xs text-slate-400">Profiled {{ at }}</p>{% endif %}
+    <div class="mt-1 overflow-x-auto">
+    <table class="data-table text-sm" aria-label="Columns of {{ t.name }}">
+      <thead><tr class="border-b border-slate-700 text-left text-xs uppercase text-slate-400"><th scope="col">Column</th><th scope="col">Type</th><th scope="col">Meaning</th><th scope="col">Present</th><th scope="col">Distinct</th><th scope="col">Warnings</th></tr></thead>
+      <tbody>
+      {% for c in t.columns %}<tr class="align-top">
+        <td class="font-mono wrap-anywhere">{{ c.name }}</td>
+        <td class="font-mono text-slate-400"><div class="max-w-[16rem] truncate" title="{{ c.kind }}">{{ c.kind }}</div></td>
+        <td class="wrap-anywhere">{{ c.meaning }}</td>
+        <td class="tabular-nums">{{ c.present }}</td>
+        <td class="tabular-nums">{{ c.distinct }}</td>
+        <td class="text-amber-300">
+          {% for w in c.warnings %}<div>{{ w }}</div>{% endfor %}
+          {% if ws.can_write %}{% if let Some(fix) = c.fix %}
+          <form method="post" action="/w/{{ ws.membership.workspace.id }}/tables/retype" class="mt-1">
+            <input type="hidden" name="name" value="{{ t.name }}">
+            <input type="hidden" name="column" value="{{ c.name }}">
+            <input type="hidden" name="type" value="{{ fix }}">
+            <button type="submit" class="rounded border border-slate-700 px-2 py-0.5 text-xs text-slate-200 hover:bg-slate-800">Fix type: {{ fix }}</button>
+          </form>
+          {% endif %}{% endif %}
+        </td>
+      </tr>{% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% if !t.measures.is_empty() %}
+    <h2 class="mt-4 text-sm font-semibold uppercase text-slate-400">Measures</h2>
+    <ul class="mt-1 space-y-1 text-sm">{% for m in t.measures %}<li class="font-mono wrap-anywhere">{{ m }}</li>{% endfor %}</ul>
+    {% endif %}
     <h2 class="mt-4 text-sm font-semibold uppercase text-slate-400">Sample rows</h2>
     <div class="mt-1 overflow-x-auto rounded border border-slate-800 bg-slate-900">
       <table class="min-w-full text-sm">
@@ -33,12 +72,13 @@
     <form method="post" action="/w/{{ ws.membership.workspace.id }}/import" class="mt-6 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
       <h2 class="font-medium">Import from a database or a URL</h2>
       <p class="mt-1 text-xs text-slate-400">postgres://user:password@host/db, sqlite:/path/to.db, or https://host/file.csv (also .parquet, .json, .xlsx). The password is used once and never stored.</p>
-      {% if let Some(error) = error %}<p role="alert" class="mt-2 rounded border border-red-900 bg-red-950 px-2 py-1 text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}
+      {% if selected.is_none() %}{% if let Some(error) = error %}<p role="alert" class="mt-2 rounded border border-red-900 bg-red-950 px-2 py-1 text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}{% endif %}
       <div class="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
         <input aria-label="Source URL" name="url" placeholder="source URL" required class="rounded border border-slate-700 px-2 py-1 md:col-span-2">
         <input aria-label="Workspace table name" name="table" placeholder="workspace table name" required class="rounded border border-slate-700 px-2 py-1">
         <input aria-label="Source table" name="source_table" placeholder="source table (or leave empty and give a query)" class="rounded border border-slate-700 px-2 py-1">
         <textarea aria-label="Source query" name="query" rows="2" placeholder="SELECT ... (optional)" class="rounded border border-slate-700 px-2 py-1 font-mono text-xs md:col-span-2"></textarea>
+        <input aria-label="Column types" name="types" placeholder="column types (optional): amount=DOUBLE, placed=DATE" class="rounded border border-slate-700 px-2 py-1 font-mono text-xs md:col-span-2">
       </div>
       <button type="submit" class="mt-2 rounded bg-blue-600 px-3 py-1 text-white hover:bg-blue-500">Import</button>
     </form>

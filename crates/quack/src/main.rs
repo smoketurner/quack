@@ -17,6 +17,7 @@ mod saved_cli;
 mod scripted_ollama;
 mod server;
 mod stdio;
+mod tables_cli;
 mod terminal;
 mod text_or_json;
 
@@ -46,9 +47,10 @@ use quack_core::progress::RunControl;
 use quack_core::proxy::Proxies;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, ResourceKind, WorkspaceRow};
+use quack_core::storage::profile::{ColumnTypes, TableProfile};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
 use quack_core::storage::workspace::{
-    DocumentFields, Pinning, QueryResults, SearchMode, WorkspaceDb,
+    DocumentFields, Pinning, QueryResults, SearchMode, StatementKind, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use quack_core::vault::Vault;
@@ -264,6 +266,9 @@ enum Commands {
     /// Search the documents without the model, showing each hit's rank in
     /// the vector and keyword legs and after reranking
     Search(SearchArgs),
+    /// List the tables with their row counts, notes, and warnings; show
+    /// one in full, set its note, or give a column a type
+    Tables(tables_cli::TablesArgs),
 
     /// The workspace's vectors: refresh the ones made with another
     /// embedding model, width, or input prefixes
@@ -458,6 +463,12 @@ struct IngestArgs {
     /// (without this they are only reported)
     #[arg(long)]
     prune: bool,
+
+    /// Give columns of the loaded table a type, as COLUMN=TYPE (VARCHAR,
+    /// BIGINT, DOUBLE, DATE, TIMESTAMP, BOOLEAN), comma-separated or
+    /// repeated; every value must convert
+    #[arg(long, value_name = "COLUMN=TYPE")]
+    types: Vec<ColumnTypes>,
 }
 
 /// What `quack ingest --replace [DOCUMENT_ID]` replaces.
@@ -540,6 +551,10 @@ struct ImportArgs {
     /// Rows to pull at most (capped by `[import].max_rows`)
     #[arg(long)]
     limit: Option<u64>,
+    /// Give columns of the table a type, as COLUMN=TYPE, comma-separated
+    /// or repeated; every value must convert
+    #[arg(long, value_name = "COLUMN=TYPE")]
+    types: Vec<ColumnTypes>,
 }
 
 impl From<ImportArgs> for ImportRequest {
@@ -550,6 +565,7 @@ impl From<ImportArgs> for ImportRequest {
             query: args.query,
             source_table: args.from,
             limit: args.limit,
+            types: ColumnTypes::joined(args.types),
         }
     }
 }
@@ -1062,6 +1078,14 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Search(args) => args.run(cli).await,
+        Commands::Tables(args) => {
+            let ws_db = open_workspace(cli).await?;
+            let stdout = std::io::stdout();
+            let mut out = std::io::BufWriter::new(stdout.lock());
+            args.run(&ws_db, &mut out)?;
+            out.flush()?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -2103,7 +2127,7 @@ impl OpenedWorkspace {
     ) -> Result<()> {
         anyhow::ensure!(
             !per_file,
-            "--replace, --pin, --title, --filename, --author, --authored, and --tag take one file, not a directory"
+            "--replace, --pin, --title, --filename, --author, --authored, --tag, and --types take one file, not a directory"
         );
         if Bundle::is_dir(dir) {
             return self
@@ -2358,6 +2382,9 @@ async fn run_query(
     .await?;
 
     let results = ws_db.execute_query(sql).context("query execution failed")?;
+    if ws_db.classify_statement(sql)? != StatementKind::Read {
+        TableProfile::after_write(&ws_db);
+    }
 
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
@@ -2379,6 +2406,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         author,
         authored,
         tags,
+        types,
     } = args;
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
     let config = &opened.config;
@@ -2392,7 +2420,8 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
             || filename.is_some()
             || author.is_some()
             || authored.is_some()
-            || !tags.is_empty();
+            || !tags.is_empty()
+            || !types.is_empty();
         return opened.ingest_dir(dir, per_file, no_embed, prune).await;
     }
     if prune {
@@ -2417,15 +2446,15 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
             .context("failed to build embedding model")?
     };
 
-    let source = file.document_source();
     let outcome = ingestion::ingest_file(
         config,
         &ws_db,
         opened.workspace.id.as_str(),
         &NewFile::new(&effective_filename, &data)
-            .source(source)
+            .source(file.document_source())
             .title(title.as_deref())
             .replaces(replaces.as_ref())
+            .types(ColumnTypes::joined(types))
             .fields(DocumentFields {
                 title: None,
                 author,

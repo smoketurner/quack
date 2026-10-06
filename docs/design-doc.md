@@ -439,7 +439,35 @@ CREATE TABLE _quack_ontology_properties (
     type          TEXT NOT NULL,            -- string | number | date | enum | boolean
     enum_values   JSON,
     since_version INTEGER NOT NULL,
+    description   TEXT,                     -- what a value means (issue #403)
+    unit          TEXT,                     -- cents, USD, kg
+    synonyms      JSON,                     -- other words for it; the table search matches them
     PRIMARY KEY (id, class_id)
+);
+CREATE TABLE _quack_ontology_measures (     -- named calculations over one table
+    id            TEXT PRIMARY KEY,
+    description   TEXT,
+    table_name    TEXT NOT NULL,
+    expression    TEXT NOT NULL,            -- SELECT <expression> FROM <table> must be one read
+    since_version INTEGER NOT NULL
+);
+CREATE TABLE _quack_table_profiles (       -- each table's columns as last profiled (section 6.2)
+    table_name  TEXT PRIMARY KEY,
+    row_count   BIGINT NOT NULL,            -- a profile is shown only while this matches
+    profiled_at TIMESTAMP DEFAULT now(),
+    columns     JSON NOT NULL               -- [{name, duckdb_type, non_null, distinct, samples, number_share, date_share}]
+);
+CREATE TABLE _quack_table_notes (          -- an owner's note on a table
+    table_name TEXT PRIMARY KEY,
+    note       TEXT NOT NULL,               -- at most 2,000 characters
+    edited_by  TEXT,
+    edited_at  TIMESTAMP DEFAULT now()
+);
+CREATE TABLE _quack_table_cards (          -- each table card's vector, for find_tables (section 7.3)
+    table_name        TEXT PRIMARY KEY,
+    digest            TEXT NOT NULL,        -- SHA-256 of the card text the vector was made from
+    embedding         FLOAT[],
+    embedding_profile TEXT
 );
 CREATE TABLE _quack_ontology_mappings (     -- table rows -> nodes and edges (section 6.3)
     id            TEXT PRIMARY KEY,
@@ -909,7 +937,7 @@ levers are `OLLAMA_NUM_PARALLEL` and a smaller embedding model.
 Every ingest logs chunk count, batches, seconds, and chunks per second (`embedded chunks`);
 `quack ingest` prints them. No index is built: vector search is an exact scan,
 and a chunk's term rows are appended on insert. A full term rebuild happens only when an
-older workspace is opened (schema version below 12). Re-uploading a file with the same
+older workspace is opened (schema version below 13). Re-uploading a file with the same
 SHA-256 is a no-op with a message.
 
 **Hybrid retrieval.** A query runs an exact cosine scan over `embedding` (core
@@ -939,7 +967,7 @@ which leaves keyword-exact questions (part numbers, policy IDs) unanswered.
   content or heading contains the phrase (case-insensitive, whitespace-normalized). A phrase
   matching nothing returns no keyword results, not the unfiltered ranking.
 - *Rebuild:* the term index is rebuilt on open when a workspace predates the stemmer, the
-  joined identifier form, or per-document languages (schema version 12, which first detects
+  joined identifier form, or per-document languages (schema version 13, which first detects
   each document's language from its first chunks).
 - *Fusion:* each ranking is over-fetched to twice `top_k` (more with a phrase), fused by
   reciprocal rank fusion (`k = 60`), and the top `k` chunks (default 8) returned.
@@ -1015,7 +1043,36 @@ proxy decides which hosts a name may reach.
 
 **Table naming.** The sanitized file stem. One live document owns a table: a changed file
 with the same name is refused (`Error::TableTaken`, 409) unless it replaces its
-predecessor. The prompt describes tables live on every build, with no cache (section 7.2).
+predecessor. A name starting with `_quack_` or `graph_` is refused at ingest and import
+(`TableName::check_unreserved`): the first is quack's internal tables, the second the graph's
+views (section 6.4). The prompt describes tables live on every build, with no cache (section 7.2).
+
+**Column types.** `quack ingest FILE --types amount=DOUBLE,placed=DATE`, `quack import
+... --types`, the `types` field of `POST .../import` and the Tables page's import form give
+columns a type after the load (`storage::profile::ColumnTypes`): one of `VARCHAR`, `BIGINT`,
+`DOUBLE`, `DATE`, `TIMESTAMP`, `BOOLEAN`, a closed list since the name goes into the
+statement. The change is `ALTER TABLE ... SET DATA TYPE ... USING CAST(...)`, strict: a value
+that does not convert fails the whole load, naming the column, rather than becoming an empty
+cell. `quack tables T --retype COL=TYPE`, `POST .../tables/retype`, and the Tables page's Fix
+type button (members and owners) change an existing table the same way, audited as `retype`.
+
+**Column profiles.** Every table is profiled when it is loaded or imported, after a statement
+that wrote (the agent's `run_sql`, the SQL page, MCP `sql`, the terminal, `quack -q`) when its
+row count changed, and once on upgrade to schema version 12 (`storage::profile::TableProfile`,
+`_quack_table_profiles`). One statement per table counts each column's present and distinct
+values, keeps its three most common values (`approx_top_k`, cut to 60 characters), and for a
+text column the share of values that cast to a number and to a date; columns past 200 are left
+out. A profile whose row count no longer matches the table is not shown. Warnings are worked out
+when read: every value empty, at least half empty, numbers stored as text and dates stored as
+text (at least 90% of values cast), and a key that repeats (the mapping's key column, or a
+column named `id`). A mistyped-text warning names the type that fixes it only when every value
+converts. The prompt's tables block, `describe_table`, `find_tables`, the Tables page, REST
+`POST .../tables/describe`, MCP `describe_table`, and `quack tables` show them.
+
+**Table notes.** A member or owner writes a note per table (`quack tables T --note TEXT`,
+`PUT .../tables/note`, the Tables page; blank removes it; at most 2,000 characters), kept in
+`_quack_table_notes` and audited as `table_note`. It renders under the table wherever the table
+is described, the prompt included, and feeds the table search.
 
 **Replacing a document.** `quack ingest FILE --replace [ID]` (the newest ready document
 with the file's name when no id is given), `POST .../documents?replace={doc}`, and the
@@ -1048,7 +1105,15 @@ access control: class and relation names alone reveal what a workspace is about.
 
 **Model.** Single inheritance from the implicit root class `entity`. Relations have a domain
 and a range class, each satisfied by any subclass. Properties are typed
-`string | number | date | enum | boolean` and inherited. Every ontology implicitly contains
+`string | number | date | enum | boolean` and inherited, and may carry a `description`, a
+`unit`, and `synonyms`: a column a mapping gives a property renders as `- col (TYPE):
+description [unit] (also: synonyms)` in the tables block, `describe_table`, and the Tables
+page, and its synonyms feed the table search (issue #403). **Measures** are named calculations
+over one table (`{"id": "revenue", "table": "orders", "expression": "sum(amount) / 100.0",
+"description": ...}`); a save checks `SELECT <expression> FROM <table>` is one read that plans,
+keeps one over a table that is gone (like a mapping), and the prompt lists up to 30 of them
+after the tables block, `describe_table` a table's own. Measures version, export, and diff with
+the rest of the ontology. Every ontology implicitly contains
 the `mentions` relation (`entity` to `entity`), so extraction never has to invent one. Ids
 are `snake_case` and stable; a rename is a new id plus a migration of nodes and edges.
 
@@ -1153,6 +1218,23 @@ their provenance rows. A mapping whose table is gone stays in the ontology (save
 succeed); extraction skips it, and `graph status` lists it under `missing_tables`.
 
 ### 6.4 Knowledge graph
+
+**SQL views (issue #406).** The one sanctioned SQL window into the graph is a read-only view
+per class, made by `graph::views::ensure` at the end of every ontology save and when the
+workspace opens: `graph_<class_id>` has `id`, `label`, `class_id`, `provisional`, then one
+column per property the class has or inherits, typed from `PropertyType` (`TRY_CAST` of
+`json_extract_string(properties, '$.<id>')` to `DOUBLE`, `DATE`, or `BOOLEAN`; a property named
+like a node column gets a `_property` suffix), with the rows of its subclasses. `graph_edges`
+has `id`, `source_id`, `source_label`, `relation_id`, `target_id`, `target_label`,
+`provisional`, and the edge's `properties` JSON. The column lists are explicit, so
+`embedding`, `normalized_label`, and provenance never surface; the views read live rows, so
+extraction, merges, and revalidation need no hook. A comment marks quack's views, so `ensure`
+drops only its own when a class goes, and skips (with a warning) a class whose view name a user
+table made before the prefix was reserved holds. `SELECT` over a view classifies as a read;
+the base `_quack_` tables stay refused; a write that names anything `graph_` is refused
+(`graph::views::RESERVED_REFUSED`: no `DROP VIEW graph_x`, no `CREATE TABLE graph_x`), and
+ingest and import refuse the prefix as a table name. DuckPGQ stays out: counting, filtering,
+grouping, and joining entities to tables are plain SQL over these views.
 
 **Extraction from documents.** On demand (`quack graph extract`, `POST .../graph/extract`,
 the graph page), permission-gated, with cost (chunk count, model) shown first. Each chunk
@@ -1369,11 +1451,16 @@ terminal as a system line, SSE as a `status` event.
    extensions, or `SET`) and says so, since the tables block is all the data there is. The
    guidance is one numbered procedure per substrate: structured data, document content,
    and, only when the graph tools are registered, how entities relate.
-3. Tables block: user-facing tables and views with columns, types, row count, and three
-   sample rows. It is bounded so one wide or narrative table cannot push the guidance and
-   question out of a small window: the first 25 tables are described and the rest listed
-   by name; the first 40 columns are listed and the rest counted; sample rows appear only
-   up to 20 columns, cut at 60 characters per cell. `describe_table` has the rest.
+3. Tables block: user-facing tables and views with columns, types, row count, the owner's
+   note, each column's meaning and unit from the ontology, the profile's warnings, and three
+   sample rows (section 6.2). It is bounded so one wide or narrative table cannot push the
+   guidance and question out of a small window: the first 25 tables are described and the
+   rest listed by name; the first 40 columns are listed and the rest counted; sample rows
+   appear only up to 20 columns, cut at 60 characters per cell. `describe_table` and
+   `find_tables` have the rest. The ontology's measures follow (30 at most), then, when the
+   graph has nodes, one line naming the graph views (30 at most). The graph views are not
+   counted or described as tables. The block depends on the workspace only, never on the
+   question, so a provider's prefix cache keeps it.
 4. Documents block: every document by filename, title, status and mime type, then, when
    the person limited the question to documents, a sentence naming them (`DocumentScope`,
    6.1), then the pinned documents with their full text (6.1), each fenced as document
@@ -1384,7 +1471,11 @@ terminal as a system line, SSE as a `status` event.
    edge counts, and whether the graph is provisional or stale, follow only when the graph
    has content.
 6. Global context prefix, then the workspace context.
-7. The trust rule, then the permission rules.
+7. Past 25 tables, the five tables the question ranks highest (`analysis::table_search`, the
+   ranking `find_tables` uses), each described in full unless the tables block already did.
+   It comes after the context so everything before it stays the same from question to
+   question.
+8. The trust rule, then the permission rules.
 
 **Document text is data.** The trust rule is one fixed paragraph: only the person's messages
 and the owner-written workspace context carry instructions; text inside document markers,
@@ -1460,14 +1551,17 @@ model (`test-utils`, a dev-dependency feature only).
 | `read_document(document, from=0, limit?)` | none | One document's chunks in order from a position, numbered for citing like search hits, within `[retrieval].pinned_token_budget` (at most 50 chunks a call), with a trailer saying where to continue; a document that is not ready or holds tables is refused with the reason |
 | `list_documents()` | none | Registry with status and pinned flag |
 | `run_sql(query)` | read: none; write: prompt | Execute SQL; result capped at `max_query_rows` with a trailer that says to narrow it in one statement, a note when the statement repeats an earlier one with only its literals changed (the one-query-per-group loop), and which tool call of `max_turns` this was |
-| `describe_table(table_name)` / `list_tables()` | none | Schema and inventory |
+| `describe_table(table_name)` / `list_tables()` | none | Schema with column meanings, note, profile warnings, and measures; inventory |
+| `find_tables(query, top_k=10)` | none | Past 25 tables: ranks a card per table (name, columns with their ontology descriptions and synonyms, note, mapped class, common values) by BM25 over the document index's tokens and, with an embedding model, cosine over each card's stored vector (`_quack_table_cards`, made again when the card's digest or the embedding profile changes, 256 a turn at most), fused by reciprocal rank; returns each table's columns, note, warnings, and measures |
 | `describe_class(class_id)` | none | One ontology class in full, with how many entities of it the graph holds |
 | `search_graph(entity?, class?, relation?, hops=2)` | none | Neighborhood or class listing with provenance |
 | `find_path(from, to, max_hops=4)` | none | Shortest relation path between two entities |
 | `create_chart(sql, kind, x, y, title)` | none | Runs the SQL, emits a chart spec (section 9) |
 
 `search_graph` and `find_path` register only when the graph has nodes; `describe_class`
-whenever an ontology exists, since the prompt's ontology block is capped. The rest register
+whenever an ontology exists, since the prompt's ontology block is capped, and it names the
+class's SQL view with its typed columns; `find_tables` only when the workspace has more than
+25 tables (graph views not counted). The rest register
 in every workspace, and the prompt tells the model what the workspace holds. An `export`
 tool (`COPY ... TO` under `files/`) is not built (section 17).
 
@@ -1491,7 +1585,10 @@ provisional nodes says the matches exist but are unreviewed.
 A result cut short by `max_nodes` says so, and a class listing carries the total it was
 capped from (`GraphResult::total_nodes`, `truncated`); otherwise the reader takes the cap
 for the class's population. Traversal cannot count, and user SQL may not read `_quack_`
-tables, so `describe_class` reports the exact count of a class and its subclasses.
+tables, so `describe_class` reports the exact count of a class and its subclasses. To count
+by a property, filter, or join, the graph procedure in the prompt points the model at
+`run_sql` over `graph_<class>` and `graph_edges` (section 6.4), with `WHERE NOT provisional` in
+query mode.
 
 ### 7.4 Permissions and limits
 
@@ -1500,7 +1597,8 @@ via `SELECT json_serialize_sql(?)`, with three outcomes: it serializes (read), a
 (invalid, returned as a syntax error, not a write), or anything else (write). `DESCRIBE`,
 `SHOW`, `SUMMARIZE`, `PIVOT`, `UNPIVOT` and `EXPLAIN` are read by an explicit allow-list,
 because DuckDB cannot serialize them. `COPY`, `INSTALL`, `LOAD`, `ATTACH`, `SET` are always
-write. Statements referencing `_quack_` tables are refused regardless.
+write. Statements referencing `_quack_` tables are refused regardless, and a write that names
+anything `graph_` is refused (section 6.4); reading the graph views is a read.
 
 **Decision by interface and role.**
 
@@ -2052,7 +2150,7 @@ and ask again. The UI covers:
   and shows each hit's fused score, its vector, keyword, and rerank rank and score, a link
   to its passage page, both legs' candidates, the phrase note, and the rerank outcome.
   Audited as `search`; the chat form's document picker lists the same documents.
-- Tables: list with schema and sample rows, and the import form; a SQL page with an editor
+- Tables: list with schema (each column's type, meaning, present share, distinct count, and warnings, with a Fix type button for members and owners when every value converts), the table's note (editable by members and owners), its measures, sample rows, and the import form (with optional column types); a SQL page with an editor
   that highlights SQL and completes table and column names, a result grid, and download.
   The grid holds at most `max_query_rows`; the download streams every row
   (`WorkspaceDb::stream_query`, a read-only transaction on a reader connection, under the
@@ -2124,8 +2222,10 @@ GET    /api/v1/workspaces/{id}/documents/{doc}/chunks?from=0&limit=20   the chun
 PATCH  /api/v1/workspaces/{id}/documents/{doc}    {pinned?, title?, author?, authored_at?, tags?}: each given field is set (an empty text clears it)
 DELETE /api/v1/workspaces/{id}/documents/{doc}
 GET    /api/v1/workspaces/{id}/tables
-POST   /api/v1/workspaces/{id}/tables/describe  {name}: columns, row count, sample rows
+POST   /api/v1/workspaces/{id}/tables/describe  {name}: columns with their meaning, row count, note, profile, warnings (each with its fix), measures, sample rows
 GET    /api/v1/workspaces/{id}/tables/schema    every user table's columns, each name as SQL writes it (capped)
+PUT    /api/v1/workspaces/{id}/tables/note      {name, note}: set the table's note (blank removes it); member or owner
+POST   /api/v1/workspaces/{id}/tables/retype    {name, column, type}: give a column a type, every value converting (422 otherwise); member or owner
 POST   /api/v1/workspaces/{id}/graph/search    {entity?, class?, relation?, hops?}
 POST   /api/v1/workspaces/{id}/graph/path      {from, to, max_hops?}
 GET    /api/v1/workspaces/{id}/graph/status
@@ -2139,7 +2239,7 @@ PATCH  /api/v1/workspaces/{id}/graph/nodes/{nid}   {label?, class?, properties?,
 DELETE /api/v1/workspaces/{id}/graph/nodes/{nid}   the node with its edges
 POST   /api/v1/workspaces/{id}/graph/edges         {source, target, relation, properties?, note?} by node id: 201, or 200 when asserted
 DELETE /api/v1/workspaces/{id}/graph/edges/{eid}
-POST   /api/v1/workspaces/{id}/import              {url, table, query?, source_table?, limit?}
+POST   /api/v1/workspaces/{id}/import              {url, table, query?, source_table?, limit?, types?}
 GET    /api/v1/workspaces/{id}/embeddings          current, stale, and missing vectors against the configured profile, and the plan
 POST   /api/v1/workspaces/{id}/embeddings/refresh  200 when current, else 202 with the plan and the job
 GET    /api/v1/workspaces/{id}/okf                 the bundle as a tar (import is POST .../documents with a tar)
@@ -2226,7 +2326,7 @@ and returns its `session_id`; passing the id back continues it, and `document_id
 the question to documents. A turn that fails before recording anything leaves no session.
 `search` takes `document_ids`, `entity`, `filters`, `mode`, and `explain`, as REST does.
 
-Tools: `query`, `search`, `sql`, `list_tables`, `describe_table`, `list_documents`, and,
+Tools: `query`, `search`, `sql`, `list_tables`, `describe_table` (the REST describe shape: meanings, note, profile, warnings, measures), `list_documents`, and,
 once the graph has nodes, `search_graph` and `find_path`. Each answers with structured
 content plus text. Refusals (a write without permission, an internal table, a missing
 table) are tool errors the client model can read. Resources:
@@ -3099,7 +3199,7 @@ Every gap is a GitHub issue unless the item says otherwise.
     the same image from source for `make image` and `docker-compose.yml`. Section 14.
 11. ~~No stemming in keyword search~~ (#31, closed: Snowball English over the same
     tokenizer; schema version 6 rebuilds older term indexes on open; #395: each document
-    stemmed under its detected language, CJK as bigrams, schema version 12); ~~no reranking hook~~
+    stemmed under its detected language, CJK as bigrams, schema version 13); ~~no reranking hook~~
     (#34, closed: `Reranker` trait, `none` or `model`); ~~large-workspace vector index
     options~~ (#32, closed as a recorded decision in section 15, item 2). Sections 6.1, 15.
 12. ~~Web UI mapping of the chart spec to ECharts~~ (#26, closed): `static/js/app.js` maps
@@ -3192,7 +3292,7 @@ Every gap is a GitHub issue unless the item says otherwise.
 7. Web search tool for the agent
 8. OpenAI-compatible `/v1/chat/completions` endpoint
 9. In-process embedding models (ONNX) to drop the Ollama requirement offline
-10. DuckPGQ for graph queries
+10. ~~DuckPGQ for graph queries~~ (plain SQL views over the graph, section 6.4)
 11. Kubernetes manifests; WebSocket MCP transport; object-storage file backend
 12. Web UI localization via fluent (pattern already documented in `docs/web-ui.md`)
 

@@ -22,6 +22,7 @@ use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{
     DocumentFilter, ExportFormat, SearchMode, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
@@ -617,8 +618,13 @@ impl Access {
         let max_rows = app.config.analysis.max_query_rows;
         let timed = move |db: &WorkspaceDb| {
             let began = Instant::now();
-            db.execute_query_capped(&sql, max_rows)
-                .map(|capped| (capped, began.elapsed()))
+            let result = db
+                .execute_query_capped(&sql, max_rows)
+                .map(|capped| (capped, began.elapsed()));
+            if is_write {
+                TableProfile::after_write(db);
+            }
+            result
         };
         let result = if is_write {
             let db = app.workspace_db(&access.membership.workspace.id).await?;

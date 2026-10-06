@@ -8,6 +8,7 @@ use crate::ingestion::parser::PageCounts;
 use crate::ingestion::parser::SectionKind;
 use crate::ontology::Ontology;
 use crate::ontology::store::Revision;
+use crate::storage::profile::{TableNote, TableProfile};
 use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument, Pinning};
 
 fn db() -> WorkspaceDb {
@@ -52,6 +53,7 @@ fn options(mode: ChatMode, pinned: u32) -> PromptOptions {
         context_max_tokens: Tokens::new(4000),
         ollama_context_cap: None,
         scope: DocumentScope::default(),
+        question: None,
     }
 }
 
@@ -663,4 +665,136 @@ fn the_prompt_names_the_documents_a_question_is_limited_to() {
     let inventory = scoped.find("Ingested documents:").unwrap_or(usize::MAX);
     let trust = scoped.find("Trust:").unwrap_or(0);
     assert!(inventory < note && note < trust, "{scoped}");
+}
+
+/// `n` filler tables plus `zz_orders`, noted and mapped with a measure.
+#[expect(clippy::unwrap_used, reason = "test setup")]
+fn tables_workspace(n: usize) -> WorkspaceDb {
+    let db = db();
+    for i in 0..n {
+        db.execute_statement(&format!("CREATE TABLE filler_{i:02} AS SELECT 'x' AS code"))
+            .unwrap();
+    }
+    db.execute_statement(
+        "CREATE TABLE zz_orders AS SELECT * FROM (VALUES ('o1', '1250')) t(order_id, amount)",
+    )
+    .unwrap();
+    TableProfile::refresh_stale(&db).unwrap();
+    TableNote::set(
+        &db,
+        "zz_orders",
+        "One row per order; cancelled orders are kept",
+        None,
+    )
+    .unwrap();
+    let json = r#"{"classes": [{"id": "order", "properties": ["order_id", "amount"]}],
+        "properties": [{"id": "order_id", "type": "string"},
+                       {"id": "amount", "type": "number", "description": "order total", "unit": "cents"}],
+        "mappings": [{"table": "zz_orders", "class": "order", "key": "order_id", "properties": {"amount": "amount"}}],
+        "measures": [{"id": "revenue", "description": "in dollars", "table": "zz_orders", "expression": "sum(CAST(amount AS BIGINT)) / 100.0"}]}"#;
+    ontology_store::save(
+        &db,
+        &Ontology::from_json(json).unwrap(),
+        Revision::reviewed(None, None),
+    )
+    .unwrap();
+    db
+}
+
+fn asking(text: &str) -> PromptOptions {
+    PromptOptions {
+        question: Some(Question {
+            text: text.to_owned(),
+            vector: None,
+            rrf_k: 60,
+        }),
+        context: Some(String::from("Fiscal years start in April.")),
+        ..options(ChatMode::Chat, 0)
+    }
+}
+
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn a_described_table_carries_its_note_meaning_warnings_and_measures() {
+    let db = tables_workspace(2);
+    let prompt = SystemPrompt::build(&db, &asking("order totals")).unwrap();
+    assert!(
+        prompt.contains("- zz_orders (1 rows)\n  Note (from the owner): One row per order; cancelled orders are kept\n  Columns:\n    - order_id (VARCHAR)\n    - amount (VARCHAR): order total [cents]\n  Warnings:\n    - amount: numbers stored as text"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("Measures (named calculations; compute them with the expression as given):\n- revenue = sum(CAST(amount AS BIGINT)) / 100.0: in dollars (SELECT ... FROM zz_orders)"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("find_tables"),
+        "every table is described: {prompt}"
+    );
+    assert!(
+        !prompt.contains("Tables most related"),
+        "no ranking when every table is described"
+    );
+}
+
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn past_the_cap_the_question_ranks_tables_after_the_context() {
+    let db = tables_workspace(30);
+    let first = SystemPrompt::build(&db, &asking("total order amount in dollars")).unwrap();
+    assert!(first.contains("call find_tables with the question in other words"));
+    assert!(first.contains("find_tables ranks every table against a question"));
+    assert!(
+        first.contains("- zz_orders (1 rows)\n"),
+        "listed by name: {first}"
+    );
+
+    let context = first.find("Workspace context").unwrap();
+    let ranked = first.find("Tables most related to this question").unwrap();
+    assert!(ranked > context, "the ranking follows the context");
+    let block = first.get(ranked..).unwrap();
+    assert!(
+        block.contains("- zz_orders (1 rows)\n  Note (from the owner)")
+            && block.contains("order total [cents]"),
+        "{block}"
+    );
+
+    let second = SystemPrompt::build(&db, &asking("which codes exist")).unwrap();
+    assert_eq!(
+        first.get(..context),
+        second.get(..context),
+        "everything before the context is the same for every question"
+    );
+    let unasked = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    assert!(!unasked.contains("Tables most related"));
+}
+
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn graph_views_are_named_once_the_graph_has_nodes() {
+    let db = tables_workspace(1);
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    assert!(!prompt.contains("Graph views"), "{prompt}");
+    assert!(
+        !prompt.contains("- graph_order"),
+        "views are not described as tables"
+    );
+    db.connection()
+        .execute(
+            "INSERT INTO _quack_graph_nodes (id, label, normalized_label, class_id, properties) \
+             VALUES ('n1', 'o1', 'o1', 'order', '{}')",
+            [],
+        )
+        .unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    assert!(
+        prompt.contains(
+            "Graph views (read-only SQL over the knowledge graph; describe_class lists a class view's columns): graph_edges, graph_order"
+        ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("run_sql over the graph_<class> view"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("in query mode add WHERE NOT provisional"));
 }

@@ -45,6 +45,7 @@ use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
 use quack_core::storage::control::ResourceKind;
+use quack_core::storage::profile::{ColumnTypes, TableProfile};
 use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, MessageRole, Sharing, Transcript,
 };
@@ -847,7 +848,10 @@ impl DirectSql {
             Side::Write => {
                 let result = db
                     .run(move |db| {
-                        db.cancellable(&canceller, |db| db.execute_query_capped(&sql, max_rows))
+                        let result = db
+                            .cancellable(&canceller, |db| db.execute_query_capped(&sql, max_rows));
+                        TableProfile::after_write(db);
+                        result
                     })
                     .await;
                 reader.observe_write().await;
@@ -1997,23 +2001,30 @@ impl App {
 
     /// Run a typed `/` line; a line the parser refuses is answered in the
     /// transcript (its help as a note, anything else as an error).
-    fn handle_slash_command(&mut self, input: &str) {
-        let command = match SlashCommand::parse(input) {
-            Ok(command) => command,
-            Err(e) => {
-                let (kind, text) = match e.kind() {
-                    ErrorKind::InvalidSubcommand => {
-                        let name = input.split_whitespace().next().unwrap_or(input);
-                        (MessageKind::Error, format!("unknown command: {name}"))
-                    }
-                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
-                        (MessageKind::System, e.to_string())
-                    }
-                    _ => (MessageKind::Error, e.to_string()),
-                };
-                self.note(kind, text.trim_end());
-                return;
+    /// `input` as a slash command, or `None` once the transcript says why
+    /// it is not one (or shows the help it asked for).
+    fn parse_slash_command(&mut self, input: &str) -> Option<SlashCommand> {
+        let e = match SlashCommand::parse(input) {
+            Ok(command) => return Some(command),
+            Err(e) => e,
+        };
+        let (kind, text) = match e.kind() {
+            ErrorKind::InvalidSubcommand => {
+                let name = input.split_whitespace().next().unwrap_or(input);
+                (MessageKind::Error, format!("unknown command: {name}"))
             }
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                (MessageKind::System, e.to_string())
+            }
+            _ => (MessageKind::Error, e.to_string()),
+        };
+        self.note(kind, text.trim_end());
+        None
+    }
+
+    fn handle_slash_command(&mut self, input: &str) {
+        let Some(command) = self.parse_slash_command(input) else {
+            return;
         };
         match command {
             SlashCommand::Quit => self.quit = Quit::Now,
@@ -2078,6 +2089,7 @@ impl App {
                 query,
                 source_table,
                 limit: None,
+                types: ColumnTypes::default(),
             })),
             SlashCommand::Path { route } => self.show_path(&route),
             SlashCommand::Sql {

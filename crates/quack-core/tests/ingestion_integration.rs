@@ -21,6 +21,7 @@ use quack_core::ingestion::tree::{Folder, FolderReport, Outcome, Prune};
 use quack_core::llm::CancellationToken;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::{ControlPlane, WorkspaceName};
+use quack_core::storage::profile::{ColumnTypes, TableProfile};
 use quack_core::storage::workspace::{
     ChunkScope, DocumentFields, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk,
     NewDocument, Pinning, StatementKind, WorkspaceDb,
@@ -1408,7 +1409,7 @@ fn open_records_schema_version_and_embedding_meta() {
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
     assert_eq!(
         db.meta(MetaKey::SchemaVersion).unwrap().as_deref(),
-        Some("12")
+        Some("13")
     );
     assert_eq!(
         db.meta(MetaKey::EmbeddingDimension).unwrap().as_deref(),
@@ -1966,7 +1967,7 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
     let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
     assert_eq!(
         db.meta(MetaKey::SchemaVersion).unwrap().as_deref(),
-        Some("12")
+        Some("13")
     );
     let hits = db
         .search_keyword_chunks("8841", 3, &ChunkScope::all())
@@ -2866,6 +2867,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         query: None,
         source_table: Some(String::from("orders")),
         limit: None,
+        types: ColumnTypes::default(),
     };
     let summary = import::Importing {
         config: &config,
@@ -2923,6 +2925,7 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         )),
         source_table: None,
         limit: Some(2),
+        types: ColumnTypes::default(),
     };
     let summary = import::Importing {
         config: &config,
@@ -3183,6 +3186,7 @@ async fn server_policy_refuses_local_sqlite_files() {
             query: None,
             source_table: Some(String::from("users")),
             limit: None,
+            types: ColumnTypes::default(),
         },
         policy: server_policy,
         embedder: None::<&Embedder<MockEmbeddingModel>>,
@@ -3220,6 +3224,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         query: None,
         source_table: Some(String::from("orders")),
         limit: None,
+        types: ColumnTypes::default(),
     };
     let summary = import::Importing {
         config: &config,
@@ -3239,13 +3244,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         config: &config,
         db: &writer,
         workspace_id: "ws-import-errors",
-        request: &ImportRequest {
-            url: url.clone().into(),
-            table: String::from("Orders Import"),
-            query: None,
-            source_table: Some(String::from("orders")),
-            limit: None,
-        },
+        request: &first,
         policy: ImportPolicy::owner(),
         embedder: None::<&Embedder<MockEmbeddingModel>>,
         control: RunControl::unobserved(),
@@ -3263,6 +3262,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
             query: Some(String::from("SELECT * FROM nope")),
             source_table: None,
             limit: None,
+            types: ColumnTypes::default(),
         },
         policy: ImportPolicy::owner(),
         embedder: None::<&Embedder<MockEmbeddingModel>>,
@@ -3281,6 +3281,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
             query: None,
             source_table: Some(String::from("t")),
             limit: None,
+            types: ColumnTypes::default(),
         },
         policy: ImportPolicy::owner(),
         embedder: None::<&Embedder<MockEmbeddingModel>>,
@@ -4069,4 +4070,96 @@ async fn the_uploaders_fields_win_and_a_person_edits_them() {
         db.set_document_fields(&DocumentId::from("absent"), &DocumentFields::default())
             .is_err()
     );
+}
+
+/// A loaded table is profiled at once; `--types` retypes its columns
+/// strictly, and a reserved name is refused before anything loads.
+#[tokio::test]
+async fn a_loaded_table_is_profiled_retyped_and_reserved_names_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let csv = b"id,amount,placed\n1,100,2026-01-02\n2,250,2026-01-03\n";
+
+    ingest(&config, &writer, ingestion::NewFile::new("orders.csv", csv))
+        .await
+        .unwrap();
+    let profile = TableProfile::current(&db, "orders", 2).unwrap().unwrap();
+    assert_eq!(profile.column("amount").unwrap().distinct, 2);
+
+    let typed = b"code,amount,placed\nA,100,2026-01-02\nB,250,2026-01-03\n";
+    ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("typed.csv", typed)
+            .types("amount=DOUBLE,placed=VARCHAR".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+    let columns = db.describe_columns("typed").unwrap();
+    let kind = |name: &str| {
+        columns
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.column_type.clone())
+    };
+    assert_eq!(kind("amount").as_deref(), Some("DOUBLE"));
+    assert_eq!(kind("placed").as_deref(), Some("VARCHAR"));
+    assert_eq!(
+        TableProfile::current(&db, "typed", 2)
+            .unwrap()
+            .unwrap()
+            .column("amount")
+            .unwrap()
+            .duckdb_type,
+        "DOUBLE"
+    );
+
+    let wrong = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("wrong.csv", b"code\nA\n").types("code=BIGINT".parse().unwrap()),
+    )
+    .await;
+    assert!(wrong.is_err_and(|e| e.to_string().contains("does not convert")));
+    let missing = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("missing.csv", b"code\nA\n").types("ghost=BIGINT".parse().unwrap()),
+    )
+    .await;
+    assert!(missing.is_err_and(|e| e.to_string().contains("'ghost'")));
+
+    for name in ["graph_vendors.csv", "_quack_meta.csv"] {
+        let refused = ingest(&config, &writer, ingestion::NewFile::new(name, b"a\n1\n")).await;
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("reserves")),
+            "{name}"
+        );
+    }
+    assert!(
+        !db.list_tables()
+            .unwrap()
+            .iter()
+            .any(|t| t.starts_with("graph_v"))
+    );
+}
+
+/// A workspace from before profiles gets every table profiled on open.
+#[test]
+fn an_older_workspace_is_profiled_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    {
+        let db = WorkspaceDb::open(&config, "ws-old").unwrap();
+        db.execute_statement("CREATE TABLE t AS SELECT range AS n FROM range(4)")
+            .unwrap();
+        db.execute_statement("DELETE FROM _quack_table_profiles")
+            .unwrap();
+        db.execute_statement("UPDATE _quack_meta SET value = '11' WHERE key = 'schema_version'")
+            .unwrap();
+    }
+    let db = WorkspaceDb::open(&config, "ws-old").unwrap();
+    assert!(TableProfile::current(&db, "t", 4).unwrap().is_some());
 }
