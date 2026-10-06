@@ -4363,6 +4363,7 @@ dependencies = [
  "crossterm 0.29.0",
  "csv",
  "dirs",
+ "duckdb",
  "futures",
  "ipnet",
  "jiff",

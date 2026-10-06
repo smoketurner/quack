@@ -1,7 +1,7 @@
 //! A workspace as one tar: `manifest.json` first, then `data.duckdb` and
-//! everything under `files/`. The snapshot runs on the workspace's writer
-//! thread after a `CHECKPOINT`, so the file it copies is complete and no
-//! write lands between the checkpoint and the copy. A restore unpacks
+//! everything under `files/`. The file is copied after a `CHECKPOINT` with
+//! every connection to it closed: Windows refuses any other handle to an
+//! open `DuckDB` file (#448), and a closed file is complete. A restore unpacks
 //! into a new workspace's directory, which is then opened once through
 //! `WorkspaceDb::open`, so schema upgrades run as for any older file.
 //!
@@ -147,13 +147,13 @@ impl Manifest {
 
 impl Manifest {
     /// Write this manifest, `workspace_dir`'s file, and its `files/` as a tar
-    /// to `out`, after a checkpoint on `db`. Runs on the writer's thread.
+    /// to `out`. Call it once every connection to the file has checkpointed
+    /// and closed.
     ///
     /// # Errors
     ///
-    /// Returns an error if the checkpoint or a write fails.
-    pub fn write<W: Write>(&self, db: &WorkspaceDb, workspace_dir: &Path, out: W) -> Result<W> {
-        db.connection().execute_batch("CHECKPOINT")?;
+    /// Returns an error if a read or a write fails.
+    pub fn write<W: Write>(&self, workspace_dir: &Path, out: W) -> Result<W> {
         let mut builder = tar::Builder::new(out);
         let text = serde_json::to_vec_pretty(self)?;
         let mut header = tar::Header::new_gnu();
@@ -537,10 +537,12 @@ mod tests {
         let manifest =
             Manifest::of(&db, described).unwrap_or_else(|e| unreachable_tar(&e.to_string()));
         assert_eq!(manifest.schema_version, Some(WorkspaceDb::schema_version()));
-        let tar = manifest
-            .write(&db, &config.workspace_dir("src"), Vec::new())
+        db.checkpoint()
             .unwrap_or_else(|e| unreachable_tar(&e.to_string()));
         drop(db);
+        let tar = manifest
+            .write(&config.workspace_dir("src"), Vec::new())
+            .unwrap_or_else(|e| unreachable_tar(&e.to_string()));
 
         assert_eq!(
             Manifest::read(tar.as_slice()).ok().as_ref(),

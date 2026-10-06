@@ -88,6 +88,13 @@ async fn settle(app: &mut App) {
     fail("no background result arrived");
 }
 
+/// Wait until no job is queued or running, then take in what they sent:
+/// each job posts its result before it ends.
+async fn settle_jobs(app: &mut App) {
+    pump_until(app, |app| app.jobs.counts(None).active() == 0).await;
+    app.pump();
+}
+
 /// Wait until every database step sent so far has been applied.
 async fn db_settle(app: &mut App) {
     pump_until(app, |app| app.pending_db == 0).await;
@@ -848,7 +855,9 @@ async fn a_dropped_file_loads_at_once_and_other_pastes_are_typed_in() {
             "{}",
             second.content
         );
-        settle(&mut app).await;
+        // Both files' jobs: a finish left unread would land in a later
+        // step's message count (#448).
+        settle_jobs(&mut app).await;
         assert_ne!(
             last(&app).kind,
             MessageKind::Error,
@@ -872,7 +881,9 @@ async fn a_dropped_file_loads_at_once_and_other_pastes_are_typed_in() {
     settle(&mut app).await;
 
     // Names cut short by a word starting with `#` load nothing, typed
-    // as a line or after /ingest, and the error says why.
+    // as a line or after /ingest, and the error says why. Windows quoting
+    // has no comments, so there the `#` word is just a missing file.
+    #[cfg(not(windows))]
     for line in [
         format!("{dropped} #drafts.md"),
         format!("/ingest {dropped} #drafts.md"),

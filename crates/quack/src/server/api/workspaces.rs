@@ -3,8 +3,7 @@
 //! audit for members.
 
 use std::collections::BTreeSet;
-use std::io::{self, Write};
-use std::sync::Arc;
+use std::io::{self, Seek, Write};
 
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -156,58 +155,56 @@ pub(crate) async fn update(
     }))
 }
 
-/// `GET .../snapshot`: the workspace as a tar for its owner, written on
-/// the writer's thread after a checkpoint and streamed to the body as
-/// the OKF export is. Audited as `snapshot`, since it moves the whole
-/// workspace across the boundary.
+/// `GET .../snapshot`: the workspace as a tar for its owner. The tar is
+/// spooled to an unnamed file while the workspace's file is closed (its
+/// requests wait for the copy, not for the download), then streamed to
+/// the body as the OKF export is. Audited as `snapshot`, since it moves
+/// the whole workspace across the boundary.
 pub(crate) async fn snapshot(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
-    let writer = app.workspace_db(&id).await?;
     let described = Described::of(&app.control, &access.membership.workspace).await?;
     let filename = format!("{}.snapshot.tar", okf::slug(&described.name));
+    let manifest = app.read(&id, move |db| Manifest::of(db, described)).await?;
     let dir = app.config.workspace_dir(id.as_str());
+    let spool_dir = app.config.data_dir().to_path_buf();
+    let spooled = app
+        .with_workspace_closed(&id, move || {
+            let spool = tempfile::tempfile_in(&spool_dir)?;
+            manifest.write(&dir, spool)
+        })
+        .await;
+    let mut spool = match spooled {
+        Ok(spool) => spool,
+        Err(e) => {
+            access.audit_snapshot(&app, &Err(e.message.clone())).await;
+            return Err(e);
+        }
+    };
     let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(CHUNKS_IN_FLIGHT);
     let failed = tx.clone();
-    let audit_app = Arc::clone(&app);
     tokio::spawn(async move {
-        let written = writer
-            .run(move |db| {
-                let manifest = Manifest::of(db, described)?;
-                manifest.write(db, &dir, BodyWriter::new(tx))?.flush()?;
-                Ok(())
-            })
-            .await;
-        let (outcome, detail) = match written {
-            Ok(()) => (
-                Outcome::Allowed,
-                serde_json::json!({ "format": "snapshot" }),
-            ),
+        let sent = tokio::task::spawn_blocking(move || {
+            spool.seek(io::SeekFrom::Start(0))?;
+            let mut body = BodyWriter::new(tx);
+            io::copy(&mut spool, &mut body)?;
+            body.flush()
+        })
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(e.to_string())));
+        let sent = match sent {
+            Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!(workspace = %id, error = %e, "snapshot failed partway");
                 drop(failed.send(Err(io::Error::other(e.to_string()))).await);
-                (
-                    Outcome::Error,
-                    serde_json::json!({ "format": "snapshot", "error": e.to_string() }),
-                )
+                Err(e.to_string())
             }
         };
         drop(failed);
-        let recorded = access
-            .audit(
-                &audit_app,
-                AuditAction::Snapshot,
-                Some(ResourceKind::Workspace.id(id.as_str())),
-                outcome,
-                Some(detail),
-            )
-            .await;
-        if let Err(e) = recorded {
-            tracing::error!(workspace = %id, error = %e.message, "could not audit a snapshot");
-        }
+        access.audit_snapshot(&app, &sent).await;
     });
     let body = Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|chunk| (chunk, rx))
@@ -271,6 +268,34 @@ pub(crate) async fn delete(
 }
 
 impl Access {
+    /// The `snapshot` audit row, with the error when it failed; a row that
+    /// cannot be written is logged, since the response has gone.
+    async fn audit_snapshot(&self, app: &App, sent: &Result<(), String>) {
+        let id = &self.membership.workspace.id;
+        let (outcome, detail) = match sent {
+            Ok(()) => (
+                Outcome::Allowed,
+                serde_json::json!({ "format": "snapshot" }),
+            ),
+            Err(error) => (
+                Outcome::Error,
+                serde_json::json!({ "format": "snapshot", "error": error }),
+            ),
+        };
+        let recorded = self
+            .audit(
+                app,
+                AuditAction::Snapshot,
+                Some(ResourceKind::Workspace.id(id.as_str())),
+                outcome,
+                Some(detail),
+            )
+            .await;
+        if let Err(e) = recorded {
+            tracing::error!(workspace = %id, error = %e.message, "could not audit a snapshot");
+        }
+    }
+
     /// Change a workspace's settings for its owner, from the API or the web
     /// console: every allowed provider must be configured, the classification
     /// is trimmed, and the change is audited.
