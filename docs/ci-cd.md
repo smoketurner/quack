@@ -3,8 +3,9 @@
 ## Continuous integration
 
 - **`.github/workflows/ci.yml`**: `fmt`, `clippy` (`--locked -D warnings`), `test`
-  (`cargo test --locked`, Linux + macOS cached, Windows uncached: a third debug cache would
-  push the entries past the 10 GB Actions budget), `docs` (`cargo doc --no-deps` with
+  (`cargo test --locked` on Linux and macOS), `test-windows` (the same on Windows, cached,
+  built without debuginfo, and skipped in the merge queue since it is not a required check),
+  `prune-caches` (on `main`, deletes all but the newest entry of each cache), `docs` (`cargo doc --no-deps` with
   `RUSTDOCFLAGS=-D warnings`, the same as `make doc`; `[workspace.lints.rustdoc]` denies
   broken and private intra-doc links), `dependency-review` (PRs), and `license-check`
   (`cargo-deny check`). The toolchain comes from `rust-toolchain.toml` via `rustup show`;
@@ -94,7 +95,8 @@ The caching layout exists to keep one build script's output: DuckDB's C++ amalga
 - **The repository gets 10 GB of Actions cache in total.** Past that, GitHub evicts
   least-recently-used entries, even mid-run: a job saving a fresh entry can evict the one a
   parallel job is about to restore. Every `Cargo.lock` change starts a new generation of
-  entries, so the steady state must leave room for two.
+  entries, and the old one lingers until eviction catches up, so `prune-caches` deletes it
+  on the next push to `main`.
 - **Only an exact key hit keeps the build-script output.** `rust-cache`'s restore-key
   fallback recovers the registry and some artifacts, but `libduckdb-sys` re-runs, so a
   near-miss costs nine minutes. A surviving entry beats a better-shaped evicted one.
@@ -105,6 +107,9 @@ The resulting rules:
   `target/`, which fits the total inside the budget. Test backtraces keep file and line
   numbers. `rust-cache` hashes every `CARGO_*` variable into the key, so `release.yml` sets
   it identically; otherwise its gates job cannot restore what CI saved.
+- **Windows tests build without debuginfo** (`CARGO_PROFILE_DEV_DEBUG: "0"` on that job), so
+  its `v1-debug-Windows` entry fits beside the other three. A failed assertion still names
+  its file and line: those come from the panic location, not from debuginfo.
 - **One entry per compiling job**: `v1-clippy-<os>` and `v1-debug-<os>`. Folding clippy
   into the test job would halve the entries but serialize the work: measured cold, 11m36s
   of clippy plus 13m08s of tests, against about 13 minutes in parallel. Line-tables-only
@@ -295,8 +300,8 @@ and `docker compose up -d`.
   actionlint 1.7 does not know the `$/` self-repository `uses:` form that zizmor asks for.
 - `docker buildx build --check -f Dockerfile .` (and `Dockerfile.release`,
   `Dockerfile.build`) validates the Dockerfiles without building.
-- CI tests on Linux, macOS, and Windows (the Windows entry builds uncached, so it is the
-  slowest), but only a `workflow_dispatch` release run exercises the release builds
+- CI tests on Linux, macOS, and Windows (Windows runs on pull requests and `main`, not in
+  the merge queue, so a pull request should show it green before it merges), but only a `workflow_dispatch` release run exercises the release builds
   themselves. Run one before tagging after any build change.
 - Pin every new action to a SHA (`secure_workflows.yml` enforces it). Resolve current SHAs
   with `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`.
