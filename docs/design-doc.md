@@ -826,8 +826,15 @@ count the parts the parser reads. A workbook counts every entry, because `calami
 the archive itself: `DecompressionBudget::admit_zip` inflates the entries first and keeps
 nothing. A file over the limit ends in status `error`, naming the setting. An XLS file is not
 compressed and is bounded by the upload limit. `pdf_oxide` applies its own limit to each PDF
-stream (100 MB and a 100:1 ratio). The limit covers bytes inflated, not the cell grid
-`calamine` builds from them.
+stream (100 MB and a 100:1 ratio). The limit covers bytes inflated, not the cells a sheet
+spans: a sheet holding `A1` and `XFD1048576` inflates to a few hundred bytes, and
+`calamine`'s `worksheet_range` would allocate its 17-billion-cell bounding box. So
+`ingestion::xlsx` never builds that grid: XLSX and XLSB cells are streamed through
+`calamine`'s cell readers and held sparse, and a sheet's CSV is refused past
+`xlsx::MAX_SHEET_CELLS` (100 million: its rows with cells times the width of its used
+columns, the message naming both). XLS is parsed whole when `calamine` opens it, before any
+check can run, and its row and column indexes are 16-bit, so a crafted XLS can still ask for
+up to 4 billion cells; ODS is capped at 100 million cells by `calamine` itself.
 
 **Chunking.** A fixed token window: 512-token target, 64-token overlap, stepping by the
 difference; token counts via `tiktoken` (`cl100k_base`). A sectioned source (Markdown, HTML,
