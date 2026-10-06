@@ -38,3 +38,9 @@ crates/quack/editor/node_modules/
 # Claude Code local state
 .claude/settings.local.json
 .claude/worktrees/
+
+# Fuzzing (fuzz/, a detached crate): inputs libFuzzer grows and crashes it finds
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/target/
+/fuzz/Cargo.lock

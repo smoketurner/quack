@@ -11,6 +11,15 @@
   full commit-SHA pin (`zgosalvez/github-actions-ensure-sha-pinned-actions`).
 - **`.github/dependabot.yml`**: `cargo`, `github-actions`, and `docker` (the base-image
   tags), weekly, grouped, 7-day cooldown.
+- **`.github/workflows/advisories.yml`**: `cargo deny check` every Monday (and on
+  dispatch), since `ci.yml` runs it only when code changes and Dependabot's alerts do not
+  cover RustSec's `unmaintained` and `unsound` classes or license and source drift. On a
+  failure it opens one issue titled "cargo deny check fails on the weekly advisory scan",
+  or comments on the open one, with the run's link.
+- **`.github/workflows/fuzz.yml`**: every night (and on dispatch), one job per fuzz target
+  in `fuzz/` (`pdf`, `markdown`, `text`, `html`, `docx`, `pptx`, `xlsx`, `chunker`) on the
+  nightly toolchain, seeded from the evaluation fixtures by `fuzz/seed.sh`, ten minutes
+  each; a crash uploads `fuzz/artifacts/` as the run's artifact.
 
 CI runs on pushes to main. The release workflow runs on tags alone, so ordinary pushes
 spend no release minutes.
@@ -282,10 +291,24 @@ and `docker compose up -d`.
 - Pin every new action to a SHA (`secure_workflows.yml` enforces it). Resolve current SHAs
   with `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`.
 
-Two patterns to add when the code calls for them:
+## Fuzzing
 
-- **Fuzzing**: once a parser takes untrusted input at scale, add a detached `fuzz/` crate
-  (`cargo-fuzz` + `libfuzzer-sys`, its own empty `[workspace]`) and gitignore
-  `fuzz/corpus/` and `fuzz/artifacts/`.
+`fuzz/` is a detached crate (its own `[workspace]`, so the main workspace's lints, profiles,
+and lock file stay as they are) with one libFuzzer target per parser entry point:
+`TextFormat::extract` for each format, `xlsx::sheets`, and `Chunker::document` over the
+Markdown and text parsers. Locally:
+
+```bash
+cargo install cargo-fuzz --locked
+./fuzz/seed.sh                        # copies the evaluation fixtures into fuzz/corpus/<target>/
+cd fuzz && cargo +nightly fuzz run docx -- -max_total_time=120
+```
+
+`fuzz/corpus/`, `fuzz/artifacts/`, and `fuzz/target/` are gitignored. A crash leaves its
+input under `fuzz/artifacts/<target>/`; `cargo +nightly fuzz run <target> <that file>`
+replays it.
+
+One pattern to add when the code calls for it:
+
 - **Docs site**: when `docs/` outgrows flat files, migrate to mdBook (`docs/book.toml` +
   `src/SUMMARY.md`), deploy via a GitHub Pages workflow, and gitignore `docs/book/`.
