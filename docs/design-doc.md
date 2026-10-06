@@ -692,7 +692,7 @@ CREATE TABLE audit_log (                     -- who accessed what, when, how, an
     user_id       TEXT,                      -- NULL for anonymous / failed login
     token_hash    TEXT,                      -- when authenticated by API token
     workspace_id  TEXT,                      -- NULL for admin and auth actions
-    action        TEXT NOT NULL,   -- login | logout | open | query | sql | search | graph | ingest | delete
+    action        TEXT NOT NULL,   -- every value, what writes it, and its OCSF class: docs/audit.md
                                    -- | export | import | context | ontology | propose | extract
                                    -- | session_read | share | okf | member | token | workspace | admin
     resource_type TEXT,                      -- document | table | session | ontology_version | user | token | ...
@@ -2841,7 +2841,8 @@ the air-gapped static binary, which loads no extensions.
 
 **CI and local gates.** On every push and pull request, `.github/workflows/ci.yml` runs
 `cargo fmt --check`, clippy with `-D warnings` over all targets and features, and
-`cargo test --locked --workspace` on Linux and macOS, plus dependency review and cargo-deny.
+`cargo test --locked --workspace` on Linux, macOS, and Windows, rustdoc with broken links
+denied, plus dependency review and cargo-deny.
 Coverage (`make test-coverage`, `cargo llvm-cov`) and mutation testing (`make test-mutants`,
 the whole workspace) are local-only and not wired into a release. Every file parser and
 the chunker are fuzzed nightly (`fuzz/`, `docs/ci-cd.md`), and `cargo deny check` runs

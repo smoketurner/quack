@@ -53,7 +53,7 @@ pub struct SavedQuestion {
 const QUESTION_COLUMNS: &str = "id, name, question, mode, CAST(statements AS VARCHAR), \
      session_id, created_by, CAST(created_at AS VARCHAR), CAST(pinned_at AS VARCHAR)";
 
-/// A row selected with [`QUESTION_COLUMNS`].
+/// A row selected with `QUESTION_COLUMNS`.
 impl TryFrom<&duckdb::Row<'_>> for SavedQuestion {
     type Error = Error;
 
@@ -393,7 +393,7 @@ impl SavedRun {
 const RUN_COLUMNS: &str =
     "id, saved_id, CAST(ran_at AS VARCHAR), status, changed, CAST(statements AS VARCHAR)";
 
-/// A row selected with [`RUN_COLUMNS`].
+/// A row selected with `RUN_COLUMNS`.
 impl TryFrom<&duckdb::Row<'_>> for SavedRun {
     type Error = Error;
 

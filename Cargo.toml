@@ -101,6 +101,7 @@ secrecy              = { version = "=0.10.3", default-features = false }
 serde                = { version = "=1.0.229", default-features = false }
 serde_json           = { version = "=1.0.151", default-features = false }
 shlex                = { version = "=2.0.1", default-features = false } # terminal slash-command arguments; already built for cc
+winsplit             = { version = "=0.1.0", default-features = false } # dropped file paths in the Windows terminal (CommandLineToArgvW rules)
 sqlparser            = { version = "=0.63.0", default-features = false } # tokenizes typed SQL for terminal completion
 sqlx                 = { version = "=0.9.0", default-features = false }
 strsim               = { version = "=0.11.1", default-features = false } # closest model ids in quack doctor
@@ -145,6 +146,10 @@ unit_bindings         = "warn"
 elided_lifetimes_in_paths     = "warn"
 explicit_outlives_requirements = "warn"
 meta_variable_misuse  = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
 
 [workspace.lints.clippy]
 # Whole pedantic group on as warnings; specific rules below override it.

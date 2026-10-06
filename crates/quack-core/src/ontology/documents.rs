@@ -1,7 +1,7 @@
 //! Ontology induction from document evidence (design doc 6.5): open
 //! extraction on a stratified sample of chunks, vocabulary normalization,
 //! structure inference, and support scoring. Model calls go through
-//! [`Extract`], so the pipeline is tested with a canned one.
+//! [`Extract`](crate::extraction::Extract), so the pipeline is tested with a canned one.
 
 use std::collections::{BTreeMap, BTreeSet};
 

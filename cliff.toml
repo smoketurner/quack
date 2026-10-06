@@ -1,0 +1,58 @@
+# git-cliff configuration: release notes and CHANGELOG.md from the
+# Conventional Commits this repository requires (.claude/rules/commits-and-issues.md).
+# `make changelog` renders CHANGELOG.md; release.yml renders the tag being
+# published and puts that version's docs/upgrading.md section above it.
+
+[changelog]
+header = """
+# Changelog
+
+Every release, newest first, from the commit history. The upgrade steps a release
+needs (config keys, schema moves, `quack embeddings refresh`) are in
+[docs/upgrading.md](docs/upgrading.md).
+
+"""
+body = """
+{% if version -%}
+## {{ version }} ({{ timestamp | date(format="%Y-%m-%d") }})
+{% else -%}
+## Unreleased
+{% endif -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}
+{%- endfor %}
+{% endfor %}
+"""
+footer = ""
+trim = true
+
+[git]
+# A squash merge's subject ends in "(#N)": link it to the pull request.
+commit_preprocessors = [
+  { pattern = '(?m) \(#([0-9]+)\)$', replace = " ([#${1}](https://github.com/smoketurner/quack/pull/${1}))" },
+]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+# The `<!-- N -->` prefixes sort the groups; `striptags` removes them above.
+commit_parsers = [
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^refactor", group = "<!-- 3 -->Refactoring" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^test", group = "<!-- 5 -->Tests" },
+  { message = "^build|^ci", group = "<!-- 6 -->Build and CI" },
+  { message = "^chore\\(version\\)", skip = true },
+  { message = "^chore|^style|^release", group = "<!-- 7 -->Other" },
+]
+filter_commits = false
+tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+"
+topo_order = false
+sort_commits = "newest"
+
+[remote.github]
+owner = "smoketurner"
+repo = "quack"

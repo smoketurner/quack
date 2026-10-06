@@ -108,6 +108,13 @@ jobs:
           - name: macos
             runner: macos-latest
             install-deps: ""
+          # Uncached: a third debug cache would push the three entries past
+          # the repository's 10 GB Actions budget and evict CI's own, so this
+          # entry builds from scratch. The release workflow builds Windows
+          # too; this is the first place its tests run.
+          - name: windows
+            runner: windows-latest
+            install-deps: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -118,6 +125,7 @@ jobs:
       - name: Setup Rust toolchain
         run: rustup show
       - name: Setup Rust cache
+        if: matrix.name != 'windows'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: "v1"
@@ -126,6 +134,30 @@ jobs:
           cache-on-failure: true
       - name: Run tests
         run: cargo test --locked --workspace
+
+  docs:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
+      - name: Setup Rust toolchain
+        run: rustup show
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: "v1"
+          shared-key: "debug-${{ runner.os }}"
+          save-if: "false"
+      - name: Build the documentation with broken links denied
+        run: cargo doc --locked --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   dependency-review:
     name: Dependency Review

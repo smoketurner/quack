@@ -370,6 +370,32 @@ was not started with. Ollama, Anthropic, and Bedrock serve no rerank endpoint, s
 refuses them for `rerank_model` when it loads the config. `quack doctor` checks that the
 server lists the model and answers one small rerank call.
 
+**Offline or air-gapped: Qwen3-Reranker-0.6B on llama.cpp.** Of the rerankers small enough
+to run beside Ollama on one machine, Qwen3-Reranker-0.6B scores highest on the MTEB-R
+reranking benchmark (65.80, against 57.03 for bge-reranker-v2-m3; the model card has the
+table). llama.cpp's server serves it at `/v1/rerank` with no network at runtime:
+
+```bash
+llama-server --reranking -m Qwen3-Reranker-0.6B-Q8_0.gguf --port 8000
+```
+
+```toml
+[retrieval]
+rerank = "reranker"
+rerank_model = "rerank/Qwen3-Reranker-0.6B"
+# rerank_candidates = 24
+
+[providers.rerank]
+type = "openai"
+base_url = "http://localhost:8000/v1"
+```
+
+`rerank_candidates` (24) is how many fused hits the reranker scores before `top_k` are
+kept. Raise it, to 50 or so, when the workspace holds many near-duplicate passages (versions
+of one policy, templated reports): the right passage is then often below rank 24 in the fused
+list, and a reranker scores a pair in a few milliseconds, so the cost is small. Leave it
+when the search already returns the right document in its first page.
+
 ## Recipe: LiteLLM
 
 A LiteLLM proxy speaks the OpenAI API, so quack reaches it as one `openai` provider with a

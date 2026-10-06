@@ -146,7 +146,7 @@ impl fmt::Display for VectorTable {
 /// The keys of `_quack_meta`, the workspace's own settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetaKey {
-    /// [`WORKSPACE_SCHEMA_VERSION`] when the internal tables were last upgraded.
+    /// `WORKSPACE_SCHEMA_VERSION` when the internal tables were last upgraded.
     SchemaVersion,
     /// The width of the vector columns.
     EmbeddingDimension,
@@ -590,7 +590,7 @@ impl CappedResults {
     }
 }
 
-/// Query results with a digest of the whole result set ([`ResultDigest`]).
+/// Query results with a digest of the whole result set (`ResultDigest`).
 /// Rows past the cap are digested and counted but not kept.
 #[derive(Debug, Clone)]
 pub struct DigestedResults {
@@ -918,8 +918,8 @@ impl WorkspaceDb {
     /// second `DatabaseInstance` and take the file's exclusive lock.
     ///
     /// The clone inherits the confinement and resource limits already
-    /// locked in on `self`, so it must never call [`Self::confine_to`] or
-    /// [`Self::apply_resource_limits`] again — both `SET`s would fail once
+    /// locked in on `self`, so it must never call `confine_to` or
+    /// `apply_resource_limits` again — both `SET`s would fail once
     /// the configuration is locked.
     ///
     /// # Errors
@@ -2749,7 +2749,7 @@ impl WorkspaceDb {
         self.read_rows(sql, Some(max_rows as usize))
     }
 
-    /// [`Self::execute_query_capped`], with a [`ResultDigest`] of the
+    /// [`Self::execute_query_capped`], with a `ResultDigest` of the
     /// whole result set: every row is read and digested, and only the
     /// first `max_rows` are kept.
     ///
@@ -3488,7 +3488,7 @@ const LIVE_STATUS: &str = "status NOT IN ('error', 'superseded')";
 /// failed document stays listed with its reason, a replaced one does not.
 const NOT_SUPERSEDED: &str = "status <> 'superseded'";
 
-/// A row selected with [`DOCUMENT_SELECT`].
+/// A row selected with `DOCUMENT_SELECT`.
 impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
     type Error = duckdb::Error;
 

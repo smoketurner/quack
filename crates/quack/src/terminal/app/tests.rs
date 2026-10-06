@@ -36,18 +36,34 @@ fn app(dir: &Path) -> App {
     app_with(dir, Config::default())
 }
 
+/// A file as a terminal pastes it when it is dropped: spaces escaped on
+/// Unix, the path in double quotes on Windows.
+fn dropped_path(file: &Path) -> String {
+    let path = file.display().to_string();
+    if cfg!(windows) {
+        format!("\"{path}\"")
+    } else {
+        path.replace(' ', "\\ ")
+    }
+}
+
 /// `app` under `config`, its data directory moved to `dir`.
-fn app_with(dir: &Path, mut config: Config) -> App {
+fn app_with(dir: &Path, config: Config) -> App {
+    app_in(dir, "ws", config)
+}
+
+/// `app_with` over workspace `workspace` of the data directory `dir`.
+fn app_in(dir: &Path, workspace: &str, mut config: Config) -> App {
     config.general.data_dir = dir.to_path_buf();
-    let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+    let db = WorkspaceDb::open(&config, workspace).unwrap_or_else(|e| fail(&e.to_string()));
     let session = sessions::create_session(&db, "m", ChatMode::Chat, None)
         .unwrap_or_else(|e| fail(&e.to_string()));
     let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
     let reader_db = ReaderDb::new(Arc::clone(&db));
     App::new(SessionSetup {
         config,
-        workspace_name: String::from("ws"),
-        workspace_id: WorkspaceId::from("ws"),
+        workspace_name: String::from(workspace),
+        workspace_id: WorkspaceId::from(workspace),
         db,
         reader_db,
         session_id: session.id,
@@ -743,7 +759,7 @@ async fn a_dropped_file_loads_at_once_and_other_pastes_are_typed_in() {
     let mut app = app(dir.path());
     let file = dir.path().join("team notes.md");
     std::fs::write(&file, "# Notes\n\nThe team met.").unwrap_or_else(|e| fail(&e.to_string()));
-    let dropped = file.display().to_string().replace(' ', "\\ ");
+    let dropped = dropped_path(&file);
 
     // The path a terminal pastes for a dropped file: loaded, not typed.
     assert!(app.handle_terminal_event(&Event::Paste(dropped.clone())));
@@ -772,7 +788,7 @@ async fn a_dropped_file_loads_at_once_and_other_pastes_are_typed_in() {
     // and no Upload was announced until the user pressed Enter.
     let more = dir.path().join("more notes.md");
     std::fs::write(&more, "# More notes.").unwrap_or_else(|e| fail(&e.to_string()));
-    let more_dropped = more.display().to_string().replace(' ', "\\ ");
+    let more_dropped = dropped_path(&more);
     for sep in ["\r\n", "\r"] {
         let before = app.messages.len();
         assert!(app.handle_terminal_event(&Event::Paste(format!("{dropped}{sep}{more_dropped}"))));
@@ -1661,7 +1677,10 @@ async fn typed_input_is_kept_across_sessions_and_browsed_with_up_and_down() {
         app.submit_message();
         db_settle(&mut app).await;
     }
-    let mut again = app(dir.path());
+    // History is the data directory's, not the workspace's. Another
+    // workspace proves it: the first app's writer may still hold "ws",
+    // which Windows locks exclusively until the last handle closes.
+    let mut again = app_in(dir.path(), "ws2", Config::default());
     assert_eq!(again.history.lines, vec![String::from("/tables")]);
 
     // Up recalls the newest, then older ones; Down comes back and past

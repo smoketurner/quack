@@ -20,7 +20,7 @@ WORKSPACE ?= storms
 # The crate whose templates Tailwind scans; its built CSS is committed.
 SERVER_CRATE ?= quack
 
-.PHONY: all build check clean fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates image hooks css-dev css-build editor-build run run-server demo-data help
+.PHONY: all build check clean setup doc changelog fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates image hooks css-dev css-build editor-build run run-server demo-data help
 
 all: build
 
@@ -34,6 +34,17 @@ check: ## Type-check the workspace
 
 clean: ## Remove the cargo target/ build artifacts
 	$(CARGO) clean
+
+setup: ## Install the toolchain and tools a contributor needs (idempotent), then the git hooks
+	./scripts/setup.sh
+	prek install
+
+doc: ## Build the API documentation with broken links denied (what the CI docs job runs)
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps
+
+changelog: ## Render CHANGELOG.md from the commits with git-cliff (cliff.toml); commit the result
+	git cliff -o CHANGELOG.md
+	@printf '%s\n' "$$(cat CHANGELOG.md)" > CHANGELOG.md
 
 ##@ Quality
 

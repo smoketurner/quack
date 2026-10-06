@@ -90,6 +90,13 @@ sessions, the ontology, the graph, the context, and the detail of what was done.
 `control.db` holds only who may open which workspace and the access audit (who, what
 resource by opaque id, outcome, channel, when). Decide the side for every new table.
 
+## Recipes
+
+Step-by-step file lists for the common contributions: [adding a
+parser](contributing/adding-a-parser.md), [adding an agent
+tool](contributing/adding-an-agent-tool.md), [adding a provider
+type](contributing/adding-a-provider-type.md).
+
 ## Build and test
 
 ```bash

@@ -93,7 +93,7 @@ pub struct SessionRow {
     pub message_count: i64,
 }
 
-/// A row selected with [`SESSION_COLUMNS`].
+/// A row selected with `SESSION_COLUMNS`.
 impl TryFrom<&duckdb::Row<'_>> for SessionRow {
     type Error = duckdb::Error;
 
