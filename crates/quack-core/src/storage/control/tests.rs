@@ -678,21 +678,24 @@ async fn an_audited_change_names_what_it_changed_and_a_no_op_is_an_error() {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()))
         .rows;
-    let named = |id: &str| rows.iter().find(|r| r.resource_id.as_deref() == Some(id));
+    let named = |id: &str| {
+        rows.iter()
+            .find(|r| r.entry.resource_id.as_deref() == Some(id))
+    };
     assert!(
-        named(ws.id.as_str()).is_some_and(
-            |r| r.workspace_id.as_ref() == Some(&ws.id) && r.outcome == Outcome::Allowed
-        ),
+        named(ws.id.as_str()).is_some_and(|r| r.entry.workspace_id.as_ref() == Some(&ws.id)
+            && r.entry.outcome == Outcome::Allowed),
         "{rows:?}"
     );
     assert!(
-        named(&issued.row.token_hash).is_some_and(|r| r.workspace_id.as_ref() == Some(&ws.id)),
+        named(&issued.row.token_hash)
+            .is_some_and(|r| r.entry.workspace_id.as_ref() == Some(&ws.id)),
         "{rows:?}"
     );
     let bob_rows: Vec<_> = rows
         .iter()
-        .filter(|r| r.resource_id.as_deref() == Some(bob.id.as_str()))
-        .map(|r| r.outcome)
+        .filter(|r| r.entry.resource_id.as_deref() == Some(bob.id.as_str()))
+        .map(|r| r.entry.outcome)
         .collect();
     assert_eq!(bob_rows, [Outcome::Error, Outcome::Allowed], "{rows:?}");
 }
@@ -873,7 +876,11 @@ async fn audit_rows_append_and_filter() {
         })
         .await
         .map(|page| page.rows);
-    assert!(all.is_ok_and(|r| r.len() == 3 && r.first().is_some_and(|r| r.action == "login")));
+    assert!(all.is_ok_and(|r| {
+        r.len() == 3
+            && r.first()
+                .is_some_and(|r| r.entry.action == AuditAction::Login)
+    }));
     let denied_only = cp
         .query_audit(&AuditFilter {
             outcome: Some(Outcome::Denied),
@@ -885,7 +892,7 @@ async fn audit_rows_append_and_filter() {
     assert!(denied_only.is_ok_and(|r| {
         r.len() == 1
             && r.first()
-                .is_some_and(|r| r.user_id == Some(UserId::from("u2")))
+                .is_some_and(|r| r.entry.user_id == Some(UserId::from("u2")))
     }));
     let for_ws = cp
         .query_audit(&AuditFilter {
@@ -896,7 +903,9 @@ async fn audit_rows_append_and_filter() {
         })
         .await
         .map(|page| page.rows);
-    assert!(for_ws.is_ok_and(|r| r.len() == 1 && r.first().is_some_and(|r| r.id == allowed.id)));
+    assert!(
+        for_ws.is_ok_and(|r| r.len() == 1 && r.first().is_some_and(|r| r.entry.id == allowed.id))
+    );
     let none = cp
         .query_audit(&AuditFilter {
             until: Some(String::from("1990-01-01")),
@@ -990,7 +999,7 @@ async fn a_named_workspace_must_exist_and_the_default_is_created_on_first_use() 
         .unwrap()
         .rows;
     assert!(
-        matches!(audited.as_slice(), [row] if row.channel == Channel::Cli),
+        matches!(audited.as_slice(), [row] if row.entry.origin.channel == Channel::Cli),
         "{audited:?}"
     );
     let again = cp
@@ -1083,13 +1092,13 @@ async fn audit_pages_walk_the_log_once_in_order() {
     loop {
         let page = cp
             .query_audit(&AuditFilter {
-                after,
+                cursor: after,
                 ..filter.clone()
             })
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
         pages += 1;
-        seen.extend(page.rows.into_iter().map(|r| r.id));
+        seen.extend(page.rows.into_iter().map(|r| r.entry.id));
         match page.next {
             Some(next) => after = Some(next),
             None => break,
@@ -1112,7 +1121,7 @@ async fn audit_pages_walk_the_log_once_in_order() {
     let elsewhere = cp
         .query_audit(&AuditFilter {
             action: Some(String::from("open")),
-            after: Some(cursor),
+            cursor: Some(cursor),
             ..filter.clone()
         })
         .await;
@@ -1125,4 +1134,54 @@ async fn audit_pages_walk_the_log_once_in_order() {
 fn dummy_hash_parses_as_argon2id() {
     assert!(PasswordHash::new(StoredPasswordHash::DUMMY).is_ok());
     assert!(!StoredPasswordHash::stored_or_dummy(None).verifies("anything"));
+}
+
+/// A stored row names its action and resource kind through the enums, so
+/// one this build does not know is a decode error naming the column, not
+/// a row with a guessed kind.
+#[tokio::test]
+async fn an_audit_row_with_an_unknown_action_or_kind_is_a_decode_error() {
+    let (_dir, cp) = open().await;
+    let known = AuditEntry::new(AuditAction::Open, Outcome::Allowed, Channel::Api)
+        .on(ResourceKind::Document.id("d1"));
+    assert!(cp.record_audit(&known).await.is_ok());
+    let filter = AuditFilter {
+        limit: 10,
+        ..AuditFilter::default()
+    };
+    assert!(
+        cp.query_audit(&filter)
+            .await
+            .is_ok_and(|p| p.rows.len() == 1)
+    );
+    for (set, column, value, restore) in [
+        (
+            "UPDATE audit_log SET action = ?",
+            "action",
+            "retired_action",
+            "UPDATE audit_log SET action = 'open'",
+        ),
+        (
+            "UPDATE audit_log SET resource_type = ?",
+            "resource_type",
+            "widget",
+            "UPDATE audit_log SET resource_type = 'document'",
+        ),
+    ] {
+        sqlx::query(set)
+            .bind(value)
+            .execute(&cp.pool)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let err = cp.query_audit(&filter).await.err().map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains(column) && e.contains(value)),
+            "{column}: {err:?}"
+        );
+        sqlx::query(restore)
+            .execute(&cp.pool)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
 }

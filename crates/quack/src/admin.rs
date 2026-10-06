@@ -7,7 +7,7 @@ use std::io::{IsTerminal, Write};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use quack_core::config::Config;
-use quack_core::ids::WorkspaceId;
+use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, Expiry, IssuedToken,
@@ -449,7 +449,7 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
         since: args.since,
         until: args.until,
         limit: AUDIT_PAGE,
-        after: None,
+        cursor: None,
     };
     let mut remaining = (args.limit != 0).then_some(args.limit);
     let stdout = std::io::stdout();
@@ -461,8 +461,8 @@ pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
         remaining = remaining
             .map(|left| left.saturating_sub(u32::try_from(page.rows.len()).unwrap_or(u32::MAX)));
         match (page.next, remaining) {
-            (Some(next), None) => filter.after = Some(next),
-            (Some(next), Some(left)) if left > 0 => filter.after = Some(next),
+            (Some(next), None) => filter.cursor = Some(next),
+            (Some(next), Some(left)) if left > 0 => filter.cursor = Some(next),
             (Some(_) | None, _) => break,
         }
     }
@@ -511,7 +511,21 @@ impl<W: Write> AuditOutput<W> {
         match self {
             Self::Csv(writer) => {
                 for r in rows {
-                    writer.serialize(r)?;
+                    let e = &r.entry;
+                    writer.write_record([
+                        e.id.as_str(),
+                        r.timestamp.as_str(),
+                        e.user_id.as_ref().map_or("", UserId::as_str),
+                        e.token_hash.as_deref().unwrap_or(""),
+                        e.workspace_id.as_ref().map_or("", WorkspaceId::as_str),
+                        e.action.as_str(),
+                        e.resource_type.map_or("", ResourceKind::as_str),
+                        e.resource_id.as_deref().unwrap_or(""),
+                        e.outcome.as_str(),
+                        e.origin.channel.as_str(),
+                        e.origin.client_addr.as_deref().unwrap_or(""),
+                        e.origin.request_id.as_deref().unwrap_or(""),
+                    ])?;
                 }
             }
             Self::Ocsf(out) => {
@@ -526,14 +540,18 @@ impl<W: Write> AuditOutput<W> {
                         out,
                         "{}  {:<7} {:<5} {:<12} {:<10} {:<36} {}",
                         r.timestamp,
-                        r.outcome,
-                        r.channel,
-                        r.action,
-                        r.user_id
+                        r.entry.outcome,
+                        r.entry.origin.channel,
+                        r.entry.action,
+                        r.entry
+                            .user_id
                             .as_ref()
                             .map_or("-", |u| u.as_str().get(..8).unwrap_or(u.as_str())),
-                        r.workspace_id.as_ref().map_or("-", WorkspaceId::as_str),
-                        r.resource_id.as_deref().unwrap_or("")
+                        r.entry
+                            .workspace_id
+                            .as_ref()
+                            .map_or("-", WorkspaceId::as_str),
+                        r.entry.resource_id.as_deref().unwrap_or("")
                     )
                 })?;
             }

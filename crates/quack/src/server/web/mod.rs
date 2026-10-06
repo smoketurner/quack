@@ -36,8 +36,8 @@ use quack_core::ontology::{
 };
 use quack_core::storage::context;
 use quack_core::storage::control::{
-    AuditAction, AuditCursor, AuditFilter, AuditPage, AuditRow, Expiry, IssuedToken, MemberRow,
-    Membership, Outcome, ProviderAllowList, ResourceKind, Role, Scope, TokenRow, UserKind, UserRow,
+    AuditAction, AuditFilter, AuditPage, AuditRow, Expiry, IssuedToken, MemberRow, Membership,
+    Outcome, ProviderAllowList, ResourceKind, Role, Scope, TokenRow, UserKind, UserRow,
     WorkspaceChanges, WorkspaceTimes,
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
@@ -82,7 +82,7 @@ use quack_core::jobs::JobNumber;
 use quack_core::llm::Embeddings;
 use quack_core::ontology::ROOT_CLASS;
 use quack_core::storage::workspace::WorkspaceDb;
-use quack_core::text::NonBlankText;
+use quack_core::text::{NonBlankText, blank_as_none};
 
 #[derive(Embed)]
 #[folder = "static/"]
@@ -2249,60 +2249,22 @@ async fn admin_user_add(
     Ok(Flash::after("/admin/users", created, |_| None).into_response())
 }
 
-#[derive(Deserialize)]
-struct AuditQuery {
-    action: Option<String>,
-    #[serde(default, deserialize_with = "blank_as_none")]
-    outcome: Option<Outcome>,
-    workspace_id: Option<String>,
-    #[serde(default, deserialize_with = "blank_as_none")]
-    cursor: Option<AuditCursor>,
-}
-
-/// The page's filter form: a blank field is no filter; 200 rows a page.
-impl From<AuditQuery> for AuditFilter {
-    fn from(q: AuditQuery) -> Self {
-        let given = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-        Self {
-            action: given(q.action),
-            outcome: q.outcome,
-            workspace_id: given(q.workspace_id).map(WorkspaceId::from),
-            limit: 200,
-            after: q.cursor,
-            ..Self::default()
-        }
-    }
-}
-
-/// A query or form value where blank means "not given", as the filter's
-/// "any" option sends it; anything else must parse.
-fn blank_as_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: std::str::FromStr,
-    T::Err: fmt::Display,
-{
-    match Option::<String>::deserialize(deserializer)?
-        .as_deref()
-        .map(str::trim)
-    {
-        None | Some("") => Ok(None),
-        Some(text) => text.parse().map(Some).map_err(serde::de::Error::custom),
-    }
-}
-
 async fn admin_audit(
     State(app): State<App>,
     WebUser(identity): WebUser,
-    Query(q): Query<AuditQuery>,
+    Query(filter): Query<AuditFilter>,
 ) -> WebResult<Response> {
     identity.require_admin()?;
-    let filter = AuditFilter::from(q);
+    // The page's own size; the form never sends one.
+    let filter = AuditFilter {
+        limit: 200,
+        ..filter
+    };
     let AuditPage { rows, next } = app.control.query_audit(&filter).await?;
     html(&AdminAuditPage {
         page: Page::new(&app, &identity, Tab::Audit),
         rows,
-        continued: filter.after.is_some(),
+        continued: filter.cursor.is_some(),
         next_cursor: next.map(|c| c.to_string()),
         action: filter.action.unwrap_or_default(),
         outcome: filter.outcome,

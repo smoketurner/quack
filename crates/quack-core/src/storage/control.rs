@@ -27,6 +27,7 @@ use crate::crypto::sha256_hex;
 use crate::error::{Error, Result};
 use crate::ids::{AuditId, UserId, WorkspaceId};
 use crate::oidc::OidcSubject;
+use crate::text::blank_as_none;
 use crate::vault::Sealed;
 
 /// The `control.db` schema, as plain SQL files embedded at compile time.
@@ -432,7 +433,7 @@ impl FromStr for Expiry {
 
 /// Where a request came from: the channel it arrived over, and the
 /// client address and request id the server saw, when it recorded them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Origin {
     pub channel: Channel,
     pub client_addr: Option<String>,
@@ -462,7 +463,7 @@ impl Origin {
 }
 
 /// One access-audit row to record: who, what, outcome, origin.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditEntry {
     /// UUID v7; the same id keys `_quack_audit` inside the workspace.
     pub id: AuditId,
@@ -474,6 +475,7 @@ pub struct AuditEntry {
     /// An opaque id or a table name; never content.
     pub resource_id: Option<String>,
     pub outcome: Outcome,
+    #[serde(flatten)]
     pub origin: Origin,
 }
 
@@ -510,9 +512,9 @@ impl AuditEntry {
     }
 }
 
-/// What an access-audit row records was done. Rows are written with one of
-/// these; they are read back as text, since the log is history and keeps
-/// what older versions wrote.
+/// What an access-audit row records was done. The log is history, so a
+/// variant is never removed: a stored row reads back through this enum
+/// whatever version wrote it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditAction {
@@ -734,55 +736,84 @@ text_enum!(Channel, "channel", {
     Cli => "cli",
 });
 
-/// A stored access-audit row.
+/// A stored access-audit row: the entry as it was recorded, and when.
+/// Serializes flat, the timestamp beside the entry's fields.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditRow {
-    pub id: AuditId,
     pub timestamp: String,
-    pub user_id: Option<UserId>,
-    pub token_hash: Option<String>,
-    pub workspace_id: Option<WorkspaceId>,
-    pub action: String,
-    pub resource_type: Option<String>,
-    pub resource_id: Option<String>,
-    pub outcome: Outcome,
-    pub channel: Channel,
-    pub client_addr: Option<String>,
-    pub request_id: Option<String>,
+    #[serde(flatten)]
+    pub entry: AuditEntry,
 }
 
 impl FromRow<'_, SqliteRow> for AuditRow {
     fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
+        let resource_type = row
+            .try_get::<Option<String>, _>("resource_type")?
+            .map(|text| text.parse())
+            .transpose()
+            .map_err(|e: Error| sqlx::Error::ColumnDecode {
+                index: String::from("resource_type"),
+                source: Box::new(e),
+            })?;
         Ok(Self {
-            id: row.try_get("id")?,
             timestamp: row.try_get("timestamp")?,
-            user_id: row.try_get("user_id")?,
-            token_hash: row.try_get("token_hash")?,
-            workspace_id: row.try_get("workspace_id")?,
-            action: row.try_get("action")?,
-            resource_type: row.try_get("resource_type")?,
-            resource_id: row.try_get("resource_id")?,
-            outcome: parsed(row, "outcome")?,
-            channel: parsed(row, "channel")?,
-            client_addr: row.try_get("client_addr")?,
-            request_id: row.try_get("request_id")?,
+            entry: AuditEntry {
+                id: row.try_get("id")?,
+                user_id: row.try_get("user_id")?,
+                token_hash: row.try_get("token_hash")?,
+                workspace_id: row.try_get("workspace_id")?,
+                action: parsed(row, "action")?,
+                resource_type,
+                resource_id: row.try_get("resource_id")?,
+                outcome: parsed(row, "outcome")?,
+                origin: Origin {
+                    channel: parsed(row, "channel")?,
+                    client_addr: row.try_get("client_addr")?,
+                    request_id: row.try_get("request_id")?,
+                },
+            },
         })
     }
 }
 
-/// Filters for reading the audit log; every field is optional.
-#[derive(Debug, Clone, Default)]
+/// Filters for reading the audit log, as a query string or a form sends
+/// them: every field is optional, a blank one is "any", and `limit`
+/// defaults to 100 rows a page.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
 pub struct AuditFilter {
+    #[serde(deserialize_with = "blank_as_none")]
     pub user_id: Option<UserId>,
+    #[serde(deserialize_with = "blank_as_none")]
     pub workspace_id: Option<WorkspaceId>,
+    #[serde(deserialize_with = "blank_as_none")]
     pub action: Option<String>,
+    #[serde(deserialize_with = "blank_as_none")]
     pub outcome: Option<Outcome>,
     /// Inclusive lower bound on `timestamp` (SQLite text form).
+    #[serde(deserialize_with = "blank_as_none")]
     pub since: Option<String>,
     /// Exclusive upper bound on `timestamp`.
+    #[serde(deserialize_with = "blank_as_none")]
     pub until: Option<String>,
     pub limit: u32,
-    pub after: Option<AuditCursor>,
+    #[serde(deserialize_with = "blank_as_none")]
+    pub cursor: Option<AuditCursor>,
+}
+
+impl Default for AuditFilter {
+    fn default() -> Self {
+        Self {
+            user_id: None,
+            workspace_id: None,
+            action: None,
+            outcome: None,
+            since: None,
+            until: None,
+            limit: Self::DEFAULT_LIMIT,
+            cursor: None,
+        }
+    }
 }
 
 /// A page of the audit log, newest first; `next` is `None` on the last page.
@@ -2281,7 +2312,7 @@ impl ControlPlane {
     /// Returns an error if the query fails.
     pub async fn query_audit(&self, filter: &AuditFilter) -> Result<AuditPage> {
         let digest = filter.digest();
-        if let Some(after) = &filter.after
+        if let Some(after) = &filter.cursor
             && after.filter != digest
         {
             return Err(Error::Config(String::from(
@@ -2294,7 +2325,7 @@ impl ControlPlane {
             rows.truncate(limit);
             rows.last().map(|last| AuditCursor {
                 timestamp: last.timestamp.clone(),
-                id: last.id.clone(),
+                id: last.entry.id.clone(),
                 filter: digest,
             })
         } else {
@@ -2305,8 +2336,12 @@ impl ControlPlane {
 }
 
 impl AuditFilter {
+    pub const DEFAULT_LIMIT: u32 = 100;
+    /// Rows a page holds at most, whatever `limit` asks.
+    pub const MAX_LIMIT: u32 = 1_000;
+
     fn page_size(&self) -> u32 {
-        Ord::max(self.limit, 1)
+        self.limit.clamp(1, Self::MAX_LIMIT)
     }
 
     /// Identifies the filter so a cursor only continues the same query.
@@ -2349,7 +2384,7 @@ impl AuditFilter {
             .order_by(AuditLog::Timestamp, Order::Desc)
             .order_by(AuditLog::Id, Order::Desc)
             .limit(u64::from(filter.page_size()).saturating_add(1));
-        if let Some(after) = &filter.after {
+        if let Some(after) = &filter.cursor {
             select.cond_where(
                 Cond::any()
                     .add(Expr::col(AuditLog::Timestamp).lt(after.timestamp.as_str()))
