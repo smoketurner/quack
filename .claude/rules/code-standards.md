@@ -94,6 +94,9 @@ and code — this file is the gate, the doc is the detail.
 - [ ] `thiserror` for library crates, `anyhow` for binaries; `tracing` for logging, never
       `println!`/`eprintln!`.
 - [ ] Date/time uses `jiff`, not `chrono` or `time`, for direct handling.
+- [ ] A source file over 1,000 lines holds no inline `mod tests { ... }`: it declares
+      `#[cfg(test)] mod tests;` and the tests live in a sibling `tests.rs`
+      (`foo/tests.rs` for `foo.rs`, `tests.rs` in the directory for a `mod.rs`).
 
 ## Before opening a PR
 
