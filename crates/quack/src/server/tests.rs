@@ -9421,10 +9421,11 @@ async fn the_graph_exports_as_a_download_audited_with_its_counts() {
     assert!(text.contains("Ada &lt;Lovelace&gt;"), "{text}");
     assert!(text.contains("from the filing"), "{text}");
 
-    // Audited when the stream ends, with what went.
-    let mut row = None;
-    for _ in 0..100 {
-        row = h
+    // Audited when the stream ends, with what went; the detail row lands
+    // in the workspace after the access row.
+    let mut detail = serde_json::Value::Null;
+    for _ in 0..250 {
+        let row = h
             .audit(AuditFilter {
                 workspace_id: Some(ws.clone()),
                 action: Some(String::from("export")),
@@ -9433,22 +9434,23 @@ async fn the_graph_exports_as_a_download_audited_with_its_counts() {
             .await
             .into_iter()
             .find(|r| r.entry.outcome == Outcome::Allowed);
-        if row.is_some() {
-            break;
+        if let Some(row) = row {
+            let details = h
+                .app
+                .read(&ws, |db| audit::list(db, 50))
+                .await
+                .unwrap_or_else(|e| fail(&e.message));
+            if let Some(found) = details
+                .iter()
+                .find(|d| d.id == row.entry.id)
+                .and_then(|d| d.detail.clone())
+            {
+                detail = found;
+                break;
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let row = row.unwrap_or_else(|| fail("the finished export is audited as allowed"));
-    let details = h
-        .app
-        .read(&ws, |db| audit::list(db, 50))
-        .await
-        .unwrap_or_else(|e| fail(&e.message));
-    let detail = details
-        .iter()
-        .find(|d| d.id == row.entry.id)
-        .and_then(|d| d.detail.clone())
-        .unwrap_or_default();
     assert_eq!(
         detail,
         serde_json::json!({ "format": "graphml", "nodes": 2, "edges": 1, "provenance": 3 })
