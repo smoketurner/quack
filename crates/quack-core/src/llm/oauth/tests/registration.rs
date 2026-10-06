@@ -693,11 +693,11 @@ async fn quack_config_shows_the_registered_client_id_and_where_it_came_from() {
     let idp = MockIdp::start().await;
     let dir = temp();
     let toml = format!(
-        "[general]\ndata_dir = \"{}\"\n\
+        "[general]\ndata_dir = {:?}\n\
          [providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example.com/v1\"\nauth = \"oauth\"\n\
          [providers.gw.oauth]\nissuer_url = \"{}\"\nclient_auth = \"private_key_jwt\"\n\
          grant = \"on-behalf-of\"\nactor = false\n",
-        dir.path().display(),
+        dir.path(),
         idp.issuer
     );
     let client_id = |inspection: &Inspection| {
