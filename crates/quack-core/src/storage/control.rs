@@ -577,6 +577,8 @@ text_enum!(AuditAction, "audit action", {
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
     Session,
+    /// A message in a session, named by its sequence number.
+    Message,
     Document,
     User,
     Workspace,
@@ -597,6 +599,7 @@ pub enum ResourceKind {
 
 text_enum!(ResourceKind, "resource kind", {
     Session => "session",
+    Message => "message",
     Document => "document",
     User => "user",
     Workspace => "workspace",
@@ -615,6 +618,21 @@ text_enum!(ResourceKind, "resource kind", {
 });
 
 impl ResourceKind {
+    /// The text form with spaces, for a sentence: "ontology version".
+    #[must_use]
+    pub fn label(self) -> String {
+        self.as_str().replace('_', " ")
+    }
+
+    /// The error for this kind of resource with `id` missing.
+    #[must_use]
+    pub fn missing(self, id: impl Into<String>) -> Error {
+        Error::NotFound {
+            kind: self,
+            id: id.into(),
+        }
+    }
+
     /// This kind of resource with `id`, as an audit row names it.
     #[must_use]
     pub fn id(self, id: &(impl AsRef<str> + ?Sized)) -> AuditResource<'_> {
@@ -1236,7 +1254,7 @@ impl ControlPlane {
         bound.query().execute(&self.pool).await?;
         self.get_workspace(id)
             .await?
-            .ok_or_else(|| Error::WorkspaceNotFound(id.to_string()))
+            .ok_or_else(|| ResourceKind::Workspace.missing(id.to_string()))
     }
 
     /// List all workspaces.

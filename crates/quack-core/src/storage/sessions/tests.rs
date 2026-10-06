@@ -434,7 +434,7 @@ fn append_to_missing_session_is_an_error() {
     assert!(err.is_some_and(|e| matches!(
         e,
         Error::NotFound {
-            record: Record::Session,
+            kind: ResourceKind::Session,
             ..
         }
     )));

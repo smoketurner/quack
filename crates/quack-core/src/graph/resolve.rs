@@ -10,10 +10,11 @@ use crate::embedding::EmbeddingModel;
 
 use super::{GraphOptions, Node, store};
 use crate::embedding::{Embedder, Input};
-use crate::error::{Error, Record, Result};
+use crate::error::{Error, Result};
 use crate::ids::{MergeId, NodeId};
 use crate::prefix::PrefixMatch;
 use crate::progress::{ChunkDone, RunControl};
+use crate::storage::control::ResourceKind;
 use crate::storage::workspace::{WorkspaceDb, tokenize};
 use crate::storage::writer::Writer;
 
@@ -524,7 +525,7 @@ pub fn pending(db: &WorkspaceDb) -> Result<Vec<MergeProposal>> {
 ///
 /// Returns an error when nothing or more than one proposal matches.
 pub fn find(db: &WorkspaceDb, prefix: &str) -> Result<MergeProposal> {
-    PrefixMatch::of(pending(db)?, prefix, |m| m.id.as_str()).one(Record::MergeProposal, prefix)
+    PrefixMatch::of(pending(db)?, prefix, |m| m.id.as_str()).one(ResourceKind::GraphMerge, prefix)
 }
 
 /// Record a reviewer's answer to a pending proposal (full id or unique

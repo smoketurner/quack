@@ -26,7 +26,7 @@ use quack_core::analysis::events::{
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
-use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
+use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery, UnknownEntity};
 use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
@@ -42,6 +42,7 @@ use quack_core::prefix::PrefixMatch;
 use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
+use quack_core::storage::control::ResourceKind;
 use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, MessageRole, Sharing, Transcript,
 };
@@ -2322,7 +2323,7 @@ impl App {
             Side::Write,
             move |db| {
                 let doc = PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
-                    .one(Record::Document, &prefix)?;
+                    .one(ResourceKind::Document, &prefix)?;
                 db.delete_document(&doc.id).map(|_| doc.filename)
             },
             |app, filename| {
@@ -2481,7 +2482,7 @@ impl App {
             Side::Write,
             move |db| {
                 let doc = PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
-                    .one(Record::Document, &prefix)?;
+                    .one(ResourceKind::Document, &prefix)?;
                 db.set_document_pinning(&doc.id, pinning).map(|()| doc.id)
             },
             move |app, id| {

@@ -12,13 +12,14 @@ use crate::crypto;
 use crate::embedding::{
     Dimension, EmbeddingStatus, Fingerprint, Input, Profile, Prompts, StaleVectors, Vector,
 };
-use crate::error::{Error, Record, Result, WrittenBy};
+use crate::error::{Error, Result, WrittenBy};
 use crate::graph;
 use crate::ids::{ChunkId, DocumentId, NodeId};
 use crate::ingestion::TableName;
 use crate::ingestion::parser::{FileType, Load, PageCounts};
 use crate::ontology::store::Acceptance;
 use crate::saved;
+use crate::storage::control::ResourceKind;
 use crate::text::OneLine;
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
@@ -2345,7 +2346,7 @@ impl WorkspaceDb {
             duckdb::params![pinning, document_id],
         )?;
         if changed == 0 {
-            return Err(Record::Document.missing(document_id.as_str()));
+            return Err(ResourceKind::Document.missing(document_id.as_str()));
         }
         Ok(())
     }

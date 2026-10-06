@@ -497,9 +497,9 @@ mod tests {
 
     use super::*;
     use crate::embedding::Dimension;
-    use crate::error::{AuthReason, Record};
+    use crate::error::AuthReason;
     use crate::llm::egress::Refusal;
-    use crate::storage::control::AllowedProviders;
+    use crate::storage::control::{AllowedProviders, ResourceKind};
 
     /// Interfaces choose their answer from the kind, never the text.
     #[test]
@@ -518,7 +518,10 @@ mod tests {
             }),
             FailureKind::NoChatModel
         );
-        assert_eq!(kind(Record::Session.missing("s1")), FailureKind::NotFound);
+        assert_eq!(
+            kind(ResourceKind::Session.missing("s1")),
+            FailureKind::NotFound
+        );
         let refused = Refusal::Provider {
             provider: String::from("hosted"),
             allowed: AllowedProviders::Only(BTreeSet::new()),
@@ -528,7 +531,7 @@ mod tests {
             kind(Error::Llm(String::from("the model went away"))),
             FailureKind::Other
         );
-        let failure = TurnFailure::from(&Record::Session.missing("s1"));
+        let failure = TurnFailure::from(&ResourceKind::Session.missing("s1"));
         assert_eq!(failure.to_string(), "session 's1' does not exist");
     }
 

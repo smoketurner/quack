@@ -11,9 +11,9 @@ use clap::Subcommand;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
-use quack_core::error::Record;
 use quack_core::ids::SessionId;
 use quack_core::saved::{self, Answer, RunStatus, SavedQuestion, SavedRun, StatementRun};
+use quack_core::storage::control::ResourceKind;
 use quack_core::storage::sessions;
 use quack_core::storage::workspace::QueryResults;
 use quack_core::storage::writer::Writer;
@@ -185,7 +185,7 @@ async fn find(db: &Writer, name: &str) -> Result<SavedQuestion> {
     Ok(db
         .run(move |db| saved::by_name(db, &wanted))
         .await?
-        .ok_or_else(|| Record::SavedQuestion.missing(name))?)
+        .ok_or_else(|| ResourceKind::SavedQuestion.missing(name))?)
 }
 
 /// Ask `question` again as a print-mode turn in a new session of its

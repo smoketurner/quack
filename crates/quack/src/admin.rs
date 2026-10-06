@@ -7,12 +7,11 @@ use std::io::{IsTerminal, Write};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use quack_core::config::Config;
-use quack_core::error::Record;
 use quack_core::ids::WorkspaceId;
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, Expiry, IssuedToken,
-    Outcome, Role, Scope, UserKind, WorkspaceName, WorkspaceRow,
+    Outcome, ResourceKind, Role, Scope, UserKind, WorkspaceName, WorkspaceRow,
 };
 
 use crate::text_or_json::TextOrJson;
@@ -335,7 +334,7 @@ async fn revoke_token(control: &ControlPlane, ws: &WorkspaceRow, prefix: &str) -
     let hash = PrefixMatch::of(control.list_tokens(&ws.id).await?, prefix, |t| {
         t.token_hash.as_str()
     })
-    .one(Record::Token, prefix)?
+    .one(ResourceKind::Token, prefix)?
     .token_hash;
     let entry =
         AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli).in_workspace(&ws.id);

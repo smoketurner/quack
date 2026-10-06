@@ -2,7 +2,8 @@
 //! lets people type one: v7 ids are long, and the first few characters
 //! usually tell them apart.
 
-use crate::error::{Error, Record, Result};
+use crate::error::{Error, Result};
+use crate::storage::control::ResourceKind;
 
 /// What an id prefix names among some records.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,13 +36,13 @@ impl<T> PrefixMatch<T> {
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] when nothing matched and
-    /// [`Error::Ambiguous`] when several did, both naming `record`.
-    pub fn one(self, record: Record, prefix: &str) -> Result<T> {
+    /// [`Error::Ambiguous`] when several did, both naming `kind`.
+    pub fn one(self, kind: ResourceKind, prefix: &str) -> Result<T> {
         match self {
             Self::One(item) => Ok(item),
-            Self::None => Err(record.missing(prefix)),
+            Self::None => Err(kind.missing(prefix)),
             Self::Many(items) => Err(Error::Ambiguous {
-                record,
+                kind,
                 prefix: prefix.to_owned(),
                 count: items.len(),
             }),
@@ -75,16 +76,16 @@ mod tests {
     #[test]
     fn one_names_the_record_when_it_cannot_pick() {
         assert_eq!(
-            find("01b").one(Record::Document, "01b").ok(),
+            find("01b").one(ResourceKind::Document, "01b").ok(),
             Some("01b0-third")
         );
         let missing = find("02")
-            .one(Record::Document, "02")
+            .one(ResourceKind::Document, "02")
             .err()
             .map(|e| e.to_string());
         assert_eq!(missing.as_deref(), Some("document '02' does not exist"));
         let many = find("01a")
-            .one(Record::Session, "01a")
+            .one(ResourceKind::Session, "01a")
             .err()
             .map(|e| e.to_string());
         assert_eq!(

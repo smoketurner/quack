@@ -114,7 +114,7 @@ mod tests {
 
     use crate::analysis::chart::ChartKind;
     use crate::doctor::{Area, Status};
-    use crate::error::{Error, Record};
+    use crate::error::Error;
     use crate::graph::ExtractSource;
     use crate::graph::resolve::{MergeDecision, MergeStatus};
     use crate::okf::ConceptType;
@@ -180,7 +180,6 @@ mod tests {
         round_trips(ExtractSource::ALL);
         round_trips(AuditAction::ALL);
         round_trips(ResourceKind::ALL);
-        text_round_trips(Record::ALL);
         round_trips(Status::ALL);
         round_trips(Area::ALL);
         text_round_trips(MetaKey::ALL);

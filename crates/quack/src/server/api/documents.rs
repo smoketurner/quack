@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use axum::extract::{FromRequest, Multipart, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
-use quack_core::error::Record;
 use quack_core::ids::{DocumentId, WorkspaceId};
 use quack_core::ingestion;
 use quack_core::jobs::JobId;
@@ -57,7 +56,7 @@ pub(crate) async fn show(
     let document = app
         .read(&id, move |db| {
             db.document(&doc)?
-                .ok_or_else(|| Record::Document.missing(doc.as_str()))
+                .ok_or_else(|| ResourceKind::Document.missing(doc.as_str()))
         })
         .await?;
     Ok(Json(serde_json::to_value(document)?))
@@ -423,7 +422,7 @@ pub(crate) async fn set_pinned(
     let document = with_db(db, move |db| {
         db.set_document_pinning(&doc_id, pinning)?;
         db.document(&doc_id)?
-            .ok_or_else(|| Record::Document.missing(doc_id.as_str()))
+            .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))
     })
     .await?;
     access
@@ -460,7 +459,7 @@ pub(crate) async fn delete_document(
     let filename = with_db(db, move |db| {
         let document = db
             .document(&doc_id)?
-            .ok_or_else(|| Record::Document.missing(doc_id.as_str()))?;
+            .ok_or_else(|| ResourceKind::Document.missing(doc_id.as_str()))?;
         db.delete_document(&doc_id)?;
         Ok(document.filename)
     })

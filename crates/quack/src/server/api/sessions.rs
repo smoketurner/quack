@@ -5,7 +5,6 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use quack_core::error::Record;
 use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
@@ -61,7 +60,7 @@ impl Access {
                 Ok(sessions::get_session(db, &sid)?.filter(|s| s.visible_to(&viewer)))
             })
             .await?;
-        found.ok_or_else(|| Record::Session.missing(session_id.as_str()).into())
+        found.ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()).into())
     }
 }
 
@@ -117,7 +116,8 @@ pub(crate) async fn update(
         Some(mode) => Some(access.set_session_mode(&app, &sid, mode).await?),
         None => shared,
     };
-    let session = session.ok_or_else(|| ApiError::from(Record::Session.missing(sid.as_str())))?;
+    let session =
+        session.ok_or_else(|| ApiError::from(ResourceKind::Session.missing(sid.as_str())))?;
     Ok(Json(serde_json::to_value(session)?))
 }
 
@@ -179,7 +179,7 @@ impl Access {
         let updated = with_db(db, move |db| {
             sessions::set_session_mode(db, &session_id, mode)?;
             sessions::get_session(db, &session_id)?
-                .ok_or_else(|| Record::Session.missing(session_id.as_str()))
+                .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))
         })
         .await?;
         self.audit(
@@ -213,7 +213,7 @@ impl Access {
         let updated = with_db(db, move |db| {
             sessions::set_session_sharing(db, &session_id, sharing)?;
             sessions::get_session(db, &session_id)?
-                .ok_or_else(|| Record::Session.missing(session_id.as_str()))
+                .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))
         })
         .await?;
         self.audit(

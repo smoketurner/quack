@@ -15,7 +15,6 @@ use quack_core::analysis::events::{self, AgentEvent, FailureKind, TurnFailure};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::embedding::{Input, Vector};
-use quack_core::error::Record;
 use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
@@ -90,7 +89,7 @@ impl PreparedTurn {
                 // A session the caller may not see reads as missing, not forbidden.
                 sessions::get_session(db, &id)?
                     .filter(|s| s.visible_to(&viewer))
-                    .ok_or_else(|| Record::Session.missing(id.as_str()))?;
+                    .ok_or_else(|| ResourceKind::Session.missing(id.as_str()))?;
                 // A session's mode is set when it is created; `mode` on a
                 // later turn is ignored, and PATCH .../sessions/{sid} changes
                 // it explicitly (issue #57).
