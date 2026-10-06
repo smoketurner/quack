@@ -84,7 +84,7 @@ metrics-exporter-prometheus = { version = "=0.18.3", default-features = false } 
 mimalloc             = { version = "=0.1.52", default-features = false }
 mime_guess           = { version = "=2.0.5", default-features = false }
 oauth2               = { version = "=5.0.0", default-features = false }
-office_oxide         = { version = "=0.1.11", default-features = false } # pdf_oxide 0.3.78 does not build against 0.1.12 or 0.1.13; not used directly
+office_oxide         = { version = "=0.1.12", default-features = false } # pdf_oxide 0.3.78 does not build against 0.1.12 or 0.1.13; not used directly
 pdf_oxide            = { version = "=0.3.78", default-features = false }
 proptest             = { version = "=1.11.0", default-features = false }
 pulldown-cmark       = { version = "=0.13.4", default-features = false }
