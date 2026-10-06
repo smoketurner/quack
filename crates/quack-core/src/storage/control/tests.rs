@@ -1137,52 +1137,65 @@ fn dummy_hash_parses_as_argon2id() {
     assert!(!StoredPasswordHash::stored_or_dummy(None).verifies("anything"));
 }
 
-/// A stored row names its action and resource kind through the enums, so
-/// one this build does not know is a decode error naming the column, not
-/// a row with a guessed kind.
+/// A stored action or resource kind this build does not define reads back
+/// as `Unknown` carrying the name, so history written by a newer build
+/// still lists; nothing writes such a name back.
 #[tokio::test]
-async fn an_audit_row_with_an_unknown_action_or_kind_is_a_decode_error() {
+async fn undefined_stored_audit_names_read_back_and_are_never_written() {
     let (_dir, cp) = open().await;
     let known = AuditEntry::new(AuditAction::Open, Outcome::Allowed, Channel::Api)
         .on(ResourceKind::Document.id("d1"));
     assert!(cp.record_audit(&known).await.is_ok());
-    let filter = AuditFilter {
-        limit: 10,
-        ..AuditFilter::default()
-    };
-    assert!(
-        cp.query_audit(&filter)
-            .await
-            .is_ok_and(|p| p.rows.len() == 1)
-    );
-    for (set, column, value, restore) in [
-        (
-            "UPDATE audit_log SET action = ?",
-            "action",
-            "retired_action",
-            "UPDATE audit_log SET action = 'open'",
-        ),
-        (
-            "UPDATE audit_log SET resource_type = ?",
-            "resource_type",
-            "widget",
-            "UPDATE audit_log SET resource_type = 'document'",
-        ),
+    for statement in [
+        "UPDATE audit_log SET action = 'retired_action'",
+        "UPDATE audit_log SET resource_type = 'widget'",
     ] {
-        sqlx::query(set)
-            .bind(value)
-            .execute(&cp.pool)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let err = cp.query_audit(&filter).await.err().map(|e| e.to_string());
-        assert!(
-            err.as_deref()
-                .is_some_and(|e| e.contains(column) && e.contains(value)),
-            "{column}: {err:?}"
-        );
-        sqlx::query(restore)
+        sqlx::query(statement)
             .execute(&cp.pool)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
     }
+    let filter = AuditFilter {
+        limit: 10,
+        ..AuditFilter::default()
+    };
+    let rows = cp
+        .query_audit(&filter)
+        .await
+        .map_or_else(|e| fail(&e.to_string()), |p| p.rows);
+    let entry = &rows
+        .first()
+        .unwrap_or_else(|| fail("the row is gone"))
+        .entry;
+    assert_eq!(
+        entry.action,
+        AuditAction::Unknown(String::from("retired_action"))
+    );
+    assert_eq!(
+        entry.resource_type,
+        Some(ResourceKind::Unknown(String::from("widget")))
+    );
+    let mut back = entry.clone();
+    back.id = AuditId::generate();
+    let refused = cp.record_audit(&back).await.err().map(|e| e.to_string());
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|e| e.contains("audit action") && e.contains("retired_action")),
+        "{refused:?}"
+    );
+    let mut kind_only = known.clone();
+    kind_only.id = AuditId::generate();
+    kind_only.resource_type = Some(ResourceKind::Unknown(String::from("widget")));
+    let refused = cp
+        .record_audit(&kind_only)
+        .await
+        .err()
+        .map(|e| e.to_string());
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|e| e.contains("resource kind") && e.contains("widget")),
+        "{refused:?}"
+    );
 }

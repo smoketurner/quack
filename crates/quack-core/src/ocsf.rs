@@ -40,7 +40,7 @@ enum ApiActivity {
 impl EventClass {
     /// Where a row's action lands. A denied `token` is a rejected bearer,
     /// so it is a failed logon rather than token management.
-    fn of(action: AuditAction, outcome: Outcome) -> Self {
+    fn of(action: &AuditAction, outcome: Outcome) -> Self {
         use ApiActivity::{Create, Delete, Other, Read, Update};
         match action {
             AuditAction::Login | AuditAction::Session => Self::Authentication(AuthActivity::Logon),
@@ -79,7 +79,10 @@ impl EventClass {
             | AuditAction::GraphMerge
             | AuditAction::EmbeddingsRefresh => Self::Api(Update),
             AuditAction::Delete => Self::Api(Delete),
-            AuditAction::Workspace | AuditAction::Ontology => Self::Api(Other),
+            // A name a newer build wrote is an API event under its own name.
+            AuditAction::Workspace | AuditAction::Ontology | AuditAction::Unknown(_) => {
+                Self::Api(Other)
+            }
         }
     }
 
@@ -112,7 +115,7 @@ impl AuditRow {
     /// Returns an error if the stored timestamp does not parse.
     pub fn to_ocsf(&self) -> Result<Value> {
         let entry = &self.entry;
-        let class = EventClass::of(entry.action, entry.outcome);
+        let class = EventClass::of(&entry.action, entry.outcome);
         let (class_uid, class_name, category_uid, category_name) = class.class();
         let (activity_id, known_activity) = class.activity();
         let activity_name = match class {
@@ -143,7 +146,7 @@ impl AuditRow {
         if let Some(workspace) = &entry.workspace_id {
             resources.push(json!({ "type": "workspace", "uid": workspace }));
         }
-        if let (Some(kind), Some(uid)) = (entry.resource_type, &entry.resource_id) {
+        if let (Some(kind), Some(uid)) = (&entry.resource_type, &entry.resource_id) {
             resources.push(json!({ "type": kind, "uid": uid }));
         }
         let mut event = json!({
@@ -367,6 +370,14 @@ mod tests {
             "{event}"
         );
         assert!(event["unmapped"].get("token_hash").is_none(), "{event}");
+
+        let retired = render(&row(
+            AuditAction::Unknown(String::from("retired_action")),
+            Outcome::Allowed,
+        ));
+        assert_eq!(retired["type_uid"], 600_399);
+        assert_eq!(retired["activity_name"], "retired_action");
+        assert_eq!(retired["api"]["operation"], "retired_action");
 
         let mut broken = row(AuditAction::Open, Outcome::Allowed);
         broken.timestamp = String::from("yesterday");

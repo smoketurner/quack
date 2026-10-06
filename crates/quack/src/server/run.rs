@@ -22,7 +22,7 @@ use crate::server::state::App;
 
 /// What a background run is: the job kind whose workspace lane it takes,
 /// how it is audited, and what the job list calls it. One row per run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunKind {
     job: JobKind,
     action: AuditAction,
@@ -125,8 +125,8 @@ impl BackgroundRun {
         access
             .audit(
                 app,
-                kind.action,
-                Some(kind.resource.id(&id)),
+                kind.action.clone(),
+                Some(kind.resource.clone().id(&id)),
                 Outcome::Allowed,
                 Some(detail),
             )
@@ -204,8 +204,8 @@ impl BackgroundRun {
             .access
             .audit(
                 &self.app,
-                self.kind.action,
-                Some(self.kind.resource.id(&self.id)),
+                self.kind.action.clone(),
+                Some(self.kind.resource.clone().id(&self.id)),
                 outcome,
                 Some(detail),
             )

@@ -62,6 +62,66 @@ macro_rules! text_enum_sql {
     };
 }
 
+/// Like [`text_enum!`], for an enum that names stored history: `$unknown`
+/// is its one tuple variant, carrying a stored name this build does not
+/// define, so a row a newer build wrote reads back instead of failing.
+/// Parsing never fails; `ALL` lists the defined values; serde reads and
+/// writes the text form (`from`/`into` `String`).
+macro_rules! history_enum {
+    ($name:ident, $unknown:ident, { $($variant:ident => $text:literal),+ $(,)? }) => {
+        impl $name {
+            /// Every value this build defines, in declaration order.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            /// The text form, as `Display` writes it and `FromStr` reads it.
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $text,)+
+                    Self::$unknown(name) => name,
+                }
+            }
+
+            /// Whether this build defines the value: only those are written.
+            #[must_use]
+            pub const fn is_defined(&self) -> bool {
+                !matches!(self, Self::$unknown(_))
+            }
+        }
+
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                f.pad(self.as_str())
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(text: String) -> Self {
+                text.parse().unwrap_or_else(|never: ::std::convert::Infallible| match never {})
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.as_str().to_owned()
+            }
+        }
+
+        impl ::std::str::FromStr for $name {
+            type Err = ::std::convert::Infallible;
+
+            fn from_str(text: &str) -> ::std::result::Result<Self, Self::Err> {
+                let wanted = text.trim();
+                Ok(Self::ALL
+                    .iter()
+                    .find(|value| value.as_str().eq_ignore_ascii_case(wanted))
+                    .cloned()
+                    .unwrap_or_else(|| Self::$unknown(wanted.to_owned())))
+            }
+        }
+    };
+}
+
 /// Implement `as_str`, `ALL`, `Display`, and `FromStr` for a fieldless,
 /// `Copy` enum from its variants' text forms, which must be the names its
 /// serde attributes give. Parsing trims and ignores ASCII case; anything
@@ -114,6 +174,7 @@ macro_rules! text_enum {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::fmt::{Debug, Display};
     use std::str::FromStr;
 
@@ -186,12 +247,53 @@ mod tests {
         round_trips(CandidateAction::ALL);
         round_trips(ItemKind::ALL);
         round_trips(ExtractSource::ALL);
-        round_trips(AuditAction::ALL);
-        round_trips(ResourceKind::ALL);
         round_trips(Status::ALL);
         round_trips(Area::ALL);
         text_round_trips(MetaKey::ALL);
         text_round_trips(ConceptType::ALL);
+    }
+
+    /// A history enum's defined values round-trip through text and serde
+    /// like any other; an undefined stored name reads back carrying itself,
+    /// prints as itself, and is not defined.
+    #[test]
+    fn history_enums_keep_undefined_names() {
+        fn stored<T>(all: &[T])
+        where
+            T: Clone
+                + PartialEq
+                + Debug
+                + Display
+                + FromStr<Err = Infallible>
+                + Serialize
+                + From<String>,
+        {
+            for value in all {
+                assert_eq!(
+                    serde_json::to_value(value).ok(),
+                    Some(Value::String(value.to_string())),
+                    "{value:?}"
+                );
+                let text = value.to_string();
+                let upper = format!("  {}  ", text.to_ascii_uppercase());
+                assert_eq!(upper.parse::<T>().ok().as_ref(), Some(value));
+                assert_eq!(T::from(text), *value);
+            }
+        }
+        stored(AuditAction::ALL);
+        stored(ResourceKind::ALL);
+        let retired = AuditAction::from(String::from(" retired_action "));
+        assert_eq!(
+            retired,
+            AuditAction::Unknown(String::from("retired_action"))
+        );
+        assert_eq!(retired.to_string(), "retired_action");
+        assert!(!retired.is_defined());
+        assert!(AuditAction::Open.is_defined());
+        assert_eq!(
+            serde_json::from_value::<ResourceKind>(Value::String(String::from("widget"))).ok(),
+            Some(ResourceKind::Unknown(String::from("widget")))
+        );
     }
 
     #[test]

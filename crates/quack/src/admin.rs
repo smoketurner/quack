@@ -519,7 +519,7 @@ impl<W: Write> AuditOutput<W> {
                         e.token_hash.as_deref().unwrap_or(""),
                         e.workspace_id.as_ref().map_or("", WorkspaceId::as_str),
                         e.action.as_str(),
-                        e.resource_type.map_or("", ResourceKind::as_str),
+                        e.resource_type.as_ref().map_or("", ResourceKind::as_str),
                         e.resource_id.as_deref().unwrap_or(""),
                         e.outcome.as_str(),
                         e.origin.channel.as_str(),

@@ -553,11 +553,11 @@ impl AuditEntry {
     }
 }
 
-/// What an access-audit row records was done. The log is history, so a
-/// variant is never removed: a stored row reads back through this enum
-/// whatever version wrote it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// What an access-audit row records was done. The log is history: a
+/// stored name this build does not define reads back as `Unknown`, which
+/// is never written.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(into = "String", from = "String")]
 pub enum AuditAction {
     Login,
     Logout,
@@ -603,9 +603,12 @@ pub enum AuditAction {
     Save,
     /// A saved question's SQL run again without the model.
     SavedRun,
+    /// A stored name this build does not define, as a newer build wrote
+    /// it. Read only: the one write path refuses it.
+    Unknown(String),
 }
 
-text_enum!(AuditAction, "audit action", {
+history_enum!(AuditAction, Unknown, {
     Login => "login",
     Logout => "logout",
     Session => "session",
@@ -644,9 +647,11 @@ text_enum!(AuditAction, "audit action", {
     SavedRun => "saved_run",
 });
 
-/// The kinds of resource an audit row names by opaque id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// The kinds of resource an audit row names by opaque id. Like
+/// [`AuditAction`], a stored kind this build does not define reads back as
+/// `Unknown` and is never written.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(into = "String", from = "String")]
 pub enum ResourceKind {
     Session,
     /// A message in a session, named by its sequence number.
@@ -667,9 +672,12 @@ pub enum ResourceKind {
     Resource,
     Audit,
     SavedQuestion,
+    /// A stored name this build does not define, as a newer build wrote
+    /// it. Read only: the one write path refuses it.
+    Unknown(String),
 }
 
-text_enum!(ResourceKind, "resource kind", {
+history_enum!(ResourceKind, Unknown, {
     Session => "session",
     Message => "message",
     Document => "document",
@@ -692,7 +700,7 @@ text_enum!(ResourceKind, "resource kind", {
 impl ResourceKind {
     /// The text form with spaces, for a sentence: "ontology version".
     #[must_use]
-    pub fn label(self) -> String {
+    pub fn label(&self) -> String {
         self.as_str().replace('_', " ")
     }
 
@@ -716,7 +724,7 @@ impl ResourceKind {
 }
 
 /// The resource an audit row names: its kind and opaque id, never content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditResource<'a> {
     pub kind: ResourceKind,
     pub id: &'a str,
@@ -788,14 +796,6 @@ pub struct AuditRow {
 
 impl FromRow<'_, SqliteRow> for AuditRow {
     fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
-        let resource_type = row
-            .try_get::<Option<String>, _>("resource_type")?
-            .map(|text| text.parse())
-            .transpose()
-            .map_err(|e: Error| sqlx::Error::ColumnDecode {
-                index: String::from("resource_type"),
-                source: Box::new(e),
-            })?;
         Ok(Self {
             timestamp: row.try_get("timestamp")?,
             entry: AuditEntry {
@@ -803,8 +803,10 @@ impl FromRow<'_, SqliteRow> for AuditRow {
                 user_id: row.try_get("user_id")?,
                 token_hash: row.try_get("token_hash")?,
                 workspace_id: row.try_get("workspace_id")?,
-                action: parsed(row, "action")?,
-                resource_type,
+                action: AuditAction::from(row.try_get::<String, _>("action")?),
+                resource_type: row
+                    .try_get::<Option<String>, _>("resource_type")?
+                    .map(ResourceKind::from),
                 resource_id: row.try_get("resource_id")?,
                 outcome: parsed(row, "outcome")?,
                 origin: Origin {
@@ -2314,6 +2316,30 @@ impl ControlPlane {
     }
 
     fn audit_insert(entry: &AuditEntry) -> Result<Bound> {
+        // Only what this build defines is written; a name read from history
+        // never goes back in under this build's name.
+        if !entry.action.is_defined() {
+            return Err(Error::UnknownValue {
+                what: "audit action",
+                value: entry.action.as_str().to_owned(),
+                allowed: AuditAction::ALL
+                    .iter()
+                    .map(AuditAction::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+        if let Some(kind) = entry.resource_type.as_ref().filter(|k| !k.is_defined()) {
+            return Err(Error::UnknownValue {
+                what: "resource kind",
+                value: kind.as_str().to_owned(),
+                allowed: ResourceKind::ALL
+                    .iter()
+                    .map(ResourceKind::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
         Ok(Bound::new(
             Query::insert()
                 .into_table(AuditLog::Table)
@@ -2336,7 +2362,11 @@ impl ControlPlane {
                     entry.token_hash.as_deref().into(),
                     entry.workspace_id.as_ref().map(WorkspaceId::as_str).into(),
                     entry.action.as_str().into(),
-                    entry.resource_type.map(ResourceKind::as_str).into(),
+                    entry
+                        .resource_type
+                        .as_ref()
+                        .map(ResourceKind::as_str)
+                        .into(),
                     entry.resource_id.as_deref().into(),
                     entry.outcome.as_str().into(),
                     entry.origin.channel.as_str().into(),

@@ -95,7 +95,7 @@ impl Caller {
         };
         caller
             .access
-            .audit(app, action, resource, outcome, detail)
+            .audit(app, action.clone(), resource, outcome, detail)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e.message, %action, "audit write failed");
