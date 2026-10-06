@@ -59,14 +59,11 @@ use super::api::import::ImportBody;
 use super::api::members::{AddMember, GroupRole};
 use super::api::ontology::{DecideRequest, RenameRequest};
 use super::api::workspaces::CreateWorkspace;
-use super::api::{
-    documents as docs_api, graph as graph_api, import as import_api, workspaces as workspaces_api,
-};
+use super::api::{documents as docs_api, graph as graph_api, import as import_api};
 use super::auth::{Access, Identity, Need, Peer, RequestId, SessionCookie, password_login};
 use super::error::ApiError;
 use super::oidc::Oidc;
 use super::state::{App, ServeMode};
-use crate::graph_cli;
 use quack_core::analysis::tools::{FindPathArgs, NonBlank, SearchGraphArgs};
 use quack_core::config::{GraphConfig, OidcConfig};
 use quack_core::embedding::Vector;
@@ -2269,9 +2266,9 @@ async fn settings_save(
         classification: Some(form.classification),
         allowed_providers,
     };
-    let saved = match workspaces_api::update_settings(&app, &access, changes).await {
+    let saved = match access.update_settings(&app, changes).await {
         Ok(ws) => match form.name {
-            Some(name) => workspaces_api::rename(&app, &access, &name).await,
+            Some(name) => access.rename_workspace(&app, &name).await,
             None => Ok(ws),
         },
         Err(e) => Err(e),
@@ -2302,7 +2299,7 @@ async fn workspace_delete(
         )
         .into_response());
     }
-    let deleted = workspaces_api::delete_workspace(&app, &access).await;
+    let deleted = access.delete_workspace(&app).await;
     Ok(match deleted {
         Ok(()) => Flash::notice("/workspaces", format!("Deleted workspace '{name}'")),
         Err(e) => Flash::error(format!("/w/{id}/settings"), e.message),
@@ -2971,25 +2968,6 @@ struct EdgeForm {
     note: Option<String>,
 }
 
-/// `KEY=VALUE` lines as a property patch: an empty value is `null`, which
-/// removes the key on an edit.
-fn property_lines(text: &str) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
-    let lines: Vec<String> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_owned)
-        .collect();
-    let mut patch =
-        graph_cli::parse_properties(&lines).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    for value in patch.values_mut() {
-        if value.as_str().is_some_and(str::is_empty) {
-            *value = serde_json::Value::Null;
-        }
-    }
-    Ok(patch)
-}
-
 async fn graph_node_add(
     State(app): State<App>,
     WebUser(identity): WebUser,
@@ -2998,9 +2976,9 @@ async fn graph_node_add(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let back = format!("/w/{id}/graph");
-    let properties = match property_lines(&form.properties) {
+    let properties = match Properties::parse_patch_lines(&form.properties) {
         Ok(patch) => Properties::from(patch),
-        Err(e) => return Ok(Flash::error(back, e.message).into_response()),
+        Err(e) => return Ok(Flash::error(back, e.to_string()).into_response()),
     };
     let added = access
         .create_node(
@@ -3031,9 +3009,9 @@ async fn graph_node_edit(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let back = format!("/w/{id}/graph");
-    let patch = match property_lines(&form.properties) {
+    let patch = match Properties::parse_patch_lines(&form.properties) {
         Ok(patch) => patch,
-        Err(e) => return Ok(Flash::error(back, e.message).into_response()),
+        Err(e) => return Ok(Flash::error(back, e.to_string()).into_response()),
     };
     let edit = NodeEdit {
         label: form.label,

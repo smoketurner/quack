@@ -120,7 +120,9 @@ impl From<CoreError> for ApiError {
             | CoreError::WorkspaceLocked { .. }
             | CoreError::WorkspaceTooNew { .. } => StatusCode::SERVICE_UNAVAILABLE,
             CoreError::NoWorkspaceNamed(_) | CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
-            CoreError::SignIn(_) | CoreError::Bearer(_) => StatusCode::UNAUTHORIZED,
+            CoreError::SignIn(_) | CoreError::Bearer(_) | CoreError::AccountDisabled => {
+                StatusCode::UNAUTHORIZED
+            }
             // The caller is known; this provider cannot act for them, or
             // the workspace's allow-list keeps its content from the provider.
             CoreError::Delegation { .. } | CoreError::ProviderRefused(_) => StatusCode::FORBIDDEN,

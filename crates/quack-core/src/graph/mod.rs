@@ -19,6 +19,8 @@ pub mod traverse;
 
 use std::fmt;
 
+use crate::error::{Error, Result as CoreResult};
+
 use duckdb::types::ToSqlOutput;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -135,6 +137,52 @@ impl Properties {
         for (key, value) in &other.0 {
             self.0.entry(key.clone()).or_insert_with(|| value.clone());
         }
+    }
+
+    /// `KEY=VALUE` pairs as properties, as `quack graph add` and `set`
+    /// take them: a value that reads as a JSON number or boolean is stored
+    /// as one, anything else as text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] naming a pair without `=` or a key.
+    pub fn parse_pairs<S: AsRef<str>>(
+        pairs: impl IntoIterator<Item = S>,
+    ) -> CoreResult<serde_json::Map<String, serde_json::Value>> {
+        let mut out = serde_json::Map::new();
+        for pair in pairs {
+            let pair = pair.as_ref();
+            let Some((key, value)) = pair.split_once('=') else {
+                return Err(Error::Config(format!("'{pair}' is not KEY=VALUE")));
+            };
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(Error::Config(format!("'{pair}' has no key")));
+            }
+            let value = serde_json::from_str::<serde_json::Value>(value.trim())
+                .ok()
+                .filter(|v| v.is_number() || v.is_boolean())
+                .unwrap_or_else(|| serde_json::Value::String(value.trim().to_owned()));
+            out.insert(key.to_owned(), value);
+        }
+        Ok(out)
+    }
+
+    /// The graph page's `KEY=VALUE` lines as an edit for [`Self::patch`]:
+    /// blank lines skipped, and an empty value is `null`, which removes
+    /// the key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] naming a line without `=` or a key.
+    pub fn parse_patch_lines(text: &str) -> CoreResult<serde_json::Map<String, serde_json::Value>> {
+        let mut patch = Self::parse_pairs(text.lines().map(str::trim).filter(|l| !l.is_empty()))?;
+        for value in patch.values_mut() {
+            if value.as_str().is_some_and(str::is_empty) {
+                *value = serde_json::Value::Null;
+            }
+        }
+        Ok(patch)
     }
 
     /// Apply a person's edit: each value sets its key, `null` removes it.

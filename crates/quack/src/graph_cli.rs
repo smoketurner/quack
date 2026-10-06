@@ -134,29 +134,6 @@ pub(crate) enum DeleteWhat {
     Edge { id: String },
 }
 
-/// `KEY=VALUE` pairs as properties: a value that reads as a JSON number
-/// or boolean is stored as one, anything else as text.
-pub(crate) fn parse_properties(
-    pairs: &[String],
-) -> Result<serde_json::Map<String, serde_json::Value>> {
-    let mut out = serde_json::Map::new();
-    for pair in pairs {
-        let (key, value) = pair
-            .split_once('=')
-            .with_context(|| format!("'{pair}' is not KEY=VALUE"))?;
-        let key = key.trim();
-        if key.is_empty() {
-            anyhow::bail!("'{pair}' has no key");
-        }
-        let value = serde_json::from_str::<serde_json::Value>(value.trim())
-            .ok()
-            .filter(|v| v.is_number() || v.is_boolean())
-            .unwrap_or_else(|| serde_json::Value::String(value.trim().to_owned()));
-        out.insert(key.to_owned(), value);
-    }
-    Ok(out)
-}
-
 #[derive(clap::Args)]
 pub(crate) struct SearchArgs {
     /// The entity's name as it appears in the data
@@ -322,7 +299,7 @@ async fn run_add(db: &Writer, out: &mut impl Write, what: AddWhat) -> Result<()>
             properties,
             note,
         } => {
-            let properties = Properties::from(parse_properties(&properties)?);
+            let properties = Properties::from(Properties::parse_pairs(&properties)?);
             let assertion = Assertion { author: None, note };
             db.render(out, move |db, out| {
                 let added = graph_store::create_node(
@@ -357,7 +334,7 @@ async fn run_add(db: &Writer, out: &mut impl Write, what: AddWhat) -> Result<()>
             properties,
             note,
         } => {
-            let properties = Properties::from(parse_properties(&properties)?);
+            let properties = Properties::from(Properties::parse_pairs(&properties)?);
             let assertion = Assertion { author: None, note };
             db.render(out, move |db, out| {
                 let source = graph_store::find_node(db, &from, None)?;
@@ -402,7 +379,7 @@ async fn run_set(db: &Writer, out: &mut impl Write, args: SetArgs) -> Result<()>
         unset,
         note,
     } = args;
-    let mut patch = parse_properties(&properties)?;
+    let mut patch = Properties::parse_pairs(&properties)?;
     for key in unset {
         patch.insert(key, serde_json::Value::Null);
     }
@@ -885,7 +862,7 @@ mod edit_tests {
             edge.starts_with("Added Ada Lovelace -mentions-> London ("),
             "{edge}"
         );
-        let bad_pair = parse_properties(&[String::from("novalue")])
+        let bad_pair = Properties::parse_pairs(["novalue"])
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();

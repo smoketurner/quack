@@ -26,7 +26,9 @@ use crate::config::{Config, Lockout, ProviderName};
 use crate::crypto::sha256_hex;
 use crate::error::{Error, Result};
 use crate::ids::{AuditId, UserId, WorkspaceId};
+use crate::ocsf::PromptText;
 use crate::oidc::OidcSubject;
+use crate::storage::audit::AuditDetailRow;
 use crate::text::blank_as_none;
 use crate::vault::Sealed;
 
@@ -1657,6 +1659,29 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// `user`, unless an admin disabled them: then a denied row under
+    /// `action` from `origin`, and [`Error::AccountDisabled`], whatever the
+    /// credential that named them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::AccountDisabled`] for a disabled user, or an error
+    /// when the denied row cannot be written.
+    pub async fn admit(
+        &self,
+        user: UserRow,
+        action: AuditAction,
+        origin: &Origin,
+    ) -> Result<UserRow> {
+        if !user.is_disabled() {
+            return Ok(user);
+        }
+        let mut entry = AuditEntry::new(action, Outcome::Denied, origin.clone());
+        entry.user_id = Some(user.id.clone());
+        self.record_audit(&entry).await?;
+        Err(Error::AccountDisabled)
+    }
+
     /// Refuse the user's logins and credentials from now on.
     ///
     /// # Errors
@@ -2658,7 +2683,8 @@ impl ControlPlane {
         Ok(bound.query_as().fetch_all(&self.pool).await?)
     }
 
-    /// Make the user's provider-granted memberships match `groups`: in
+    /// Make the user's provider-granted memberships match `groups`, each
+    /// change a `member` row from `origin`: in
     /// each workspace, the highest role among the groups with one, else
     /// none. Only rows granted by the provider are added, re-roled, or
     /// deleted; a row a person granted is never touched. Every change
@@ -2669,10 +2695,16 @@ impl ControlPlane {
     /// Returns an error if a query or the commit fails.
     pub async fn reconcile_idp_memberships(
         &self,
-        user_id: &UserId,
+        user: &UserRow,
         groups: &[String],
-        audit: impl Fn() -> AuditEntry,
+        origin: &Origin,
     ) -> Result<Reconciled> {
+        let user_id = &user.id;
+        let audit = || {
+            let mut entry = AuditEntry::new(AuditAction::Member, Outcome::Allowed, origin.clone());
+            entry.user_id = Some(user_id.clone());
+            entry
+        };
         let wanted = self.roles_for_groups(groups).await?;
         let bound = Bound::new(
             Query::select()
@@ -2746,7 +2778,7 @@ impl ControlPlane {
                 .await?;
         }
         tx.commit().await?;
-        tracing::info!(user_id = %user_id, ?outcome, "reconciled identity-provider memberships");
+        tracing::info!(user = %user.username, ?outcome, "memberships follow the identity provider's groups");
         Ok(outcome)
     }
 
@@ -3029,6 +3061,31 @@ impl ControlPlane {
         }
         let bound = AuditFilter::by_ids(ids)?;
         Ok(bound.query_as().fetch_all(&self.pool).await?)
+    }
+
+    /// A workspace's detail rows joined to their access rows by the shared
+    /// id, as OCSF events in the details' order; a detail row whose access
+    /// row is gone is left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or a stored timestamp does not
+    /// parse.
+    pub async fn ocsf_events(
+        &self,
+        details: &[AuditDetailRow],
+        prompt: PromptText,
+    ) -> Result<Vec<serde_json::Value>> {
+        let ids: Vec<AuditId> = details.iter().map(|d| d.id.clone()).collect();
+        let rows = self.audit_rows_by_ids(&ids).await?;
+        let by_id: HashMap<&AuditId, &AuditRow> = rows.iter().map(|r| (&r.entry.id, r)).collect();
+        let mut events = Vec::with_capacity(details.len());
+        for detail in details {
+            if let Some(row) = by_id.get(&detail.id) {
+                events.push(row.to_ocsf_with_detail(Some(detail), prompt)?);
+            }
+        }
+        Ok(events)
     }
 
     /// One page of the access audit under `filter`, newest first.

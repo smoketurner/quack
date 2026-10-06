@@ -153,6 +153,10 @@ pub enum Error {
     #[error("ingestion error: {0}")]
     Ingestion(String),
 
+    /// An admin disabled the account a credential names.
+    #[error("account disabled")]
+    AccountDisabled,
+
     /// A workspace snapshot that is not one, is from a newer quack, or
     /// names a path outside the workspace (`storage::backup`).
     #[error("snapshot error: {0}")]
@@ -218,6 +222,12 @@ pub enum Error {
 }
 
 impl Error {
+    /// Bytes the tar reader could not take as a workspace snapshot.
+    #[must_use]
+    pub fn not_a_snapshot(e: &std::io::Error) -> Self {
+        Self::Snapshot(format!("not a workspace snapshot: {e}"))
+    }
+
     /// Whether a workspace's provider allow-list refused the work: the one
     /// place that decides it, for the audit outcome, a turn's failure kind,
     /// and anything else that answers a refusal differently.

@@ -261,23 +261,6 @@ pub(crate) async fn password_login(
     Ok(Login { user, token })
 }
 
-/// A user a credential names, unless an admin disabled them: then a denied
-/// row under `action` and a 401, whatever the credential.
-pub(crate) async fn unless_disabled(
-    app: &App,
-    user: UserRow,
-    action: AuditAction,
-    origin: &Origin,
-) -> ApiResult<UserRow> {
-    if !user.is_disabled() {
-        return Ok(user);
-    }
-    let mut entry = AuditEntry::new(action, Outcome::Denied, origin.clone());
-    entry.user_id = Some(user.id.clone());
-    app.control.record_audit(&entry).await?;
-    Err(ApiError::unauthorized("account disabled"))
-}
-
 /// A password login that succeeded: who, and their new session.
 pub(crate) struct Login {
     pub(crate) user: UserRow,
@@ -356,7 +339,10 @@ impl Identity {
                     .get_user(&user_id)
                     .await?
                     .ok_or_else(|| ApiError::unauthorized("session user no longer exists"))?;
-                let user = unless_disabled(app, user, AuditAction::Session, &origin).await?;
+                let user = app
+                    .control
+                    .admit(user, AuditAction::Session, &origin)
+                    .await?;
                 return Ok(Self {
                     user_id: user.id,
                     username: user.username,
@@ -410,7 +396,7 @@ impl Identity {
             .get_user(&token.user_id)
             .await?
             .ok_or_else(|| ApiError::unauthorized("token user no longer exists"))?;
-        let user = unless_disabled(app, user, AuditAction::Token, &origin).await?;
+        let user = app.control.admit(user, AuditAction::Token, &origin).await?;
         Ok(Self {
             user_id: user.id,
             username: user.username,
@@ -430,7 +416,7 @@ impl Identity {
     ) -> ApiResult<Self> {
         match oidc.bearer_user(&app.control, token, &origin).await {
             Ok(user) => {
-                let user = unless_disabled(app, user, AuditAction::Token, &origin).await?;
+                let user = app.control.admit(user, AuditAction::Token, &origin).await?;
                 Ok(Self {
                     user_id: user.id,
                     username: user.username,

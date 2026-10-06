@@ -47,8 +47,12 @@ pub fn render() -> Option<String> {
 
 /// The model a request named, as a label: the id, or `-` for a request
 /// that named none.
-fn model_label(model: Option<&str>) -> String {
-    model.unwrap_or("-").to_owned()
+struct ModelLabel<'a>(Option<&'a str>);
+
+impl ModelLabel<'_> {
+    fn text(&self) -> String {
+        self.0.unwrap_or("-").to_owned()
+    }
 }
 
 /// One provider request finished with `status` (the HTTP status, or
@@ -56,7 +60,7 @@ fn model_label(model: Option<&str>) -> String {
 pub fn provider_request(provider: &str, model: Option<&str>, status: &str, latency: Duration) {
     let labels = [
         ("provider", provider.to_owned()),
-        ("model", model_label(model)),
+        ("model", ModelLabel(model).text()),
         ("status", status.to_owned()),
     ];
     counter!("quack_provider_requests_total", &labels).increment(1);
@@ -67,7 +71,7 @@ pub fn provider_request(provider: &str, model: Option<&str>, status: &str, laten
 pub fn provider_permit_wait(provider: &str, model: Option<&str>, wait: Duration) {
     let labels = [
         ("provider", provider.to_owned()),
-        ("model", model_label(model)),
+        ("model", ModelLabel(model).text()),
     ];
     histogram!("quack_provider_permit_wait_seconds", &labels).record(wait.as_secs_f64());
 }
@@ -76,7 +80,7 @@ pub fn provider_permit_wait(provider: &str, model: Option<&str>, wait: Duration)
 pub fn provider_retry(provider: &str, model: Option<&str>) {
     let labels = [
         ("provider", provider.to_owned()),
-        ("model", model_label(model)),
+        ("model", ModelLabel(model).text()),
     ];
     counter!("quack_provider_retries_total", &labels).increment(1);
 }
@@ -96,25 +100,30 @@ pub fn http_request(method: &str, route: &str, status: u16, latency: Duration) {
 /// How many jobs of `kind` are in `state` right now.
 pub fn set_jobs(kind: &str, state: &str, count: usize) {
     let labels = [("kind", kind.to_owned()), ("state", state.to_owned())];
-    gauge!("quack_jobs", &labels).set(count_f64(count));
+    gauge!("quack_jobs", &labels).set(Gauged(count).value());
 }
 
 /// How many closures wait for the workspaces' writers, by priority.
 pub fn set_writer_waiting(priority: &str, count: usize) {
-    gauge!("quack_writer_waiting", "priority" => priority.to_owned()).set(count_f64(count));
+    gauge!("quack_writer_waiting", "priority" => priority.to_owned()).set(Gauged(count).value());
 }
 
 /// How many workspace files the server holds open.
 pub fn set_open_workspaces(count: usize) {
-    gauge!("quack_open_workspaces").set(count_f64(count));
+    gauge!("quack_open_workspaces").set(Gauged(count).value());
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "a count of jobs or workspaces is far below 2^53"
-)]
-fn count_f64(count: usize) -> f64 {
-    count as f64
+/// A count as a gauge's value.
+struct Gauged(usize);
+
+impl Gauged {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a count of jobs or workspaces is far below 2^53"
+    )]
+    fn value(self) -> f64 {
+        self.0 as f64
+    }
 }
 
 #[cfg(test)]

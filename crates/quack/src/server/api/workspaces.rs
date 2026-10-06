@@ -2,7 +2,7 @@
 //! admins, settings and snapshots by owners, and the content half of the
 //! audit for members.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -11,14 +11,14 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use quack_core::ids::{AuditId, WorkspaceId};
+use quack_core::ids::WorkspaceId;
 use quack_core::ocsf::PromptText;
 use quack_core::okf;
-use quack_core::storage::audit::{self, AuditDetailRow};
-use quack_core::storage::backup::{self, Described, Manifest, RestoreRequest};
+use quack_core::storage::audit;
+use quack_core::storage::backup::{Described, Manifest, RestoreRequest};
 use quack_core::storage::control::{
-    AuditAction, AuditRow, ControlPlane, Membership, Outcome, ProviderAllowList, ResourceKind,
-    Role, Standing, UserKind, WorkspaceChanges, WorkspaceName, WorkspaceRow,
+    AuditAction, Membership, Outcome, ProviderAllowList, ResourceKind, Role, Standing, UserKind,
+    WorkspaceChanges, WorkspaceName, WorkspaceRow,
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -145,37 +145,15 @@ pub(crate) async fn update(
             Some(names) => ProviderAllowList::Only(names),
         },
     };
-    let ws = update_settings(&app, &access, changes).await?;
+    let ws = access.update_settings(&app, changes).await?;
     let ws = match body.name {
-        Some(name) => rename(&app, &access, &name).await?,
+        Some(name) => access.rename_workspace(&app, &name).await?,
         None => ws,
     };
     Ok(Json(Membership {
         workspace: ws,
         standing: access.membership.standing,
     }))
-}
-
-/// Rename the workspace for its owner, audited as a settings change; a
-/// name that is already the workspace's own changes nothing.
-pub(crate) async fn rename(app: &App, access: &Access, name: &str) -> ApiResult<WorkspaceRow> {
-    let name: WorkspaceName = name.parse()?;
-    if name.as_str() == access.membership.workspace.name {
-        return Ok(access.membership.workspace.clone());
-    }
-    let entry = access.entry(AuditAction::Workspace, Outcome::Allowed);
-    let ws = app
-        .control
-        .rename_workspace(&access.membership.workspace.id, &name, entry.clone())
-        .await?;
-    access
-        .record_detail(
-            app,
-            &entry,
-            Some(serde_json::json!({ "renamed_to": name.as_str() })),
-        )
-        .await?;
-    Ok(ws)
 }
 
 /// `GET .../snapshot`: the workspace as a tar for its owner, written on
@@ -199,7 +177,7 @@ pub(crate) async fn snapshot(
         let written = writer
             .run(move |db| {
                 let manifest = Manifest::of(db, described)?;
-                backup::snapshot(db, &dir, &manifest, BodyWriter::new(tx))?.flush()?;
+                manifest.write(db, &dir, BodyWriter::new(tx))?.flush()?;
                 Ok(())
             })
             .await;
@@ -266,16 +244,14 @@ pub(crate) async fn restore(
     let name = query.name.map(|n| n.parse::<WorkspaceName>()).transpose()?;
     let owner = (app.mode == ServeMode::Login).then(|| identity.user_id.clone());
     let audit = |action| identity.audit(action, Outcome::Allowed);
-    let restored = backup::restore(
-        &app.control,
-        &app.config,
-        move || Ok(io::Cursor::new(body.clone())),
-        RestoreRequest {
-            name,
-            owner: owner.as_ref(),
-            audit: &audit,
-        },
-    )
+    let restored = RestoreRequest {
+        name,
+        owner: owner.as_ref(),
+        audit: &audit,
+    }
+    .run(&app.control, &app.config, move || {
+        Ok(io::Cursor::new(body.clone()))
+    })
     .await?;
     Ok((StatusCode::CREATED, Json(restored)))
 }
@@ -290,56 +266,37 @@ pub(crate) async fn delete(
     Path(id): Path<WorkspaceId>,
 ) -> ApiResult<StatusCode> {
     let access = Access::resolve(&app, identity, &id, Need::OWN).await?;
-    delete_workspace(&app, &access).await?;
+    access.delete_workspace(&app).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Delete the workspace an `Access` names, from the API or the web
-/// console; see [`delete`].
-pub(crate) async fn delete_workspace(app: &App, access: &Access) -> ApiResult<()> {
-    let id = &access.membership.workspace.id;
-    app.close_workspace(id).await?;
-    let entry = access.entry(AuditAction::Delete, Outcome::Allowed);
-    app.control.delete_workspace(id, entry).await?;
-    let dir = app.config.workspace_dir(id.as_str());
-    if dir.exists()
-        && let Err(e) = tokio::fs::remove_dir_all(&dir).await
-    {
-        tracing::error!(workspace = %id, error = %e, "the deleted workspace's directory remains");
-        return Err(ApiError::internal(format!(
-            "the workspace is gone from control.db, but its directory could not be removed: {e}"
-        )));
-    }
-    Ok(())
-}
-
-/// Change a workspace's settings for its owner, from the API or the web
-/// console: every allowed provider must be configured, the classification
-/// is trimmed, and the change is audited.
-pub(crate) async fn update_settings(
-    app: &App,
-    access: &Access,
-    changes: WorkspaceChanges,
-) -> ApiResult<WorkspaceRow> {
-    if let ProviderAllowList::Only(names) = &changes.allowed_providers
-        && let Some(unknown) = names
-            .iter()
-            .find(|name| !app.config.providers.contains_key(name.as_str()))
-    {
-        return Err(ApiError::bad_request(format!(
-            "'{unknown}' is not a configured provider"
-        )));
-    }
-    let changes = WorkspaceChanges {
-        classification: changes.classification.map(|c| c.trim().to_owned()),
-        ..changes
-    };
-    let ws = app
-        .control
-        .update_workspace(&access.membership.workspace.id, &changes)
-        .await?;
-    access
-        .audit(
+impl Access {
+    /// Change a workspace's settings for its owner, from the API or the web
+    /// console: every allowed provider must be configured, the classification
+    /// is trimmed, and the change is audited.
+    pub(crate) async fn update_settings(
+        &self,
+        app: &App,
+        changes: WorkspaceChanges,
+    ) -> ApiResult<WorkspaceRow> {
+        if let ProviderAllowList::Only(names) = &changes.allowed_providers
+            && let Some(unknown) = names
+                .iter()
+                .find(|name| !app.config.providers.contains_key(name.as_str()))
+        {
+            return Err(ApiError::bad_request(format!(
+                "'{unknown}' is not a configured provider"
+            )));
+        }
+        let changes = WorkspaceChanges {
+            classification: changes.classification.map(|c| c.trim().to_owned()),
+            ..changes
+        };
+        let ws = app
+            .control
+            .update_workspace(&self.membership.workspace.id, &changes)
+            .await?;
+        self.audit(
             app,
             AuditAction::Workspace,
             Some(ResourceKind::Workspace.id(ws.id.as_str())),
@@ -347,7 +304,48 @@ pub(crate) async fn update_settings(
             None,
         )
         .await?;
-    Ok(ws)
+        Ok(ws)
+    }
+
+    /// Rename the workspace for its owner, audited as a settings change; a
+    /// name that is already the workspace's own changes nothing.
+    pub(crate) async fn rename_workspace(&self, app: &App, name: &str) -> ApiResult<WorkspaceRow> {
+        let name: WorkspaceName = name.parse()?;
+        if name.as_str() == self.membership.workspace.name {
+            return Ok(self.membership.workspace.clone());
+        }
+        let entry = self.entry(AuditAction::Workspace, Outcome::Allowed);
+        let ws = app
+            .control
+            .rename_workspace(&self.membership.workspace.id, &name, entry.clone())
+            .await?;
+        self.record_detail(
+            app,
+            &entry,
+            Some(serde_json::json!({ "renamed_to": name.as_str() })),
+        )
+        .await?;
+        Ok(ws)
+    }
+
+    /// Delete the workspace an `Access` names, from the API or the web
+    /// console; see [`delete`].
+    pub(crate) async fn delete_workspace(&self, app: &App) -> ApiResult<()> {
+        let id = &self.membership.workspace.id;
+        app.close_workspace(id).await?;
+        let entry = self.entry(AuditAction::Delete, Outcome::Allowed);
+        app.control.delete_workspace(id, entry).await?;
+        let dir = app.config.workspace_dir(id.as_str());
+        if dir.exists()
+            && let Err(e) = tokio::fs::remove_dir_all(&dir).await
+        {
+            tracing::error!(workspace = %id, error = %e, "the deleted workspace's directory remains");
+            return Err(ApiError::internal(format!(
+                "the workspace is gone from control.db, but its directory could not be removed: {e}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -388,37 +386,14 @@ pub(crate) async fn audit_detail(
     match q.format.as_deref() {
         None => Ok(Json(serde_json::json!({ "audit": rows }))),
         Some("ocsf") => {
-            let prompt = if q.prompt {
-                PromptText::Include
-            } else {
-                PromptText::Omit
-            };
-            let events = ocsf_events(&app.control, &rows, prompt).await?;
+            let events = app
+                .control
+                .ocsf_events(&rows, PromptText::from(q.prompt))
+                .await?;
             Ok(Json(serde_json::json!({ "audit": events })))
         }
         Some(other) => Err(ApiError::bad_request(format!(
             "format must be ocsf, not {other}"
         ))),
     }
-}
-
-/// A workspace's detail rows joined to their access rows by the shared
-/// id, rendered as OCSF events, newest first; a detail row whose access
-/// row is gone is left out.
-pub(crate) async fn ocsf_events(
-    control: &ControlPlane,
-    details: &[AuditDetailRow],
-    prompt: PromptText,
-) -> ApiResult<Vec<serde_json::Value>> {
-    let ids: Vec<AuditId> = details.iter().map(|d| d.id.clone()).collect();
-    let access_rows = control.audit_rows_by_ids(&ids).await?;
-    let by_id: HashMap<&AuditId, &AuditRow> =
-        access_rows.iter().map(|r| (&r.entry.id, r)).collect();
-    let mut events = Vec::with_capacity(details.len());
-    for detail in details {
-        if let Some(row) = by_id.get(&detail.id) {
-            events.push(row.to_ocsf_with_detail(Some(detail), prompt)?);
-        }
-    }
-    Ok(events)
 }

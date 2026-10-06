@@ -145,104 +145,102 @@ impl Manifest {
     }
 }
 
-/// Write `workspace_dir`'s file and `files/` as a tar to `out`, after a
-/// checkpoint on `db`. Runs on the writer's thread.
-///
-/// # Errors
-///
-/// Returns an error if the checkpoint or a write fails.
-pub fn snapshot<W: Write>(
-    db: &WorkspaceDb,
-    workspace_dir: &Path,
-    manifest: &Manifest,
-    out: W,
-) -> Result<W> {
-    db.connection().execute_batch("CHECKPOINT")?;
-    let mut builder = tar::Builder::new(out);
-    let text = serde_json::to_vec_pretty(manifest)?;
-    let mut header = tar::Header::new_gnu();
-    header.set_size(u64::try_from(text.len()).unwrap_or(u64::MAX));
-    header.set_mode(0o644);
-    header.set_mtime(0);
-    header.set_cksum();
-    builder.append_data(&mut header, MANIFEST, text.as_slice())?;
-    builder.append_path_with_name(workspace_dir.join(DATABASE), DATABASE)?;
-    let files = workspace_dir.join(FILES);
-    if files.is_dir() {
-        builder.append_dir_all(FILES, &files)?;
+impl Manifest {
+    /// Write this manifest, `workspace_dir`'s file, and its `files/` as a tar
+    /// to `out`, after a checkpoint on `db`. Runs on the writer's thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint or a write fails.
+    pub fn write<W: Write>(&self, db: &WorkspaceDb, workspace_dir: &Path, out: W) -> Result<W> {
+        db.connection().execute_batch("CHECKPOINT")?;
+        let mut builder = tar::Builder::new(out);
+        let text = serde_json::to_vec_pretty(self)?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(u64::try_from(text.len()).unwrap_or(u64::MAX));
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder.append_data(&mut header, MANIFEST, text.as_slice())?;
+        builder.append_path_with_name(workspace_dir.join(DATABASE), DATABASE)?;
+        let files = workspace_dir.join(FILES);
+        if files.is_dir() {
+            builder.append_dir_all(FILES, &files)?;
+        }
+        builder.into_inner().map_err(Error::Io)
     }
-    builder.into_inner().map_err(Error::Io)
-}
 
-/// The manifest at the head of a snapshot.
-///
-/// # Errors
-///
-/// Returns an error when the bytes are not a snapshot.
-pub fn read_manifest<R: Read>(tar: R) -> Result<Manifest> {
-    let mut archive = tar::Archive::new(tar);
-    for entry in archive.entries().map_err(|e| not_a_snapshot(&e))? {
-        let mut entry = entry.map_err(|e| not_a_snapshot(&e))?;
-        if entry.path()?.to_string_lossy().trim_start_matches("./") == MANIFEST {
-            let mut text = String::new();
-            entry.read_to_string(&mut text)?;
-            return Ok(serde_json::from_str(&text)?);
+    /// The manifest at the head of a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bytes are not a snapshot.
+    pub fn read<R: Read>(tar: R) -> Result<Self> {
+        let mut archive = tar::Archive::new(tar);
+        for entry in archive.entries().map_err(|e| Error::not_a_snapshot(&e))? {
+            let mut entry = entry.map_err(|e| Error::not_a_snapshot(&e))?;
+            if entry.path()?.to_string_lossy().trim_start_matches("./") == MANIFEST {
+                let mut text = String::new();
+                entry.read_to_string(&mut text)?;
+                return Ok(serde_json::from_str(&text)?);
+            }
         }
+        Err(Error::Snapshot(String::from(
+            "not a workspace snapshot: no manifest.json",
+        )))
     }
-    Err(Error::Snapshot(String::from(
-        "not a workspace snapshot: no manifest.json",
-    )))
-}
 
-/// Unpack a snapshot into `workspace_dir`, which must not yet hold a
-/// database: `data.duckdb` and `files/`, nothing that escapes the
-/// directory. The manifest is returned.
-///
-/// # Errors
-///
-/// Returns an error when the bytes are not a snapshot, an entry's path
-/// leaves the directory, or a write fails.
-pub fn unpack<R: Read>(tar: R, workspace_dir: &Path) -> Result<Manifest> {
-    if workspace_dir.join(DATABASE).exists() {
-        return Err(Error::Snapshot(format!(
-            "{} already holds a workspace file",
-            workspace_dir.display()
-        )));
+    /// Unpack a snapshot into `workspace_dir`, which must not yet hold a
+    /// database: `data.duckdb` and `files/`, nothing that escapes the
+    /// directory. The manifest is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bytes are not a snapshot, an entry's path
+    /// leaves the directory, or a write fails.
+    pub fn unpack<R: Read>(tar: R, workspace_dir: &Path) -> Result<Self> {
+        if workspace_dir.join(DATABASE).exists() {
+            return Err(Error::Snapshot(format!(
+                "{} already holds a workspace file",
+                workspace_dir.display()
+            )));
+        }
+        std::fs::create_dir_all(workspace_dir)?;
+        let mut archive = tar::Archive::new(tar);
+        let mut manifest = None;
+        for entry in archive.entries().map_err(|e| Error::not_a_snapshot(&e))? {
+            let mut entry = entry.map_err(|e| Error::not_a_snapshot(&e))?;
+            let path = entry.path()?.into_owned();
+            let relative = EntryPath::try_from(path.as_path())?.0;
+            if relative == Path::new(MANIFEST) {
+                let mut text = String::new();
+                entry.read_to_string(&mut text)?;
+                manifest = Some(serde_json::from_str::<Self>(&text)?);
+                continue;
+            }
+            let allowed = relative == Path::new(DATABASE) || relative.starts_with(FILES);
+            if !allowed {
+                tracing::warn!(entry = %relative.display(), "skipping an entry outside the snapshot layout");
+                continue;
+            }
+            let target = workspace_dir.join(&relative);
+            if entry.header().entry_type().is_dir() {
+                std::fs::create_dir_all(&target)?;
+                continue;
+            }
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut file = std::fs::File::create(&target)?;
+            std::io::copy(&mut entry, &mut file)?;
+        }
+        manifest.ok_or_else(|| {
+            Error::Snapshot(String::from("not a workspace snapshot: no manifest.json"))
+        })
     }
-    std::fs::create_dir_all(workspace_dir)?;
-    let mut archive = tar::Archive::new(tar);
-    let mut manifest = None;
-    for entry in archive.entries().map_err(|e| not_a_snapshot(&e))? {
-        let mut entry = entry.map_err(|e| not_a_snapshot(&e))?;
-        let path = entry.path()?.into_owned();
-        let relative = safe_relative(&path)?;
-        if relative == Path::new(MANIFEST) {
-            let mut text = String::new();
-            entry.read_to_string(&mut text)?;
-            manifest = Some(serde_json::from_str::<Manifest>(&text)?);
-            continue;
-        }
-        let allowed = relative == Path::new(DATABASE) || relative.starts_with(FILES);
-        if !allowed {
-            tracing::warn!(entry = %relative.display(), "skipping an entry outside the snapshot layout");
-            continue;
-        }
-        let target = workspace_dir.join(&relative);
-        if entry.header().entry_type().is_dir() {
-            std::fs::create_dir_all(&target)?;
-            continue;
-        }
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = std::fs::File::create(&target)?;
-        std::io::copy(&mut entry, &mut file)?;
-    }
-    manifest
-        .ok_or_else(|| Error::Snapshot(String::from("not a workspace snapshot: no manifest.json")))
 }
 
 /// How a snapshot comes back as a workspace.
@@ -270,192 +268,186 @@ pub struct Restored {
     pub providers_dropped: Vec<String>,
 }
 
-/// Restore a snapshot as a new workspace: the row, then the files
-/// unpacked into its directory, then its settings and members, then one
-/// open of the file, which runs any schema upgrade. A failure after the
-/// row exists deletes it and the directory again. `open` yields the tar
-/// bytes; it is read twice, for the manifest and for the files.
-///
-/// # Errors
-///
-/// Returns an error when the bytes are not a snapshot this build reads,
-/// the name is taken, or a write fails.
-pub async fn restore<R, F>(
-    control: &ControlPlane,
-    config: &Config,
-    open: F,
-    request: RestoreRequest<'_>,
-) -> Result<Restored>
-where
-    R: Read,
-    F: Fn() -> std::io::Result<R> + Send + Sync + 'static,
-{
-    let manifest = read_manifest(open()?)?;
-    manifest.check_readable()?;
-    let name = match &request.name {
-        Some(name) => name.clone(),
-        None => manifest.name.parse()?,
-    };
-    let workspace = control
-        .create_workspace(
-            &name,
-            request.owner,
-            (request.audit)(AuditAction::Workspace),
-        )
-        .await?;
-    let id = workspace.id.clone();
-    match fill(
-        control,
-        config,
-        &workspace,
-        Arc::new(open),
-        &manifest,
-        &request,
-    )
-    .await
+impl RestoreRequest<'_> {
+    /// Restore a snapshot as a new workspace: the row, then the files
+    /// unpacked into its directory, then its settings and members, then one
+    /// open of the file, which runs any schema upgrade. A failure after the
+    /// row exists deletes it and the directory again. `open` yields the tar
+    /// bytes; it is read twice, for the manifest and for the files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bytes are not a snapshot this build reads,
+    /// the name is taken, or a write fails.
+    pub async fn run<R, F>(
+        self,
+        control: &ControlPlane,
+        config: &Config,
+        open: F,
+    ) -> Result<Restored>
+    where
+        R: Read,
+        F: Fn() -> std::io::Result<R> + Send + Sync + 'static,
     {
-        Ok(restored) => Ok(restored),
-        Err(e) => {
-            let undo = (request.audit)(AuditAction::Delete);
-            let undo = AuditEntry {
-                outcome: Outcome::Error,
-                ..undo
-            };
-            if let Err(cleanup) = control.delete_workspace(&id, undo).await {
-                tracing::error!(workspace = %id, error = %cleanup, "a failed restore left its workspace row");
+        let manifest = Manifest::read(open()?)?;
+        manifest.check_readable()?;
+        let name = match &self.name {
+            Some(name) => name.clone(),
+            None => manifest.name.parse()?,
+        };
+        let workspace = control
+            .create_workspace(&name, self.owner, (self.audit)(AuditAction::Workspace))
+            .await?;
+        let id = workspace.id.clone();
+        match self
+            .fill(control, config, &workspace, Arc::new(open), &manifest)
+            .await
+        {
+            Ok(restored) => Ok(restored),
+            Err(e) => {
+                let undo = (self.audit)(AuditAction::Delete);
+                let undo = AuditEntry {
+                    outcome: Outcome::Error,
+                    ..undo
+                };
+                if let Err(cleanup) = control.delete_workspace(&id, undo).await {
+                    tracing::error!(workspace = %id, error = %cleanup, "a failed restore left its workspace row");
+                }
+                let dir = config.workspace_dir(id.as_str());
+                if dir.exists()
+                    && let Err(cleanup) = std::fs::remove_dir_all(&dir)
+                {
+                    tracing::error!(workspace = %id, error = %cleanup, "a failed restore left its directory");
+                }
+                Err(e)
             }
-            let dir = config.workspace_dir(id.as_str());
-            if dir.exists()
-                && let Err(cleanup) = std::fs::remove_dir_all(&dir)
-            {
-                tracing::error!(workspace = %id, error = %cleanup, "a failed restore left its directory");
-            }
-            Err(e)
         }
     }
-}
 
-/// Everything after the row exists; see [`restore`].
-async fn fill<R, F>(
-    control: &ControlPlane,
-    config: &Config,
-    workspace: &WorkspaceRow,
-    open: Arc<F>,
-    manifest: &Manifest,
-    request: &RestoreRequest<'_>,
-) -> Result<Restored>
-where
-    R: Read,
-    F: Fn() -> std::io::Result<R> + Send + Sync + 'static,
-{
-    let dir = config.workspace_dir(workspace.id.as_str());
-    let unpack_dir = dir.clone();
-    tokio::task::spawn_blocking(move || unpack(open()?, &unpack_dir))
+    /// Everything after the row exists; see [`Self::run`].
+    async fn fill<R, F>(
+        &self,
+        control: &ControlPlane,
+        config: &Config,
+        workspace: &WorkspaceRow,
+        open: Arc<F>,
+        manifest: &Manifest,
+    ) -> Result<Restored>
+    where
+        R: Read,
+        F: Fn() -> std::io::Result<R> + Send + Sync + 'static,
+    {
+        let dir = config.workspace_dir(workspace.id.as_str());
+        let unpack_dir = dir.clone();
+        tokio::task::spawn_blocking(move || Manifest::unpack(open()?, &unpack_dir))
+            .await
+            .map_err(|e| {
+                Error::Io(std::io::Error::other(format!(
+                    "the restore's unpack task failed: {e}"
+                )))
+            })??;
+
+        let (allowed, providers_dropped): (Vec<String>, Vec<String>) = manifest
+            .allowed_providers
+            .iter()
+            .cloned()
+            .partition(|name| config.providers.contains_key(name.as_str()));
+        let allowed_providers = if manifest.allowed_providers.is_empty() {
+            ProviderAllowList::All
+        } else {
+            ProviderAllowList::Only(allowed.into_iter().collect())
+        };
+        let workspace = control
+            .update_workspace(
+                &workspace.id,
+                &WorkspaceChanges {
+                    classification: Some(manifest.classification.clone()),
+                    allowed_providers,
+                },
+            )
+            .await?;
+
+        let mut members_kept = 0_usize;
+        let mut members_missing = Vec::new();
+        for member in &manifest.members {
+            let Some(user) = control.find_user_by_username(&member.username).await? else {
+                members_missing.push(member.username.clone());
+                continue;
+            };
+            let role: Role = member.role.parse()?;
+            control
+                .set_member(
+                    &workspace.id,
+                    &user.id,
+                    role,
+                    (self.audit)(AuditAction::Member),
+                )
+                .await?;
+            members_kept = members_kept.saturating_add(1);
+        }
+
+        let entry = (self.audit)(AuditAction::Restore)
+            .in_workspace(&workspace.id)
+            .on(ResourceKind::Workspace.id(workspace.id.as_str()));
+        let detail = AuditDetail {
+            id: entry.id.clone(),
+            user_id: entry.user_id.clone(),
+            action: entry.action.to_string(),
+            detail: serde_json::json!({
+                "snapshot_taken_at": manifest.taken_at,
+                "snapshot_quack_version": manifest.quack_version,
+                "members_kept": members_kept,
+                "members_missing": members_missing,
+            }),
+        };
+        let open_config = config.clone();
+        let open_id = workspace.id.clone();
+        // One open, dropped before anyone else opens the file: the schema
+        // upgrade runs here, and the detail row lands on the upgraded file.
+        tokio::task::spawn_blocking(move || {
+            let db = WorkspaceDb::open(&open_config, open_id.as_str())?;
+            detail.write(&db)
+        })
         .await
         .map_err(|e| {
             Error::Io(std::io::Error::other(format!(
-                "the restore's unpack task failed: {e}"
+                "the restore's open task failed: {e}"
             )))
         })??;
-
-    let (allowed, providers_dropped): (Vec<String>, Vec<String>) = manifest
-        .allowed_providers
-        .iter()
-        .cloned()
-        .partition(|name| config.providers.contains_key(name.as_str()));
-    let allowed_providers = if manifest.allowed_providers.is_empty() {
-        ProviderAllowList::All
-    } else {
-        ProviderAllowList::Only(allowed.into_iter().collect())
-    };
-    let workspace = control
-        .update_workspace(
-            &workspace.id,
-            &WorkspaceChanges {
-                classification: Some(manifest.classification.clone()),
-                allowed_providers,
-            },
-        )
-        .await?;
-
-    let mut members_kept = 0_usize;
-    let mut members_missing = Vec::new();
-    for member in &manifest.members {
-        let Some(user) = control.find_user_by_username(&member.username).await? else {
-            members_missing.push(member.username.clone());
-            continue;
-        };
-        let role: Role = member.role.parse()?;
-        control
-            .set_member(
-                &workspace.id,
-                &user.id,
-                role,
-                (request.audit)(AuditAction::Member),
-            )
-            .await?;
-        members_kept = members_kept.saturating_add(1);
+        control.record_audit(&entry).await?;
+        Ok(Restored {
+            workspace,
+            manifest: manifest.clone(),
+            members_kept,
+            members_missing,
+            providers_dropped,
+        })
     }
-
-    let entry = (request.audit)(AuditAction::Restore)
-        .in_workspace(&workspace.id)
-        .on(ResourceKind::Workspace.id(workspace.id.as_str()));
-    let detail = AuditDetail {
-        id: entry.id.clone(),
-        user_id: entry.user_id.clone(),
-        action: entry.action.to_string(),
-        detail: serde_json::json!({
-            "snapshot_taken_at": manifest.taken_at,
-            "snapshot_quack_version": manifest.quack_version,
-            "members_kept": members_kept,
-            "members_missing": members_missing,
-        }),
-    };
-    let open_config = config.clone();
-    let open_id = workspace.id.clone();
-    // One open, dropped before anyone else opens the file: the schema
-    // upgrade runs here, and the detail row lands on the upgraded file.
-    tokio::task::spawn_blocking(move || {
-        let db = WorkspaceDb::open(&open_config, open_id.as_str())?;
-        detail.write(&db)
-    })
-    .await
-    .map_err(|e| {
-        Error::Io(std::io::Error::other(format!(
-            "the restore's open task failed: {e}"
-        )))
-    })??;
-    control.record_audit(&entry).await?;
-    Ok(Restored {
-        workspace,
-        manifest: manifest.clone(),
-        members_kept,
-        members_missing,
-        providers_dropped,
-    })
 }
 
-/// Bytes the tar reader cannot take as a tar.
-fn not_a_snapshot(e: &std::io::Error) -> Error {
-    Error::Snapshot(format!("not a workspace snapshot: {e}"))
-}
+/// A tar entry's path as a relative path with no `..` or root: the one
+/// shape `Manifest::unpack` writes under the workspace directory.
+struct EntryPath(PathBuf);
 
-/// A tar entry's path as a relative path with no `..` or root.
-fn safe_relative(path: &Path) -> Result<PathBuf> {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(Error::Snapshot(format!(
-                    "the snapshot names a path outside the workspace: {}",
-                    path.display()
-                )));
+impl TryFrom<&Path> for EntryPath {
+    type Error = Error;
+
+    fn try_from(path: &Path) -> Result<Self> {
+        let mut out = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(part) => out.push(part),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(Error::Snapshot(format!(
+                        "the snapshot names a path outside the workspace: {}",
+                        path.display()
+                    )));
+                }
             }
         }
+        Ok(Self(out))
     }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -492,11 +484,13 @@ mod tests {
     #[test]
     fn paths_that_escape_the_workspace_are_refused() {
         assert_eq!(
-            safe_relative(Path::new("./files/a.csv")).ok(),
+            EntryPath::try_from(Path::new("./files/a.csv"))
+                .ok()
+                .map(|p| p.0),
             Some(PathBuf::from("files/a.csv"))
         );
-        assert!(safe_relative(Path::new("../etc/passwd")).is_err());
-        assert!(safe_relative(Path::new("/etc/passwd")).is_err());
+        assert!(EntryPath::try_from(Path::new("../etc/passwd")).is_err());
+        assert!(EntryPath::try_from(Path::new("/etc/passwd")).is_err());
     }
 
     #[test]
@@ -511,9 +505,9 @@ mod tests {
         let bytes = builder
             .into_inner()
             .unwrap_or_else(|e| unreachable_tar(&e.to_string()));
-        assert!(read_manifest(bytes.as_slice()).is_err());
+        assert!(Manifest::read(bytes.as_slice()).is_err());
         let dir = tempfile::tempdir().unwrap_or_else(|e| unreachable_tar(&e.to_string()));
-        assert!(unpack(bytes.as_slice(), &dir.path().join("ws")).is_err());
+        assert!(Manifest::unpack(bytes.as_slice(), &dir.path().join("ws")).is_err());
     }
 
     /// The tar holds the manifest, the file, and the uploads; unpacked
@@ -543,12 +537,16 @@ mod tests {
         let manifest =
             Manifest::of(&db, described).unwrap_or_else(|e| unreachable_tar(&e.to_string()));
         assert_eq!(manifest.schema_version, Some(WorkspaceDb::schema_version()));
-        let tar = snapshot(&db, &config.workspace_dir("src"), &manifest, Vec::new())
+        let tar = manifest
+            .write(&db, &config.workspace_dir("src"), Vec::new())
             .unwrap_or_else(|e| unreachable_tar(&e.to_string()));
         drop(db);
 
-        assert_eq!(read_manifest(tar.as_slice()).ok().as_ref(), Some(&manifest));
-        let unpacked = unpack(tar.as_slice(), &config.workspace_dir("dst"))
+        assert_eq!(
+            Manifest::read(tar.as_slice()).ok().as_ref(),
+            Some(&manifest)
+        );
+        let unpacked = Manifest::unpack(tar.as_slice(), &config.workspace_dir("dst"))
             .unwrap_or_else(|e| unreachable_tar(&e.to_string()));
         assert_eq!(unpacked, manifest);
         assert_eq!(
@@ -562,7 +560,7 @@ mod tests {
             .unwrap_or_else(|e| unreachable_tar(&e.to_string()));
         assert_eq!(rows.rows, vec![vec![serde_json::json!(42)]]);
         // A second unpack into a directory that holds a file is refused.
-        assert!(unpack(tar.as_slice(), &config.workspace_dir("dst")).is_err());
+        assert!(Manifest::unpack(tar.as_slice(), &config.workspace_dir("dst")).is_err());
     }
 
     #[expect(clippy::panic, reason = "test failure path")]

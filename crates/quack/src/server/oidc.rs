@@ -22,9 +22,7 @@ use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::oidc::{
     Pending, RENEW_MARGIN, SignIn, SignedIn, Stored, SubjectTokens, UserTokens,
 };
-use quack_core::storage::control::{
-    AuditAction, AuditEntry, ControlPlane, Origin, Outcome, UserRow,
-};
+use quack_core::storage::control::{ControlPlane, Origin, UserRow};
 use quack_core::vault::Vault;
 use quack_core::web_sessions::{SessionToken, WebSessions};
 
@@ -222,7 +220,9 @@ impl Oidc {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(user.id.clone(), digest.clone());
             if seen.as_deref() != Some(digest.as_str()) {
-                reconcile_groups(control, &user, groups, origin).await?;
+                control
+                    .reconcile_idp_memberships(&user, groups, origin)
+                    .await?;
             }
         }
         Ok(user)
@@ -243,24 +243,3 @@ impl Oidc {
 
 #[cfg(test)]
 mod tests;
-
-/// Make the user's provider-granted memberships match the groups their
-/// token lists; each change is a `member` row of their own, from `origin`.
-pub(crate) async fn reconcile_groups(
-    control: &ControlPlane,
-    user: &UserRow,
-    groups: &[String],
-    origin: &Origin,
-) -> CoreResult<()> {
-    let outcome = control
-        .reconcile_idp_memberships(&user.id, groups, || {
-            let mut entry = AuditEntry::new(AuditAction::Member, Outcome::Allowed, origin.clone());
-            entry.user_id = Some(user.id.clone());
-            entry
-        })
-        .await?;
-    if outcome.granted > 0 || outcome.changed > 0 || outcome.revoked > 0 {
-        tracing::info!(user = %user.username, ?outcome, "memberships follow the identity provider's groups");
-    }
-    Ok(())
-}

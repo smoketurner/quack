@@ -8,13 +8,12 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use quack_core::config::Config;
-use std::collections::HashMap;
 
-use quack_core::ids::{AuditId, UserId, WorkspaceId};
+use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::ocsf::PromptText;
 use quack_core::prefix::PrefixMatch;
 use quack_core::storage::audit;
-use quack_core::storage::backup::{self, Described, Manifest, RestoreRequest};
+use quack_core::storage::backup::{Described, Manifest, RestoreRequest};
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, Expiry, GrantedBy,
     IssuedToken, Outcome, ResourceKind, Role, Scope, UserKind, UserRow, WorkspaceName,
@@ -342,7 +341,7 @@ async fn snapshot_workspace(
             .run(move |db| {
                 let manifest = Manifest::of(db, described)?;
                 let out = std::io::stdout().lock();
-                backup::snapshot(db, &dir, &manifest, out)?.flush()?;
+                manifest.write(db, &dir, out)?.flush()?;
                 Ok(())
             })
             .await
@@ -353,7 +352,7 @@ async fn snapshot_workspace(
         .run(move |db| {
             let manifest = Manifest::of(db, described)?;
             let file = std::fs::File::create(&out_path)?;
-            backup::snapshot(db, &dir, &manifest, file)?.sync_all()?;
+            manifest.write(db, &dir, file)?.sync_all()?;
             Ok(())
         })
         .await?;
@@ -379,16 +378,12 @@ async fn restore_workspace(
     } else {
         Source::File(file)
     };
-    let restored = backup::restore(
-        control,
-        config,
-        move || source.open(),
-        RestoreRequest {
-            name,
-            owner: None,
-            audit: &audit,
-        },
-    )
+    let restored = RestoreRequest {
+        name,
+        owner: None,
+        audit: &audit,
+    }
+    .run(control, config, move || source.open())
     .await?;
     let mut out = stdout.lock();
     writeln!(
@@ -888,22 +883,13 @@ async fn audit_with_detail(
     };
     let details = audit::list(&db, limit)?;
     drop(db);
-    let ids: Vec<AuditId> = details.iter().map(|d| d.id.clone()).collect();
-    let rows = control.audit_rows_by_ids(&ids).await?;
-    let by_id: HashMap<&AuditId, &AuditRow> = rows.iter().map(|r| (&r.entry.id, r)).collect();
-    let prompt = if args.with_prompt {
-        PromptText::Include
-    } else {
-        PromptText::Omit
-    };
+    let events = control
+        .ocsf_events(&details, PromptText::from(args.with_prompt))
+        .await?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    for detail in &details {
-        let Some(row) = by_id.get(&detail.id) else {
-            continue;
-        };
-        let event = row.to_ocsf_with_detail(Some(detail), prompt)?;
-        writeln!(out, "{}", serde_json::to_string(&event)?)?;
+    for event in &events {
+        writeln!(out, "{}", serde_json::to_string(event)?)?;
     }
     out.flush()?;
     Ok(())

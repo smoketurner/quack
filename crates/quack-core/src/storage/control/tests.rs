@@ -1400,9 +1400,9 @@ async fn memberships_follow_group_roles_without_touching_hand_grants() {
         .unwrap_or_else(|e| fail(&e.to_string()));
 
     let groups = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
-    let member_audit = || AuditEntry::new(AuditAction::Member, Outcome::Allowed, Channel::Web);
+    let origin = Origin::from(Channel::Web);
     let outcome = cp
-        .reconcile_idp_memberships(&carol.id, &groups(&["finance", "leads"]), member_audit)
+        .reconcile_idp_memberships(&carol, &groups(&["finance", "leads"]), &origin)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert_eq!(
@@ -1433,7 +1433,7 @@ async fn memberships_follow_group_roles_without_touching_hand_grants() {
 
     // Leaving the leads group lowers the role; leaving finance revokes it.
     let outcome = cp
-        .reconcile_idp_memberships(&carol.id, &groups(&["finance"]), member_audit)
+        .reconcile_idp_memberships(&carol, &groups(&["finance"]), &origin)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert_eq!(outcome.changed, 1);
@@ -1442,7 +1442,7 @@ async fn memberships_follow_group_roles_without_touching_hand_grants() {
         Some((Role::Viewer, GrantedBy::Idp))
     );
     let outcome = cp
-        .reconcile_idp_memberships(&carol.id, &[], member_audit)
+        .reconcile_idp_memberships(&carol, &[], &origin)
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert_eq!(outcome.revoked, 1);
