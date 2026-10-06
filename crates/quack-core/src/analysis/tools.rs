@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::ids::{ChunkId, NodeId};
+use crate::storage::profile::TableProfile;
 use crate::storage::workspace::{
     ChunkScope, ChunkSearchResult, DocumentInfo, DocumentStatus, HybridLimits, StatementKind,
     TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object, quote_ident,
@@ -23,10 +24,12 @@ use super::citations::{ChunkLocation, Markers};
 use super::events::{DetailPreview, ToolName, TurnRecorder};
 use super::policy::{Exposure, Hold, RefusalFlag, WriteDecision, WritePolicy};
 use super::rerank::{self, ModelReranker, RerankAnswer, Reranker, ScoredReranker};
-use super::text_to_sql::Modeled;
+use super::table_search::TableCards;
+use super::text_to_sql::{ColumnLine, Modeled};
 use crate::config::{GraphConfig, RerankMode, RetrievalConfig};
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
+use crate::graph::views::ClassView;
 use crate::ingestion::parser::PageCounts;
 use crate::llm::{RerankModel, SchemaCall};
 use crate::ontology::{ClassRelations, Ontology, store as ontology_store};
@@ -475,6 +478,15 @@ enum Gate {
     Refused(Hold),
 }
 
+/// A statement from the agent, screened before the write policy.
+enum Screened {
+    Kind(StatementKind),
+    /// It names one of quack's internal tables.
+    Internal,
+    /// It writes something named `graph_`.
+    ReservedGraph,
+}
+
 /// What a statement from the agent passes before it runs: no internal
 /// tables, a valid parse, and for a write, no temp object and the write
 /// policy.
@@ -491,8 +503,12 @@ impl SqlGate {
     /// recorded on the turn. A permission prompt holds no connection while
     /// it waits.
     async fn check(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolError> {
-        let Some(kind) = self.classify(sql).await? else {
-            return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)));
+        let kind = match self.classify(sql).await? {
+            Screened::Kind(kind) => kind,
+            Screened::Internal => return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED))),
+            Screened::ReservedGraph => {
+                return Ok(Gate::Reject(String::from(graph::views::RESERVED_REFUSED)));
+            }
         };
         match kind {
             StatementKind::Read => Ok(Gate::Read),
@@ -527,24 +543,32 @@ impl SqlGate {
     /// refused as not permitted, and that is not the turn's refused write.
     async fn check_read_only(&self, sql: &str) -> Result<Gate, ToolError> {
         Ok(match self.classify(sql).await? {
-            None => Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)),
-            Some(StatementKind::Read) => Gate::Read,
-            Some(StatementKind::Invalid(msg)) => Gate::Reject(format!("SQL syntax error: {msg}")),
-            Some(StatementKind::Write) => Gate::Refused(Hold::NotPermitted),
+            Screened::Internal => Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)),
+            Screened::Kind(StatementKind::Read) => Gate::Read,
+            Screened::Kind(StatementKind::Invalid(msg)) => {
+                Gate::Reject(format!("SQL syntax error: {msg}"))
+            }
+            Screened::Kind(StatementKind::Write) | Screened::ReservedGraph => {
+                Gate::Refused(Hold::NotPermitted)
+            }
         })
     }
 
-    /// The statement's kind on a reader, or `None` when it names an
-    /// internal table.
-    async fn classify(&self, sql: &str) -> Result<Option<StatementKind>, ToolError> {
+    /// The statement's kind on a reader, unless it names an internal table
+    /// or writes something in the reserved `graph_` space.
+    async fn classify(&self, sql: &str) -> Result<Screened, ToolError> {
         let sql = sql.to_owned();
         Ok(self
             .db
             .with_db(move |db| {
                 if db.references_internal_table(&sql)? {
-                    return Ok(None);
+                    return Ok(Screened::Internal);
                 }
-                db.classify_statement(&sql).map(Some)
+                let kind = db.classify_statement(&sql)?;
+                if graph::views::write_names_reserved(&sql, &kind) {
+                    return Ok(Screened::ReservedGraph);
+                }
+                Ok(Screened::Kind(kind))
             })
             .await?)
     }
@@ -672,7 +696,9 @@ impl Tool for RunSqlTool {
                 let results = if read_only {
                     db.read_only(|db| Ok(db.execute_query_capped(&sql, max_rows)))?
                 } else {
-                    db.execute_query_capped(&sql, max_rows)
+                    let results = db.execute_query_capped(&sql, max_rows);
+                    TableProfile::after_write(db);
+                    results
                 };
                 Ok((results, shape))
             })
@@ -1227,11 +1253,12 @@ impl Tool for DescribeTableTool {
     fn description(&self) -> String {
         String::from(
             "Describe one table in the workspace: its row count, every column with its DuckDB \
-             type, and up to 3 sample rows. Use it for a table the system prompt lists without \
-             columns or sample rows, or to confirm exact column names before writing SQL. A name \
-             that matches no table returns an error followed by the names of the tables that \
-             exist. It does not profile values; for min, max, null share, or distinct counts, \
-             run SUMMARIZE <table> with run_sql.",
+             type and, when the owner gave them, its meaning, unit, and synonyms, the owner's note \
+             on the table, warnings from its profile (empty columns, numbers or dates stored as \
+             text, a key that repeats), the measures defined over it, and up to 3 sample rows. A \
+             name that matches no table returns an error followed by the names of the tables that \
+             exist. For min, max, or distinct counts per column, run SUMMARIZE <table> with \
+             run_sql.",
         )
     }
 
@@ -1279,9 +1306,27 @@ impl Tool for DescribeTableTool {
         let mut output = String::new();
         writeln!(output, "Table: {}", desc.table_name)?;
         writeln!(output, "Rows: {}", desc.row_count)?;
+        if let Some(note) = &desc.note {
+            writeln!(output, "Note (from the owner): {}", OneLine(note))?;
+        }
         writeln!(output, "Columns:")?;
         for col in &desc.columns {
-            writeln!(output, "  - {} ({})", col.name, col.column_type)?;
+            writeln!(output, "  - {}", ColumnLine(col))?;
+        }
+        if !desc.warnings.is_empty() {
+            writeln!(output, "Warnings:")?;
+            for flagged in &desc.warnings {
+                writeln!(output, "  - {}: {}", flagged.column, flagged.warning)?;
+            }
+        }
+        if !desc.measures.is_empty() {
+            writeln!(
+                output,
+                "Measures (compute them with the expression as given):"
+            )?;
+            for measure in &desc.measures {
+                writeln!(output, "  - {measure}")?;
+            }
         }
 
         if !desc.sample_rows.rows.is_empty() {
@@ -1357,6 +1402,139 @@ impl Tool for ListTablesTool {
             match count {
                 Some(n) => writeln!(output, "- {table} ({n} rows)")?,
                 None => writeln!(output, "- {table}")?,
+            }
+        }
+        Ok(output)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// find_tables
+// ---------------------------------------------------------------------------
+
+/// Tables `find_tables` returns by default, and at most.
+const FIND_TABLES_TOP_K: u32 = 10;
+const MAX_FIND_TABLES_TOP_K: u32 = 25;
+
+/// Ranks every table against a question, for a workspace with more tables
+/// than the prompt describes (`table_search`).
+pub struct FindTablesTool<M> {
+    db: ReaderDb,
+    /// `None` ranks by keyword alone.
+    embedding_model: Option<Embedder<M>>,
+    rrf_k: u32,
+}
+
+impl<M> FindTablesTool<M> {
+    #[must_use]
+    pub const fn new(db: ReaderDb, embedding_model: Option<Embedder<M>>, rrf_k: u32) -> Self {
+        Self {
+            db,
+            embedding_model,
+            rrf_k,
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FindTablesArgs {
+    /// What the tables should hold: the question, or the words for the
+    /// data it needs
+    pub query: String,
+    /// Number of tables to return (default 10, at most 25)
+    pub top_k: Option<u32>,
+}
+
+impl<M> Tool for FindTablesTool<M>
+where
+    M: EmbeddingModel + Send + Sync,
+{
+    const NAME: &'static str = ToolName::FindTables.as_str();
+    type Error = ToolError;
+    type Args = FindTablesArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        String::from(
+            "Find the tables that hold the data a question needs, ranked by their names, columns, \
+             the owner's notes, the ontology's descriptions and synonyms, and their common values. \
+             Returns each table with its row count, note, columns with their meaning, and \
+             warnings, so describe_table is rarely needed afterwards.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        FindTablesArgs::schema()
+    }
+
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let turn = Turn::of(context)?;
+        let step = turn.recorder.start(ToolName::FindTables, &args.query);
+        let query_vec = match &self.embedding_model {
+            None => None,
+            Some(model) => match turn
+                .recorder
+                .embed_cached(model, Input::Query(args.query.clone()))
+                .await
+            {
+                Ok(vector) => Some(vector),
+                Err(e) => return Err(ToolError::Embedding(step.fail(e).to_string())),
+            },
+        };
+        let top_k = args
+            .top_k
+            .unwrap_or(FIND_TABLES_TOP_K)
+            .clamp(1, MAX_FIND_TABLES_TOP_K);
+        let (query, rrf_k) = (args.query.clone(), self.rrf_k);
+        let found = self
+            .db
+            .with_db(move |db| {
+                let ontology = ontology_store::current(db)?;
+                let ranked = TableCards::read(db, ontology.as_ref())?.rank(
+                    db,
+                    &query,
+                    query_vec.as_ref(),
+                    usize::try_from(top_k).unwrap_or(usize::MAX),
+                    rrf_k,
+                )?;
+                let mut described = Vec::with_capacity(ranked.len());
+                for table in ranked {
+                    described.push(db.describe_table_under(&table.table, ontology.as_ref()));
+                }
+                Ok(described)
+            })
+            .await;
+        let found = match found {
+            Ok(found) => found,
+            Err(e) => return Err(step.fail(e.into())),
+        };
+        step.finish(format!("{} tables", found.len()));
+        if found.is_empty() {
+            return Ok(String::from(
+                "No table matched those words. Try other words for the data, or list_tables.",
+            ));
+        }
+        let mut output = String::from("Tables, best match first:\n");
+        for desc in found {
+            let Ok(desc) = desc else {
+                continue;
+            };
+            writeln!(output, "- {} ({} rows)", desc.table_name, desc.row_count)?;
+            if let Some(note) = &desc.note {
+                writeln!(output, "  Note (from the owner): {}", OneLine(note))?;
+            }
+            for col in &desc.columns {
+                writeln!(output, "  - {}", ColumnLine(col))?;
+            }
+            for flagged in &desc.warnings {
+                writeln!(output, "  ! {}: {}", flagged.column, flagged.warning)?;
+            }
+            for measure in &desc.measures {
+                writeln!(output, "  measure {measure}")?;
             }
         }
         Ok(output)
@@ -2251,6 +2429,7 @@ impl std::fmt::Display for ClassDescription<'_> {
                 mapping.table, mapping.key
             )?;
         }
+        writeln!(f, "{}", ViewLine(ClassView::of(ontology, class_id)))?;
 
         let samples: Vec<String> = samples
             .iter()
@@ -2271,6 +2450,28 @@ impl std::fmt::Display for ClassDescription<'_> {
                 samples.join(", ")
             )
         }
+    }
+}
+
+/// A class's SQL view as `describe_class` names it: the view and its
+/// typed columns.
+struct ViewLine(ClassView);
+
+impl std::fmt::Display for ViewLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let columns: Vec<String> = self
+            .0
+            .columns
+            .iter()
+            .map(|(name, kind)| format!("{name} {kind}"))
+            .collect();
+        write!(
+            f,
+            "SQL view: {} ({}); one row per entity of this class and its subclasses, for \
+             run_sql to count, filter, and join",
+            self.0.name,
+            columns.join(", ")
+        )
     }
 }
 

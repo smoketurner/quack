@@ -85,3 +85,21 @@ fn colliding_sheet_names_sanitize_to_one_table_name() {
         stem.with_sheet("Sheet_1").as_str()
     );
 }
+
+#[test]
+fn reserved_table_names_are_refused() {
+    for name in ["graph_suppliers.csv", "GRAPH_x.parquet", "_quack_meta.csv"] {
+        assert!(
+            TableName::of_file(name)
+                .check_unreserved()
+                .is_err_and(|e| e.to_string().contains("reserves")),
+            "{name}"
+        );
+    }
+    for name in ["graphs.csv", "my_graph_data.csv", "quack.csv"] {
+        assert!(
+            TableName::of_file(name).check_unreserved().is_ok(),
+            "{name}"
+        );
+    }
+}

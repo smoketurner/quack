@@ -4,10 +4,12 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
+use quack_core::error::Error as CoreError;
 use quack_core::ids::WorkspaceId;
 use quack_core::llm::Embeddings;
 use quack_core::progress::RunControl;
 use quack_core::storage::control::{AuditAction, Outcome};
+use quack_core::storage::profile::ColumnTypes;
 use quack_core::text::NonBlankText;
 use serde::Deserialize;
 
@@ -25,20 +27,30 @@ pub(crate) struct ImportBody {
     pub query: Option<String>,
     pub source_table: Option<String>,
     pub limit: Option<u64>,
+    /// `COLUMN=TYPE` pairs, comma-separated, as `quack import --types`.
+    pub types: Option<String>,
 }
 
-/// A blank query or source table (an empty form field) is none.
-impl From<ImportBody> for ImportRequest {
-    fn from(body: ImportBody) -> Self {
+/// A blank query, source table, or types (an empty form field) is none.
+impl TryFrom<ImportBody> for ImportRequest {
+    type Error = ApiError;
+
+    fn try_from(body: ImportBody) -> ApiResult<Self> {
         let given =
             |field: Option<String>| field.as_deref().and_then(str::non_blank).map(str::to_owned);
-        Self {
+        let types: ColumnTypes = given(body.types)
+            .map(|t| t.parse())
+            .transpose()
+            .map_err(|e: CoreError| ApiError::bad_request(e.to_string()))?
+            .unwrap_or_default();
+        Ok(Self {
             url: body.url.into(),
             table: body.table,
             query: given(body.query),
             source_table: given(body.source_table),
             limit: body.limit,
-        }
+            types,
+        })
     }
 }
 
@@ -49,7 +61,7 @@ pub(crate) async fn import(
     Json(body): Json<ImportBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let imported = run_import(&app, &access, &ImportRequest::from(body)).await?;
+    let imported = run_import(&app, &access, &ImportRequest::try_from(body)?).await?;
     let mut body = serde_json::to_value(&imported.summary)?;
     if let (Some(fields), Some(job)) = (body.as_object_mut(), &imported.graph_job) {
         fields.insert(String::from("graph_job"), serde_json::to_value(job)?);

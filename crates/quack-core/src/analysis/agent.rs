@@ -7,7 +7,7 @@ use rig::prelude::*;
 use rig::streaming::{Item, PartKind, StreamEvent};
 
 use crate::config::{AnalysisConfig, GraphConfig, RetrievalConfig};
-use crate::embedding::{Embedder, EmbeddingModel};
+use crate::embedding::{Embedder, EmbeddingModel, Input};
 use crate::error::{Error, Result};
 use crate::ids::SessionId;
 use crate::text::Tokens;
@@ -18,11 +18,12 @@ use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, Turn
 use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls};
 use super::policy::WritePolicy;
 use super::rerank::RerankAnswer;
-use super::text_to_sql::{Modeled, PromptOptions, SystemPrompt};
+use super::table_search::{TableCards, TableLayout, user_tables};
+use super::text_to_sql::{Modeled, PromptOptions, Question, SystemPrompt};
 use super::tools::{
-    CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphTools,
-    ListDocumentsTool, ListTablesTool, ReadDocumentTool, ReaderDb, RunSqlTool, SearchDocumentsTool,
-    SearchGraphTool, SharedDb, Turn,
+    CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, FindTablesTool,
+    GraphTools, ListDocumentsTool, ListTablesTool, ReadDocumentTool, ReaderDb, RunSqlTool,
+    SearchDocumentsTool, SearchGraphTool, SharedDb, Turn,
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::{GraphResult, store as graph_store};
@@ -212,7 +213,19 @@ where
         let max_turns = usize::try_from(self.config.max_turns)
             .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
         let recorder = TurnRecorder::new(sink).with_turn_limit(max_turns);
-        match self
+        let mut this = self;
+        this.prompt.question = Some(
+            Question::of_turn(
+                this.message,
+                this.retrieval_config.rrf_k,
+                &this.reader_db,
+                &this.db,
+                this.embedder.as_ref(),
+                &recorder,
+            )
+            .await,
+        );
+        match this
             .run_inner(completion_model, reranker_call, &recorder)
             .await
         {
@@ -233,6 +246,59 @@ where
 struct PromptAndModel {
     system_prompt: String,
     modeled: Modeled,
+    tables: TableLayout,
+}
+
+impl Question {
+    /// The turn's question with its embedding, after bringing the stored
+    /// table vectors up to date: both only when an embedding model exists
+    /// and the workspace has more tables than the prompt describes. A model
+    /// that fails leaves the keyword ranking, with a warning.
+    async fn of_turn<M: EmbeddingModel>(
+        text: &str,
+        rrf_k: u32,
+        reader: &ReaderDb,
+        writer: &SharedDb,
+        embedder: Option<&Embedder<M>>,
+        recorder: &TurnRecorder,
+    ) -> Self {
+        let mut question = Self {
+            text: text.to_owned(),
+            vector: None,
+            rrf_k,
+        };
+        let Some(embedder) = embedder else {
+            return question;
+        };
+        let layout = reader
+            .with_db(|db| Ok(TableLayout::of(user_tables(db)?.len())))
+            .await;
+        match layout {
+            Ok(TableLayout::Ranked) => {}
+            Ok(TableLayout::AllDescribed) => return question,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not count the tables; ranking tables by keyword");
+                return question;
+            }
+        }
+        match TableCards::refresh_vectors(reader, writer, embedder).await {
+            Ok(made) => tracing::debug!(tables = made, "embedded table cards"),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not embed the table cards; ranking tables by keyword");
+                return question;
+            }
+        }
+        match recorder
+            .embed_cached(embedder, Input::Query(text.to_owned()))
+            .await
+        {
+            Ok(vector) => question.vector = Some(vector),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not embed the question; ranking tables by keyword");
+            }
+        }
+        question
+    }
 }
 
 impl PromptAndModel {
@@ -246,6 +312,7 @@ impl PromptAndModel {
                         ontology_store::current(db)?.as_ref(),
                         &graph_store::status(db)?,
                     ),
+                    tables: TableLayout::of(user_tables(db)?.len()),
                 })
             })
             .await
@@ -437,6 +504,7 @@ where
             retrieval_config,
             graph_options,
             modeled: read.modeled,
+            tables: read.tables,
             mode: prompt.mode,
             window,
             rerank_model,
@@ -736,6 +804,7 @@ struct BuildContext<'a> {
     retrieval_config: &'a RetrievalConfig,
     graph_options: GraphConfig,
     modeled: Modeled,
+    tables: TableLayout,
     mode: ChatMode,
     window: Window,
     rerank_model: Option<RerankModel>,
@@ -815,6 +884,14 @@ impl BuildContext<'_> {
         // even when nothing has been extracted into the graph yet.
         if ctx.modeled.has_ontology() {
             builder = builder.tool(DescribeClassTool(reader()));
+        }
+
+        if ctx.tables == TableLayout::Ranked {
+            builder = builder.tool(FindTablesTool::new(
+                reader(),
+                embedding_model.clone(),
+                ctx.retrieval_config.rrf_k,
+            ));
         }
 
         if ctx.modeled.has_graph() {

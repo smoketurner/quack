@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use quack_core::analysis::table_search;
 use quack_core::config::{Config, FollowIngest, GraphConfig};
 use quack_core::embedding::{Dimension, Embedder, EmbeddingModel, Input, Profile, Prompts, Vector};
 use quack_core::error::Error;
@@ -120,24 +121,21 @@ fn ontology() -> Ontology {
             relation("delivered_to", "shipment", "country"),
         ],
         properties: vec![
-            ontology::Property {
-                id: String::from("name"),
-                label: None,
-                kind: ontology::PropertyType::String,
-                values: Vec::new(),
-            },
-            ontology::Property {
-                id: String::from("po"),
-                label: None,
-                kind: ontology::PropertyType::String,
-                values: Vec::new(),
-            },
-            ontology::Property {
-                id: String::from("mode"),
-                label: None,
-                kind: ontology::PropertyType::String,
-                values: Vec::new(),
-            },
+            ontology::Property::new(
+                String::from("name"),
+                ontology::PropertyType::String,
+                Vec::new(),
+            ),
+            ontology::Property::new(
+                String::from("po"),
+                ontology::PropertyType::String,
+                Vec::new(),
+            ),
+            ontology::Property::new(
+                String::from("mode"),
+                ontology::PropertyType::String,
+                Vec::new(),
+            ),
         ],
         mappings: vec![Mapping {
             table: String::from("shipments"),
@@ -159,6 +157,7 @@ fn ontology() -> Ontology {
                 },
             ],
         }],
+        measures: Vec::new(),
     }
 }
 
@@ -602,7 +601,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     db.set_document_tables(&DocumentId::from("doc-t"), &[String::from("shipments")])
         .unwrap();
     assert!(db.delete_document(&DocumentId::from("doc-t")).unwrap());
-    assert!(db.list_tables().unwrap().is_empty());
+    assert!(table_search::user_tables(&db).unwrap().is_empty());
     let status = graph_store::status(&db).unwrap();
     assert_eq!((status.nodes, status.edges), (0, 0));
     assert_eq!(status.missing_tables, vec![String::from("shipments")]);
@@ -1519,12 +1518,11 @@ fn shipments_with_a_subclass_and_candidates() -> WorkspaceDb {
             Candidate {
                 proposal: Proposal::Property {
                     class: String::from("shipment"),
-                    property: ontology::Property {
-                        id: String::from("weight"),
-                        label: None,
-                        kind: ontology::PropertyType::Number,
-                        values: Vec::new(),
-                    },
+                    property: ontology::Property::new(
+                        String::from("weight"),
+                        ontology::PropertyType::Number,
+                        Vec::new(),
+                    ),
                 },
                 evidence: serde_json::Value::Null,
                 confidence: 0.9,

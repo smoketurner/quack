@@ -8993,3 +8993,152 @@ async fn a_workspace_round_trips_through_a_snapshot_and_is_renamed_and_deleted()
         "{rows:?}"
     );
 }
+
+/// A table's note, profile warnings, and Fix type over REST and the web
+/// page: writers set notes and retype, viewers read, both audited.
+#[tokio::test(flavor = "multi_thread")]
+async fn table_notes_profiles_and_retypes_over_rest_and_the_web() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let viewer = h.user("viewer", UserKind::Standard).await;
+    let ws = h.workspace("data", &owner).await;
+    h.app
+        .control
+        .set_member(&ws, &viewer, Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let owner_token = h.login("owner").await;
+    let viewer_token = h.login("viewer").await;
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &owner_token,
+            serde_json::json!({ "sql": "CREATE TABLE t AS SELECT * FROM (VALUES ('1', 'a'), ('2', 'b')) v(amount, code)" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let note = |name: &str, text: &str| serde_json::json!({ "name": name, "note": text });
+    let (status, _) = h
+        .call(
+            Method::PUT,
+            &format!("/api/v1/workspaces/{ws}/tables/note"),
+            Some(&viewer_token),
+            Some(note("t", "x")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = h
+        .call(
+            Method::PUT,
+            &format!("/api/v1/workspaces/{ws}/tables/note"),
+            Some(&owner_token),
+            Some(note("t", "amounts in cents")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["note"], "amounts in cents");
+    let (status, _) = h
+        .call(
+            Method::PUT,
+            &format!("/api/v1/workspaces/{ws}/tables/note"),
+            Some(&owner_token),
+            Some(note("ghost", "x")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/tables/describe"),
+            &viewer_token,
+            serde_json::json!({ "name": "t" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["note"], "amounts in cents");
+    assert_eq!(body["profile"]["row_count"], 2);
+    assert_eq!(body["warnings"][0]["column"], "amount");
+    assert_eq!(body["warnings"][0]["kind"], "numeric_text");
+    assert_eq!(body["warnings"][0]["fix"], "DOUBLE");
+
+    let retype =
+        |column: &str, to: &str| serde_json::json!({ "name": "t", "column": column, "type": to });
+    let path = format!("/api/v1/workspaces/{ws}/tables/retype");
+    let (status, _) = h
+        .post(&path, &viewer_token, retype("amount", "DOUBLE"))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h.post(&path, &owner_token, retype("amount", "MONEY")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _) = h.post(&path, &owner_token, retype("code", "DOUBLE")).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a value that does not convert"
+    );
+    let (status, _) = h
+        .post(
+            &path,
+            &owner_token,
+            serde_json::json!({ "name": "_quack_meta", "column": "key", "type": "DOUBLE" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = h
+        .post(&path, &owner_token, retype("amount", "DOUBLE"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["columns"][0]["type"], "DOUBLE");
+    assert_eq!(body["warnings"], serde_json::json!([]));
+
+    for action in ["table_note", "retype"] {
+        let rows = h
+            .audit(AuditFilter {
+                workspace_id: Some(ws.clone()),
+                action: Some(String::from(action)),
+                ..AuditFilter::default()
+            })
+            .await;
+        assert!(
+            rows.iter().any(|r| r.entry.outcome == Outcome::Allowed),
+            "{action}"
+        );
+    }
+
+    let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    let cookie = headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| c.split(';').next())
+        .and_then(|c| c.strip_prefix("quack_session="))
+        .unwrap_or_default()
+        .to_owned();
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/tables/note"),
+            Some(&cookie),
+            "name=t&note=one+row+per+order",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, html) = h.land(&headers, Some(&cookie)).await;
+    assert!(
+        html.contains("note saved") && html.contains("one row per order"),
+        "{html}"
+    );
+    assert!(html.contains("Present") && html.contains("100%"), "{html}");
+    let (status, _, headers) = h
+        .form(
+            &format!("/w/{ws}/tables/retype"),
+            Some(&cookie),
+            "name=t&column=code&type=DATE",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, html) = h.land(&headers, Some(&cookie)).await;
+    assert!(
+        html.contains("role=\"alert\"") && html.contains("does not convert"),
+        "{html}"
+    );
+}

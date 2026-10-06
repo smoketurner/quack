@@ -756,12 +756,7 @@ fn propose_attributes(
         candidates.push(Candidate {
             proposal: Proposal::Property {
                 class: class.clone(),
-                property: Property {
-                    id: property.clone(),
-                    label: None,
-                    kind: PropertyType::infer(values),
-                    values: Vec::new(),
-                },
+                property: Property::new(property.clone(), PropertyType::infer(values), Vec::new()),
             },
             evidence: support.evidence(serde_json::json!({ "source": "documents" })),
             confidence: support.confidence(options.min_support_documents),

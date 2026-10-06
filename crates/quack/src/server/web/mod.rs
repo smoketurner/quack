@@ -39,6 +39,7 @@ use quack_core::storage::control::{
     MemberRow, Membership, Outcome, ProviderAllowList, ResourceKind, Role, Scope, Standing,
     TokenRow, UserKind, UserRow, WorkspaceChanges, WorkspaceTimes,
 };
+use quack_core::storage::profile::Share;
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{
     Cell, ChunkSearchResult, DocumentInfo, DocumentSource, DocumentStatus, ExportFormat, Pinning,
@@ -517,20 +518,69 @@ struct DocumentStatuses {
 
 struct TableView {
     name: String,
-    columns: Vec<(String, String)>,
+    note: Option<String>,
+    columns: Vec<ColumnRow>,
+    /// When the profile was taken; `None` when there is no current one.
+    profiled_at: Option<String>,
+    measures: Vec<String>,
     sample_columns: Vec<String>,
     sample_rows: Vec<Vec<String>>,
 }
 
+/// One column on the Tables page: its type, what it means, its profile,
+/// and what is wrong with it, with the type that fixes it.
+struct ColumnRow {
+    name: String,
+    kind: String,
+    meaning: String,
+    present: String,
+    distinct: String,
+    warnings: Vec<String>,
+    fix: Option<String>,
+}
+
 impl TableView {
     fn of(described: TableDescription) -> Self {
+        let profile = described.profile.as_ref();
+        let columns = described
+            .columns
+            .iter()
+            .map(|c| {
+                let counts = profile.and_then(|p| p.column(&c.name));
+                let flagged: Vec<_> = described
+                    .warnings
+                    .iter()
+                    .filter(|f| f.column == c.name)
+                    .collect();
+                ColumnRow {
+                    name: c.name.clone(),
+                    kind: c.column_type.clone(),
+                    meaning: c
+                        .meaning
+                        .as_ref()
+                        .map(|m| m.to_string().trim_start_matches(": ").to_owned())
+                        .unwrap_or_default(),
+                    present: match (counts, profile) {
+                        (Some(counts), Some(p)) => {
+                            Share::of(counts.non_null, p.row_count).to_string()
+                        }
+                        _ => String::new(),
+                    },
+                    distinct: counts.map(|c| c.distinct.to_string()).unwrap_or_default(),
+                    warnings: flagged.iter().map(|f| f.warning.to_string()).collect(),
+                    fix: flagged
+                        .iter()
+                        .find_map(|f| f.warning.fix())
+                        .map(|t| t.to_string()),
+                }
+            })
+            .collect();
         Self {
             name: described.table_name,
-            columns: described
-                .columns
-                .into_iter()
-                .map(|c| (c.name, c.column_type))
-                .collect(),
+            note: described.note,
+            columns,
+            profiled_at: profile.map(|p| p.profiled_at.clone()),
+            measures: described.measures.iter().map(ToString::to_string).collect(),
             sample_columns: described.sample_rows.columns,
             sample_rows: described
                 .sample_rows
@@ -549,6 +599,7 @@ struct TablesPage {
     tables: Vec<String>,
     selected: Option<TableView>,
     error: Option<String>,
+    notice: Option<String>,
 }
 
 impl TablesPage {
@@ -559,7 +610,7 @@ impl TablesPage {
         identity: Identity,
         id: &WorkspaceId,
         open: Option<String>,
-        error: Option<String>,
+        (error, notice): (Option<String>, Option<String>),
     ) -> WebResult<Response> {
         let access = Access::resolve(app, identity, id, Need::READ).await?;
         let selected = if let Some(name) = open {
@@ -578,6 +629,7 @@ impl TablesPage {
             tables: list,
             selected,
             error,
+            notice,
         })
     }
 }
@@ -925,6 +977,8 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/jobs/rows", get(job_rows))
         .route("/w/{id}/jobs/{job}/cancel", post(job_cancel))
         .route("/w/{id}/tables", get(tables).post(table))
+        .route("/w/{id}/tables/note", post(table_note))
+        .route("/w/{id}/tables/retype", post(table_retype))
         .route("/w/{id}/import", post(import_submit))
         .route("/w/{id}/sql", get(sql_page).post(sql_run))
         .route("/w/{id}/sql.csv", post(sql_csv))
@@ -1621,7 +1675,14 @@ async fn tables(
     Path(id): Path<WorkspaceId>,
     flash: Flashed,
 ) -> WebResult<Response> {
-    TablesPage::render(&app, identity, &id, flash.table(), flash.error()).await
+    TablesPage::render(
+        &app,
+        identity,
+        &id,
+        flash.table(),
+        (flash.error(), flash.notice()),
+    )
+    .await
 }
 
 /// The Tables page's choice: the table to open. Posted, never in the URL:
@@ -1637,7 +1698,61 @@ async fn table(
     Path(id): Path<WorkspaceId>,
     Form(choice): Form<TableChoice>,
 ) -> WebResult<Response> {
-    TablesPage::render(&app, identity, &id, Some(choice.name), None).await
+    TablesPage::render(&app, identity, &id, Some(choice.name), (None, None)).await
+}
+
+/// The Tables page's note form.
+#[derive(Deserialize)]
+struct TableNoteForm {
+    name: String,
+    #[serde(default)]
+    note: String,
+}
+
+async fn table_note(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(form): Form<TableNoteForm>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let back = format!("/w/{id}/tables");
+    Ok(
+        match access.set_table_note(&app, &form.name, &form.note).await {
+            Ok(()) => Flash::notice(back, "note saved"),
+            Err(e) => Flash::error(back, e.message),
+        }
+        .opening(form.name)
+        .into_response(),
+    )
+}
+
+/// The Tables page's Fix type button.
+#[derive(Deserialize)]
+struct RetypeForm {
+    name: String,
+    column: String,
+    #[serde(rename = "type")]
+    to: String,
+}
+
+async fn table_retype(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(form): Form<RetypeForm>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let back = format!("/w/{id}/tables");
+    Ok(match access
+        .retype_column(&app, &form.name, &form.column, &form.to)
+        .await
+    {
+        Ok(()) => Flash::notice(back, format!("{} is now {}", form.column, form.to)),
+        Err(e) => Flash::error(back, e.message),
+    }
+    .opening(form.name)
+    .into_response())
 }
 
 async fn import_submit(
@@ -1647,7 +1762,10 @@ async fn import_submit(
     Form(form): Form<ImportBody>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let request = ImportRequest::from(form);
+    let request = match ImportRequest::try_from(form) {
+        Ok(request) => request,
+        Err(e) => return Ok(Flash::error(format!("/w/{id}/tables"), e.message).into_response()),
+    };
     Ok(
         match import_api::run_import(&app, &access, &request).await {
             Ok(imported) => match imported.graph_job {

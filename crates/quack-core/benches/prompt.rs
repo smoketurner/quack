@@ -93,6 +93,7 @@ fn prompt(c: &mut Criterion) {
         )),
         context_max_tokens: Tokens::new(2_000),
         ollama_context_cap: None,
+        question: None,
     };
     c.bench_function("build_system_prompt/150_tables", |b| {
         b.iter(|| {

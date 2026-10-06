@@ -659,12 +659,11 @@ mod tests {
     #[test]
     fn the_schema_allows_exactly_the_ontologys_ids() {
         let mut ontology = ontology();
-        ontology.properties.push(ontology::Property {
-            id: String::from("region"),
-            label: None,
-            kind: ontology::PropertyType::String,
-            values: Vec::new(),
-        });
+        ontology.properties.push(ontology::Property::new(
+            String::from("region"),
+            ontology::PropertyType::String,
+            Vec::new(),
+        ));
         let schema = ontology.extraction_schema();
         assert_eq!(
             allowed(&schema, "/properties/nodes/items/properties/class/enum"),

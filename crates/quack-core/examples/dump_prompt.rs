@@ -54,6 +54,7 @@ fn main() {
         context: Some(String::from("Amounts are in cents.")),
         context_max_tokens: Tokens::new(1000),
         ollama_context_cap: None,
+        question: None,
     };
     let prompt = text_to_sql::SystemPrompt::build(&db, &options).unwrap();
     println!("{}", serde_json::to_string(&prompt).unwrap());
