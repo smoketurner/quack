@@ -2111,3 +2111,59 @@ fn document_chunks_page_in_order_and_documents_resolve_by_id_name_or_prefix() {
         );
     }
 }
+
+/// Every row of a statement streams out in each format, the shapes the
+/// collected writers make, with a NULL as an empty CSV cell and JSON null.
+#[test]
+fn stream_query_writes_every_row_in_each_format() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    db.execute_query(
+        "CREATE TABLE t AS SELECT * FROM (VALUES (1, 'a'), (2, NULL), (3, 'c,\"q\"')) v(n, s)",
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let stream = |format| {
+        let mut out = Vec::new();
+        let rows = db
+            .read_only(|db| db.stream_query("SELECT n, s FROM t ORDER BY n", format, &mut out))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        (rows, String::from_utf8(out).unwrap_or_default())
+    };
+    let (rows, csv) = stream(ExportFormat::Csv);
+    assert_eq!(rows, 3);
+    assert_eq!(csv, "n,s\n1,a\n2,\n3,\"c,\"\"q\"\"\"\n");
+    let (rows, ndjson) = stream(ExportFormat::Ndjson);
+    assert_eq!(rows, 3);
+    assert_eq!(
+        ndjson,
+        "{\"n\":1,\"s\":\"a\"}\n{\"n\":2,\"s\":null}\n{\"n\":3,\"s\":\"c,\\\"q\\\"\"}\n"
+    );
+    let (rows, json) = stream(ExportFormat::Json);
+    assert_eq!(rows, 3);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json).unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(parsed.as_array().map(Vec::len), Some(3));
+    assert_eq!(
+        parsed.get(1).and_then(|r| r.get("s")),
+        Some(&serde_json::Value::Null)
+    );
+    // A statement with a result shape but no rows: the header alone.
+    let (rows, csv) = stream_statement(&db, "CREATE TABLE empty_t (a INT)", ExportFormat::Csv);
+    assert_eq!((rows, csv.as_str()), (0, "Count\n"));
+    assert!(
+        db.read_only(|db| db.stream_query(
+            "SELECT * FROM nope",
+            ExportFormat::Csv,
+            &mut Vec::new()
+        ))
+        .is_err()
+    );
+}
+
+fn stream_statement(db: &WorkspaceDb, sql: &str, format: ExportFormat) -> (u64, String) {
+    let mut out = Vec::new();
+    let rows = db
+        .stream_query(sql, format, &mut out)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    (rows, String::from_utf8(out).unwrap_or_default())
+}

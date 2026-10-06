@@ -13,7 +13,7 @@
 )]
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::{
     BaseUrl, Config, FollowIngest, ProviderConfig, ProviderName, ProviderType, SecureCookies,
@@ -95,6 +95,25 @@ impl Harness {
             serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
         });
         (status, value, headers)
+    }
+
+    /// `send`, with the body as it came: for a file, not JSON or text.
+    async fn send_bytes(
+        &self,
+        request: Request<Body>,
+    ) -> (StatusCode, Bytes, axum::http::HeaderMap) {
+        let response = self
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|e| fail(&format!("request failed: {e}")));
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        (status, bytes, headers)
     }
 
     async fn call(
@@ -6341,10 +6360,11 @@ async fn closing_the_state_checkpoints_each_workspace() {
     assert!(!log.exists(), "the log was checkpointed into the file");
 }
 
-/// A download the row cap cut says so in its filename and on its button;
-/// a complete one keeps the plain name, and neither file carries a marker.
+/// The grid is capped, but the download streams every row: the button
+/// says so when the grid was cut, and the file is the whole result either
+/// way, under the plain name.
 #[tokio::test]
-async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
+async fn the_csv_download_holds_every_row_past_the_grids_cap() {
     let mut config = Config::default();
     config.analysis.max_query_rows = 3;
     let h = harness_with(ServeMode::Login, config).await;
@@ -6364,20 +6384,17 @@ async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
     assert_eq!(status, StatusCode::OK);
     assert!(
         html.contains("10 rows (showing 3)")
-            && html.contains(">Download CSV (first 3 of 10 rows)</button>"),
+            && html.contains(">Download CSV (all 10 rows)</button>"),
         "{html}"
     );
     let (status, csv, headers) = h
         .form(&format!("/w/{ws}/sql.csv"), Some(&cookie), capped)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        disposition(&headers),
-        "attachment; filename=\"query-first-3-of-10.csv\""
-    );
-    assert_eq!(csv, "n\n0\n1\n2\n");
+    assert_eq!(disposition(&headers), "attachment; filename=\"query.csv\"");
+    assert_eq!(csv, "n\n0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n");
 
-    // A result of exactly the cap is complete.
+    // A result within the cap: no note on the button.
     let complete = "sql=SELECT+*+FROM+range(3)+t(n)";
     let (_, html, _) = h
         .form(&format!("/w/{ws}/sql"), Some(&cookie), complete)
@@ -6386,11 +6403,10 @@ async fn a_capped_csv_download_names_the_cut_and_a_complete_one_does_not() {
         html.contains(">Download CSV</button>") && !html.contains("showing"),
         "{html}"
     );
-    let (status, csv, headers) = h
+    let (status, csv, _) = h
         .form(&format!("/w/{ws}/sql.csv"), Some(&cookie), complete)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(disposition(&headers), "attachment; filename=\"query.csv\"");
     assert_eq!(csv, "n\n0\n1\n2\n");
 }
 
@@ -7366,6 +7382,7 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
                     detail: String::from(OVERDUE),
                     summary: String::from("1 rows"),
                     rows: Some(1),
+                    result: None,
                     duration_ms: 1,
                 }],
                 ..AgentResponse::default()
@@ -8063,4 +8080,105 @@ async fn an_upload_queues_the_graph_follow_up_the_setting_asks_for() {
         extracts.iter().any(|d| d["finished"] == true),
         "{extracts:?}"
     );
+}
+
+/// `POST .../sql/export` streams every row past the grid's cap in the
+/// asked format, refuses a write, and audits the export with its row
+/// count; the SQL page's download takes the same path.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_export_streams_every_row_and_refuses_writes() {
+    let mut config = Config::default();
+    config.analysis.max_query_rows = 10;
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("sales", &owner).await;
+    let token = h.login("owner").await;
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &token,
+            serde_json::json!({ "sql": "CREATE TABLE big AS SELECT range AS n FROM range(1000)" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let export = |sql: &str, format: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/workspaces/{ws}/sql/export"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "sql": sql, "format": format }).to_string(),
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    let (status, bytes, headers) = h
+        .send_bytes(export("SELECT n FROM big ORDER BY n", "csv"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/csv; charset=utf-8")
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(text.lines().count(), 1001, "a header and every row");
+    assert!(
+        text.ends_with("999\n"),
+        "{}",
+        &text[text.len().saturating_sub(40)..]
+    );
+    let (status, bytes, _) = h
+        .send_bytes(export("SELECT n FROM big WHERE n < 3", "ndjson"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n"
+    );
+    let (status, bytes, _) = h.send_bytes(export("DELETE FROM big", "csv")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let (status, _, _) = h
+        .send_bytes(export("SELECT * FROM _quack_documents", "csv"))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // The audit row lands once the stream has ended.
+    let mut exports = Vec::new();
+    for _ in 0..50 {
+        exports = h
+            .audit(AuditFilter {
+                action: Some(String::from("export")),
+                ..AuditFilter::default()
+            })
+            .await;
+        if exports.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(exports.len(), 3, "{exports:?}");
+    assert!(exports.iter().any(|r| r.entry.outcome == Outcome::Denied));
+
+    // The web download streams the whole result too.
+    let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    let cookie = session_cookie(&headers);
+    let (status, bytes, _) = h
+        .send_bytes(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/w/{ws}/sql.csv"))
+                .header(header::COOKIE, format!("quack_session={cookie}"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("sql=SELECT+n+FROM+big"))
+                .unwrap_or_else(|e| fail(&e.to_string())),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(String::from_utf8_lossy(&bytes).lines().count(), 1001);
 }

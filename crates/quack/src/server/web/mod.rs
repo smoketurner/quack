@@ -42,8 +42,8 @@ use quack_core::storage::control::{
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{
-    ChunkSearchResult, DocumentInfo, DocumentSource, DocumentStatus, Pinning, ResultSort,
-    SortDirection, TableDescription,
+    ChunkSearchResult, DocumentInfo, DocumentSource, DocumentStatus, ExportFormat, Pinning,
+    ResultSort, SortDirection, TableDescription,
 };
 use rust_embed::Embed;
 use serde::Deserialize;
@@ -383,11 +383,45 @@ struct MessageView {
     duration_ms: Option<u64>,
     /// Rendered HTML for assistant answers; escaped text for user messages.
     content_html: String,
-    steps: Vec<ToolStep>,
+    steps: Vec<StepView>,
     citations: Vec<CitationView>,
     chart_json: Option<String>,
     /// One JSON `GraphResult` per graph tool call the turn made.
     graphs: Vec<String>,
+}
+
+/// A step as the chat page lists it: the rows it kept, as text cells.
+struct StepView {
+    tool: String,
+    detail: String,
+    summary: String,
+    duration_ms: u64,
+    rows: Option<u64>,
+    columns: Vec<String>,
+    cells: Vec<Vec<String>>,
+}
+
+impl From<&ToolStep> for StepView {
+    fn from(step: &ToolStep) -> Self {
+        let (columns, cells) = step.result.as_ref().map_or((Vec::new(), Vec::new()), |r| {
+            (
+                r.columns.clone(),
+                r.rows
+                    .iter()
+                    .map(|row| row.iter().map(|v| JsonText(v).to_string()).collect())
+                    .collect(),
+            )
+        });
+        Self {
+            tool: step.tool.to_string(),
+            detail: step.detail.clone(),
+            summary: step.summary.clone(),
+            duration_ms: step.duration_ms,
+            rows: step.rows,
+            columns,
+            cells,
+        }
+    }
 }
 
 struct CitationView {
@@ -1089,7 +1123,7 @@ impl MessageView {
             match row.role {
                 MessageRole::Tool => steps.extend(row.tool().map(|m| m.step(row.content.clone()))),
                 MessageRole::User => out.push(Self::question(row)),
-                MessageRole::Assistant => out.push(Self::answer(row, std::mem::take(&mut steps))),
+                MessageRole::Assistant => out.push(Self::answer(row, &std::mem::take(&mut steps))),
             }
         }
         out
@@ -1110,14 +1144,14 @@ impl MessageView {
         }
     }
 
-    fn answer(row: &MessageRow, steps: Vec<ToolStep>) -> Self {
+    fn answer(row: &MessageRow, steps: &[ToolStep]) -> Self {
         let meta = row.assistant().cloned().unwrap_or_default();
         Self {
             role: String::from("assistant"),
             at: Moment::from_utc_text(&row.created_at),
             duration_ms: meta.duration_ms,
             content_html: markdown::to_html(&row.content),
-            steps,
+            steps: steps.iter().map(StepView::from).collect(),
             citations: meta
                 .citations
                 .iter()
@@ -1729,38 +1763,10 @@ async fn sql_csv(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let statement = q.statement(&app, &access).await;
-    let outcome = access.execute_sql(&app, &statement.sql).await?;
-    let mut writer = csv::Writer::from_writer(Vec::new());
-    writer
-        .write_record(&outcome.columns)
-        .map_err(CoreError::from)?;
-    for row in &outcome.rows {
-        let cells: Vec<String> = row.iter().map(|v| JsonText(v).to_string()).collect();
-        writer.write_record(&cells).map_err(CoreError::from)?;
-    }
-    let csv = writer
-        .into_inner()
-        .map_err(|e| CoreError::Io(e.into_error()))?;
-    let filename = if outcome.truncated {
-        format!(
-            "query-first-{}-of-{}.csv",
-            outcome.rows.len(),
-            outcome.row_count
-        )
-    } else {
-        "query.csv".to_owned()
-    };
-    Ok((
-        [
-            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_owned()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{filename}\""),
-            ),
-        ],
-        csv,
-    )
-        .into_response())
+    // Every row, streamed: the grid's cap does not apply to the file.
+    Ok(access
+        .export_sql(&app, statement.sql, ExportFormat::Csv)
+        .await?)
 }
 
 impl ClassRow {

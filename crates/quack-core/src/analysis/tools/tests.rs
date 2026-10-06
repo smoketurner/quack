@@ -1765,3 +1765,40 @@ fn tool_schemas_have_no_references_or_null_types() {
         Some(&json!("integer"))
     );
 }
+
+/// A `run_sql` step keeps the first rows of its result for the transcript,
+/// cut at the configured count while the row count says how many there
+/// were; a failed statement keeps none.
+#[tokio::test]
+async fn run_sql_keeps_the_first_rows_on_its_step() {
+    let db = shared_db();
+    let reader_db = ReaderDb::open(&db, 2).await;
+    let (sink, _rx) = events::channel();
+    let recorder = TurnRecorder::new(sink);
+    let turn = Turn::new(recorder.clone(), WritePolicy::Allow(Approver::Nobody));
+    let tool = RunSqlTool::new(Arc::clone(&db), reader_db, 100).with_step_rows(2);
+    for sql in [
+        "SELECT * FROM range(5) t(n) ORDER BY n",
+        "SELECT * FROM no_such_table",
+    ] {
+        drop(
+            tool.call(
+                &mut turn.context(),
+                RunSqlArgs {
+                    query: String::from(sql),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| fail_test(&format!("{sql}: {e}"))),
+        );
+    }
+    let steps = recorder.steps();
+    let kept = steps.first().and_then(|s| s.result.as_ref());
+    assert_eq!(steps.first().and_then(|s| s.rows), Some(5));
+    assert_eq!(
+        kept.map(|r| r.columns.clone()),
+        Some(vec![String::from("n")])
+    );
+    assert_eq!(kept.map(|r| r.rows.len()), Some(2));
+    assert!(steps.get(1).is_some_and(|s| s.result.is_none()));
+}

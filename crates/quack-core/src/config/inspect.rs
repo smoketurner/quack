@@ -382,6 +382,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
         "analysis",
         &[
             "max_query_rows",
+            "step_result_rows",
             "query_timeout_seconds",
             "memory_limit_mb",
             "threads",
@@ -765,6 +766,11 @@ fn analysis(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "max_query_rows",
         analysis.max_query_rows,
         default.max_query_rows,
+    );
+    s.literal(
+        "step_result_rows",
+        analysis.step_result_rows,
+        default.step_result_rows,
     );
     s.literal(
         "query_timeout_seconds",

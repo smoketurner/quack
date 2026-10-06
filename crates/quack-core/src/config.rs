@@ -1575,6 +1575,9 @@ text_enum!(Effort, "effort", {
 #[serde(default, deny_unknown_fields)]
 pub struct AnalysisConfig {
     pub max_query_rows: u32,
+    /// Rows of a `run_sql` or `create_chart` result kept on the step for
+    /// the transcript; the model sees up to `max_query_rows`.
+    pub step_result_rows: u32,
     pub query_timeout_seconds: u32,
     pub memory_limit_mb: u32,
     pub threads: u32,
@@ -1628,6 +1631,7 @@ impl Default for AnalysisConfig {
     fn default() -> Self {
         Self {
             max_query_rows: 250,
+            step_result_rows: 50,
             query_timeout_seconds: 30,
             memory_limit_mb: 256,
             threads: 4,

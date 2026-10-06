@@ -149,7 +149,10 @@ instructions, `quack_core::storage::context`, versioned in `_quack_context`) is 
 into the system prompt after the schema and documents, capped at `[context].max_tokens`;
 the agent never writes it. The prompt states today's date (`PromptOptions::today`, the
 system's local zone from jiff) right after the mode paragraph; tests pin it. Charts are `analysis::chart::ChartSpec` (bar, line, scatter,
-pie; 200 points max), not ECharts.
+pie; several series from several `y` columns or a `series_by` pivot, `stacked`; 200 distinct x
+values and 8 series max), not ECharts. A `run_sql` or `create_chart` step keeps its first
+`[analysis].step_result_rows` rows (`ToolStep::result`); `POST .../sql/export` and the SQL page's
+download stream every row of a read statement (`WorkspaceDb::stream_query`).
 
 Background work is asynchronous everywhere (design doc 4.1): `quack_core::jobs::JobQueue`
 runs submitted jobs with optional lanes that keep submission order (a chat session is a

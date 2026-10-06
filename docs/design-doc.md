@@ -1536,6 +1536,15 @@ The web UI shows them as a collapsible steps block above the answer, citations a
 TUI shows them inline, with `/sql` to reopen the last query. `--verbose` in print mode
 includes full payloads.
 
+A `run_sql` or `create_chart` step also keeps the first `[analysis].step_result_rows` (50)
+rows of its result (`ToolStep::result`, stored on the tool message's `ToolMeta` and sent in
+the `tool_finished` event), so a reader can check an answer's numbers against the rows that
+produced them without re-running the statement. The web chat shows them as a collapsed grid
+under the step with "first 50 of N rows" and an Export full result button, which posts the
+step's SQL to the SQL page's download; `/steps` in the terminal prints them as a table; the
+JSON response carries them on each step. The model is unaffected: it still sees up to
+`max_query_rows`.
+
 ---
 
 ## 8. Sessions
@@ -1627,11 +1636,21 @@ desktop map it to an ECharts option, and REST, MCP, and print mode emit it as JS
 }
 ```
 
-One x axis, one numeric series (the tool takes a single `y` column), at most 200 points; a
-larger result refuses the query rather than sampling. A NULL x becomes the label "NULL", a
-NULL y becomes 0, and a non-numeric y is an error reported to the model. The chart's SQL
-always runs read-only, so charting never prompts for a write. A chart attaches to the
-assistant message that produced it and appears there in every rendering.
+One x axis and one or more numeric series, at most 200 distinct x values per series and 8
+series; a larger result refuses the query rather than sampling. The tool takes `y` as one
+or more columns (one series each, for "revenue and cost by month") and `series_by`, a column
+whose distinct values become the series for long-format rows ("orders by month, one line per
+region"): distinct x values in first-seen order become the axis, and a series with no row
+for a label gets 0 there. `stacked` (`#[serde(default)]`, so stored specs decode unchanged)
+stacks bars and lines: ECharts stacks them, the terminal draws stacked lines as running sums
+and stacked bars as one bar of the total with the parts named in the title. A NULL x becomes
+the label "NULL", a NULL y becomes 0, and a non-numeric y is an error reported to the model.
+The prompt's guidance says when to use several `y` columns or `series_by`, and to bin a
+histogram in SQL and chart the counts as bars; there is no histogram kind. A pie takes its
+first series. The chart's SQL always runs read-only, so charting never prompts for a write. A
+chart attaches to the assistant message that produced it and appears there in every
+rendering; in the web chat it carries ECharts' save-as-image and read-only data view, and a
+Download CSV link built in the browser from the spec, so nothing re-runs.
 
 ---
 
@@ -1958,8 +1977,10 @@ and ask again. The UI covers:
 - Documents: upload (multi-file), paste text, status with progress, pin, delete.
 - Tables: list with schema and sample rows, and the import form; a SQL page with an editor
   that highlights SQL and completes table and column names, a result grid, and download.
-  The download holds the grid's rows, at most `max_query_rows`; when that cut the result, the
-  button and the filename say so ("first 250 of 1000 rows", `query-first-250-of-1000.csv`).
+  The grid holds at most `max_query_rows`; the download streams every row
+  (`WorkspaceDb::stream_query`, a read-only transaction on a reader connection, under the
+  query timeout, one row in memory at a time), the same path `POST .../sql/export` serves
+  scripts, and the button says "all N rows" when the grid was cut.
 - Graph: search box, ECharts graph with class colors, node inspector with properties and
   provenance, merge review queue, provisional and stale banners.
 - Ontology: class, relation, property, and mapping editors with inline validation;
@@ -2005,6 +2026,7 @@ POST   /api/v1/workspaces/{id}/query/stream       same, SSE agent events; closin
                                                   a turn whose job never ran ends with an `error` event
 POST   /api/v1/workspaces/{id}/sessions/{sid}/permissions/{request}  {decision}: answer a write the turn waits on
 POST   /api/v1/workspaces/{id}/sql                {sql}
+POST   /api/v1/workspaces/{id}/sql/export         {sql, format: csv|ndjson|json}: every row of a read statement, streamed; audited `export`
 POST   /api/v1/workspaces/{id}/search         {query, top_k?}: hybrid retrieval, no LLM (the MCP `search` tool's names)
 GET    /api/v1/workspaces/{id}/documents
 POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 202 {id}
@@ -2580,6 +2602,7 @@ max_tokens = 4000
 
 [analysis]
 max_query_rows = 250
+step_result_rows = 50                   # rows a run_sql or create_chart step keeps for the transcript
 query_timeout_seconds = 30
 memory_limit_mb = 256
 threads = 4
