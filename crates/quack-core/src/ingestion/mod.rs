@@ -39,6 +39,25 @@ pub struct IngestResult {
     pub pages: Option<PageCounts>,
     /// How long embedding the chunks took, when a model ran.
     pub embedding_time: Option<Duration>,
+    /// The document this one replaced, now `superseded`.
+    pub replaced: Option<DocumentId>,
+}
+
+impl IngestResult {
+    /// Document `document_id` from `filename`, before what it loaded is
+    /// known: no chunks, tables, pages, or timing yet.
+    fn of(document_id: &DocumentId, filename: &str, file_type: FileType) -> Self {
+        Self {
+            document_id: document_id.to_owned(),
+            filename: filename.to_owned(),
+            file_type,
+            chunks_stored: 0,
+            tables: Vec::new(),
+            pages: None,
+            embedding_time: None,
+            replaced: None,
+        }
+    }
 }
 
 /// What `ingest_file` did: stored the file, or skipped it because a
@@ -72,6 +91,10 @@ pub struct NewFile<'a> {
     /// Stops the ingest between steps and mid-embedding when cancelled, and
     /// hears how many chunks are embedded.
     pub control: RunControl<'a>,
+    /// The ready document this file replaces: it is `superseded` once this
+    /// one is ready, and untouched if this one fails. A table file takes
+    /// over its table.
+    pub replaces: Option<&'a DocumentId>,
 }
 
 impl<'a> NewFile<'a> {
@@ -85,6 +108,7 @@ impl<'a> NewFile<'a> {
             title: None,
             ingested_by: None,
             control: RunControl::unobserved(),
+            replaces: None,
         }
     }
 
@@ -110,6 +134,13 @@ impl<'a> NewFile<'a> {
     #[must_use]
     pub fn control(mut self, control: RunControl<'a>) -> Self {
         self.control = control;
+        self
+    }
+
+    /// Replace the ready document `old` with this file.
+    #[must_use]
+    pub fn replaces(mut self, old: Option<&'a DocumentId>) -> Self {
+        self.replaces = old;
         self
     }
 }
@@ -177,6 +208,7 @@ struct Pending {
     size_bytes: usize,
     sha256: String,
     file_type: FileType,
+    replaces: Option<DocumentId>,
 }
 
 impl Pending {
@@ -197,11 +229,14 @@ impl Pending {
             size_bytes: file.data.len(),
             sha256: sha256_hex(file.data),
             file_type,
+            replaces: file.replaces.cloned(),
         })
     }
 
     /// Insert the document row, or return the live document that already
-    /// holds these bytes.
+    /// holds these bytes (a replacement by identical bytes is one too).
+    /// A file that replaces a document marks it as being replaced and may
+    /// take over its table.
     fn register(&self, db: &WorkspaceDb) -> Result<Registration> {
         if let Some(existing) = db.document_by_sha256(&self.sha256)? {
             if db.document_intact(&existing)? {
@@ -217,9 +252,12 @@ impl Pending {
             )?;
         }
         if let Load::Table(_) = self.file_type.load() {
-            TableName::of_file(&self.filename).check_free(db, None)?;
+            TableName::of_file(&self.filename).check_free(db, self.replaces.as_ref())?;
         }
         let doc_id = DocumentId::generate();
+        if let Some(old) = &self.replaces {
+            db.begin_replacement(old, &doc_id)?;
+        }
         db.insert_document(&NewDocument {
             id: &doc_id,
             filename: &self.filename,
@@ -266,17 +304,20 @@ impl<M: EmbeddingModel> Processing<'_, M> {
             Err(e) => Err(e),
         };
         let id = doc_id.to_owned();
-        match &outcome {
+        let mut outcome = outcome;
+        match &mut outcome {
             Ok(result) => {
                 let (chunks, tables) = (result.chunks_stored, result.tables.clone());
                 let pages = result.pages;
-                db.run(move |db| {
-                    db.set_document_chunk_count(&id, chunks)?;
-                    db.set_document_pages(&id, pages)?;
-                    db.set_document_tables(&id, &tables)?;
-                    db.update_document_status(&id, DocumentStatus::Ready)
-                })
-                .await?;
+                result.replaced = db
+                    .run(move |db| {
+                        db.set_document_chunk_count(&id, chunks)?;
+                        db.set_document_pages(&id, pages)?;
+                        db.set_document_tables(&id, &tables)?;
+                        db.update_document_status(&id, DocumentStatus::Ready)?;
+                        db.finish_replacement(&id)
+                    })
+                    .await?;
             }
             Err(e) => {
                 let message = e.to_string();
@@ -316,13 +357,8 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 };
                 let table_name = db.run(move |db| step.load(db)).await?;
                 Ok(IngestResult {
-                    document_id: doc_id.to_owned(),
-                    filename: filename.to_owned(),
-                    file_type,
-                    chunks_stored: 0,
                     tables: vec![table_name],
-                    pages: None,
-                    embedding_time: None,
+                    ..IngestResult::of(doc_id, filename, file_type)
                 })
             }
             Load::Workbook => {
@@ -339,13 +375,8 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 };
                 let tables = db.run(move |db| load.load(db)).await?;
                 Ok(IngestResult {
-                    document_id: doc_id.to_owned(),
-                    filename: filename.to_owned(),
-                    file_type,
-                    chunks_stored: 0,
                     tables,
-                    pages: None,
-                    embedding_time: None,
+                    ..IngestResult::of(doc_id, filename, file_type)
                 })
             }
             Load::Chunks(format) => {
@@ -384,13 +415,10 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 )
                 .await?;
                 Ok(IngestResult {
-                    document_id: doc_id.to_owned(),
-                    filename: filename.to_owned(),
-                    file_type,
                     chunks_stored: stored.chunks,
-                    tables: Vec::new(),
                     pages,
                     embedding_time: stored.embedding_time,
+                    ..IngestResult::of(doc_id, filename, file_type)
                 })
             }
         }
@@ -980,14 +1008,20 @@ impl TableName {
     }
 
     /// One document per table: refuse when a live document other than
-    /// `owner` already loaded this one.
+    /// `owner`, or the one `owner` is replacing, already loaded this one.
     fn check_free(&self, db: &WorkspaceDb, owner: Option<&DocumentId>) -> Result<()> {
         match db.table_owner(&self.0)? {
-            Some(doc) if owner != Some(&doc.id) => Err(Error::TableTaken {
-                table: self.0.clone(),
-                document: doc.id.into_string(),
-                filename: doc.filename,
-            }),
+            Some(doc)
+                if owner.is_none_or(|owner| {
+                    *owner != doc.id && doc.superseded_by.as_ref() != Some(owner)
+                }) =>
+            {
+                Err(Error::TableTaken {
+                    table: self.0.clone(),
+                    document: doc.id.into_string(),
+                    filename: doc.filename,
+                })
+            }
             _ => Ok(()),
         }
     }

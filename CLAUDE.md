@@ -91,7 +91,7 @@ data-layer, crypto, or dependency change:
 cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # SQL, no agent
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
 cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use
-cargo run --bin quack -- ingest sales.csv -w ws                                # file -> table(s) or chunks
+cargo run --bin quack -- ingest sales.csv -w ws [--replace [ID]]               # file -> table(s) or chunks; --replace supersedes the document with the same name (or ID) once the new one is ready
 #   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX
 cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
@@ -404,7 +404,15 @@ bytes' SHA-256 already belong to a non-failed document whose table or chunks sti
 `parser::PageCounts`: pages in the file, pages whose extraction failed, pages without text;
 `PageCounts::note` is the one wording every interface shows, as `3 of 40 pages unreadable`);
 `ingest_file` does both and takes a `NewFile` (name, bytes, `DocumentSource`, optional
-title and uploader, and its `RunControl`).
+title and uploader, its `RunControl`, and `replaces`, the ready document this file takes
+the place of: `quack ingest --replace [ID]`, `POST .../documents?replace={doc}`, the
+Documents row's Replace control). The old document keeps serving, marked `superseded_by`,
+until the new one is `ready`; then it becomes `DocumentStatus::Superseded` and its pin moves
+over (`WorkspaceDb::finish_replacement`); a failure clears the mark (`mark_document_error`).
+A table file loads over its predecessor's table. A superseded document leaves search, the
+prompt, `list_documents`, and `read_document` (`WorkspaceDb::list_documents` is live rows;
+`list_all_documents` has them all for `quack docs --all` and the page's `?all=true`), but keeps
+its chunks so stored citations still open.
 
 The MCP server (`crates/quack/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `sql`,
 `list_tables`, `describe_table`, `list_documents` and the `quack://workspace/...` resources;

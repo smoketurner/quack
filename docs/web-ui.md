@@ -48,6 +48,12 @@ signed-in user and reads no workspace, so it writes no audit row.
   when it was created, and when a request last touched it (`ControlDb::workspace_times`:
   the newest `audit_log` row naming it, allowed or denied; "never used" for a workspace
   the CLI made and nothing has opened through the server), one column each.
+- **`documents.html`** lists what the workspace holds now; "Show replaced documents"
+  (`?all=true`) adds each superseded document with a link to the one that took its place. A
+  ready row's Replace control (`POST /w/{id}/documents/{doc}/replace`, one file) queues the
+  file through the same `documents::enqueue` as the upload form with the row as its
+  predecessor; the row reads "being replaced by …" until the new document is ready. The
+  htmx actions on a row (pin, unpin, delete) swap in the live listing.
 - **`passage.html`** (`/w/{id}/documents/{doc}/chunks/{n}`) is where a citation link lands:
   one chunk of a document with its position and total, page and heading, when the document
   was ingested, the chunk's full text, and links to the chunks before and after. It reads

@@ -855,6 +855,133 @@ async fn a_documents_chunks_page_through_the_api_and_open_on_the_passage_page() 
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// `POST .../documents?replace={doc}` queues one file that takes the
+/// document's place once ready: the old one is `superseded`, out of the
+/// listing, and named by the new one's audit row; the request refuses
+/// more than one file, and the web row's Replace form does the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_supersedes_its_predecessor_once_ready() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("docs", &owner).await;
+    let token = h.login("owner").await;
+    let base = format!("/api/v1/workspaces/{ws}/documents");
+    let paste = |text: &str, title: &str| serde_json::json!({ "text": text, "title": title });
+    let (status, body) = h
+        .post(&base, &token, paste("Flood is excluded.", "policy"))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let old = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(h.wait_ready(&ws, &old, &token).await["status"], "ready");
+
+    let (status, body) = h
+        .post(
+            &format!("{base}?replace={old}"),
+            &token,
+            paste("Flood is covered.", "policy"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let new = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_ne!(new, old);
+    assert_eq!(h.wait_ready(&ws, &new, &token).await["status"], "ready");
+    let (_, replaced) = h.get(&format!("{base}/{old}"), &token).await;
+    assert_eq!(replaced["status"], "superseded", "{replaced}");
+    assert_eq!(replaced["superseded_by"], new, "{replaced}");
+    let (_, listed) = h.get(&base, &token).await;
+    let ids: Vec<&str> = listed["documents"]
+        .as_array()
+        .map(|docs| docs.iter().filter_map(|d| d["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(ids, [new.as_str()], "{listed}");
+    let ingests = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("ingest")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        ingests
+            .iter()
+            .any(|r| r.resource_id.as_deref() == Some(new.as_str())),
+        "{ingests:?}"
+    );
+
+    // A replaced document cannot be replaced again, and a replacement
+    // is one file.
+    let (status, body) = h
+        .post(
+            &format!("{base}?replace={old}"),
+            &token,
+            paste("Flood is excluded again.", "policy"),
+        )
+        .await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "{body}"
+    );
+    assert!(body.to_string().contains("superseded, not ready"), "{body}");
+    let boundary = "two";
+    let two = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.md\"\r\n\r\nA\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"b.md\"\r\n\r\nB\r\n--{boundary}--\r\n"
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("{base}?replace={new}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(two))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body, _) = h.send(request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("exactly one file"), "{body}");
+
+    // The web: the live listing hides the replaced row, `?all=true` shows
+    // it with its replacement, and the row's Replace form queues a file.
+    let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    let cookie = session_cookie(&headers);
+    let (status, html, _) = h.page(&format!("/w/{ws}/documents"), Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!html.contains(&format!("id=\"doc-{old}\"")), "{html}");
+    assert!(html.contains("Show replaced documents"), "{html}");
+    assert!(
+        html.contains(&format!("/documents/{new}/replace")),
+        "{html}"
+    );
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents?all=true"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(&format!("id=\"doc-{old}\"")), "{html}");
+    assert!(html.contains(&format!("replaced by {new}")), "{html}");
+    let (content_type, bytes) = multipart("policy.md", "text/markdown", "Flood is covered now.");
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/w/{ws}/documents/{new}/replace"))
+        .header(header::COOKIE, format!("quack_session={cookie}"))
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(bytes))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, _, headers) = h.send(request).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location(&headers), format!("/w/{ws}/documents"));
+    let (_, pending) = h.get(&format!("{base}/{new}"), &token).await;
+    assert!(
+        pending["superseded_by"].is_string(),
+        "the replacement is on its way: {pending}"
+    );
+}
+
 /// The `quack_session` cookie a login response set.
 fn session_cookie(headers: &axum::http::HeaderMap) -> String {
     headers

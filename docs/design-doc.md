@@ -916,9 +916,25 @@ applies to the URL (`HTTPS_PROXY`, `HTTP_PROXY`; loopback and link-local are nev
 the proxy resolves the name, so quack checks only an address written in the URL and the
 proxy decides which hosts a name may reach.
 
-**Table naming.** The sanitized file stem. On collision the web UI and TUI ask (replace,
-rename, skip); the API and print mode require an explicit name. The prompt describes tables
-live on every build, with no cache (section 7.2).
+**Table naming.** The sanitized file stem. One live document owns a table: a changed file
+with the same name is refused (`Error::TableTaken`, 409) unless it replaces its
+predecessor. The prompt describes tables live on every build, with no cache (section 7.2).
+
+**Replacing a document.** `quack ingest FILE --replace [ID]` (the newest ready document
+with the file's name when no id is given), `POST .../documents?replace={doc}`, and the
+Replace control on a Documents page row register the new file with `NewFile::replaces`.
+The old document stays `ready` and serving, marked `superseded_by` the new id, until the
+new one reaches `ready`; then one writer step sets it `superseded` and hands its pin on. A
+table file loads over its predecessor's table (`CREATE OR REPLACE`, one statement), so the
+name stays the new document's. A failed replacement marks the new row `error` and clears
+the mark, so nothing changes; identical bytes are a duplicate even under `--replace`; a
+document that is not `ready`, or already has a replacement on its way, is refused with the
+reason. A superseded document is out of search (both legs filter on `ready`), the prompt's
+documents block, `list_documents`, `read_document`, and every live listing; its chunks and
+graph provenance stay in the file, so a citation in a stored session still opens on the
+passage page. Graph nodes extracted from it are kept and `graph status` does not change;
+`quack docs --all` and the Documents page's "Show replaced documents" list it with its
+successor. The terminal's `/ingest` takes paths only and has no `--replace`.
 
 Every SQL statement, the agent's or the user's, passes classification and resource limits
 (section 7.4).
@@ -1931,6 +1947,8 @@ POST   /api/v1/workspaces/{id}/sql                {sql}
 POST   /api/v1/workspaces/{id}/search         {query, top_k?}: hybrid retrieval, no LLM (the MCP `search` tool's names)
 GET    /api/v1/workspaces/{id}/documents
 POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 202 {id}
+                                                  ?replace={doc}: the one file takes that ready document's
+                                                  place once ready (the old one becomes "superseded")
                                                   (identical bytes: status "duplicate";
                                                   a table another document owns: 409)
 GET    /api/v1/workspaces/{id}/documents/{doc}    status, metadata
@@ -2148,8 +2166,8 @@ quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query]
       [--allow-write] [-c | -r SESSION] [--stdin] [--verbose]
 quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
 quack workspace create NAME | list [--format json]
-quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed]
-quack docs [--format json] [--pin ID | --unpin ID | --delete ID]
+quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--pin] [--no-embed] [--replace [ID]]
+quack docs [--format json] [--all] [--pin ID | --unpin ID | --delete ID]
 quack embeddings refresh [-w NAME] [-y]
 quack graph search ENTITY [--hops N] [--relation R] [--class C] | search --class C
             | path FROM TO [--max-hops N] | status | extract [--source all|tables|documents]

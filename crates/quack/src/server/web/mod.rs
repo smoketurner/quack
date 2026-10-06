@@ -42,8 +42,8 @@ use quack_core::storage::control::{
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{
-    ChunkSearchResult, DocumentInfo, DocumentSource, Pinning, ResultSort, SamplePool,
-    SortDirection, TableDescription,
+    ChunkSearchResult, DocumentInfo, DocumentSource, DocumentStatus, Pinning, ResultSort,
+    SamplePool, SortDirection, TableDescription,
 };
 use rust_embed::Embed;
 use serde::Deserialize;
@@ -446,6 +446,8 @@ struct DocumentsPage {
     notice: Option<String>,
     /// Chunks found by keyword only until a refresh, when there are any.
     embeddings_note: Option<String>,
+    /// Replaced documents are listed too (`?all=true`).
+    show_all: bool,
 }
 
 /// One chunk of a document, where a citation link lands.
@@ -911,6 +913,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/documents/{doc}/pin", post(pin))
         .route("/w/{id}/documents/{doc}/unpin", post(unpin))
         .route("/w/{id}/documents/{doc}/delete", post(delete_doc))
+        .route("/w/{id}/documents/{doc}/replace", post(replace_doc))
         .route("/w/{id}/embeddings/refresh", post(refresh_embeddings))
         .route("/w/{id}/jobs", get(jobs_page))
         .route("/w/{id}/jobs/rows", get(job_rows))
@@ -1247,11 +1250,39 @@ async fn unshare_session(
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
 
+/// Which documents the Documents page lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shown {
+    /// What the workspace holds now.
+    Live,
+    /// Replaced documents too, each naming its replacement.
+    All,
+}
+
+/// `?all=true` on the Documents page.
+#[derive(Debug, Default, Deserialize)]
+struct DocumentsQuery {
+    #[serde(default)]
+    all: bool,
+}
+
+impl DocumentsQuery {
+    const fn shown(&self) -> Shown {
+        if self.all { Shown::All } else { Shown::Live }
+    }
+}
+
 impl DocumentRows {
     /// The workspace's documents as the caller may act on them.
-    async fn load(app: &App, access: &Access) -> WebResult<Self> {
+    async fn load(app: &App, access: &Access, shown: Shown) -> WebResult<Self> {
         let documents = app
-            .read(&access.workspace.id, WorkspaceDb::list_documents)
+            .read(
+                &access.workspace.id,
+                match shown {
+                    Shown::Live => WorkspaceDb::list_documents,
+                    Shown::All => WorkspaceDb::list_all_documents,
+                },
+            )
             .await?;
         let pending = documents.iter().any(|d| d.status.is_in_flight());
         Ok(Self {
@@ -1336,13 +1367,16 @@ async fn documents(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
+    Query(query): Query<DocumentsQuery>,
     flash: Flashed,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::Page, "documents")
         .await?;
-    let rows = DocumentRows::load(&app, &access).await?.render()?;
+    let rows = DocumentRows::load(&app, &access, query.shown())
+        .await?
+        .render()?;
     let embeddings_note = app.read(&id, WorkspaceDb::embedding_status).await?.note();
     html(&DocumentsPage {
         page: Page::in_workspace(&app, Tab::Documents, &access),
@@ -1350,7 +1384,35 @@ async fn documents(
         error: flash.error(),
         notice: flash.notice(),
         embeddings_note,
+        show_all: query.all,
     })
+}
+
+/// The row's Replace control: the one uploaded file takes `doc`'s place
+/// once it is ready; `doc` serves until then.
+async fn replace_doc(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
+    multipart: Multipart,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let form = UploadForm::read(multipart).await?;
+    let back = format!("/w/{id}/documents");
+    let queued =
+        match docs_api::enqueue(&app, &access, DocumentSource::Upload, form.files, Some(doc)).await
+        {
+            Ok(queued) => queued,
+            Err(e) => return Ok(Flash::error(back, e.message).into_response()),
+        };
+    Ok(match queued.first() {
+        Some(Enqueued::Duplicate { filename, .. }) => Flash::error(
+            back,
+            format!("{filename} is identical to the document it would replace"),
+        ),
+        Some(Enqueued::Queued { .. }) | None => Flash::to(back),
+    }
+    .into_response())
 }
 
 /// The Documents page's refresh button: the API's refresh, then back
@@ -1384,7 +1446,12 @@ async fn document_rows(
     access
         .audit_read(&app, AuditAction::Page, "document_rows")
         .await?;
-    Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
+    Ok(Html(
+        DocumentRows::load(&app, &access, Shown::Live)
+            .await?
+            .render()?,
+    )
+    .into_response())
 }
 
 async fn document_status(
@@ -1398,7 +1465,7 @@ async fn document_status(
         .await?;
     let DocumentRows {
         documents, pending, ..
-    } = DocumentRows::load(&app, &access).await?;
+    } = DocumentRows::load(&app, &access, Shown::Live).await?;
     Ok(Html(DocumentStatuses { documents, pending }.render()?).into_response())
 }
 
@@ -1446,10 +1513,10 @@ async fn enqueue_web(
     }
     let mut queued = Vec::new();
     if !files.is_empty() {
-        queued.extend(docs_api::enqueue(app, access, DocumentSource::Upload, files).await?);
+        queued.extend(docs_api::enqueue(app, access, DocumentSource::Upload, files, None).await?);
     }
     if !pasted.is_empty() {
-        queued.extend(docs_api::enqueue(app, access, DocumentSource::Paste, pasted).await?);
+        queued.extend(docs_api::enqueue(app, access, DocumentSource::Paste, pasted, None).await?);
     }
     let mut skipped = Vec::new();
     for entry in queued {
@@ -1494,7 +1561,12 @@ async fn pin(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, Pinning::Pinned).await?;
-    Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
+    Ok(Html(
+        DocumentRows::load(&app, &access, Shown::Live)
+            .await?
+            .render()?,
+    )
+    .into_response())
 }
 
 async fn unpin(
@@ -1504,7 +1576,12 @@ async fn unpin(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, Pinning::Unpinned).await?;
-    Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
+    Ok(Html(
+        DocumentRows::load(&app, &access, Shown::Live)
+            .await?
+            .render()?,
+    )
+    .into_response())
 }
 
 async fn delete_doc(
@@ -1514,7 +1591,12 @@ async fn delete_doc(
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::delete_document(&app, &access, &doc).await?;
-    Ok(Html(DocumentRows::load(&app, &access).await?.render()?).into_response())
+    Ok(Html(
+        DocumentRows::load(&app, &access, Shown::Live)
+            .await?
+            .render()?,
+    )
+    .into_response())
 }
 
 async fn tables(

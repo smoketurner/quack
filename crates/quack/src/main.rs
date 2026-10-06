@@ -32,7 +32,7 @@ use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
 use quack_core::ids::{DocumentId, SessionId};
 use quack_core::import::{self, ImportPolicy, ImportRequest};
 use quack_core::ingestion::parser::PageCounts;
-use quack_core::ingestion::{self, IngestOutcome, NewFile};
+use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile};
 use quack_core::llm::Embeddings;
 use quack_core::llm::egress::Egress;
 use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt, TokenManager, TokenStatus};
@@ -291,6 +291,53 @@ struct IngestArgs {
     /// Pin the document: its full text goes into every prompt
     #[arg(long)]
     pin: bool,
+
+    /// Replace a ready document: the one with the same file name, or the
+    /// given id (prefixes accepted). It is superseded once this file is
+    /// ready and untouched if ingestion fails; a table file takes over its
+    /// table. Identical bytes are still skipped.
+    #[arg(long, value_name = "DOCUMENT_ID", num_args = 0..=1, default_missing_value = "")]
+    replace: Option<Replace>,
+}
+
+/// What `quack ingest --replace [DOCUMENT_ID]` replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Replace {
+    /// The newest ready document with the ingested file's name.
+    SameName,
+    /// The document with this id or unique id prefix.
+    Document(String),
+}
+
+impl std::str::FromStr for Replace {
+    type Err = std::convert::Infallible;
+
+    /// `--replace` alone arrives as the empty default value.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(match value.trim() {
+            "" => Self::SameName,
+            id => Self::Document(id.to_owned()),
+        })
+    }
+}
+
+impl Replace {
+    /// The id of the ready document to replace, for a file named `filename`.
+    async fn resolve(self, db: &Writer, filename: &str) -> Result<DocumentId> {
+        match self {
+            Self::Document(prefix) => Ok(db.run(move |db| find_document(db, &prefix)).await?),
+            Self::SameName => {
+                let name = filename.to_owned();
+                let found = db.run(move |db| db.newest_document_named(&name)).await?;
+                let Some(found) = found else {
+                    anyhow::bail!(
+                        "no ready document named {filename} to replace; pass its id to --replace"
+                    );
+                };
+                Ok(found.id)
+            }
+        }
+    }
 }
 
 #[derive(clap::Args)]
@@ -387,6 +434,10 @@ struct DocsArgs {
     /// `json` prints one JSON object per document
     #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
     format: TextOrJson,
+
+    /// List replaced documents too, each with the id that took its place
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Subcommand)]
@@ -1521,18 +1572,36 @@ fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
     }
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    list_documents(db, args.format, &mut out)
+    let shown = if args.all { Shown::All } else { Shown::Live };
+    list_documents(db, args.format, shown, &mut out)
 }
 
 /// Resolve a full document id or a unique prefix.
-fn find_document(db: &WorkspaceDb, prefix: &str) -> Result<DocumentId> {
+fn find_document(db: &WorkspaceDb, prefix: &str) -> CoreResult<DocumentId> {
     let document = PrefixMatch::of(db.list_documents()?, prefix, |d| d.id.as_str())
         .one(Record::Document, prefix)?;
     Ok(document.id)
 }
 
-fn list_documents(db: &WorkspaceDb, format: TextOrJson, out: &mut impl Write) -> Result<()> {
-    let docs = db.list_documents()?;
+/// Which documents `quack docs` lists.
+#[derive(Debug, Clone, Copy)]
+enum Shown {
+    /// What the workspace holds now.
+    Live,
+    /// Replaced documents too (`--all`).
+    All,
+}
+
+fn list_documents(
+    db: &WorkspaceDb,
+    format: TextOrJson,
+    shown: Shown,
+    out: &mut impl Write,
+) -> Result<()> {
+    let docs = match shown {
+        Shown::Live => db.list_documents()?,
+        Shown::All => db.list_all_documents()?,
+    };
     format.write_rows(out, &docs, "No documents yet.", |out, doc| {
         let title = doc
             .title
@@ -1542,9 +1611,13 @@ fn list_documents(db: &WorkspaceDb, format: TextOrJson, out: &mut impl Write) ->
             .pages
             .and_then(PageCounts::note)
             .map_or(String::new(), |note| format!("  [{note}]"));
+        let replaced = doc
+            .superseded_by
+            .as_ref()
+            .map_or(String::new(), |by| format!("  -> {by}"));
         writeln!(
             out,
-            "{}  {:<10}  {:<6}  {}  {}{title}{pages}",
+            "{}  {:<10}  {:<6}  {}  {}{title}{pages}{replaced}",
             doc.id,
             doc.status,
             doc.source,
@@ -1705,6 +1778,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         title,
         no_embed,
         pin,
+        replace,
     } = args;
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
     let config = &opened.config;
@@ -1712,6 +1786,9 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     if let StdioPath::Path(dir) = &file
         && dir.is_dir()
     {
+        if replace.is_some() {
+            anyhow::bail!("--replace takes one file, not a directory");
+        }
         return ingest_bundle(&opened, &dir.display().to_string(), no_embed).await;
     }
     let NamedInput {
@@ -1720,6 +1797,10 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     } = file.read_named(filename.as_deref())?;
 
     let ws_db = opened.writer()?;
+    let replaces = match replace {
+        None => None,
+        Some(replace) => Some(replace.resolve(&ws_db, &effective_filename).await?),
+    };
 
     let embedding_model = if no_embed {
         None
@@ -1739,7 +1820,8 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         opened.workspace.id.as_str(),
         &NewFile::new(&effective_filename, &data)
             .source(source)
-            .title(title.as_deref()),
+            .title(title.as_deref())
+            .replaces(replaces.as_ref()),
         embedding_model.as_ref(),
     )
     .await
@@ -1767,10 +1849,19 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
             .run(move |db| db.set_document_pinning(&id, Pinning::Pinned))
             .await?;
     }
+    report_ingested(&mut out, &result, pin)?;
+    out.flush()?;
+    Ok(())
+}
 
+/// The lines `quack ingest` prints for a stored file.
+fn report_ingested(out: &mut impl Write, result: &IngestResult, pin: bool) -> Result<()> {
     writeln!(out, "Ingested: {}", result.filename)?;
     writeln!(out, "  Type: {}", result.file_type)?;
     writeln!(out, "  Document ID: {}", result.document_id)?;
+    if let Some(old) = &result.replaced {
+        writeln!(out, "  Replaced: {old} (now superseded)")?;
+    }
     if pin {
         writeln!(out, "  Pinned: yes")?;
     }
@@ -1800,8 +1891,6 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
             )?;
         }
     }
-
-    out.flush()?;
     Ok(())
 }
 

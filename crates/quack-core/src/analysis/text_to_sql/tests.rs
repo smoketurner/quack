@@ -156,6 +156,27 @@ fn the_prompt_is_byte_identical_across_repeated_calls_with_no_workspace_change()
     assert!(ontology_at < context_at, "{first}");
 }
 
+/// A replaced document is out of the inventory and its count; its
+/// replacement is in.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn a_replaced_document_leaves_the_inventory() {
+    let db = db();
+    for (id, name, status) in [
+        ("d1", "old-policy.md", DocumentStatus::Superseded),
+        ("d2", "policy.md", DocumentStatus::Ready),
+    ] {
+        db.insert_document(
+            &NewDocument::new(&DocumentId::from(id), name, "text/markdown", 1).with_status(status),
+        )
+        .unwrap();
+    }
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
+    assert!(prompt.contains("- policy.md (status: ready"), "{prompt}");
+    assert!(!prompt.contains("old-policy.md"), "{prompt}");
+    assert!(!prompt.contains("older documents"), "{prompt}");
+}
+
 /// The inventory lists the newest documents and counts the rest, so a
 /// workspace of thousands of files keeps a prompt the model can hold.
 #[test]

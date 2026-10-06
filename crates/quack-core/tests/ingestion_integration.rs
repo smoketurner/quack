@@ -3306,3 +3306,217 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
     .await;
     assert!(matches!(outcome, Err(Error::Cancelled)));
 }
+
+/// `ingest_file` into `ws-replace` without an embedding model, for the
+/// replacement tests.
+async fn ingest(
+    config: &Config,
+    writer: &Writer,
+    file: ingestion::NewFile<'_>,
+) -> Result<ingestion::IngestOutcome, Error> {
+    ingestion::ingest_file(
+        config,
+        writer,
+        "ws-replace",
+        &file,
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+}
+
+/// A changed file replaces its predecessor: the old document is
+/// `superseded` once the new one is ready, leaves search, the listing,
+/// and the prompt, keeps its chunks for earlier citations, and hands its
+/// pin on. Identical bytes are still a duplicate, and a document that is
+/// not ready, or missing, is refused.
+#[tokio::test]
+async fn a_changed_file_replaces_its_predecessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let ingested = |outcome: ingestion::IngestOutcome| outcome.ingested().unwrap();
+
+    let first = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("policy.md", b"Flood is excluded."),
+        )
+        .await
+        .unwrap(),
+    );
+    db.set_document_pinning(&first.document_id, Pinning::Pinned)
+        .unwrap();
+    let second = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("policy.md", b"Flood is covered.")
+                .replaces(Some(&first.document_id)),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(second.replaced.as_ref(), Some(&first.document_id));
+    let old = db.document(&first.document_id).unwrap().unwrap();
+    assert_eq!(old.status, DocumentStatus::Superseded);
+    assert_eq!(old.superseded_by.as_ref(), Some(&second.document_id));
+    let new = db.document(&second.document_id).unwrap().unwrap();
+    assert_eq!((new.status, new.pinned), (DocumentStatus::Ready, true));
+    assert_eq!(
+        db.list_documents()
+            .unwrap()
+            .iter()
+            .map(|d| &d.id)
+            .collect::<Vec<_>>(),
+        [&second.document_id]
+    );
+    assert_eq!(db.list_all_documents().unwrap().len(), 2);
+    assert_eq!(db.recent_documents(10).unwrap().1, 1);
+    assert_eq!(
+        db.document_chunks(&first.document_id, 0, 10).unwrap().len(),
+        1
+    );
+    let hits = db
+        .search_keyword_chunks("flood", 5, &ChunkScope::all())
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| &h.document_id).collect::<Vec<_>>(),
+        [&second.document_id]
+    );
+    assert_eq!(db.pinned_documents().unwrap().len(), 1);
+
+    // Identical bytes are a duplicate even as a replacement; a replaced
+    // document, or a missing one, cannot be replaced.
+    let same = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("policy.md", b"Flood is covered.")
+            .replaces(Some(&first.document_id)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(same, ingestion::IngestOutcome::Duplicate(d) if d.id == second.document_id));
+    let stale = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("policy.md", b"Flood is excluded again.")
+            .replaces(Some(&first.document_id)),
+    )
+    .await;
+    assert!(
+        matches!(&stale, Err(Error::Ingestion(m)) if m.contains("it is superseded, not ready")),
+        "{stale:?}"
+    );
+    let missing = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("policy.md", b"Flood is excluded again.")
+            .replaces(Some(&DocumentId::from("nope"))),
+    )
+    .await;
+    assert!(
+        matches!(missing, Err(Error::NotFound { .. })),
+        "{missing:?}"
+    );
+    assert_eq!(
+        db.list_all_documents().unwrap().len(),
+        2,
+        "nothing registered"
+    );
+}
+
+/// A table file takes over its predecessor's table; a failed replacement
+/// leaves the document and its table as they were; a second replacement
+/// of a document whose first is on its way is refused; deleting a
+/// replaced table document leaves the table to its successor.
+#[tokio::test]
+async fn a_table_replacement_swaps_the_table_and_a_failed_one_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let ingested = |outcome: ingestion::IngestOutcome| outcome.ingested().unwrap();
+
+    let sales = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("sales.csv", b"region,total\nnorth,1\n"),
+        )
+        .await
+        .unwrap(),
+    );
+    let sales2 = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("sales.csv", b"region,total\nnorth,1\nsouth,2\n")
+                .replaces(Some(&sales.document_id)),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(sales2.tables, vec![String::from("sales")]);
+    let rows = || -> i64 {
+        db.connection()
+            .query_row("SELECT count(*) FROM sales", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(rows(), 2);
+    assert_eq!(
+        db.table_owner("sales").unwrap().map(|d| d.id),
+        Some(sales2.document_id.clone())
+    );
+    assert_eq!(
+        db.document(&sales.document_id).unwrap().unwrap().status,
+        DocumentStatus::Superseded
+    );
+
+    // A failed replacement leaves the document and its table as they were.
+    let broken = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("sales.csv", b"a,b\n1,2,3,4\n\"unterminated,5\n6\n")
+            .replaces(Some(&sales2.document_id)),
+    )
+    .await;
+    assert!(matches!(broken, Err(Error::Ingestion(_))), "{broken:?}");
+    let kept = db.document(&sales2.document_id).unwrap().unwrap();
+    assert_eq!(
+        (kept.status, kept.superseded_by),
+        (DocumentStatus::Ready, None)
+    );
+    assert_eq!(rows(), 2);
+    let failed = db
+        .list_all_documents()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.status == DocumentStatus::Error)
+        .unwrap();
+    assert_eq!(failed.superseded_by, None);
+
+    // While one replacement is on its way, a second is refused.
+    let pending = ingestion::register_document(
+        &db,
+        &ingestion::NewFile::new("sales.csv", b"region,total\nnorth,3\n")
+            .replaces(Some(&sales2.document_id)),
+    )
+    .unwrap();
+    assert!(matches!(pending, ingestion::Registration::New(_)));
+    let twice = ingestion::register_document(
+        &db,
+        &ingestion::NewFile::new("sales.csv", b"region,total\nnorth,4\n")
+            .replaces(Some(&sales2.document_id)),
+    );
+    assert!(
+        matches!(&twice, Err(Error::Ingestion(m)) if m.contains("already being processed")),
+        "{twice:?}"
+    );
+
+    // Deleting a replaced table document leaves the table to its successor.
+    assert!(db.delete_document(&sales.document_id).unwrap());
+    assert_eq!(rows(), 2);
+    assert!(db.list_tables().unwrap().contains(&String::from("sales")));
+}
