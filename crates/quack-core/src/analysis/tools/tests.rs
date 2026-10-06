@@ -472,6 +472,193 @@ fn format_search_results_empty_tells_model_to_say_so() {
     assert!(out.contains("No relevant chunks found"));
 }
 
+/// A ready document with `count` chunks of `text` each, under `name`.
+async fn seed_document(db: &SharedDb, name: &str, count: u32, text: &str) {
+    let (name, text) = (name.to_owned(), text.to_owned());
+    db.run(move |guard| {
+        let id = DocumentId::from(name.as_str());
+        guard.insert_document(
+            &NewDocument::new(&id, &name, "text/markdown", 1).with_status(DocumentStatus::Ready),
+        )?;
+        for i in 0..count {
+            guard.insert_chunk(&NewChunk {
+                id: &ChunkId::from(format!("{name}-{i}")),
+                document_id: &id,
+                chunk_index: i,
+                content: &format!("{text} {i}"),
+                heading: None,
+                page: None,
+                embedding: None,
+            })?;
+        }
+        guard.set_document_chunk_count(&id, count)
+    })
+    .await
+    .unwrap_or_else(|e| fail_test(&e.to_string()));
+}
+
+/// `read_document` over `db` in `turn` with a budget of `budget` tokens.
+async fn read(
+    db: &SharedDb,
+    turn: &Turn,
+    budget: u32,
+    document: &str,
+    from: Option<u32>,
+    limit: Option<u32>,
+) -> Result<String, ToolError> {
+    let retrieval = RetrievalConfig {
+        pinned_token_budget: Tokens::new(budget),
+        ..RetrievalConfig::default()
+    };
+    ReadDocumentTool::new(ReaderDb::new(Arc::clone(db)), &retrieval)
+        .call(
+            &mut turn.context(),
+            ReadDocumentArgs {
+                document: String::from(document),
+                from,
+                limit,
+            },
+        )
+        .await
+}
+
+/// `read_document` hands the model a document's chunks in order, numbered
+/// for citing like search hits, registers each with the turn, and counts
+/// as reading document text for the write rule.
+#[tokio::test]
+async fn read_document_returns_consecutive_chunks_registered_as_citations() {
+    let db = shared_db();
+    seed_document(&db, "notes.md", 3, "Section").await;
+    let (sink, _rx) = events::channel();
+    let recorder = TurnRecorder::new(sink);
+    let turn = Turn::new(recorder.clone(), WritePolicy::Deny);
+    assert_eq!(turn.exposure(), Exposure::None);
+    let text = read(&db, &turn, 8000, "notes.md", None, None)
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    for (marker, chunk) in [("[1]", 0), ("[2]", 1), ("[3]", 2)] {
+        assert!(
+            text.contains(&format!(
+                "{marker} notes.md (document_id: notes.md, chunk {chunk}"
+            )),
+            "{text}"
+        );
+        assert!(text.contains(&format!("\nSection {chunk}\n")), "{text}");
+    }
+    assert!(
+        text.ends_with("End of notes.md: chunks 0 to 2 of 3.\n"),
+        "{text}"
+    );
+    let cited = recorder.citations().all();
+    assert_eq!(
+        cited
+            .iter()
+            .map(|c| (c.n, c.chunk_index))
+            .collect::<Vec<_>>(),
+        [(1, 0), (2, 1), (3, 2)]
+    );
+    assert_eq!(cited.first().map(|c| c.excerpt.as_str()), Some("Section 0"));
+    assert_eq!(turn.exposure(), Exposure::Documents);
+    let steps = recorder.steps();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| (s.tool, s.detail.as_str(), s.summary.as_str()))
+            .collect::<Vec<_>>(),
+        [(ToolName::ReadDocument, "notes.md from 0", "3 chunks")]
+    );
+
+    // From a position with a limit: the markers continue and the trailer
+    // says where to go on; a position past the end says so.
+    let text = read(&db, &turn, 8000, "notes", Some(1), Some(1))
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    assert!(
+        text.contains("[4] notes.md (document_id: notes.md, chunk 1"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "Chunks 1 to 1 of 3 in notes.md; call read_document again with from = 2 for the rest.\n"
+        ),
+        "{text}"
+    );
+    let past = read(&db, &turn, 8000, "notes.md", Some(3), None)
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    assert_eq!(
+        past,
+        "notes.md has 3 chunks, positions 0 to 2; from = 3 is past the end."
+    );
+    assert_eq!(recorder.citations().all().len(), 4);
+}
+
+/// The budget bounds what one call hands the model: chunks go out while
+/// they fit, and the first always does.
+#[tokio::test]
+async fn read_document_stops_at_the_token_budget() {
+    let db = shared_db();
+    // Each chunk is 42 characters, about 11 tokens.
+    seed_document(&db, "long.md", 4, &"x".repeat(40)).await;
+    let (sink, _rx) = events::channel();
+    let turn = Turn::new(TurnRecorder::new(sink), WritePolicy::Deny);
+    let text = read(&db, &turn, 25, "long.md", None, None)
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    assert!(
+        text.contains("[1] long.md") && text.contains("[2] long.md"),
+        "{text}"
+    );
+    assert!(!text.contains("[3] long.md"), "{text}");
+    assert!(text.contains("with from = 2 for the rest"), "{text}");
+    let text = read(&db, &turn, 1, "long.md", Some(3), None)
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    assert!(text.contains("[3] long.md"), "{text}");
+    assert!(
+        text.contains("End of long.md: chunks 3 to 3 of 4."),
+        "{text}"
+    );
+}
+
+/// A name that matches nothing, a document that is not ready, and a
+/// tabular file are each refused with a reason the model can act on,
+/// and the failed step is recorded.
+#[tokio::test]
+async fn read_document_refuses_an_unknown_unready_or_tabular_document() {
+    let db = shared_db();
+    seed_document(&db, "notes.md", 1, "Section").await;
+    db.run(|guard| {
+        guard.insert_document(
+            &NewDocument::new(&DocumentId::from("q"), "queued.md", "text/markdown", 1)
+                .with_status(DocumentStatus::Queued),
+        )?;
+        guard.insert_document(
+            &NewDocument::new(&DocumentId::from("t"), "sales.csv", "text/csv", 1)
+                .with_status(DocumentStatus::Ready),
+        )
+    })
+    .await
+    .unwrap_or_else(|e| fail_test(&e.to_string()));
+    let (sink, _rx) = events::channel();
+    let recorder = TurnRecorder::new(sink);
+    let turn = Turn::new(recorder.clone(), WritePolicy::Deny);
+    for (document, expected) in [
+        ("missing.md", "no document matches 'missing.md'"),
+        ("queued.md", "queued.md is queued, not ready"),
+        ("sales.csv", "sales.csv holds no text chunks"),
+    ] {
+        let Err(error) = read(&db, &turn, 8000, document, None, None).await else {
+            fail_test(&format!("{document} was read"))
+        };
+        let error = error.to_string();
+        assert!(error.contains(expected), "{document}: {error}");
+    }
+    assert!(recorder.citations().all().is_empty());
+    assert_eq!(turn.exposure(), Exposure::None);
+    assert_eq!(recorder.steps().len(), 3);
+}
+
 fn shared_db() -> SharedDb {
     Arc::new(
         Writer::spawn(

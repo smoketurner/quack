@@ -371,7 +371,7 @@
         r.citations.forEach(function (cit) {
           var li = el("li", null, "[" + cit.n + "] ");
           var a = el("a", "text-blue-400 hover:underline", cit.label);
-          a.href = "/w/" + chat.getAttribute("data-workspace") + "/documents#doc-" + cit.document_id;
+          a.href = "/w/" + chat.getAttribute("data-workspace") + "/documents/" + cit.document_id + "/chunks/" + cit.chunk_index;
           li.appendChild(a);
           ol.appendChild(li);
         });

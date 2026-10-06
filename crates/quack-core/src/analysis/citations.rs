@@ -24,12 +24,25 @@ pub struct Citation {
     /// before it was kept.
     #[serde(default)]
     pub ingested_at: Option<DateTime>,
+    /// The start of the cited chunk's text, at most [`Self::EXCERPT_CHARS`]
+    /// characters with an ellipsis when cut; empty on answers recorded
+    /// before it was kept. The passage page has the whole chunk.
+    #[serde(default)]
+    pub excerpt: String,
 }
 
 impl Citation {
+    /// Characters of chunk text an excerpt keeps.
+    pub const EXCERPT_CHARS: usize = 500;
+
     /// The retrieved chunk `hit`, cited as `[n]`.
     #[must_use]
     pub fn new(n: u32, hit: &ChunkSearchResult) -> Self {
+        let text = hit.content.trim();
+        let mut excerpt: String = text.chars().take(Self::EXCERPT_CHARS).collect();
+        if text.chars().count() > Self::EXCERPT_CHARS {
+            excerpt.push('\u{2026}');
+        }
         Self {
             n,
             chunk_id: hit.id.clone(),
@@ -39,6 +52,7 @@ impl Citation {
             page: hit.page,
             heading: hit.heading.clone(),
             ingested_at: Some(hit.ingested_at),
+            excerpt,
         }
     }
 
@@ -336,6 +350,40 @@ mod tests {
         assert_eq!(cited.len(), 1);
     }
 
+    /// The excerpt is the chunk's trimmed text up to the bound, with an
+    /// ellipsis when cut on a character, never a byte, boundary.
+    #[test]
+    fn excerpt_is_the_chunk_text_cut_at_the_bound() {
+        let short = Citation::new(
+            1,
+            &ChunkSearchResult {
+                content: String::from("  Flood is excluded.  "),
+                ..hit("a", "p.pdf", 0)
+            },
+        );
+        assert_eq!(short.excerpt, "Flood is excluded.");
+        let long = Citation::new(
+            1,
+            &ChunkSearchResult {
+                content: "é".repeat(Citation::EXCERPT_CHARS.saturating_add(1)),
+                ..hit("a", "p.pdf", 0)
+            },
+        );
+        assert_eq!(
+            long.excerpt.chars().count(),
+            Citation::EXCERPT_CHARS.saturating_add(1)
+        );
+        assert!(long.excerpt.ends_with('\u{2026}'));
+        let exact = Citation::new(
+            1,
+            &ChunkSearchResult {
+                content: "x".repeat(Citation::EXCERPT_CHARS),
+                ..hit("a", "p.pdf", 0)
+            },
+        );
+        assert!(!exact.excerpt.ends_with('\u{2026}'));
+    }
+
     #[test]
     fn validate_leaves_text_without_markers_alone() {
         let CitedAnswer {
@@ -357,6 +405,7 @@ mod tests {
             page: Some(12),
             heading: Some(String::from("Exclusions")),
             ingested_at: Some(DateTime::constant(2026, 10, 5, 14, 3, 0, 0)),
+            excerpt: String::new(),
         };
         assert_eq!(
             c.label(),

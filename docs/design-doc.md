@@ -1308,6 +1308,7 @@ model (`test-utils`, a dev-dependency feature only).
 | Tool | Permission | Description |
 |------|------------|-------------|
 | `search_documents(query, top_k=8, document_ids?, entity?)` | none | Hybrid retrieval; returns chunks with citation metadata and the entities each was the source of |
+| `read_document(document, from=0, limit?)` | none | One document's chunks in order from a position, numbered for citing like search hits, within `[retrieval].pinned_token_budget` (at most 50 chunks a call), with a trailer saying where to continue; a document that is not ready or holds tables is refused with the reason |
 | `list_documents()` | none | Registry with status and pinned flag |
 | `run_sql(query)` | read: none; write: prompt | Execute SQL; result capped at `max_query_rows` with a trailer that says to narrow it in one statement, a note when the statement repeats an earlier one with only its literals changed (the one-query-per-group loop), and which tool call of `max_turns` this was |
 | `describe_table(table_name)` / `list_tables()` | none | Schema and inventory |
@@ -1397,7 +1398,8 @@ cover a write after it.
 Every interface returns one response object (11.2), built by `AgentResponse::to_json`:
 `answer`, `citations` (each with `n`, `chunk_id`, `document_id`, `filename`, `chunk_index`,
 `page`, `heading`, `ingested_at` (when the document was ingested, UTC; `null` on answers
-recorded before it was kept), `label`), `queries`, `steps`, `graph`, `chart`, `write_refused`,
+recorded before it was kept), `excerpt` (the first 500 characters of the chunk, with an
+ellipsis when cut; empty on older answers), `label`), `queries`, `steps`, `graph`, `chart`, `write_refused`,
 `cancelled`, `usage`, `duration_ms`, `session_id`. `AuthRequired` is exit code 4 from every command that
 reaches a provider.
 
@@ -1899,7 +1901,7 @@ mode emits:
 ```json
 {
   "answer": "...",
-  "citations": [{"n": 1, "document_id": "...", "filename": "Policy-2024.pdf", "page": 12, "heading": "Exclusions", "chunk_id": "...", "chunk_index": 3, "ingested_at": "2026-10-05T14:03:11.412", "label": "Policy-2024.pdf, page 12, under \"Exclusions\", ingested 2026-10-05"}],
+  "citations": [{"n": 1, "document_id": "...", "filename": "Policy-2024.pdf", "page": 12, "heading": "Exclusions", "chunk_id": "...", "chunk_index": 3, "ingested_at": "2026-10-05T14:03:11.412", "excerpt": "Flood damage is excluded...", "label": "Policy-2024.pdf, page 12, under \"Exclusions\", ingested 2026-10-05"}],
   "queries": [{"sql": "...", "rows": 4, "duration_ms": 9}],
   "steps": [{"tool": "run_sql", "summary": "4 rows", "rows": 4, "duration_ms": 9, "detail": "..."}],
   "graph": {"nodes": [...], "edges": [...]},
@@ -1932,6 +1934,7 @@ POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 2
                                                   (identical bytes: status "duplicate";
                                                   a table another document owns: 409)
 GET    /api/v1/workspaces/{id}/documents/{doc}    status, metadata
+GET    /api/v1/workspaces/{id}/documents/{doc}/chunks?from=0&limit=20   the chunks from position `from` in order (text, heading, page, position; limit at most 200), with the document's total; audited as opening the document
 PATCH  /api/v1/workspaces/{id}/documents/{doc}    {pinned}
 DELETE /api/v1/workspaces/{id}/documents/{doc}
 GET    /api/v1/workspaces/{id}/tables

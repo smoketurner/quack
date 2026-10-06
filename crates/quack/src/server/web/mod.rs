@@ -42,7 +42,8 @@ use quack_core::storage::control::{
 };
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{
-    DocumentInfo, DocumentSource, Pinning, ResultSort, SamplePool, SortDirection, TableDescription,
+    ChunkSearchResult, DocumentInfo, DocumentSource, Pinning, ResultSort, SamplePool,
+    SortDirection, TableDescription,
 };
 use rust_embed::Embed;
 use serde::Deserialize;
@@ -68,7 +69,7 @@ use super::oidc::Oidc;
 use super::state::{App, ServeMode};
 use quack_core::config::OidcConfig;
 use quack_core::embedding::Vector;
-use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery};
 use quack_core::graph::resolve::MergeDecision;
 use quack_core::graph::store::Revalidation;
@@ -421,6 +422,7 @@ struct CitationView {
     n: u64,
     label: String,
     document_id: DocumentId,
+    chunk_index: u32,
 }
 
 #[derive(Template)]
@@ -444,6 +446,20 @@ struct DocumentsPage {
     notice: Option<String>,
     /// Chunks found by keyword only until a refresh, when there are any.
     embeddings_note: Option<String>,
+}
+
+/// One chunk of a document, where a citation link lands.
+#[derive(Template)]
+#[template(path = "passage.html")]
+struct PassagePage {
+    page: Page,
+    document: DocumentInfo,
+    chunk: ChunkSearchResult,
+    /// Chunks the document holds, when recorded.
+    total: Option<i64>,
+    /// Positions of the chunks before and after, when they exist.
+    previous: Option<u32>,
+    next: Option<u32>,
 }
 
 #[derive(Template)]
@@ -891,6 +907,7 @@ pub(crate) fn router() -> Router<App> {
         .route("/w/{id}/documents", get(documents).post(upload))
         .route("/w/{id}/documents/rows", get(document_rows))
         .route("/w/{id}/documents/status", get(document_status))
+        .route("/w/{id}/documents/{doc}/chunks/{n}", get(passage))
         .route("/w/{id}/documents/{doc}/pin", post(pin))
         .route("/w/{id}/documents/{doc}/unpin", post(unpin))
         .route("/w/{id}/documents/{doc}/delete", post(delete_doc))
@@ -1129,6 +1146,7 @@ impl MessageView {
                     n: u64::from(c.n),
                     label: c.label(),
                     document_id: c.document_id.clone(),
+                    chunk_index: c.chunk_index,
                 })
                 .collect(),
             chart_json: meta
@@ -1441,6 +1459,32 @@ async fn enqueue_web(
         }
     }
     Ok(skipped)
+}
+
+/// The passage a citation links to: chunk `n` of `doc`, with links to
+/// its neighbours. A position past the end is a 404 page.
+async fn passage(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, doc, n)): Path<(WorkspaceId, DocumentId, u32)>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let docs_api::Chunks { document, chunks } =
+        docs_api::read_chunks(&app, &access, &doc, docs_api::ChunkPage::around(n)).await?;
+    let at = |position: u32| chunks.iter().find(|c| c.chunk_index == position);
+    let Some(chunk) = at(n).cloned() else {
+        return Err(Record::Chunk.missing(format!("{doc} chunk {n}")).into());
+    };
+    let previous = n.checked_sub(1).filter(|p| at(*p).is_some());
+    let next = n.checked_add(1).filter(|p| at(*p).is_some());
+    html(&PassagePage {
+        page: Page::in_workspace(&app, Tab::Documents, &access),
+        total: document.chunk_count,
+        document,
+        chunk,
+        previous,
+        next,
+    })
 }
 
 async fn pin(

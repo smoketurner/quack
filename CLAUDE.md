@@ -373,7 +373,16 @@ to the chunks that entity was extracted from (`graph::store::chunks_of_nodes` in
 hit names the entities the graph took from it (`graph::store::entities_of_chunks`). An
 entity that exists only in mapped table rows says so instead of returning nothing. The
 `entity` argument is offered only while the graph has nodes (`SearchDocumentsTool::with_model`, `text_to_sql::Modeled`),
-like the graph tools themselves. Ollama embedding requests go through `llm::OllamaEmbedder`,
+like the graph tools themselves. `read_document(document, from, limit)` (`tools::ReadDocumentTool`,
+registered in every workspace beside `search_documents`) returns a document's chunks in order
+from a position, numbered through the turn's citation registry so `[n]` markers on them
+validate, within `[retrieval].pinned_token_budget` (at most 50 chunks a call), and counts as
+reading document text for the write rule. Every `Citation` carries `excerpt`, the chunk's
+first 500 characters; the web chat links each citation to the passage page
+`/w/{id}/documents/{doc}/chunks/{n}` (`templates/passage.html`, previous and next chunk linked),
+and `GET .../documents/{doc}/chunks?from=&limit=` pages a document's chunks over REST, both
+through `api::documents::read_chunks` (`WorkspaceDb::document_chunks`), audited as opening the
+document. Ollama embedding requests go through `llm::OllamaEmbedder`,
 not rig's client, so they carry `keep_alive` and a chunk-sized `num_ctx`.
 
 Every command resolves its workspace through `ControlPlane::workspace_or_default`: `-w NAME`

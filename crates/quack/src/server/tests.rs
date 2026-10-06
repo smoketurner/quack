@@ -718,6 +718,154 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
     assert!(access_rows.iter().all(|r| r.request_id.is_some()));
 }
 
+/// A document's chunks page in order through the API and open on the web
+/// passage page, where a citation link lands, with its neighbours linked;
+/// a non-member is refused and the refusal is audited.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_documents_chunks_page_through_the_api_and_open_on_the_passage_page() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let outsider = h.user("outsider", UserKind::Standard).await;
+    let ws = h.workspace("docs", &owner).await;
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    db.run(|db| {
+        let id = DocumentId::from("d");
+        db.insert_document(
+            &NewDocument::new(&id, "policy.md", "text/markdown", 1)
+                .with_status(DocumentStatus::Ready),
+        )?;
+        for (i, text) in [
+            "Flood is excluded.",
+            "Hail is covered.",
+            "Claims close in 30 days.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            db.insert_chunk(&NewChunk {
+                id: &ChunkId::from(format!("c{i}")),
+                document_id: &id,
+                chunk_index: u32::try_from(i).unwrap_or_default(),
+                content: text,
+                heading: (i == 1).then_some("Perils"),
+                page: Some(2),
+                embedding: None,
+            })?;
+        }
+        db.set_document_chunk_count(&id, 3)
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let token = h.login("owner").await;
+    let path = format!("/api/v1/workspaces/{ws}/documents/d/chunks");
+
+    let (status, body) = h.get(&format!("{path}?from=1&limit=1"), &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["document_id"], "d");
+    assert_eq!(body["filename"], "policy.md");
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["from"], 1);
+    let chunks = body["chunks"].as_array().cloned().unwrap_or_default();
+    assert_eq!(chunks.len(), 1, "{body}");
+    assert_eq!(chunks[0]["chunk_index"], 1);
+    assert_eq!(chunks[0]["content"], "Hail is covered.");
+    assert_eq!(chunks[0]["heading"], "Perils");
+    assert_eq!(chunks[0]["page"], 2);
+    let (status, body) = h.get(&path, &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["chunks"].as_array().map(Vec::len), Some(3));
+    let (status, body) = h.get(&format!("{path}?from=3"), &token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["chunks"].as_array().map(Vec::len), Some(0));
+    let (status, _) = h
+        .get(
+            &format!("/api/v1/workspaces/{ws}/documents/nope/chunks"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let outsider_token = h.login("outsider").await;
+    let (status, _) = h.get(&path, &outsider_token).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let opened = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("open")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        opened.iter().any(|r| r.outcome == Outcome::Allowed
+            && r.user_id.as_ref() == Some(&owner)
+            && r.resource_id.as_deref() == Some("d")),
+        "{opened:?}"
+    );
+    let denied = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            outcome: Some(Outcome::Denied),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        denied.iter().any(|r| r.user_id.as_ref() == Some(&outsider)),
+        "{denied:?}"
+    );
+
+    // The passage page shows the chunk with links to its neighbours; a
+    // position past the end is a 404 page, and a non-member is refused.
+    let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
+    let cookie = session_cookie(&headers);
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents/d/chunks/1"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(html.contains("Hail is covered."), "{html}");
+    assert!(html.contains("Chunk 1 of 3"), "{html}");
+    assert!(html.contains("Page 2 · Under \"Perils\""), "{html}");
+    assert!(
+        html.contains(&format!("href=\"/w/{ws}/documents/d/chunks/0\""))
+            && html.contains(&format!("href=\"/w/{ws}/documents/d/chunks/2\"")),
+        "{html}"
+    );
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents/d/chunks/2"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(html.contains("End of document"), "{html}");
+    assert!(!html.contains("/chunks/3\""), "{html}");
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents/d/chunks/3"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{html}");
+    let (_, _, headers) = h
+        .form("/login", None, "username=outsider&password=pw")
+        .await;
+    let (status, _, _) = h
+        .page(
+            &format!("/w/{ws}/documents/d/chunks/0"),
+            Some(&session_cookie(&headers)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// The `quack_session` cookie a login response set.
+fn session_cookie(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| c.split(';').next())
+        .and_then(|c| c.strip_prefix("quack_session="))
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// The SQL editor's schema: members read every user table's columns as a
 /// statement writes them, never an internal table; anyone else is refused,
 /// and both are audited.

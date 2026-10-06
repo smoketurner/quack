@@ -291,6 +291,8 @@ pub enum Record {
     Message,
     SavedQuestion,
     Document,
+    /// A chunk of a document, named by the document and its position.
+    Chunk,
     OntologyVersion,
     MergeProposal,
     Candidate,
@@ -302,6 +304,7 @@ text_enum!(Record, "record", {
     Message => "message",
     SavedQuestion => "saved question",
     Document => "document",
+    Chunk => "chunk",
     OntologyVersion => "ontology version",
     MergeProposal => "merge proposal",
     Candidate => "candidate",

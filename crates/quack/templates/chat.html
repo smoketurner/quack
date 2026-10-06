@@ -46,7 +46,7 @@
         {% for g in m.graphs %}<div class="graph mt-3 h-72 rounded border border-slate-800" data-graph="{{ g }}"></div>{% endfor %}
         {% if !m.citations.is_empty() %}
         <ol class="mt-3 space-y-1 text-sm text-slate-400">
-          {% for c in m.citations %}<li>[{{ c.n }}] <a class="text-blue-400 hover:underline" href="/w/{{ ws.id }}/documents#doc-{{ c.document_id }}">{{ c.label }}</a></li>{% endfor %}
+          {% for c in m.citations %}<li>[{{ c.n }}] <a class="text-blue-400 hover:underline" href="/w/{{ ws.id }}/documents/{{ c.document_id }}/chunks/{{ c.chunk_index }}">{{ c.label }}</a></li>{% endfor %}
         </ol>
         {% endif %}
       </article>

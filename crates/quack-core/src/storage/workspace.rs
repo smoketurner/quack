@@ -2316,6 +2316,34 @@ impl WorkspaceDb {
         Ok(rows.collect::<duckdb::Result<_>>()?)
     }
 
+    /// Up to `limit` of a document's chunks from position `from` on, in
+    /// document order, with the citation metadata a search hit carries
+    /// (score 1). Status is not checked: a passage cited by an earlier
+    /// answer must still open after its document was replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn document_chunks(
+        &self,
+        document_id: &DocumentId,
+        from: u32,
+        limit: u32,
+    ) -> Result<Vec<ChunkSearchResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0, \
+                    CAST(d.ingested_at AS VARCHAR) \
+             FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE c.document_id = ? AND c.chunk_index >= ? \
+             ORDER BY c.chunk_index LIMIT ?",
+        )?;
+        let rows = stmt.query_map(
+            duckdb::params![document_id, i64::from(from), i64::from(limit)],
+            |row| ChunkSearchResult::try_from(row),
+        )?;
+        Ok(rows.collect::<duckdb::Result<_>>()?)
+    }
+
     /// Chunks by id, in the order given, with the citation metadata a
     /// search hit carries (score 1).
     ///
@@ -2914,6 +2942,37 @@ impl DocumentInfo {
         self.title.as_deref().unwrap_or(&self.filename)
     }
 
+    /// The document in `documents` the model named: by id, exact file
+    /// name, or id prefix.
+    ///
+    /// # Errors
+    ///
+    /// A name that matches none is an error listing the documents there
+    /// are, so the caller corrects it rather than reading an empty result
+    /// as "the workspace has nothing on this".
+    pub fn find<'a>(documents: &'a [Self], want: &str) -> Result<&'a Self> {
+        let want = want.trim();
+        let found = documents
+            .iter()
+            .find(|d| d.id.as_str() == want || d.filename == want)
+            .or_else(|| {
+                documents
+                    .iter()
+                    .find(|d| !want.is_empty() && d.id.as_str().starts_with(want))
+            });
+        found.ok_or_else(|| {
+            let known: Vec<String> = documents
+                .iter()
+                .map(|d| format!("{} ({})", d.id, OneLine(&d.filename)))
+                .collect();
+            Error::Analysis(format!(
+                "no document matches '{want}'; pass an id (a prefix is enough) or an exact \
+                 file name from list_documents. Documents: {}",
+                known.join(", ")
+            ))
+        })
+    }
+
     /// The tables a row from before `tables` was recorded loaded into: the
     /// one named after the file, for a CSV, Parquet, or JSON file. Workbooks
     /// arrived with the `tables` column, so their rows always carry it.
@@ -3341,27 +3400,7 @@ impl ChunkScope {
         let documents = db.list_documents()?;
         let mut resolved = Vec::with_capacity(wanted.len());
         for want in wanted {
-            let want = want.trim();
-            let found = documents
-                .iter()
-                .find(|d| d.id.as_str() == want || d.filename == want)
-                .or_else(|| {
-                    documents
-                        .iter()
-                        .find(|d| !want.is_empty() && d.id.as_str().starts_with(want))
-                });
-            let Some(d) = found else {
-                let known: Vec<String> = documents
-                    .iter()
-                    .map(|d| format!("{} ({})", d.id, OneLine(&d.filename)))
-                    .collect();
-                return Err(Error::Analysis(format!(
-                    "no document matches '{want}'; pass an id from list_documents or omit \
-                     document_ids to search everything. Documents: {}",
-                    known.join(", ")
-                )));
-            };
-            resolved.push(d.id.clone());
+            resolved.push(DocumentInfo::find(&documents, want)?.id.clone());
         }
         Ok(Self::documents(resolved))
     }

@@ -21,8 +21,8 @@ use super::rerank::RerankAnswer;
 use super::text_to_sql::{Modeled, PromptOptions, SystemPrompt};
 use super::tools::{
     CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphTools,
-    ListDocumentsTool, ListTablesTool, ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool,
-    SharedDb, Turn,
+    ListDocumentsTool, ListTablesTool, ReadDocumentTool, ReaderDb, RunSqlTool, SearchDocumentsTool,
+    SearchGraphTool, SharedDb, Turn,
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::{GraphOptions, GraphResult, store as graph_store};
@@ -772,6 +772,7 @@ impl BuildContext<'_> {
         let mut builder = AgentBuilder::new(completion_model)
             .preamble(system_prompt)
             .tool(search)
+            .tool(ReadDocumentTool::new(reader(), ctx.retrieval_config))
             .tool(RunSqlTool::new(
                 Arc::clone(&ctx.shared_db),
                 reader(),

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::Json;
 use std::collections::HashMap;
 
-use axum::extract::{FromRequest, Multipart, Path, State};
+use axum::extract::{FromRequest, Multipart, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use quack_core::error::Record;
@@ -24,7 +24,9 @@ use crate::server::queue::UploadJob;
 use crate::server::state::{App, with_db};
 use quack_core::okf::{self, Bundle};
 use quack_core::ontology::store::Revision;
-use quack_core::storage::workspace::{DocumentInfo, DocumentSource, Pinning, WorkspaceDb};
+use quack_core::storage::workspace::{
+    ChunkSearchResult, DocumentInfo, DocumentSource, Pinning, WorkspaceDb,
+};
 
 pub(crate) async fn list(
     State(app): State<App>,
@@ -61,6 +63,88 @@ pub(crate) async fn show(
         })
         .await?;
     Ok(Json(serde_json::to_value(document)?))
+}
+
+/// `?from=&limit=` on `GET .../documents/{doc}/chunks`: chunk positions
+/// from `from` on, `limit` of them.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub(crate) struct ChunkPage {
+    #[serde(default)]
+    pub from: u32,
+    #[serde(default = "ChunkPage::default_limit")]
+    pub limit: u32,
+}
+
+impl ChunkPage {
+    /// Chunks one request returns at most.
+    pub(crate) const MAX_LIMIT: u32 = 200;
+
+    const fn default_limit() -> u32 {
+        20
+    }
+
+    /// The chunk at `position` with its neighbours, for a passage page.
+    pub(crate) const fn around(position: u32) -> Self {
+        Self {
+            from: position.saturating_sub(1),
+            limit: 3,
+        }
+    }
+}
+
+/// A page of one document's chunks in document order, with the
+/// document itself (its `chunk_count` is the total).
+pub(crate) struct Chunks {
+    pub document: DocumentInfo,
+    pub chunks: Vec<ChunkSearchResult>,
+}
+
+/// Read `page` of `doc`'s chunks, audited as opening the document; what
+/// the REST route and the web passage page share.
+pub(crate) async fn read_chunks(
+    app: &App,
+    access: &Access,
+    doc: &DocumentId,
+    page: ChunkPage,
+) -> ApiResult<Chunks> {
+    let limit = page.limit.clamp(1, ChunkPage::MAX_LIMIT);
+    access
+        .audit(
+            app,
+            AuditAction::Open,
+            Some(ResourceKind::Document.id(doc)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "chunks_from": page.from, "limit": limit })),
+        )
+        .await?;
+    let doc = doc.clone();
+    app.read(&access.workspace.id, move |db| {
+        let document = db
+            .document(&doc)?
+            .ok_or_else(|| Record::Document.missing(doc.as_str()))?;
+        let chunks = db.document_chunks(&doc, page.from, limit)?;
+        Ok(Chunks { document, chunks })
+    })
+    .await
+}
+
+/// `GET .../documents/{doc}/chunks?from=&limit=`: the document's chunks
+/// from position `from`, each with its text, heading, page, and position.
+pub(crate) async fn chunks(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
+    Query(page): Query<ChunkPage>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let Chunks { document, chunks } = read_chunks(&app, &access, &doc, page).await?;
+    Ok(Json(serde_json::json!({
+        "document_id": document.id,
+        "filename": document.filename,
+        "total": document.chunk_count,
+        "from": page.from,
+        "chunks": chunks,
+    })))
 }
 
 #[derive(Deserialize)]
