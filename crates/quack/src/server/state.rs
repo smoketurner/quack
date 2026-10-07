@@ -176,9 +176,17 @@ pub(crate) struct AppState {
     /// Cancelled when the server begins to stop: long-lived streams end on
     /// it, so a connection left open cannot hold the process up.
     pub stopping: CancellationToken,
+    /// The last readiness answer and when it was worked out: `/readyz` is
+    /// open to anyone and outside the limiter, so its checks run at most
+    /// once per [`READINESS_FRESH`].
+    readiness: tokio::sync::Mutex<Option<(Instant, Readiness)>>,
 }
 
-/// What `GET /readyz` answers: each component `ok`, or why it is not.
+/// How long a readiness answer is served again before it is checked anew.
+const READINESS_FRESH: Duration = Duration::from_secs(2);
+
+/// What `GET /readyz` answers: each component `ok` or `fail`; why one
+/// failed goes to the server's log, not to whoever asked.
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct Readiness {
     pub control_db: Probe,
@@ -199,14 +207,17 @@ impl Readiness {
 #[serde(tag = "status", rename_all = "lowercase")]
 pub(crate) enum Probe {
     Ok,
-    Fail { error: String },
+    Fail,
 }
 
 impl Probe {
-    fn of(outcome: Result<(), String>) -> Self {
+    fn of(component: &str, outcome: Result<(), String>) -> Self {
         match outcome {
             Ok(()) => Self::Ok,
-            Err(error) => Self::Fail { error },
+            Err(error) => {
+                tracing::warn!(component, error, "not ready");
+                Self::Fail
+            }
         }
     }
 }
@@ -264,6 +275,7 @@ impl AppState {
             flashes: Flashes::default(),
             permissions: Permissions::default(),
             stopping: CancellationToken::new(),
+            readiness: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -396,6 +408,18 @@ impl AppState {
     /// Whether this server can serve: `control.db` answers, the data
     /// directory takes a write, and the vault key is where it should be.
     pub(crate) async fn readiness(&self) -> Readiness {
+        let mut last = self.readiness.lock().await;
+        if let Some((at, answer)) = last.as_ref()
+            && at.elapsed() < READINESS_FRESH
+        {
+            return answer.clone();
+        }
+        let answer = self.check_readiness().await;
+        *last = Some((Instant::now(), answer.clone()));
+        answer
+    }
+
+    async fn check_readiness(&self) -> Readiness {
         let control_db = self.control.ping().await.map_err(|e| e.to_string());
         let data_dir = {
             let probe = self
@@ -413,9 +437,9 @@ impl AppState {
             .map(|_| ())
             .map_err(|e| e.to_string());
         Readiness {
-            control_db: Probe::of(control_db),
-            data_dir: Probe::of(data_dir),
-            vault_key: Probe::of(vault_key),
+            control_db: Probe::of("control_db", control_db),
+            data_dir: Probe::of("data_dir", data_dir),
+            vault_key: Probe::of("vault_key", vault_key),
         }
     }
 

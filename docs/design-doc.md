@@ -2308,7 +2308,7 @@ answer to a question is the same object print mode emits (`AgentResponseBody` in
 
 ```
 GET    /healthz                                   liveness, no auth
-GET    /readyz                                    readiness, no auth: 200 {control_db, data_dir, vault_key} each `ok`, else 503 with the failing probe's error
+GET    /readyz                                    readiness, no auth: 200 {control_db, data_dir, vault_key} each `ok`, else 503 naming the failing probe (its error goes to the log); checked at most every 2 s
 GET    /metrics                                   Prometheus text; loopback, or an admin's bearer
 GET    /api/v1/openapi.json                       the OpenAPI 3.1 document, no auth
 GET    /api/v1/docs                               the document rendered by Redoc, no auth

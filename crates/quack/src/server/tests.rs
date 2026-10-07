@@ -29,7 +29,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 use super::state::{App, AppState, ServeMode, with_db};
-use crate::server::auth::{Access, Credential, Identity};
+use crate::server::auth::{Access, Credential, Identity, Need};
 use crate::server::queue::UploadJob;
 use crate::server::run::{BackgroundRun, RunKind, RunReport};
 use quack_core::jobs::{JobKind, LaneKey};
@@ -271,6 +271,38 @@ impl Harness {
         }
         fail("document never left the queue")
     }
+}
+
+/// What let a long-lived stream in is checked again while it runs: a
+/// member who is removed, or an account that is disabled, no longer holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn access_no_longer_holds_once_a_member_is_removed_or_disabled() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("w", &owner).await;
+    let access = h.owner_access(&ws, &owner).await;
+    assert!(access.still_holds(&h.app, Need::READ).await);
+    h.app
+        .control
+        .remove_member(&ws, &owner, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(!access.still_holds(&h.app, Need::READ).await, "removed");
+    h.app
+        .control
+        .set_member(&ws, &owner, Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        access.still_holds(&h.app, Need::READ).await,
+        "a viewer reads"
+    );
+    h.app
+        .control
+        .disable_user(&owner, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(!access.still_holds(&h.app, Need::READ).await, "disabled");
 }
 
 /// A browser on another site cannot make this one change anything: a

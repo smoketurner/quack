@@ -5,6 +5,7 @@
 //! admin), like the session itself.
 
 use std::convert::Infallible;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -163,10 +164,16 @@ pub(crate) async fn cancel(
     Ok(Json(access.cancel_job(&app, &job).await?))
 }
 
+/// How often an open stream checks that its caller may still read it.
+const ACCESS_RECHECK: Duration = Duration::from_secs(30);
+
 /// Every change to the workspace's jobs as SSE `job` events (a `JobInfo`
 /// each), starting with the current list as one `jobs` event. A client
 /// that falls behind gets a fresh `jobs` event rather than a gap. The
-/// stream ends when the server begins to stop.
+/// stream ends when the server begins to stop, and when the caller's
+/// access no longer holds (checked before an event, at most every 30
+/// seconds): a removed member, a disabled account, or a closed session
+/// stops seeing the workspace's job labels.
 #[utoipa::path(
     get,
     path = "/workspaces/{id}/jobs/stream",
@@ -186,36 +193,48 @@ pub(crate) async fn stream(
         .event()
         .json_data(access.visible_jobs(&app))
         .unwrap_or_default();
-    let state = (receiver, app, access, Some(first));
-    let stream = futures::stream::unfold(state, |(mut receiver, app, access, first)| async move {
-        if let Some(event) = first {
-            return Some((Ok(event), (receiver, app, access, None)));
-        }
-        loop {
-            let received = tokio::select! {
-                biased;
-                () = app.stopping.cancelled() => return None,
-                received = receiver.recv() => received,
-            };
-            match received {
-                Ok(job) if job.workspace_id.as_ref() == Some(&access.membership.workspace.id) => {
-                    let event = StreamEvent::Job
-                        .event()
-                        .json_data(access.redact(job))
-                        .unwrap_or_default();
-                    return Some((Ok(event), (receiver, app, access, None)));
-                }
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let event = StreamEvent::Jobs
-                        .event()
-                        .json_data(access.visible_jobs(&app))
-                        .unwrap_or_default();
-                    return Some((Ok(event), (receiver, app, access, None)));
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
+    let state = (receiver, app, access, Some(first), Instant::now());
+    let stream = futures::stream::unfold(
+        state,
+        |(mut receiver, app, access, first, checked)| async move {
+            if let Some(event) = first {
+                return Some((Ok(event), (receiver, app, access, None, checked)));
             }
-        }
-    });
+            let mut checked = checked;
+            loop {
+                if checked.elapsed() >= ACCESS_RECHECK {
+                    if !access.still_holds(&app, Need::READ).await {
+                        return None;
+                    }
+                    checked = Instant::now();
+                }
+                let received = tokio::select! {
+                    biased;
+                    () = app.stopping.cancelled() => return None,
+                    received = receiver.recv() => received,
+                };
+                match received {
+                    Ok(job)
+                        if job.workspace_id.as_ref() == Some(&access.membership.workspace.id) =>
+                    {
+                        let event = StreamEvent::Job
+                            .event()
+                            .json_data(access.redact(job))
+                            .unwrap_or_default();
+                        return Some((Ok(event), (receiver, app, access, None, checked)));
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let event = StreamEvent::Jobs
+                            .event()
+                            .json_data(access.visible_jobs(&app))
+                            .unwrap_or_default();
+                        return Some((Ok(event), (receiver, app, access, None, checked)));
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    );
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
