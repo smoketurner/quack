@@ -7484,6 +7484,44 @@ async fn a_waiting_write_is_answered_once_by_its_asker() {
     assert!(details.contains("UPDATE t SET a = 1"), "{details}");
 }
 
+/// A turn through the REST API, its handler's scopes included, fits a
+/// worker stack of 1 MiB, half of Tokio's default, in a debug build. Layered
+/// scopes that each doubled the turn's future once needed nearly all 2 MiB,
+/// and a Windows worker overflowed.
+#[test]
+fn a_turn_fits_a_one_mebibyte_worker_stack() {
+    use crate::scripted_ollama::{Reply, ScriptedOllama};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(1024 * 1024)
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    // On a worker, not this thread, whose stack the test harness sets.
+    let turn = runtime.spawn(async {
+        let ollama = ScriptedOllama::serve(vec![Reply::Text("An answer.")])
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let config = ollama.config().unwrap_or_else(|e| fail(&e.to_string()));
+        let h = harness_with(ServeMode::Login, config).await;
+        let owner = h.user("owner", UserKind::Standard).await;
+        let ws = h.workspace("stack", &owner).await;
+        let token = h.login("owner").await;
+        let (status, answer) = h
+            .post(
+                &format!("/api/v1/workspaces/{ws}/query"),
+                &token,
+                serde_json::json!({ "prompt": "hello" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["answer"], "An answer.", "{answer}");
+    });
+    runtime
+        .block_on(turn)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+}
+
 /// `allow_write` lets a turn write until it has read document text. A
 /// non-streamed turn cannot ask, so its write after a search is refused; a
 /// streamed one asks the person with the reason, and their answer runs it.
