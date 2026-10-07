@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use rig::tool::{Tool, ToolContext};
 use schemars::generate::SchemaSettings;
@@ -42,8 +42,8 @@ use crate::text::{Fenced, NonBlankText, OneLine, Tokens};
 pub type SharedDb = Arc<Writer>;
 
 /// One reader connection of a pool: a `try_clone_reader` clone of the
-/// writer, used by one read at a time.
-type ReaderConn = Arc<Mutex<WorkspaceDb>>;
+/// writer, used by one read at a time; `None` once a lease closed it.
+type ReaderConn = Arc<Mutex<Option<WorkspaceDb>>>;
 
 /// Where one read runs.
 enum Slot<'a> {
@@ -151,7 +151,7 @@ impl ReaderDb {
                     let guard = conn
                         .lock()
                         .map_err(|e| Error::Analysis(format!("reader lock poisoned: {e}")))?;
-                    guard.read_only(f)
+                    guard.as_ref().ok_or(Error::WriterStopped)?.read_only(f)
                 })
                 .await
                 .map_err(|e| Error::Analysis(format!("database task failed: {e}")))?
@@ -221,7 +221,7 @@ impl ReaderDb {
         let readers: Vec<ReaderConn> = clones
             .into_iter()
             .filter_map(|clone| match clone {
-                Ok(db) => Some(Arc::new(Mutex::new(db))),
+                Ok(db) => Some(Arc::new(Mutex::new(Some(db)))),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -232,6 +232,52 @@ impl ReaderDb {
             })
             .collect();
         Self::from_pool(readers, Arc::clone(shared_db))
+    }
+}
+
+impl ReaderDb {
+    /// Every reader connection, locked until the lease drops, so a read
+    /// waits for it. Blocks until reads in progress end.
+    #[must_use]
+    pub fn lend(&self) -> ReaderLease<'_> {
+        ReaderLease {
+            degraded: &self.0.degraded,
+            slots: self
+                .0
+                .readers
+                .iter()
+                .map(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner))
+                .collect(),
+        }
+    }
+}
+
+/// A reader pool's connections, held by [`ReaderDb::lend`].
+pub struct ReaderLease<'a> {
+    degraded: &'a AtomicBool,
+    slots: Vec<MutexGuard<'a, Option<WorkspaceDb>>>,
+}
+
+impl ReaderLease<'_> {
+    /// Close every reader connection.
+    pub fn close(&mut self) {
+        for slot in &mut self.slots {
+            **slot = None;
+        }
+    }
+
+    /// Fill every slot with a clone of `db`, the writer's new connection; a
+    /// clone that fails sends every later read to the writer.
+    pub fn restore(&mut self, db: &WorkspaceDb) {
+        for slot in &mut self.slots {
+            match db.try_clone_reader() {
+                Ok(clone) => **slot = Some(clone),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to clone a reader connection again; every read will share the writer");
+                    self.degraded.store(true, Ordering::Relaxed);
+                }
+            }
+        }
     }
 }
 

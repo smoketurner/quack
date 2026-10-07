@@ -1634,10 +1634,18 @@ fn opening_an_older_workspace_reads_auto_acceptance_from_the_note() {
     }
     // The second open runs while the first is still live, so it replays
     // the first one's column change from the write-ahead log, as the next
-    // start does after a process dies before a checkpoint.
-    let upgraded = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-    let reopened = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-    drop(upgraded);
+    // start does after a process dies before a checkpoint. Windows lets no
+    // second handle open the file (#448), so there it follows the close.
+    let open = || WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+    let upgraded = open();
+    let reopened = if cfg!(windows) {
+        drop(upgraded);
+        open()
+    } else {
+        let reopened = open();
+        drop(upgraded);
+        reopened
+    };
     let acceptance: Vec<Acceptance> = store::versions(&reopened, 10)
         .unwrap_or_else(|e| fail(&e.to_string()))
         .into_iter()

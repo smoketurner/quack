@@ -27,6 +27,22 @@ this order and know what each step leaves.
    was ingested, read, and deleted, by opaque id, never by content. That is the record of
    the spill and its remediation; it is not erased.
 
+## Taking a snapshot
+
+`quack workspace snapshot NAME --to FILE`, `GET /api/v1/workspaces/{id}/snapshot`, and the
+Settings page's download write the workspace as one tar. The workspace's file is closed
+while it is copied: quack checkpoints it, closes every connection to it, copies it, and
+opens it again. Windows refuses to let any other handle read a DuckDB file that is open, so
+every OS takes this path.
+
+- **Under `quack serve`**, requests to that workspace wait while the file is closed: writes
+  and audit rows queue, reads wait for their connection. The window is the time to copy
+  `data.duckdb` and `files/` to an unnamed temporary file in the data directory; the
+  download then streams from that file with the workspace open again. Other workspaces do
+  not wait. Leave free space in the data directory for one copy of the workspace.
+- **From the command line**, the snapshot opens the workspace itself, so it fails while
+  `quack serve` or another `quack` holds the workspace; use the API then.
+
 ## Retiring a workspace
 
 `quack workspace delete NAME` (or `DELETE /api/v1/workspaces/{id}`, or the Settings page)

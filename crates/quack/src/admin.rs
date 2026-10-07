@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use quack_core::config::Config;
+use quack_core::error::Error as CoreError;
 
 use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::ocsf::PromptText;
@@ -19,7 +20,6 @@ use quack_core::storage::control::{
     IssuedToken, Outcome, ResourceKind, Role, Scope, UserKind, WorkspaceName, WorkspaceRow,
 };
 use quack_core::storage::workspace::WorkspaceDb;
-use quack_core::storage::writer::Writer;
 
 use crate::confirm::Confirm;
 use crate::text_or_json::TextOrJson;
@@ -329,33 +329,32 @@ impl WorkspaceAction {
         let ws = control.workspace_named(name).await?;
         let described = Described::of(control, &ws).await?;
         let dir = config.workspace_dir(ws.id.as_str());
-        let writer = Writer::spawn(WorkspaceDb::open(config, ws.id.as_str())?)
-            .context("failed to start the workspace writer")?;
-        let Some(path) = to else {
-            if stdout.is_terminal() {
-                anyhow::bail!("stdout is a terminal; pipe the tar somewhere or use --to FILE");
+        if to.is_none() && stdout.is_terminal() {
+            anyhow::bail!("stdout is a terminal; pipe the tar somewhere or use --to FILE");
+        }
+        let open_config = config.clone();
+        let out_path = to.clone();
+        // The file is copied closed: Windows lets no other handle open a
+        // `DuckDB` file in use (#448).
+        tokio::task::spawn_blocking(move || {
+            let db = WorkspaceDb::open(&open_config, ws.id.as_str())?;
+            let manifest = Manifest::of(&db, described)?;
+            db.checkpoint()?;
+            drop(db);
+            match out_path {
+                Some(path) => {
+                    let file = std::fs::File::create(&path)?;
+                    manifest.write(&dir, file)?.sync_all()?;
+                }
+                None => manifest.write(&dir, std::io::stdout().lock())?.flush()?,
             }
-            // The tar is written on the writer's thread, which holds the
-            // stdout lock for the whole snapshot; nothing else prints then.
-            return writer
-                .run(move |db| {
-                    let manifest = Manifest::of(db, described)?;
-                    let out = std::io::stdout().lock();
-                    manifest.write(db, &dir, out)?.flush()?;
-                    Ok(())
-                })
-                .await
-                .map_err(Into::into);
+            Ok::<_, CoreError>(())
+        })
+        .await
+        .context("the snapshot task failed")??;
+        let Some(path) = to else {
+            return Ok(());
         };
-        let out_path = path.clone();
-        writer
-            .run(move |db| {
-                let manifest = Manifest::of(db, described)?;
-                let file = std::fs::File::create(&out_path)?;
-                manifest.write(db, &dir, file)?.sync_all()?;
-                Ok(())
-            })
-            .await?;
         let mut out = stdout.lock();
         writeln!(out, "Wrote '{name}' to {}", path.display())?;
         out.flush()?;

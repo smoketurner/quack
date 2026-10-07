@@ -60,6 +60,9 @@ winsplit = { workspace = true, features = ["std"] }
 # Tests sign access tokens the way an issuer would; the binary itself signs
 # nothing and gets its crypto through quack-core.
 aws-lc-rs    = { workspace = true, features = ["aws-lc-sys"] }
+# A test opens a workspace file from a child process, as another program
+# would, to show a snapshot closes it.
+duckdb       = { workspace = true, features = ["bundled"] }
 ipnet        = { workspace = true, features = ["std"] }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 proptest     = { workspace = true, features = ["std"] }

@@ -1000,6 +1000,17 @@ impl WorkspaceDb {
         })
     }
 
+    /// Write everything committed into the database file, so a copy of the
+    /// file once every connection has closed holds it all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint fails.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.conn.execute_batch("CHECKPOINT")?;
+        Ok(())
+    }
+
     /// Whether this connection has any temp tables: only ever the CLI's
     /// piped-stdin table, `ingestion::STDIN_TABLE`, loaded before a
     /// workspace handle's first turn — the agent itself is refused any
