@@ -210,6 +210,24 @@ status line, and outcome (a one-line summary or the error). Each change is broad
 snapshot; the terminal's job strip and `/jobs`, the web console's Jobs page, and
 `GET .../jobs/stream` all read it.
 
+Every workspace page in the web console carries a job strip above its content
+(`templates/base.html`, `/w/{id}/jobs/strip`): the active jobs, three at most as in the
+terminal, the rest counted, refetched on each event of the one `jobs/stream` the page opens
+(audited as `stream`, the strip as a `page` read). When a background job finishes, a
+`role="status"` toast says so from its kind, number, state, and the label already redacted
+for the caller; "Notify me" asks the browser once, remembered in `localStorage`, and a
+notification fires only while the page is hidden. The Documents page refreshes on job events
+instead of polling.
+
+`[server.webhooks]` POSTs each finished job to the operator's endpoint (`jobs::webhook`):
+`job_id`, `number`, `kind`, `state`, `workspace_id`, `owner`, the three times, and `progress`,
+never the label or outcome, which can carry workspace content; a receiver asks `GET
+.../jobs/{job}` with its own token for those. The body is signed with HMAC-SHA256 (aws-lc-rs)
+under the secret `secret_env` names, as `X-Quack-Signature: sha256=<hex>`, and `quack serve`
+refuses to start when that variable is unset. `kinds` narrows the report (every kind but chat
+turns by default). Delivery goes through `Proxies::client`, with one retry after two seconds,
+and a failure is logged.
+
 Cancelling a queued job ends it without running, including one whose task has not yet
 run for the first time. A running job sees its cancel token and
 stops at its next checkpoint, or finishes if its work has none (an ingest mid-embedding).
@@ -379,7 +397,6 @@ CREATE TABLE _quack_documents (
     page_count       INTEGER,              -- a PDF's pages; NULL for other sources
     pages_unreadable INTEGER,              -- pages whose extraction failed
     pages_empty      INTEGER,              -- pages that read and held no text
-    pages_transcribed INTEGER,             -- textless pages the vision model transcribed
     ingested_by   TEXT,
     ingested_at   TIMESTAMP DEFAULT now(),
     language      TEXT                     -- ISO 639-3 code its text was indexed under (deu, cmn)
@@ -868,34 +885,28 @@ own values win (`quack ingest --author`, `--authored`, `--tag`), and a person ca
 them afterwards (`PATCH .../documents/{doc}`, `quack docs --author|--authored|--tag|--untag`).
 They show in the Documents page, `list_documents`, and the prompt's document inventory.
 
-**Images and scanned pages.** `[ingestion].vision_model` names a chat model that reads
-images (`provider/model`, like `chat_model`); it runs at that model's `background_effort`.
-An uploaded or ingested image goes to it once with a prompt to transcribe the text and
-describe the rest, and what it writes is chunked and embedded like any Markdown document.
-A PDF page that reads without error and holds no text (a scan) is rendered to a PNG that
-fits 1568 pixels (`pdf::Scans`, pdf_oxide's pure-Rust renderer, one page at a time off the
-runtime) and transcribed by the same model; its text takes the page's place in the
-document. Without a vision model an image is refused before it is registered
-(`Error::NoVisionModel`, REST 400 `no_vision_model`), and a PDF with no text on any page
-fails with `no extractable text: the PDF has no text layer; set [ingestion].vision_model to
-transcribe scanned pages`. A page the model cannot read stays without text, with a warning;
-the document fails only when no page gave text at all. Images are not a `quack import`
-source, which loads tables.
+A scanned PDF (no text layer) is reported as `error: no extractable text`. OCR is deferred.
+
+**Images.** `[ingestion].vision_model` names a chat model that reads images
+(`provider/model`, like `chat_model`); it runs at that model's `background_effort`. An uploaded
+or ingested image goes to it once with a prompt to transcribe the text and describe the rest,
+and what it writes is chunked and embedded like any Markdown document. Without a vision model
+an image is refused before it is registered (`Error::NoVisionModel`, REST 400
+`no_vision_model`). Images are not a `quack import` source, which loads tables.
 
 A chat model marked `images = true` (`[providers.NAME]` or `[providers.NAME.models."ID"]`)
-also gets the `view_image` tool in every workspace holding an image (section 7.3). The
-image document's passage page shows the image, served by `GET .../documents/{doc}/image`
-(and `/w/{id}/documents/{doc}/image` in the web console), audited as opening the document.
+also gets the `view_image` tool in every workspace holding an image (section 7.3). The image
+document's passage page shows the image, served by `GET .../documents/{doc}/image` (and
+`/w/{id}/documents/{doc}/image` in the web console), audited as opening the document.
 
 **Partly read PDFs.** A PDF with some pages missing from its text still becomes `ready`, and
 the document row records what is missing (`parser::PageCounts`): `page_count`,
-`pages_unreadable` (extraction failed), `pages_empty` (the page read and held no text,
-as a scanned image does, and no vision model read it), and `pages_transcribed` (the vision
-model wrote its text). `DocumentInfo` carries them as `pages`
-(`{"total": 40, "unreadable": 3, "empty": 2, "transcribed": 0}`, `null` for any other source), so REST, MCP
+`pages_unreadable` (extraction failed), and `pages_empty` (the page read and held no text,
+as a scanned image does). `DocumentInfo` carries them as `pages`
+(`{"total": 40, "unreadable": 3, "empty": 2}`, `null` for any other source), so REST, MCP
 `list_documents`, and `quack docs --format json` return them. Every listing a person or the
 agent reads shows one note from `PageCounts::note`, such as `3 of 40 pages
-unreadable, 2 without text, 12 transcribed by the vision model`: `quack ingest`, `quack docs`, the terminal's `/docs` and load
+unreadable, 2 without text`: `quack ingest`, `quack docs`, the terminal's `/docs` and load
 message, the web Documents row, an upload job's result, the agent's `list_documents` output,
 and the documents block of the system prompt.
 
@@ -2972,7 +2983,7 @@ tokenizer_encoding = "cl100k_base"
 upload_max_mb = 512
 max_decompressed_mb = 1024      # what a DOCX, PPTX, or zipped workbook may inflate to while parsed
 table_rows_as_table = 20        # a table inside a document with this many rows also loads as a workspace table
-# vision_model = "ollama/qwen2.5vl:7b"   # reads images and scanned PDF pages at ingest; images are refused without it
+# vision_model = "ollama/gemma4:e4b"   # describes uploaded images at ingest; images are refused without it
 
 [context]
 max_tokens = 4000
@@ -3027,6 +3038,12 @@ permission_timeout_seconds = 300        # how long a streamed turn waits for a p
 shutdown_grace_seconds = 20             # how long SIGTERM or Ctrl-C waits for jobs and requests to end; keep the supervisor's kill timeout above it
 secure_cookies = "auto"                 # "always": Secure cookies on loopback too (same-host TLS proxy)
 log_format = "text"                     # "json": one JSON object per line for a log collector; the access log is `quack::access` at debug
+
+[server.webhooks]        # optional: a signed POST when a background job finishes
+url = "https://hooks.example.com/quack"
+secret_env = "QUACK_WEBHOOK_SECRET"     # the HMAC-SHA256 key; quack serve will not start without it
+kinds = ["ingest", "import"]            # default: every kind but chat
+timeout_seconds = 10
 
 [server.oidc]            # optional: "Sign in with <issuer>" beside the password form
 issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
@@ -3378,8 +3395,7 @@ Every gap is a GitHub issue unless the item says otherwise.
       included, is a plain runtime task. The terminal's commands run their database step in
       typed order on a worker task, reads on the reader pool.
     - Not yet: MCP `query` calls and print mode run their turn directly (one call, one
-      answer, nothing to keep responsive); the web chat page shows its own turn but not a
-      job strip (the Jobs page does); jobs are not persisted across restarts.
+      answer, nothing to keep responsive); jobs are not persisted across restarts.
 
 ---
 
@@ -3424,7 +3440,7 @@ Every gap is a GitHub issue unless the item says otherwise.
 2. Data connectors: GitHub, Confluence, SharePoint (fetching a data file over http(s)
    already ships in `quack import`)
 3. ~~Cross-encoder reranking provider~~ (`[retrieval].rerank = "reranker"`)
-4. ~~OCR for scanned PDFs~~ (`[ingestion].vision_model` transcribes them)
+4. OCR for scanned PDFs
 5. Postgres + pgvector storage backend, which now also means building the seam section 15
    item 4 describes
 6. Ontology import from OWL / SKOS; a registry of domain packs

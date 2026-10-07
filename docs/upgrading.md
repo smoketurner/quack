@@ -22,16 +22,13 @@ Two rules hold for every release:
 
 - Config: `[retrieval].languages` added (default `["auto"]`): what a document may be
   detected as for keyword stemming, `"auto"` or Snowball language names.
-- Schema: workspace 14. The first open of each workspace detects every document's language
+- Schema: workspace 13. The first open of each workspace detects every document's language
   from its first chunks and rebuilds the keyword index (`_quack_terms`), reading every chunk
-  once, and adds `_quack_imports` for saved imports. `control.db` migrations 9 to 11
-  (applied on start): user lifecycle, group roles, and the sealed credentials of saved
-  imports.
+  once. `control.db` unchanged (migration 8).
 - Embeddings: no refresh needed.
-- Config: `[ingestion].vision_model` added (unset by default): the model that reads images
-  and scanned PDF pages at ingest. Without it, image uploads are refused and a PDF with no
-  text fails as before. `images = true` on a provider or model gives the agent `view_image`.
-- Workspace: `_quack_documents.pages_transcribed` is added on open; no schema bump.
+- Config: `[ingestion].vision_model` added (unset by default): the model that describes
+  uploaded images at ingest; without it, image uploads are refused. `images = true` on a
+  provider or model gives the agent `view_image`.
 
 The version-bump pull request renames this section to the tag.
 

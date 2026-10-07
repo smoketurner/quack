@@ -1449,16 +1449,15 @@ async fn a_turn_views_an_image_with_a_chat_model_that_reads_images() {
 }
 
 /// An image is described by the vision model at upload, served back as
-/// uploaded, and shown on its passage page; a PDF page with no text is
-/// rendered and transcribed; without a vision model an image is refused.
+/// uploaded, and shown on its passage page; without a vision model an
+/// image is refused.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_vision_model_reads_images_and_scanned_pages() {
+async fn the_vision_model_reads_images_and_they_are_served() {
     use crate::scripted_ollama::{Reply, ScriptedOllama};
 
-    let ollama = ScriptedOllama::serve(vec![
-        Reply::Text("A bar chart: revenue rose from 10 to 20."),
-        Reply::Text("The second page says the audit passed."),
-    ])
+    let ollama = ScriptedOllama::serve(vec![Reply::Text(
+        "A bar chart: revenue rose from 10 to 20.",
+    )])
     .await
     .unwrap_or_else(|e| fail(&e.to_string()));
     let config = ollama
@@ -1537,41 +1536,6 @@ async fn the_vision_model_reads_images_and_scanned_pages() {
     let (status, _) = h.get(&format!("{base}/{notes}/image"), &token).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Audit");
-    pdf.letter_page().at(72.0, 720.0).text("First page").done();
-    pdf.letter_page().done();
-    let pdf = pdf.build().unwrap_or_else(|e| fail(&e.to_string()));
-    let (status, body) = upload(&h, &ws, &token, "audit.pdf", "application/pdf", &pdf).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    let doc = body["documents"][0]["id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
-    let ready = h.wait_ready(&ws, &doc, &token).await;
-    assert_eq!(ready["status"], "ready", "{ready}");
-    assert_eq!(
-        ready["pages"],
-        serde_json::json!({ "total": 2, "unreadable": 0, "empty": 0, "transcribed": 1 }),
-        "{ready}"
-    );
-    let (_, chunks) = h.get(&format!("{base}/{doc}/chunks"), &token).await;
-    let all = chunks["chunks"].to_string();
-    assert!(all.contains("First page"), "{chunks}");
-    assert!(all.contains("the audit passed"), "{chunks}");
-    let rendered = ollama
-        .requests()
-        .get(1)
-        .and_then(|r| r["messages"].as_array().cloned())
-        .unwrap_or_default();
-    assert!(
-        rendered.iter().any(|m| m["images"]
-            .as_array()
-            .and_then(|i| i.first())
-            .and_then(|i| i.as_str())
-            .is_some_and(|png| png.starts_with("iVBORw0KGgo"))),
-        "the page went to the model as a PNG"
-    );
-
     let plain = harness(ServeMode::Login).await;
     let owner = plain.user("owner", UserKind::Standard).await;
     let ws = plain.workspace("plain", &owner).await;
@@ -1604,13 +1568,12 @@ async fn a_partly_read_document_says_so_over_rest_mcp_and_the_web() {
                 total: 40,
                 unreadable: 3,
                 empty: 2,
-                transcribed: 0,
             }),
         )
     })
     .await
     .unwrap_or_else(|e| fail(&e.to_string()));
-    let counts = serde_json::json!({ "total": 40, "unreadable": 3, "empty": 2, "transcribed": 0 });
+    let counts = serde_json::json!({ "total": 40, "unreadable": 3, "empty": 2 });
 
     let base = format!("/api/v1/workspaces/{ws}/documents");
     let (status, body) = h.get(&base, &token).await;

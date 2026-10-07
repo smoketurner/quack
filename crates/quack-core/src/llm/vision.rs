@@ -1,6 +1,5 @@
-//! A model that reads an image: `[ingestion].vision_model` describing a
-//! picture or transcribing a PDF page with no text at ingest, and a chat
-//! model marked `images = true` answering a question about one in a turn
+//! A model that reads an image: `[ingestion].vision_model` describing an
+//! uploaded picture at ingest, and a chat model marked `images = true` answering a question about one in a turn
 //! (`view_image`). Each call is one tool-less request through the provider's
 //! client, so it takes the provider's permit, keeps to the workspace's
 //! allowed providers, and is retried like any other.
@@ -24,12 +23,6 @@ const DESCRIBE_PROMPT: &str = "You read an image so it can be searched and cited
      relationships it conveys. Write plain Markdown with no preamble. If the image holds no \
      text, say so in one line and describe it.";
 
-/// What a scanned PDF page becomes: its text, as the page has it.
-const TRANSCRIBE_PROMPT: &str = "You transcribe one scanned page of a document. Write out \
-     every word on it exactly as written, in reading order, keeping headings, lists, and \
-     tables as Markdown. Do not summarize or add anything. If the page is blank, answer with \
-     an empty line.";
-
 /// What a question about an image in a turn is answered from.
 const LOOK_PROMPT: &str = "You answer a question about one image for a data analysis \
      assistant. Answer from what the image shows, quoting its text exactly where it matters, \
@@ -38,35 +31,22 @@ const LOOK_PROMPT: &str = "You answer a question about one image for a data anal
 /// How long one image call may run.
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// What an image is read for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reading {
-    /// An ingested picture: its text, then what it shows.
-    Describe,
-    /// A scanned PDF page: its text alone.
-    Transcribe,
-}
-
 /// A model that takes images, set up for one purpose.
 pub struct ImageReader(PlainCall);
 
 impl ImageReader {
     /// The vision model `[ingestion].vision_model` names, at background
-    /// effort, reading for `reading`; `None` when none is configured.
+    /// effort, describing images; `None` when none is configured.
     ///
     /// # Errors
     ///
     /// Returns an error when the model names an unknown provider or its
     /// client cannot be built.
-    pub async fn for_ingest(config: &Config, reading: Reading) -> Result<Option<Self>> {
+    pub async fn for_ingest(config: &Config) -> Result<Option<Self>> {
         let Some(model) = config.vision_model_ref()? else {
             return Ok(None);
         };
         let settings = config.model_settings(model);
-        let preamble = match reading {
-            Reading::Describe => DESCRIBE_PROMPT,
-            Reading::Transcribe => TRANSCRIBE_PROMPT,
-        };
         let chat = ChatClient::build(config, &model).await?.chat_model(
             model.model,
             settings.background_effort,
@@ -75,7 +55,7 @@ impl ImageReader {
         Ok(Some(Self(PlainCall::new(
             chat,
             Task {
-                preamble,
+                preamble: DESCRIBE_PROMPT,
                 timeout: IMAGE_TIMEOUT,
                 label: "image reading",
             },

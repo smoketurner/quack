@@ -42,7 +42,6 @@ pub fn html(text: &str) -> Result<Extracted> {
         flow: Flow::Sectioned,
         pages: None,
         meta,
-        blank_pages: Vec::new(),
     })
 }
 

@@ -41,7 +41,7 @@ metrics       = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 oauth2        = { workspace = true }
 office_oxide  = { workspace = true }
-pdf_oxide     = { workspace = true, features = ["legacy-crypto", "rendering"] }
+pdf_oxide     = { workspace = true, features = ["legacy-crypto"] }
 pulldown-cmark = { workspace = true }
 quick-xml     = { workspace = true }
 reqwest       = { workspace = true, features = ["rustls", "http2"] }
@@ -86,6 +86,7 @@ rustls                       = { workspace = true, features = ["fips"] }
 windows-native-keyring-store = { workspace = true }
 
 [dev-dependencies]
+axum      = { workspace = true, features = ["http1", "tokio"] } # the test endpoint a webhook posts to
 criterion = { workspace = true, features = ["cargo_bench_support"] }
 rig       = { workspace = true, features = ["test-utils"] } # rig's scripted model, for whole-turn tests
 sqlx      = { workspace = true, features = ["runtime-tokio", "sqlite"] }

@@ -28,7 +28,7 @@ use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
 use crate::graph::views;
 use crate::ids::{ChunkId, DocumentId};
-use crate::llm::vision::{ImageReader, Reading};
+use crate::llm::vision::ImageReader;
 use crate::progress::{ChunkDone, RunControl};
 use crate::storage::profile::ColumnTypes;
 use crate::storage::workspace::{
@@ -40,8 +40,8 @@ use crate::text::{NonBlankText, OneLine};
 use budget::DecompressionBudget;
 use chunker::Chunker;
 use parser::{
-    DocumentMeta, Extracted, FileType, ImageFormat, Load, PageCounts, Reader, Section, SectionKind,
-    Separator, TextFormat,
+    DocumentMeta, FileType, ImageFormat, Load, PageCounts, Reader, SectionKind, Separator,
+    TextFormat,
 };
 use table::Table;
 
@@ -541,7 +541,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
     /// titled after the file.
     async fn image(&self, format: ImageFormat, file_type: FileType) -> Result<IngestResult> {
         let (config, filename) = (self.config, self.file.filename);
-        let reader = ImageReader::for_ingest(config, Reading::Describe)
+        let reader = ImageReader::for_ingest(config)
             .await?
             .ok_or_else(|| Error::NoVisionModel(filename.to_owned()))?;
         let stored = StoredImage::of(config, self.workspace_id, self.document_id, format);
@@ -554,74 +554,6 @@ impl<M: EmbeddingModel> Processing<'_, M> {
         let markdown = format!("# {}\n\n{text}\n", OneLine(filename));
         self.chunk(TextFormat::Markdown, file_type, markdown.as_bytes())
             .await
-    }
-
-    /// Have the vision model transcribe the PDF pages that held no text,
-    /// rendering one page at a time off the runtime, and put each page's
-    /// text in its place. Without a vision model the pages stay blank. A
-    /// page that cannot be rendered or read stays blank with a warning,
-    /// unless no page could be read, when the last model error is the
-    /// document's.
-    async fn transcribe(&self, extracted: &mut Extracted) -> Result<()> {
-        let Some(reader) = ImageReader::for_ingest(self.config, Reading::Transcribe).await? else {
-            return Ok(());
-        };
-        let blank = std::mem::take(&mut extracted.blank_pages);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let data = self.file.data.to_vec();
-        let scans = parse_off_runtime(move || pdf::Scans::open(&data)).await?;
-        let rendering = tokio::task::spawn_blocking(move || {
-            for page in blank {
-                if tx.blocking_send((page, scans.render(page))).is_err() {
-                    return;
-                }
-            }
-        });
-        let mut last_error = None;
-        let mut read = 0_u32;
-        while let Some((page, image)) = rx.recv().await {
-            let text = match image {
-                Ok(png) => {
-                    self.file
-                        .control
-                        .or_cancelled(reader.read(&png, ImageFormat::Png, "Transcribe this page."))
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            match text {
-                Ok(text) if !text.trim().is_empty() => {
-                    extracted
-                        .sections
-                        .push(Section::body(None, text).on_page(Some(page)));
-                    read = read.saturating_add(1);
-                }
-                Ok(_) => {}
-                Err(Error::Cancelled) => return Err(Error::Cancelled),
-                Err(error) => {
-                    tracing::warn!(
-                        file = %self.file.filename,
-                        page,
-                        error = %error,
-                        "a scanned PDF page could not be transcribed"
-                    );
-                    last_error = Some(error);
-                }
-            }
-            self.file.control.check()?;
-        }
-        rendering.await.map_err(|e| {
-            Error::Ingestion(format!("PDF rendering stopped before it finished: {e}"))
-        })?;
-        if let Some(pages) = extracted.pages.as_mut() {
-            pages.empty = pages.empty.saturating_sub(read);
-            pages.transcribed = read;
-        }
-        extracted.sections.sort_by_key(|section| section.page);
-        match last_error {
-            Some(error) if read == 0 && extracted.sections.is_empty() => Err(error),
-            _ => Ok(()),
-        }
     }
 
     /// Parse and chunk a text document, record what it says about itself,
@@ -643,34 +575,13 @@ impl<M: EmbeddingModel> Processing<'_, M> {
         // Parsing and chunking are the slow, CPU-bound part: off the
         // runtime's workers, and not on the writer.
         let parsing = Parsing::new(config, format, filename, data);
-        let (parsing, mut extracted) = parse_off_runtime(move || {
-            let mut parsing = parsing;
-            let extracted = parsing.extract()?;
-            Ok((parsing, extracted))
-        })
-        .await?;
-        let scanned = !extracted.blank_pages.is_empty();
-        if scanned {
-            self.transcribe(&mut extracted).await?;
-        }
-        if scanned && extracted.sections.is_empty() {
-            return Err(Error::Ingestion(String::from(
-                if config.ingestion.vision_model.is_some() {
-                    "no extractable text: the PDF has no text layer and the vision model read \
-                     none from its pages"
-                } else {
-                    "no extractable text: the PDF has no text layer; set \
-                     [ingestion].vision_model to transcribe scanned pages"
-                },
-            )));
-        }
         let Parsed {
             title,
             pages,
             chunks,
             meta,
             tables: found,
-        } = parse_off_runtime(move || parsing.chunked(extracted)).await?;
+        } = parse_off_runtime(move || parsing.run()).await?;
         let (id, fields) = (doc_id.to_owned(), self.file.fields.clone());
         db.run(move |db| {
             if let Some(title) = title {
@@ -705,7 +616,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 document = %doc_id,
                 file = %filename,
                 pages = %note,
-                "ingested with pages that did not read as text"
+                "ingested with pages missing from the text"
             );
         }
         control.check()?;
@@ -771,14 +682,8 @@ impl Parsing {
         }
     }
 
-    /// The document's sections. The budget goes with them: a file is
-    /// extracted once.
-    fn extract(&mut self) -> Result<Extracted> {
-        let budget = std::mem::replace(&mut self.budget, DecompressionBudget::megabytes(0));
-        self.format.extract(&self.data, budget)
-    }
-
-    fn chunked(self, extracted: Extracted) -> Result<Parsed> {
+    fn run(self) -> Result<Parsed> {
+        let extracted = self.format.extract(&self.data, self.budget)?;
         let chunks = Chunker::new(self.chunk_size, self.chunk_overlap, &self.encoding)?
             .document(&extracted, self.stem.as_deref())?;
         let mut tables = Vec::new();

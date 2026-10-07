@@ -233,7 +233,6 @@ fn a_partly_read_document_says_so_in_the_inventory() {
             total: 40,
             unreadable: 3,
             empty: 0,
-            transcribed: 0,
         }),
     )
     .unwrap();
@@ -243,7 +242,6 @@ fn a_partly_read_document_says_so_in_the_inventory() {
             total: 12,
             unreadable: 0,
             empty: 0,
-            transcribed: 0,
         }),
     )
     .unwrap();

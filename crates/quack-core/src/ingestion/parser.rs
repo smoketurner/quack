@@ -323,9 +323,6 @@ pub struct Extracted {
     /// has them).
     pub pages: Option<PageCounts>,
     pub meta: DocumentMeta,
-    /// The pages, from 1, that read without error and held no text: a
-    /// scanned page a vision model can transcribe.
-    pub blank_pages: Vec<u32>,
 }
 
 /// What a file says about itself: who wrote it and when, its tags, and
@@ -392,38 +389,26 @@ pub struct PageCounts {
     pub unreadable: u32,
     /// Pages that read without error and yielded no text.
     pub empty: u32,
-    /// Pages with no text layer whose text the vision model transcribed.
-    pub transcribed: u32,
 }
 
 impl PageCounts {
-    /// What a person is told when pages did not read as text, as
-    /// `3 of 40 pages unreadable, 2 transcribed by the vision model`;
-    /// `None` when every page read as text.
+    /// What a person is told when pages are missing from the text, as
+    /// `3 of 40 pages unreadable`; `None` when every page was kept.
     #[must_use]
     pub fn note(self) -> Option<String> {
         let Self {
             total,
             unreadable,
             empty,
-            transcribed,
         } = self;
-        let mut parts = Vec::new();
-        for (count, what) in [
-            (unreadable, "unreadable"),
-            (empty, "without text"),
-            (transcribed, "transcribed by the vision model"),
-        ] {
-            if count == 0 {
-                continue;
-            }
-            parts.push(if parts.is_empty() {
-                format!("{count} of {total} pages {what}")
-            } else {
-                format!("{count} {what}")
-            });
+        match (unreadable, empty) {
+            (0, 0) => None,
+            (_, 0) => Some(format!("{unreadable} of {total} pages unreadable")),
+            (0, _) => Some(format!("{empty} of {total} pages without text")),
+            (_, _) => Some(format!(
+                "{unreadable} of {total} pages unreadable, {empty} without text"
+            )),
         }
-        (!parts.is_empty()).then(|| parts.join(", "))
     }
 
     /// The note of `pages` after a comma, to end a one-line description
@@ -826,8 +811,7 @@ mod tests {
             Some(PageCounts {
                 total: 60,
                 unreadable: 0,
-                empty: 0,
-                transcribed: 0,
+                empty: 0
             })
         );
         assert_eq!(extracted.pages.and_then(PageCounts::note), None);
@@ -850,20 +834,7 @@ mod tests {
             total: 40,
             unreadable,
             empty,
-            transcribed: 0,
         };
-        let read = |unreadable, empty, transcribed| PageCounts {
-            transcribed,
-            ..counts(unreadable, empty)
-        };
-        assert_eq!(
-            read(0, 0, 12).note().as_deref(),
-            Some("12 of 40 pages transcribed by the vision model")
-        );
-        assert_eq!(
-            read(3, 2, 12).note().as_deref(),
-            Some("3 of 40 pages unreadable, 2 without text, 12 transcribed by the vision model")
-        );
         assert_eq!(counts(0, 0).note(), None);
         assert_eq!(
             counts(3, 0).note().as_deref(),

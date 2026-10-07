@@ -64,8 +64,6 @@ aws-lc-rs    = { workspace = true, features = ["aws-lc-sys"] }
 # would, to show a snapshot closes it.
 duckdb       = { workspace = true, features = ["bundled"] }
 ipnet        = { workspace = true, features = ["std"] }
-# Tests build a PDF with a page that holds no text, as a scan would.
-pdf_oxide    = { workspace = true }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 proptest     = { workspace = true, features = ["std"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }

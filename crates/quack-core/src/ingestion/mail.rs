@@ -34,7 +34,6 @@ pub fn eml(data: &[u8]) -> Result<Extracted> {
         flow: Flow::Sectioned,
         pages: None,
         meta,
-        blank_pages: Vec::new(),
     })
 }
 

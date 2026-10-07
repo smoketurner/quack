@@ -2699,7 +2699,6 @@ async fn a_pdf_page_without_text_is_counted_on_the_document() {
         total: 3,
         unreadable: 0,
         empty: 1,
-        transcribed: 0,
     };
     assert_eq!(result.pages, Some(counts));
     assert_eq!(
@@ -2732,32 +2731,13 @@ async fn a_pdf_page_without_text_is_counted_on_the_document() {
     assert_eq!(doc.pages, None);
 }
 
-/// A PDF with no text on any page fails with what to configure when no
-/// vision model is set, and an image is refused before it is registered.
+/// An image is refused before it is registered when no vision model is
+/// set.
 #[tokio::test]
-async fn scans_and_images_without_a_vision_model_say_what_to_set() {
+async fn an_image_without_a_vision_model_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
-    let db = WorkspaceDb::open(&config, "ws-scans").unwrap();
-    let writer = writer_of(&db);
-    let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Scan");
-    pdf.letter_page().done();
-    pdf.letter_page().done();
-    let bytes = pdf.build().unwrap();
-    let failed = ingestion::ingest_file(
-        &config,
-        &writer,
-        "ws-scans",
-        &ingestion::NewFile::new("scan.pdf", &bytes),
-        None::<&Embedder<MockEmbeddingModel>>,
-    )
-    .await;
-    let message = failed.err().map(|e| e.to_string()).unwrap_or_default();
-    assert!(
-        message.contains("set [ingestion].vision_model to transcribe scanned pages"),
-        "{message}"
-    );
-
+    let db = WorkspaceDb::open(&config, "ws-images").unwrap();
     let refused = ingestion::register_document(
         &db,
         &config,

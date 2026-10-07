@@ -96,7 +96,6 @@ const DOCUMENTS_DDL: &str = "
         page_count INTEGER,
         pages_unreadable INTEGER,
         pages_empty INTEGER,
-        pages_transcribed INTEGER,
         superseded_by TEXT,
         source_root TEXT,
         source_path TEXT
@@ -111,7 +110,6 @@ const DOCUMENTS_DDL: &str = "
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_unreadable INTEGER;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_empty INTEGER;
-    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_transcribed INTEGER;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS superseded_by TEXT;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_root TEXT;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_path TEXT;
@@ -2196,13 +2194,12 @@ impl WorkspaceDb {
     /// Returns an error if the update fails.
     pub fn set_document_pages(&self, id: &DocumentId, pages: Option<PageCounts>) -> Result<()> {
         self.conn.execute(
-            "UPDATE _quack_documents SET page_count = ?, pages_unreadable = ?, pages_empty = ?, \
-             pages_transcribed = ? WHERE id = ?",
+            "UPDATE _quack_documents SET page_count = ?, pages_unreadable = ?, pages_empty = ? \
+             WHERE id = ?",
             duckdb::params![
                 pages.map(|p| p.total),
                 pages.map(|p| p.unreadable),
                 pages.map(|p| p.empty),
-                pages.map(|p| p.transcribed),
                 id
             ],
         )?;
@@ -2367,10 +2364,6 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    /// Remove what ingestion wrote under `files/` for a document: the file
-    /// itself, for workbooks and imports one CSV per table, and for an
-    /// image its stored copy. A missing file is fine; any other failure is
-    /// logged, since the rows are gone.
     /// Whether a ready document is an image, which `view_image` can look at.
     ///
     /// # Errors
@@ -2396,6 +2389,10 @@ impl WorkspaceDb {
         Some(StoredImage::in_dir(files_dir, &document.id, format))
     }
 
+    /// Remove what ingestion wrote under `files/` for a document: the file
+    /// itself, for workbooks and imports one CSV per table, and for an
+    /// image its stored copy. A missing file is fine; any other failure is
+    /// logged, since the rows are gone.
     fn remove_document_files(&self, id: &DocumentId, filename: &str, tables: &[String]) {
         let Some(files_dir) = &self.files_dir else {
             return;
@@ -4157,8 +4154,8 @@ const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, statu
      COALESCE(pinned, false), CAST(ingested_at AS VARCHAR), title, sha256, source, chunk_count, \
      ingested_by, CAST(tables AS VARCHAR), page_count, pages_unreadable, pages_empty, \
      superseded_by, source_root, source_path, author, CAST(authored_at AS VARCHAR), \
-     CAST(modified_at AS VARCHAR), CAST(tags AS VARCHAR), CAST(metadata AS VARCHAR), language, \
-     pages_transcribed FROM _quack_documents";
+     CAST(modified_at AS VARCHAR), CAST(tags AS VARCHAR), CAST(metadata AS VARCHAR), language \
+     FROM _quack_documents";
 
 /// The `WHERE` clause that keeps a document that still stands for its
 /// bytes, neither failed nor replaced: only such a document is a duplicate
@@ -4196,7 +4193,6 @@ impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
                     total,
                     unreadable: row.get::<_, Option<u32>>(15)?.unwrap_or(0),
                     empty: row.get::<_, Option<u32>>(16)?.unwrap_or(0),
-                    transcribed: row.get::<_, Option<u32>>(26)?.unwrap_or(0),
                 }),
                 None => None,
             },

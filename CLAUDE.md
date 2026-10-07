@@ -267,10 +267,8 @@ Images (PNG, JPEG, WebP, GIF; `FileType::Image`) are read once at ingest by
 `background_effort`), whose transcription and description are chunked as Markdown; the image is
 kept as `files/<document id>.<ext>` (`ingestion::StoredImage`, `WorkspaceDb::stored_image`) and
 served by `GET .../documents/{doc}/image`. With no vision model an image is refused at
-registration (`Error::NoVisionModel`). A PDF page with no text is rendered (`pdf::Scans`, one page
-at a time off the runtime) and transcribed by the same model, counted in
-`PageCounts::transcribed`. A chat model marked `images = true` gets `view_image` (the stored
-image and a question back to the chat model) in a workspace that holds an image.
+registration (`Error::NoVisionModel`). A chat model marked `images = true` gets `view_image` (the
+stored image and a question back to the chat model) in a workspace that holds an image.
 Chunk bodies, graph source excerpts, and pinned text reach the model inside `text::Fenced`
 markers, whose code is a digest of the enclosed text (so the text cannot close its own block),
 after a fixed sentence that it is data; an `always_retrieve` chunk is fenced too, as the `content`
@@ -549,7 +547,9 @@ write in progress just to record itself. `query/stream` forwards the agent event
 and run on the work queue in a lane of `[server].workers_per_workspace` per workspace
 (`queue.rs`), which locks the workspace only around each database step and keeps each queued upload's bytes on disk in the workspace's `uploads/` until its job ends; `api/jobs.rs`
 serves `GET .../jobs`, `.../jobs/stream` (SSE), `.../jobs/{job}`, and `POST .../cancel`,
-and `/w/{id}/jobs` is the web console's Jobs page. The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
+and `/w/{id}/jobs` is the web console's Jobs page; every workspace page carries a job strip
+(`/w/{id}/jobs/strip`) over one `jobs/stream`, with a toast when a background job finishes, and
+`[server.webhooks]` POSTs finished jobs, content-free and HMAC-signed (`jobs::webhook`). The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
 the same `Access::resolve` checks and the API's `Access` operations; `WebUser` redirects to `/login` instead
 of a 401; the built Tailwind CSS is committed (`make css-build` after template edits),
 htmx, ECharts, and Redoc are vendored, and the SQL page's CodeMirror editor is bundled from

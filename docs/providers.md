@@ -141,8 +141,7 @@ a chat turn still answers, without model reranking and history summaries, and lo
 Two settings let quack read images. Neither sends an image anywhere until it is set.
 
 - `[ingestion].vision_model` names the model that reads an uploaded PNG, JPEG, WebP, or GIF
-  once at ingest, and transcribes each PDF page that has no text layer. Without it, an
-  image upload is refused and a fully scanned PDF fails. It runs at the model's
+  once at ingest. Without it, an image upload is refused. It runs at the model's
   `background_effort`.
 - `images = true` on `[providers.NAME]` or `[providers.NAME.models."ID"]` says the chat
   model reads images, which gives the agent the `view_image` tool in a workspace that holds
@@ -150,10 +149,10 @@ Two settings let quack read images. Neither sends an image anywhere until it is 
 
 ```toml
 [ingestion]
-vision_model = "ollama/qwen2.5vl:7b"
+vision_model = "ollama/gemma4:e4b"
 
-[providers.ollama.models."qwen2.5vl:7b"]
-images = true                            # the chat model may look at images in a turn
+[providers.ollama.models."gemma4:e4b"]
+images = true                            # only when gemma4:e4b is also the chat model
 ```
 
 Any provider type works if the model accepts images: Ollama's vision models, OpenAI's
