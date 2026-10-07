@@ -11,6 +11,7 @@ pub mod memory;
 pub mod oauth;
 pub mod sampling;
 mod slot;
+pub mod vision;
 
 use jiff::{Timestamp, Zoned};
 use rig::agent::OutputMode;
@@ -54,6 +55,7 @@ use crate::storage::{context, sessions};
 use egress::Egress;
 use sampling::{Sampled, Wire};
 pub use tokio_util::sync::CancellationToken;
+use vision::ImageReader;
 
 pub mod limit;
 
@@ -774,24 +776,32 @@ pub struct Task<'a> {
 /// uses and the one Ollama answers reliably, and an answer the output limit
 /// cut is refused by name.
 pub struct SchemaCall<A> {
+    call: PlainCall,
+    answer: PhantomData<fn() -> A>,
+}
+
+/// One tool-less model call: the agent, how long it may take, and what it
+/// is called in errors and logs.
+pub(crate) struct PlainCall {
     agent: Agent,
     timeout: Duration,
     label: &'static str,
-    answer: PhantomData<fn() -> A>,
 }
 
 impl<A> SchemaCall<A> {
     #[must_use]
     pub fn new(model: ChatModel, task: Task<'_>, schema: Schema) -> Self {
         Self {
-            agent: AgentBuilder::new(model)
-                .preamble(task.preamble)
-                .temperature(0.0)
-                .output_schema_raw(schema)
-                .output_mode(OutputMode::Native)
-                .build(),
-            timeout: task.timeout,
-            label: task.label,
+            call: PlainCall {
+                agent: AgentBuilder::new(model)
+                    .preamble(task.preamble)
+                    .temperature(0.0)
+                    .output_schema_raw(schema)
+                    .output_mode(OutputMode::Native)
+                    .build(),
+                timeout: task.timeout,
+                label: task.label,
+            },
             answer: PhantomData,
         }
     }
@@ -807,21 +817,36 @@ impl<A> SchemaCall<A> {
     where
         A: DeserializeOwned,
     {
-        let answer = self.text(text).await?;
-        tracing::debug!(call = self.label, answer = %answer, "structured answer");
+        let answer = self.call.text(text).await?;
+        tracing::debug!(call = self.call.label, answer = %answer, "structured answer");
         serde_json::from_str(answer.trim()).map_err(|e| {
             Error::Llm(format!(
                 "the {} answer does not fit its schema: {e}",
-                self.label
+                self.call.label
             ))
         })
     }
+}
 
-    async fn text(&self, text: &str) -> Result<String> {
+impl PlainCall {
+    /// A call to `model` with `task`'s preamble that answers in text.
+    pub(crate) fn new(model: ChatModel, task: Task<'_>) -> Self {
+        Self {
+            agent: AgentBuilder::new(model)
+                .preamble(task.preamble)
+                .temperature(0.0)
+                .build(),
+            timeout: task.timeout,
+            label: task.label,
+        }
+    }
+
+    /// The model's text answer to `message`, within the call's timeout.
+    async fn text(&self, message: impl Into<Message>) -> Result<String> {
         use futures::StreamExt;
         let what = self.label;
         let collect = async {
-            let mut stream = self.agent.prompt(text).stream();
+            let mut stream = self.agent.prompt(message).stream();
             let mut answer = String::new();
             let mut final_text: Option<String> = None;
             let mut cutoff: Option<Cutoff> = None;
@@ -1463,7 +1488,8 @@ async fn dispatch(
     } else {
         None
     };
-    Box::pin(analysis.run(model, reranker, sink)).await
+    let images = ImageReader::for_turn(&client, chat.model, settings)?;
+    Box::pin(analysis.run(model, reranker, images, sink)).await
 }
 
 #[cfg(test)]

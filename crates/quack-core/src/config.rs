@@ -779,6 +779,9 @@ pub struct ModelSettings {
     pub effort: Option<Effort>,
     /// Reasoning effort for background calls.
     pub background_effort: Option<Effort>,
+    /// Whether the model reads images: a chat model that does is offered
+    /// `view_image`.
+    pub images: Option<bool>,
 }
 
 impl ModelSettings {
@@ -789,6 +792,7 @@ impl ModelSettings {
             temperature: self.temperature.or(fallback.temperature),
             effort: self.effort.or(fallback.effort),
             background_effort: self.background_effort.or(fallback.background_effort),
+            images: self.images.or(fallback.images),
         }
     }
 }
@@ -815,6 +819,7 @@ struct RawProviderConfig {
     temperature: Option<bool>,
     effort: Option<Effort>,
     background_effort: Option<Effort>,
+    images: Option<bool>,
     #[serde(default)]
     models: BTreeMap<String, ModelSettings>,
 }
@@ -913,6 +918,7 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
                 temperature: raw.temperature,
                 effort: raw.effort,
                 background_effort: raw.background_effort,
+                images: raw.images,
             },
             models: raw.models,
         };
@@ -1079,6 +1085,10 @@ pub struct IngestionConfig {
     /// as a table of the workspace, owned by the document, so `run_sql`
     /// can query it. Zero loads none.
     pub table_rows_as_table: u32,
+    /// The model that describes an image, and transcribes a PDF page with
+    /// no text, as `provider/model`. Unset, images are refused and such
+    /// pages stay empty.
+    pub vision_model: Option<ModelSpec>,
 }
 
 impl IngestionConfig {
@@ -1102,6 +1112,7 @@ impl Default for IngestionConfig {
             // limit still has as much again for its XML.
             max_decompressed_mb: 1024,
             table_rows_as_table: 20,
+            vision_model: None,
         }
     }
 }
@@ -1949,6 +1960,7 @@ impl Config {
         if self.general.chat_model.is_some() {
             self.chat_model_ref()?;
         }
+        self.vision_model_ref()?;
         if let Some(embed) = self.embedding_model_ref()? {
             if embed.provider.provider_type == ProviderType::Anthropic {
                 return Err(Error::Config(format!(
@@ -2024,6 +2036,7 @@ impl Config {
                 temperature: None,
                 effort: self.analysis.effort,
                 background_effort: self.analysis.background_effort,
+                images: None,
             })
     }
 
@@ -2069,6 +2082,19 @@ impl Config {
                  to rank with the chat model"
             ))),
         }
+    }
+
+    /// The model `[ingestion].vision_model` names, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Config` error when it names no configured provider.
+    pub fn vision_model_ref(&self) -> Result<Option<ModelRef<'_>>> {
+        self.ingestion
+            .vision_model
+            .as_ref()
+            .map(|spec| self.resolve_model("[ingestion].vision_model", spec))
+            .transpose()
     }
 
     /// The embedding model, if configured.

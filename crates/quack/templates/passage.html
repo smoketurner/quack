@@ -4,6 +4,9 @@
 <p class="text-sm text-slate-400"><a class="text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/documents#doc-{{ document.id }}">Documents</a> · {{ document.filename }}{% if let Some(title) = document.title %} <span class="text-slate-500">{{ title }}</span>{% endif %}</p>
 <h1 class="mt-1 text-xl font-semibold">Chunk {{ chunk.chunk_index }}{% if let Some(total) = total %} of {{ total }}{% endif %}</h1>
 <p class="mt-1 text-sm text-slate-400">{% if let Some(page) = chunk.page %}Page {{ page }} · {% endif %}{% if let Some(locator) = chunk.locator %}{{ locator }} · {% endif %}{% if let Some(heading) = chunk.heading %}Under "{{ heading }}" · {% endif %}{% if chunk.page.is_none() && chunk.locator.is_none() && chunk.heading.is_none() %}No page or heading recorded · {% endif %}{% if chunk.kind != SectionKind::Body %}{{ chunk.kind }} · {% endif %}ingested {{ When::Relative.html(document.ingested_at.as_str())|safe }}</p>
+{% if image %}
+<figure class="mt-4"><img class="max-h-[70vh] max-w-full rounded border border-slate-800" src="/w/{{ ws.membership.workspace.id }}/documents/{{ document.id }}/image" alt="{{ document.filename }}"></figure>
+{% endif %}
 <article class="mt-4 rounded border border-slate-800 bg-slate-900 p-4">
   <pre class="whitespace-pre-wrap font-sans text-sm leading-relaxed wrap-anywhere">{{ chunk.content }}</pre>
 </article>

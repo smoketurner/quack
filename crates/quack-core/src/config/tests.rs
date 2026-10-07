@@ -455,6 +455,7 @@ fn a_model_s_settings_override_its_provider_s_then_analysis_key_by_key() {
             temperature: Some(true),
             effort: Some(Effort::Xhigh),
             background_effort: Some(Effort::Low),
+            images: None,
         }
     );
     assert_eq!(
@@ -463,6 +464,7 @@ fn a_model_s_settings_override_its_provider_s_then_analysis_key_by_key() {
             temperature: Some(false),
             effort: Some(Effort::High),
             background_effort: None,
+            images: None,
         }
     );
     assert_eq!(

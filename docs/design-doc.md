@@ -379,6 +379,7 @@ CREATE TABLE _quack_documents (
     page_count       INTEGER,              -- a PDF's pages; NULL for other sources
     pages_unreadable INTEGER,              -- pages whose extraction failed
     pages_empty      INTEGER,              -- pages that read and held no text
+    pages_transcribed INTEGER,             -- textless pages the vision model transcribed
     ingested_by   TEXT,
     ingested_at   TIMESTAMP DEFAULT now(),
     language      TEXT                     -- ISO 639-3 code its text was indexed under (deu, cmn)
@@ -848,6 +849,7 @@ terminal's `/ingest` takes files.
 | `.vtt`, `.srt` | `subtp` | cues merged into runs of about 600 characters, a new run after a gap over 10 seconds; the run's start time (`12:04`) as the locator |
 | source code (`.rs`, `.py`, `.js`, `.ts`, `.go`, `.java`, `.c`, `.sql`, ...) | direct | one code section, chunked by whole lines with `line N` as each chunk's locator (no grammar: a definition-aware split is a dependency decision left open) |
 | RTF | `rtf-parser` | one section |
+| PNG, JPEG, WebP, GIF | `[ingestion].vision_model` (`llm::vision`) | the model's transcription of the image's text, then a description of what it shows, as one Markdown section under the file name; the image is kept as `files/<document id>.<ext>`; refused at upload when no vision model is set |
 | CSV, Parquet, JSON, JSONL, XLSX | DuckDB (section 6.2) | become tables, not chunks |
 
 Every section has a kind (`body`, `table`, `note`, `code`) and may carry a locator beside
@@ -866,16 +868,34 @@ own values win (`quack ingest --author`, `--authored`, `--tag`), and a person ca
 them afterwards (`PATCH .../documents/{doc}`, `quack docs --author|--authored|--tag|--untag`).
 They show in the Documents page, `list_documents`, and the prompt's document inventory.
 
-A scanned PDF (no text layer) is reported as `error: no extractable text`. OCR is deferred.
+**Images and scanned pages.** `[ingestion].vision_model` names a chat model that reads
+images (`provider/model`, like `chat_model`); it runs at that model's `background_effort`.
+An uploaded or ingested image goes to it once with a prompt to transcribe the text and
+describe the rest, and what it writes is chunked and embedded like any Markdown document.
+A PDF page that reads without error and holds no text (a scan) is rendered to a PNG that
+fits 1568 pixels (`pdf::Scans`, pdf_oxide's pure-Rust renderer, one page at a time off the
+runtime) and transcribed by the same model; its text takes the page's place in the
+document. Without a vision model an image is refused before it is registered
+(`Error::NoVisionModel`, REST 400 `no_vision_model`), and a PDF with no text on any page
+fails with `no extractable text: the PDF has no text layer; set [ingestion].vision_model to
+transcribe scanned pages`. A page the model cannot read stays without text, with a warning;
+the document fails only when no page gave text at all. Images are not a `quack import`
+source, which loads tables.
+
+A chat model marked `images = true` (`[providers.NAME]` or `[providers.NAME.models."ID"]`)
+also gets the `view_image` tool in every workspace holding an image (section 7.3). The
+image document's passage page shows the image, served by `GET .../documents/{doc}/image`
+(and `/w/{id}/documents/{doc}/image` in the web console), audited as opening the document.
 
 **Partly read PDFs.** A PDF with some pages missing from its text still becomes `ready`, and
 the document row records what is missing (`parser::PageCounts`): `page_count`,
-`pages_unreadable` (extraction failed), and `pages_empty` (the page read and held no text,
-as a scanned image does). `DocumentInfo` carries them as `pages`
-(`{"total": 40, "unreadable": 3, "empty": 2}`, `null` for any other source), so REST, MCP
+`pages_unreadable` (extraction failed), `pages_empty` (the page read and held no text,
+as a scanned image does, and no vision model read it), and `pages_transcribed` (the vision
+model wrote its text). `DocumentInfo` carries them as `pages`
+(`{"total": 40, "unreadable": 3, "empty": 2, "transcribed": 0}`, `null` for any other source), so REST, MCP
 `list_documents`, and `quack docs --format json` return them. Every listing a person or the
 agent reads shows one note from `PageCounts::note`, such as `3 of 40 pages
-unreadable, 2 without text`: `quack ingest`, `quack docs`, the terminal's `/docs` and load
+unreadable, 2 without text, 12 transcribed by the vision model`: `quack ingest`, `quack docs`, the terminal's `/docs` and load
 message, the web Documents row, an upload job's result, the agent's `list_documents` output,
 and the documents block of the system prompt.
 
@@ -1610,11 +1630,13 @@ model (`test-utils`, a dev-dependency feature only).
 | `search_graph(entity?, class?, relation?, hops=2)` | none | Neighborhood or class listing with provenance |
 | `find_path(from, to, max_hops=4)` | none | Shortest relation path between two entities |
 | `create_chart(sql, kind, x, y, title)` | none | Runs the SQL, emits a chart spec (section 9) |
+| `view_image(document, question)` | none | Sends one image document and the question to the chat model; returns its answer, citable as the document's first chunk, and counts as reading document text |
 
 `search_graph` and `find_path` register only when the graph has nodes; `describe_class`
 whenever an ontology exists, since the prompt's ontology block is capped, and it names the
 class's SQL view with its typed columns; `find_tables` only when the workspace has more than
-25 tables (graph views not counted). The rest register
+25 tables (graph views not counted); `view_image` only when the chat model is marked
+`images = true` and a ready document is an image. The rest register
 in every workspace, and the prompt tells the model what the workspace holds. An `export`
 tool (`COPY ... TO` under `files/`) is not built (section 17).
 
@@ -2935,6 +2957,7 @@ tokenizer_encoding = "cl100k_base"
 upload_max_mb = 512
 max_decompressed_mb = 1024      # what a DOCX, PPTX, or zipped workbook may inflate to while parsed
 table_rows_as_table = 20        # a table inside a document with this many rows also loads as a workspace table
+# vision_model = "ollama/qwen2.5vl:7b"   # reads images and scanned PDF pages at ingest; images are refused without it
 
 [context]
 max_tokens = 4000
@@ -3386,7 +3409,7 @@ Every gap is a GitHub issue unless the item says otherwise.
 2. Data connectors: GitHub, Confluence, SharePoint (fetching a data file over http(s)
    already ships in `quack import`)
 3. ~~Cross-encoder reranking provider~~ (`[retrieval].rerank = "reranker"`)
-4. OCR for scanned PDFs
+4. ~~OCR for scanned PDFs~~ (`[ingestion].vision_model` transcribes them)
 5. Postgres + pgvector storage backend, which now also means building the seam section 15
    item 4 describes
 6. Ontology import from OWL / SKOS; a registry of domain packs

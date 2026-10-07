@@ -41,7 +41,7 @@ metrics       = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 oauth2        = { workspace = true }
 office_oxide  = { workspace = true }
-pdf_oxide     = { workspace = true, features = ["legacy-crypto"] }
+pdf_oxide     = { workspace = true, features = ["legacy-crypto", "rendering"] }
 pulldown-cmark = { workspace = true }
 quick-xml     = { workspace = true }
 reqwest       = { workspace = true, features = ["rustls", "http2"] }

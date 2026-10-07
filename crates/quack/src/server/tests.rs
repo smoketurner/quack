@@ -1341,14 +1341,244 @@ async fn read_requests_never_wait_for_the_writer() {
 }
 
 fn multipart(filename: &str, content_type: &str, data: &str) -> (String, Vec<u8>) {
+    multipart_bytes(filename, content_type, data.as_bytes())
+}
+
+fn multipart_bytes(filename: &str, content_type: &str, data: &[u8]) -> (String, Vec<u8>) {
     let boundary = "quackboundary";
-    let body = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n{data}\r\n--{boundary}--\r\n"
-    );
-    (
-        format!("multipart/form-data; boundary={boundary}"),
-        body.into_bytes(),
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
     )
+    .into_bytes();
+    body.extend_from_slice(data);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+/// A one-pixel PNG.
+const PIXEL_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+    0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// Upload `data` as `filename` and return the response's status and body.
+async fn upload(
+    h: &Harness,
+    ws: &WorkspaceId,
+    token: &str,
+    filename: &str,
+    content_type: &str,
+    data: &[u8],
+) -> (StatusCode, serde_json::Value) {
+    let (form_type, bytes) = multipart_bytes(filename, content_type, data);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/workspaces/{ws}/documents"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, form_type)
+        .body(Body::from(bytes))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body, _) = h.send(request).await;
+    (status, body)
+}
+
+/// With the chat model marked `images = true`, a turn can look at an image
+/// document again: the image and the question go to the model, and the
+/// answer comes back citable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_views_an_image_with_a_chat_model_that_reads_images() {
+    use crate::scripted_ollama::{Reply, ScriptedOllama};
+
+    let ollama = ScriptedOllama::serve(vec![
+        Reply::Text("A bar chart of revenue by quarter."),
+        Reply::Call {
+            tool: "view_image",
+            args: serde_json::json!({ "document": "chart.png", "question": "What is the peak?" }),
+        },
+        Reply::Text("The peak is 20, in the fourth quarter."),
+        Reply::Text("Revenue peaked at 20 [1]."),
+    ])
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let config = ollama
+        .config_with(
+            "[providers.scripted.models.\"model\"]\nimages = true\n\
+             [ingestion]\nvision_model = \"scripted/model\"\n",
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("pictures", &owner).await;
+    let token = h.login("owner").await;
+    let (status, body) = upload(&h, &ws, &token, "chart.png", "image/png", PIXEL_PNG).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let doc = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    h.wait_ready(&ws, &doc, &token).await;
+
+    let (status, answer) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/query"),
+            &token,
+            serde_json::json!({ "prompt": "What was peak revenue?" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["steps"][0]["tool"], "view_image", "{answer}");
+    assert_eq!(answer["answer"], "Revenue peaked at 20 [1].", "{answer}");
+    assert_eq!(answer["citations"][0]["document_id"], doc, "{answer}");
+    let requests = ollama.requests();
+    let look = requests.get(2).cloned().unwrap_or_default();
+    let user = look["messages"]
+        .as_array()
+        .and_then(|m| m.iter().find(|m| m["role"] == "user"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(user["content"], "What is the peak?", "{look}");
+    assert_eq!(user["images"].as_array().map(Vec::len), Some(1), "{look}");
+    let back = requests.get(3).map(ToString::to_string).unwrap_or_default();
+    assert!(
+        back.contains("The peak is 20"),
+        "the answer reached the turn: {back}"
+    );
+}
+
+/// An image is described by the vision model at upload, served back as
+/// uploaded, and shown on its passage page; a PDF page with no text is
+/// rendered and transcribed; without a vision model an image is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_vision_model_reads_images_and_scanned_pages() {
+    use crate::scripted_ollama::{Reply, ScriptedOllama};
+
+    let ollama = ScriptedOllama::serve(vec![
+        Reply::Text("A bar chart: revenue rose from 10 to 20."),
+        Reply::Text("The second page says the audit passed."),
+    ])
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let config = ollama
+        .config_with("[ingestion]\nvision_model = \"scripted/model\"\n")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("pictures", &owner).await;
+    let token = h.login("owner").await;
+    let base = format!("/api/v1/workspaces/{ws}/documents");
+
+    let (status, body) = upload(&h, &ws, &token, "chart.png", "image/png", PIXEL_PNG).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let doc = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let ready = h.wait_ready(&ws, &doc, &token).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    let (status, chunks) = h.get(&format!("{base}/{doc}/chunks"), &token).await;
+    assert_eq!(status, StatusCode::OK, "{chunks}");
+    let text = chunks["chunks"][0]["content"].as_str().unwrap_or_default();
+    assert_eq!(chunks["chunks"][0]["heading"], "chart.png", "{chunks}");
+    assert!(text.contains("revenue rose from 10 to 20"), "{chunks}");
+    let requests = ollama.requests();
+    let images = requests
+        .first()
+        .and_then(|r| r["messages"].as_array())
+        .and_then(|m| m.iter().find_map(|m| m["images"].as_array()))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(images.len(), 1, "the image went to the model: {requests:?}");
+
+    let request = Request::builder()
+        .uri(format!("{base}/{doc}/image"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, bytes, headers) = h.send_bytes(request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes.as_ref(), PIXEL_PNG);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("image/png")
+    );
+    let cookie = h.web_session("owner").await;
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents/{doc}/chunks/0"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(&format!("/w/{ws}/documents/{doc}/image")),
+        "{html}"
+    );
+    // A document that is not an image has none to serve.
+    let (status, _) = upload(
+        &h,
+        &ws,
+        &token,
+        "notes.md",
+        "text/markdown",
+        b"# Notes\n\nplain",
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (_, listed) = h.get(&base, &token).await;
+    let notes = listed["documents"]
+        .as_array()
+        .and_then(|d| d.iter().find(|d| d["filename"] == "notes.md"))
+        .and_then(|d| d["id"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    h.wait_ready(&ws, &notes, &token).await;
+    let (status, _) = h.get(&format!("{base}/{notes}/image"), &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Audit");
+    pdf.letter_page().at(72.0, 720.0).text("First page").done();
+    pdf.letter_page().done();
+    let pdf = pdf.build().unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body) = upload(&h, &ws, &token, "audit.pdf", "application/pdf", &pdf).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let doc = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let ready = h.wait_ready(&ws, &doc, &token).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    assert_eq!(
+        ready["pages"],
+        serde_json::json!({ "total": 2, "unreadable": 0, "empty": 0, "transcribed": 1 }),
+        "{ready}"
+    );
+    let (_, chunks) = h.get(&format!("{base}/{doc}/chunks"), &token).await;
+    let all = chunks["chunks"].to_string();
+    assert!(all.contains("First page"), "{chunks}");
+    assert!(all.contains("the audit passed"), "{chunks}");
+    let rendered = ollama
+        .requests()
+        .get(1)
+        .and_then(|r| r["messages"].as_array().cloned())
+        .unwrap_or_default();
+    assert!(
+        rendered.iter().any(|m| m["images"]
+            .as_array()
+            .and_then(|i| i.first())
+            .and_then(|i| i.as_str())
+            .is_some_and(|png| png.starts_with("iVBORw0KGgo"))),
+        "the page went to the model as a PNG"
+    );
+
+    let plain = harness(ServeMode::Login).await;
+    let owner = plain.user("owner", UserKind::Standard).await;
+    let ws = plain.workspace("plain", &owner).await;
+    let token = plain.login("owner").await;
+    let (status, body) = upload(&plain, &ws, &token, "chart.png", "image/png", PIXEL_PNG).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "no_vision_model", "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1374,12 +1604,13 @@ async fn a_partly_read_document_says_so_over_rest_mcp_and_the_web() {
                 total: 40,
                 unreadable: 3,
                 empty: 2,
+                transcribed: 0,
             }),
         )
     })
     .await
     .unwrap_or_else(|e| fail(&e.to_string()));
-    let counts = serde_json::json!({ "total": 40, "unreadable": 3, "empty": 2 });
+    let counts = serde_json::json!({ "total": 40, "unreadable": 3, "empty": 2, "transcribed": 0 });
 
     let base = format!("/api/v1/workspaces/{ws}/documents");
     let (status, body) = h.get(&base, &token).await;

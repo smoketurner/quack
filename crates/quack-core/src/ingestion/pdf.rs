@@ -22,7 +22,8 @@ use crate::error::{Error, Result};
 /// # Errors
 ///
 /// Returns an error when the bytes are not a PDF, it is password-protected,
-/// or no page yields text.
+/// or every page failed to read. A PDF whose pages read but hold no text (a
+/// scan) comes back with no sections and those pages in `blank_pages`.
 pub fn extract(data: &[u8]) -> Result<Extracted> {
     let pdf = Pdf(PdfDocument::from_bytes(data.to_vec())
         .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))?);
@@ -49,7 +50,46 @@ pub fn extract(data: &[u8]) -> Result<Extracted> {
         flow: Flow::Continuous,
         pages: Some(pages.counts),
         meta,
+        blank_pages: pages.blank,
     })
+}
+
+/// The box, in pixels, a scanned page is rendered to fit for the vision
+/// model: the long side the image providers read at full detail.
+const SCAN_FIT_PX: u32 = 1568;
+
+/// A PDF whose scanned pages are rendered as PNG images, one at a time.
+pub struct Scans(PdfDocument);
+
+impl Scans {
+    /// Open the PDF in `data` for rendering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bytes are not a PDF.
+    pub fn open(data: &[u8]) -> Result<Self> {
+        PdfDocument::from_bytes(data.to_vec())
+            .map(Self)
+            .map_err(|e| Error::Ingestion(format!("PDF rendering failed: {e}")))
+    }
+
+    /// Page `page` (from 1) as a PNG fitted to the vision model's box.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the page does not exist or cannot be drawn.
+    pub fn render(&self, page: u32) -> Result<Vec<u8>> {
+        let index = usize::try_from(page.saturating_sub(1)).unwrap_or(usize::MAX);
+        pdf_oxide::rendering::render_page_fit(
+            &self.0,
+            index,
+            SCAN_FIT_PX,
+            SCAN_FIT_PX,
+            &pdf_oxide::rendering::RenderOptions::default(),
+        )
+        .map(|image| image.data)
+        .map_err(|e| Error::Ingestion(format!("PDF page {page} could not be rendered: {e}")))
+    }
 }
 
 /// What one page holds once its chrome is dropped, in reading order:
@@ -323,6 +363,8 @@ impl PageContent {
 struct Pages {
     sections: Vec<Section>,
     counts: PageCounts,
+    /// The pages, from 1, that read and held no text.
+    blank: Vec<u32>,
 }
 
 impl Pages {
@@ -338,7 +380,9 @@ impl Pages {
             total: u32::try_from(page_count).unwrap_or(u32::MAX),
             unreadable: 0,
             empty: 0,
+            transcribed: 0,
         };
+        let mut blank = Vec::new();
         let mut heading: Option<String> = None;
         for index in 0..page_count {
             let page = u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX);
@@ -362,25 +406,27 @@ impl Pages {
                         }
                     }
                 }
-                Ok(_) => counts.empty = counts.empty.saturating_add(1),
+                Ok(_) => {
+                    counts.empty = counts.empty.saturating_add(1);
+                    blank.push(page);
+                }
                 Err(error) => {
                     tracing::warn!(page, error = %error, "skipping an unreadable PDF page");
                     counts.unreadable = counts.unreadable.saturating_add(1);
                 }
             }
         }
-        if sections.is_empty() {
-            if counts.unreadable > 0 {
-                return Err(Error::Ingestion(format!(
-                    "no readable text: {} of {page_count} pages failed to parse",
-                    counts.unreadable
-                )));
-            }
-            return Err(Error::Ingestion(String::from(
-                "no extractable text: the PDF has no text layer (scanned pages need OCR)",
+        if sections.is_empty() && blank.is_empty() {
+            return Err(Error::Ingestion(format!(
+                "no readable text: {} of {page_count} pages failed to parse",
+                counts.unreadable
             )));
         }
-        Ok(Self { sections, counts })
+        Ok(Self {
+            sections,
+            counts,
+            blank,
+        })
     }
 }
 
@@ -509,10 +555,12 @@ mod tests {
         })
         .unwrap_or_else(|_| Pages {
             sections: Vec::new(),
+            blank: Vec::new(),
             counts: PageCounts {
                 total: 0,
                 unreadable: 0,
                 empty: 0,
+                transcribed: 0,
             },
         });
         assert_eq!(
@@ -520,7 +568,8 @@ mod tests {
             PageCounts {
                 total: 4,
                 unreadable: 1,
-                empty: 1
+                empty: 1,
+                transcribed: 0,
             }
         );
         let numbered: Vec<Option<u32>> = pages.sections.iter().map(|s| s.page).collect();
@@ -567,10 +616,12 @@ mod tests {
         })
         .unwrap_or_else(|_| Pages {
             sections: Vec::new(),
+            blank: Vec::new(),
             counts: PageCounts {
                 total: 0,
                 unreadable: 0,
                 empty: 0,
+                transcribed: 0,
             },
         });
         let summary: Vec<(Option<&str>, &str, Option<u32>)> = pages
@@ -596,6 +647,18 @@ mod tests {
     }
 
     #[test]
+    fn a_scanned_page_renders_as_a_png_that_fits_the_vision_box() {
+        let mut pdf = pdf_oxide::writer::DocumentBuilder::new();
+        pdf.letter_page().done();
+        let bytes = pdf.build().unwrap_or_default();
+        let png = Scans::open(&bytes).and_then(|scans| scans.render(1));
+        let png = png.unwrap_or_default();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{} bytes", png.len());
+        let missing = Scans::open(&bytes).and_then(|scans| scans.render(2));
+        assert!(missing.is_err());
+    }
+
+    #[test]
     fn a_pdf_whose_every_page_fails_or_is_blank_says_which() {
         let failed = Pages::read(3, |_| Err(String::from("bad")))
             .err()
@@ -603,9 +666,8 @@ mod tests {
             .unwrap_or_default();
         assert!(failed.contains("3 of 3 pages failed"), "{failed}");
         let blank = Pages::read(2, |_| Ok(PageContent::default()))
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(blank.contains("no text layer"), "{blank}");
+            .map(|pages| (pages.sections.len(), pages.blank, pages.counts.empty))
+            .ok();
+        assert_eq!(blank, Some((0, vec![1, 2], 2)));
     }
 }

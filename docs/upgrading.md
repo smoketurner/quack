@@ -26,6 +26,10 @@ Two rules hold for every release:
   from its first chunks and rebuilds the keyword index (`_quack_terms`), reading every chunk
   once. `control.db` unchanged (migration 8).
 - Embeddings: no refresh needed.
+- Config: `[ingestion].vision_model` added (unset by default): the model that reads images
+  and scanned PDF pages at ingest. Without it, image uploads are refused and a PDF with no
+  text fails as before. `images = true` on a provider or model gives the agent `view_image`.
+- Workspace: `_quack_documents.pages_transcribed` is added on open; no schema bump.
 
 The version-bump pull request renames this section to the tag.
 

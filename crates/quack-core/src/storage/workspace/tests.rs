@@ -1346,6 +1346,7 @@ fn page_counts_are_stored_on_the_document_and_cleared_with_none() {
         total: 40,
         unreadable: 3,
         empty: 2,
+        transcribed: 5,
     };
     db.set_document_pages(&id, Some(counts))
         .unwrap_or_else(|e| fail(&e.to_string()));
@@ -1353,7 +1354,9 @@ fn page_counts_are_stored_on_the_document_and_cleared_with_none() {
         pages(&db),
         Some((
             Some(counts),
-            Some(String::from("3 of 40 pages unreadable, 2 without text"))
+            Some(String::from(
+                "3 of 40 pages unreadable, 2 without text, 5 transcribed by the vision model"
+            ))
         ))
     );
     let listed = db.list_documents().unwrap_or_else(|e| fail(&e.to_string()));

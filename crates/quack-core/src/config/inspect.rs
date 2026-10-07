@@ -354,6 +354,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "upload_max_mb",
             "max_decompressed_mb",
             "table_rows_as_table",
+            "vision_model",
         ],
     ),
     (
@@ -469,11 +470,12 @@ const PROVIDER_KEYS: &[&str] = &[
     "temperature",
     "effort",
     "background_effort",
+    "images",
     "models",
 ];
 
 /// The keys a `[providers.NAME.models."ID"]` table accepts.
-const MODEL_KEYS: &[&str] = &["temperature", "effort", "background_effort"];
+const MODEL_KEYS: &[&str] = &["temperature", "effort", "background_effort", "images"];
 
 /// The keys a `[server.oidc]` table accepts.
 const OIDC_KEYS: &[&str] = &[
@@ -712,6 +714,8 @@ fn ingestion(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) 
         ingestion.table_rows_as_table,
         default.table_rows_as_table,
     );
+    let vision = ingestion.vision_model.as_ref().map(ToString::to_string);
+    s.optional_text("vision_model", vision.as_deref(), None);
 }
 
 /// The model, its width, and the prefix in force for each role: the
@@ -1402,6 +1406,7 @@ impl Section<'_, '_> {
             settings.background_effort.map(Effort::as_str),
             None,
         );
+        self.optional("images", settings.images.map(|i| i.to_string()), None);
     }
 
     /// A number or a flag: shown as TOML writes it, unquoted.

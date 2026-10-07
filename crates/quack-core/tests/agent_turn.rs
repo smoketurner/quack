@@ -180,7 +180,7 @@ async fn run_turn_answering(
         message,
         asked: Instant::now(),
     };
-    let run = analysis.run(model.clone().erase(), None, sink);
+    let run = analysis.run(model.clone().erase(), None, None, sink);
     tokio::pin!(run);
     let mut events = Vec::new();
     let mut asked = Vec::new();

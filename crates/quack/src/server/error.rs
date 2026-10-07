@@ -75,6 +75,8 @@ pub(crate) enum ErrorCode {
     NoChatModel,
     /// The file's type is not one quack ingests.
     UnsupportedFileType,
+    /// An image arrived with no vision model configured to read it.
+    NoVisionModel,
     /// The file has no bytes.
     EmptyFile,
     /// The text cannot name a workspace.
@@ -158,6 +160,7 @@ impl ErrorCode {
             CoreError::UnsupportedFileType(_) => {
                 (Self::UnsupportedFileType, StatusCode::BAD_REQUEST)
             }
+            CoreError::NoVisionModel(_) => (Self::NoVisionModel, StatusCode::BAD_REQUEST),
             CoreError::EmptyFile(_) => (Self::EmptyFile, StatusCode::BAD_REQUEST),
             CoreError::InvalidWorkspaceName => {
                 (Self::InvalidWorkspaceName, StatusCode::BAD_REQUEST)

@@ -22,11 +22,17 @@ pub(crate) enum Reply {
     Text(&'static str),
 }
 
-type Script = Arc<Mutex<VecDeque<Reply>>>;
+/// The replies still to give, and every request body received.
+#[derive(Clone, Default)]
+struct Script {
+    replies: Arc<Mutex<VecDeque<Reply>>>,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
 
 /// The server; it stops when dropped.
 pub(crate) struct ScriptedOllama {
     base_url: String,
+    script: Script,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -39,25 +45,46 @@ impl Drop for ScriptedOllama {
 impl ScriptedOllama {
     /// Serve `replies`, one per chat request, in order.
     pub(crate) async fn serve(replies: Vec<Reply>) -> std::io::Result<Self> {
-        let script: Script = Arc::new(Mutex::new(replies.into()));
+        let script = Script {
+            replies: Arc::new(Mutex::new(replies.into())),
+            requests: Arc::default(),
+        };
         let router = Router::new()
             .route("/api/chat", post(chat))
             .route("/api/ps", get(loaded))
-            .with_state(script);
+            .with_state(script.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base_url = format!("http://{}", listener.local_addr()?);
         let task = tokio::spawn(async move {
             drop(axum::serve(listener, router).await);
         });
-        Ok(Self { base_url, task })
+        Ok(Self {
+            base_url,
+            script,
+            task,
+        })
+    }
+
+    /// Every chat request body received so far, in order.
+    pub(crate) fn requests(&self) -> Vec<serde_json::Value> {
+        self.script
+            .requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// A configuration whose chat model is this server, with no embedding
     /// model, so document search is by keyword.
     pub(crate) fn config(&self) -> Result<Config> {
+        self.config_with("")
+    }
+
+    /// [`Self::config`], with `more` TOML after it.
+    pub(crate) fn config_with(&self, more: &str) -> Result<Config> {
         Config::parse(&format!(
             "[general]\nchat_model = \"scripted/model\"\n\
-             [providers.scripted]\ntype = \"ollama\"\nbase_url = \"{}\"\n",
+             [providers.scripted]\ntype = \"ollama\"\nbase_url = \"{}\"\n{more}",
             self.base_url
         ))
     }
@@ -111,8 +138,14 @@ async fn loaded() -> Json<serde_json::Value> {
 
 /// `POST /api/chat`: the next reply as Ollama's NDJSON stream; a script
 /// that has run out answers with text, so a turn always ends.
-async fn chat(State(script): State<Script>) -> String {
+async fn chat(State(script): State<Script>, Json(request): Json<serde_json::Value>) -> String {
+    script
+        .requests
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(request);
     let reply = script
+        .replies
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .pop_front()

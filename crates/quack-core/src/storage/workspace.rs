@@ -20,8 +20,8 @@ use crate::embedding::{
 use crate::error::{Error, Result, WrittenBy};
 use crate::graph;
 use crate::ids::{ChunkId, DocumentId, NodeId, UserId};
-use crate::ingestion::TableName;
 use crate::ingestion::parser::{DocumentMeta, FileType, Load, PageCounts, SectionKind};
+use crate::ingestion::{StoredImage, TableName};
 use crate::ontology::store::{self as ontology_store, Acceptance};
 use crate::ontology::{Measure, Ontology, Property};
 use crate::saved;
@@ -96,6 +96,7 @@ const DOCUMENTS_DDL: &str = "
         page_count INTEGER,
         pages_unreadable INTEGER,
         pages_empty INTEGER,
+        pages_transcribed INTEGER,
         superseded_by TEXT,
         source_root TEXT,
         source_path TEXT
@@ -110,6 +111,7 @@ const DOCUMENTS_DDL: &str = "
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_unreadable INTEGER;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_empty INTEGER;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_transcribed INTEGER;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS superseded_by TEXT;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_root TEXT;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_path TEXT;
@@ -2193,12 +2195,13 @@ impl WorkspaceDb {
     /// Returns an error if the update fails.
     pub fn set_document_pages(&self, id: &DocumentId, pages: Option<PageCounts>) -> Result<()> {
         self.conn.execute(
-            "UPDATE _quack_documents SET page_count = ?, pages_unreadable = ?, pages_empty = ? \
-             WHERE id = ?",
+            "UPDATE _quack_documents SET page_count = ?, pages_unreadable = ?, pages_empty = ?, \
+             pages_transcribed = ? WHERE id = ?",
             duckdb::params![
                 pages.map(|p| p.total),
                 pages.map(|p| p.unreadable),
                 pages.map(|p| p.empty),
+                pages.map(|p| p.transcribed),
                 id
             ],
         )?;
@@ -2303,7 +2306,7 @@ impl WorkspaceDb {
                 .execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)))?;
         }
         if doc.status != DocumentStatus::Superseded {
-            self.remove_document_files(&doc.filename, &tables);
+            self.remove_document_files(id, &doc.filename, &tables);
         }
         self.abandon_replacement(id)?;
         Ok(true)
@@ -2364,15 +2367,44 @@ impl WorkspaceDb {
     }
 
     /// Remove what ingestion wrote under `files/` for a document: the file
-    /// itself and, for workbooks and imports, one CSV per table. A missing
-    /// file is fine; any other failure is logged, since the rows are gone.
-    fn remove_document_files(&self, filename: &str, tables: &[String]) {
+    /// itself, for workbooks and imports one CSV per table, and for an
+    /// image its stored copy. A missing file is fine; any other failure is
+    /// logged, since the rows are gone.
+    /// Whether a ready document is an image, which `view_image` can look at.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn has_images(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM _quack_documents \
+             WHERE status = ? AND mime_type LIKE 'image/%')",
+            duckdb::params![DocumentStatus::Ready],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The image `document` keeps in the workspace's `files/`, when it is
+    /// an image and the connection knows the workspace's directory.
+    #[must_use]
+    pub fn stored_image(&self, document: &DocumentInfo) -> Option<StoredImage> {
+        let FileType::Image(format) = FileType::of(&document.filename)? else {
+            return None;
+        };
+        let files_dir = self.files_dir.as_ref()?;
+        Some(StoredImage::in_dir(files_dir, &document.id, format))
+    }
+
+    fn remove_document_files(&self, id: &DocumentId, filename: &str, tables: &[String]) {
         let Some(files_dir) = &self.files_dir else {
             return;
         };
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(name) = Path::new(filename).file_name() {
             candidates.push(files_dir.join(name));
+        }
+        if let Some(FileType::Image(format)) = FileType::of(filename) {
+            candidates.push(StoredImage::in_dir(files_dir, id, format).path().to_owned());
         }
         for table in tables {
             candidates.push(files_dir.join(format!("{table}.csv")));
@@ -3970,7 +4002,7 @@ impl DocumentInfo {
     pub fn fallback_tables(&self) -> Vec<String> {
         match FileType::of(&self.filename).map(FileType::load) {
             Some(Load::Table(_)) => vec![TableName::of_file(&self.filename).into_string()],
-            Some(Load::Workbook | Load::Chunks(_)) | None => Vec::new(),
+            Some(Load::Workbook | Load::Chunks(_) | Load::Image(_)) | None => Vec::new(),
         }
     }
 }
@@ -4096,8 +4128,8 @@ const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, statu
      COALESCE(pinned, false), CAST(ingested_at AS VARCHAR), title, sha256, source, chunk_count, \
      ingested_by, CAST(tables AS VARCHAR), page_count, pages_unreadable, pages_empty, \
      superseded_by, source_root, source_path, author, CAST(authored_at AS VARCHAR), \
-     CAST(modified_at AS VARCHAR), CAST(tags AS VARCHAR), CAST(metadata AS VARCHAR), language \
-     FROM _quack_documents";
+     CAST(modified_at AS VARCHAR), CAST(tags AS VARCHAR), CAST(metadata AS VARCHAR), language, \
+     pages_transcribed FROM _quack_documents";
 
 /// The `WHERE` clause that keeps a document that still stands for its
 /// bytes, neither failed nor replaced: only such a document is a duplicate
@@ -4135,6 +4167,7 @@ impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
                     total,
                     unreadable: row.get::<_, Option<u32>>(15)?.unwrap_or(0),
                     empty: row.get::<_, Option<u32>>(16)?.unwrap_or(0),
+                    transcribed: row.get::<_, Option<u32>>(26)?.unwrap_or(0),
                 }),
                 None => None,
             },

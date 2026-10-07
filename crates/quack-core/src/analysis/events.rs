@@ -72,6 +72,7 @@ pub enum ToolName {
     SearchGraph,
     FindPath,
     DescribeClass,
+    ViewImage,
 }
 
 text_enum!(ToolName, "tool", {
@@ -86,6 +87,7 @@ text_enum!(ToolName, "tool", {
     SearchGraph => "search_graph",
     FindPath => "find_path",
     DescribeClass => "describe_class",
+    ViewImage => "view_image",
 });
 
 impl ToolName {
@@ -102,7 +104,8 @@ impl ToolName {
             | Self::FindTables
             | Self::SearchGraph
             | Self::FindPath
-            | Self::DescribeClass => false,
+            | Self::DescribeClass
+            | Self::ViewImage => false,
         }
     }
 }
