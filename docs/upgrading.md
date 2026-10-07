@@ -28,8 +28,8 @@ Two rules hold for every release:
   rebuilds the keyword index, reading every chunk once (13), and adds `_quack_imports` for saved
   imports (14). Expect the first open of a large workspace to take longer. An older quack
   refuses the upgraded file, so back up or take a snapshot first.
-- `control.db`: migrations 9 to 11 run on start: user lifecycle and login lockout, group roles,
-  and the sealed credentials of saved imports.
+- `control.db`: migrations 9 to 12 run on start: user lifecycle and login lockout, group roles,
+  and the sealed credentials of saved imports, kept per workspace.
 - Config: keys added, each defaulted so an existing file keeps its behavior:
   - `[ingestion]`: `max_decompressed_mb` (1024), `table_rows_as_table` (20).
   - `[retrieval]`: `languages` (`["auto"]`).

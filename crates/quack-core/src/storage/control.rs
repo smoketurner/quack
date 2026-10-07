@@ -8,7 +8,7 @@
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
-use sea_query::{Cond, DynIden, Expr, ExprTrait, IntoIden, OnConflict, Order, Query};
+use sea_query::{Cond, Condition, DynIden, Expr, ExprTrait, IntoIden, OnConflict, Order, Query};
 use serde::{Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{FromRow, Row, SqlitePool};
@@ -1156,14 +1156,35 @@ pub enum SealedOwner<'a> {
 }
 
 /// Where an owner's sealed value lives: its table, key column and key, the
-/// column that records when it was written, and the workspace column a row
-/// that goes with its workspace also fills.
+/// column that records when it was written, and for a row that goes with
+/// its workspace, the workspace column, which is part of its key.
 struct SealedRow {
     table: DynIden,
     key: DynIden,
     id: String,
     stamp: DynIden,
     workspace: Option<(DynIden, String)>,
+}
+
+impl SealedRow {
+    /// The condition that selects this owner's row: its key, and its
+    /// workspace when the row is kept per workspace.
+    fn matching(&self) -> Condition {
+        let mut condition = Condition::all().add(Expr::col(self.key.clone()).eq(self.id.as_str()));
+        if let Some((column, workspace)) = &self.workspace {
+            condition = condition.add(Expr::col(column.clone()).eq(workspace.as_str()));
+        }
+        condition
+    }
+
+    /// The columns an insert conflicts on: the key, with the workspace.
+    fn conflict_columns(&self) -> Vec<DynIden> {
+        self.workspace
+            .iter()
+            .map(|(column, _)| column.clone())
+            .chain(std::iter::once(self.key.clone()))
+            .collect()
+    }
 }
 
 impl SealedOwner<'_> {
@@ -2066,7 +2087,7 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn sealed(&self, owner: SealedOwner<'_>) -> Result<Option<Sealed>> {
-        let SealedRow { table, key, id, .. } = owner.row();
+        let row = owner.row();
         let bound = Bound::new(
             Query::select()
                 .columns([
@@ -2074,8 +2095,8 @@ impl ControlPlane {
                     SealedColumns::Enc,
                     SealedColumns::Ciphertext,
                 ])
-                .from(table)
-                .and_where(Expr::col(key).eq(id)),
+                .from(row.table.clone())
+                .cond_where(row.matching()),
         )?;
         Ok(bound.query_as().fetch_optional(&self.pool).await?)
     }
@@ -2114,16 +2135,10 @@ impl ControlPlane {
         expected: &Sealed,
         sealed: &Sealed,
     ) -> Result<bool> {
-        let SealedRow {
-            table,
-            key,
-            id,
-            stamp,
-            ..
-        } = owner.row();
+        let row = owner.row();
         let bound = Bound::new(
             Query::update()
-                .table(table)
+                .table(row.table.clone())
                 .values([
                     (
                         SealedColumns::KeyId.into_iden(),
@@ -2134,9 +2149,9 @@ impl ControlPlane {
                         SealedColumns::Ciphertext.into_iden(),
                         sealed.ciphertext.clone().into(),
                     ),
-                    (stamp, Expr::current_timestamp()),
+                    (row.stamp.clone(), Expr::current_timestamp()),
                 ])
-                .and_where(Expr::col(key).eq(id))
+                .cond_where(row.matching())
                 .and_where(Expr::col(SealedColumns::KeyId).eq(expected.key_id.as_str()))
                 .and_where(Expr::col(SealedColumns::Enc).eq(expected.enc.clone())),
         )?;
@@ -2160,15 +2175,17 @@ impl ControlPlane {
     /// The insert that keeps `owner`'s sealed value: replacing the one
     /// before it, or only when there is none.
     fn sealed_insert(owner: SealedOwner<'_>, sealed: &Sealed, replace: bool) -> Result<Bound> {
+        let row = owner.row();
+        let conflict_columns = row.conflict_columns();
         let SealedRow {
             table,
             key,
             id,
             stamp,
             workspace,
-        } = owner.row();
+        } = row;
         let conflict = if replace {
-            OnConflict::column(key.clone())
+            OnConflict::columns(conflict_columns)
                 .update_columns([
                     SealedColumns::KeyId.into_iden(),
                     SealedColumns::Enc.into_iden(),
@@ -2177,7 +2194,9 @@ impl ControlPlane {
                 ])
                 .to_owned()
         } else {
-            OnConflict::column(key.clone()).do_nothing().to_owned()
+            OnConflict::columns(conflict_columns)
+                .do_nothing()
+                .to_owned()
         };
         let bound = Bound::new(
             Query::insert()
@@ -2211,11 +2230,11 @@ impl ControlPlane {
 
     /// The delete that forgets `owner`'s sealed value.
     fn sealed_delete(owner: SealedOwner<'_>) -> Result<Bound> {
-        let SealedRow { table, key, id, .. } = owner.row();
+        let row = owner.row();
         Ok(Bound::new(
             Query::delete()
-                .from_table(table)
-                .and_where(Expr::col(key).eq(id)),
+                .from_table(row.table.clone())
+                .cond_where(row.matching()),
         )?)
     }
 

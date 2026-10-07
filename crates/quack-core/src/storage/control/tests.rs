@@ -347,6 +347,51 @@ async fn a_first_sign_in_creates_a_plain_user_and_never_takes_a_name() {
     );
 }
 
+/// A saved import's secret belongs to its workspace: a restored copy
+/// holds the same import ids, and its secret neither reads, replaces, nor
+/// deletes the original's.
+#[tokio::test]
+async fn an_import_secret_is_kept_per_workspace_for_the_same_import_id() {
+    let (_dir, cp) = open().await;
+    let original = cp
+        .create_workspace(&workspace_name("sales"), None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let restored = cp
+        .create_workspace(&workspace_name("sales-restored"), None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let import = ImportId::from("imp-1");
+    let owner = |workspace| SealedOwner::Import {
+        workspace,
+        import: &import,
+    };
+    let sealed = |id: &str| Sealed {
+        key_id: id.to_owned(),
+        enc: vec![1],
+        ciphertext: vec![2],
+    };
+    cp.put_sealed(owner(&original.id), &sealed("original"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        cp.sealed(owner(&restored.id)).await.ok().flatten(),
+        None,
+        "the restored copy cannot read the original's secret"
+    );
+    cp.put_sealed(owner(&restored.id), &sealed("restored"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.delete_sealed(owner(&restored.id))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        cp.sealed(owner(&original.id)).await.ok().flatten(),
+        Some(sealed("original")),
+        "the original's secret stands"
+    );
+}
+
 #[tokio::test]
 async fn a_sealed_token_is_replaced_in_place_and_goes_with_its_user() {
     let (_dir, cp) = open().await;
