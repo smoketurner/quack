@@ -120,7 +120,19 @@ impl std::str::FromStr for JobNumber {
 }
 
 /// What a job does, for display and filtering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, utoipa::ToSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
     /// An agent turn.
@@ -1081,6 +1093,8 @@ impl Inner {
         }
     }
 }
+
+pub mod webhook;
 
 #[cfg(test)]
 mod tests;

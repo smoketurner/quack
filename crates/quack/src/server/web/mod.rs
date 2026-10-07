@@ -498,6 +498,33 @@ struct JobView {
     queued_at: Moment,
 }
 
+/// The active jobs every workspace page shows above its content, as many
+/// as the terminal's strip, with the rest counted.
+#[derive(Template)]
+#[template(path = "jobs_strip.html")]
+struct JobStrip {
+    ws_id: String,
+    active: Vec<JobView>,
+    more: usize,
+}
+
+impl JobStrip {
+    /// Jobs the strip names; the terminal's strip shows as many.
+    const SHOWN: usize = 3;
+
+    fn of(app: &App, access: &Access) -> Self {
+        let rows = JobRows::of(app, access);
+        let mut active: Vec<JobView> = rows.jobs.into_iter().filter(|j| j.active).collect();
+        let more = active.len().saturating_sub(Self::SHOWN);
+        active.truncate(Self::SHOWN);
+        Self {
+            ws_id: rows.ws_id,
+            active,
+            more,
+        }
+    }
+}
+
 #[derive(Template)]
 #[template(path = "jobs_rows.html")]
 struct JobRows {
@@ -988,6 +1015,7 @@ pub(crate) fn router(app: &App) -> Router<App> {
         )
         .route("/w/{id}/jobs", get(jobs_page))
         .route("/w/{id}/jobs/rows", get(job_rows))
+        .route("/w/{id}/jobs/strip", get(job_strip))
         .route("/w/{id}/jobs/{job}/cancel", post(job_cancel))
         .route("/w/{id}/tables", get(tables).post(table))
         .route("/w/{id}/tables/note", post(table_note))
@@ -1446,6 +1474,19 @@ async fn job_rows(
         .audit_read(&app, AuditAction::Page, "job_rows")
         .await?;
     Ok(Html(JobRows::of(&app, &access).render()?).into_response())
+}
+
+/// The strip above every workspace page, refetched on each job event.
+async fn job_strip(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access
+        .audit_read(&app, AuditAction::Page, "jobs_strip")
+        .await?;
+    Ok(Html(JobStrip::of(&app, &access).render()?).into_response())
 }
 
 async fn job_cancel(

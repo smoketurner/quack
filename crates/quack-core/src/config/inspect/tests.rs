@@ -280,11 +280,14 @@ fn the_key_list_matches_the_config_structs() {
         // A nested table, checked on its own below.
         if *section == "server" {
             declared.insert(String::from("oidc"));
+            declared.insert(String::from("webhooks"));
         }
         assert_eq!(fields_of(&format!("[{section}]")), declared, "[{section}]");
     }
     let oidc: BTreeSet<String> = OIDC_KEYS.iter().map(|k| (*k).to_owned()).collect();
     assert_eq!(fields_of("[server.oidc]"), oidc, "[server.oidc]");
+    let webhooks: BTreeSet<String> = WEBHOOK_KEYS.iter().map(|k| (*k).to_owned()).collect();
+    assert_eq!(fields_of("[server.webhooks]"), webhooks, "[server.webhooks]");
     let providers: BTreeSet<String> = PROVIDER_KEYS.iter().map(|k| (*k).to_owned()).collect();
     assert_eq!(
         fields_of("[providers.p]\ntype = \"ollama\""),

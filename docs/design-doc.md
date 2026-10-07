@@ -210,6 +210,24 @@ status line, and outcome (a one-line summary or the error). Each change is broad
 snapshot; the terminal's job strip and `/jobs`, the web console's Jobs page, and
 `GET .../jobs/stream` all read it.
 
+Every workspace page in the web console carries a job strip above its content
+(`templates/base.html`, `/w/{id}/jobs/strip`): the active jobs, three at most as in the
+terminal, the rest counted, refetched on each event of the one `jobs/stream` the page opens
+(audited as `stream`, the strip as a `page` read). When a background job finishes, a
+`role="status"` toast says so from its kind, number, state, and the label already redacted
+for the caller; "Notify me" asks the browser once, remembered in `localStorage`, and a
+notification fires only while the page is hidden. The Documents page refreshes on job events
+instead of polling.
+
+`[server.webhooks]` POSTs each finished job to the operator's endpoint (`jobs::webhook`):
+`job_id`, `number`, `kind`, `state`, `workspace_id`, `owner`, the three times, and `progress`,
+never the label or outcome, which can carry workspace content; a receiver asks `GET
+.../jobs/{job}` with its own token for those. The body is signed with HMAC-SHA256 (aws-lc-rs)
+under the secret `secret_env` names, as `X-Quack-Signature: sha256=<hex>`, and `quack serve`
+refuses to start when that variable is unset. `kinds` narrows the report (every kind but chat
+turns by default). Delivery goes through `Proxies::client`, with one retry after two seconds,
+and a failure is logged.
+
 Cancelling a queued job ends it without running, including one whose task has not yet
 run for the first time. A running job sees its cancel token and
 stops at its next checkpoint, or finishes if its work has none (an ingest mid-embedding).
@@ -2968,6 +2986,12 @@ shutdown_grace_seconds = 20             # how long SIGTERM or Ctrl-C waits for j
 secure_cookies = "auto"                 # "always": Secure cookies on loopback too (same-host TLS proxy)
 log_format = "text"                     # "json": one JSON object per line for a log collector; the access log is `quack::access` at debug
 
+[server.webhooks]        # optional: a signed POST when a background job finishes
+url = "https://hooks.example.com/quack"
+secret_env = "QUACK_WEBHOOK_SECRET"     # the HMAC-SHA256 key; quack serve will not start without it
+kinds = ["ingest", "import"]            # default: every kind but chat
+timeout_seconds = 10
+
 [server.oidc]            # optional: "Sign in with <issuer>" beside the password form
 issuer_url = "https://login.microsoftonline.com/{tenant_id}/v2.0"
 client_id = "..."
@@ -3318,8 +3342,7 @@ Every gap is a GitHub issue unless the item says otherwise.
       included, is a plain runtime task. The terminal's commands run their database step in
       typed order on a worker task, reads on the reader pool.
     - Not yet: MCP `query` calls and print mode run their turn directly (one call, one
-      answer, nothing to keep responsive); the web chat page shows its own turn but not a
-      job strip (the Jobs page does); jobs are not persisted across restarts.
+      answer, nothing to keep responsive); jobs are not persisted across restarts.
 
 ---
 

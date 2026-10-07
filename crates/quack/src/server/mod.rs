@@ -29,6 +29,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use quack_core::DUCK;
 use quack_core::config::Config;
+use quack_core::jobs::webhook::Webhook;
 use quack_core::telemetry;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::KeyExtractor;
@@ -509,6 +510,13 @@ pub(crate) async fn serve(
         out.flush()?;
     }
     let app = Arc::new(AppState::new(config, control, mode, sessions, oidc));
+    // Finished jobs go to the operator's endpoint, when one is configured;
+    // a webhook that cannot sign stops the server before it listens.
+    if let Some(hook) =
+        Webhook::from_config(app.config.server.webhooks.as_ref()).context("[server.webhooks]")?
+    {
+        drop(hook.spawn(app.jobs.subscribe(), app.stopping.clone()));
+    }
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot listen on {addr}"))?;

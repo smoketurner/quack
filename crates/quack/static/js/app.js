@@ -516,6 +516,59 @@
   // The Jobs page follows the job stream instead of polling: every change
   // asks htmx to refetch the rows, at most once per quarter second. If the
   // stream drops, the browser reconnects on its own (EventSource retries).
+  // A job's last known state, so a finish is announced once.
+  var jobStates = {};
+  var FINISHED = { succeeded: true, failed: true, cancelled: true };
+  var NOTIFY_KEY = "quack.notify";
+
+  function wantsNotifications() {
+    try { return window.localStorage.getItem(NOTIFY_KEY) === "on"; } catch (e) { return false; }
+  }
+
+  // A finished background job, said in the corner and, when the person
+  // asked and the page is hidden, by the browser. Only the kind, number,
+  // state, and the label the server already redacted for this caller.
+  function announceJob(job) {
+    var text = "Job #" + job.number + " (" + job.kind + ") " + job.state + (job.label ? ": " + job.label : "");
+    var toasts = document.getElementById("toasts");
+    if (toasts) {
+      var toast = document.createElement("div");
+      toast.className = "rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 shadow";
+      toast.textContent = text;
+      toasts.appendChild(toast);
+      setTimeout(function () { toast.remove(); }, 8000);
+    }
+    if (document.hidden && wantsNotifications() && window.Notification && Notification.permission === "granted") {
+      new Notification("quack", { body: text });
+    }
+  }
+
+  function noteJob(job) {
+    if (!job || !job.id) return;
+    var before = jobStates[job.id];
+    jobStates[job.id] = job.state;
+    if (job.kind !== "chat" && FINISHED[job.state] && before && !FINISHED[before]) announceJob(job);
+  }
+
+  // The strip's "Notify me": asks once, remembered in this browser.
+  function offerNotifications() {
+    var strip = document.getElementById("jobs-strip");
+    if (!strip || !window.Notification || Notification.permission === "denied" || wantsNotifications()) return;
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "mt-1 text-xs text-blue-400 hover:underline";
+    button.textContent = "Notify me when jobs finish";
+    button.addEventListener("click", function () {
+      Notification.requestPermission().then(function (answer) {
+        if (answer === "granted") {
+          try { window.localStorage.setItem(NOTIFY_KEY, "on"); } catch (e) { /* notifications stay off */ }
+          button.remove();
+        }
+      });
+    });
+    strip.insertAdjacentElement("afterend", button);
+  }
+
   function followJobs() {
     var rows = document.querySelector("[data-jobs-stream]");
     if (!rows || !window.EventSource) return;
@@ -528,8 +581,15 @@
       }, 250);
     }
     var source = new EventSource(rows.getAttribute("data-jobs-stream"));
-    source.addEventListener("job", refresh);
-    source.addEventListener("jobs", refresh);
+    source.addEventListener("job", function (ev) {
+      try { noteJob(JSON.parse(ev.data)); } catch (e) { /* a refresh still follows */ }
+      refresh();
+    });
+    source.addEventListener("jobs", function (ev) {
+      try { JSON.parse(ev.data).forEach(function (job) { jobStates[job.id] = job.state; }); } catch (e) { /* a refresh still follows */ }
+      refresh();
+    });
+    offerNotifications();
   }
 
   // Relative times go stale; swapped-in rows arrive as UTC.
