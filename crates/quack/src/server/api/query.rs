@@ -592,10 +592,23 @@ impl Access {
     ) -> ApiResult<Response> {
         let workspace_id = self.membership.workspace.id.clone();
         let sql = statement.clone();
-        let kind = app
+        let kind = match app
             .read(&workspace_id, move |db| db.classify_user_statement(&sql))
             .await
-            .map_err(|e| ApiError::forbidden(e.message))?;
+        {
+            Ok(kind) => kind,
+            Err(e) => {
+                self.audit(
+                    app,
+                    AuditAction::Export,
+                    None,
+                    Outcome::Denied,
+                    Some(serde_json::json!({ "sql": statement, "format": format, "error": e.message })),
+                )
+                .await?;
+                return Err(ApiError::forbidden(e.message));
+            }
+        };
         if kind.writes().map_err(ApiError::bad_request)? {
             self.audit(
                 app,

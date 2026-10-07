@@ -1641,6 +1641,20 @@ async fn the_vision_model_reads_images_and_they_are_served() {
     h.wait_ready(&ws, &notes, &token).await;
     let (status, _) = h.get(&format!("{base}/{notes}/image"), &token).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let opens = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("open")),
+            outcome: Some(Outcome::Error),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        opens
+            .iter()
+            .any(|r| r.entry.resource_id.as_deref() == Some(notes.as_str())),
+        "a missing image is audited as an error, not an allowed open: {opens:?}"
+    );
 
     let plain = harness(ServeMode::Login).await;
     let owner = plain.user("owner", UserKind::Standard).await;
@@ -1877,6 +1891,32 @@ async fn uploads_are_queued_processed_pinned_and_deleted() {
         deletes.first().and_then(|r| r.entry.resource_id.clone()),
         Some(csv_id)
     );
+}
+
+/// A password changes only through the person's own sign-in: an API
+/// token, of any scope, is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_api_token_cannot_change_a_password() {
+    let h = harness(ServeMode::Login).await;
+    let ada = h.user("ada", UserKind::Standard).await;
+    let ws = h.workspace("a", &ada).await;
+    let token = h
+        .app
+        .control
+        .create_token(&ws, &ada, "t", &[Scope::Admin], None, setup_audit())
+        .await
+        .map_or_else(
+            |e| fail(&e.to_string()),
+            |issued| issued.secret.expose().to_owned(),
+        );
+    let (status, body) = h
+        .post(
+            "/api/v1/auth/password",
+            &token,
+            serde_json::json!({ "current": "pw", "new": "another-password" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
 /// An admin's read or write token for one workspace is not a key to the
@@ -9234,13 +9274,21 @@ async fn sql_export_streams_every_row_and_refuses_writes() {
                 ..AuditFilter::default()
             })
             .await;
-        if exports.len() >= 3 {
+        if exports.len() >= 4 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(exports.len(), 3, "{exports:?}");
-    assert!(exports.iter().any(|r| r.entry.outcome == Outcome::Denied));
+    // Two streamed exports, the refused write, and the refused internal
+    // table: every refusal is on the record.
+    assert_eq!(exports.len(), 4, "{exports:?}");
+    assert_eq!(
+        exports
+            .iter()
+            .filter(|r| r.entry.outcome == Outcome::Denied)
+            .count(),
+        2
+    );
 
     // The web download streams the whole result too.
     let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;

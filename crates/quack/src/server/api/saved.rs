@@ -170,7 +170,18 @@ pub(crate) async fn remove(
         ));
     }
     let db = app.workspace_db(&id).await?;
-    with_db(db, move |db| saved::remove(db, &question.id)).await?;
+    if let Err(e) = with_db(db, move |db| saved::remove(db, &question.id)).await {
+        access
+            .audit(
+                &app,
+                AuditAction::Delete,
+                resource,
+                Outcome::Error,
+                Some(serde_json::json!({ "error": e.message })),
+            )
+            .await?;
+        return Err(e);
+    }
     access
         .audit(&app, AuditAction::Delete, resource, Outcome::Allowed, None)
         .await?;
@@ -195,7 +206,21 @@ pub(crate) async fn run(
     let question = access.saved_question(&app, &saved).await?;
     let db = app.workspace_db(&id).await?;
     let max_rows = app.config.analysis.max_query_rows;
-    let run = with_db(db, move |db| saved::run(db, &question, max_rows)).await?;
+    let run = match with_db(db, move |db| saved::run(db, &question, max_rows)).await {
+        Ok(run) => run,
+        Err(e) => {
+            access
+                .audit(
+                    &app,
+                    AuditAction::SavedRun,
+                    Some(ResourceKind::SavedQuestion.id(&saved)),
+                    Outcome::Error,
+                    Some(serde_json::json!({ "error": e.message })),
+                )
+                .await?;
+            return Err(e);
+        }
+    };
     let outcome = match run.status {
         RunStatus::Ok => Outcome::Allowed,
         RunStatus::Failed => Outcome::Error,
