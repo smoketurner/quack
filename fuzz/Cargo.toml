@@ -64,6 +64,62 @@ doc = false
 bench = false
 
 [[bin]]
+name = "epub"
+path = "fuzz_targets/epub.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "odt"
+path = "fuzz_targets/odt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "eml"
+path = "fuzz_targets/eml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mbox"
+path = "fuzz_targets/mbox.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vtt"
+path = "fuzz_targets/vtt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "srt"
+path = "fuzz_targets/srt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "code"
+path = "fuzz_targets/code.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtf"
+path = "fuzz_targets/rtf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "chunker"
 path = "fuzz_targets/chunker.rs"
 test = false
