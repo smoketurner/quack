@@ -225,7 +225,7 @@ async fn an_outcome_reranks_keeps_top_k_and_renders_its_workings() {
     let top = reranked.explanation.fused.first().map(|h| h.ranks);
     assert_eq!(top.and_then(|r| r.rerank_rank), Some(1));
     assert_eq!(top.and_then(|r| r.rerank_score), Some(0.5));
-    let json = reranked.to_json(true);
+    let json = serde_json::json!(reranked.body(SearchDetail::Workings));
     assert_eq!(
         json.pointer("/chunks/0/rerank_rank"),
         Some(&serde_json::json!(1))
@@ -235,7 +235,7 @@ async fn an_outcome_reranks_keeps_top_k_and_renders_its_workings() {
         Some(&serde_json::json!("reranked by the reverse"))
     );
     assert!(json.pointer("/explain/keyword/1").is_some());
-    assert!(reranked.to_json(false).get("explain").is_none());
+    assert!(reranked.body(SearchDetail::Hits).explain.is_none());
     let hits = reranked.render(SearchDetail::Hits);
     assert!(
         hits.starts_with("1. policy.md") || hits.starts_with("1. notes.md"),

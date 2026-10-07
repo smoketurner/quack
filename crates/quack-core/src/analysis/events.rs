@@ -56,7 +56,9 @@ impl<'a> DetailPreview<'a> {
 }
 
 /// The agent's tools, by the name the model calls each one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolName {
     RunSql,
@@ -106,7 +108,7 @@ impl ToolName {
 }
 
 /// One tool invocation, recorded for the transcript and the final response.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ToolStep {
     pub tool: ToolName,
     /// What the tool was asked to do: the SQL text, the search query, the
@@ -149,7 +151,9 @@ pub enum Delivery {
 
 /// The interface's answer to a permission request: the API body's
 /// `decision` and the audit detail's, as `deny`, `allow`, `allow_turn`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
     Deny,

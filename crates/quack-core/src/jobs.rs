@@ -76,9 +76,24 @@ impl Serialize for JobId {
     }
 }
 
+/// Serialized as its UUID text.
+impl utoipa::PartialSchema for JobId {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{KnownFormat, ObjectBuilder, SchemaFormat, Type};
+        ObjectBuilder::new()
+            .schema_type(Type::String)
+            .format(Some(SchemaFormat::KnownFormat(KnownFormat::Uuid)))
+            .into()
+    }
+}
+
+impl utoipa::ToSchema for JobId {}
+
 /// A job's short number, counting from 1 per queue, for people to type
 /// (`/cancel 3`): v7 ids submitted together share their first digits.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, utoipa::ToSchema,
+)]
 #[serde(transparent)]
 pub struct JobNumber(u64);
 
@@ -105,7 +120,7 @@ impl std::str::FromStr for JobNumber {
 }
 
 /// What a job does, for display and filtering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
     /// An agent turn.
@@ -189,7 +204,7 @@ impl fmt::Display for JobKind {
 
 /// Where a job is in its life. `Queued` and `Running` are active; the other
 /// three are final.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     /// Waiting for its lane or a worker slot.
@@ -335,7 +350,7 @@ impl JobSpec {
 }
 
 /// How far along a job with countable work is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct JobProgress {
     pub done: u32,
     pub total: u32,
@@ -373,7 +388,7 @@ impl fmt::Display for JobProgress {
 }
 
 /// A job as it stands: what every subscriber receives on each change.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct JobInfo {
     pub id: JobId,
     pub number: JobNumber,

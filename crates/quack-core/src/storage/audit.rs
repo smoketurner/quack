@@ -82,7 +82,7 @@ impl AuditDetail {
 }
 
 /// A stored detail row.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AuditDetailRow {
     pub id: AuditId,
     pub timestamp: String,

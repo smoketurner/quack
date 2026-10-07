@@ -36,6 +36,15 @@ macro_rules! flag_enum {
                 bool::column_result(value).map(Self::from)
             }
         }
+
+        /// Serialized as the boolean, so documented as one.
+        impl ::utoipa::PartialSchema for $name {
+            fn schema() -> ::utoipa::openapi::RefOr<::utoipa::openapi::schema::Schema> {
+                <bool as ::utoipa::PartialSchema>::schema()
+            }
+        }
+
+        impl ::utoipa::ToSchema for $name {}
     };
 }
 
@@ -119,6 +128,19 @@ macro_rules! history_enum {
                     .unwrap_or_else(|| Self::$unknown(wanted.to_owned())))
             }
         }
+
+        /// Serialized as its text, which a newer build may extend, so
+        /// documented as a string with the values this build defines.
+        impl ::utoipa::PartialSchema for $name {
+            fn schema() -> ::utoipa::openapi::RefOr<::utoipa::openapi::schema::Schema> {
+                ::utoipa::openapi::schema::ObjectBuilder::new()
+                    .schema_type(::utoipa::openapi::schema::Type::String)
+                    .examples(Self::ALL.iter().map(|value| value.as_str().to_owned()))
+                    .into()
+            }
+        }
+
+        impl ::utoipa::ToSchema for $name {}
     };
 }
 

@@ -329,7 +329,7 @@ impl DocumentMeta {
 /// How a paginated document's pages read. A page left out of the text is
 /// one of two kinds, which mean different things to the person: its
 /// extraction failed, or it holds no text (a scanned image).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct PageCounts {
     pub total: u32,
     /// Pages whose extraction failed.
@@ -442,7 +442,17 @@ impl Section {
 /// What a section (and the chunks cut from it) holds: running text, a
 /// table rendered as Markdown, a note (footnote, endnote, comment,
 /// speaker note), or source code.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SectionKind {
     #[default]

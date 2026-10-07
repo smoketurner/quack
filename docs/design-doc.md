@@ -1678,7 +1678,7 @@ the reason (`Hold`) for `SqlGate::check`. The gate matches no SQL or chunk text.
 the rest of a turn (`a`, `allow_turn`) given before the turn read document text does not
 cover a write after it.
 
-Every interface returns one response object (11.2), built by `AgentResponse::to_json`:
+Every interface returns one response object (11.2), `AgentResponseBody`, built by `AgentResponse::body`:
 `answer`, `citations` (each with `n`, `chunk_id`, `document_id`, `filename`, `chunk_index`,
 `page`, `heading`, `ingested_at` (when the document was ingested, UTC; `null` on answers
 recorded before it was kept), `excerpt` (the first 500 characters of the chunk, with an
@@ -2204,8 +2204,17 @@ and ask again. The UI covers:
 ### 11.2 REST API
 
 The API is JSON under `/api/v1`, authenticated by a bearer token (a login session or an API
-token) or the `quack_session` cookie. Every answer to a question is the same object print
-mode emits:
+token) or the `quack_session` cookie. Its contract is an OpenAPI 3.1 document at
+`GET /api/v1/openapi.json`, generated with `utoipa` from each handler's
+`#[utoipa::path]` annotation and the request and response types' schemas
+(`server/api/openapi.rs`), and rendered for people at `GET /api/v1/docs` by the vendored
+Redoc. Both sit beside `/healthz`: no sign-in, no audit row, no rate limit, and
+`Cache-Control: no-cache`, since the document describes the routes and reveals no workspace
+content. Every path the router registers is in the document, and a test fails when one is
+not. The two Server-Sent Events streams list their events, each with its data's schema, in
+the operation's `x-sse-events` extension, generated from the one `StreamEvent` enum. Every
+answer to a question is the same object print mode emits (`AgentResponseBody` in
+`quack_core::analysis::agent`):
 
 ```json
 {
@@ -2227,6 +2236,8 @@ mode emits:
 GET    /healthz                                   liveness, no auth
 GET    /readyz                                    readiness, no auth: 200 {control_db, data_dir, vault_key} each `ok`, else 503 with the failing probe's error
 GET    /metrics                                   Prometheus text; loopback, or an admin's bearer
+GET    /api/v1/openapi.json                       the OpenAPI 3.1 document, no auth
+GET    /api/v1/docs                               the document rendered by Redoc, no auth
 POST   /api/v1/auth/login                         {username,password} -> token (web session)
 ANY    /mcp/v1/{id}                               MCP over streamable HTTP, same bearer (section 11.3)
 GET    /api/v1/workspaces
@@ -2323,7 +2334,21 @@ Workspace content never travels in a URL: search text, entity names, table names
 go in a request body, since request logs, proxies, and browser history keep URLs and all of
 them sit outside the workspace file. Paths and query strings carry only ids, versions,
 fixed-set values, and paging. The request log records each request's route template
-(`/api/v1/workspaces/{id}/documents/{doc}`), never its URI. Errors:
+(`/api/v1/workspaces/{id}/documents/{doc}`), never its URI.
+
+Every error response under `/api/` is `{"error": "...", "code": "..."}`, and the
+`query/stream` turn's SSE `error` event carries the same object as its data. `code` is a
+stable `snake_case` value (`ErrorCode` in `server/error.rs`, listed as an enum in the
+document's components): a client branches on it, never on `error`, which is for a person
+and may change in any release. Core errors and failed turns map to specific codes
+(`auth_required`, `workspace_locked`, `no_chat_model`, `table_taken`, `unknown_value`,
+`query_timeout`, `provider_refused`, ...); an error with only a status carries that
+status's code (`bad_request`, `forbidden`, `not_found`, `conflict`, `busy`, ...). A user's
+own statement or import that fails is 422 with `sql_failed` or `import_failed` unless a
+more specific code applies. Errors the framework builds itself (a body that is not JSON, a
+method the route lacks, the rate limiter, the request timeout) get the same body through
+the `coded_errors` middleware, with codes such as `unsupported_media_type`,
+`method_not_allowed`, `rate_limited`, and `timeout`. Statuses:
 
 - An unknown value for a fixed-set field (`mode`, `role`, `scopes`, an audit `outcome`, a
   merge or candidate `action`, an extraction `source`) is refused while the request is

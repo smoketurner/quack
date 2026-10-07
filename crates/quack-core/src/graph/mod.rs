@@ -46,7 +46,7 @@ pub enum Standing {
 flag_enum!(Standing, false => Reviewed, true => Provisional);
 
 /// A stored node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Node {
     pub id: NodeId,
     pub label: String,
@@ -78,7 +78,7 @@ impl Node {
 }
 
 /// A stored edge.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Edge {
     pub id: EdgeId,
     pub source_node_id: NodeId,
@@ -105,7 +105,7 @@ const ALIASES: &str = "aliases";
 /// A node's or edge's properties: always an object. Whatever else a model
 /// answered or a column held reads as no properties, so no caller checks
 /// the shape again.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct Properties(serde_json::Map<String, serde_json::Value>);
 
@@ -308,8 +308,9 @@ impl fmt::Display for Properties {
 /// Where a node or edge came from. Serialized flat into [`Provenance`],
 /// as `document_id` and `chunk_id`, `table_name` and `row_key`, or the
 /// person who asserted it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(untagged)]
+#[schema(as = ProvenanceOrigin)]
 pub enum Origin {
     /// A person stated it (`quack graph add`, the API, the graph page).
     /// First, so a row with `asserted_at` never reads as a chunk.
@@ -422,7 +423,7 @@ impl Origin {
 }
 
 /// A node's or edge's source, with how sure the extraction was.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Provenance {
     pub subject_id: String,
     #[serde(flatten)]
@@ -432,7 +433,7 @@ pub struct Provenance {
 
 /// A traversal or listing: the nodes and edges found, each with its
 /// provenance, and the nodes the query started from.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GraphResult {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -459,7 +460,7 @@ pub struct GraphResult {
 /// which ontology built it, whether it lags the current one, how much of
 /// it is provisional, how much the corpus expressed that the ontology
 /// lacks, and how many provisional nodes this result left out.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GraphStatusSummary {
     pub built_with_version: Option<OntologyVersion>,
     pub ontology_version: Option<OntologyVersion>,
@@ -511,7 +512,7 @@ impl GraphResult {
 
 /// Counts of what the corpus tried to express that the ontology has no
 /// place for, accumulated across extraction runs (design doc 6.5, drift).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Drift {
     #[serde(default)]
     pub classes: Tally,
@@ -535,7 +536,7 @@ impl Drift {
 /// What the interfaces show about the graph: size, whether it is
 /// provisional (built from an auto-accepted ontology) or stale (the
 /// ontology moved on), and the drift the corpus expressed.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GraphStatus {
     pub nodes: u64,
     pub edges: u64,
@@ -697,7 +698,7 @@ impl duckdb::ToSql for NormalizedLabel {
 }
 
 /// What a graph extraction reads.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ExtractSource {
     /// Mapped tables, then document chunks.

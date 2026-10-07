@@ -44,7 +44,9 @@ pub enum Exposure {
 
 /// Why a write does not simply run. Ordered: a person who granted the rest
 /// of a turn's writes under one reason has granted the reasons before it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Hold {
     /// Writes were not permitted up front.

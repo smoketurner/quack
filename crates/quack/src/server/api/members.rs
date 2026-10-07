@@ -5,31 +5,46 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use quack_core::ids::{UserId, WorkspaceId};
 use quack_core::storage::control::{
-    AuditAction, GroupRoleRow, Outcome, ResourceKind, Role, Standing, UserKind,
+    AuditAction, GroupRoleRow, MemberRow, Outcome, ResourceKind, Role, Standing, UserKind,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::App;
 
+/// The workspace's members.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct MemberList {
+    pub members: Vec<MemberRow>,
+}
+
+/// The workspace's members and their roles.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/members",
+    tag = "members",
+    responses((status = 200, description = "The members", body = MemberList)),
+)]
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<MemberList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
     access
         .audit_read(&app, AuditAction::List, "members")
         .await?;
     let members = app.control.list_members(&id).await?;
-    Ok(Json(serde_json::json!({ "members": members })))
+    Ok(Json(MemberList { members }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct AddMember {
     pub username: String,
     #[serde(default = "default_role")]
+    #[schema(default = "member")]
     pub role: Role,
     /// Why, when an admin grants themself a role in a workspace they are
     /// not a member of; required then, ignored otherwise.
@@ -41,6 +56,14 @@ fn default_role() -> Role {
     Role::Member
 }
 
+/// Give a user a role here; an existing member's role changes.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/members",
+    tag = "members",
+    request_body = AddMember,
+    responses((status = 200, description = "The member", body = NewMember)),
+)]
 pub(crate) async fn add(
     State(app): State<App>,
     identity: Identity,
@@ -51,6 +74,13 @@ pub(crate) async fn add(
     Ok(Json(access.add_member(&app, &body).await?))
 }
 
+/// Remove a member.
+#[utoipa::path(
+    delete,
+    path = "/workspaces/{id}/members/{user}",
+    tag = "members",
+    responses((status = 204, description = "Removed")),
+)]
 pub(crate) async fn remove(
     State(app): State<App>,
     identity: Identity,
@@ -62,7 +92,7 @@ pub(crate) async fn remove(
 }
 
 /// A member as added.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct NewMember {
     pub user_id: UserId,
     pub username: String,
@@ -141,25 +171,47 @@ impl Access {
     }
 }
 
+/// The identity provider's groups with a role here.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct GroupList {
+    pub groups: Vec<GroupRoleRow>,
+}
+
 /// `GET .../groups`: the identity provider's groups with a role here.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/groups",
+    tag = "members",
+    responses((status = 200, description = "The groups", body = GroupList)),
+)]
 pub(crate) async fn groups(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<GroupList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ_OR_ADMIN).await?;
     access.audit_read(&app, AuditAction::List, "groups").await?;
     let groups = app.control.list_group_roles(&id).await?;
-    Ok(Json(serde_json::json!({ "groups": groups })))
+    Ok(Json(GroupList { groups }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct GroupRole {
     pub group: String,
     #[serde(default = "default_role")]
+    #[schema(default = "member")]
     pub role: Role,
 }
 
+/// Give a group a role here, or change it; members already signed in get
+/// it at their next sign-in.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/groups",
+    tag = "members",
+    request_body = GroupRole,
+    responses((status = 200, description = "The group's role", body = GroupRoleRow)),
+)]
 pub(crate) async fn set_group(
     State(app): State<App>,
     identity: Identity,
@@ -170,6 +222,13 @@ pub(crate) async fn set_group(
     Ok(Json(access.set_group_role(&app, &body).await?))
 }
 
+/// Take a group's role here away.
+#[utoipa::path(
+    delete,
+    path = "/workspaces/{id}/groups/{group}",
+    tag = "members",
+    responses((status = 204, description = "Removed")),
+)]
 pub(crate) async fn remove_group(
     State(app): State<App>,
     identity: Identity,

@@ -36,7 +36,17 @@ use crate::storage::sessions::ChatMode;
 /// itself — the history trim, Ollama's `num_ctx` — is a four-characters-
 /// per-token estimate; this is the measured count the provider reported,
 /// for the response object and the transcript.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
 #[expect(
     clippy::struct_field_names,
     reason = "these are the field names of rig's Usage and of every provider's API, and they are the response object's JSON keys"
@@ -113,7 +123,7 @@ pub struct AgentResponse {
 }
 
 /// One SQL statement the turn ran, as the response object lists it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct QueryRun {
     pub sql: String,
     /// Rows the statement produced, when the step reported a count.
@@ -140,33 +150,63 @@ impl AgentResponse {
     /// issue #50): print mode's `--format json`, the REST body and SSE
     /// `complete` event, and the MCP structured content all carry this.
     #[must_use]
-    pub fn to_json(&self, session_id: &SessionId) -> serde_json::Value {
-        let citations: Vec<serde_json::Value> = self
-            .citations
-            .iter()
-            .map(|c| {
-                let mut value = serde_json::json!(c);
-                if let Some(fields) = value.as_object_mut() {
-                    fields.insert(String::from("label"), c.label().into());
-                }
-                value
-            })
-            .collect();
-        serde_json::json!({
-            "answer": self.content,
-            "citations": citations,
-            "queries": self.queries(),
-            "steps": self.steps,
-            "graph": self.graph,
-            "chart": self.chart,
-            "write_refused": self.write_refused,
-            "cancelled": self.cancelled,
-            "usage": self.usage,
-            "duration_ms": self.duration_ms,
-            "documents": self.documents,
-            "session_id": session_id,
-        })
+    pub fn body(&self, session_id: &SessionId) -> AgentResponseBody {
+        AgentResponseBody {
+            answer: self.content.clone(),
+            citations: self
+                .citations
+                .iter()
+                .map(|c| LabeledCitation {
+                    label: c.label(),
+                    citation: c.clone(),
+                })
+                .collect(),
+            queries: self.queries(),
+            steps: self.steps.clone(),
+            graph: self.graph.clone(),
+            chart: self.chart.clone(),
+            write_refused: self.write_refused,
+            cancelled: self.cancelled,
+            usage: self.usage,
+            duration_ms: self.duration_ms,
+            documents: self.documents.clone(),
+            session_id: session_id.clone(),
+        }
     }
+}
+
+/// The response object (design doc 11.2): the answer, its sources, and
+/// what the turn did to reach it.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct AgentResponseBody {
+    pub answer: String,
+    pub citations: Vec<LabeledCitation>,
+    /// The `run_sql` steps, as statements with their row counts.
+    pub queries: Vec<QueryRun>,
+    pub steps: Vec<ToolStep>,
+    /// What the graph tools returned, in call order.
+    pub graph: Vec<GraphResult>,
+    pub chart: Option<ChartSpec>,
+    /// At least one mutating statement was refused during the turn.
+    pub write_refused: bool,
+    /// The turn was cancelled; `answer` holds what streamed before.
+    pub cancelled: bool,
+    /// Tokens the provider reported; `null` when it reported none.
+    pub usage: Option<TokenUsage>,
+    /// Milliseconds from the question to the answer.
+    pub duration_ms: Option<u64>,
+    /// The documents the question was limited to; empty for all.
+    pub documents: DocumentScope,
+    pub session_id: SessionId,
+}
+
+/// A citation with the label every interface shows for it.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct LabeledCitation {
+    #[serde(flatten)]
+    pub citation: Citation,
+    /// `file.pdf p. 3`, `notes.md § Heading`: the source as a person reads it.
+    pub label: String,
 }
 
 /// One question for the agent: the workspace handles, the embedding model

@@ -22,7 +22,7 @@ use crate::storage::workspace::{StatementKind, WorkspaceDb};
 /// Whether a person reviewed a version before it was saved. A graph
 /// built from an auto-accepted version is provisional until someone
 /// saves a reviewed one.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Acceptance {
     #[default]
@@ -80,7 +80,7 @@ impl<'a> Revision<'a> {
 }
 
 /// A stored version's header.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct VersionRow {
     pub version: OntologyVersion,
     pub author: Option<String>,

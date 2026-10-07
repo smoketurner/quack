@@ -133,8 +133,21 @@ pub const MENTIONS_RELATION: &str = "mentions";
 
 /// A saved ontology version: the first save is 1 and each save counts up.
 /// An ontology not yet saved, and a graph never built, have none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(transparent)]
+#[schema(value_type = u32, minimum = 1)]
 pub struct OntologyVersion(NonZeroU32);
 
 impl OntologyVersion {
@@ -212,7 +225,7 @@ impl FromSql for OntologyVersion {
 }
 
 /// A kind of entity: graph nodes are typed by one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Class {
     /// `snake_case`, unique among classes.
@@ -242,7 +255,7 @@ fn hidden(total: usize, limit: usize) -> Option<usize> {
 }
 
 /// A kind of edge, from an entity of `domain` to one of `range`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Relation {
     /// `snake_case`, unique among relations.
@@ -258,7 +271,9 @@ pub struct Relation {
 }
 
 /// The type of a property's values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum PropertyType {
     String,
@@ -277,7 +292,7 @@ text_enum!(PropertyType, "property type", {
 });
 
 /// A typed attribute that classes carry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Property {
     /// Unique among properties.
@@ -319,7 +334,7 @@ impl Property {
 /// A named calculation over one table: a SQL expression such as
 /// `sum(amount) / 100.0`, checked as a read of that table when the
 /// ontology is saved, so the agent and people compute it one way.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Measure {
     pub id: String,
@@ -356,7 +371,7 @@ impl std::fmt::Display for Measure {
 }
 
 /// One foreign-key-like column of a mapped table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MappingRelation {
     /// The relation each row's edge takes.
@@ -369,7 +384,7 @@ pub struct MappingRelation {
 }
 
 /// How a table's rows become nodes and edges (design doc 6.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Mapping {
     /// The workspace table whose rows become nodes.
@@ -394,7 +409,9 @@ impl Mapping {
 }
 
 /// The whole ontology in interchange form.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Ontology {
     /// The stored version this was read from; `None` for one not yet saved.
@@ -1177,7 +1194,7 @@ impl Ontology {
 }
 
 /// Ids added, removed, or changed for one kind.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct Changes {
     pub added: Vec<String>,
     pub removed: Vec<String>,
@@ -1211,7 +1228,7 @@ impl Changes {
 }
 
 /// The difference between two versions.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct OntologyDiff {
     pub from: Option<OntologyVersion>,
     pub to: Option<OntologyVersion>,

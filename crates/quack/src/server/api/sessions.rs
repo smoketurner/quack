@@ -8,16 +8,22 @@ use axum::response::{IntoResponse, Response};
 use quack_core::analysis::events::Decision;
 use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
-use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
-use serde::Deserialize;
+use quack_core::storage::sessions::{
+    self, ChatMode, ExportFormat, MessageRow, SessionRow, Sharing, Transcript,
+};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct ListQuery {
+    /// Sessions at most, newest first.
     #[serde(default = "default_limit")]
+    #[param(default = 50)]
     pub limit: u32,
 }
 
@@ -25,12 +31,26 @@ fn default_limit() -> u32 {
     50
 }
 
+/// The sessions the caller may read.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SessionList {
+    pub sessions: Vec<SessionRow>,
+}
+
+/// The caller's sessions and the shared ones; an owner's sees every one.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/sessions",
+    tag = "sessions",
+    params(ListQuery),
+    responses((status = 200, description = "The sessions", body = SessionList)),
+)]
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Query(q): Query<ListQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SessionList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "sessions")
@@ -42,7 +62,7 @@ pub(crate) async fn list(
             sessions::list_sessions_for(db, limit, &viewer)
         })
         .await?;
-    Ok(Json(serde_json::json!({ "sessions": rows })))
+    Ok(Json(SessionList { sessions: rows }))
 }
 
 impl Access {
@@ -52,7 +72,7 @@ impl Access {
         &self,
         app: &App,
         session_id: &SessionId,
-    ) -> ApiResult<sessions::SessionRow> {
+    ) -> ApiResult<SessionRow> {
         let sid = session_id.to_owned();
         let viewer = self.session_viewer();
         let found = app
@@ -64,11 +84,25 @@ impl Access {
     }
 }
 
+/// A session and every message in it.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SessionDetail {
+    pub session: SessionRow,
+    pub messages: Vec<MessageRow>,
+}
+
+/// A session and every message in it.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/sessions/{sid}",
+    tag = "sessions",
+    responses((status = 200, description = "The session", body = SessionDetail)),
+)]
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
     Path((id, sid)): Path<(WorkspaceId, SessionId)>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SessionDetail>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let session = access.visible_session(&app, &sid).await?;
     let session_id = session.id.clone();
@@ -84,12 +118,10 @@ pub(crate) async fn show(
             None,
         )
         .await?;
-    Ok(Json(
-        serde_json::json!({ "session": session, "messages": messages }),
-    ))
+    Ok(Json(SessionDetail { session, messages }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct UpdateSession {
     pub shared: Option<Sharing>,
     /// `chat` or `query`: the explicit way to change a session's mode.
@@ -98,12 +130,19 @@ pub(crate) struct UpdateSession {
 
 /// Share a session with every member or take it back, or change its
 /// mode. Its creator, or an owner, may. Audited as `share` and `mode`.
+#[utoipa::path(
+    patch,
+    path = "/workspaces/{id}/sessions/{sid}",
+    tag = "sessions",
+    request_body = UpdateSession,
+    responses((status = 200, description = "The session as it now is", body = SessionRow)),
+)]
 pub(crate) async fn update(
     State(app): State<App>,
     identity: Identity,
     Path((id, sid)): Path<(WorkspaceId, SessionId)>,
     Json(body): Json<UpdateSession>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SessionRow>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     if body.shared.is_none() && body.mode.is_none() {
         return Err(ApiError::bad_request("give shared or mode"));
@@ -118,10 +157,16 @@ pub(crate) async fn update(
     };
     let session =
         session.ok_or_else(|| ApiError::from(ResourceKind::Session.missing(sid.as_str())))?;
-    Ok(Json(serde_json::to_value(session)?))
+    Ok(Json(session))
 }
 
 /// Delete a session: its creator, or an owner, may. Audited as `delete`.
+#[utoipa::path(
+    delete,
+    path = "/workspaces/{id}/sessions/{sid}",
+    tag = "sessions",
+    responses((status = 204, description = "Deleted")),
+)]
 pub(crate) async fn remove(
     State(app): State<App>,
     identity: Identity,
@@ -143,7 +188,7 @@ impl Access {
         sid: &SessionId,
         action: AuditAction,
         refusal: &'static str,
-    ) -> ApiResult<sessions::SessionRow> {
+    ) -> ApiResult<SessionRow> {
         let session = self.visible_session(app, sid).await?;
         if !self.owns(session.created_by.as_ref()) {
             self.audit(
@@ -165,7 +210,7 @@ impl Access {
         app: &App,
         sid: &SessionId,
         mode: ChatMode,
-    ) -> ApiResult<sessions::SessionRow> {
+    ) -> ApiResult<SessionRow> {
         let session = self
             .own_session(
                 app,
@@ -199,7 +244,7 @@ impl Access {
         app: &App,
         sid: &SessionId,
         sharing: Sharing,
-    ) -> ApiResult<sessions::SessionRow> {
+    ) -> ApiResult<SessionRow> {
         let session = self
             .own_session(
                 app,
@@ -251,12 +296,25 @@ impl Access {
         Ok(())
     }
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct ExportQuery {
     #[serde(default)]
     pub format: ExportFormat,
 }
 
+/// The session as Markdown (questions, steps, answers) or as a runnable
+/// `.sql` file of its statements.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/sessions/{sid}/export",
+    tag = "sessions",
+    params(ExportQuery),
+    responses((status = 200, description = "The transcript", content(
+        (String = "text/markdown"),
+        (String = "application/sql"),
+    ))),
+)]
 pub(crate) async fn export(
     State(app): State<App>,
     identity: Identity,
@@ -286,7 +344,7 @@ pub(crate) async fn export(
 }
 
 /// A person's answer to a write their streamed turn is waiting on.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct PermissionAnswer {
     pub decision: Decision,
 }
@@ -294,6 +352,13 @@ pub(crate) struct PermissionAnswer {
 /// Answer the write `request` that the caller's turn in session `sid` is
 /// waiting on. Only the person whose question asked may answer, and only
 /// with write access; every answer is audited with the statement.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/sessions/{sid}/permissions/{request}",
+    tag = "sessions",
+    request_body = PermissionAnswer,
+    responses((status = 204, description = "The turn has the answer")),
+)]
 pub(crate) async fn decide(
     State(app): State<App>,
     identity: Identity,

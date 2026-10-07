@@ -163,6 +163,19 @@ row is processing (marked `data-pending`).
   commit it whenever a template changes classes.
 - `static/js/htmx.min.js` (htmx 4.0.0) and `static/js/echarts.min.js` (ECharts 6.1.0) are
   vendored so the binary works air-gapped.
+- `static/js/redoc.standalone.js` (Redoc 2.5.4, MIT, the npm package's
+  `bundles/redoc.standalone.js`, with its `redoc.standalone.js.LICENSE.txt` beside it) is
+  vendored the same way. It renders the API reference at `/api/v1/docs`
+  (`templates/api_docs.html`, a page of its own outside `base.html`) from
+  `/api/v1/openapi.json`. Redoc was chosen over Swagger UI (Apache-2.0, a 1.6 MB bundle plus
+  a stylesheet) and Scalar (MIT, 4.4 MB) for its size, 1.1 MB in one file, and because it
+  is read-only: the page sends no requests to the API on the reader's behalf. Neither the
+  page nor the document needs sign-in, like the static assets: the document describes
+  routes and reveals no workspace content. The Settings page's API tokens section and the
+  About page link to it. To update it, download the new version's two files from the npm
+  package and replace both.
+- `.pre-commit-config.yaml` keeps prek's whitespace and file-size hooks off the vendored
+  scripts and `output.css`, so each stays byte for byte as built or downloaded.
 - `static/js/sql-editor.min.js` is the SQL page's editor: CodeMirror 6 with
   `@codemirror/lang-sql`, highlighting SQL and completing the table and column names that
   `GET /api/v1/workspaces/{id}/tables/schema` returns (audited, `no-store`, never a

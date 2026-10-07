@@ -482,7 +482,7 @@ impl JsonSchema for NoArgs {
 
 /// An optional text argument, trimmed, and absent when blank: a model that
 /// sends `""` for an argument it meant to leave out has left it out.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, utoipa::ToSchema)]
 pub struct NonBlank(Option<String>);
 
 impl NonBlank {
@@ -1828,7 +1828,7 @@ pub struct SearchGraphTool<M>(pub GraphTools<M>);
 /// A graph search as every interface takes it: the agent tool's
 /// arguments, the MCP tool's, the REST body, and what the CLI and the
 /// web form fill in.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema, utoipa::ToSchema)]
 pub struct SearchGraphArgs {
     /// The entity to start from (its name as it appears in the data); omit
     /// to list every entity of `class`
@@ -1965,7 +1965,7 @@ where
 pub struct FindPathTool<M>(pub GraphTools<M>);
 
 /// A path request as every interface takes it, like [`SearchGraphArgs`].
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema, utoipa::ToSchema)]
 pub struct FindPathArgs {
     /// The entity to start from
     pub from: String,

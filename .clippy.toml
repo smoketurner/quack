@@ -93,6 +93,7 @@ absolute-paths-allowed-crates = [
     "tower_http",
     "tracing",
     "tracing_subscriber",
+    "utoipa",
     "uuid",
     "windows_native_keyring_store",
     "zip",

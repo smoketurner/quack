@@ -12,7 +12,7 @@ use crate::storage::workspace::WorkspaceDb;
 use crate::text::NonBlankText;
 
 /// A stored candidate.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct CandidateRow {
     pub id: CandidateId,
     pub kind: ItemKind,
@@ -108,7 +108,9 @@ impl CandidateRow {
 }
 
 /// Where a candidate stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateStatus {
     /// In the main review queue.
@@ -142,7 +144,17 @@ impl CandidateStatus {
 }
 
 /// The two review queues a reader pages through.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Queue {
     /// The main proposal.
@@ -170,7 +182,9 @@ impl Queue {
 
 /// What a reviewer does with one candidate, from the API or the ontology
 /// page; [`Self::decision`] turns it and its target into a [`Decision`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateAction {
     Accept,

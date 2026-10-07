@@ -20,7 +20,7 @@ use axum::http::request::Parts;
 use quack_core::analysis::citations::Sources;
 use quack_core::analysis::events;
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::search::DocumentSearch;
+use quack_core::analysis::search::{DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{FindPathArgs, ReaderDb, Rerank, SearchGraphArgs, SharedDb};
 use quack_core::config::Config;
 use quack_core::ids::{SessionId, UserId};
@@ -485,7 +485,7 @@ impl McpServer {
                     });
                 }
                 let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-                result.structured_content = Some(response.to_json(&session_id));
+                result.structured_content = Some(serde_json::json!(response.body(&session_id)));
                 Ok(result)
             }
             Err(e) => {
@@ -569,7 +569,9 @@ impl McpServer {
             .record(AuditAction::Search, None, outcome, Some(detail))
             .await?;
         match result {
-            Ok(found) => Ok(CallToolResult::structured(found.to_json(args.explain))),
+            Ok(found) => Ok(CallToolResult::structured(serde_json::json!(
+                found.body(SearchDetail::explained(args.explain))
+            ))),
             Err(e) => Ok(failure(e.to_string())),
         }
     }
@@ -904,7 +906,7 @@ impl McpServer {
                 db.describe_table(&table).map(Some)
             })
             .await?;
-        Ok(described.map(|d| d.to_json()))
+        Ok(described.map(|d| serde_json::json!(d.body())))
     }
 
     async fn resource_text(

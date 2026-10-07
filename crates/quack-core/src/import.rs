@@ -106,7 +106,7 @@ pub struct Importing<'a, M> {
 }
 
 /// What an import did.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct ImportSummary {
     pub table: String,
     pub rows: u64,
