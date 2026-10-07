@@ -5,6 +5,7 @@ use quack_core::analysis::chart::ChartSpec;
 use quack_core::analysis::events::ToolStep;
 use quack_core::analysis::policy::Hold;
 use quack_core::ingestion::parser::SectionKind;
+use quack_core::storage::profile::{TableNote, TableProfile};
 
 use super::*;
 use crate::terminal::commands::Suggestion;
@@ -162,6 +163,32 @@ async fn graph_exports_go_to_a_directory() {
     );
 }
 
+/// `/schema` shows what `describe_table` shows: the owner's note and the
+/// profile's warnings beside the columns.
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_shows_the_table_note_and_profile_warnings() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut app = app(dir.path());
+    app.db
+        .run(|db| {
+            db.execute_statement("CREATE TABLE t AS SELECT 1 AS id, NULL::VARCHAR AS empty")?;
+            TableProfile::refresh(db, "t")?;
+            TableNote::set(db, "t", "One row per test run.", None)
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    app.handle_slash_command("/schema t");
+    db_settle(&mut app).await;
+    let content = &last(&app).content;
+    assert_eq!(last(&app).kind, MessageKind::Sql);
+    assert!(
+        content.contains("Note (from the owner): One row per test run."),
+        "{content}"
+    );
+    assert!(content.contains("Warnings:\n  - empty: "), "{content}");
+    assert!(content.contains("- id (INTEGER)"), "{content}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn slash_commands_run_sql_schema_and_cli_verbs_without_a_terminal() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -184,7 +211,7 @@ async fn slash_commands_run_sql_schema_and_cli_verbs_without_a_terminal() {
     db_settle(&mut app).await;
     assert_eq!(last(&app).kind, MessageKind::Sql);
     assert!(
-        last(&app).content.contains("a INTEGER"),
+        last(&app).content.contains("- a (INTEGER)"),
         "{}",
         last(&app).content
     );
@@ -1462,17 +1489,19 @@ async fn embeddings_refresh_is_a_job_and_stale_vectors_are_noted_at_startup() {
                 &NewDocument::new(&DocumentId::from("d"), "a.md", "text/markdown", 1)
                     .with_status(DocumentStatus::Ready),
             )?;
-            db.insert_chunk(&NewChunk {
-                id: &ChunkId::from("c"),
-                document_id: &DocumentId::from("d"),
-                chunk_index: 0,
-                content: "levee report",
-                heading: None,
-                page: None,
-                kind: SectionKind::Body,
-                locator: None,
-                embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
-            })?;
+            db.chunk_writer(&DocumentId::from("d"), "levee report")
+                .and_then(|writer| {
+                    writer.insert(&NewChunk {
+                        id: &ChunkId::from("c"),
+                        chunk_index: 0,
+                        content: "levee report",
+                        heading: None,
+                        page: None,
+                        kind: SectionKind::Body,
+                        locator: None,
+                        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+                    })
+                })?;
             db.execute_statement("UPDATE _quack_chunks SET embedding_profile = 'older'")
         })
         .await

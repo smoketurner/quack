@@ -54,18 +54,18 @@ fn workspace_with_docs() -> WorkspaceDb {
             );
             let id = format!("{doc}-{i}");
             assert!(
-                db.insert_chunk(&NewChunk {
-                    id: &ChunkId::from(id.as_str()),
-                    document_id: &DocumentId::from(doc.as_str()),
-                    chunk_index: i,
-                    content: &content,
-                    heading: None,
-                    page: None,
-                    kind: SectionKind::Body,
-                    locator: None,
-                    embedding: None
-                })
-                .is_ok()
+                db.chunk_writer(&DocumentId::from(doc.as_str()), &content)
+                    .and_then(|writer| writer.insert(&NewChunk {
+                        id: &ChunkId::from(id.as_str()),
+                        chunk_index: i,
+                        content: &content,
+                        heading: None,
+                        page: None,
+                        kind: SectionKind::Body,
+                        locator: None,
+                        embedding: None
+                    }))
+                    .is_ok()
             );
         }
     }
@@ -77,9 +77,12 @@ fn workspace_with_docs() -> WorkspaceDb {
         .is_ok()
     );
     assert!(
-        db.insert_chunk(&NewChunk {
+        db.chunk_writer(
+            &DocumentId::from("pending"),
+            "not ready but long enough to pass the length filter here"
+        )
+        .and_then(|writer| writer.insert(&NewChunk {
             id: &ChunkId::from("p-0"),
-            document_id: &DocumentId::from("pending"),
             chunk_index: 0,
             content: "not ready but long enough to pass the length filter here",
             heading: None,
@@ -87,7 +90,7 @@ fn workspace_with_docs() -> WorkspaceDb {
             kind: SectionKind::Body,
             locator: None,
             embedding: None
-        })
+        }))
         .is_ok()
     );
     db

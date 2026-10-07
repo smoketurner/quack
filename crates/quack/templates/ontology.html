@@ -12,14 +12,14 @@
         <li><strong>Review the suggestions.</strong> Each one waits in the <em>Review queue</em>. Select the ones that make sense and press <em>Accept selected</em>, or <em>Reject selected</em> for the rest. Suggestions marked <em>low support</em> were seen in only a few documents; accept those you know to be right.</li>
         <li><strong>Build the graph.</strong> Once the ontology looks right, go to the Graph page and extract.</li>
       </ol>
-      <p class="mt-3">Every accepted change makes a new <strong>version</strong>; you can compare versions and restore an older one at any time. To edit everything at once, use <em>Edit as JSON</em>. To give a class or relation a new id, use <em>Rename</em>: the graph's nodes and edges move with it. Changing an id in the JSON instead removes the old id, and revalidating the graph then drops its nodes and edges.</p>
+      <p class="mt-3">Every accepted change makes a new <strong>version</strong>; you can compare versions and restore an older one at any time. Each property's <em>Edit meaning</em> sets the description, unit, and synonyms shown beside every column mapped to it, and the <em>Measures</em> forms add, change, and remove named calculations. To edit everything at once, use <em>Edit as JSON</em>. To give a class or relation a new id, use <em>Rename</em>: the graph's nodes and edges move with it. Changing an id in the JSON instead removes the old id, and revalidating the graph then drops its nodes and edges.</p>
     </div>
   </details>
 </div>
 <p class="mt-1 text-sm text-slate-400">The schema of the knowledge graph: classes with single inheritance from <code>entity</code>, relations with a domain and a range, typed properties, and table mappings. Every accepted change is a new version.</p>
 {% if let Some(error) = error %}<p role="alert" class="mt-3 rounded border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}
 {% if let Some(notice) = notice %}<p role="status" class="mt-3 rounded border border-green-900 bg-green-950 px-3 py-2 text-sm text-green-300 wrap-anywhere">{{ notice }}</p>{% endif %}
-{% if ws.can_write && has_tables %}
+{% if ws.can_write && !tables.is_empty() %}
 <form method="post" action="/w/{{ ws.membership.workspace.id }}/ontology/propose" class="mt-4 flex flex-wrap items-center gap-3 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
   <span class="font-medium">Propose from the tables</span>
   <span class="text-slate-400">classes, typed properties, keys, relations, and mappings{% if ontology.is_some() %} the current ontology lacks{% endif %}; no model calls</span>
@@ -103,14 +103,63 @@
     </form>
     {% endif %}
     <h2 class="mt-6 text-sm font-semibold uppercase text-slate-400">Properties</h2>
-    <ul class="mt-2 space-y-1 font-mono text-sm wrap-anywhere">
-      {% for p in o.properties %}<li>{{ p.id }}: {{ p.kind.as_str() }}{% if !p.values.is_empty() %} [{{ p.values.join(", ") }}]{% endif %}</li>{% endfor %}
+    <ul class="mt-2 space-y-1 text-sm wrap-anywhere">
+      {% for p in o.properties %}<li><span class="font-mono">{{ p.id }}: {{ p.kind.as_str() }}{% if !p.values.is_empty() %} [{{ p.values.join(", ") }}]{% endif %}</span>{% if let Some(d) = p.description %} <span class="text-slate-300">{{ d }}</span>{% endif %}{% if let Some(u) = p.unit %} <span class="text-slate-400">[{{ u }}]</span>{% endif %}{% if !p.synonyms.is_empty() %} <span class="text-slate-400">(also: {{ p.synonyms.join(", ") }})</span>{% endif %}
+        {% if ws.can_write %}
+        <details class="mt-1">
+          <summary class="cursor-pointer text-xs text-blue-400 hover:underline">Edit meaning</summary>
+          <form method="post" action="/w/{{ ws.membership.workspace.id }}/ontology/properties/{{ p.id }}" class="mt-1 flex flex-wrap items-center gap-2 rounded border border-slate-800 bg-slate-900 p-2 text-xs">
+            <input aria-label="Description of {{ p.id }}" name="description" value="{{ p.description.as_deref().unwrap_or("") }}" placeholder="what a value means" class="w-56 rounded border border-slate-700 px-2 py-1">
+            <input aria-label="Unit of {{ p.id }}" name="unit" value="{{ p.unit.as_deref().unwrap_or("") }}" placeholder="unit (cents, USD, kg)" class="w-32 rounded border border-slate-700 px-2 py-1">
+            <input aria-label="Synonyms of {{ p.id }}" name="synonyms" value="{{ p.synonyms.join(", ") }}" placeholder="synonyms, comma-separated" class="w-56 rounded border border-slate-700 px-2 py-1">
+            <button type="submit" class="rounded bg-blue-600 px-2 py-1 text-white hover:bg-blue-500">Save</button>
+            <span class="w-full text-slate-400">Saves a new version. A blank field clears it. Every column mapped to this property shows its meaning.</span>
+          </form>
+        </details>
+        {% endif %}
+      </li>{% endfor %}
     </ul>
     {% if !o.mappings.is_empty() %}
     <h2 class="mt-6 text-sm font-semibold uppercase text-slate-400">Mapped tables</h2>
     <ul class="mt-2 space-y-1 font-mono text-sm wrap-anywhere">
       {% for m in o.mappings %}<li>{{ m.table }} → {{ m.class }} (key {{ m.key }})</li>{% endfor %}
     </ul>
+    {% endif %}
+    <h2 class="mt-6 text-sm font-semibold uppercase text-slate-400">Measures</h2>
+    <p class="mt-1 text-xs text-slate-400">Named calculations over one table, so the assistant and people compute them one way. Saving checks that <code>SELECT expression FROM table</code> is one read that runs.</p>
+    <ul class="mt-2 space-y-2 text-sm wrap-anywhere">
+      {% for m in o.measures %}<li><span class="font-mono">{{ m }}</span> <span class="text-slate-400">on {{ m.table }}</span>
+        {% if ws.can_write %}
+        <details class="mt-1">
+          <summary class="cursor-pointer text-xs text-blue-400 hover:underline">Edit or remove</summary>
+          <form method="post" action="/w/{{ ws.membership.workspace.id }}/ontology/measures/{{ m.id }}" class="mt-1 flex flex-wrap items-center gap-2 rounded border border-slate-800 bg-slate-900 p-2 text-xs">
+            <select name="table" aria-label="Table of {{ m.id }}" class="rounded border border-slate-700 px-1 py-1">
+              {% if !tables.contains(m.table) %}<option value="{{ m.table }}" selected>{{ m.table }} (missing)</option>{% endif %}
+              {% for t in tables %}<option value="{{ t }}"{% if *t == m.table %} selected{% endif %}>{{ t }}</option>{% endfor %}
+            </select>
+            <input aria-label="Expression of {{ m.id }}" name="expression" value="{{ m.expression }}" required class="w-56 rounded border border-slate-700 px-2 py-1 font-mono">
+            <input aria-label="Description of {{ m.id }}" name="description" value="{{ m.description.as_deref().unwrap_or("") }}" placeholder="what it means" class="w-56 rounded border border-slate-700 px-2 py-1">
+            <button type="submit" class="rounded bg-blue-600 px-2 py-1 text-white hover:bg-blue-500">Save</button>
+          </form>
+          <form method="post" action="/w/{{ ws.membership.workspace.id }}/ontology/measures/{{ m.id }}/remove" class="mt-1 text-xs">
+            <button type="submit" class="rounded border border-slate-700 px-2 py-1 hover:bg-slate-800">Remove {{ m.id }}</button>
+          </form>
+        </details>
+        {% endif %}
+      </li>{% else %}<li class="text-slate-400">None yet.</li>{% endfor %}
+    </ul>
+    {% if ws.can_write && !tables.is_empty() %}
+    <form method="post" action="/w/{{ ws.membership.workspace.id }}/ontology/measures" class="mt-3 flex flex-wrap items-center gap-2 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
+      <span class="font-medium">Add a measure</span>
+      <input aria-label="Measure id" name="id" placeholder="id (revenue)" required class="w-32 rounded border border-slate-700 px-2 py-1 font-mono">
+      <select name="table" aria-label="Measure table" class="rounded border border-slate-700 px-1 py-1">
+        {% for t in tables %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
+      </select>
+      <input aria-label="Measure expression" name="expression" placeholder="sum(amount) / 100.0" required class="w-48 rounded border border-slate-700 px-2 py-1 font-mono">
+      <input aria-label="Measure description" name="description" placeholder="what it means" class="w-48 rounded border border-slate-700 px-2 py-1">
+      <button type="submit" class="rounded bg-blue-600 px-3 py-1 text-white hover:bg-blue-500">Add</button>
+      <span class="w-full text-xs text-slate-400">Saves a new version.</span>
+    </form>
     {% endif %}
   </section>
   <section>

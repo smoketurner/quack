@@ -48,19 +48,23 @@ fn workspace() -> WorkspaceDb {
             .with_status(DocumentStatus::Ready),
         )
         .unwrap();
-        for c in 0..CHUNKS_PER_DOC {
-            db.insert_chunk(&NewChunk {
-                id: &ChunkId::from(format!("chunk-{d}-{c}")),
-                document_id: &DocumentId::from(doc_id.as_str()),
-                chunk_index: c as u32,
-                content: "flood exclusion premium coverage claim policy audit",
-                heading: None,
-                page: Some(c as u32),
-                kind: SectionKind::Body,
-                locator: None,
-                embedding: None,
-            })
+        let text = "flood exclusion premium coverage claim policy audit";
+        let writer = db
+            .chunk_writer(&DocumentId::from(doc_id.as_str()), text)
             .unwrap();
+        for c in 0..CHUNKS_PER_DOC {
+            writer
+                .insert(&NewChunk {
+                    id: &ChunkId::from(format!("chunk-{d}-{c}")),
+                    chunk_index: c as u32,
+                    content: text,
+                    heading: None,
+                    page: Some(c as u32),
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: None,
+                })
+                .unwrap();
         }
     }
     for t in 0..TABLES {

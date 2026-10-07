@@ -85,20 +85,26 @@ fn fill(db: &WorkspaceDb, from: usize, to: usize, dim: usize) {
             .with_status(DocumentStatus::Ready),
         )
         .unwrap();
+        let writer = db
+            .chunk_writer(
+                &DocumentId::from(doc_id.as_str()),
+                &content(doc * CHUNKS_PER_DOC),
+            )
+            .unwrap();
         for c in 0..CHUNKS_PER_DOC {
             let n = doc * CHUNKS_PER_DOC + c;
-            db.insert_chunk(&NewChunk {
-                id: &ChunkId::from(format!("chunk-{n}")),
-                document_id: &DocumentId::from(doc_id.as_str()),
-                chunk_index: c as u32,
-                content: &content(n),
-                heading: None,
-                page: None,
-                kind: SectionKind::Body,
-                locator: None,
-                embedding: Some(&embedding(n, dim)),
-            })
-            .unwrap();
+            writer
+                .insert(&NewChunk {
+                    id: &ChunkId::from(format!("chunk-{n}")),
+                    chunk_index: c as u32,
+                    content: &content(n),
+                    heading: None,
+                    page: None,
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: Some(&embedding(n, dim)),
+                })
+                .unwrap();
         }
     }
 }

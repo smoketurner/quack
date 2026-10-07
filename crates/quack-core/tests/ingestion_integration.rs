@@ -958,18 +958,20 @@ fn workspace_db_chunk_without_embedding() {
     )
     .unwrap();
 
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 0,
-        content: "hello world",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "hello world")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c1"),
+                chunk_index: 0,
+                content: "hello world",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
 
     let qr = db
         .execute_query("SELECT id, content FROM _quack_chunks WHERE id = 'c1'")
@@ -993,18 +995,20 @@ fn workspace_db_chunk_with_embedding() {
     .unwrap();
 
     let embedding = Vector::from(vec![0.5_f32, 0.3, -0.2, 0.8]);
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 0,
-        content: "embedded chunk",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&embedding),
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "embedded chunk")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c1"),
+                chunk_index: 0,
+                content: "embedded chunk",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&embedding),
+            })
+        })
+        .unwrap();
 
     let qr = db
         .execute_query("SELECT content FROM _quack_chunks WHERE embedding IS NOT NULL")
@@ -1025,18 +1029,20 @@ fn workspace_db_set_chunk_embedding() {
     )
     .unwrap();
 
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 0,
-        content: "hello world",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "hello world")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c1"),
+                chunk_index: 0,
+                content: "hello world",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
 
     // Embedding should be NULL initially
     let qr = db
@@ -1100,30 +1106,34 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("a0"),
-        document_id: &DocumentId::from("doc-a"),
-        chunk_index: 0,
-        content: "flood exclusion",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
-    })
-    .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("b0"),
-        document_id: &DocumentId::from("doc-b"),
-        chunk_index: 0,
-        content: "claims timeline",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&Vector::from(vec![0.9, 0.1, 0.0, 0.0])),
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-a"), "flood exclusion")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("a0"),
+                chunk_index: 0,
+                content: "flood exclusion",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-b"), "claims timeline")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("b0"),
+                chunk_index: 0,
+                content: "claims timeline",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![0.9, 0.1, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
 
     let query = Vector::from(vec![1.0_f32, 0.0, 0.0, 0.0]);
 
@@ -1171,42 +1181,48 @@ fn workspace_db_search_similar_chunks() {
     )
     .unwrap();
 
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 0,
-        content: "first chunk",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
-    })
-    .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c2"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 1,
-        content: "second chunk",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&Vector::from(vec![0.0, 1.0, 0.0, 0.0])),
-    })
-    .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c3"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 2,
-        content: "third chunk",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&Vector::from(vec![0.7, 0.7, 0.0, 0.0])),
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "first chunk")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c1"),
+                chunk_index: 0,
+                content: "first chunk",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "second chunk")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c2"),
+                chunk_index: 1,
+                content: "second chunk",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![0.0, 1.0, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "third chunk")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c3"),
+                chunk_index: 2,
+                content: "third chunk",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![0.7, 0.7, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
 
     let query = Vector::from(vec![1.0_f32, 0.0, 0.0, 0.0]);
     let results = db
@@ -1458,18 +1474,20 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_refresh() {
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c"),
-            document_id: &DocumentId::from("d"),
-            chunk_index: 0,
-            content: "x",
-            heading: None,
-            page: None,
-            kind: SectionKind::Body,
-            locator: None,
-            embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
-        })
-        .unwrap();
+        db.chunk_writer(&DocumentId::from("d"), "x")
+            .and_then(|writer| {
+                writer.insert(&NewChunk {
+                    id: &ChunkId::from("c"),
+                    chunk_index: 0,
+                    content: "x",
+                    heading: None,
+                    page: None,
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+                })
+            })
+            .unwrap();
     }
     let mut changed = test_config(dir.path());
     changed.embedding.dimension = Some(Dimension::new(8));
@@ -1534,18 +1552,20 @@ fn dimension_change_without_embeddings_adopts_new_width() {
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c"),
-            document_id: &DocumentId::from("d"),
-            chunk_index: 0,
-            content: "x",
-            heading: None,
-            page: None,
-            kind: SectionKind::Body,
-            locator: None,
-            embedding: None,
-        })
-        .unwrap();
+        db.chunk_writer(&DocumentId::from("d"), "x")
+            .and_then(|writer| {
+                writer.insert(&NewChunk {
+                    id: &ChunkId::from("c"),
+                    chunk_index: 0,
+                    content: "x",
+                    heading: None,
+                    page: None,
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: None,
+                })
+            })
+            .unwrap();
     }
     {
         // A node label embedding of the old width: cleared on reopen and
@@ -1590,30 +1610,34 @@ fn dimension_change_without_embeddings_adopts_new_width() {
             .unwrap()
             .is_empty()
     );
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c8"),
-        document_id: &DocumentId::from("d"),
-        chunk_index: 1,
-        content: "y",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
-    })
-    .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c2"),
-        document_id: &DocumentId::from("d"),
-        chunk_index: 1,
-        content: "y",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&Vector::from(vec![0.5; 8])),
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("d"), "y")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c8"),
+                chunk_index: 1,
+                content: "y",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
+    db.chunk_writer(&DocumentId::from("d"), "y")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c2"),
+                chunk_index: 1,
+                content: "y",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![0.5; 8])),
+            })
+        })
+        .unwrap();
 }
 
 #[test]
@@ -1738,40 +1762,55 @@ fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("a0"),
-        document_id: &DocumentId::from("doc-a"),
-        chunk_index: 0,
-        content: "Flood damage is excluded from coverage.",
-        heading: Some("Exclusions"),
-        page: Some(12),
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+    db.chunk_writer(
+        &DocumentId::from("doc-a"),
+        "Flood damage is excluded from coverage.",
+    )
+    .and_then(|writer| {
+        writer.insert(&NewChunk {
+            id: &ChunkId::from("a0"),
+            chunk_index: 0,
+            content: "Flood damage is excluded from coverage.",
+            heading: Some("Exclusions"),
+            page: Some(12),
+            kind: SectionKind::Body,
+            locator: None,
+            embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+        })
     })
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("b0"),
-        document_id: &DocumentId::from("doc-b"),
-        chunk_index: 0,
-        content: "Policy POL-8841 renews every March.",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&Vector::from(vec![0.0, 1.0, 0.0, 0.0])),
+    db.chunk_writer(
+        &DocumentId::from("doc-b"),
+        "Policy POL-8841 renews every March.",
+    )
+    .and_then(|writer| {
+        writer.insert(&NewChunk {
+            id: &ChunkId::from("b0"),
+            chunk_index: 0,
+            content: "Policy POL-8841 renews every March.",
+            heading: None,
+            page: None,
+            kind: SectionKind::Body,
+            locator: None,
+            embedding: Some(&Vector::from(vec![0.0, 1.0, 0.0, 0.0])),
+        })
     })
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("b1"),
-        document_id: &DocumentId::from("doc-b"),
-        chunk_index: 1,
-        content: "Claims close within thirty days of filing.",
-        heading: Some("Claims"),
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&Vector::from(vec![0.0, 0.0, 1.0, 0.0])),
+    db.chunk_writer(
+        &DocumentId::from("doc-b"),
+        "Claims close within thirty days of filing.",
+    )
+    .and_then(|writer| {
+        writer.insert(&NewChunk {
+            id: &ChunkId::from("b1"),
+            chunk_index: 1,
+            content: "Claims close within thirty days of filing.",
+            heading: Some("Claims"),
+            page: None,
+            kind: SectionKind::Body,
+            locator: None,
+            embedding: Some(&Vector::from(vec![0.0, 0.0, 1.0, 0.0])),
+        })
     })
     .unwrap();
     db
@@ -1940,18 +1979,20 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c0"),
-            document_id: &DocumentId::from("d"),
-            chunk_index: 0,
-            content: "renewal POL-8841 notice",
-            heading: None,
-            page: None,
-            kind: SectionKind::Body,
-            locator: None,
-            embedding: None,
-        })
-        .unwrap();
+        db.chunk_writer(&DocumentId::from("d"), "renewal POL-8841 notice")
+            .and_then(|writer| {
+                writer.insert(&NewChunk {
+                    id: &ChunkId::from("c0"),
+                    chunk_index: 0,
+                    content: "renewal POL-8841 notice",
+                    heading: None,
+                    page: None,
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: None,
+                })
+            })
+            .unwrap();
         // Simulate a v5 workspace: unstemmed term rows, old version recorded.
         db.execute_statement("DELETE FROM _quack_terms").unwrap();
         db.execute_statement("INSERT INTO _quack_terms VALUES ('c0', 'renewal', 1)")
@@ -2955,18 +2996,20 @@ fn keyword_search_treats_null_as_a_word() {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c"),
-        document_id: &DocumentId::from("d"),
-        chunk_index: 0,
-        content: "The null hypothesis was rejected.",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("d"), "The null hypothesis was rejected.")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c"),
+                chunk_index: 0,
+                content: "The null hypothesis was rejected.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
     assert_eq!(
         db.search_keyword_chunks("null", 5, &ChunkScope::all())
             .unwrap()
@@ -2994,18 +3037,20 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
             .with_status(DocumentStatus::Error),
     )
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c"),
-        document_id: &DocumentId::from("d"),
-        chunk_index: 0,
-        content: "zebra crossing",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("d"), "zebra crossing")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c"),
+                chunk_index: 0,
+                content: "zebra crossing",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
     assert!(
         db.search_keyword_chunks("zebra", 5, &ChunkScope::all())
             .unwrap()

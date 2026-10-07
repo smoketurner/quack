@@ -1318,44 +1318,8 @@ impl Tool for DescribeTableTool {
             }
         };
 
-        let mut output = String::new();
-        writeln!(output, "Table: {}", desc.table_name)?;
-        writeln!(output, "Rows: {}", desc.row_count)?;
-        if let Some(note) = &desc.note {
-            writeln!(output, "Note (from the owner): {}", OneLine(note))?;
-        }
-        writeln!(output, "Columns:")?;
-        for col in &desc.columns {
-            writeln!(output, "  - {}", ColumnLine(col))?;
-        }
-        if !desc.warnings.is_empty() {
-            writeln!(output, "Warnings:")?;
-            for flagged in &desc.warnings {
-                writeln!(output, "  - {}: {}", flagged.column, flagged.warning)?;
-            }
-        }
-        if !desc.measures.is_empty() {
-            writeln!(
-                output,
-                "Measures (compute them with the expression as given):"
-            )?;
-            for measure in &desc.measures {
-                writeln!(output, "  - {measure}")?;
-            }
-        }
-
-        if !desc.sample_rows.rows.is_empty() {
-            writeln!(output, "\nSample rows:")?;
-            let mut buf = Vec::new();
-            if desc.sample_rows.write_table(&mut buf).is_ok()
-                && let Ok(text) = String::from_utf8(buf)
-            {
-                write!(output, "{text}")?;
-            }
-        }
-
         step.finish(format!("{} columns", desc.columns.len()));
-        Ok(output)
+        Ok(desc.to_string())
     }
 }
 

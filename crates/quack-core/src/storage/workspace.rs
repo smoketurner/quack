@@ -11,6 +11,7 @@ use jiff::civil::DateTime;
 use std::collections::BTreeMap;
 
 use crate::analysis::table_search;
+use crate::analysis::text_to_sql::ColumnLine;
 use crate::config::Config;
 use crate::crypto;
 use crate::embedding::{
@@ -2347,62 +2348,26 @@ impl WorkspaceDb {
         }
     }
 
-    /// Insert a text chunk, optionally with an embedding vector, and index
-    /// its terms for keyword search.
+    /// Detect a document's language from `sample` (its opening text, under
+    /// `[retrieval].languages`), record it, and return what stores the
+    /// document's chunks under that language's stemming, so the language
+    /// is resolved once per document rather than once per chunk.
     ///
     /// # Errors
     ///
-    /// Returns an error if the insert fails.
-    pub fn insert_chunk(&self, chunk: &NewChunk<'_>) -> Result<()> {
-        let page = chunk.page.map(i64::from);
-        let stemming = self.document_stemming(chunk.document_id, chunk.content)?;
-        let terms = TermFrequencies::of(&Analyzer::of(stemming), chunk.content, chunk.heading);
-        let length = terms.total();
-        match chunk.embedding {
-            Some(emb) => {
-                self.check_vector_width(emb.len())?;
-                let sql = format!(
-                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, embedding, embedding_profile, kind, locator) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?::{}, ?, ?, ?)",
-                    self.vector_type()
-                );
-                self.conn.execute(
-                    &sql,
-                    duckdb::params![
-                        chunk.id,
-                        chunk.document_id,
-                        chunk.chunk_index,
-                        chunk.content,
-                        chunk.heading,
-                        page,
-                        length,
-                        emb.sql_literal(),
-                        self.embedding_fingerprint(),
-                        chunk.kind,
-                        chunk.locator
-                    ],
-                )?;
-            }
-            None => {
-                self.conn.execute(
-                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, kind, locator) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    duckdb::params![
-                        chunk.id,
-                        chunk.document_id,
-                        chunk.chunk_index,
-                        chunk.content,
-                        chunk.heading,
-                        page,
-                        length,
-                        chunk.kind,
-                        chunk.locator
-                    ],
-                )?;
-            }
-        }
-        self.insert_terms(chunk.id, &terms)?;
-        Ok(())
+    /// Returns an error if a write fails.
+    pub fn chunk_writer(&self, id: &DocumentId, sample: &str) -> Result<ChunkWriter<'_>> {
+        let code = self.languages.detect(sample);
+        self.conn.execute(
+            "UPDATE _quack_documents SET language = ? WHERE id = ?",
+            duckdb::params![code, id],
+        )?;
+        self.record_languages()?;
+        Ok(ChunkWriter {
+            db: self,
+            document_id: id.clone(),
+            analyzer: Analyzer::of(Stemming::of_code(Some(code))),
+        })
     }
 
     fn insert_terms(&self, chunk_id: &ChunkId, terms: &TermFrequencies) -> Result<()> {
@@ -2415,43 +2380,6 @@ impl WorkspaceDb {
         }
         appender.flush()?;
         Ok(())
-    }
-
-    /// The stemming a document's chunks are indexed under: the language it
-    /// was detected as, detected now from `sample` when it has none yet.
-    fn document_stemming(&self, id: &DocumentId, sample: &str) -> Result<Stemming> {
-        let code: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT language FROM _quack_documents WHERE id = ?",
-                duckdb::params![id],
-                |row| row.get(0),
-            )
-            .or_else(|e| match e {
-                duckdb::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other),
-            })?;
-        match code {
-            Some(code) => Ok(Stemming::of_code(Some(&code))),
-            None => self.set_document_language(id, sample),
-        }
-    }
-
-    /// Detect a document's language from `sample` (its opening text, under
-    /// `[retrieval].languages`), record it, and add its stemming to the
-    /// workspace's set: what its chunks are indexed under.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a write fails.
-    pub fn set_document_language(&self, id: &DocumentId, sample: &str) -> Result<Stemming> {
-        let code = self.languages.detect(sample);
-        self.conn.execute(
-            "UPDATE _quack_documents SET language = ? WHERE id = ?",
-            duckdb::params![code, id],
-        )?;
-        self.record_languages()?;
-        Ok(Stemming::of_code(Some(code)))
     }
 
     /// Record the stemmings the documents were indexed under, which a
@@ -3796,6 +3724,45 @@ impl TableDescription {
     }
 }
 
+/// The description as a person or the model reads it: the note, columns
+/// with their meaning, the profile's warnings, the measures, and the sample
+/// rows (`describe_table`, the terminal's `/schema`).
+impl fmt::Display for TableDescription {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Table: {}", self.table_name)?;
+        writeln!(f, "Rows: {}", self.row_count)?;
+        if let Some(note) = &self.note {
+            writeln!(f, "Note (from the owner): {}", OneLine(note))?;
+        }
+        writeln!(f, "Columns:")?;
+        for col in &self.columns {
+            writeln!(f, "  - {}", ColumnLine(col))?;
+        }
+        if !self.warnings.is_empty() {
+            writeln!(f, "Warnings:")?;
+            for flagged in &self.warnings {
+                writeln!(f, "  - {}: {}", flagged.column, flagged.warning)?;
+            }
+        }
+        if !self.measures.is_empty() {
+            writeln!(f, "Measures (compute them with the expression as given):")?;
+            for measure in &self.measures {
+                writeln!(f, "  - {measure}")?;
+            }
+        }
+        if !self.sample_rows.rows.is_empty() {
+            writeln!(f, "\nSample rows:")?;
+            let mut buf = Vec::new();
+            if self.sample_rows.write_table(&mut buf).is_ok()
+                && let Ok(text) = String::from_utf8(buf)
+            {
+                write!(f, "{text}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Where a document is in ingestion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -4151,11 +4118,10 @@ impl TryFrom<&duckdb::Row<'_>> for PendingChunk {
     }
 }
 
-/// A chunk to store.
+/// A chunk to store through its document's [`ChunkWriter`].
 #[derive(Debug, Clone, Copy)]
 pub struct NewChunk<'a> {
     pub id: &'a ChunkId,
-    pub document_id: &'a DocumentId,
     pub chunk_index: u32,
     pub content: &'a str,
     pub heading: Option<&'a str>,
@@ -4165,6 +4131,73 @@ pub struct NewChunk<'a> {
     /// Where the chunk sits in a source without pages (`line 40`, `12:04`,
     /// `chapter 3`, `message 2`).
     pub locator: Option<&'a str>,
+}
+
+/// Stores one document's chunks under the stemming its language was
+/// detected as ([`WorkspaceDb::chunk_writer`]).
+pub struct ChunkWriter<'db> {
+    db: &'db WorkspaceDb,
+    document_id: DocumentId,
+    analyzer: Analyzer,
+}
+
+impl ChunkWriter<'_> {
+    /// Insert a text chunk, optionally with an embedding vector, and index
+    /// its terms for keyword search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the insert fails.
+    pub fn insert(&self, chunk: &NewChunk<'_>) -> Result<()> {
+        let db = self.db;
+        let page = chunk.page.map(i64::from);
+        let terms = TermFrequencies::of(&self.analyzer, chunk.content, chunk.heading);
+        let length = terms.total();
+        match chunk.embedding {
+            Some(emb) => {
+                db.check_vector_width(emb.len())?;
+                let sql = format!(
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, embedding, embedding_profile, kind, locator) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?::{}, ?, ?, ?)",
+                    db.vector_type()
+                );
+                db.conn.execute(
+                    &sql,
+                    duckdb::params![
+                        chunk.id,
+                        self.document_id,
+                        chunk.chunk_index,
+                        chunk.content,
+                        chunk.heading,
+                        page,
+                        length,
+                        emb.sql_literal(),
+                        db.embedding_fingerprint(),
+                        chunk.kind,
+                        chunk.locator
+                    ],
+                )?;
+            }
+            None => {
+                db.conn.execute(
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, kind, locator) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    duckdb::params![
+                        chunk.id,
+                        self.document_id,
+                        chunk.chunk_index,
+                        chunk.content,
+                        chunk.heading,
+                        page,
+                        length,
+                        chunk.kind,
+                        chunk.locator
+                    ],
+                )?;
+            }
+        }
+        db.insert_terms(chunk.id, &terms)
+    }
 }
 
 /// A chunk returned from retrieval, with what a citation needs.

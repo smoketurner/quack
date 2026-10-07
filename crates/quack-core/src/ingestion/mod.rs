@@ -1054,15 +1054,14 @@ async fn embed_and_store<M: EmbeddingModel>(
                     sample.push_str(&chunk.content);
                     sample.push('\n');
                 }
-                db.set_document_language(&id, &sample)?;
+                let writer = db.chunk_writer(&id, &sample)?;
                 let mut ids = Vec::with_capacity(owned.len());
                 for (i, chunk) in owned.iter().enumerate() {
                     let chunk_id = ChunkId::generate();
                     let idx = u32::try_from(i)
                         .map_err(|_| Error::Ingestion("chunk index overflow".into()))?;
-                    db.insert_chunk(&NewChunk {
+                    writer.insert(&NewChunk {
                         id: &chunk_id,
-                        document_id: &id,
                         chunk_index: idx,
                         content: &chunk.content,
                         heading: chunk.heading.as_deref(),

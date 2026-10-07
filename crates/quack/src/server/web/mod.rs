@@ -30,9 +30,10 @@ use quack_core::ids::{
     CandidateId, ClassId, DocumentId, EdgeId, NodeId, RelationId, SessionId, UserId, WorkspaceId,
 };
 use quack_core::ontology::candidates::{CandidateAction, Queue};
+use quack_core::ontology::edit::Edit;
 use quack_core::ontology::induction::{ItemKind, Proposal};
 use quack_core::ontology::{
-    Ontology, OntologyDiff, OntologyVersion, candidates, store as ontology_store,
+    Measure, Ontology, OntologyDiff, OntologyVersion, candidates, store as ontology_store,
 };
 use quack_core::storage::context;
 use quack_core::storage::control::{
@@ -43,8 +44,8 @@ use quack_core::storage::control::{
 use quack_core::storage::profile::Share;
 use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
 use quack_core::storage::workspace::{
-    Cell, ChunkSearchResult, DocumentInfo, DocumentSource, DocumentStatus, ExportFormat, Pinning,
-    ResultSort, SortDirection, TableDescription,
+    Cell, ChunkSearchResult, ColumnMeaning, DocumentInfo, DocumentSource, DocumentStatus,
+    ExportFormat, Pinning, ResultSort, SortDirection, TableDescription,
 };
 use rust_embed::Embed;
 use serde::Deserialize;
@@ -814,7 +815,8 @@ struct OntologyPage {
     queue_pages: usize,
     pending_total: usize,
     low_support_total: usize,
-    has_tables: bool,
+    /// The workspace's tables, which a measure reads one of.
+    tables: Vec<String>,
     error: Option<String>,
     notice: Option<String>,
 }
@@ -997,6 +999,19 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/ontology", get(ontology_page).post(ontology_import))
         .route("/w/{id}/ontology/init", post(ontology_init))
         .route("/w/{id}/ontology/rename", post(ontology_rename))
+        .route(
+            "/w/{id}/ontology/properties/{property}",
+            post(ontology_describe_property),
+        )
+        .route("/w/{id}/ontology/measures", post(ontology_add_measure))
+        .route(
+            "/w/{id}/ontology/measures/{measure}",
+            post(ontology_change_measure),
+        )
+        .route(
+            "/w/{id}/ontology/measures/{measure}/remove",
+            post(ontology_remove_measure),
+        )
         .route("/w/{id}/ontology/propose", post(ontology_propose))
         .route("/w/{id}/ontology/candidates", post(ontology_decide_many))
         .route("/w/{id}/ontology/candidates/{cid}", post(ontology_decide))
@@ -1926,7 +1941,7 @@ async fn ontology_page(
         .audit_read(&app, AuditAction::Page, "ontology")
         .await?;
     let queue_status = q.status.unwrap_or_default();
-    let (ontology, versions, diff, pending, low_support, has_tables) = app
+    let (ontology, versions, diff, pending, low_support, tables) = app
         .read(&id, |db| {
             let current = ontology_store::current(db)?;
             let versions = ontology_store::versions(db, 20)?;
@@ -1942,8 +1957,8 @@ async fn ontology_page(
             };
             let pending = candidates::queue(db, Queue::Pending)?;
             let low_support = candidates::queue(db, Queue::LowSupport)?;
-            let has_tables = !db.list_tables()?.is_empty();
-            Ok((current, versions, diff, pending, low_support, has_tables))
+            let tables = db.list_tables()?;
+            Ok((current, versions, diff, pending, low_support, tables))
         })
         .await?;
     let (pending_total, low_support_total) = (pending.len(), low_support.len());
@@ -1982,7 +1997,7 @@ async fn ontology_page(
         queue_pages,
         pending_total,
         low_support_total,
-        has_tables,
+        tables,
         error: flash.error(),
         notice: flash.notice(),
     })
@@ -2246,6 +2261,121 @@ async fn ontology_rename(
         ))
     })
     .into_response())
+}
+
+/// A property's meaning as the page's form sends it: blank fields clear,
+/// synonyms comma-separated.
+#[derive(Deserialize)]
+struct PropertyMeaningForm {
+    #[serde(default, deserialize_with = "blank_as_none")]
+    description: Option<String>,
+    #[serde(default, deserialize_with = "blank_as_none")]
+    unit: Option<String>,
+    #[serde(default)]
+    synonyms: String,
+}
+
+impl PropertyMeaningForm {
+    fn meaning(self) -> ColumnMeaning {
+        ColumnMeaning {
+            description: self.description,
+            unit: self.unit,
+            synonyms: self
+                .synonyms
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
+        }
+    }
+}
+
+/// A measure as the page's add and edit forms send it; the edit form's id
+/// is in the path.
+#[derive(Deserialize)]
+struct MeasureForm {
+    #[serde(default)]
+    id: String,
+    table: String,
+    expression: String,
+    #[serde(default, deserialize_with = "blank_as_none")]
+    description: Option<String>,
+}
+
+impl MeasureForm {
+    fn measure(self, id: &str) -> Measure {
+        Measure {
+            id: id.trim().to_owned(),
+            description: self.description,
+            table: self.table,
+            expression: self.expression.trim().to_owned(),
+        }
+    }
+}
+
+impl Access {
+    /// Apply `edit` and go back to the ontology page, saying what was saved
+    /// or why the save refused it.
+    async fn edit_ontology_page(&self, app: &App, edit: Edit) -> Response {
+        let said = edit.to_string();
+        let stored = self.edit_ontology(app, edit).await;
+        let back = format!("/w/{}/ontology", self.membership.workspace.id);
+        Flash::after(back, stored, |stored| {
+            Some(match stored.version {
+                Some(v) => format!("{said}; saved as version {v}"),
+                None => said,
+            })
+        })
+        .into_response()
+    }
+}
+
+async fn ontology_describe_property(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, property)): Path<(WorkspaceId, String)>,
+    Form(form): Form<PropertyMeaningForm>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let edit = Edit::Describe {
+        property,
+        meaning: form.meaning(),
+    };
+    Ok(access.edit_ontology_page(&app, edit).await)
+}
+
+async fn ontology_add_measure(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(form): Form<MeasureForm>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let measure_id = form.id.clone();
+    let edit = Edit::AddMeasure(form.measure(&measure_id));
+    Ok(access.edit_ontology_page(&app, edit).await)
+}
+
+async fn ontology_change_measure(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, measure)): Path<(WorkspaceId, String)>,
+    Form(form): Form<MeasureForm>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let edit = Edit::ChangeMeasure(form.measure(&measure));
+    Ok(access.edit_ontology_page(&app, edit).await)
+}
+
+async fn ontology_remove_measure(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, measure)): Path<(WorkspaceId, String)>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let edit = Edit::RemoveMeasure { id: measure };
+    Ok(access.edit_ontology_page(&app, edit).await)
 }
 
 async fn ontology_restore(

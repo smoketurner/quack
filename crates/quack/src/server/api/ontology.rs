@@ -5,6 +5,7 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use quack_core::error::Error as CoreError;
 use quack_core::extraction::ExtractionRun;
 use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::ontology::candidates::{CandidateAction, Queue};
@@ -19,6 +20,7 @@ use crate::server::state::{App, with_db};
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::OntologyVersion;
 use quack_core::ontology::documents::{self, DocumentProposal};
+use quack_core::ontology::edit::Edit;
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{IdRenames, Ontology, candidates, store};
 use quack_core::progress::{ChunkDone, RunControl};
@@ -99,6 +101,35 @@ impl Access {
             Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
             Outcome::Allowed,
             Some(serde_json::json!({ "version": stored.version, "classes": stored.classes.len() })),
+        )
+        .await?;
+        Ok(stored)
+    }
+
+    /// Apply one form edit to the current ontology and store the result as
+    /// the next version; the save validates it as it does any other.
+    pub(crate) async fn edit_ontology(&self, app: &App, edit: Edit) -> ApiResult<Ontology> {
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let note = format!("{edit} in the web UI");
+        let detail = serde_json::to_value(&edit)?;
+        let stored = with_db(db, move |db| {
+            let mut ontology = store::current(db)?
+                .ok_or_else(|| CoreError::Ontology(String::from("no ontology yet")))?;
+            edit.apply(&mut ontology)?;
+            store::save(
+                db,
+                &ontology,
+                Revision::reviewed(Some(&author), Some(&note)),
+            )
+        })
+        .await?;
+        self.audit(
+            app,
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "edited": detail, "version": stored.version })),
         )
         .await?;
         Ok(stored)

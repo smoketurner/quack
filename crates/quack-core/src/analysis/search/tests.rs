@@ -34,18 +34,20 @@ fn workspace() -> WorkspaceDb {
             &NewDocument::new(&DocumentId::from(id), name, "text/markdown", 1).with_status(status),
         )
         .unwrap_or_else(|e| fail(&e.to_string()));
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from(format!("{id}-c0")),
-            document_id: &DocumentId::from(id),
-            chunk_index: 0,
-            content: "Renewal terms for the policy year.",
-            heading: None,
-            page: None,
-            kind: SectionKind::Body,
-            locator: None,
-            embedding: None,
-        })
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        db.chunk_writer(&DocumentId::from(id), "Renewal terms for the policy year.")
+            .and_then(|writer| {
+                writer.insert(&NewChunk {
+                    id: &ChunkId::from(format!("{id}-c0")),
+                    chunk_index: 0,
+                    content: "Renewal terms for the policy year.",
+                    heading: None,
+                    page: None,
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: None,
+                })
+            })
+            .unwrap_or_else(|e| fail(&e.to_string()));
     }
     db
 }

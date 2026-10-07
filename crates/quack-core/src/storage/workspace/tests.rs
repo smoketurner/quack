@@ -1379,18 +1379,20 @@ fn insert_text_chunk(
     chunk_index: u32,
     content: &str,
 ) {
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from(id),
-        document_id: &DocumentId::from(document_id),
-        chunk_index,
-        content,
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: None,
-    })
-    .unwrap_or_else(|e| fail(&e.to_string()));
+    db.chunk_writer(&DocumentId::from(document_id), content)
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from(id),
+                chunk_index,
+                content,
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
 }
 
 /// The joined identifier term must rank a chunk containing the exact
@@ -1453,16 +1455,21 @@ fn search_keyword_chunks_phrase_match_in_heading() {
     let db =
         WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
     insert_ready_document(&db, "doc1");
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc1"),
-        chunk_index: 0,
-        content: "See below for what is not covered.",
-        heading: Some("Flood Exclusion"),
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: None,
+    db.chunk_writer(
+        &DocumentId::from("doc1"),
+        "See below for what is not covered.",
+    )
+    .and_then(|writer| {
+        writer.insert(&NewChunk {
+            id: &ChunkId::from("c1"),
+            chunk_index: 0,
+            content: "See below for what is not covered.",
+            heading: Some("Flood Exclusion"),
+            page: None,
+            kind: SectionKind::Body,
+            locator: None,
+            embedding: None,
+        })
     })
     .unwrap_or_else(|e| fail(&e.to_string()));
 
@@ -1522,21 +1529,25 @@ fn search_hybrid_chunks_ranks_identifier_and_filters_phrase() {
         WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
     insert_ready_document(&db, "doc1");
     let embedding = Vector::from(vec![0.1_f32, 0.2, 0.3, 0.4]);
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc1"),
-        chunk_index: 0,
-        content: "Policy POL-8841 covers water damage.",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&embedding),
+    db.chunk_writer(
+        &DocumentId::from("doc1"),
+        "Policy POL-8841 covers water damage.",
+    )
+    .and_then(|writer| {
+        writer.insert(&NewChunk {
+            id: &ChunkId::from("c1"),
+            chunk_index: 0,
+            content: "Policy POL-8841 covers water damage.",
+            heading: None,
+            page: None,
+            kind: SectionKind::Body,
+            locator: None,
+            embedding: Some(&embedding),
+        })
     })
     .unwrap_or_else(|e| fail(&e.to_string()));
-    db.insert_chunk(&NewChunk {
+    db.chunk_writer(&DocumentId::from("doc1"), "The pol number appears here, and the 8841 total appears elsewhere in this paragraph.").and_then(|writer| writer.insert(&NewChunk {
         id: &ChunkId::from("c2"),
-        document_id: &DocumentId::from("doc1"),
         chunk_index: 1,
         content: "The pol number appears here, and the 8841 total appears elsewhere in this paragraph.",
         heading: None,
@@ -1544,7 +1555,7 @@ fn search_hybrid_chunks_ranks_identifier_and_filters_phrase() {
         kind: SectionKind::Body,
         locator: None,
         embedding: Some(&embedding),
-    })
+    }))
     .unwrap_or_else(|e| fail(&e.to_string()));
 
     let results = db
@@ -1567,28 +1578,38 @@ fn search_hybrid_chunks_phrase_filters_to_matching_chunks() {
         WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
     insert_ready_document(&db, "doc1");
     let embedding = Vector::from(vec![0.1_f32, 0.2, 0.3, 0.4]);
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc1"),
-        chunk_index: 0,
-        content: "The flood exclusion applies to basements.",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&embedding),
+    db.chunk_writer(
+        &DocumentId::from("doc1"),
+        "The flood exclusion applies to basements.",
+    )
+    .and_then(|writer| {
+        writer.insert(&NewChunk {
+            id: &ChunkId::from("c1"),
+            chunk_index: 0,
+            content: "The flood exclusion applies to basements.",
+            heading: None,
+            page: None,
+            kind: SectionKind::Body,
+            locator: None,
+            embedding: Some(&embedding),
+        })
     })
     .unwrap_or_else(|e| fail(&e.to_string()));
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c2"),
-        document_id: &DocumentId::from("doc1"),
-        chunk_index: 1,
-        content: "Exclusion of flood risk is handled in a separate clause.",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&embedding),
+    db.chunk_writer(
+        &DocumentId::from("doc1"),
+        "Exclusion of flood risk is handled in a separate clause.",
+    )
+    .and_then(|writer| {
+        writer.insert(&NewChunk {
+            id: &ChunkId::from("c2"),
+            chunk_index: 1,
+            content: "Exclusion of flood risk is handled in a separate clause.",
+            heading: None,
+            page: None,
+            kind: SectionKind::Body,
+            locator: None,
+            embedding: Some(&embedding),
+        })
     })
     .unwrap_or_else(|e| fail(&e.to_string()));
 
@@ -2102,18 +2123,20 @@ fn document_chunks_page_in_order_and_documents_resolve_by_id_name_or_prefix() {
     )
     .unwrap_or_else(|e| fail(&e.to_string()));
     for i in 0..4u32 {
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from(format!("c{i}")),
-            document_id: &id,
-            chunk_index: i,
-            content: &format!("part {i}"),
-            heading: None,
-            page: Some(i.saturating_add(1)),
-            kind: SectionKind::Body,
-            locator: None,
-            embedding: None,
-        })
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        db.chunk_writer(&id, &format!("part {i}"))
+            .and_then(|writer| {
+                writer.insert(&NewChunk {
+                    id: &ChunkId::from(format!("c{i}")),
+                    chunk_index: i,
+                    content: &format!("part {i}"),
+                    heading: None,
+                    page: Some(i.saturating_add(1)),
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: None,
+                })
+            })
+            .unwrap_or_else(|e| fail(&e.to_string()));
     }
     let positions = |from: u32, limit: u32| -> Vec<u32> {
         db.document_chunks(&id, from, limit)
@@ -2216,12 +2239,10 @@ fn stream_statement(db: &WorkspaceDb, sql: &str, format: ExportFormat) -> (u64, 
     (rows, String::from_utf8(out).unwrap_or_default())
 }
 
-/// A ready document whose language is detected from `sample`, with one
-/// chunk of `content`.
-fn language_document(db: &WorkspaceDb, id: &str, sample: &str, content: &str) {
+/// A ready document whose language is detected from its one chunk of
+/// `content`.
+fn language_document(db: &WorkspaceDb, id: &str, content: &str) {
     insert_ready_document(db, id);
-    db.set_document_language(&DocumentId::from(id), sample)
-        .unwrap_or_else(|e| fail(&e.to_string()));
     insert_text_chunk(db, &format!("{id}-c0"), id, 0, content);
 }
 
@@ -2232,7 +2253,7 @@ const GERMAN_TEXT: &str = "Die Versicherungsverträge werden jedes Jahr erneuert
 fn a_german_document_is_stemmed_as_german_and_found_by_another_inflection() {
     let db =
         WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-    language_document(&db, "de", GERMAN_TEXT, GERMAN_TEXT);
+    language_document(&db, "de", GERMAN_TEXT);
     let document = db
         .document(&DocumentId::from("de"))
         .unwrap_or_else(|e| fail(&e.to_string()));
@@ -2253,11 +2274,11 @@ fn a_german_document_is_stemmed_as_german_and_found_by_another_inflection() {
 fn a_query_reaches_documents_in_every_language_of_the_workspace() {
     let db =
         WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-    language_document(&db, "de", GERMAN_TEXT, GERMAN_TEXT);
+    language_document(&db, "de", GERMAN_TEXT);
     let english = "The insurance policies are renewed every year, and the customer is told.";
-    language_document(&db, "en", english, english);
+    language_document(&db, "en", english);
     let japanese = "保険契約の更新手続きについて説明します。";
-    language_document(&db, "ja", japanese, japanese);
+    language_document(&db, "ja", japanese);
     assert_eq!(
         db.meta(MetaKey::Languages)
             .unwrap_or_else(|e| fail(&e.to_string()))
@@ -2276,16 +2297,51 @@ fn a_query_reaches_documents_in_every_language_of_the_workspace() {
     assert_eq!(found("更新手続き"), ["ja"]);
 }
 
+/// The writer resolves the language once: every chunk it stores is indexed
+/// under it, whatever the row says later and whatever each chunk's own text
+/// would be detected as.
 #[test]
-fn a_chunk_of_a_document_without_a_language_detects_one_from_its_text() {
+fn a_document_s_chunks_are_indexed_under_the_language_resolved_once() {
     let db =
         WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
     insert_ready_document(&db, "de");
-    insert_text_chunk(&db, "c0", "de", 0, GERMAN_TEXT);
+    let writer = db
+        .chunk_writer(&DocumentId::from("de"), GERMAN_TEXT)
+        .unwrap_or_else(|e| fail(&e.to_string()));
     let document = db
         .document(&DocumentId::from("de"))
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert_eq!(document.and_then(|d| d.language).as_deref(), Some("deu"));
+    db.execute_statement("UPDATE _quack_documents SET language = 'eng'")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let chunk = |id: &str, content: &str| {
+        writer
+            .insert(&NewChunk {
+                id: &ChunkId::from(id),
+                chunk_index: 0,
+                content,
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    };
+    chunk("c0", "Die Versicherungsverträge");
+    chunk("c1", "The renewals");
+    let terms = |chunk: &str| {
+        db.execute_query(&format!(
+            "SELECT string_agg(term, ',' ORDER BY term) FROM _quack_terms WHERE chunk_id = '{chunk}'"
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .rows
+    };
+    assert_eq!(
+        terms("c0"),
+        vec![vec![serde_json::json!("die,versicherungsvertrag")]]
+    );
+    assert_eq!(terms("c1"), vec![vec![serde_json::json!("renewal,the")]]);
 }
 
 #[test]
@@ -2293,7 +2349,7 @@ fn the_languages_setting_fixes_what_a_document_is_detected_as() {
     let db = WorkspaceDb::open_in_memory(Dimension::new(4))
         .unwrap_or_else(|e| fail(&e.to_string()))
         .with_languages(LanguageSetting::Only(vec![Language::ENGLISH]));
-    language_document(&db, "de", GERMAN_TEXT, GERMAN_TEXT);
+    language_document(&db, "de", GERMAN_TEXT);
     let document = db
         .document(&DocumentId::from("de"))
         .unwrap_or_else(|e| fail(&e.to_string()));
@@ -2307,7 +2363,7 @@ fn the_languages_setting_fixes_what_a_document_is_detected_as() {
 fn the_upgrade_detects_languages_and_reindexes_the_terms() {
     let db =
         WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-    language_document(&db, "de", GERMAN_TEXT, GERMAN_TEXT);
+    language_document(&db, "de", GERMAN_TEXT);
     db.execute_statement("UPDATE _quack_documents SET language = NULL")
         .unwrap_or_else(|e| fail(&e.to_string()));
     db.execute_statement("DELETE FROM _quack_terms")
@@ -2336,18 +2392,20 @@ fn the_upgrade_detects_languages_and_reindexes_the_terms() {
 
 fn vector_chunk(db: &WorkspaceDb, id: &str, index: u32, content: &str, vector: [f32; 4]) {
     let embedding = Vector::from(vector.to_vec());
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from(id),
-        document_id: &DocumentId::from("doc1"),
-        chunk_index: index,
-        content,
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: Some(&embedding),
-    })
-    .unwrap_or_else(|e| fail(&e.to_string()));
+    db.chunk_writer(&DocumentId::from("doc1"), content)
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from(id),
+                chunk_index: index,
+                content,
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&embedding),
+            })
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
 }
 
 #[test]
