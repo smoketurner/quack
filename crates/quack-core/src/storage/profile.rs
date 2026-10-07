@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::storage::workspace::{INTERNAL_PREFIX, WorkspaceDb, quote_ident};
+use crate::storage::writer::Writer;
 
 /// The profiles and the owners' notes on tables.
 pub const DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_table_profiles (
@@ -548,16 +549,21 @@ impl TableProfile {
     /// Returns an error if the table cannot be read or the row not written.
     pub fn refresh(db: &WorkspaceDb, table: &str) -> Result<Self> {
         let profile = Self::compute(db, table)?;
+        profile.store(db)?;
+        Ok(profile)
+    }
+
+    fn store(&self, db: &WorkspaceDb) -> Result<()> {
         db.connection().execute(
             "INSERT OR REPLACE INTO _quack_table_profiles (table_name, row_count, profiled_at, columns) \
              VALUES (?, ?, now(), ?)",
             duckdb::params![
-                profile.table,
-                i64::try_from(profile.row_count).unwrap_or(i64::MAX),
-                serde_json::to_string(&profile.columns)?
+                self.table,
+                i64::try_from(self.row_count).unwrap_or(i64::MAX),
+                serde_json::to_string(&self.columns)?
             ],
         )?;
-        Ok(profile)
+        Ok(())
     }
 
     /// Profile `table`, or say why not and go on: a profile is advice, so a
@@ -570,45 +576,38 @@ impl TableProfile {
 
     /// Profile every stored table whose row count changed since its
     /// profile, or that has none, and forget the profiles of tables that
-    /// are gone. Run after a statement that may have written; returns how
-    /// many it profiled.
+    /// are gone. Returns how many it profiled.
     ///
     /// # Errors
     ///
     /// Returns an error if the catalog or the stored profiles cannot be read.
     pub fn refresh_stale(db: &WorkspaceDb) -> Result<usize> {
-        let stored = Self::stored_counts(db)?;
-        let tables = Self::base_tables(db)?;
-        let mut profiled = 0_usize;
-        for table in &tables {
-            let rows = match db.count_rows(table) {
-                Ok(rows) => u64::try_from(rows).unwrap_or(0),
-                Err(e) => {
-                    tracing::warn!(table, error = %e, "could not count the table's rows");
-                    continue;
-                }
-            };
-            if stored.get(table) == Some(&rows) {
-                continue;
-            }
-            Self::refresh_or_warn(db, table);
-            profiled = profiled.saturating_add(1);
-        }
-        for gone in stored.keys().filter(|t| !tables.contains(t)) {
-            db.connection().execute(
-                "DELETE FROM _quack_table_profiles WHERE table_name = ?",
-                duckdb::params![gone],
-            )?;
-        }
+        let stale = Stale::find(db)?;
+        let profiled = stale.taken.len();
+        stale.store(db)?;
         Ok(profiled)
     }
 
-    /// [`Self::refresh_stale`] after a statement that wrote; a failure is
-    /// logged, never the statement's.
-    pub fn after_write(db: &WorkspaceDb) {
-        if let Err(e) = Self::refresh_stale(db) {
+    /// [`Self::refresh_stale`] after a statement that wrote, with the
+    /// reading off the writer: the tables are counted and profiled on a
+    /// reader connection, which a large table can keep busy for a while,
+    /// and the writer only stores the results. A failure is logged, never
+    /// the statement's.
+    pub async fn after_write(writer: &Writer) {
+        if let Err(e) = Self::refresh_beside(writer).await {
             tracing::warn!(error = %e, "could not refresh table profiles after a write");
         }
+    }
+
+    async fn refresh_beside(writer: &Writer) -> Result<()> {
+        let reader = writer.run(WorkspaceDb::try_clone_reader).await?;
+        let stale = tokio::task::spawn_blocking(move || reader.read_only(Stale::find))
+            .await
+            .map_err(|e| Error::Analysis(format!("the profiling task failed: {e}")))??;
+        if stale.is_empty() {
+            return Ok(());
+        }
+        writer.run(move |db| stale.store(db)).await
     }
 
     /// The user's stored tables: views are left out, since profiling one
@@ -744,6 +743,60 @@ impl TableProfile {
             }
         }
         out
+    }
+}
+
+/// The profiles a workspace's tables need: one taken of each table whose
+/// row count changed since its profile or that has none, and the tables
+/// whose profiles are left over. Found by reading alone, so a reader
+/// connection can do it; stored on the writer.
+struct Stale {
+    taken: Vec<TableProfile>,
+    gone: Vec<String>,
+}
+
+impl Stale {
+    fn find(db: &WorkspaceDb) -> Result<Self> {
+        let stored = TableProfile::stored_counts(db)?;
+        let tables = TableProfile::base_tables(db)?;
+        let mut taken = Vec::new();
+        for table in &tables {
+            let rows = match db.count_rows(table) {
+                Ok(rows) => u64::try_from(rows).unwrap_or(0),
+                Err(e) => {
+                    tracing::warn!(table, error = %e, "could not count the table's rows");
+                    continue;
+                }
+            };
+            if stored.get(table) == Some(&rows) {
+                continue;
+            }
+            // A profile is advice: a table it cannot be taken of (an
+            // unusual column type) is left without one.
+            match TableProfile::compute(db, table) {
+                Ok(profile) => taken.push(profile),
+                Err(e) => tracing::warn!(table, error = %e, "could not profile the table"),
+            }
+        }
+        let gone = stored.into_keys().filter(|t| !tables.contains(t)).collect();
+        Ok(Self { taken, gone })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.taken.is_empty() && self.gone.is_empty()
+    }
+
+    fn store(&self, db: &WorkspaceDb) -> Result<()> {
+        for profile in &self.taken {
+            profile.store(db)?;
+        }
+        for gone in &self.gone {
+            db.connection().execute(
+                "DELETE FROM _quack_table_profiles WHERE table_name = ?",
+                duckdb::params![gone],
+            )?;
+        }
+        Ok(())
     }
 }
 

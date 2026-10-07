@@ -86,6 +86,32 @@ fn a_stored_profile_is_shown_only_at_its_row_count() {
     );
 }
 
+/// After a write the profiles are taken on a reader and stored by the
+/// writer, which ends up with the same rows a refresh on it would write.
+#[tokio::test]
+async fn after_a_write_the_writer_stores_profiles_read_beside_it() {
+    let writer = Writer::spawn(db()).unwrap();
+    writer
+        .run(|db| db.execute_statement("CREATE TABLE t AS SELECT range AS n FROM range(5)"))
+        .await
+        .unwrap();
+    TableProfile::after_write(&writer).await;
+    assert!(
+        writer
+            .run(|db| TableProfile::current(db, "t", 5))
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    writer
+        .run(|db| db.execute_statement("DROP TABLE t"))
+        .await
+        .unwrap();
+    TableProfile::after_write(&writer).await;
+    assert!(writer.run(TableProfile::all).await.unwrap().is_empty());
+}
+
 #[test]
 fn views_and_empty_tables_profile_without_warnings() {
     let db = db();

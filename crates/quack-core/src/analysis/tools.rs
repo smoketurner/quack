@@ -775,9 +775,7 @@ impl Tool for RunSqlTool {
                 let results = if read_only {
                     db.read_only(|db| Ok(db.execute_query_capped(&sql, max_rows)))?
                 } else {
-                    let results = db.execute_query_capped(&sql, max_rows);
-                    TableProfile::after_write(db);
-                    results
+                    db.execute_query_capped(&sql, max_rows)
                 };
                 Ok((results, shape))
             })
@@ -790,6 +788,7 @@ impl Tool for RunSqlTool {
             // statement itself errored, since an earlier
             // statement in a batch can have already run.
             self.gate.db.observe_write().await;
+            TableProfile::after_write(&self.db).await;
         }
         match results {
             Ok(results) => {

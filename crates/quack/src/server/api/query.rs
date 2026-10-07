@@ -709,23 +709,19 @@ impl Access {
         let max_rows = app.config.analysis.max_query_rows;
         let timed = move |db: &WorkspaceDb| {
             let began = Instant::now();
-            let result = db
-                .execute_query_capped(&sql, max_rows)
-                .map(|capped| (capped, began.elapsed()));
-            if is_write {
-                TableProfile::after_write(db);
-            }
-            result
+            db.execute_query_capped(&sql, max_rows)
+                .map(|capped| (capped, began.elapsed()))
         };
         let result = if is_write {
             let db = app.workspace_db(&access.membership.workspace.id).await?;
-            let result = with_db(db, timed).await;
+            let result = with_db(Arc::clone(&db), timed).await;
             // Whatever ran might have created a temp object the check above
             // did not catch (a leading comment, a multi-statement batch);
             // check the writer's catalog regardless of whether the statement
             // itself errored, since an earlier statement in a batch can have
             // already run.
             reader_db.observe_write().await;
+            TableProfile::after_write(&db).await;
             result
         } else {
             // A read never queues behind a write: run it on the workspace's

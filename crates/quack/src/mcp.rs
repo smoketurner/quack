@@ -621,11 +621,7 @@ impl McpServer {
         let max_rows = self.inner.config.analysis.max_query_rows;
         let result = if is_write {
             let result = self
-                .db(move |db| {
-                    let result = db.execute_query_capped(&sql, max_rows);
-                    TableProfile::after_write(db);
-                    result
-                })
+                .db(move |db| db.execute_query_capped(&sql, max_rows))
                 .await;
             // Whatever ran might have created a temp object the check
             // above did not catch (a leading comment, a multi-statement
@@ -633,6 +629,7 @@ impl McpServer {
             // the statement itself errored, since an earlier statement in
             // a batch can have already run.
             self.inner.reader.observe_write().await;
+            TableProfile::after_write(&self.inner.db).await;
             result
         } else {
             // A read never queues behind a write: run it on the reader

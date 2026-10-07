@@ -2696,8 +2696,10 @@ async fn run_query(
     .await?;
 
     let results = ws_db.execute_query(sql).context("query execution failed")?;
-    if ws_db.classify_statement(sql)? != StatementKind::Read {
-        TableProfile::after_write(&ws_db);
+    if ws_db.classify_statement(sql)? != StatementKind::Read
+        && let Err(e) = TableProfile::refresh_stale(&ws_db)
+    {
+        tracing::warn!(error = %e, "could not refresh table profiles after a write");
     }
 
     let stdout = std::io::stdout();
