@@ -279,7 +279,7 @@ fn list_chunked_files(dir: &Path) -> Result<Vec<PathBuf>> {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .and_then(FileType::of)
-                .is_some_and(|t| matches!(t.load(), Load::Chunks(_)))
+                .is_some_and(|t| matches!(t.load(), Load::Chunks(_) | Load::Image(_)))
         })
         .collect();
     entries.sort();

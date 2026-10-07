@@ -866,6 +866,7 @@ terminal's `/ingest` takes files.
 | `.vtt`, `.srt` | `subtp` | cues merged into runs of about 600 characters, a new run after a gap over 10 seconds; the run's start time (`12:04`) as the locator |
 | source code (`.rs`, `.py`, `.js`, `.ts`, `.go`, `.java`, `.c`, `.sql`, ...) | direct | one code section, chunked by whole lines with `line N` as each chunk's locator (no grammar: a definition-aware split is a dependency decision left open) |
 | RTF | `rtf-parser` | one section |
+| PNG, JPEG, WebP, GIF | `[ingestion].vision_model` (`llm::vision`) | the model's transcription of the image's text, then a description of what it shows, as one Markdown section under the file name; the image is kept as `files/<document id>.<ext>`; refused at upload when no vision model is set |
 | CSV, Parquet, JSON, JSONL, XLSX | DuckDB (section 6.2) | become tables, not chunks |
 
 Every section has a kind (`body`, `table`, `note`, `code`) and may carry a locator beside
@@ -885,6 +886,18 @@ them afterwards (`PATCH .../documents/{doc}`, `quack docs --author|--authored|--
 They show in the Documents page, `list_documents`, and the prompt's document inventory.
 
 A scanned PDF (no text layer) is reported as `error: no extractable text`. OCR is deferred.
+
+**Images.** `[ingestion].vision_model` names a chat model that reads images
+(`provider/model`, like `chat_model`); it runs at that model's `background_effort`. An uploaded
+or ingested image goes to it once with a prompt to transcribe the text and describe the rest,
+and what it writes is chunked and embedded like any Markdown document. Without a vision model
+an image is refused before it is registered (`Error::NoVisionModel`, REST 400
+`no_vision_model`). Images are not a `quack import` source, which loads tables.
+
+A chat model marked `images = true` (`[providers.NAME]` or `[providers.NAME.models."ID"]`)
+also gets the `view_image` tool in every workspace holding an image (section 7.3). The image
+document's passage page shows the image, served by `GET .../documents/{doc}/image` (and
+`/w/{id}/documents/{doc}/image` in the web console), audited as opening the document.
 
 **Partly read PDFs.** A PDF with some pages missing from its text still becomes `ready`, and
 the document row records what is missing (`parser::PageCounts`): `page_count`,
@@ -1628,11 +1641,13 @@ model (`test-utils`, a dev-dependency feature only).
 | `search_graph(entity?, class?, relation?, hops=2)` | none | Neighborhood or class listing with provenance |
 | `find_path(from, to, max_hops=4)` | none | Shortest relation path between two entities |
 | `create_chart(sql, kind, x, y, title)` | none | Runs the SQL, emits a chart spec (section 9) |
+| `view_image(document, question)` | none | Sends one image document and the question to the chat model; returns its answer, citable as the document's first chunk, and counts as reading document text |
 
 `search_graph` and `find_path` register only when the graph has nodes; `describe_class`
 whenever an ontology exists, since the prompt's ontology block is capped, and it names the
 class's SQL view with its typed columns; `find_tables` only when the workspace has more than
-25 tables (graph views not counted). The rest register
+25 tables (graph views not counted); `view_image` only when the chat model is marked
+`images = true` and a ready document is an image. The rest register
 in every workspace, and the prompt tells the model what the workspace holds. An `export`
 tool (`COPY ... TO` under `files/`) is not built (section 17).
 
@@ -2968,6 +2983,7 @@ tokenizer_encoding = "cl100k_base"
 upload_max_mb = 512
 max_decompressed_mb = 1024      # what a DOCX, PPTX, or zipped workbook may inflate to while parsed
 table_rows_as_table = 20        # a table inside a document with this many rows also loads as a workspace table
+# vision_model = "ollama/gemma4:e4b"   # describes uploaded images at ingest; images are refused without it
 
 [context]
 max_tokens = 4000

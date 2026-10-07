@@ -215,6 +215,10 @@ pub enum Error {
     #[error("unsupported file type: {0}")]
     UnsupportedFileType(String),
 
+    /// An image arrived with no `[ingestion].vision_model` to read it.
+    #[error("{0} is an image; set [ingestion].vision_model to describe images")]
+    NoVisionModel(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

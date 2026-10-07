@@ -79,6 +79,8 @@ pub enum Area {
     Embeddings,
     /// The dedicated rerank model, when `[retrieval].rerank = "reranker"`.
     Reranker,
+    /// The model that reads images at ingest, `[ingestion].vision_model`.
+    Vision,
     Server,
     /// The OAuth clients quack registered itself (`quack auth register`).
     Auth,
@@ -96,6 +98,7 @@ text_enum!(Area, "doctor area", {
     ChatModel => "chat model",
     Embeddings => "embeddings",
     Reranker => "reranker",
+    Vision => "vision",
     Server => "server",
     Auth => "auth",
     Vault => "vault",
@@ -318,6 +321,7 @@ pub async fn run(inspection: &Inspection, options: &Options) -> Report {
         check_chat_model(&mut report, config, options.probing).await;
         check_embedding_model(&mut report, config, options.probing).await;
         check_reranker(&mut report, config, options.probing).await;
+        check_vision_model(&mut report, config, options.probing).await;
         check_server(&mut report, config, control.as_ref()).await;
         check_sign_in(&mut report, config, options.probing).await;
         check_registrations(
@@ -853,6 +857,17 @@ async fn check_reranker(report: &mut Report, config: &Config, probing: Probing) 
             model.provider_name, model.model
         )),
     });
+}
+
+/// The vision model, when `[ingestion].vision_model` is set: the setting
+/// resolves and the provider lists the model. Whether it reads images is
+/// the model's own; no image is sent.
+async fn check_vision_model(report: &mut Report, config: &Config, probing: Probing) {
+    match config.vision_model_ref() {
+        Ok(Some(model)) => check_model(report, Area::Vision, config, model, probing).await,
+        Ok(None) => {}
+        Err(e) => report.push(Check::new(Area::Vision, Status::Fail, e.to_string())),
+    }
 }
 
 /// Which input prefixes the embedding model gets, and where they come

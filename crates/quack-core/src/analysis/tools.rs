@@ -32,6 +32,7 @@ use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
 use crate::graph::views::ClassView;
 use crate::ingestion::parser::PageCounts;
+use crate::llm::vision::ImageReader;
 use crate::llm::{RerankModel, SchemaCall};
 use crate::ontology::{ClassRelations, Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
@@ -1244,6 +1245,125 @@ impl Tool for ReadDocumentTool {
             )?;
         }
         Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// view_image
+// ---------------------------------------------------------------------------
+
+/// Looks at an image document again for one question: the stored image and
+/// the question go to the chat model, which reads images. Registered only
+/// when the chat model is marked `images = true` and a ready document is
+/// an image.
+pub struct ViewImageTool {
+    db: ReaderDb,
+    reader: Arc<ImageReader>,
+}
+
+impl ViewImageTool {
+    #[must_use]
+    pub fn new(db: ReaderDb, reader: ImageReader) -> Self {
+        Self {
+            db,
+            reader: Arc::new(reader),
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ViewImageArgs {
+    /// The image document: an id from `list_documents` (a prefix is enough)
+    /// or its exact file name
+    pub document: String,
+    /// What to find out from the image, as a full question
+    pub question: String,
+}
+
+impl Tool for ViewImageTool {
+    const NAME: &'static str = ToolName::ViewImage.as_str();
+    type Error = ToolError;
+    type Args = ViewImageArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        String::from(
+            "Look at an image document (a PNG, JPEG, WebP, or GIF the workspace holds) to answer \
+             a question its stored description does not: a value in a chart, a label, a \
+             detail. Returns what the image shows, citable as [n] like a document chunk.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        ViewImageArgs::schema()
+    }
+
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let turn = Turn::of(context)?;
+        let step = turn.recorder.start(
+            ToolName::ViewImage,
+            &format!("{}: {}", args.document, args.question),
+        );
+        let wanted = args.document;
+        let within = turn.scope().clone();
+        let found = self
+            .db
+            .with_db(move |db| {
+                let documents = db.list_documents()?;
+                let document = DocumentInfo::find(&documents, &wanted)?.clone();
+                within.narrow(vec![document.id.clone()])?;
+                if document.status != DocumentStatus::Ready {
+                    return Err(Error::Analysis(format!(
+                        "{} is {}, not ready, so it cannot be viewed",
+                        OneLine(&document.filename),
+                        document.status
+                    )));
+                }
+                let Some(image) = db.stored_image(&document) else {
+                    return Err(Error::Analysis(format!(
+                        "{} is not an image; read_document reads its text",
+                        OneLine(&document.filename)
+                    )));
+                };
+                let chunks = db.document_chunks(&document.id, 0, 1)?;
+                Ok((document, image, chunks))
+            })
+            .await;
+        let (document, image, chunks) = match found {
+            Ok(found) => found,
+            Err(e) => return Err(step.fail(e.into())),
+        };
+        let answer = match image.read().await {
+            Ok(bytes) => {
+                self.reader
+                    .read(&bytes, image.format(), &args.question)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(e) => return Err(step.fail(e.into())),
+        };
+        step.finish(format!("{} characters", answer.chars().count()));
+        // What the image shows can carry instructions like any document.
+        turn.read_documents();
+        let markers = turn.cite(&chunks);
+        let label = if chunks.is_empty() {
+            String::new()
+        } else {
+            format!("[{}] ", markers.nth(0))
+        };
+        Ok(format!(
+            "What {label}{} shows, as the chat model read it. Cite it with its marker. {}\n{}\n",
+            OneLine(&document.filename),
+            Fenced::NOTICE,
+            Fenced(&answer)
+        ))
     }
 }
 

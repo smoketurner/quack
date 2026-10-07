@@ -141,6 +141,7 @@ fn test_config(data_dir: &Path) -> Config {
             tokenizer_encoding: String::from("cl100k_base"),
             upload_max_mb: 512,
             max_decompressed_mb: 1024,
+            vision_model: None,
         },
         embedding: EmbeddingConfig {
             model: Some("mock/mock-model".parse().unwrap()),
@@ -844,7 +845,7 @@ async fn ingest_unknown_file_type_returns_error() {
         &config,
         &writer,
         workspace_id,
-        &ingestion::NewFile::new("image.png", b"fake image data"),
+        &ingestion::NewFile::new("scan.tiff", b"fake image data"),
         None,
     )
     .await;
@@ -2189,7 +2190,8 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
         .unwrap();
     assert_eq!(errored.status, DocumentStatus::Error);
     let retry =
-        ingestion::register_document(&db, &ingestion::NewFile::new("scan.pdf", bad)).unwrap();
+        ingestion::register_document(&db, &config, &ingestion::NewFile::new("scan.pdf", bad))
+            .unwrap();
     assert!(matches!(retry, ingestion::Registration::New(_)));
 }
 
@@ -2729,6 +2731,56 @@ async fn a_pdf_page_without_text_is_counted_on_the_document() {
     assert_eq!(doc.pages, None);
 }
 
+/// An image is refused before it is registered when no vision model is
+/// set.
+#[tokio::test]
+async fn an_image_without_a_vision_model_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-images").unwrap();
+    let refused = ingestion::register_document(
+        &db,
+        &config,
+        &ingestion::NewFile::new("chart.png", b"\x89PNG\r\n\x1a\n"),
+    );
+    assert!(
+        matches!(refused, Err(Error::NoVisionModel(ref name)) if name == "chart.png"),
+        "{refused:?}"
+    );
+    assert!(
+        !db.list_all_documents()
+            .unwrap()
+            .iter()
+            .any(|d| d.filename == "chart.png")
+    );
+}
+
+/// Deleting an image document removes the image it keeps.
+#[tokio::test]
+async fn deleting_an_image_document_removes_its_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-image").unwrap();
+    let id = DocumentId::from("img");
+    db.insert_document(
+        &NewDocument::new(&id, "chart.png", "image/png", 8).with_status(DocumentStatus::Ready),
+    )
+    .unwrap();
+    let document = db.document(&id).unwrap().unwrap();
+    let image = db.stored_image(&document).unwrap();
+    assert_eq!(
+        image.path(),
+        config.workspace_files_dir("ws-image").join("img.png")
+    );
+    std::fs::create_dir_all(image.path().parent().unwrap()).unwrap();
+    std::fs::write(image.path(), b"png").unwrap();
+    assert!(db.has_images().unwrap());
+
+    assert!(db.delete_document(&id).unwrap());
+    assert!(!image.path().exists());
+    assert!(!db.has_images().unwrap());
+}
+
 /// `tiny_xlsx` with one more sheet part of `megabytes` of spaces: a few
 /// kilobytes more on disk.
 fn padded_xlsx(megabytes: usize) -> Vec<u8> {
@@ -3192,9 +3244,12 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
 
     // A queued row from a process that died is failed when the server
     // opens the workspace.
-    let registration =
-        ingestion::register_document(&db, &ingestion::NewFile::new("later.csv", b"a\n1\n"))
-            .unwrap();
+    let registration = ingestion::register_document(
+        &db,
+        &config,
+        &ingestion::NewFile::new("later.csv", b"a\n1\n"),
+    )
+    .unwrap();
     let ingestion::Registration::New(queued) = registration else {
         return assert!(matches!(registration, ingestion::Registration::New(_)));
     };
@@ -3864,6 +3919,7 @@ async fn a_table_replacement_swaps_the_table_and_a_failed_one_changes_nothing() 
     // While one replacement is on its way, a second is refused.
     let pending = ingestion::register_document(
         &db,
+        &config,
         &ingestion::NewFile::new("sales.csv", b"region,total\nnorth,3\n")
             .replaces(Some(&sales2.document_id)),
     )
@@ -3871,6 +3927,7 @@ async fn a_table_replacement_swaps_the_table_and_a_failed_one_changes_nothing() 
     assert!(matches!(pending, ingestion::Registration::New(_)));
     let twice = ingestion::register_document(
         &db,
+        &config,
         &ingestion::NewFile::new("sales.csv", b"region,total\nnorth,4\n")
             .replaces(Some(&sales2.document_id)),
     );

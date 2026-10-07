@@ -28,7 +28,7 @@ use crate::config::Config;
 use crate::embedding::Embedder;
 use crate::error::{Error, Result};
 use crate::ids::DocumentId;
-use crate::ingestion::parser::{FileType, Load};
+use crate::ingestion::parser::FileType;
 use crate::ingestion::{self, IngestOutcome, NewFile, TableName};
 use crate::progress::RunControl;
 use crate::proxy::{Proxies, Route};
@@ -808,7 +808,7 @@ impl Download<'_> {
         name.split(['?', '#'])
             .next()
             .and_then(|path| path.rsplit('/').next())
-            .filter(|name| FileType::of(name).is_some_and(|t| !matches!(t.load(), Load::Chunks(_))))
+            .filter(|name| FileType::of(name).is_some_and(|t| t.load().makes_tables()))
             .and_then(|name| name.rsplit_once('.'))
             .map(|(_, ext)| ext.to_ascii_lowercase())
             .ok_or_else(|| {

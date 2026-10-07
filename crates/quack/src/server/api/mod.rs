@@ -142,6 +142,10 @@ pub(crate) fn router(app: &App) -> ApiRoutes {
             "/workspaces/{id}/documents/{doc}/chunks",
             get(documents::chunks),
         )
+        .route(
+            "/workspaces/{id}/documents/{doc}/image",
+            get(documents::image),
+        )
         .route("/workspaces/{id}/embeddings", get(embeddings::show))
         .route(
             "/workspaces/{id}/embeddings/refresh",

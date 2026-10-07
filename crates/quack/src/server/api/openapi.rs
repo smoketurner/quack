@@ -95,6 +95,7 @@ const COOKIE: &str = "session";
         documents::update,
         documents::remove,
         documents::chunks,
+        documents::image,
         embeddings::show,
         embeddings::refresh,
         tables::list,

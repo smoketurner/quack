@@ -136,6 +136,30 @@ because a model that does not reason rejects the field. `quack config` lists eve
 `effort`. A level the model refuses fails graph extraction and the ontology's document pass;
 a chat turn still answers, without model reranking and history summaries, and logs a warning.
 
+## Images
+
+Two settings let quack read images. Neither sends an image anywhere until it is set.
+
+- `[ingestion].vision_model` names the model that reads an uploaded PNG, JPEG, WebP, or GIF
+  once at ingest. Without it, an image upload is refused. It runs at the model's
+  `background_effort`.
+- `images = true` on `[providers.NAME]` or `[providers.NAME.models."ID"]` says the chat
+  model reads images, which gives the agent the `view_image` tool in a workspace that holds
+  an image: the stored image and the agent's question go to the chat model again.
+
+```toml
+[ingestion]
+vision_model = "ollama/gemma4:e4b"
+
+[providers.ollama.models."gemma4:e4b"]
+images = true                            # only when gemma4:e4b is also the chat model
+```
+
+Any provider type works if the model accepts images: Ollama's vision models, OpenAI's
+and Claude's current models, and Bedrock's Claude models. A model that does not read
+images either rejects the request or answers without seeing the image, so set these
+only for one that does. `quack doctor` checks that the provider lists `vision_model`.
+
 ## Credentials
 
 Each provider entry picks one `auth` mode:

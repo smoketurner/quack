@@ -26,6 +26,9 @@ Two rules hold for every release:
   from its first chunks and rebuilds the keyword index (`_quack_terms`), reading every chunk
   once. `control.db` unchanged (migration 8).
 - Embeddings: no refresh needed.
+- Config: `[ingestion].vision_model` added (unset by default): the model that describes
+  uploaded images at ingest; without it, image uploads are refused. `images = true` on a
+  provider or model gives the agent `view_image`.
 
 The version-bump pull request renames this section to the tag.
 

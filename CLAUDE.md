@@ -92,7 +92,7 @@ cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # S
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
 cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use
 cargo run --bin quack -- workspace rename OLD NEW | delete NAME [-y] | snapshot NAME [--to FILE] | restore FILE|- [--name N]   # storage::backup: one tar (manifest.json, data.duckdb, files/); delete is at once, the audit rows stay
-cargo run --bin quack -- ingest sales.csv -w ws [--replace [ID]] [--types amount=DOUBLE]   # file -> table(s) or chunks; --replace supersedes the document with the same name (or ID) once the new one is ready; --types retypes columns strictly after the load
+cargo run --bin quack -- ingest sales.csv -w ws [--replace [ID]] [--types amount=DOUBLE]   # file -> table(s) or chunks; --replace supersedes the document with the same name (or ID) once the new one is ready; --types retypes columns strictly after the load; an image needs [ingestion].vision_model
 cargo run --bin quack -- ingest DIR -w ws [--prune]                            # every supported file under DIR (not a bundle), root and path recorded; re-run skips unchanged, replaces changed, reports gone files of that root (--prune deletes them)
 #   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX, EPUB, ODT, EML/MBOX, VTT/SRT, source code, RTF
 #   --author/--authored/--tag set what the file says about itself; a table inside a document with >= [ingestion].table_rows_as_table rows also loads as <stem>_tableN
@@ -262,6 +262,13 @@ tables are `ingestion::table::Table` rendered as pipe Markdown, chunked by rows 
 repeated, and loaded as document-owned workspace tables past `[ingestion].table_rows_as_table`.
 `parser::DocumentMeta` (author, dates, tags, other named values) comes from each format and
 lands on `_quack_documents`; `NewFile::fields` (the uploader's `DocumentFields`) wins over it.
+Images (PNG, JPEG, WebP, GIF; `FileType::Image`) are read once at ingest by
+`[ingestion].vision_model` (`llm::vision::ImageReader`, a tool-less `llm::PlainCall` at
+`background_effort`), whose transcription and description are chunked as Markdown; the image is
+kept as `files/<document id>.<ext>` (`ingestion::StoredImage`, `WorkspaceDb::stored_image`) and
+served by `GET .../documents/{doc}/image`. With no vision model an image is refused at
+registration (`Error::NoVisionModel`). A chat model marked `images = true` gets `view_image` (the
+stored image and a question back to the chat model) in a workspace that holds an image.
 Chunk bodies, graph source excerpts, and pinned text reach the model inside `text::Fenced`
 markers, whose code is a digest of the enclosed text (so the text cannot close its own block),
 after a fixed sentence that it is data; an `always_retrieve` chunk is fenced too, as the `content`

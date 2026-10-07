@@ -20,8 +20,8 @@ use crate::embedding::{
 use crate::error::{Error, Result, WrittenBy};
 use crate::graph;
 use crate::ids::{ChunkId, DocumentId, NodeId, UserId};
-use crate::ingestion::TableName;
 use crate::ingestion::parser::{DocumentMeta, FileType, Load, PageCounts, SectionKind};
+use crate::ingestion::{StoredImage, TableName};
 use crate::ontology::store::{self as ontology_store, Acceptance};
 use crate::ontology::{Measure, Ontology, Property};
 use crate::saved;
@@ -2304,7 +2304,7 @@ impl WorkspaceDb {
                 .execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)))?;
         }
         if doc.status != DocumentStatus::Superseded {
-            self.remove_document_files(&doc.filename, &tables);
+            self.remove_document_files(id, &doc.filename, &tables);
         }
         self.abandon_replacement(id)?;
         Ok(true)
@@ -2364,16 +2364,45 @@ impl WorkspaceDb {
         Ok(())
     }
 
+    /// Whether a ready document is an image, which `view_image` can look at.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn has_images(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM _quack_documents \
+             WHERE status = ? AND mime_type LIKE 'image/%')",
+            duckdb::params![DocumentStatus::Ready],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The image `document` keeps in the workspace's `files/`, when it is
+    /// an image and the connection knows the workspace's directory.
+    #[must_use]
+    pub fn stored_image(&self, document: &DocumentInfo) -> Option<StoredImage> {
+        let FileType::Image(format) = FileType::of(&document.filename)? else {
+            return None;
+        };
+        let files_dir = self.files_dir.as_ref()?;
+        Some(StoredImage::in_dir(files_dir, &document.id, format))
+    }
+
     /// Remove what ingestion wrote under `files/` for a document: the file
-    /// itself and, for workbooks and imports, one CSV per table. A missing
-    /// file is fine; any other failure is logged, since the rows are gone.
-    fn remove_document_files(&self, filename: &str, tables: &[String]) {
+    /// itself, for workbooks and imports one CSV per table, and for an
+    /// image its stored copy. A missing file is fine; any other failure is
+    /// logged, since the rows are gone.
+    fn remove_document_files(&self, id: &DocumentId, filename: &str, tables: &[String]) {
         let Some(files_dir) = &self.files_dir else {
             return;
         };
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(name) = Path::new(filename).file_name() {
             candidates.push(files_dir.join(name));
+        }
+        if let Some(FileType::Image(format)) = FileType::of(filename) {
+            candidates.push(StoredImage::in_dir(files_dir, id, format).path().to_owned());
         }
         for table in tables {
             candidates.push(files_dir.join(format!("{table}.csv")));
@@ -3999,7 +4028,7 @@ impl DocumentInfo {
     pub fn fallback_tables(&self) -> Vec<String> {
         match FileType::of(&self.filename).map(FileType::load) {
             Some(Load::Table(_)) => vec![TableName::of_file(&self.filename).into_string()],
-            Some(Load::Workbook | Load::Chunks(_)) | None => Vec::new(),
+            Some(Load::Workbook | Load::Chunks(_) | Load::Image(_)) | None => Vec::new(),
         }
     }
 }

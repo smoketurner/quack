@@ -28,6 +28,7 @@ use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
 use crate::graph::views;
 use crate::ids::{ChunkId, DocumentId};
+use crate::llm::vision::ImageReader;
 use crate::progress::{ChunkDone, RunControl};
 use crate::storage::profile::ColumnTypes;
 use crate::storage::workspace::{
@@ -35,11 +36,12 @@ use crate::storage::workspace::{
     NewDocument, WorkspaceDb, quote_ident,
 };
 use crate::storage::writer::Writer;
-use crate::text::NonBlankText;
+use crate::text::{NonBlankText, OneLine};
 use budget::DecompressionBudget;
 use chunker::Chunker;
 use parser::{
-    DocumentMeta, FileType, Load, PageCounts, Reader, SectionKind, Separator, TextFormat,
+    DocumentMeta, FileType, ImageFormat, Load, PageCounts, Reader, SectionKind, Separator,
+    TextFormat,
 };
 use table::Table;
 
@@ -223,7 +225,7 @@ pub async fn ingest_file<M: EmbeddingModel>(
     file: &NewFile<'_>,
     embedder: Option<&Embedder<M>>,
 ) -> Result<IngestOutcome> {
-    let pending = Pending::of(file)?;
+    let pending = Pending::of(config, file)?;
     let doc_id = match db.run(move |db| pending.register(db)).await? {
         Registration::New(id) => id,
         Registration::Duplicate(existing) => return Ok(IngestOutcome::Duplicate(existing)),
@@ -241,6 +243,79 @@ pub async fn ingest_file<M: EmbeddingModel>(
     Ok(IngestOutcome::Ingested(result))
 }
 
+/// The copy of an ingested image kept under the workspace's `files/`
+/// directory as `<document id>.<ext>`, so it travels with snapshots and is
+/// shown beside its text; deleting the document removes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredImage {
+    path: PathBuf,
+    format: ImageFormat,
+}
+
+impl StoredImage {
+    /// Where `document`'s image is kept in `workspace_id`.
+    #[must_use]
+    pub fn of(
+        config: &Config,
+        workspace_id: &str,
+        document: &DocumentId,
+        format: ImageFormat,
+    ) -> Self {
+        Self::in_dir(&config.workspace_files_dir(workspace_id), document, format)
+    }
+
+    /// Where `document`'s image is kept under `files_dir`.
+    #[must_use]
+    pub fn in_dir(files_dir: &Path, document: &DocumentId, format: ImageFormat) -> Self {
+        Self {
+            path: files_dir.join(format!("{document}.{}", format.extension())),
+            format,
+        }
+    }
+
+    /// The image `document` (named `filename`) keeps, when it is one.
+    #[must_use]
+    pub fn of_document(
+        config: &Config,
+        workspace_id: &str,
+        document: &DocumentId,
+        filename: &str,
+    ) -> Option<Self> {
+        match FileType::of(filename) {
+            Some(FileType::Image(format)) => Some(Self::of(config, workspace_id, document, format)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub const fn format(&self) -> ImageFormat {
+        self.format
+    }
+
+    /// Keep `bytes` as the image.
+    async fn write(&self, bytes: &[u8]) -> Result<()> {
+        if let Some(dir) = self.path.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        tokio::fs::write(&self.path, bytes).await?;
+        Ok(())
+    }
+
+    /// The image's bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read.
+    pub async fn read(&self) -> Result<Vec<u8>> {
+        Ok(tokio::fs::read(&self.path).await?)
+    }
+}
+
 /// Insert the document row with status `queued` and return its id, or the
 /// document already holding the same bytes (by SHA-256) so the caller can
 /// skip it. Fails before writing anything for a file type nothing can parse.
@@ -248,8 +323,12 @@ pub async fn ingest_file<M: EmbeddingModel>(
 /// # Errors
 ///
 /// Returns `UnsupportedFileType` or a storage error.
-pub fn register_document(db: &WorkspaceDb, file: &NewFile<'_>) -> Result<Registration> {
-    Pending::of(file)?.register(db)
+pub fn register_document(
+    db: &WorkspaceDb,
+    config: &Config,
+    file: &NewFile<'_>,
+) -> Result<Registration> {
+    Pending::of(config, file)?.register(db)
 }
 
 /// What registering a file writes, owned and without its bytes, so the
@@ -268,12 +347,15 @@ struct Pending {
 }
 
 impl Pending {
-    /// Hash the bytes and refuse an empty file or a type nothing can parse,
-    /// before any write.
-    fn of(file: &NewFile<'_>) -> Result<Self> {
+    /// Hash the bytes and refuse an empty file, a type nothing can parse,
+    /// or an image with no vision model to read it, before any write.
+    fn of(config: &Config, file: &NewFile<'_>) -> Result<Self> {
         let Some(file_type) = FileType::of(file.filename) else {
             return Err(Error::UnsupportedFileType(file.filename.to_owned()));
         };
+        if matches!(file_type.load(), Load::Image(_)) && config.ingestion.vision_model.is_none() {
+            return Err(Error::NoVisionModel(file.filename.to_owned()));
+        }
         if file.data.is_empty() {
             return Err(Error::EmptyFile(file.filename.to_owned()));
         }
@@ -449,13 +531,39 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     ..IngestResult::of(doc_id, filename, file_type)
                 })
             }
-            Load::Chunks(format) => self.chunk(format, file_type).await,
+            Load::Chunks(format) => self.chunk(format, file_type, self.file.data).await,
+            Load::Image(format) => self.image(format, file_type).await,
         }
+    }
+
+    /// Have the vision model read the image, keep the original under
+    /// `files/`, and chunk what the model wrote as a Markdown document
+    /// titled after the file.
+    async fn image(&self, format: ImageFormat, file_type: FileType) -> Result<IngestResult> {
+        let (config, filename) = (self.config, self.file.filename);
+        let reader = ImageReader::for_ingest(config)
+            .await?
+            .ok_or_else(|| Error::NoVisionModel(filename.to_owned()))?;
+        let stored = StoredImage::of(config, self.workspace_id, self.document_id, format);
+        stored.write(self.file.data).await?;
+        let text = self
+            .file
+            .control
+            .or_cancelled(reader.read(self.file.data, format, "Read this image."))
+            .await?;
+        let markdown = format!("# {}\n\n{text}\n", OneLine(filename));
+        self.chunk(TextFormat::Markdown, file_type, markdown.as_bytes())
+            .await
     }
 
     /// Parse and chunk a text document, record what it says about itself,
     /// load the tables inside it that are big enough, and embed the chunks.
-    async fn chunk(&self, format: TextFormat, file_type: FileType) -> Result<IngestResult> {
+    async fn chunk(
+        &self,
+        format: TextFormat,
+        file_type: FileType,
+        data: &[u8],
+    ) -> Result<IngestResult> {
         let (config, db, workspace_id, doc_id, embedder) = (
             self.config,
             self.db,
@@ -463,7 +571,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
             self.document_id,
             self.embedder,
         );
-        let (filename, data, control) = (self.file.filename, self.file.data, self.file.control);
+        let (filename, control) = (self.file.filename, self.file.control);
         // Parsing and chunking are the slow, CPU-bound part: off the
         // runtime's workers, and not on the writer.
         let parsing = Parsing::new(config, format, filename, data);

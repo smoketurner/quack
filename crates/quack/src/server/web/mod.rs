@@ -479,6 +479,8 @@ struct PassagePage {
     /// Positions of the chunks before and after, when they exist.
     previous: Option<u32>,
     next: Option<u32>,
+    /// Whether the document is an image, shown above its text.
+    image: bool,
 }
 
 #[derive(Template)]
@@ -1024,6 +1026,7 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/documents/rows", get(document_rows))
         .route("/w/{id}/documents/status", get(document_status))
         .route("/w/{id}/documents/{doc}/chunks/{n}", get(passage))
+        .route("/w/{id}/documents/{doc}/image", get(document_image))
         .route("/w/{id}/documents/{doc}/pin", post(pin))
         .route("/w/{id}/documents/{doc}/unpin", post(unpin))
         .route("/w/{id}/documents/{doc}/delete", post(delete_doc))
@@ -1756,11 +1759,24 @@ async fn passage(
     html(&PassagePage {
         page: Page::in_workspace(&app, Tab::Documents, &access),
         total: document.chunk_count,
+        image: document
+            .mime_type
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("image/")),
         document,
         chunk,
         previous,
         next,
     })
+}
+
+async fn document_image(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    Ok(docs_api::read_image(&app, &access, &doc).await?)
 }
 
 async fn pin(

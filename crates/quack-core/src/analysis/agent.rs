@@ -24,10 +24,11 @@ use super::text_to_sql::{Modeled, PromptOptions, Question, SystemPrompt};
 use super::tools::{
     CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, FindTablesTool,
     GraphTools, ListDocumentsTool, ListTablesTool, ReadDocumentTool, ReaderDb, RunSqlTool,
-    SearchDocumentsTool, SearchGraphTool, SharedDb, Turn,
+    SearchDocumentsTool, SearchGraphTool, SharedDb, Turn, ViewImageTool,
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::{GraphResult, store as graph_store};
+use crate::llm::vision::ImageReader;
 use crate::llm::{ChatModel, OLLAMA_KEEP_ALIVE, RerankModel, SchemaCall};
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
@@ -254,6 +255,7 @@ where
         self,
         completion_model: ChatModel,
         reranker_call: Option<SchemaCall<RerankAnswer>>,
+        images: Option<ImageReader>,
         sink: EventSink,
     ) -> Result<AgentResponse> {
         let max_turns = usize::try_from(self.config.max_turns)
@@ -272,7 +274,7 @@ where
             .await,
         );
         match this
-            .run_inner(completion_model, reranker_call, &recorder)
+            .run_inner(completion_model, reranker_call, images, &recorder)
             .await
         {
             Ok(response) => {
@@ -293,6 +295,8 @@ struct PromptAndModel {
     system_prompt: String,
     modeled: Modeled,
     tables: TableLayout,
+    /// Whether a ready document is an image, for `view_image` to look at.
+    has_images: bool,
 }
 
 impl Question {
@@ -359,6 +363,7 @@ impl PromptAndModel {
                         &graph_store::status(db)?,
                     ),
                     tables: TableLayout::of(user_tables(db)?.len()),
+                    has_images: db.has_images()?,
                 })
             })
             .await
@@ -523,6 +528,7 @@ where
         self,
         completion_model: ChatModel,
         reranker_call: Option<SchemaCall<RerankAnswer>>,
+        images: Option<ImageReader>,
         recorder: &TurnRecorder,
     ) -> Result<AgentResponse> {
         let Self {
@@ -555,6 +561,7 @@ where
             window,
             rerank_model,
             reranker_call,
+            images: images.filter(|_| read.has_images),
             turn: turn.clone(),
         }
         .build_agent(completion_model, embedding_model, &read.system_prompt)?;
@@ -859,6 +866,9 @@ struct BuildContext<'a> {
     /// `dispatch`'s `schema_call`. `Some` only when `rerank = "model"`; the
     /// search tool wires it in, the other rerank modes ignore it.
     reranker_call: Option<SchemaCall<RerankAnswer>>,
+    /// The chat model reading images for `view_image`, when it reads them
+    /// and the workspace holds one.
+    images: Option<ImageReader>,
     /// The turn the agent runs: `always_retrieve` records on it that it
     /// put chunk text in the prompt.
     turn: Turn,
@@ -931,6 +941,10 @@ impl BuildContext<'_> {
         // even when nothing has been extracted into the graph yet.
         if ctx.modeled.has_ontology() {
             builder = builder.tool(DescribeClassTool(reader()));
+        }
+
+        if let Some(images) = ctx.images {
+            builder = builder.tool(ViewImageTool::new(reader(), images));
         }
 
         if ctx.tables == TableLayout::Ranked {

@@ -243,6 +243,58 @@ pub(crate) async fn chunks(
     }))
 }
 
+/// The image an image document keeps, as the response that serves it,
+/// audited as opening the document.
+pub(crate) async fn read_image(
+    app: &App,
+    access: &Access,
+    doc: &DocumentId,
+) -> ApiResult<axum::response::Response> {
+    access
+        .audit(
+            app,
+            AuditAction::Open,
+            Some(ResourceKind::Document.id(doc)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "image": true })),
+        )
+        .await?;
+    let wanted = doc.clone();
+    let image = app
+        .read(&access.membership.workspace.id, move |db| {
+            let document = db
+                .document(&wanted)?
+                .ok_or_else(|| ResourceKind::Document.missing(wanted.as_str()))?;
+            db.stored_image(&document)
+                .ok_or_else(|| ResourceKind::Document.missing(format!("an image named {wanted}")))
+        })
+        .await?;
+    let bytes = image.read().await?;
+    Ok(([(header::CONTENT_TYPE, image.format().mime_type())], bytes).into_response())
+}
+
+/// `GET .../documents/{doc}/image`: the image an image document was
+/// ingested from (PNG, JPEG, WebP, or GIF).
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/documents/{doc}/image",
+    tag = "documents",
+    responses((status = 200, description = "The image, as uploaded", content(
+        (Vec<u8> = "image/png"),
+        (Vec<u8> = "image/jpeg"),
+        (Vec<u8> = "image/webp"),
+        (Vec<u8> = "image/gif"),
+    ))),
+)]
+pub(crate) async fn image(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
+) -> ApiResult<axum::response::Response> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    read_image(&app, &access, &doc).await
+}
+
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct PastedText {
     pub text: String,
@@ -588,9 +640,11 @@ impl Lane<'_> {
             | DocumentSource::Import => None,
         };
         let (source, old) = (self.source, self.replaces.cloned());
+        let config = app.config.clone();
         let registration = with_db(Arc::clone(self.db), move |db| {
             ingestion::register_document(
                 db,
+                &config,
                 &ingestion::NewFile::new(&name, &data)
                     .source(source)
                     .title(title.as_deref())

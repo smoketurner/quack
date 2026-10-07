@@ -33,6 +33,41 @@ pub enum FileType {
     /// Source code, chunked by line with line-number locators.
     Code,
     Rtf,
+    /// A picture, read by `[ingestion].vision_model`.
+    Image(ImageFormat),
+}
+
+/// An image format a vision model takes: what Anthropic, `OpenAI`, and
+/// Ollama all accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFormat {
+    Png,
+    Jpeg,
+    Webp,
+    Gif,
+}
+
+impl ImageFormat {
+    #[must_use]
+    pub const fn mime_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Webp => "image/webp",
+            Self::Gif => "image/gif",
+        }
+    }
+
+    /// The extension a stored copy of the image is saved under.
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+            Self::Webp => "webp",
+            Self::Gif => "gif",
+        }
+    }
 }
 
 /// How a file type loads into a workspace.
@@ -44,6 +79,19 @@ pub enum Load {
     Workbook,
     /// Text in this format, parsed and chunked.
     Chunks(TextFormat),
+    /// A picture a vision model describes; its description is chunked.
+    Image(ImageFormat),
+}
+
+impl Load {
+    /// Whether this load makes workspace tables.
+    #[must_use]
+    pub const fn makes_tables(self) -> bool {
+        match self {
+            Self::Table(_) | Self::Workbook => true,
+            Self::Chunks(_) | Self::Image(_) => false,
+        }
+    }
 }
 
 /// A file type whose text is parsed and chunked.
@@ -179,6 +227,7 @@ impl FileType {
             Self::Srt => Load::Chunks(TextFormat::Srt),
             Self::Code => Load::Chunks(TextFormat::Code),
             Self::Rtf => Load::Chunks(TextFormat::Rtf),
+            Self::Image(format) => Load::Image(format),
         }
     }
 
@@ -186,7 +235,7 @@ impl FileType {
     pub fn table_extensions() -> impl Iterator<Item = &'static str> {
         EXTENSIONS
             .iter()
-            .filter(|(_, file_type)| !matches!(file_type.load(), Load::Chunks(_)))
+            .filter(|(_, file_type)| file_type.load().makes_tables())
             .map(|(ext, _)| *ext)
     }
 
@@ -214,6 +263,7 @@ impl FileType {
             Self::Srt => "application/x-subrip",
             Self::Code => "text/x-source",
             Self::Rtf => "application/rtf",
+            Self::Image(format) => format.mime_type(),
         }
     }
 }
@@ -240,6 +290,7 @@ impl std::fmt::Display for FileType {
             Self::Srt => "SubRip captions",
             Self::Code => "Source code",
             Self::Rtf => "Rich Text",
+            Self::Image(_) => "Image",
         };
         f.write_str(label)
     }
@@ -328,7 +379,9 @@ impl DocumentMeta {
 
 /// How a paginated document's pages read. A page left out of the text is
 /// one of two kinds, which mean different things to the person: its
-/// extraction failed, or it holds no text (a scanned image).
+/// extraction failed, or it holds no text (a scanned image the vision
+/// model did not read). A page the vision model read is counted apart,
+/// since its text is the model's transcription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct PageCounts {
     pub total: u32,
@@ -484,6 +537,11 @@ const EXTENSIONS: &[(&str, FileType)] = &[
     ("xls", FileType::Xlsx),
     ("ods", FileType::Xlsx),
     ("pdf", FileType::Pdf),
+    ("png", FileType::Image(ImageFormat::Png)),
+    ("jpg", FileType::Image(ImageFormat::Jpeg)),
+    ("jpeg", FileType::Image(ImageFormat::Jpeg)),
+    ("webp", FileType::Image(ImageFormat::Webp)),
+    ("gif", FileType::Image(ImageFormat::Gif)),
     ("md", FileType::Markdown),
     ("markdown", FileType::Markdown),
     ("txt", FileType::Text),
@@ -677,8 +735,29 @@ mod tests {
         assert_eq!(FileType::of("main.rs"), Some(FileType::Code));
         assert_eq!(FileType::of("app.PY"), Some(FileType::Code));
         assert_eq!(FileType::of("memo.rtf"), Some(FileType::Rtf));
-        assert_eq!(FileType::of("image.png"), None);
+        assert_eq!(
+            FileType::of("chart.PNG"),
+            Some(FileType::Image(ImageFormat::Png))
+        );
+        assert_eq!(
+            FileType::of("photo.jpeg"),
+            Some(FileType::Image(ImageFormat::Jpeg))
+        );
+        assert_eq!(
+            FileType::of("photo.jpg"),
+            Some(FileType::Image(ImageFormat::Jpeg))
+        );
+        assert_eq!(
+            FileType::of("shot.webp"),
+            Some(FileType::Image(ImageFormat::Webp))
+        );
+        assert_eq!(
+            FileType::of("loop.gif"),
+            Some(FileType::Image(ImageFormat::Gif))
+        );
+        assert_eq!(FileType::of("scan.tiff"), None);
         assert_eq!(FileType::of("noext"), None);
+        assert!(!FileType::table_extensions().any(|e| e == "png"));
         assert!(FileType::table_extensions().any(|e| e == "xlsx"));
         assert!(!FileType::table_extensions().any(|e| e == "epub"));
     }
