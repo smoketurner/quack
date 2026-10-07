@@ -91,7 +91,7 @@ data-layer, crypto, or dependency change:
 cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # SQL, no agent
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
 cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use
-cargo run --bin quack -- workspace rename OLD NEW | delete NAME [-y] | snapshot NAME [--to FILE] | restore FILE|- [--name N]   # storage::backup: one tar (manifest.json, data.duckdb, files/); delete is at once, the audit rows stay
+cargo run --bin quack -- workspace rename OLD NEW | delete NAME [-y] | snapshot NAME [--to FILE|-] | restore FILE|- [--name N]   # storage::backup: one tar (manifest.json, data.duckdb, files/); delete is at once, the audit rows stay
 cargo run --bin quack -- ingest sales.csv -w ws [--replace [ID]] [--types amount=DOUBLE]   # file -> table(s) or chunks; --replace supersedes the document with the same name (or ID) once the new one is ready; --types retypes columns strictly after the load; an image needs [ingestion].vision_model
 cargo run --bin quack -- ingest DIR -w ws [--prune]                            # every supported file under DIR (not a bundle), root and path recorded; re-run skips unchanged, replaces changed, reports gone files of that root (--prune deletes them)
 #   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX, EPUB, ODT, EML/MBOX, VTT/SRT, source code, RTF
@@ -118,7 +118,7 @@ cargo run --bin quack -- auth login|status|logout PROVIDER ; auth jwks [PROVIDER
 cargo run --bin quack -- auth register [--issuer URL] [--device-code|--token-env VAR|--open] [--replace] [--print] | unregister   # RFC 7591/7592 client registration
 cargo run --bin quack -- config [--changed] [--format json]                      # every recognized setting, its value and origin, the file's unknown keys, the env vars read
 cargo run --bin quack -- doctor [--offline] [--format json]                      # every check with its fix: config, data dir mode, workspace, model providers (probed), bind, vault key; exit 1 on a failure
-cargo run --bin quack -- ready [--url URL] ; vault export-key [--to FILE] [-y]          # GET /readyz (the image's HEALTHCHECK); the vault key to a 0600 file or stdout
+cargo run --bin quack -- ready [--url URL] ; vault export-key [--to FILE|-] [-y]          # GET /readyz (the image's HEALTHCHECK); the vault key to a 0600 file or stdout
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit [-w ws --detail --format ocsf [--with-prompt]]   # server admin; --detail joins the workspace's own audit (OCSF ai_operation on queries)
 cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1 (its OpenAPI 3.1 document at /api/v1/openapi.json, rendered at /api/v1/docs), MCP under /mcp/v1/{workspace}; /readyz and /metrics (quack_core::telemetry) outside the limiter; [server].log_format = "json" for a collector; every provider request retried under [providers.NAME].max_retries / retry_backoff_ms (llm::limit::Attempts)
 cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors

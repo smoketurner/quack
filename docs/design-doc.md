@@ -2587,7 +2587,7 @@ quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query] [--documents DOC,
 quack search QUERY [-w NAME] [--in DOC..] [--keyword | --vector] [--explain] [-k N] [-f text|json]
 quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
 quack workspace create NAME | list [--format json] | rename NAME NEW_NAME
-quack workspace delete NAME [-y] | snapshot NAME [--to FILE] | restore FILE|- [--name NAME]
+quack workspace delete NAME [-y] | snapshot NAME [--to FILE|-] | restore FILE|- [--name NAME]
 quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--author A] [--authored DATE] [--tag T].. [--pin] [--no-embed] [--replace [ID]] [--prune]
 quack docs [--format json] [--all] [--pin ID | --unpin ID | --delete ID | --tag ID TAG | --untag ID TAG | --author ID NAME | --authored ID DATE]
 quack embeddings refresh [-w NAME] [-y]
@@ -2627,7 +2627,7 @@ quack config [--changed] [--format json]
 quack doctor [-w NAME] [--offline] [--format json]
 quack serve [--bind ADDR] [--local]
 quack ready [--url URL]    GET /readyz on the server (the default URL from [server].bind), exit 0 or 1; the image's health check
-quack vault export-key [--to FILE] [-y]    the vault key, to a 0600 file or (after a yes) stdout
+quack vault export-key [--to FILE|-] [-y]    the vault key, to a 0600 file or (after a yes) stdout
 quack mcp [-w NAME] [--allow-write]
 quack user add [--admin] | list [--format json] ; quack token create|list|revoke ;
 quack member add|remove|list ; quack audit [filters] [--format text|json|csv|ocsf]   (server admin)
@@ -2669,7 +2669,7 @@ through `WorkspaceDb::open`. Windows lets no other handle read a DuckDB file in 
 is the one path on every OS (#448). In `quack serve` the tar is spooled to an unnamed file
 under the data directory while the file is closed, and the download streams from it; the
 workspace's requests wait for the copy, not the download, and other workspaces never wait.
-`quack workspace snapshot NAME [--to FILE]`, the Settings page's download, and
+`quack workspace snapshot NAME [--to FILE|-]`, the Settings page's download, and
 `GET .../snapshot` write it; `quack workspace restore FILE [--name N]` and
 `POST /api/v1/workspaces/restore` read it: a new row (the manifest's name unless given),
 the tar unpacked into the new directory (paths that leave it are refused), the settings

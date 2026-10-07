@@ -299,7 +299,8 @@ enum VaultAction {
     /// Print the vault key, or write it to a file only its owner can read;
     /// a copy of control.db restored on another host needs it as vault.key
     ExportKey {
-        /// Write the key here (mode 0600) instead of printing it
+        /// Write the key here (mode 0600) instead of printing it (`-`
+        /// prints it)
         #[arg(long, value_name = "FILE")]
         to: Option<PathBuf>,
         /// Print without asking
@@ -321,7 +322,7 @@ impl VaultAction {
         };
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        if let Some(path) = to {
+        if let Some(path) = to.filter(|path| path.as_os_str() != "-") {
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]

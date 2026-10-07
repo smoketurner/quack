@@ -2,7 +2,7 @@
 //! members, and the access audit log. Every mutation is itself audited on the `cli`
 //! channel with no user, because the operator at the shell is implicit.
 
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -94,7 +94,7 @@ pub(crate) enum WorkspaceAction {
     /// uploaded files, and a manifest naming its members and settings
     Snapshot {
         name: String,
-        /// Write the tar here instead of stdout
+        /// Write the tar here instead of stdout (`-` is stdout)
         #[arg(long, value_name = "FILE")]
         to: Option<PathBuf>,
     },
@@ -318,13 +318,15 @@ impl WorkspaceAction {
         Ok(())
     }
 
-    /// `quack workspace snapshot`: the tar to `to`, or to a piped stdout.
+    /// `quack workspace snapshot`: the tar to `to`, or to a piped stdout
+    /// when `to` is absent or `-`.
     async fn snapshot(
         config: &Config,
         control: &ControlPlane,
         name: &str,
         to: Option<PathBuf>,
     ) -> Result<()> {
+        let to = to.filter(|path| path.as_os_str() != "-");
         let stdout = std::io::stdout();
         let ws = control.workspace_named(name).await?;
         let described = Described::of(control, &ws).await?;
@@ -361,7 +363,9 @@ impl WorkspaceAction {
         Ok(())
     }
 
-    /// `quack workspace restore`: a new workspace from `file` (`-` is stdin).
+    /// `quack workspace restore`: a new workspace from `file` (`-` is stdin,
+    /// spooled to a 0600 file in the data directory, since a restore reads
+    /// its tar twice and a snapshot can be larger than memory).
     async fn restore(
         config: &Config,
         control: &ControlPlane,
@@ -370,19 +374,20 @@ impl WorkspaceAction {
     ) -> Result<()> {
         let stdout = std::io::stdout();
         let audit = |action| AuditEntry::new(action, Outcome::Allowed, Channel::Cli);
-        let source = if file.as_os_str() == "-" {
-            let mut bytes = Vec::new();
-            std::io::stdin().lock().read_to_end(&mut bytes)?;
-            Source::Bytes(bytes)
+        let spool = if file.as_os_str() == "-" {
+            let mut spool = tempfile::NamedTempFile::new_in(config.data_dir())?;
+            std::io::copy(&mut std::io::stdin().lock(), &mut spool)?;
+            Some(spool)
         } else {
-            Source::File(file)
+            None
         };
+        let path = spool.as_ref().map_or(file, |spool| spool.path().to_owned());
         let restored = RestoreRequest {
             name,
             owner: None,
             audit: &audit,
         }
-        .run(control, config, move || source.open())
+        .run(control, config, move || std::fs::File::open(&path))
         .await?;
         let mut out = stdout.lock();
         writeln!(
@@ -410,21 +415,6 @@ impl WorkspaceAction {
         }
         out.flush()?;
         Ok(())
-    }
-}
-
-/// Where a restore reads its tar from, twice: the manifest, then the files.
-enum Source {
-    File(PathBuf),
-    Bytes(Vec<u8>),
-}
-
-impl Source {
-    fn open(&self) -> std::io::Result<Box<dyn Read + Send>> {
-        Ok(match self {
-            Self::File(path) => Box::new(std::fs::File::open(path)?),
-            Self::Bytes(bytes) => Box::new(std::io::Cursor::new(bytes.clone())),
-        })
     }
 }
 
