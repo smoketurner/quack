@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS _quack_saved_runs (
 );";
 
 /// A question with the statements its answer ran.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct SavedQuestion {
     pub id: SavedId,
     pub name: String,
@@ -300,7 +300,9 @@ pub fn remove(db: &WorkspaceDb, id: &SavedId) -> Result<bool> {
 }
 
 /// How a run ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum RunStatus {
     /// Every statement ran.
@@ -312,7 +314,7 @@ pub enum RunStatus {
 text_enum!(RunStatus, "run status", { Ok => "ok", Failed => "failed" });
 
 /// One statement of a run.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct StatementRun {
     pub sql: String,
     /// The digest of the columns and every row in any order
@@ -364,7 +366,7 @@ impl StatementRun {
 }
 
 /// One run of a saved question.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct SavedRun {
     pub id: RunId,
     pub saved_id: SavedId,

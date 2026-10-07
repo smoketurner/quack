@@ -119,7 +119,7 @@ cargo run --bin quack -- config [--changed] [--format json]                     
 cargo run --bin quack -- doctor [--offline] [--format json]                      # every check with its fix: config, data dir mode, workspace, model providers (probed), bind, vault key; exit 1 on a failure
 cargo run --bin quack -- ready [URL] ; vault export-key [--to FILE] [-y]          # GET /readyz (the image's HEALTHCHECK); the vault key to a 0600 file or stdout
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit [-w ws --detail --format ocsf [--with-prompt]]   # server admin; --detail joins the workspace's own audit (OCSF ai_operation on queries)
-cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1, MCP under /mcp/v1/{workspace}; /readyz and /metrics (quack_core::telemetry) outside the limiter; [server].log_format = "json" for a collector; every provider request retried under [providers.NAME].max_retries / retry_backoff_ms (llm::limit::Attempts)
+cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1 (its OpenAPI 3.1 document at /api/v1/openapi.json, rendered at /api/v1/docs), MCP under /mcp/v1/{workspace}; /readyz and /metrics (quack_core::telemetry) outside the limiter; [server].log_format = "json" for a collector; every provider request retried under [providers.NAME].max_retries / retry_backoff_ms (llm::limit::Attempts)
 cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors
 ```
 
@@ -300,7 +300,7 @@ temporary client stays recorded (sealed) until deleted, so an interrupted run le
 `--token-env` or `--open`. RFC 7592 carries
 each rotation step's key set (`Registrar::publish_keys`, a full-metadata `PUT`) and deletes the
 client (`unregister`).
-Every interface returns one response object, `AgentResponse::to_json` (answer, citations with
+Every interface returns one response object, `AgentResponseBody` from `AgentResponse::body` (answer, citations with
 labels and the document's `ingested_at`, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `duration_ms`, `session_id`); a write refused
 inside a turn is `write_refused: true` (REST 200, MCP structured content, print exit 3). A streamed
 web or REST turn from someone who may write asks instead: a `permission_required` SSE event, answered
@@ -409,7 +409,7 @@ numbers or dates stored as text, a repeating key) is worked out when read, with 
 `--types` at ingest and import). Owners' notes are `profile::TableNote` (`_quack_table_notes`).
 The ontology's `Property` carries `description`, `unit`, `synonyms`, and `Ontology::measures`
 (a SQL expression over one table, checked as a read at save); `WorkspaceDb::describe_table`
-returns all of it on `TableDescription` (`to_json` is the one REST, MCP, and CLI shape). Past
+returns all of it on `TableDescription` (`TableDescription::body`, a `TableDescriptionBody`, is the one REST, MCP, and CLI shape). Past
 `table_search::DETAILED_TABLES` (25) user tables, `find_tables` registers and the prompt ranks
 tables against the question after the workspace context (`analysis::table_search`: a card per
 table, BM25 with `tokenize`, plus cosine over card vectors in `_quack_table_cards` refreshed at
@@ -535,8 +535,18 @@ serves `GET .../jobs`, `.../jobs/stream` (SSE), `.../jobs/{job}`, and `POST .../
 and `/w/{id}/jobs` is the web console's Jobs page. The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
 the same `Access::resolve` checks and the API's `Access` operations; `WebUser` redirects to `/login` instead
 of a 401; the built Tailwind CSS is committed (`make css-build` after template edits),
-htmx and ECharts are vendored, and the SQL page's CodeMirror editor is bundled from
-`crates/quack/editor/` (`make editor-build`, bundle committed; `docs/web-ui.md`). Tests drive the router with
+htmx, ECharts, and Redoc are vendored, and the SQL page's CodeMirror editor is bundled from
+`crates/quack/editor/` (`make editor-build`, bundle committed; `docs/web-ui.md`). The API's
+contract is `server/api/openapi.rs`: an OpenAPI 3.1 document generated with `utoipa` from a
+`#[utoipa::path]` on every handler and `ToSchema` on every request and response type (core
+types included), served at `/api/v1/openapi.json` and rendered by Redoc at `/api/v1/docs`,
+both beside `/healthz` (no sign-in, no audit, no limiter). A new route goes through
+`api::ApiRoutes::route` and needs its annotation in `ApiDoc`'s `paths`; the tests in
+`api/openapi/tests.rs` fail otherwise, and also when a method the router answers is not
+documented. Every API error is `{"error", "code"}` with a stable `server::error::ErrorCode`
+(`ErrorCode::of` maps each core error, `of_turn` each `FailureKind`); the SSE `error` event
+carries the same JSON, and `error::coded_errors` gives the framework's own errors under
+`/api/` (rejections, 405, 429, 504) the same body. Tests drive the router with
 `tower::ServiceExt::oneshot` and no model. The full CLI (`quack -p`, `quack serve`, `quack mcp`,
 `quack ontology propose`, ...) is specified in design doc section 11.
 

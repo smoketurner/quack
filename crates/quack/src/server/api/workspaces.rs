@@ -14,24 +14,39 @@ use axum::response::{IntoResponse, Response};
 use quack_core::ids::WorkspaceId;
 use quack_core::ocsf::PromptText;
 use quack_core::okf;
-use quack_core::storage::audit;
-use quack_core::storage::backup::{Described, Manifest, RestoreRequest};
+use quack_core::storage::audit::{self, AuditDetailRow};
+use quack_core::storage::backup::{Described, Manifest, RestoreRequest, Restored};
 use quack_core::storage::control::{
     AuditAction, Membership, Outcome, ProviderAllowList, ResourceKind, Role, Standing, UserKind,
     WorkspaceChanges, WorkspaceName, WorkspaceRow,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use utoipa::ToSchema;
 
 use crate::server::api::okf::{BodyWriter, CHUNKS_IN_FLIGHT};
 use crate::server::auth::{Access, Credential, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, ServeMode};
 
+/// The workspaces the caller can reach.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct WorkspaceList {
+    pub workspaces: Vec<Membership>,
+}
+
+/// The caller's workspaces with their role in each; an admin sees every
+/// workspace, a token only its own.
+#[utoipa::path(
+    get,
+    path = "/workspaces",
+    tag = "workspaces",
+    responses((status = 200, description = "The workspaces", body = WorkspaceList)),
+)]
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<WorkspaceList>> {
     let rows = if app.mode == ServeMode::Local {
         app.control
             .list_workspaces()
@@ -73,14 +88,22 @@ pub(crate) async fn list(
     } else {
         app.control.workspaces_for_user(&identity.user_id).await?
     };
-    Ok(Json(serde_json::json!({ "workspaces": rows })))
+    Ok(Json(WorkspaceList { workspaces: rows }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct CreateWorkspace {
     pub name: String,
 }
 
+/// Create a workspace (admins); the creator owns it.
+#[utoipa::path(
+    post,
+    path = "/workspaces",
+    tag = "workspaces",
+    request_body = CreateWorkspace,
+    responses((status = 201, description = "Created", body = Membership)),
+)]
 pub(crate) async fn create(
     State(app): State<App>,
     identity: Identity,
@@ -109,6 +132,13 @@ impl Identity {
     }
 }
 
+/// The workspace and the caller's role in it.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}",
+    tag = "workspaces",
+    responses((status = 200, description = "The workspace", body = Membership)),
+)]
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
@@ -121,7 +151,7 @@ pub(crate) async fn show(
     Ok(Json(access.membership))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct UpdateWorkspace {
     /// A new name, which `-w` and the URL bar then use.
     pub name: Option<String>,
@@ -130,6 +160,14 @@ pub(crate) struct UpdateWorkspace {
     pub allowed_providers: Option<BTreeSet<String>>,
 }
 
+/// Rename the workspace or change its settings (owners).
+#[utoipa::path(
+    patch,
+    path = "/workspaces/{id}",
+    tag = "workspaces",
+    request_body = UpdateWorkspace,
+    responses((status = 200, description = "The workspace as it now is", body = Membership)),
+)]
 pub(crate) async fn update(
     State(app): State<App>,
     identity: Identity,
@@ -160,6 +198,12 @@ pub(crate) async fn update(
 /// the writer's thread after a checkpoint and streamed to the body as
 /// the OKF export is. Audited as `snapshot`, since it moves the whole
 /// workspace across the boundary.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/snapshot",
+    tag = "workspaces",
+    responses((status = 200, description = "The snapshot", content_type = "application/x-tar", body = Vec<u8>)),
+)]
 pub(crate) async fn snapshot(
     State(app): State<App>,
     identity: Identity,
@@ -225,7 +269,8 @@ pub(crate) async fn snapshot(
         .into_response())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct RestoreQuery {
     /// The new workspace's name; the snapshot's own when absent.
     pub name: Option<String>,
@@ -234,6 +279,14 @@ pub(crate) struct RestoreQuery {
 /// `POST /workspaces/restore`: a snapshot's tar as the body becomes a new
 /// workspace, for admins; in login mode the admin owns it beside the
 /// snapshot's members. The body is bounded by `[server].max_upload_mb`.
+#[utoipa::path(
+    post,
+    path = "/workspaces/restore",
+    tag = "workspaces",
+    params(RestoreQuery),
+    request_body(content = Vec<u8>, content_type = "application/x-tar", description = "A snapshot from `GET .../snapshot` or `quack workspace snapshot`"),
+    responses((status = 201, description = "Restored", body = Restored)),
+)]
 pub(crate) async fn restore(
     State(app): State<App>,
     identity: Identity,
@@ -260,6 +313,12 @@ pub(crate) async fn restore(
 /// tokens with it) and its directory, for an owner, once no job of it is
 /// active. The access row is committed with the row; no detail row can
 /// follow it into a file that no longer exists.
+#[utoipa::path(
+    delete,
+    path = "/workspaces/{id}",
+    tag = "workspaces",
+    responses((status = 204, description = "Deleted")),
+)]
 pub(crate) async fn delete(
     State(app): State<App>,
     identity: Identity,
@@ -348,13 +407,16 @@ impl Access {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct AuditQuery {
+    /// Rows at most, newest first.
     #[serde(default = "default_limit")]
+    #[param(default = 100)]
     pub limit: u32,
     /// `ocsf`: each detail row joined to its access row as an OCSF event
     /// (the `ai_operation` profile on queries); absent, the detail rows.
-    pub format: Option<String>,
+    pub format: Option<AuditFormat>,
     /// With `format=ocsf`, carry the question's text on query events.
     #[serde(default)]
     pub prompt: bool,
@@ -364,13 +426,42 @@ fn default_limit() -> u32 {
     100
 }
 
+/// The shapes the workspace audit comes in besides its own rows.
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AuditFormat {
+    Ocsf,
+}
+
+/// The workspace's audit detail, newest first.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct AuditDetail {
+    pub audit: AuditEntries,
+}
+
+/// Detail rows, or OCSF events.
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub(crate) enum AuditEntries {
+    Detail(Vec<AuditDetailRow>),
+    /// OCSF 1.x events, whose schema is OCSF's own.
+    Ocsf(Vec<serde_json::Value>),
+}
+
 /// The content half of the audit, for members only (design doc 12).
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/audit",
+    tag = "workspaces",
+    params(AuditQuery),
+    responses((status = 200, description = "The audit detail", body = AuditDetail)),
+)]
 pub(crate) async fn audit_detail(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Query(q): Query<AuditQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<AuditDetail>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let limit = q.limit;
     let rows = app.read(&id, move |db| audit::list(db, limit)).await?;
@@ -383,17 +474,13 @@ pub(crate) async fn audit_detail(
             None,
         )
         .await?;
-    match q.format.as_deref() {
-        None => Ok(Json(serde_json::json!({ "audit": rows }))),
-        Some("ocsf") => {
-            let events = app
-                .control
+    let audit = match q.format {
+        None => AuditEntries::Detail(rows),
+        Some(AuditFormat::Ocsf) => AuditEntries::Ocsf(
+            app.control
                 .ocsf_events(&rows, PromptText::from(q.prompt))
-                .await?;
-            Ok(Json(serde_json::json!({ "audit": events })))
-        }
-        Some(other) => Err(ApiError::bad_request(format!(
-            "format must be ocsf, not {other}"
-        ))),
-    }
+                .await?,
+        ),
+    };
+    Ok(Json(AuditDetail { audit }))
 }

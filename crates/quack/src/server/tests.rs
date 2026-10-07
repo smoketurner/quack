@@ -632,6 +632,106 @@ async fn workspaces_follow_membership_roles_and_admin_limits() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// Every error a client sees carries a stable `code` beside the message:
+/// a handler's own, a core error's, and the framework's (a body that is not
+/// JSON, a method the route lacks, a path that does not exist).
+#[tokio::test(flavor = "multi_thread")]
+async fn error_responses_carry_a_stable_code() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("codes", &owner).await;
+    let token = h.login("owner").await;
+    let code = |body: &serde_json::Value| body["code"].as_str().unwrap_or_default().to_owned();
+
+    let (status, body) = h.get("/api/v1/workspaces", "not-a-token").await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (StatusCode::UNAUTHORIZED, "unauthorized"),
+        "{body}"
+    );
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            &token,
+            serde_json::json!({ "sql": "SELECT * FROM no_such_table" }),
+        )
+        .await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "sql_failed"),
+        "{body}"
+    );
+    assert!(
+        body["error"].as_str().is_some_and(|m| !m.is_empty()),
+        "{body}"
+    );
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/query"),
+            &token,
+            serde_json::json!({ "prompt": "hi" }),
+        )
+        .await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (StatusCode::BAD_REQUEST, "no_chat_model"),
+        "{body}"
+    );
+    let (status, body) = h
+        .post(
+            "/api/v1/workspaces",
+            &token,
+            serde_json::json!({ "name": "codes" }),
+        )
+        .await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (StatusCode::FORBIDDEN, "forbidden"),
+        "{body}"
+    );
+    let (status, body) = h
+        .get(
+            &format!("/api/v1/workspaces/{ws}/sessions/{}", SessionId::generate()),
+            &token,
+        )
+        .await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (StatusCode::NOT_FOUND, "not_found"),
+        "{body}"
+    );
+
+    let request = Request::post(format!("/api/v1/workspaces/{ws}/sql"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from("SELECT 1"))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body, _) = h.send(request).await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type"),
+        "{body}"
+    );
+    let (status, body) = h
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
+        "{body}"
+    );
+    let (status, body) = h.get("/api/v1/no-such-route", &token).await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (StatusCode::NOT_FOUND, "not_found"),
+        "{body}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
     let h = harness(ServeMode::Login).await;
@@ -6253,7 +6353,11 @@ async fn a_stopping_server_closes_its_runs_and_refuses_new_work_on_the_record() 
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, format!("event: error\ndata: {stopping}\n\n"));
+    // The `error` event's data is the same coded body a failed request has.
+    assert_eq!(
+        body,
+        format!("event: error\ndata: {{\"error\":\"{stopping}\",\"code\":\"busy\"}}\n\n")
+    );
     let (status, body) = h
         .post(
             &format!("/api/v1/workspaces/{ws}/query"),
@@ -6262,7 +6366,11 @@ async fn a_stopping_server_closes_its_runs_and_refuses_new_work_on_the_record() 
         )
         .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(body.to_string().contains(stopping), "{body}");
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": stopping, "code": "busy" }),
+        "{body}"
+    );
 }
 
 /// An MCP `query` turn is cut short by the server stopping, like any other

@@ -6,8 +6,10 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum_extra::extract::CookieJar;
-use quack_core::storage::control::{AuditAction, Outcome, PasswordCheck};
-use serde::Deserialize;
+use quack_core::ids::UserId;
+use quack_core::storage::control::{AuditAction, Outcome, PasswordCheck, UserKind, UserRow};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::server::auth::{
     Credential, Identity, Login, Peer, RequestId, SessionCookie, password_login,
@@ -15,12 +17,30 @@ use crate::server::auth::{
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, ServeMode};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct LoginRequest {
     pub username: String,
     pub password: String,
 }
 
+/// A login: the session token, also set as the `quack_session` cookie.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct LoginResponse {
+    /// Send as `Authorization: Bearer`.
+    pub token: String,
+    pub user: UserRow,
+}
+
+/// Sign in with a password: a session token for scripts, and the session
+/// cookie for browsers.
+#[utoipa::path(
+    post,
+    path = "/auth/login",
+    tag = "auth",
+    security(()),
+    request_body = LoginRequest,
+    responses((status = 200, description = "Signed in", body = LoginResponse)),
+)]
 pub(crate) async fn login(
     State(app): State<App>,
     peer: Peer,
@@ -35,10 +55,20 @@ pub(crate) async fn login(
         password_login(&app, peer, request_id, &body.username, &body.password).await?;
     Ok((
         jar.add(SessionCookie::issue(&app, peer, token.clone())),
-        Json(serde_json::json!({ "token": token.as_str(), "user": user })),
+        Json(LoginResponse {
+            token: token.as_str().to_owned(),
+            user,
+        }),
     ))
 }
 
+/// End this login; for any credential but a session, nothing happens.
+#[utoipa::path(
+    post,
+    path = "/auth/logout",
+    tag = "auth",
+    responses((status = 204, description = "Signed out")),
+)]
 pub(crate) async fn logout(
     State(app): State<App>,
     identity: Identity,
@@ -76,6 +106,12 @@ impl Identity {
 
 /// `POST /auth/logout-all`: every session of this user ends, this one
 /// included, and their stored sign-in token goes.
+#[utoipa::path(
+    post,
+    path = "/auth/logout-all",
+    tag = "auth",
+    responses((status = 204, description = "Every session ended")),
+)]
 pub(crate) async fn logout_all(
     State(app): State<App>,
     identity: Identity,
@@ -93,7 +129,7 @@ pub(crate) async fn logout_all(
     Ok((jar.remove(SessionCookie::clear()), StatusCode::NO_CONTENT))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct ChangePassword {
     pub current: String,
     pub new: String,
@@ -102,6 +138,13 @@ pub(crate) struct ChangePassword {
 /// `POST /auth/password`: a person's own password, proven by the current
 /// one (under the login lockout, as a login is); every other session of
 /// theirs ends.
+#[utoipa::path(
+    post,
+    path = "/auth/password",
+    tag = "auth",
+    request_body = ChangePassword,
+    responses((status = 204, description = "Changed")),
+)]
 pub(crate) async fn change_password(
     State(app): State<App>,
     identity: Identity,
@@ -147,16 +190,42 @@ pub(crate) async fn change_password(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub(crate) async fn me(identity: Identity) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "id": identity.user_id,
-        "username": identity.username,
-        "is_admin": identity.kind,
-        "via": match identity.credential {
-            Credential::Local => "local",
-            Credential::Session(_) => "session",
-            Credential::Token(_) => "token",
-            Credential::IdentityProvider => "identity-provider",
+/// How the caller proved who they are.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Via {
+    Local,
+    Session,
+    Token,
+    IdentityProvider,
+}
+
+/// The caller.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct Me {
+    pub id: UserId,
+    pub username: String,
+    pub is_admin: UserKind,
+    pub via: Via,
+}
+
+/// Who the credential names.
+#[utoipa::path(
+    get,
+    path = "/auth/me",
+    tag = "auth",
+    responses((status = 200, description = "The caller", body = Me)),
+)]
+pub(crate) async fn me(identity: Identity) -> Json<Me> {
+    Json(Me {
+        id: identity.user_id,
+        username: identity.username,
+        is_admin: identity.kind,
+        via: match identity.credential {
+            Credential::Local => Via::Local,
+            Credential::Session(_) => Via::Session,
+            Credential::Token(_) => Via::Token,
+            Credential::IdentityProvider => Via::IdentityProvider,
         },
-    }))
+    })
 }

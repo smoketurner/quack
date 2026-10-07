@@ -9,7 +9,7 @@ use super::workspace::WorkspaceDb;
 use crate::config;
 use crate::error::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct ContextVersion {
     pub version: i64,
     pub content: String,

@@ -89,11 +89,13 @@ impl fmt::Display for WorkspaceName {
 }
 
 /// A workspace row from the control plane.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct WorkspaceRow {
     pub id: WorkspaceId,
     pub name: String,
     pub classification: String,
+    /// Providers the workspace's questions may use; empty for every one.
+    #[schema(value_type = Vec<String>)]
     pub allowed_providers: AllowedProviders,
 }
 
@@ -256,11 +258,12 @@ impl fmt::Debug for TokenSecret {
 /// A workspace and where one person stands in it. Serializes as the
 /// workspace's fields plus `role`: the role, or `null` for an admin
 /// without membership.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct Membership {
     #[serde(flatten)]
     pub workspace: WorkspaceRow,
     #[serde(rename = "role")]
+    #[schema(value_type = Option<Role>)]
     pub standing: Standing,
 }
 
@@ -310,7 +313,7 @@ pub struct WorkspaceTimes {
 }
 
 /// A server user. The password hash never leaves this module.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct UserRow {
     pub id: UserId,
     pub username: String,
@@ -361,7 +364,16 @@ pub enum PasswordCheck {
 
 /// What a member may do in a workspace (design doc 12).
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -380,7 +392,7 @@ text_enum!(Role, "role", {
 });
 
 /// One membership, with the username for listings.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct MemberRow {
     pub workspace_id: WorkspaceId,
     pub user_id: UserId,
@@ -406,7 +418,9 @@ impl FromRow<'_, SqliteRow> for MemberRow {
 /// Who gave a member their role: a person, or the identity provider's
 /// group claim at sign-in. Only the latter is revoked when the groups
 /// change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum GrantedBy {
     User,
@@ -419,7 +433,7 @@ text_enum!(GrantedBy, "membership grant", {
 });
 
 /// A role an identity provider's group carries in a workspace.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct GroupRoleRow {
     pub workspace_id: WorkspaceId,
     pub group_name: String,
@@ -550,7 +564,8 @@ impl FromStr for Expiry {
 
 /// Where a request came from: the channel it arrived over, and the
 /// client address and request id the server saw, when it recorded them.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = RequestOrigin)]
 pub struct Origin {
     pub channel: Channel,
     pub client_addr: Option<String>,
@@ -580,7 +595,7 @@ impl Origin {
 }
 
 /// One access-audit row to record: who, what, outcome, origin.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AuditEntry {
     /// UUID v7; the same id keys `_quack_audit` inside the workspace.
     pub id: AuditId,
@@ -838,7 +853,9 @@ pub struct AuditResource<'a> {
     pub id: &'a str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {
     Allowed,
@@ -873,7 +890,9 @@ impl Outcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {
     Web,
@@ -895,7 +914,7 @@ text_enum!(Channel, "channel", {
 
 /// A stored access-audit row: the entry as it was recorded, and when.
 /// Serializes flat, the timestamp beside the entry's fields.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AuditRow {
     pub timestamp: String,
     #[serde(flatten)]
@@ -930,8 +949,9 @@ impl FromRow<'_, SqliteRow> for AuditRow {
 /// Filters for reading the audit log, as a query string or a form sends
 /// them: every field is optional, a blank one is "any", and `limit`
 /// defaults to 100 rows a page.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, utoipa::IntoParams)]
 #[serde(default)]
+#[into_params(parameter_in = Query)]
 pub struct AuditFilter {
     #[serde(deserialize_with = "blank_as_none")]
     pub user_id: Option<UserId>,
@@ -947,7 +967,10 @@ pub struct AuditFilter {
     /// Exclusive upper bound on `timestamp`.
     #[serde(deserialize_with = "blank_as_none")]
     pub until: Option<String>,
+    /// Rows a page.
+    #[param(default = 100)]
     pub limit: u32,
+    /// The previous page's `next_cursor`.
     #[serde(deserialize_with = "blank_as_none")]
     pub cursor: Option<AuditCursor>,
 }
@@ -1033,6 +1056,15 @@ impl From<AuditCursor> for String {
         cursor.to_string()
     }
 }
+
+/// Serialized as its opaque text.
+impl utoipa::PartialSchema for AuditCursor {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <String as utoipa::PartialSchema>::schema()
+    }
+}
+
+impl utoipa::ToSchema for AuditCursor {}
 
 impl TryFrom<String> for AuditCursor {
     type Error = Error;

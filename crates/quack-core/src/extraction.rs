@@ -125,7 +125,7 @@ impl<'p> RunProgress<'p> {
 }
 
 /// How many times each name was seen.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct Tally(BTreeMap<String, u32>);
 

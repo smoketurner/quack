@@ -20,6 +20,7 @@ macro_rules! id_type {
             serde::Serialize,
             serde::Deserialize,
             schemars::JsonSchema,
+            utoipa::ToSchema,
         )]
         #[serde(transparent)]
         pub struct $name(String);

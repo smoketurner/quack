@@ -124,6 +124,7 @@ tower_governor       = { version = "=0.8.0", default-features = false }
 tracing              = { version = "=0.1.44", default-features = false }
 tracing-subscriber   = { version = "=0.3.23", default-features = false }
 unic-langid          = { version = "=0.9.6", default-features = false }
+utoipa               = { version = "=6.0.0", default-features = false } # the REST API's OpenAPI document
 uuid                 = { version = "=1.27.0", default-features = false } # IDs — enable "v7"; use Uuid::now_v7()
 webpki-roots         = { version = "=1.0.9", default-features = false }
 whatlang             = { version = "=0.18.0", default-features = false } # per-document language detection for the keyword index

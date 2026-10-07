@@ -134,8 +134,8 @@
     });
   }
 
-  // The body may be JSON ({error}) or, from the timeout or rate-limit
-  // layers, plain text: either way the message is what the user sees.
+  // An API error is JSON ({error, code}); a page route's may be plain
+  // text: either way the message is what the user sees.
   function errorMessage(res) {
     return res.text().then(function (text) {
       try { var j = JSON.parse(text); if (j && j.error) return j.error; } catch (e) { }
@@ -455,7 +455,9 @@
       }
       finishWorking(view);
     } else if (event === "error") {
-      view.body.textContent = "Error: " + data;
+      var failure = data;
+      try { failure = JSON.parse(data).error || data; } catch (e) { }
+      view.body.textContent = "Error: " + failure;
       view.article.classList.add("border-red-800");
       finishWorking(view);
     } else if (event === "permission_required") {

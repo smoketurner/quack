@@ -15,7 +15,7 @@ use crate::ontology::{Mapping, Ontology, store as ontology_store};
 use crate::storage::workspace::{WorkspaceDb, quote_ident};
 
 /// What table extraction did for one mapping.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct MappingSummary {
     pub table: String,
     pub rows: u32,

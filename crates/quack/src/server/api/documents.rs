@@ -23,20 +23,27 @@ use crate::server::queue::UploadJob;
 use crate::server::state::{App, with_db};
 use quack_core::analysis::tools::SharedDb;
 use quack_core::okf::{self, Bundle};
+use quack_core::ontology::OntologyVersion;
 use quack_core::ontology::store::Revision;
 use quack_core::storage::workspace::{
     ChunkSearchResult, DocumentFields, DocumentFilter, DocumentInfo, DocumentSource, Pinning,
 };
+use utoipa::ToSchema;
 
 /// `GET .../documents`'s filter: lists comma-separated, dates as
 /// `YYYY-MM-DD`, each field given narrowing the listing.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct ListFilter {
+    /// File types, as extensions or MIME types.
     types: Option<String>,
+    /// `upload`, `paste`, `path`, `stdin`, or `import`.
     sources: Option<String>,
     tags: Option<String>,
+    /// Written on or after this date.
     since: Option<jiff::civil::Date>,
+    /// Written on or before this date.
     until: Option<jiff::civil::Date>,
     author: Option<String>,
 }
@@ -72,12 +79,26 @@ impl ListFilter {
     }
 }
 
+/// The workspace's live documents.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct DocumentList {
+    pub documents: Vec<DocumentInfo>,
+}
+
+/// The live documents, narrowed by the filter.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/documents",
+    tag = "documents",
+    params(ListFilter),
+    responses((status = 200, description = "The documents", body = DocumentList)),
+)]
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Query(q): Query<ListFilter>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<DocumentList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let filter = q.filter()?;
     access
@@ -86,14 +107,21 @@ pub(crate) async fn list(
     let docs = app
         .read(&id, move |db| db.list_documents_matching(&filter))
         .await?;
-    Ok(Json(serde_json::json!({ "documents": docs })))
+    Ok(Json(DocumentList { documents: docs }))
 }
 
+/// One document, superseded or not.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/documents/{doc}",
+    tag = "documents",
+    responses((status = 200, description = "The document", body = DocumentInfo)),
+)]
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
     Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<DocumentInfo>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit(
@@ -110,16 +138,20 @@ pub(crate) async fn show(
                 .ok_or_else(|| ResourceKind::Document.missing(doc.as_str()))
         })
         .await?;
-    Ok(Json(serde_json::to_value(document)?))
+    Ok(Json(document))
 }
 
 /// `?from=&limit=` on `GET .../documents/{doc}/chunks`: chunk positions
 /// from `from` on, `limit` of them.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct ChunkPage {
+    /// The first chunk's position, from 0.
     #[serde(default)]
     pub from: u32,
+    /// Chunks at most, up to 200.
     #[serde(default = "ChunkPage::default_limit")]
+    #[param(default = 20, maximum = 200)]
     pub limit: u32,
 }
 
@@ -176,42 +208,103 @@ pub(crate) async fn read_chunks(
     .await
 }
 
+/// A page of one document's chunks.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ChunksPage {
+    pub document_id: DocumentId,
+    pub filename: String,
+    /// Chunks in the document.
+    pub total: Option<i64>,
+    pub from: u32,
+    pub chunks: Vec<ChunkSearchResult>,
+}
+
 /// `GET .../documents/{doc}/chunks?from=&limit=`: the document's chunks
 /// from position `from`, each with its text, heading, page, and position.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/documents/{doc}/chunks",
+    tag = "documents",
+    params(ChunkPage),
+    responses((status = 200, description = "The chunks, in document order", body = ChunksPage)),
+)]
 pub(crate) async fn chunks(
     State(app): State<App>,
     identity: Identity,
     Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
     Query(page): Query<ChunkPage>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<ChunksPage>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let Chunks { document, chunks } = read_chunks(&app, &access, &doc, page).await?;
-    Ok(Json(serde_json::json!({
-        "document_id": document.id,
-        "filename": document.filename,
-        "total": document.chunk_count,
-        "from": page.from,
-        "chunks": chunks,
-    })))
+    Ok(Json(ChunksPage {
+        document_id: document.id,
+        filename: document.filename,
+        total: document.chunk_count,
+        from: page.from,
+        chunks,
+    }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct PastedText {
     pub text: String,
+    /// The document's title, and its file name's stem.
     pub title: Option<String>,
+}
+
+/// The `multipart/form-data` upload: one or more `file` parts.
+#[derive(ToSchema)]
+#[expect(
+    dead_code,
+    reason = "documents the multipart body; the handler reads the parts itself"
+)]
+pub(crate) struct UploadFiles {
+    #[schema(value_type = Vec<String>, format = Binary)]
+    file: Vec<Vec<u8>>,
 }
 
 /// `?replace={doc}` on `POST .../documents`: the one file in the request
 /// replaces that ready document.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct UploadQuery {
+    /// A ready document the one uploaded file takes the place of.
     pub replace: Option<DocumentId>,
+}
+
+/// What an upload queued.
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub(crate) enum Uploaded {
+    /// Files or pasted text.
+    Files { documents: Vec<Enqueued> },
+    /// An OKF bundle: its documents, the ontology candidates it queued, the
+    /// ontology version it restored, and its `index.md` body to apply as
+    /// the workspace context.
+    Bundle {
+        documents: Vec<Enqueued>,
+        candidates: usize,
+        ontology_version: Option<OntologyVersion>,
+        context: Option<String>,
+    },
 }
 
 /// `multipart/form-data` with one or more `file` parts, or JSON
 /// `{text, title}`. Returns 202 with the queued documents. With
 /// `?replace={doc}` the request carries one file, which takes the place
 /// of that document once it is ready.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/documents",
+    tag = "documents",
+    params(UploadQuery),
+    request_body(content(
+        (UploadFiles = "multipart/form-data"),
+        (PastedText = "application/json"),
+        (Vec<u8> = "application/x-tar"),
+    ), description = "Files, pasted text, or an OKF bundle as a tar"),
+    responses((status = 202, description = "Queued", body = Uploaded)),
+)]
 pub(crate) async fn upload(
     State(app): State<App>,
     identity: Identity,
@@ -259,7 +352,7 @@ pub(crate) async fn upload(
     let queued = enqueue(&app, &access, source, files, query.replace).await?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "documents": queued })),
+        Json(Uploaded::Files { documents: queued }),
     )
         .into_response())
 }
@@ -329,12 +422,12 @@ async fn import_bundle(
     });
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "documents": queued,
-            "candidates": report.candidates,
-            "ontology_version": report.restored,
-            "context": context,
-        })),
+        Json(Uploaded::Bundle {
+            documents: queued,
+            candidates: report.candidates,
+            ontology_version: report.restored,
+            context,
+        }),
     )
         .into_response())
 }
@@ -565,7 +658,7 @@ impl Lane<'_> {
 }
 
 /// What became of one file given to [`enqueue`].
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum Enqueued {
     /// Registered and queued for processing.
@@ -584,7 +677,7 @@ pub(crate) enum Enqueued {
 
 /// `PATCH .../documents/{doc}`: pin or unpin, and the fields a person may
 /// set (title, author, authored date, tags); each given field is applied.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct UpdateDocument {
     #[serde(default)]
     pub pinned: Option<Pinning>,
@@ -592,18 +685,21 @@ pub(crate) struct UpdateDocument {
     pub fields: DocumentFields,
 }
 
+/// Pin or unpin a document, or set its title, author, authored date, or tags.
+#[utoipa::path(
+    patch,
+    path = "/workspaces/{id}/documents/{doc}",
+    tag = "documents",
+    request_body = UpdateDocument,
+    responses((status = 200, description = "The document as it now is", body = DocumentInfo)),
+)]
 pub(crate) async fn update(
     State(app): State<App>,
     identity: Identity,
     Path((id, doc)): Path<(WorkspaceId, DocumentId)>,
     Json(body): Json<UpdateDocument>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<DocumentInfo>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    if body.pinned.is_none() && body.fields.is_empty() {
-        return Err(ApiError::bad_request(
-            "nothing to change: give pinned, title, author, authored_at, or tags",
-        ));
-    }
     let pinned = match body.pinned {
         Some(pinning) => Some(set_pinned(&app, &access, &doc, pinning).await?),
         None => None,
@@ -613,7 +709,9 @@ pub(crate) async fn update(
     } else {
         Some(set_fields(&app, &access, &doc, body.fields).await?)
     };
-    Ok(Json(serde_json::to_value(document)?))
+    document.map(Json).ok_or_else(|| {
+        ApiError::bad_request("nothing to change: give pinned, title, author, authored_at, or tags")
+    })
 }
 
 /// Set a document's own fields, audited with what changed.
@@ -689,6 +787,13 @@ pub(crate) async fn set_pinned(
     Ok(document)
 }
 
+/// Delete the document, and its table when it was loaded as one.
+#[utoipa::path(
+    delete,
+    path = "/workspaces/{id}/documents/{doc}",
+    tag = "documents",
+    responses((status = 204, description = "Deleted")),
+)]
 pub(crate) async fn remove(
     State(app): State<App>,
     identity: Identity,

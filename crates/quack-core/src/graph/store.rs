@@ -702,7 +702,7 @@ pub fn find_node(db: &WorkspaceDb, reference: &str, class_id: Option<&str>) -> R
 }
 
 /// What a person's node write did: the node, and whether it is new.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct Asserted<T> {
     #[serde(flatten)]
     pub subject: T,
@@ -784,7 +784,7 @@ pub fn create_node(
 }
 
 /// What a person changes on a node; a field left `None` stays.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NodeEdit {
     pub label: Option<String>,
@@ -1170,7 +1170,7 @@ pub(crate) fn rename_ids(
 
 /// What a revalidation drops: what [`revalidate`] removed, or what
 /// [`Self::preview`] says it would, so an interface can ask first.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct Revalidation {
     pub dropped_nodes: u64,
     /// Every edge that goes, those of dropped nodes included.

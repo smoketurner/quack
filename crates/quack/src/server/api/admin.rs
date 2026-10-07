@@ -7,24 +7,35 @@ use axum::response::IntoResponse;
 use quack_core::error::Result as CoreResult;
 use quack_core::ids::UserId;
 use quack_core::storage::control::{
-    AuditAction, AuditFilter, AuditRow, Outcome, ResourceKind, UserKind, UserRow,
+    AuditAction, AuditCursor, AuditFilter, AuditRow, Outcome, ResourceKind, UserKind, UserRow,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::server::auth::Identity;
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, ServeMode};
 
-pub(crate) async fn users(
-    State(app): State<App>,
-    identity: Identity,
-) -> ApiResult<Json<serde_json::Value>> {
-    identity.require_admin()?;
-    let users = app.control.list_users().await?;
-    Ok(Json(serde_json::json!({ "users": users })))
+/// The server's users.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct UserList {
+    pub users: Vec<UserRow>,
 }
 
-#[derive(Deserialize)]
+/// Every server user (admins).
+#[utoipa::path(
+    get,
+    path = "/admin/users",
+    tag = "admin",
+    responses((status = 200, description = "The users", body = UserList)),
+)]
+pub(crate) async fn users(State(app): State<App>, identity: Identity) -> ApiResult<Json<UserList>> {
+    identity.require_admin()?;
+    let users = app.control.list_users().await?;
+    Ok(Json(UserList { users }))
+}
+
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct CreateUser {
     pub username: String,
     pub password: String,
@@ -32,18 +43,26 @@ pub(crate) struct CreateUser {
     pub kind: UserKind,
 }
 
+/// Add a server user (admins; not in local mode).
+#[utoipa::path(
+    post,
+    path = "/admin/users",
+    tag = "admin",
+    request_body = CreateUser,
+    responses((status = 201, description = "Created", body = UserRow)),
+)]
 pub(crate) async fn create_user(
     State(app): State<App>,
     identity: Identity,
     Json(body): Json<CreateUser>,
 ) -> ApiResult<impl IntoResponse> {
     let user = identity.create_user(&app, &body).await?;
-    Ok((StatusCode::CREATED, Json(serde_json::to_value(user)?)))
+    Ok((StatusCode::CREATED, Json(user)))
 }
 
 /// `PATCH /admin/users/{user}`: each field given is applied; absent ones
 /// keep their value.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub(crate) struct UpdateUser {
     pub disabled: Option<bool>,
     #[serde(rename = "is_admin")]
@@ -51,6 +70,14 @@ pub(crate) struct UpdateUser {
     pub password: Option<String>,
 }
 
+/// Disable, enable, promote, demote, or reset a user's password.
+#[utoipa::path(
+    patch,
+    path = "/admin/users/{user}",
+    tag = "admin",
+    request_body = UpdateUser,
+    responses((status = 200, description = "The user as it now is", body = UserRow)),
+)]
 pub(crate) async fn update_user(
     State(app): State<App>,
     identity: Identity,
@@ -60,13 +87,28 @@ pub(crate) async fn update_user(
     Ok(Json(identity.update_user(&app, &user, body).await?))
 }
 
+/// What deleting a user changed in the workspace files.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct UserDeleted {
+    /// Workspace rows whose id and name for the user were replaced.
+    pub rows_forgotten: usize,
+}
+
+/// Delete a user; the workspaces forget their name, the access audit keeps
+/// its rows.
+#[utoipa::path(
+    delete,
+    path = "/admin/users/{user}",
+    tag = "admin",
+    responses((status = 200, description = "Deleted", body = UserDeleted)),
+)]
 pub(crate) async fn delete_user(
     State(app): State<App>,
     identity: Identity,
     Path(user): Path<UserId>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let forgotten = identity.delete_user(&app, &user).await?;
-    Ok(Json(serde_json::json!({ "rows_forgotten": forgotten })))
+) -> ApiResult<Json<UserDeleted>> {
+    let rows_forgotten = identity.delete_user(&app, &user).await?;
+    Ok(Json(UserDeleted { rows_forgotten }))
 }
 
 impl Identity {
@@ -165,7 +207,7 @@ impl Identity {
 }
 
 /// How each row of an audit page is shaped.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum AuditShape {
     /// The stored row's own fields.
@@ -176,30 +218,57 @@ pub(crate) enum AuditShape {
 }
 
 /// Which shape `GET /audit` answers with.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct AuditShapeQuery {
     #[serde(default)]
     pub format: AuditShape,
 }
 
+/// A page of the access audit, newest first.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct AuditLogPage {
+    pub audit: AuditLogRows,
+    /// Pass as `cursor` for the next page; `null` on the last.
+    pub next_cursor: Option<AuditCursor>,
+}
+
+/// The rows as stored, or as OCSF events.
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub(crate) enum AuditLogRows {
+    Quack(Vec<AuditRow>),
+    /// OCSF 1.9.0 events, whose schema is OCSF's own.
+    Ocsf(Vec<serde_json::Value>),
+}
+
+/// The access audit log (admins), filtered and paged.
+#[utoipa::path(
+    get,
+    path = "/admin/audit",
+    tag = "admin",
+    params(AuditFilter, AuditShapeQuery),
+    responses((status = 200, description = "A page of the audit log", body = AuditLogPage)),
+)]
 pub(crate) async fn audit(
     State(app): State<App>,
     identity: Identity,
     Query(filter): Query<AuditFilter>,
     Query(shape): Query<AuditShapeQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<AuditLogPage>> {
     identity.require_admin()?;
     let page = app.control.query_audit(&filter).await?;
     let audit = match shape.format {
-        AuditShape::Quack => serde_json::to_value(&page.rows)?,
-        AuditShape::Ocsf => serde_json::Value::Array(
+        AuditShape::Quack => AuditLogRows::Quack(page.rows),
+        AuditShape::Ocsf => AuditLogRows::Ocsf(
             page.rows
                 .iter()
                 .map(AuditRow::to_ocsf)
                 .collect::<CoreResult<_>>()?,
         ),
     };
-    Ok(Json(
-        serde_json::json!({ "audit": audit, "next_cursor": page.next }),
-    ))
+    Ok(Json(AuditLogPage {
+        audit,
+        next_cursor: page.next,
+    }))
 }

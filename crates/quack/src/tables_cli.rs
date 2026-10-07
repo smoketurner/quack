@@ -50,11 +50,9 @@ impl TablesArgs {
             .describe_table(&table)
             .with_context(|| format!("could not describe {table}"))?;
         match self.format {
-            TextOrJson::Json => writeln!(
-                out,
-                "{}",
-                serde_json::to_string_pretty(&described.to_json())?
-            )?,
+            TextOrJson::Json => {
+                writeln!(out, "{}", serde_json::to_string_pretty(&described.body())?)?;
+            }
             TextOrJson::Text => write!(out, "{}", Described(&described))?,
         }
         Ok(())

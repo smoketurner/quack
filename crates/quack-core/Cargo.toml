@@ -66,6 +66,7 @@ tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "ne
 tokio-util    = { workspace = true, features = ["rt"] }
 toml          = { workspace = true, features = ["std", "parse", "serde", "display"] }
 tracing       = { workspace = true, features = ["std"] }
+utoipa        = { workspace = true, features = ["macros", "uuid", "jiff_0_2"] }
 uuid          = { workspace = true, features = ["std", "v7"] }
 whatlang      = { workspace = true }
 zip           = { workspace = true, features = ["deflate-flate2-zlib-rs"] }

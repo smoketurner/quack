@@ -31,6 +31,14 @@ pub(crate) const CHUNK_BYTES: usize = 64 * 1024;
 /// Chunks the export may run ahead of the client.
 pub(crate) const CHUNKS_IN_FLIGHT: usize = 8;
 
+/// The workspace as an Open Knowledge Format bundle; `POST .../documents`
+/// with the tar imports one.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/okf",
+    tag = "okf",
+    responses((status = 200, description = "The bundle", content_type = "application/x-tar", body = Vec<u8>)),
+)]
 pub(crate) async fn export(
     State(app): State<App>,
     identity: Identity,

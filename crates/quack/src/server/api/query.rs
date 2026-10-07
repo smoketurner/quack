@@ -13,12 +13,12 @@ use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::Stream;
-use quack_core::analysis::agent::AgentResponse;
-use quack_core::analysis::events::{self, AgentEvent, FailureKind, TurnFailure};
-use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::search::{DocumentSearch, SearchOutcome};
+use quack_core::analysis::agent::{AgentResponse, AgentResponseBody};
+use quack_core::analysis::events::{self, AgentEvent, FailureKind, ToolName, TurnFailure};
+use quack_core::analysis::policy::{Hold, WritePolicy};
+use quack_core::analysis::search::{DocumentSearch, SearchBody, SearchDetail, SearchOutcome};
 use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
-use quack_core::ids::{SessionId, WorkspaceId};
+use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -29,19 +29,24 @@ use quack_core::storage::workspace::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use utoipa::ToSchema;
 
 use super::StreamEvent;
 use super::okf::{BodyWriter, CHUNKS_IN_FLIGHT};
 use crate::server::auth::{Access, Identity, Need};
-use crate::server::error::{ApiError, ApiResult};
+use crate::server::error::{ApiError, ApiResult, ErrorCode};
 use crate::server::state::{App, with_db};
 use crate::server::web::markdown::to_html;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct QueryRequest {
     pub prompt: String,
+    /// A session to continue; a new one when absent.
     pub session_id: Option<SessionId>,
+    /// A new session's mode; a later turn keeps the session's own.
     pub mode: Option<ChatMode>,
+    /// Run the agent's writes without asking (members with the write
+    /// scope); a turn that read document text still asks.
     #[serde(default)]
     pub allow_write: bool,
     /// The documents the question is limited to, each by id, id prefix,
@@ -324,12 +329,52 @@ impl Turn {
     }
 }
 
+/// SSE `tool_started`: a tool call began.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ToolStartedEvent {
+    pub tool: ToolName,
+    /// The SQL text, the search query, the table name.
+    pub detail: String,
+}
+
+/// SSE `permission_required`: a write the turn holds until someone answers
+/// at `POST .../sessions/{sid}/permissions/{request}`.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct PermissionEvent {
+    pub request: PermissionId,
+    pub session_id: SessionId,
+    pub sql: String,
+    pub reason: Hold,
+    /// The sentence to show beside the statement, when the reason needs one.
+    pub notice: Option<&'static str>,
+    /// When the turn stops waiting and refuses the write (RFC 3339).
+    pub expires_at: String,
+}
+
+/// SSE `complete`: the response object, and its answer as HTML.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CompleteEvent {
+    #[serde(flatten)]
+    pub response: AgentResponseBody,
+    /// The answer rendered from Markdown, for a page to swap in.
+    pub answer_html: String,
+}
+
+/// One agent turn: the answer, its citations, and every step. A write the
+/// agent wants is refused (`write_refused`) unless `allow_write` lets it run.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/query",
+    tag = "query",
+    request_body = QueryRequest,
+    responses((status = 200, description = "The response object", body = AgentResponseBody)),
+)]
 pub(crate) async fn query(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Json(body): Json<QueryRequest>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<AgentResponseBody>> {
     // A client that disconnects drops this future, and the turn's guard
     // with it, which cancels the turn.
     let mut turn = PreparedTurn::prepare(&app, identity, &id, &body, WritePolicy::Deny)
@@ -351,7 +396,7 @@ pub(crate) async fn query(
     }
     if let Some(response) = complete {
         turn.record(&app, TurnEnd::Answered(&response)).await;
-        return Ok(Json(response.to_json(&turn.session_id)));
+        return Ok(Json(response.body(&turn.session_id)));
     }
     turn.record(&app, TurnEnd::Failed(failure.as_ref())).await;
     Err(failure.map_or_else(|| Turn::unanswered(&app), ApiError::from))
@@ -361,6 +406,14 @@ pub(crate) async fn query(
 /// `complete` with the full response object, or `error`. A stopping server
 /// cancels the turn's job, so the stream ends as any cancelled turn does:
 /// `complete` with `cancelled: true`, or `error` when the turn never ran.
+/// The events are listed in the operation's `x-sse-events`.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/query/stream",
+    tag = "query",
+    request_body = QueryRequest,
+    responses((status = 200, description = "Server-Sent Events, named in `x-sse-events`", content_type = "text/event-stream", body = String)),
+)]
 pub(crate) async fn stream(
     State(app): State<App>,
     identity: Identity,
@@ -379,7 +432,8 @@ pub(crate) async fn stream(
             turn.record(&app, TurnEnd::Failed(None)).await;
             let out = StreamEvent::Error
                 .event()
-                .data(Turn::unanswered(&app).message);
+                .json_data(Turn::unanswered(&app).body())
+                .unwrap_or_default();
             return Some((Ok(out), (turn, app, TurnStream::Ended)));
         };
         let state = match event {
@@ -398,7 +452,7 @@ pub(crate) async fn stream(
             AgentEvent::TextDelta(text) => StreamEvent::Text.event().data(text),
             AgentEvent::ToolStarted { tool, detail } => StreamEvent::ToolStarted
                 .event()
-                .json_data(serde_json::json!({ "tool": tool, "detail": detail }))
+                .json_data(ToolStartedEvent { tool, detail })
                 .unwrap_or_default(),
             AgentEvent::ToolFinished(step) => StreamEvent::ToolFinished
                 .event()
@@ -411,26 +465,23 @@ pub(crate) async fn stream(
                     .hold(&app, &turn.access, &turn.session_id, request);
                 StreamEvent::PermissionRequired
                     .event()
-                    .json_data(serde_json::json!({
-                        "request": held.request,
-                        "session_id": turn.session_id,
-                        "sql": sql,
-                        "reason": hold,
-                        "notice": hold.notice(),
-                        "expires_at": held.expires_at.to_string(),
-                    }))
+                    .json_data(PermissionEvent {
+                        request: held.request,
+                        session_id: turn.session_id.clone(),
+                        sql,
+                        reason: hold,
+                        notice: hold.notice(),
+                        expires_at: held.expires_at.to_string(),
+                    })
                     .unwrap_or_default()
             }
             AgentEvent::TurnComplete(response) => {
                 turn.record(&app, TurnEnd::Answered(&response)).await;
                 // The web page swaps this in for the streamed plain text.
-                let mut payload = response.to_json(&turn.session_id);
-                if let serde_json::Value::Object(map) = &mut payload {
-                    map.insert(
-                        String::from("answer_html"),
-                        serde_json::Value::String(to_html(&response.content)),
-                    );
-                }
+                let payload = CompleteEvent {
+                    answer_html: to_html(&response.content),
+                    response: response.body(&turn.session_id),
+                };
                 StreamEvent::Complete
                     .event()
                     .json_data(payload)
@@ -438,7 +489,10 @@ pub(crate) async fn stream(
             }
             AgentEvent::Failed(failure) => {
                 turn.record(&app, TurnEnd::Failed(Some(&failure))).await;
-                StreamEvent::Error.event().data(failure.message)
+                StreamEvent::Error
+                    .event()
+                    .json_data(ApiError::from(failure).body())
+                    .unwrap_or_default()
             }
         };
         Some((Ok(out), (turn, app, state)))
@@ -446,12 +500,12 @@ pub(crate) async fn stream(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct SqlRequest {
     pub sql: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct ExportRequest {
     pub sql: String,
     #[serde(default)]
@@ -462,6 +516,17 @@ pub(crate) struct ExportRequest {
 /// `format` with no row cap, for the viewer role; a statement that
 /// writes is refused. Audited as `export` with the statement, the format,
 /// and the row count once the stream ends.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/sql/export",
+    tag = "query",
+    request_body = ExportRequest,
+    responses((status = 200, description = "Every row, as an attachment in `format`", content(
+        (String = "text/csv"),
+        (String = "application/x-ndjson"),
+        (Vec<Object> = "application/json"),
+    ))),
+)]
 pub(crate) async fn export(
     State(app): State<App>,
     identity: Identity,
@@ -475,9 +540,11 @@ pub(crate) async fn export(
 /// Direct SQL. Reads need the viewer role; anything that mutates needs the
 /// member role and the write scope. `_quack_` tables are never reachable.
 /// A capped result set for the API and the web grid.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct SqlOutcome {
     pub columns: Vec<String>,
+    /// One array per row, a JSON value per column.
+    #[schema(value_type = Vec<Vec<Object>>)]
     pub rows: Vec<Vec<serde_json::Value>>,
     pub row_count: usize,
     pub truncated: bool,
@@ -488,6 +555,13 @@ pub(crate) struct SqlOutcome {
 
 /// Direct SQL. Reads need the viewer role; anything that mutates needs the
 /// member role and the write scope. `_quack_` tables are never reachable.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/sql",
+    tag = "query",
+    request_body = SqlRequest,
+    responses((status = 200, description = "The result, capped at `[analysis].max_query_rows`", body = SqlOutcome)),
+)]
 pub(crate) async fn sql(
     State(app): State<App>,
     identity: Identity,
@@ -645,7 +719,7 @@ impl Access {
         access
             .audit(app, AuditAction::Sql, None, outcome, Some(detail))
             .await?;
-        let (capped, took) = result.map_err(|e| ApiError::unprocessable(e.message))?;
+        let (capped, took) = result.map_err(|e| e.unprocessable_as(ErrorCode::SqlFailed))?;
         Ok(SqlOutcome {
             truncated: capped.truncated(),
             columns: capped.results.columns,
@@ -656,7 +730,7 @@ impl Access {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SearchQuery {
     pub query: String,
@@ -703,15 +777,22 @@ impl SearchQuery {
 /// it: the embedding provider when one is configured, else keyword search
 /// alone. The query is in the body: search text is workspace content, and
 /// a URL ends up in logs.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/search",
+    tag = "query",
+    request_body = SearchQuery,
+    responses((status = 200, description = "The passages found", body = SearchBody)),
+)]
 pub(crate) async fn search(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Json(q): Json<SearchQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SearchBody>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let found = access.search(&app, &q).await?;
-    Ok(Json(found.to_json(q.explain)))
+    Ok(Json(found.body(SearchDetail::explained(q.explain))))
 }
 
 impl Access {

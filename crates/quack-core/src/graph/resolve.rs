@@ -20,7 +20,7 @@ use crate::storage::workspace::{Analyzer, Unspaced, WorkspaceDb};
 use crate::storage::writer::Writer;
 
 /// A proposed merge: `drop` folds into `keep`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct MergeProposal {
     pub id: MergeId,
     pub keep: Node,
@@ -30,7 +30,9 @@ pub struct MergeProposal {
 }
 
 /// Where a merge proposal stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum MergeStatus {
     /// Waiting for review.
@@ -53,7 +55,9 @@ text_enum_sql!(MergeStatus);
 
 /// A reviewer's answer to a merge proposal, from the CLI, the API, or the
 /// graph page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum MergeDecision {
     Accept,
@@ -77,7 +81,7 @@ impl MergeDecision {
 }
 
 /// What a resolution pass did.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct ResolutionSummary {
     pub embedded: u32,
     pub auto_merged: u32,

@@ -182,7 +182,7 @@ pub(crate) fn router(app: App) -> Router {
             &format!("{}/{{*path}}", resource::METADATA_PATH),
             get(resource::metadata_for),
         )
-        .nest("/api/v1", api::router(&app))
+        .nest("/api/v1", api::router(&app).into_router())
         .merge(web::router(&app));
     if let Some(config) = governor {
         let limiter = Arc::clone(config.limiter());
@@ -206,6 +206,10 @@ pub(crate) fn router(app: App) -> Router {
         // that is throttled reads a live server as dead.
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        // The API's description reveals no workspace content: no sign-in,
+        // no audit row, and no limiter, like the static assets.
+        .route(api::openapi::DOCUMENT_PATH, get(api::openapi::document))
+        .route(api::openapi::PAGE_PATH, get(api::openapi::page))
         .merge(web::assets())
         .merge(limited)
         .layer(DefaultBodyLimit::max(upload_limit))
@@ -255,6 +259,8 @@ pub(crate) fn router(app: App) -> Router {
             StatusCode::GATEWAY_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
+        // Outside the timeout and the limiter, so their errors get a code too.
+        .layer(axum::middleware::from_fn(error::coded_errors))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(RequestIdV7))
         .with_state(app)

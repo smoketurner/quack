@@ -13,7 +13,9 @@ use futures::Stream;
 use quack_core::ids::WorkspaceId;
 use quack_core::jobs::{JobId, JobInfo, JobKind};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use serde::Serialize;
 use tokio::sync::broadcast;
+use utoipa::ToSchema;
 
 use super::StreamEvent;
 use crate::server::auth::{Access, Identity, Need};
@@ -94,22 +96,44 @@ impl Access {
     }
 }
 
+/// The workspace's jobs, newest first, and how many wait and run.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct JobList {
+    pub jobs: Vec<JobInfo>,
+    pub queued: usize,
+    pub running: usize,
+}
+
+/// Queued, running, and recently finished jobs.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/jobs",
+    tag = "jobs",
+    responses((status = 200, description = "The jobs", body = JobList)),
+)]
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<JobList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::List, "jobs").await?;
     let jobs = access.visible_jobs(&app);
     let counts = app.jobs.counts(Some(&id));
-    Ok(Json(serde_json::json!({
-        "jobs": jobs,
-        "queued": counts.queued,
-        "running": counts.running,
-    })))
+    Ok(Json(JobList {
+        jobs,
+        queued: counts.queued,
+        running: counts.running,
+    }))
 }
 
+/// One job.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/jobs/{job}",
+    tag = "jobs",
+    responses((status = 200, description = "The job", body = JobInfo)),
+)]
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
@@ -123,6 +147,12 @@ pub(crate) async fn show(
 
 /// Ask a job to stop: a queued one never starts, a running one stops at
 /// its next checkpoint (an agent turn is recorded as cancelled).
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/jobs/{job}/cancel",
+    tag = "jobs",
+    responses((status = 200, description = "The job as it now is", body = JobInfo)),
+)]
 pub(crate) async fn cancel(
     State(app): State<App>,
     identity: Identity,
@@ -136,6 +166,12 @@ pub(crate) async fn cancel(
 /// each), starting with the current list as one `jobs` event. A client
 /// that falls behind gets a fresh `jobs` event rather than a gap. The
 /// stream ends when the server begins to stop.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/jobs/stream",
+    tag = "jobs",
+    responses((status = 200, description = "Server-Sent Events, named in `x-sse-events`", content_type = "text/event-stream", body = String)),
+)]
 pub(crate) async fn stream(
     State(app): State<App>,
     identity: Identity,
