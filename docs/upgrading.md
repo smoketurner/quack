@@ -29,6 +29,11 @@ vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
 - Breaking: `[general].default_workspace` must be a valid workspace name (not blank, no `/`,
   `\`, or `.`), or the config is refused at startup (#434). A workspace already named so
   still opens with `-w`.
+- Changed: the terminal and the web chat answer a write request the same way. In the
+  terminal, `a` now allows the writes of the turn that asked, not the rest of the session;
+  restart with `--allow-write` to allow every write. SQL typed in the terminal runs without
+  asking, as on the web SQL page; only the agent's writes ask. `/schema TABLE` is now
+  `/tables TABLE`, which also takes `--note` and `--retype` as `quack tables` does.
 - Breaking: `postgres://` import sources are removed (#458). Export the query to a SQLite
   file or a CSV or Parquet file and import that, or fetch the file over HTTP(S) or from S3.
   Imports already loaded stay as tables.
