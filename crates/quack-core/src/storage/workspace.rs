@@ -1445,7 +1445,7 @@ impl WorkspaceDb {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
         // Version 4 introduced the term index, version 6 stemmed it, version
-        // 7 added joined identifiers, and version 12 stems each document
+        // 7 added joined identifiers, and version 13 stems each document
         // under its own language: every one of them rebuilds the index.
         if recorded < DOCUMENT_LANGUAGES && self.chunk_count()? > 0 {
             tracing::info!("detecting document languages and indexing chunks for keyword search");

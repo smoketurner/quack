@@ -57,10 +57,11 @@ fn redaction_drops_the_whole_password_and_keeps_non_userinfo_urls() {
         SourceUrl::from("postgres://user:p%40ss@host/db").redacted(),
         "postgres://user:***@host/db"
     );
-    // Username only: the marker password is inserted, as before.
+    // Username only: no password, so nothing to hide, and a saved import
+    // of it needs no stored credential.
     assert_eq!(
         SourceUrl::from("postgres://alice@db.local/sales").redacted(),
-        "postgres://alice:***@db.local/sales"
+        "postgres://alice@db.local/sales"
     );
     // Empty username with a password: the user info is dropped.
     assert_eq!(

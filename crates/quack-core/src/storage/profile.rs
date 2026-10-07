@@ -250,7 +250,7 @@ impl Retype<'_> {
     ///
     /// # Errors
     ///
-    /// Returns an `Ingestion` error naming the column when the table lacks
+    /// Returns an `Analysis` error naming the column when the table lacks
     /// it or a value does not convert.
     pub fn run(&self, db: &WorkspaceDb) -> Result<()> {
         let columns = db.describe_columns(self.table)?;
