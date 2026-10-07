@@ -337,6 +337,19 @@ pub struct StatementRun {
 }
 
 impl StatementRun {
+    /// One line for how the statement went, as every interface shows it:
+    /// its error, or its row count and whether it changed.
+    #[must_use]
+    pub fn outcome(&self) -> String {
+        match (&self.error, self.rows) {
+            (Some(error), _) => format!("error: {error}"),
+            (None, rows) => {
+                let state = if self.changed { "changed" } else { "unchanged" };
+                format!("{} rows, {state}", rows.unwrap_or_default())
+            }
+        }
+    }
+
     /// What `sql` produced, against `previous`, the same statement in the
     /// run compared with.
     fn of(sql: &str, outcome: Result<DigestedResults>, previous: Option<&Self>) -> Self {

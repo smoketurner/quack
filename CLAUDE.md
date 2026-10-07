@@ -138,7 +138,9 @@ statements). There is no scheduler: cron runs it, and `--exit-code` exits 5 on a
 through `saved_cli` (`add` pins the session's last answer; `--refresh` and `--exit-code` are
 parse errors there), and the REST routes under `.../saved` (`server/api/saved.rs`) list, save,
 show, run, and remove, audited as `save`, `saved_run`, `open`, `list`, and `delete`; a run
-answers directly, no job.
+answers directly, no job. The web Saved page (`server/web/saved.rs`) and the chat page's Save
+form go through the same `Access` methods (`list_saved`, `save_answer`, `run_saved`,
+`remove_saved`).
 
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
 file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model through

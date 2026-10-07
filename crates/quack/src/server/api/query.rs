@@ -387,6 +387,9 @@ pub(crate) struct CompleteEvent {
     pub response: AgentResponseBody,
     /// The answer rendered from Markdown, for a page to swap in.
     pub answer_html: String,
+    /// Each entry of `graph` in one line, as the terminal prints it under
+    /// the tree: its size and what a reader must know to trust it.
+    pub graph_summaries: Vec<String>,
 }
 
 /// One agent turn: the answer, its citations, and every step. A write the
@@ -513,6 +516,11 @@ pub(crate) async fn stream(
                 // The web page swaps this in for the streamed plain text.
                 let payload = CompleteEvent {
                     answer_html: to_html(&response.content),
+                    graph_summaries: response
+                        .graph
+                        .iter()
+                        .map(|result| result.summary().to_string())
+                        .collect(),
                     response: response.body(&turn.session_id),
                 };
                 StreamEvent::Complete

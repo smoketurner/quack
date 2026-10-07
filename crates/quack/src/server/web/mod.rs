@@ -5,6 +5,7 @@
 
 pub(crate) mod flash;
 pub(crate) mod markdown;
+mod saved;
 mod search;
 mod sign_in;
 
@@ -165,6 +166,7 @@ enum Tab {
     Search,
     Tables,
     Sql,
+    Saved,
     Context,
     Ontology,
     Graph,
@@ -177,12 +179,13 @@ enum Tab {
 
 impl Tab {
     /// The workspace tabs, in header order.
-    const WORKSPACE: [Self; 10] = [
+    const WORKSPACE: [Self; 11] = [
         Self::Chat,
         Self::Documents,
         Self::Search,
         Self::Tables,
         Self::Sql,
+        Self::Saved,
         Self::Context,
         Self::Ontology,
         Self::Graph,
@@ -198,6 +201,7 @@ impl Tab {
             Self::Search => "Search",
             Self::Tables => "Tables",
             Self::Sql => "SQL",
+            Self::Saved => "Saved",
             Self::Context => "Context",
             Self::Ontology => "Ontology",
             Self::Graph => "Graph",
@@ -217,6 +221,7 @@ impl Tab {
             Self::Search => "search",
             Self::Tables => "tables",
             Self::Sql => "sql",
+            Self::Saved => "saved",
             Self::Context => "context",
             Self::Ontology => "ontology",
             Self::Graph => "graph",
@@ -395,8 +400,15 @@ struct MessageView {
     steps: Vec<StepView>,
     citations: Vec<CitationView>,
     chart_json: Option<String>,
-    /// One JSON `GraphResult` per graph tool call the turn made.
-    graphs: Vec<String>,
+    /// The graph results the turn's graph tool calls found.
+    graphs: Vec<GraphView>,
+}
+
+/// One graph result in a stored answer: the JSON the page draws, and the
+/// line under it.
+struct GraphView {
+    json: String,
+    summary: String,
 }
 
 /// A step as the chat page lists it: the rows it kept, as text cells.
@@ -452,6 +464,8 @@ struct ChatPage {
     documents: Vec<DocumentInfo>,
     /// The ready documents a question can be limited to.
     pickable: Vec<search::PickableDocument>,
+    /// Why the last form the page sent back here failed (saving an answer).
+    error: Option<String>,
 }
 
 #[derive(Template)]
@@ -1048,6 +1062,9 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/imports/{import}/remove", post(import_remove))
         .route("/w/{id}/sql", get(sql_page).post(sql_run))
         .route("/w/{id}/sql.csv", post(sql_csv))
+        .route("/w/{id}/saved", get(saved::saved_page).post(saved::save))
+        .route("/w/{id}/saved/{saved}/run", post(saved::run))
+        .route("/w/{id}/saved/{saved}/remove", post(saved::remove))
         .route("/w/{id}/context", get(context_page).post(context_save))
         .route("/w/{id}/ontology", get(ontology_page).post(ontology_import))
         .route("/w/{id}/ontology/init", post(ontology_init))
@@ -1310,7 +1327,13 @@ impl MessageView {
             graphs: meta
                 .graph
                 .iter()
-                .filter_map(|g| serde_json::to_string(g).ok())
+                .filter(|g| !g.is_empty())
+                .filter_map(|g| {
+                    Some(GraphView {
+                        json: serde_json::to_string(g).ok()?,
+                        summary: g.summary().to_string(),
+                    })
+                })
                 .collect(),
         }
     }
@@ -1321,6 +1344,7 @@ async fn chat(
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
     Query(q): Query<ChatQuery>,
+    flash: Flashed,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let viewer = access.session_viewer();
@@ -1366,6 +1390,7 @@ async fn chat(
         tables,
         documents,
         pickable,
+        error: flash.error(),
     })
 }
 

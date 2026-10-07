@@ -62,6 +62,16 @@ signed-in user and reads no workspace, so it writes no audit row.
   visit is audited as opening the document; a position the document does not have is a 404
   page. The chunk is shown whatever the document's status, so a citation in an old answer
   still opens after its document was replaced.
+- **`saved.html`** (`/w/{id}/saved`, `server::web::saved`) lists the saved questions with
+  Run and, for the creator or an owner, Remove (asked first). Run shows each statement, its
+  kept rows, and `StatementRun::outcome` (the line `quack saved run` prints), then the run's
+  verdict. The chat page's Save form posts a name and the current session to
+  `/w/{id}/saved`, which saves the session's last answer; a refused save lands back on the
+  chat with the reason. Every action goes through the `Access` methods the `.../saved` REST
+  routes use (`list_saved`, `save_answer`, `run_saved`, `remove_saved`), so the audit rows
+  match. The chat page also links the session's Markdown and SQL export
+  (`GET .../sessions/{sid}/export`), and Settings links the workspace's OKF bundle
+  (`GET .../okf`).
 - **`search.html`** (`/w/{id}/search`, `server::web::search`) runs one document search
   without the model. The form posts its query in the body (search text is workspace
   content, and a URL ends up in logs) with a multi-select of the newest 200 ready

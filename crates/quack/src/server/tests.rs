@@ -7435,6 +7435,134 @@ async fn web_forms_follow_the_api_rules_and_say_why() {
     assert!(html.contains("an ontology already exists"), "{html}");
 }
 
+/// The web's Saved page runs the API's operations: the chat saves a
+/// session's last answer, the page runs it and shows the rows and the
+/// verdict, and removes it; a refused save says why on the chat page.
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_questions_are_saved_run_and_removed_on_the_web() {
+    use quack_core::analysis::agent::AgentResponse;
+    use quack_core::analysis::events::{ToolName, ToolStep};
+    use quack_core::saved;
+    use quack_core::storage::sessions::{self, ChatMode};
+    const OVERDUE: &str = "SELECT id FROM invoices WHERE NOT paid ORDER BY id";
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("s", &owner).await;
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let (answered, no_sql) = {
+        let owner = owner.clone();
+        db.run(move |db| {
+            db.execute_statement(
+                "CREATE TABLE invoices (id INTEGER, paid BOOLEAN); \
+                 INSERT INTO invoices VALUES (1, false), (2, true)",
+            )?;
+            let answered = sessions::create_session(db, "m", ChatMode::Query, Some(&owner))?;
+            let response = AgentResponse {
+                content: String::from("Invoice 1 is overdue."),
+                steps: vec![ToolStep {
+                    tool: ToolName::RunSql,
+                    detail: String::from(OVERDUE),
+                    summary: String::from("1 rows"),
+                    rows: Some(1),
+                    result: None,
+                    duration_ms: 1,
+                }],
+                ..AgentResponse::default()
+            };
+            sessions::record_turn(
+                db,
+                &answered.id,
+                "overdue?",
+                jiff::Timestamp::now(),
+                &response,
+            )?;
+            let no_sql = sessions::create_session(db, "m", ChatMode::Chat, Some(&owner))?;
+            sessions::record_turn(
+                db,
+                &no_sql.id,
+                "hello",
+                jiff::Timestamp::now(),
+                &AgentResponse {
+                    content: String::from("Hello."),
+                    ..AgentResponse::default()
+                },
+            )?;
+            Ok((answered.id, no_sql.id))
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    let cookie = web_session(&h, "owner").await;
+
+    let (_, html, _) = h
+        .page(&format!("/w/{ws}/chat?session={answered}"), Some(&cookie))
+        .await;
+    assert!(
+        html.contains(&format!("action=\"/w/{ws}/saved\"")),
+        "{html}"
+    );
+    assert!(
+        html.contains(&format!("/sessions/{answered}/export?format=sql")),
+        "{html}"
+    );
+
+    let (_, _, headers) = h
+        .form(
+            &format!("/w/{ws}/saved"),
+            Some(&cookie),
+            &format!("name=hello&session={no_sql}"),
+        )
+        .await;
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, format!("/w/{ws}/chat?session={no_sql}"));
+    assert!(html.contains("ran no SQL"), "{html}");
+
+    let (_, _, headers) = h
+        .form(
+            &format!("/w/{ws}/saved"),
+            Some(&cookie),
+            &format!("name=overdue&session={answered}"),
+        )
+        .await;
+    let (to, html) = h.land(&headers, Some(&cookie)).await;
+    assert_eq!(to, format!("/w/{ws}/saved"));
+    assert!(
+        html.contains("Saved &#39;overdue&#39; with 1 statement."),
+        "{html}"
+    );
+    let saved = db
+        .run(|db| saved::by_name(db, "overdue"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .unwrap_or_else(|| fail("not saved"));
+
+    let (status, html, _) = h
+        .form(
+            &format!("/w/{ws}/saved/{}/run", saved.id),
+            Some(&cookie),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("overdue: unchanged"), "{html}");
+    assert!(html.contains("1 rows, unchanged"), "{html}");
+
+    let (_, _, headers) = h
+        .form(
+            &format!("/w/{ws}/saved/{}/remove", saved.id),
+            Some(&cookie),
+            "",
+        )
+        .await;
+    let (_, html) = h.land(&headers, Some(&cookie)).await;
+    assert!(html.contains("Removed the saved question."), "{html}");
+    assert!(html.contains("No saved questions yet."), "{html}");
+}
+
 /// Local mode has no logins, so no users can be added from the API
 /// either; the web form already refused.
 #[tokio::test]

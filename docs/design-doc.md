@@ -1866,7 +1866,8 @@ and the session they came from) and `_quack_saved_runs` (one row per run).
 
 - **Saving pins SQL.** A saved question is made from an answered turn: the person names the
   answer they just got (`quack saved add NAME --from-session ID [--message N]`, the
-  terminal's `/saved add NAME` for its last answer, `POST .../saved`; the terminal's other
+  terminal's `/saved add NAME` for its last answer, the chat page's Save form for the
+  session's last answer, `POST .../saved`; the Saved page, the terminal's other
   `/saved` verbs and the `.../saved` routes in 11.2 list, show, run, and remove). quack keeps the
   question text and the `run_sql` statements that returned rows, in order, each classified
   again as a read. An answer that ran no such statement, or one that ran a write, cannot be
@@ -2253,8 +2254,16 @@ and ask again. The UI covers:
 - Workspace list and switcher; workspace settings (classification label, allowed providers,
   members, API tokens); a separate context page with the editor and its version history.
 - Chat: thread list, streaming answer with a collapsible steps block, citations as links
-  to the document's row, charts and graph results inline, the allow-writes checkbox, a
-  mode selector for new sessions, Stop, an empty state that lists what the workspace holds.
+  to the document's row, charts and graph results inline (each graph with the one-line
+  summary the terminal prints under it, `GraphResult::summary`), the allow-writes checkbox, a
+  mode selector that sets a new session's mode and changes the current one's
+  (`PATCH .../sessions/{sid}`, as `/mode` does), Stop, a form that saves the session's last
+  answer as a saved question, Markdown and SQL export links for the session, and an empty
+  state that lists what the workspace holds.
+- Saved (`/w/{id}/saved`, `server::web::saved`): the workspace's saved questions, each with
+  Run (no model; the rows of each statement, its outcome line, and the run's verdict) and,
+  for its creator or an owner, Remove; the same `Access` operations as the `.../saved`
+  routes, audited the same way.
 - Documents: upload (multi-file), paste text, status with progress, pin, delete.
 - Search (`/w/{id}/search`): a POST form (query, a multi-select of ready documents, the
   mode, an optional graph entity) that runs the same search as the agent without the model

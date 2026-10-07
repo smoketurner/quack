@@ -293,7 +293,7 @@ fn write_show(
                             out,
                             "  statement {}: {}",
                             n.saturating_add(1),
-                            outcome(statement)
+                            statement.outcome()
                         )?;
                     }
                 }
@@ -310,22 +310,6 @@ fn kept_rows(statement: &StatementRun) -> Option<QueryResults> {
         columns: statement.columns.clone(),
         rows: rows.clone(),
     })
-}
-
-/// One line for how a statement went: its error, or its row count and
-/// whether it changed.
-fn outcome(statement: &StatementRun) -> String {
-    match (&statement.error, statement.rows) {
-        (Some(error), _) => format!("error: {error}"),
-        (None, rows) => {
-            let state = if statement.changed {
-                "changed"
-            } else {
-                "unchanged"
-            };
-            format!("{} rows, {state}", rows.unwrap_or_default())
-        }
-    }
 }
 
 /// Print a run in `format`: `json` is the run as one document (the
@@ -349,7 +333,7 @@ fn write_run(out: &mut impl Write, run: &SavedRun, format: QueryFormat) -> Resul
                 } else {
                     " (past the row cap, so not kept)"
                 };
-                writeln!(out, "{}{kept}", outcome(statement))?;
+                writeln!(out, "{}{kept}", statement.outcome())?;
                 writeln!(out)?;
             }
             writeln!(out, "run {}: {}", run.id, run.verdict())?;

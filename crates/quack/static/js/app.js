@@ -299,6 +299,27 @@
     return rest;
   }
 
+  function setMode(form, chat) {
+    var sid = chat.getAttribute("data-session");
+    if (!sid) return;
+    var status = document.getElementById("status");
+    var wanted = form.mode.value;
+    fetch("/api/v1/workspaces/" + chat.getAttribute("data-workspace") + "/sessions/" + sid, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: wanted }),
+      credentials: "same-origin"
+    }).then(function (res) {
+      if (res.ok) {
+        chat.setAttribute("data-mode", wanted);
+        status.textContent = "Mode set to " + wanted + " for this session.";
+        return;
+      }
+      form.mode.value = chat.getAttribute("data-mode");
+      return errorMessage(res).then(function (message) { status.textContent = "Mode not changed: " + message; });
+    });
+  }
+
   function submitAsk(form, chat) {
     var ws = chat.getAttribute("data-workspace");
     var messages = document.getElementById("messages");
@@ -438,10 +459,12 @@
         view.article.appendChild(c);
         renderChart(c, r.chart);
       }
-      (r.graph || []).forEach(function (result) {
+      (r.graph || []).forEach(function (result, i) {
+        if (!result.nodes.length) return;
         var g = el("div", "graph mt-3 h-72 rounded border border-slate-800");
         view.article.appendChild(g);
         renderGraph(g, result);
+        view.article.appendChild(el("p", "mt-1 text-xs text-slate-400", r.graph_summaries[i]));
       });
       if (r.citations && r.citations.length) {
         var ol = el("ol", "mt-3 space-y-1 text-sm text-slate-400");
@@ -639,10 +662,11 @@
     var chat = document.getElementById("chat");
     var form = document.getElementById("ask");
     if (chat && form) {
-      // A session's mode is fixed when it is created; the selector only
-      // chooses the mode of a new session.
+      // The selector shows the session's mode and changes it, as the
+      // terminal's /mode does; with no session yet it picks the new one's.
       var mode = chat.getAttribute("data-mode");
-      if (mode) { form.mode.value = mode; form.mode.disabled = true; form.mode.title = "Set when the session was created"; }
+      if (mode) form.mode.value = mode;
+      form.mode.addEventListener("change", function () { setMode(form, chat); });
       form.addEventListener("submit", function (ev) { ev.preventDefault(); submitAsk(form, chat); });
       // Enter sends; Shift+Enter adds a line.
       form.prompt.addEventListener("keydown", function (ev) {

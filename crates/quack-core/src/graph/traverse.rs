@@ -429,27 +429,47 @@ impl fmt::Display for GraphResult {
                 tree.node(f, node, 0)?;
             }
         }
-        write!(f, "{}", self.nodes.len())?;
-        if let Some(total) = self.total_nodes.filter(|_| self.truncated) {
+        writeln!(f, "{}", self.summary())
+    }
+}
+
+/// A result's last line: what it holds, and what a reader must know to
+/// trust it (cut short, provisional, left out, built from an older
+/// ontology). The terminal prints it under the tree and the web chat
+/// under the drawn graph.
+pub struct Summary<'a>(&'a GraphResult);
+
+impl GraphResult {
+    #[must_use]
+    pub const fn summary(&self) -> Summary<'_> {
+        Summary(self)
+    }
+}
+
+impl fmt::Display for Summary<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let result = self.0;
+        write!(f, "{}", result.nodes.len())?;
+        if let Some(total) = result.total_nodes.filter(|_| result.truncated) {
             write!(f, " of {total} matching")?;
         }
         write!(
             f,
             " nodes, {} edges, {} sources",
-            self.edges.len(),
-            self.provenance.len()
+            result.edges.len(),
+            result.provenance.len()
         )?;
-        if self
+        if result
             .nodes
             .iter()
             .any(|n| n.standing == Standing::Provisional)
         {
             f.write_str(" (provisional: built from an unreviewed ontology)")?;
         }
-        if self.truncated {
+        if result.truncated {
             // Without this the reader takes the cap for the population and
             // answers "how many are there" with `max_nodes`.
-            f.write_str(match self.total_nodes {
+            f.write_str(match result.total_nodes {
                 Some(_) => {
                     " — cut off at the node limit, so this is not the whole class; count with \
                      describe_class rather than by counting these lines"
@@ -457,7 +477,18 @@ impl fmt::Display for GraphResult {
                 None => " — cut off at the node limit, so entities further out are missing",
             })?;
         }
-        f.write_str("\n")
+        let status = &result.status;
+        if status.dropped_provisional > 0 {
+            write!(
+                f,
+                "; {} provisional nodes left out, since query mode answers from reviewed ones only",
+                status.dropped_provisional
+            )?;
+        }
+        if status.stale {
+            f.write_str("; the graph was built with an older ontology version")?;
+        }
+        Ok(())
     }
 }
 
