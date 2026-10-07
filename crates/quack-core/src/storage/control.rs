@@ -3245,11 +3245,15 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn audit_rows_by_ids(&self, ids: &[AuditId]) -> Result<Vec<AuditRow>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
+        // In batches: SQLite caps the variables one statement binds, and an
+        // export of a whole workspace's audit names every row.
+        const BATCH: usize = 500;
+        let mut rows = Vec::with_capacity(ids.len());
+        for batch in ids.chunks(BATCH) {
+            let bound = AuditFilter::by_ids(batch)?;
+            rows.extend(bound.query_as::<AuditRow>().fetch_all(&self.pool).await?);
         }
-        let bound = AuditFilter::by_ids(ids)?;
-        Ok(bound.query_as().fetch_all(&self.pool).await?)
+        Ok(rows)
     }
 
     /// A workspace's detail rows joined to their access rows by the shared

@@ -437,9 +437,9 @@ impl Access {
 
 #[derive(Deserialize, utoipa::IntoParams)]
 pub(crate) struct AuditQuery {
-    /// Rows at most, newest first.
+    /// Rows at most, newest first; at most 1,000.
     #[serde(default = "default_limit")]
-    #[param(default = 100)]
+    #[param(default = 100, maximum = 1000)]
     pub limit: u32,
     /// `ocsf`: each detail row joined to its access row as an OCSF event
     /// (the `ai_operation` profile on queries); absent, the detail rows.
@@ -452,6 +452,9 @@ pub(crate) struct AuditQuery {
 fn default_limit() -> u32 {
     100
 }
+
+/// The most audit rows one request returns.
+const MAX_AUDIT_ROWS: u32 = 1_000;
 
 /// The shapes the workspace audit comes in besides its own rows.
 #[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
@@ -490,7 +493,7 @@ pub(crate) async fn audit_detail(
     Query(q): Query<AuditQuery>,
 ) -> ApiResult<Json<AuditDetail>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let limit = q.limit;
+    let limit = q.limit.min(MAX_AUDIT_ROWS);
     let rows = app.read(&id, move |db| audit::list(db, limit)).await?;
     access
         .audit(

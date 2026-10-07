@@ -1620,3 +1620,25 @@ async fn a_provider_grant_never_displaces_a_hand_granted_membership() {
         Some(Role::Owner)
     );
 }
+
+/// Joining a workspace's whole audit to its access rows binds far more ids
+/// than SQLite allows in one statement: the lookup goes in batches.
+#[tokio::test]
+async fn audit_rows_are_found_for_more_ids_than_one_statement_binds() {
+    let (_dir, cp) = open().await;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let entry = setup_audit();
+        ids.push(entry.id.clone());
+        cp.record_audit(&entry)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    // Ids with no row pad the list past SQLite's 32,766-variable limit.
+    ids.extend((0..33_000).map(|_| AuditId::generate()));
+    let rows = cp
+        .audit_rows_by_ids(&ids)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(rows.len(), 3);
+}
