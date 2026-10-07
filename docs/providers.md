@@ -295,9 +295,10 @@ them.
 
 - SOCKS proxies are not supported. Requests through one fail, and `quack doctor` fails the
   check.
-- Amazon Bedrock's `converse` API and AWS credential calls take one proxy. When
-  `HTTP_PROXY` and `HTTPS_PROXY` differ they use `HTTPS_PROXY`, and an `http://` Bedrock
-  `base_url` is reached directly.
+- Amazon Bedrock's `converse` API and AWS credential calls (Bedrock's, and an S3
+  import's) take one proxy. When `HTTP_PROXY` and `HTTPS_PROXY` differ they use
+  `HTTPS_PROXY`, and an `http://` Bedrock `base_url` is reached directly. An S3 import's
+  download itself goes through the same client as any HTTP(S) import.
 - A proxy that inspects TLS presents its own certificate. Add its certificate authority
   to the operating system's trust store.
 - With `[import].allow_private_hosts` off, an import through a proxy checks only an

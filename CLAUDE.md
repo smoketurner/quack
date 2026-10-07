@@ -112,7 +112,7 @@ cargo run --bin quack -- graph add node LABEL --class C [--property K=V] | add e
 cargo run --bin quack -- graph export DIR|- [--format csv|graphml|jsonld] [--include-provisional]   # the whole graph (graph::export); csv to stdout is a tar
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
-cargo run --bin quack -- import sqlite:/path/src.db --table t --from orders [--types col=TYPE]   # snapshot a SQLite query or an http(s) data file as a table
+cargo run --bin quack -- import sqlite:/path/src.db --table t --from orders [--types col=TYPE]   # snapshot a SQLite query, an http(s) data file (-H 'Name: value', --bearer-env VAR, --json-pointer /data), or s3://bucket/key as a table
 cargo run --bin quack -- auth login|status|logout PROVIDER ; auth jwks [PROVIDER] [--rotate [--activate]]  # OAuth tokens; a client's public key
 cargo run --bin quack -- auth register [--issuer URL] [--device-code|--token-env VAR|--open] [--replace] [--print] | unregister   # RFC 7591/7592 client registration
 cargo run --bin quack -- config [--changed] [--format json]                      # every recognized setting, its value and origin, the file's unknown keys, the env vars read
@@ -499,9 +499,13 @@ Bearer resource_metadata=...` on 401, so MCP clients can sign users in themselve
 External data comes in through `quack_core::import` (`quack import`, `POST .../import`, the
 Tables page form, `/import` in the terminal): a query runs on a SQLite file, opened read-only
 by path, with every column cast to text through sqlx, or a CSV, Parquet, JSON, or workbook
-file is fetched over HTTP(S), and the rows load through the normal
-ingestion path as a document with source `import` and the redacted URL as title. No
-`ATTACH`: the workspace never reaches out at query time.
+file is fetched over HTTP(S) (with `import::SourceHeader`s: given ones, or a bearer token read
+from `--bearer-env` at fetch time; `JsonPointer` picks the rows of an enveloped JSON) or from S3
+(`import::s3`, a GET signed by `llm::bedrock::Signer::s3` with the AWS SDK's credentials), and
+the rows load through the normal ingestion path as a document with source `import` and the
+redacted URL as title. S3 and `--bearer-env` use the server's own credentials, so `quack serve`
+with logins refuses them (`Error::ServerCredentials`, 403) unless
+`[import].allow_server_credentials`. No `ATTACH`: the workspace never reaches out at query time.
 
 `quack serve` (`crates/quack/src/server/`) is a thin axum client of core: `auth.rs` turns a
 bearer (login session or API token), the session cookie, or `--local` into an `Identity`

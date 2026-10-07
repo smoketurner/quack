@@ -34,7 +34,7 @@ use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::export::Destination;
 use quack_core::graph::follow_up::FollowUp;
 use quack_core::ids::{DocumentId, SessionId};
-use quack_core::import::{self, ImportPolicy, ImportRequest};
+use quack_core::import::{self, ImportPolicy, ImportRequest, JsonPointer, SourceHeader};
 use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::tree::{FileResult, Folder, Outcome, Prune};
 use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile};
@@ -537,7 +537,8 @@ struct McpArgs {
 
 #[derive(clap::Args)]
 struct ImportArgs {
-    /// A SQLite path as `sqlite:PATH`, or an http(s) URL of a data file
+    /// A SQLite path as `sqlite:PATH`, an http(s) URL of a data file, or
+    /// `s3://BUCKET/KEY` (the AWS CLI's credentials and region)
     url: String,
     /// The workspace table to create (replaced when it exists)
     #[arg(long)]
@@ -555,17 +556,32 @@ struct ImportArgs {
     /// or repeated; every value must convert
     #[arg(long, value_name = "COLUMN=TYPE")]
     types: Vec<ColumnTypes>,
+    /// Send a header with an http(s) download, as `NAME: VALUE`; repeat
+    /// for more. Used once and never stored
+    #[arg(long = "header", short = 'H', value_name = "NAME: VALUE")]
+    headers: Vec<SourceHeader>,
+    /// Send `Authorization: Bearer` with the token in this environment
+    /// variable, read when the download starts
+    #[arg(long, value_name = "VAR")]
+    bearer_env: Option<String>,
+    /// Load the array of rows at this RFC 6901 pointer inside a JSON
+    /// download, as `/data/items`
+    #[arg(long, value_name = "POINTER")]
+    json_pointer: Option<JsonPointer>,
 }
 
 impl From<ImportArgs> for ImportRequest {
     fn from(args: ImportArgs) -> Self {
+        let mut headers = args.headers;
+        headers.extend(args.bearer_env.map(SourceHeader::BearerEnv));
         Self {
-            url: args.url.into(),
-            table: args.table,
             query: args.query,
             source_table: args.from,
             limit: args.limit,
             types: ColumnTypes::joined(args.types),
+            headers,
+            json_pointer: args.json_pointer,
+            ..Self::new(args.url, args.table)
         }
     }
 }

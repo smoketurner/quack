@@ -4,14 +4,18 @@
 //! as a workspace table through the same path a CSV upload takes. Sources:
 //! a SQLite file through sqlx, opened read-only (every column cast to text
 //! on the source side, so any type comes through), and a CSV, Parquet,
-//! JSON, or workbook file over HTTP(S) through reqwest. Credentials in the
-//! URL are used once and never stored: the document row and the audit
-//! detail carry the redacted URL.
+//! JSON, or workbook file over HTTP(S) through reqwest, with any headers
+//! the caller gives, or from Amazon S3 (`s3`). Credentials in the URL or a
+//! header are used once and never stored: the document row and the audit
+//! detail carry the redacted URL and the headers' names.
 
 use std::fmt::{self, Write as _};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::str::FromStr;
 use std::time::Duration;
+
+use http::{HeaderName, HeaderValue, StatusCode};
 
 use crate::embedding::EmbeddingModel;
 use futures::TryStreamExt as _;
@@ -45,6 +49,122 @@ pub struct ImportRequest {
     pub limit: Option<u64>,
     /// Types to give the loaded table's columns.
     pub types: ColumnTypes,
+    /// Headers an HTTP(S) download sends.
+    pub headers: Vec<SourceHeader>,
+    /// Where a JSON download's rows sit, when an envelope wraps them.
+    pub json_pointer: Option<JsonPointer>,
+}
+
+/// One header an HTTP(S) download sends. `Debug` shows only the name, so a
+/// token never reaches a log.
+#[derive(Clone)]
+pub enum SourceHeader {
+    /// A header sent as given: `Name: value`.
+    Given {
+        name: HeaderName,
+        value: HeaderValue,
+    },
+    /// `Authorization: Bearer` with a token read from this process's
+    /// environment variable when the download starts, never stored.
+    BearerEnv(String),
+}
+
+impl fmt::Debug for SourceHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Given { name, .. } => write!(f, "{name}: ***"),
+            Self::BearerEnv(variable) => write!(f, "authorization: Bearer ${variable}"),
+        }
+    }
+}
+
+/// `Name: value`, as `curl -H` takes it.
+impl FromStr for SourceHeader {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let (name, value) = text
+            .split_once(':')
+            .ok_or_else(|| Error::Ingestion(String::from("a header is NAME: VALUE")))?;
+        let name = HeaderName::from_str(name.trim())
+            .map_err(|e| Error::Ingestion(format!("bad header name: {e}")))?;
+        let mut value = HeaderValue::from_str(value.trim())
+            .map_err(|_| Error::Ingestion(format!("bad value for header {name}")))?;
+        value.set_sensitive(true);
+        Ok(Self::Given { name, value })
+    }
+}
+
+impl SourceHeader {
+    /// The header's name, which is all an audit row records.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Given { name, .. } => name.as_str(),
+            Self::BearerEnv(_) => "authorization",
+        }
+    }
+
+    /// The header to send; `variable` looks up an environment variable.
+    fn resolve(
+        &self,
+        variable: impl Fn(&str) -> Option<String>,
+    ) -> Result<(HeaderName, HeaderValue)> {
+        match self {
+            Self::Given { name, value } => Ok((name.clone(), value.clone())),
+            Self::BearerEnv(name) => {
+                let token = variable(name)
+                    .filter(|token| !token.trim().is_empty())
+                    .ok_or_else(|| Error::Ingestion(format!("{name} is not set")))?;
+                let mut value = HeaderValue::from_str(&format!("Bearer {}", token.trim()))
+                    .map_err(|_| Error::Ingestion(format!("{name} is not a usable token")))?;
+                value.set_sensitive(true);
+                Ok((http::header::AUTHORIZATION, value))
+            }
+        }
+    }
+}
+
+/// Where a JSON document's rows sit (RFC 6901): `/data/items` for
+/// `{"data": {"items": [...]}}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonPointer(String);
+
+impl FromStr for JsonPointer {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let text = text.trim();
+        if !text.is_empty() && !text.starts_with('/') {
+            return Err(Error::Ingestion(format!(
+                "a JSON pointer starts with / (RFC 6901), as /data/items; got {text}"
+            )));
+        }
+        Ok(Self(text.to_owned()))
+    }
+}
+
+impl fmt::Display for JsonPointer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl JsonPointer {
+    /// The array of rows this points at inside `document`, as JSON.
+    fn rows(&self, document: &[u8]) -> Result<Vec<u8>> {
+        let value: serde_json::Value = serde_json::from_slice(document)
+            .map_err(|e| Error::Ingestion(format!("the download is not JSON: {e}")))?;
+        let rows = value
+            .pointer(&self.0)
+            .ok_or_else(|| Error::Ingestion(format!("the JSON has nothing at {self}")))?;
+        if !rows.is_array() {
+            return Err(Error::Ingestion(format!(
+                "the JSON at {self} is not an array of rows"
+            )));
+        }
+        Ok(serde_json::to_vec(rows)?)
+    }
 }
 
 /// Which sources a caller may reach (issue #42). The owner's interfaces
@@ -55,6 +175,17 @@ pub struct ImportPolicy {
     /// `sqlite:` paths on the local disk.
     pub local_files: bool,
     pub hosts: HostReach,
+    pub credentials: CredentialReach,
+}
+
+/// Whether an import may authenticate as this process: S3 with its AWS
+/// identity, or a bearer token from its environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialReach {
+    /// The process's own credentials.
+    Process,
+    /// Only what the caller gives in the URL or a header.
+    CallerOnly,
 }
 
 /// Which HTTP(S) hosts a download may reach.
@@ -76,6 +207,7 @@ impl ImportPolicy {
         Self {
             local_files: true,
             hosts: HostReach::Any,
+            credentials: CredentialReach::Process,
         }
     }
 
@@ -88,6 +220,11 @@ impl ImportPolicy {
                 HostReach::Any
             } else {
                 HostReach::PublicOnly
+            },
+            credentials: if config.import.allow_server_credentials {
+                CredentialReach::Process
+            } else {
+                CredentialReach::CallerOnly
             },
         }
     }
@@ -118,14 +255,15 @@ pub struct ImportSummary {
 }
 
 /// The kind of source a URL names.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
     Sqlite,
     Http,
+    S3,
 }
 
-/// A source URL: `sqlite://path` or `sqlite:path`, or an `http(s)://` URL
-/// of a data file. It can carry a password, so `Debug`
+/// A source URL: `sqlite://path` or `sqlite:path`, an `http(s)://` URL of a
+/// data file, or `s3://bucket/key`. It can carry a password, so `Debug`
 /// and `Display` show it redacted; only `SourceUrl::expose` gives the
 /// whole of it, to connect with.
 #[derive(Clone, PartialEq, Eq)]
@@ -173,9 +311,11 @@ impl SourceUrl {
             Ok(SourceKind::Sqlite)
         } else if lower.starts_with("http://") || lower.starts_with("https://") {
             Ok(SourceKind::Http)
+        } else if lower.starts_with("s3://") {
+            Ok(SourceKind::S3)
         } else {
             Err(Error::Ingestion(String::from(
-                "the source must be a sqlite: file or an http(s):// data file",
+                "the source must be a sqlite: file, an http(s):// data file, or s3://bucket/key",
             )))
         }
     }
@@ -321,7 +461,11 @@ impl<M: EmbeddingModel> Importing<'_, M> {
             .min(config.import.max_rows)
             .max(1);
         let source = request.url.redacted();
-        let pulled = self.pull(&table, limit).await?;
+        request.check(request.url.kind()?, self.policy)?;
+        let mut pulled = self.pull(&table, limit).await?;
+        if let Some(pointer) = &request.json_pointer {
+            pulled.bytes = pointer.rows(&pulled.bytes)?;
+        }
         let outcome = ingestion::ingest_file(
             config,
             db,
@@ -378,16 +522,27 @@ impl<M: EmbeddingModel> Importing<'_, M> {
         let (config, request, policy, control) =
             (self.config, self.request, self.policy, self.control);
         let timeout = config.import.timeout();
+        let download = Download {
+            timeout,
+            max_mb: config.import.max_download_mb,
+            hosts: policy.hosts,
+            proxies: Proxies::from_env(),
+        };
         match request.url.kind()? {
             SourceKind::Http => {
-                let download = Download {
-                    timeout,
-                    max_mb: config.import.max_download_mb,
-                    hosts: policy.hosts,
-                    proxies: Proxies::from_env(),
-                };
+                let headers = request
+                    .headers
+                    .iter()
+                    .map(|header| header.resolve(|name| std::env::var(name).ok()))
+                    .collect::<Result<Vec<_>>>()?;
                 control
-                    .or_cancelled(download.fetch(&request.url, table.as_str()))
+                    .or_cancelled(download.fetch(&request.url, table.as_str(), headers))
+                    .await
+            }
+            SourceKind::S3 => {
+                let object = S3Object::parse(&request.url)?;
+                control
+                    .or_cancelled(download.fetch_s3(&object, table.as_str()))
                     .await
             }
             SourceKind::Sqlite if !policy.local_files => Err(Error::Ingestion(String::from(
@@ -454,6 +609,52 @@ fn cap_loaded_table(db: &WorkspaceDb, table: &str, limit: u64) -> Result<KeptRow
 }
 
 impl ImportRequest {
+    /// An import of `url` into `table`, with no query, source table, limit,
+    /// types, headers, or JSON pointer yet.
+    #[must_use]
+    pub fn new(url: impl Into<SourceUrl>, table: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            table: table.into(),
+            query: None,
+            source_table: None,
+            limit: None,
+            types: ColumnTypes::default(),
+            headers: Vec::new(),
+            json_pointer: None,
+        }
+    }
+
+    /// Refuse options the source cannot take, and credentials the caller
+    /// may not use: S3 signs with this process's AWS identity, and a bearer
+    /// token from the environment is this process's secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ServerCredentials`] for credentials the policy does
+    /// not cover, and an ingestion error for a misplaced option.
+    pub fn check(&self, kind: SourceKind, policy: ImportPolicy) -> Result<()> {
+        if !self.headers.is_empty() && kind != SourceKind::Http {
+            return Err(Error::Ingestion(String::from(
+                "headers go with an http(s):// source",
+            )));
+        }
+        if self.json_pointer.is_some() && kind == SourceKind::Sqlite {
+            return Err(Error::Ingestion(String::from(
+                "a JSON pointer goes with a downloaded JSON file",
+            )));
+        }
+        let process_credentials = kind == SourceKind::S3
+            || self
+                .headers
+                .iter()
+                .any(|header| matches!(header, SourceHeader::BearerEnv(_)));
+        if process_credentials && policy.credentials == CredentialReach::CallerOnly {
+            return Err(Error::ServerCredentials);
+        }
+        Ok(())
+    }
+
     /// The inner query the source runs: the caller's, or the whole source
     /// table.
     fn source_query(&self) -> Result<String> {
@@ -561,20 +762,10 @@ struct Download<'a> {
 }
 
 impl Download<'_> {
-    /// Download a data file; the workspace file name keeps the URL's
-    /// extension so the usual reader loads it, under the requested table name.
-    ///
-    /// When only public hosts may be reached, the name is resolved first,
-    /// every address is checked, and the connection is pinned to those
-    /// addresses so a second lookup cannot answer differently. Through a
-    /// proxy the proxy resolves the name, and may be the only resolver that
-    /// can, so only an address written in the URL is checked here.
-    async fn fetch(&self, url: &SourceUrl, table: &str) -> Result<Pulled> {
-        let download = self;
-        let url = url.expose();
-        // The same extensions `quack ingest` loads as tables.
-        let extension = url
-            .split(['?', '#'])
+    /// The extension of `name` when `quack ingest` loads it as a table, so
+    /// the usual reader takes the download under the requested table name.
+    fn table_extension(name: &str) -> Result<String> {
+        name.split(['?', '#'])
             .next()
             .and_then(|path| path.rsplit('/').next())
             .filter(|name| FileType::of(name).is_some_and(|t| !matches!(t.load(), Load::Chunks(_))))
@@ -585,21 +776,79 @@ impl Download<'_> {
                     .map(|e| format!(".{e}"))
                     .collect();
                 Error::Ingestion(format!(
-                    "the URL must name a table file ending in {}",
+                    "the source must name a table file ending in {}",
                     accepted.join(", ")
                 ))
-            })?;
-        let parsed =
-            reqwest::Url::parse(url).map_err(|e| Error::Ingestion(format!("bad URL: {e}")))?;
-        let mut builder = download.proxies.client().timeout(download.timeout);
-        if download.hosts == HostReach::PublicOnly {
-            let host = parsed
+            })
+    }
+
+    /// Download the data file at `url`, sending `headers`.
+    async fn fetch(
+        &self,
+        url: &SourceUrl,
+        table: &str,
+        headers: Vec<(HeaderName, HeaderValue)>,
+    ) -> Result<Pulled> {
+        let extension = Self::table_extension(url.expose())?;
+        let parsed = reqwest::Url::parse(url.expose())
+            .map_err(|e| Error::Ingestion(format!("bad URL: {e}")))?;
+        let response = self.get(parsed, headers).await?;
+        Ok(Pulled {
+            filename: format!("{table}.{extension}"),
+            bytes: self.body(response).await?,
+            columns: Vec::new(),
+            rows: None,
+        })
+    }
+
+    /// Download an S3 object. A bucket in another region than the
+    /// configured one answers 301 with its region; the GET is signed again
+    /// for that region once.
+    async fn fetch_s3(&self, object: &S3Object, table: &str) -> Result<Pulled> {
+        const BUCKET_REGION: &str = "x-amz-bucket-region";
+        let extension = Self::table_extension(object.key())?;
+        let signed = Box::pin(object.signed_get(self.proxies, None)).await?;
+        let mut response = self.get(signed.url, signed.headers).await?;
+        if response.status() == StatusCode::MOVED_PERMANENTLY
+            && let Some(region) = response
+                .headers()
+                .get(BUCKET_REGION)
+                .and_then(|region| region.to_str().ok())
+                .map(str::to_owned)
+        {
+            let signed = Box::pin(object.signed_get(self.proxies, Some(&region))).await?;
+            response = self.get(signed.url, signed.headers).await?;
+        }
+        Ok(Pulled {
+            filename: format!("{table}.{extension}"),
+            bytes: self.body(response).await?,
+            columns: Vec::new(),
+            rows: None,
+        })
+    }
+
+    /// Send a GET for `url` with `headers`; the response comes back whatever
+    /// its status.
+    ///
+    /// When only public hosts may be reached, the name is resolved first,
+    /// every address is checked, and the connection is pinned to those
+    /// addresses so a second lookup cannot answer differently. Through a
+    /// proxy the proxy resolves the name, and may be the only resolver that
+    /// can, so only an address written in the URL is checked here.
+    async fn get(
+        &self,
+        url: reqwest::Url,
+        headers: Vec<(HeaderName, HeaderValue)>,
+    ) -> Result<reqwest::Response> {
+        let mut builder = self.proxies.client().timeout(self.timeout);
+        if self.hosts == HostReach::PublicOnly {
+            let host = url
                 .host_str()
                 .ok_or_else(|| Error::Ingestion(String::from("the URL has no host")))?;
-            let port = parsed
+            let port = url
                 .port_or_known_default()
                 .ok_or_else(|| Error::Ingestion(String::from("the URL has no port")))?;
-            match download.proxies.route(&parsed) {
+            match self.proxies.route(&url) {
                 Route::Direct => {
                     let addresses = public_addresses(host, port).await?;
                     builder = builder.resolve_to_addrs(host, &addresses);
@@ -612,18 +861,23 @@ impl Download<'_> {
                     }
                 }
             }
-        }
-        if download.hosts == HostReach::PublicOnly {
             builder = builder.redirect(reqwest::redirect::Policy::none());
         }
         let client = builder
             .build()
             .map_err(|e| Error::Ingestion(e.to_string()))?;
-        let mut response = client
-            .get(parsed)
+        let mut request = client.get(url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        request
             .send()
             .await
-            .map_err(|e| Error::Ingestion(format!("download failed: {e}")))?;
+            .map_err(|e| Error::Ingestion(format!("download failed: {e}")))
+    }
+
+    /// A successful response's body, within `[import].max_download_mb`.
+    async fn body(&self, mut response: reqwest::Response) -> Result<Vec<u8>> {
         if response.status().is_redirection() {
             return Err(Error::Ingestion(format!(
                 "download failed: the server answered {}; import the URL it points to",
@@ -636,11 +890,11 @@ impl Download<'_> {
                 response.status()
             )));
         }
-        let max_bytes = download.max_mb.saturating_mul(1024 * 1024);
+        let max_bytes = self.max_mb.saturating_mul(1024 * 1024);
         let too_large = || {
             Error::Ingestion(format!(
                 "the file is larger than [import].max_download_mb ({} MB)",
-                download.max_mb
+                self.max_mb
             ))
         };
         if response
@@ -661,12 +915,7 @@ impl Download<'_> {
             }
             bytes.extend_from_slice(&chunk);
         }
-        Ok(Pulled {
-            filename: format!("{table}.{extension}"),
-            bytes,
-            columns: Vec::new(),
-            rows: None,
-        })
+        Ok(bytes)
     }
 }
 
@@ -722,6 +971,10 @@ fn is_private_address(ip: IpAddr) -> bool {
         },
     }
 }
+
+mod s3;
+
+use s3::S3Object;
 
 #[cfg(test)]
 mod tests;

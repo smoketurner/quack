@@ -1025,15 +1025,16 @@ that would exceed what is left is skipped with a visible "(omitted)" line, not t
 | Excel `.xlsx`, `.xls`, `.ods` | `calamine` (pure Rust) writes each sheet as CSV under `files/` for `read_csv_auto` | One table per data sheet: `<stem>` for one sheet, `<stem>_<sheet>` otherwise; recorded on the document row so deleting it drops them |
 | stdin (print mode) | sniffed | Temporary table `stdin` |
 | SQLite | `quack import URL --table T (--from SOURCE_TABLE \| --query SQL) [--limit N]`, `POST .../import`, the Tables page form, `/import` in the terminal (below) | Table in `data.duckdb`, a snapshot of the source at import time |
-| CSV, Parquet, JSON, workbooks over HTTP(S) | The same command with an `http(s)://` URL naming any file `quack ingest` loads as a table (`parser::table_extensions`: CSV, TSV, Parquet, JSON, JSONL, and XLSX, XLSM, XLS, ODS workbooks): reqwest fetches the file and it goes through the usual reader under the requested table name | Table in `data.duckdb` |
+| CSV, Parquet, JSON, workbooks over HTTP(S) | The same command with an `http(s)://` URL naming any file `quack ingest` loads as a table (`parser::table_extensions`: CSV, TSV, Parquet, JSON, JSONL, and XLSX, XLSM, XLS, ODS workbooks): reqwest fetches the file and it goes through the usual reader under the requested table name. `--header 'Name: value'` (repeatable) and `--bearer-env VAR` send headers; `--json-pointer /data/items` (RFC 6901) loads the array of rows inside an enveloped JSON response | Table in `data.duckdb` |
 | Postgres, MySQL | Not supported: `postgres://` and `mysql://` URLs are refused. Export the rows to a file, or put the file behind HTTP(S). The scanner extensions stay out (section 15). | — |
-| S3 | Not yet: S3 needs request signing. The httpfs extension stays out (section 15). | — |
+| S3 | `quack import s3://BUCKET/KEY --table T`: a `SigV4`-signed GET (`aws-sigv4`, the `import::s3` module), with the credentials and region the AWS SDK finds as the AWS CLI does, through the same proxies; `AWS_ENDPOINT_URL_S3` names an S3-compatible store. A bucket in another region is signed again for it once. The httpfs extension stays out (section 15). | Table in `data.duckdb` |
 
-**SQLite import.** sqlx opens the file read-only by path and runs the query with every
-column cast to text. Rows
+**Import.** sqlx opens a SQLite file read-only by path and runs the query with every
+column cast to text; a download or an S3 object is fetched whole. Rows
 pass through `files/<table>.csv` and `read_csv_auto`, so `DuckDB` sniffs the types. The table
 is a document (source `import`, title the redacted URL), deletable like any other. The URL's
-password is used once and never stored; audit rows carry the redacted URL. Caps:
+password and every header value are used once and never stored; audit rows carry the
+redacted URL and the headers' names. Caps:
 `[import].max_rows` (a file is cut to it after the load), `max_download_mb`,
 `timeout_seconds`. `sqlite:` paths inside `[general].data_dir` (`control.db`, the workspace
 files) are refused for every caller. The CLI, the terminal, and `quack serve --local` run as
@@ -1043,7 +1044,10 @@ the host first, refuses loopback, private, link-local, and metadata addresses, p
 connection to the checked addresses, and does not follow redirects. When a forward proxy
 applies to the URL (`HTTPS_PROXY`, `HTTP_PROXY`; loopback and link-local are never proxied),
 the proxy resolves the name, so quack checks only an address written in the URL and the
-proxy decides which hosts a name may reach.
+proxy decides which hosts a name may reach. S3 and `--bearer-env` authenticate as the
+server: its AWS identity, a token from its environment. `quack serve` with logins refuses
+both (403, code `server_credentials`, a denied audit row) unless
+`[import].allow_server_credentials` is on.
 
 **Table naming.** The sanitized file stem. One live document owns a table: a changed file
 with the same name is refused (`Error::TableTaken`, 409) unless it replaces its
@@ -2935,6 +2939,7 @@ max_download_mb = 512
 timeout_seconds = 300
 allow_local_files = false               # quack serve with logins: sqlite: paths on the server's disk
 allow_private_hosts = false             # quack serve with logins: loopback, private, link-local hosts
+allow_server_credentials = false        # quack serve with logins: S3 and --bearer-env use the server's identity
 
 [graph]
 max_traversal_depth = 3

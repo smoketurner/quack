@@ -443,6 +443,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "timeout_seconds",
             "allow_local_files",
             "allow_private_hosts",
+            "allow_server_credentials",
         ],
     ),
     ("jobs", &["history"]),
@@ -1026,6 +1027,11 @@ fn import(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "allow_private_hosts",
         import.allow_private_hosts,
         default.allow_private_hosts,
+    );
+    s.literal(
+        "allow_server_credentials",
+        import.allow_server_credentials,
+        default.allow_server_credentials,
     );
 }
 

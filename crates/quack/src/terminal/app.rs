@@ -31,7 +31,7 @@ use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::follow_up::FollowUp;
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery, UnknownEntity};
 use quack_core::ids::{SessionId, WorkspaceId};
-use quack_core::import::{self, ImportPolicy, ImportRequest};
+use quack_core::import::{self, ImportPolicy, ImportRequest, SourceHeader};
 use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::jobs::{
@@ -45,7 +45,7 @@ use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
 use quack_core::storage::control::ResourceKind;
-use quack_core::storage::profile::{ColumnTypes, TableProfile};
+use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, MessageRole, Sharing, Transcript,
 };
@@ -2083,14 +2083,19 @@ impl App {
                 table,
                 source_table,
                 query,
-            } => self.run_job(CliJob::Import(ImportRequest {
-                url: url.into(),
-                table,
-                query,
-                source_table,
-                limit: None,
-                types: ColumnTypes::default(),
-            })),
+                mut headers,
+                bearer_env,
+                json_pointer,
+            } => {
+                headers.extend(bearer_env.map(SourceHeader::BearerEnv));
+                self.run_job(CliJob::Import(ImportRequest {
+                    query,
+                    source_table,
+                    headers,
+                    json_pointer,
+                    ..ImportRequest::new(url, table)
+                }));
+            }
             SlashCommand::Path { route } => self.show_path(&route),
             SlashCommand::Sql {
                 statement: Some(sql),

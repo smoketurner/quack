@@ -21,7 +21,7 @@ use quack_core::ingestion::tree::{Folder, FolderReport, Outcome, Prune};
 use quack_core::llm::CancellationToken;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::{ControlPlane, WorkspaceName};
-use quack_core::storage::profile::{ColumnTypes, TableProfile};
+use quack_core::storage::profile::TableProfile;
 use quack_core::storage::workspace::{
     ChunkScope, DocumentFields, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk,
     NewDocument, Pinning, StatementKind, WorkspaceDb,
@@ -2905,12 +2905,8 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     }
     let url = format!("sqlite://{}", source_path.display());
     let request = ImportRequest {
-        url: url.clone().into(),
-        table: String::from("Orders Import"),
-        query: None,
         source_table: Some(String::from("orders")),
-        limit: None,
-        types: ColumnTypes::default(),
+        ..ImportRequest::new(url.clone(), String::from("Orders Import"))
     };
     let summary = import::Importing {
         config: &config,
@@ -2961,14 +2957,11 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
 
     // A query with a limit, into another table.
     let request = ImportRequest {
-        url: url.clone().into(),
-        table: String::from("big"),
         query: Some(String::from(
             "SELECT region, total * 2 AS doubled FROM orders ORDER BY id",
         )),
-        source_table: None,
         limit: Some(2),
-        types: ColumnTypes::default(),
+        ..ImportRequest::new(url.clone(), String::from("big"))
     };
     let summary = import::Importing {
         config: &config,
@@ -3228,12 +3221,11 @@ async fn server_policy_refuses_local_sqlite_files() {
         db: &writer,
         workspace_id: "ws-import-policy",
         request: &ImportRequest {
-            url: format!("sqlite://{}", dir.path().join("control.db").display()).into(),
-            table: String::from("x"),
-            query: None,
             source_table: Some(String::from("users")),
-            limit: None,
-            types: ColumnTypes::default(),
+            ..ImportRequest::new(
+                format!("sqlite://{}", dir.path().join("control.db").display()),
+                String::from("x"),
+            )
         },
         policy: server_policy,
         embedder: None::<&Embedder<MockEmbeddingModel>>,
@@ -3266,12 +3258,8 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
     }
     let url = format!("sqlite://{}", source_path.display());
     let first = ImportRequest {
-        url: url.clone().into(),
-        table: String::from("Orders Import"),
-        query: None,
         source_table: Some(String::from("orders")),
-        limit: None,
-        types: ColumnTypes::default(),
+        ..ImportRequest::new(url.clone(), String::from("Orders Import"))
     };
     let summary = import::Importing {
         config: &config,
@@ -3304,12 +3292,8 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         db: &writer,
         workspace_id: "ws-import-errors",
         request: &ImportRequest {
-            url: url.into(),
-            table: String::from("x"),
             query: Some(String::from("SELECT * FROM nope")),
-            source_table: None,
-            limit: None,
-            types: ColumnTypes::default(),
+            ..ImportRequest::new(url, String::from("x"))
         },
         policy: ImportPolicy::owner(),
         embedder: None::<&Embedder<MockEmbeddingModel>>,
@@ -3323,12 +3307,8 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         db: &writer,
         workspace_id: "ws-import-errors",
         request: &ImportRequest {
-            url: String::from("mysql://h/db").into(),
-            table: String::from("x"),
-            query: None,
             source_table: Some(String::from("t")),
-            limit: None,
-            types: ColumnTypes::default(),
+            ..ImportRequest::new(String::from("mysql://h/db"), String::from("x"))
         },
         policy: ImportPolicy::owner(),
         embedder: None::<&Embedder<MockEmbeddingModel>>,

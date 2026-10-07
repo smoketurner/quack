@@ -432,6 +432,32 @@ pub(crate) struct Signer {
     cached: tokio::sync::Mutex<Option<Credentials>>,
     region: String,
     service: &'static str,
+    style: SigningStyle,
+}
+
+/// How a service wants its requests signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SigningStyle {
+    /// The `SigV4` defaults most services take.
+    Standard,
+    /// S3's: the payload's hash in `x-amz-content-sha256`, the path as
+    /// given (S3 refuses a normalized one), encoded once.
+    S3,
+}
+
+impl SigningStyle {
+    fn settings(self) -> aws_sigv4::http_request::SigningSettings {
+        use aws_sigv4::http_request::{
+            PayloadChecksumKind, PercentEncodingMode, SigningSettings, UriPathNormalizationMode,
+        };
+        let mut settings = SigningSettings::default();
+        if self == Self::S3 {
+            settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+            settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+            settings.percent_encoding_mode = PercentEncodingMode::Single;
+        }
+        settings
+    }
 }
 
 impl std::fmt::Debug for Signer {
@@ -453,7 +479,54 @@ impl Signer {
             cached: tokio::sync::Mutex::new(None),
             region,
             service,
+            style: SigningStyle::Standard,
         }
+    }
+
+    /// A signer for S3 in `region`.
+    pub(crate) fn s3(provider: SharedCredentialsProvider, region: String) -> Self {
+        Self {
+            style: SigningStyle::S3,
+            ..Self::new(provider, region, "s3")
+        }
+    }
+
+    /// The headers that sign a request of `method` to `uri` carrying
+    /// `headers` and `body`; the caller adds them to the request it sends.
+    pub(crate) async fn signature(
+        &self,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> std::result::Result<Vec<(String, String)>, String> {
+        use aws_sigv4::http_request::{SignableBody, SignableRequest, sign};
+        use aws_sigv4::sign::v4;
+
+        let identity: Identity = self.credentials().await?.into();
+        let params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(&self.region)
+            .name(self.service)
+            .time(SystemTime::now())
+            .settings(self.style.settings())
+            .build()
+            .map_err(|e| e.to_string())?
+            .into();
+        let signable = SignableRequest::new(
+            method,
+            uri,
+            headers.iter().copied(),
+            SignableBody::Bytes(body),
+        )
+        .map_err(|e| e.to_string())?;
+        let (instructions, _) = sign(signable, &params)
+            .map_err(|e| e.to_string())?
+            .into_parts();
+        Ok(instructions
+            .headers()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect())
     }
 
     /// Current credentials, the SDK's reason when there are none.
@@ -486,21 +559,8 @@ impl Signer {
         &self,
         mut request: http::Request<Bytes>,
     ) -> std::result::Result<http::Request<Bytes>, rig::http_client::Error> {
-        use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
-        use aws_sigv4::sign::v4;
-
         let failed = |e: String| rig::http_client::Error::Instance(e.into());
         request.headers_mut().remove(http::header::AUTHORIZATION);
-        let identity: Identity = self.credentials().await.map_err(failed)?.into();
-        let params = v4::SigningParams::builder()
-            .identity(&identity)
-            .region(&self.region)
-            .name(self.service)
-            .time(SystemTime::now())
-            .settings(SigningSettings::default())
-            .build()
-            .map_err(|e| failed(e.to_string()))?
-            .into();
         let headers = request
             .headers()
             .iter()
@@ -508,17 +568,15 @@ impl Signer {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| failed(format!("a header cannot be signed: {e}")))?;
         let uri = request.uri().to_string();
-        let signable = SignableRequest::new(
-            request.method().as_str(),
-            uri.as_str(),
-            headers.into_iter(),
-            SignableBody::Bytes(request.body()),
-        )
-        .map_err(|e| failed(e.to_string()))?;
-        let (instructions, _) = sign(signable, &params)
-            .map_err(|e| failed(e.to_string()))?
-            .into_parts();
-        instructions.apply_to_request_http1x(&mut request);
+        let signed = self
+            .signature(request.method().as_str(), &uri, &headers, request.body())
+            .await
+            .map_err(failed)?;
+        for (name, value) in signed {
+            let name = http::HeaderName::try_from(name).map_err(|e| failed(e.to_string()))?;
+            let value = http::HeaderValue::try_from(value).map_err(|e| failed(e.to_string()))?;
+            request.headers_mut().insert(name, value);
+        }
         Ok(request)
     }
 }
@@ -533,29 +591,10 @@ struct LimitedAwsHttp {
 
 impl LimitedAwsHttp {
     fn new(gates: ProviderGates, proxies: &Proxies) -> Self {
-        use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
-        // The same module `crypto::install_default_provider` installs: FIPS on
-        // Linux, where the feature is on (docs/crypto.md).
-        #[cfg(target_os = "linux")]
-        let mode = CryptoMode::AwsLcFips;
-        #[cfg(not(target_os = "linux"))]
-        let mode = CryptoMode::AwsLc;
-        let proxy = proxies.aws();
-        // `build_https` takes no proxy; the SDK builds its own default
-        // client through this function for the same reason.
-        let inner = aws_smithy_http_client::Builder::new().build_with_connector_fn(
-            move |settings, components| {
-                let mut connector = aws_smithy_http_client::Connector::builder()
-                    .tls_provider(tls::Provider::Rustls(mode.clone()))
-                    .proxy_config(proxy.clone());
-                connector.set_connector_settings(settings.cloned());
-                if let Some(components) = components {
-                    connector.set_sleep_impl(components.sleep_impl());
-                }
-                connector.build()
-            },
-        );
-        Self { inner, gates }
+        Self {
+            inner: proxies.aws_client(),
+            gates,
+        }
     }
 }
 

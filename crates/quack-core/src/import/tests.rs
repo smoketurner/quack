@@ -1,7 +1,6 @@
 use super::*;
 use crate::llm::Embeddings;
 use crate::proxy::{Environment, Variable};
-use crate::storage::profile::ColumnTypes;
 
 #[test]
 fn urls_classify_and_redact() {
@@ -13,17 +12,16 @@ fn urls_classify_and_redact() {
         SourceUrl::from("https://x/y.csv").kind().ok(),
         Some(SourceKind::Http)
     );
-    for unsupported in [
-        "postgres://u:p@h/db",
-        "postgresql://h/db",
-        "mysql://h/db",
-        "s3://b/k.csv",
-    ] {
+    for unsupported in ["postgres://u:p@h/db", "postgresql://h/db", "mysql://h/db"] {
         assert!(
             SourceUrl::from(unsupported).kind().is_err(),
             "{unsupported}"
         );
     }
+    assert_eq!(
+        SourceUrl::from("S3://bucket/k.csv").kind().ok(),
+        Some(SourceKind::S3)
+    );
     assert!(SourceUrl::from("ftp://h/f").kind().is_err());
     assert_eq!(
         SourceUrl::from("postgres://alice:secret@db.local:5432/sales").redacted(),
@@ -188,14 +186,7 @@ fn redacted_url_reparses_to_the_same_host_with_no_password() {
 
 #[test]
 fn queries_come_from_the_request_and_tables_are_checked() {
-    let base = ImportRequest {
-        url: SourceUrl::from(""),
-        table: String::from("t"),
-        query: None,
-        source_table: None,
-        limit: None,
-        types: ColumnTypes::default(),
-    };
+    let base = ImportRequest::new(SourceUrl::from(""), String::from("t"));
     assert!(base.source_query().is_err());
     let by_table = ImportRequest {
         source_table: Some(String::from("public.orders")),
@@ -266,14 +257,22 @@ async fn loopback_hosts_are_refused_without_the_private_host_grant() {
         proxies: &Proxies::new(Environment::default()),
     };
     let err = download
-        .fetch(&SourceUrl::from("http://127.0.0.1:9/x.csv"), "x")
+        .fetch(
+            &SourceUrl::from("http://127.0.0.1:9/x.csv"),
+            "x",
+            Vec::new(),
+        )
         .await
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
     assert!(err.contains("private address"), "{err}");
     let err = download
-        .fetch(&SourceUrl::from("http://localhost:9/x.csv"), "x")
+        .fetch(
+            &SourceUrl::from("http://localhost:9/x.csv"),
+            "x",
+            Vec::new(),
+        )
         .await
         .err()
         .map(|e| e.to_string())
@@ -299,7 +298,7 @@ async fn urls_take_every_extension_ingest_loads_as_a_table() {
         "http://127.0.0.1:9/rows.ndjson",
     ] {
         let err = download
-            .fetch(&SourceUrl::from(accepted), "t")
+            .fetch(&SourceUrl::from(accepted), "t", Vec::new())
             .await
             .err()
             .map(|e| e.to_string())
@@ -308,7 +307,7 @@ async fn urls_take_every_extension_ingest_loads_as_a_table() {
     }
     for refused in ["http://127.0.0.1:9/notes.pdf", "http://127.0.0.1:9/data"] {
         let err = download
-            .fetch(&SourceUrl::from(refused), "t")
+            .fetch(&SourceUrl::from(refused), "t", Vec::new())
             .await
             .err()
             .map(|e| e.to_string())
@@ -360,13 +359,17 @@ async fn a_public_only_download_through_a_proxy_leaves_the_name_to_the_proxy() {
         proxies: &proxies,
     };
     let pulled = download
-        .fetch(&SourceUrl::from("http://files.invalid/data.csv"), "t")
+        .fetch(
+            &SourceUrl::from("http://files.invalid/data.csv"),
+            "t",
+            Vec::new(),
+        )
         .await;
     assert!(pulled.is_ok(), "{:?}", pulled.err().map(|e| e.to_string()));
 
     for private in ["http://10.0.0.1/x.csv", "http://[fd00::1]/x.csv"] {
         let err = download
-            .fetch(&SourceUrl::from(private), "t")
+            .fetch(&SourceUrl::from(private), "t", Vec::new())
             .await
             .err()
             .map(|e| e.to_string())
@@ -390,7 +393,7 @@ async fn a_proxy_does_not_open_this_machine_to_a_public_only_download() {
     };
     for local in ["http://127.0.0.1:9/x.csv", "http://localhost:9/x.csv"] {
         let err = download
-            .fetch(&SourceUrl::from(local), "t")
+            .fetch(&SourceUrl::from(local), "t", Vec::new())
             .await
             .err()
             .map(|e| e.to_string())
@@ -417,7 +420,7 @@ async fn downloads_stop_at_the_byte_cap_and_the_owner_follows_redirects() {
     )
     .await;
     let err = owner
-        .fetch(&SourceUrl::from(url.as_str()), "t")
+        .fetch(&SourceUrl::from(url.as_str()), "t", Vec::new())
         .await
         .err()
         .map(|e| e.to_string())
@@ -429,7 +432,7 @@ async fn downloads_stop_at_the_byte_cap_and_the_owner_follows_redirects() {
     )
     .await;
     let err = owner
-        .fetch(&SourceUrl::from(url.as_str()), "t")
+        .fetch(&SourceUrl::from(url.as_str()), "t", Vec::new())
         .await
         .err()
         .map(|e| e.to_string())
@@ -441,7 +444,9 @@ async fn downloads_stop_at_the_byte_cap_and_the_owner_follows_redirects() {
         "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\na,b\n1,2\n3,4\n",
     )
     .await;
-    let fetched = roomy.fetch(&SourceUrl::from(url.as_str()), "t").await;
+    let fetched = roomy
+        .fetch(&SourceUrl::from(url.as_str()), "t", Vec::new())
+        .await;
     assert!(
         fetched.is_ok_and(|p| p.filename == "t.csv" && p.bytes == b"a,b\n1,2\n3,4\n"),
         "the capped download of a small file succeeds"
@@ -454,7 +459,7 @@ async fn downloads_stop_at_the_byte_cap_and_the_owner_follows_redirects() {
     )
     .await;
     let err = roomy
-        .fetch(&SourceUrl::from(url.as_str()), "t")
+        .fetch(&SourceUrl::from(url.as_str()), "t", Vec::new())
         .await
         .err()
         .map(|e| e.to_string())
@@ -478,12 +483,8 @@ async fn downloaded_files_are_cut_to_the_row_cap() {
     )
     .await;
     let request = ImportRequest {
-        url: url.into(),
-        table: String::from("rows"),
-        query: None,
-        source_table: None,
         limit: Some(2),
-        types: ColumnTypes::default(),
+        ..ImportRequest::new(url, String::from("rows"))
     };
     let summary = Importing {
         config: &config,
@@ -530,14 +531,7 @@ async fn an_http_import_with_a_raw_at_in_the_password_masks_the_source() {
         None => served.as_str(),
     };
     let url = format!("http://user:p@ss@{tail}");
-    let request = ImportRequest {
-        url: url.into(),
-        table: String::from("rows"),
-        query: None,
-        source_table: None,
-        limit: None,
-        types: ColumnTypes::default(),
-    };
+    let request = ImportRequest::new(url, String::from("rows"));
     let summary = Importing {
         config: &config,
         db: &db,
@@ -603,12 +597,8 @@ async fn sqlite_imports_refuse_quacks_own_data_directory() {
     }
     for url in urls {
         let request = ImportRequest {
-            url: url.clone().into(),
-            table: String::from("x"),
-            query: None,
             source_table: Some(String::from("users")),
-            limit: None,
-            types: ColumnTypes::default(),
+            ..ImportRequest::new(url.clone(), String::from("x"))
         };
         let err = Importing {
             config: &config,
@@ -646,4 +636,189 @@ async fn a_missing_sqlite_source_is_an_error_and_is_not_created() {
         .unwrap_or_default();
     assert!(err.contains("cannot open the source"), "{err}");
     assert!(!missing.exists());
+}
+
+#[test]
+fn headers_parse_as_curl_takes_them_and_never_print_their_value() {
+    let header: SourceHeader = "X-Api-Key:  s3cr3t "
+        .parse()
+        .unwrap_or_else(|e: Error| no_source_header(&e.to_string()));
+    assert_eq!(header.name(), "x-api-key");
+    let shown = format!("{header:?}");
+    assert!(!shown.contains("s3cr3t"), "{shown}");
+    let (name, value) = header
+        .resolve(|_| None)
+        .unwrap_or_else(|e| no_header(&e.to_string()));
+    assert_eq!(name.as_str(), "x-api-key");
+    assert_eq!(value.to_str().ok(), Some("s3cr3t"));
+    assert!(value.is_sensitive());
+    for bad in ["no colon", "bad name: v", "X-Ok: line\nbreak"] {
+        assert!(bad.parse::<SourceHeader>().is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn a_bearer_token_comes_from_the_environment_when_the_download_starts() {
+    let header = SourceHeader::BearerEnv(String::from("SALES_API_TOKEN"));
+    assert_eq!(header.name(), "authorization");
+    let shown = format!("{header:?}");
+    assert!(shown.contains("$SALES_API_TOKEN"), "{shown}");
+    let missing = header
+        .resolve(|_| None)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(missing.contains("SALES_API_TOKEN is not set"), "{missing}");
+    let blank = header.resolve(|_| Some(String::from("  "))).is_err();
+    assert!(blank);
+    let (name, value) = header
+        .resolve(|name| (name == "SALES_API_TOKEN").then(|| String::from("tok-1")))
+        .unwrap_or_else(|e| no_header(&e.to_string()));
+    assert_eq!(name, http::header::AUTHORIZATION);
+    assert_eq!(value.to_str().ok(), Some("Bearer tok-1"));
+}
+
+#[test]
+fn a_json_pointer_selects_the_rows_inside_an_envelope() {
+    let document = br#"{"status": "ok", "data": {"items": [{"id": 1}, {"id": 2}]}}"#;
+    let pointer = |text: &str| {
+        text.parse::<JsonPointer>()
+            .unwrap_or_else(|e| no_pointer(&e.to_string()))
+    };
+    assert_eq!(
+        pointer("/data/items").rows(document).ok().as_deref(),
+        Some(br#"[{"id":1},{"id":2}]"#.as_slice())
+    );
+    assert_eq!(
+        pointer("").rows(b"[1]").ok().as_deref(),
+        Some(b"[1]".as_slice())
+    );
+    let error = |p: &str, d: &[u8]| {
+        pointer(p)
+            .rows(d)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+    };
+    assert!(error("/data/missing", document).contains("nothing at /data/missing"));
+    assert!(error("/status", document).contains("not an array"));
+    assert!(error("/data", b"not json").contains("not JSON"));
+    assert!("data/items".parse::<JsonPointer>().is_err());
+}
+
+/// S3 and a bearer token from the environment are the server's own
+/// credentials: refused for a server user unless the config allows them;
+/// options a source cannot take are refused for everyone.
+#[test]
+fn process_credentials_and_misplaced_options_are_checked_before_any_request() {
+    let server = ImportPolicy::server(&Config::default());
+    let mut allowing = Config::default();
+    allowing.import.allow_server_credentials = true;
+    let check = |request: &ImportRequest, policy| {
+        request
+            .check(request.url.kind().unwrap_or(SourceKind::Http), policy)
+            .err()
+            .map(|e| e.to_string())
+    };
+    let s3 = ImportRequest::new("s3://bucket/a.csv", "t");
+    let bearer = ImportRequest {
+        headers: vec![SourceHeader::BearerEnv(String::from("TOKEN"))],
+        ..ImportRequest::new("https://example.com/a.csv", "t")
+    };
+    let given = ImportRequest {
+        headers: vec![SourceHeader::Given {
+            name: HeaderName::from_static("x-api-key"),
+            value: HeaderValue::from_static("v"),
+        }],
+        ..ImportRequest::new("https://example.com/a.csv", "t")
+    };
+    for request in [&s3, &bearer] {
+        let refused = check(request, server).unwrap_or_default();
+        assert!(refused.contains("allow_server_credentials"), "{refused}");
+        assert_eq!(check(request, ImportPolicy::owner()), None);
+        assert_eq!(check(request, ImportPolicy::server(&allowing)), None);
+    }
+    assert_eq!(check(&given, server), None);
+    let headers_on_s3 = ImportRequest {
+        headers: given.headers,
+        ..ImportRequest::new("s3://bucket/a.csv", "t")
+    };
+    assert!(
+        check(&headers_on_s3, ImportPolicy::owner())
+            .unwrap_or_default()
+            .contains("headers go with an http(s)")
+    );
+    let pointer_on_sqlite = ImportRequest {
+        json_pointer: Some(JsonPointer(String::from("/rows"))),
+        ..ImportRequest::new("sqlite:/tmp/a.db", "t")
+    };
+    assert!(
+        check(&pointer_on_sqlite, ImportPolicy::owner())
+            .unwrap_or_default()
+            .contains("JSON pointer")
+    );
+}
+
+/// The headers a request carries reach the server.
+#[tokio::test]
+async fn a_download_sends_its_headers() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| unreachable_bind(&e.to_string()));
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or_default();
+    let received = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return String::new();
+        };
+        let mut buf = [0_u8; 4096];
+        let read = socket.read(&mut buf).await.unwrap_or_default();
+        let body = "a,b\n1,2\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        drop(socket.write_all(response.as_bytes()).await);
+        String::from_utf8_lossy(buf.get(..read).unwrap_or_default()).into_owned()
+    });
+    let download = Download {
+        timeout: Duration::from_secs(5),
+        max_mb: 1,
+        hosts: HostReach::Any,
+        proxies: &Proxies::new(Environment::default()),
+    };
+    let pulled = download
+        .fetch(
+            &SourceUrl::from(format!("http://127.0.0.1:{port}/sales.csv")),
+            "t",
+            vec![(
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_static("k-123"),
+            )],
+        )
+        .await
+        .unwrap_or_else(|e| no_pulled(&e.to_string()));
+    assert_eq!(pulled.bytes, b"a,b\n1,2\n");
+    let request = received.await.unwrap_or_default().to_ascii_lowercase();
+    assert!(request.contains("x-api-key: k-123"), "{request}");
+}
+
+#[expect(clippy::panic, reason = "test failure path")]
+fn no_source_header(msg: &str) -> SourceHeader {
+    panic!("{msg}")
+}
+
+#[expect(clippy::panic, reason = "test failure path")]
+fn no_header(msg: &str) -> (HeaderName, HeaderValue) {
+    panic!("{msg}")
+}
+
+#[expect(clippy::panic, reason = "test failure path")]
+fn no_pointer(msg: &str) -> JsonPointer {
+    panic!("{msg}")
+}
+
+#[expect(clippy::panic, reason = "test failure path")]
+fn no_pulled(msg: &str) -> Pulled {
+    panic!("{msg}")
 }
