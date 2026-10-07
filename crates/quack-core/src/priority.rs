@@ -24,8 +24,9 @@ tokio::task_local! {
 
 impl Priority {
     /// Run `work` at this priority (everything it awaits on this task).
-    pub async fn scope<F: Future>(self, work: F) -> F::Output {
-        PRIORITY.scope(self, work).await
+    /// Tokio's scoped future itself, not an `async fn` (see `llm::slot`).
+    pub fn scope<F: Future>(self, work: F) -> impl Future<Output = F::Output> {
+        PRIORITY.scope(self, work)
     }
 
     /// The calling task's priority: interactive unless scoped otherwise.

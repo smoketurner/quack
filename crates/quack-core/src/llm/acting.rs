@@ -98,13 +98,13 @@ impl Acting {
 
     /// Run `work` with an empty slot that [`Acting::enter`] fills once the
     /// caller is known: a server request.
-    pub async fn request<F: Future>(work: F) -> F::Output {
-        Slot::request(&SLOT, work).await
+    pub fn request<F: Future>(work: F) -> impl Future<Output = F::Output> {
+        Slot::request(&SLOT, work)
     }
 
     /// Run `work` acting for `acting`, or for nobody.
-    pub async fn scope<F: Future>(acting: Option<Self>, work: F) -> F::Output {
-        Slot::scope(&SLOT, acting, work).await
+    pub fn scope<F: Future>(acting: Option<Self>, work: F) -> impl Future<Output = F::Output> {
+        Slot::scope(&SLOT, acting, work)
     }
 
     /// Make this person the one the current request acts for. The first

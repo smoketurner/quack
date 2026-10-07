@@ -62,13 +62,13 @@ tokio::task_local! {
 impl Egress {
     /// Run `work` with an empty slot that [`Egress::enter`] fills once the
     /// workspace is known: a server request, a CLI command.
-    pub async fn request<F: Future>(work: F) -> F::Output {
-        Slot::request(&SLOT, work).await
+    pub fn request<F: Future>(work: F) -> impl Future<Output = F::Output> {
+        Slot::request(&SLOT, work)
     }
 
     /// Run `work` under `egress`; under `None` its model requests fail.
-    pub async fn scope<F: Future>(egress: Option<Self>, work: F) -> F::Output {
-        Slot::scope(&SLOT, egress, work).await
+    pub fn scope<F: Future>(egress: Option<Self>, work: F) -> impl Future<Output = F::Output> {
+        Slot::scope(&SLOT, egress, work)
     }
 
     /// Make this the scope of the current request. The first caller wins;
