@@ -32,7 +32,7 @@ pub const DATABASE: &str = "data.duckdb";
 pub const FILES: &str = "files";
 
 /// What a snapshot says about the workspace it holds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Manifest {
     pub format: u32,
     pub quack_version: String,
@@ -52,7 +52,7 @@ pub struct Manifest {
     pub taken_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ManifestMember {
     pub username: String,
     pub role: String,
@@ -255,7 +255,7 @@ pub struct RestoreRequest<'a> {
 }
 
 /// What a restore made.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct Restored {
     pub workspace: WorkspaceRow,
     pub manifest: Manifest,

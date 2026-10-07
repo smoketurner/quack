@@ -1,12 +1,13 @@
 {% extends "base.html" %}
 {% block content %}
 <h1 class="text-xl font-semibold">About quack</h1>
-<p class="mt-2 text-sm text-slate-400">Version <span class="font-mono text-slate-200">{{ version }}</span></p>
+<p class="mt-2 text-sm text-slate-400">Version <span class="font-mono text-slate-200">{{ version }}</span> · <a class="text-blue-300 hover:underline" href="/api/v1/docs">REST API reference</a></p>
 <h2 class="mt-6 text-lg font-semibold">Built with</h2>
 <ul class="mt-2 space-y-2 text-sm">
   <li><a class="text-blue-300 hover:underline" href="https://ratatui.rs" rel="noopener noreferrer">Ratatui</a> <span class="text-slate-400">· the terminal interface</span></li>
   <li><a class="text-blue-300 hover:underline" href="https://duckdb.org" rel="noopener noreferrer">DuckDB</a> <span class="text-slate-400">· each workspace's tables, documents, and graph</span></li>
   <li><a class="text-blue-300 hover:underline" href="https://rig.rs" rel="noopener noreferrer">Rig</a> <span class="text-slate-400">· model providers and the agent loop</span></li>
   <li><a class="text-blue-300 hover:underline" href="https://ollama.com" rel="noopener noreferrer">Ollama</a> <span class="text-slate-400">· local models</span></li>
+  <li><a class="text-blue-300 hover:underline" href="https://redocly.com/redoc" rel="noopener noreferrer">Redoc</a> <span class="text-slate-400">· the API reference</span></li>
 </ul>
 {% endblock %}

@@ -149,7 +149,7 @@ impl Passage for SampledChunk {
 }
 
 /// What a run will cost, shown before it starts.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, utoipa::ToSchema)]
 pub struct CostEstimate {
     pub documents: u32,
     pub chunks: u32,

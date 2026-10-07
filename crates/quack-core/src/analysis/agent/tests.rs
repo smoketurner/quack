@@ -90,7 +90,7 @@ fn to_json_carries_every_field_and_derives_queries() {
         }],
         ..AgentResponse::default()
     };
-    let json = response.to_json(&SessionId::from("s1"));
+    let json = serde_json::json!(response.body(&SessionId::from("s1")));
     assert_eq!(json["answer"], "12 storms [1]");
     assert_eq!(json["queries"][0]["sql"], "SELECT count(*) FROM events");
     assert_eq!(json["queries"][0]["rows"], 1);
@@ -117,7 +117,7 @@ fn to_json_carries_every_field_and_derives_queries() {
         }),
         ..AgentResponse::default()
     };
-    let json = counted.to_json(&SessionId::from("s1"));
+    let json = serde_json::json!(counted.body(&SessionId::from("s1")));
     assert_eq!(json["usage"]["input_tokens"], 980);
     assert_eq!(json["usage"]["output_tokens"], 43);
     assert_eq!(json["usage"]["total_tokens"], 1_023);

@@ -11,21 +11,27 @@ use quack_core::progress::RunControl;
 use quack_core::storage::control::{AuditAction, Outcome};
 use quack_core::storage::profile::ColumnTypes;
 use quack_core::text::NonBlankText;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::server::auth::{Access, Identity, Need};
-use crate::server::error::{ApiError, ApiResult};
+use crate::server::error::{ApiError, ApiResult, ErrorCode};
 use crate::server::run;
 use crate::server::state::{App, ServeMode};
 use quack_core::import::{self, ImportPolicy, ImportRequest, ImportSummary};
 use quack_core::jobs::JobId;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct ImportBody {
+    /// `postgres://...`, `sqlite://...`, or an `http(s)://` data file.
     pub url: String,
+    /// The workspace table the rows load into.
     pub table: String,
+    /// A read to run on a database source.
     pub query: Option<String>,
+    /// A database source's table, read whole.
     pub source_table: Option<String>,
+    /// Rows at most.
     pub limit: Option<u64>,
     /// `COLUMN=TYPE` pairs, comma-separated, as `quack import --types`.
     pub types: Option<String>,
@@ -54,25 +60,34 @@ impl TryFrom<ImportBody> for ImportRequest {
     }
 }
 
+/// Snapshot a query on a database, or a data file over HTTP(S), as a
+/// workspace table.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/import",
+    tag = "import",
+    request_body = ImportBody,
+    responses((status = 200, description = "What was imported", body = Imported)),
+)]
 pub(crate) async fn import(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Json(body): Json<ImportBody>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<Imported>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    let imported = run_import(&app, &access, &ImportRequest::try_from(body)?).await?;
-    let mut body = serde_json::to_value(&imported.summary)?;
-    if let (Some(fields), Some(job)) = (body.as_object_mut(), &imported.graph_job) {
-        fields.insert(String::from("graph_job"), serde_json::to_value(job)?);
-    }
-    Ok(Json(body))
+    Ok(Json(
+        run_import(&app, &access, &ImportRequest::try_from(body)?).await?,
+    ))
 }
 
 /// What an import did, and the graph follow-up it queued when
 /// `[graph].follow_ingest` asks for one.
+#[derive(Serialize, ToSchema)]
 pub(crate) struct Imported {
+    #[serde(flatten)]
     pub summary: ImportSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_job: Option<JobId>,
 }
 
@@ -124,7 +139,8 @@ pub(crate) async fn run_import(
     access
         .audit(app, AuditAction::Import, None, audit_outcome, Some(detail))
         .await?;
-    let summary = outcome.map_err(|e| ApiError::unprocessable(e.to_string()))?;
+    let summary =
+        outcome.map_err(|e| ApiError::from(e).unprocessable_as(ErrorCode::ImportFailed))?;
     let graph_job = run::follow_ingest(
         app,
         access,

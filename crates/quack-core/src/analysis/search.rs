@@ -256,25 +256,42 @@ impl SearchOutcome {
         }
     }
 
-    /// The outcome as JSON: the hits, and with `explain` both legs, the
-    /// phrase note, and the rerank outcome.
+    /// The outcome as every interface returns it: the hits, and with
+    /// `explain` both legs, the phrase note, and the rerank outcome.
     #[must_use]
-    pub fn to_json(&self, explain: bool) -> serde_json::Value {
-        let mut value = serde_json::json!({ "chunks": self.explanation.fused });
-        if explain && let serde_json::Value::Object(map) = &mut value {
-            map.insert(
-                String::from("explain"),
-                serde_json::json!({
-                    "vector": self.explanation.vector,
-                    "keyword": self.explanation.keyword,
-                    "phrases": self.explanation.phrases,
-                    "phrase_note": self.explanation.phrase_note(),
-                    "rerank": self.rerank.describe(),
+    pub fn body(&self, explain: SearchDetail) -> SearchBody {
+        SearchBody {
+            chunks: self.explanation.fused.clone(),
+            explain: match explain {
+                SearchDetail::Hits => None,
+                SearchDetail::Workings => Some(SearchWorkings {
+                    vector: self.explanation.vector.clone(),
+                    keyword: self.explanation.keyword.clone(),
+                    phrases: self.explanation.phrases.clone(),
+                    phrase_note: self.explanation.phrase_note(),
+                    rerank: self.rerank.describe(),
                 }),
-            );
+            },
         }
-        value
     }
+}
+
+/// A search's answer: the hits, and on request how they were found.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct SearchBody {
+    pub chunks: Vec<ChunkSearchResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<SearchWorkings>,
+}
+
+/// Each leg's candidates, the quoted phrases, and the rerank outcome.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct SearchWorkings {
+    pub vector: Vec<ChunkSearchResult>,
+    pub keyword: Vec<ChunkSearchResult>,
+    pub phrases: Vec<String>,
+    pub phrase_note: Option<String>,
+    pub rerank: String,
 }
 
 /// How much of a search a text rendering shows.
@@ -285,6 +302,14 @@ pub enum SearchDetail {
     /// The hits, then each leg's candidates, the phrase note, and the
     /// rerank outcome.
     Workings,
+}
+
+impl SearchDetail {
+    /// The detail an `explain` flag asks for.
+    #[must_use]
+    pub const fn explained(explain: bool) -> Self {
+        if explain { Self::Workings } else { Self::Hits }
+    }
 }
 
 /// Characters of a hit's text a rendering shows.
@@ -379,7 +404,7 @@ impl SearchOutcome {
 }
 
 /// One document a person limited a question to.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct ScopedDocument {
     pub id: DocumentId,
     pub filename: String,
@@ -388,7 +413,9 @@ pub struct ScopedDocument {
 /// The documents a person limited a question to; empty for the whole
 /// workspace. The model may narrow a search further within it, never
 /// widen one past it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(transparent)]
 pub struct DocumentScope(Vec<ScopedDocument>);
 

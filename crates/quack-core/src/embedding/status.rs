@@ -7,7 +7,7 @@ use serde::Serialize;
 use super::{Dimension, Profile};
 
 /// Stored chunk vectors made under a profile other than the current one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct StaleVectors {
     /// `None` when the fingerprint was never recorded.
     pub profile: Option<Profile>,
@@ -15,7 +15,7 @@ pub struct StaleVectors {
 }
 
 /// How a workspace's vectors stand against the current embedding profile.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct EmbeddingStatus {
     /// `None` without an embedding model.
     pub profile: Option<Profile>,

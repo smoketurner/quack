@@ -40,7 +40,7 @@ impl Default for TableEvidenceOptions {
 }
 
 /// What one candidate proposes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Proposal {
     Class(Class),
@@ -83,7 +83,7 @@ impl Proposal {
 }
 
 /// The kinds of item an ontology holds and a proposal adds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ItemKind {
     Class,

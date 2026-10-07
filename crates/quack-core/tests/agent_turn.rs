@@ -286,7 +286,7 @@ async fn a_write_a_document_dictates_is_refused_under_allow_write_with_no_approv
         (ToolName::RunSql, DICTATED)
     );
     assert_eq!(refused.summary, Hold::ReadDocuments.summary());
-    assert_eq!(response.to_json(&"s1".into())["write_refused"], true);
+    assert!(response.body(&"s1".into()).write_refused);
 
     // The model was told the passage is data, read it inside a fence, and
     // was told why its write did not run.

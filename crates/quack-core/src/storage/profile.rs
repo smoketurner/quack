@@ -90,7 +90,7 @@ impl ColumnKind {
 /// A type a column can be given: by `--types col=TYPE` at ingest or import,
 /// or by the Fix-type action. A closed list, since the name goes into the
 /// statement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ColumnType {
     Varchar,
@@ -267,7 +267,7 @@ impl Retype<'_> {
 }
 
 /// One column's counts and common values.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ColumnProfile {
     pub name: String,
     pub duckdb_type: String,
@@ -336,7 +336,7 @@ pub enum ColumnRole {
 }
 
 /// A fraction between 0 and 1, shown as a percentage.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct Share(pub f64);
 
@@ -364,7 +364,7 @@ impl fmt::Display for Share {
 }
 
 /// Something about a column that makes a query over it likely to go wrong.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ColumnWarning {
     /// Every value is empty.
@@ -419,7 +419,7 @@ impl fmt::Display for ColumnWarning {
 }
 
 /// A table's profile as stored.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
 pub struct TableProfile {
     pub table: String,
     pub row_count: u64,

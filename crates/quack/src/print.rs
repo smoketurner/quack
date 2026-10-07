@@ -181,7 +181,7 @@ impl PrintTurn<'_> {
         match format {
             TextOrJson::Text => write_text_answer(&mut out, &streamed, &response)?,
             TextOrJson::Json => {
-                let object = response.to_json(session_id);
+                let object = response.body(session_id);
                 serde_json::to_writer_pretty(&mut out, &object)?;
                 writeln!(out)?;
             }

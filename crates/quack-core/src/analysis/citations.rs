@@ -11,7 +11,7 @@ use crate::storage::workspace::ChunkSearchResult;
 use crate::text::OneLine;
 
 /// One retrievable source the model may cite by its marker.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Citation {
     pub n: u32,
     pub chunk_id: ChunkId,
@@ -28,6 +28,7 @@ pub struct Citation {
     /// When the document was ingested (UTC); `None` on answers recorded
     /// before it was kept.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub ingested_at: Option<DateTime>,
     /// The start of the cited chunk's text, at most [`Self::EXCERPT_CHARS`]
     /// characters with an ellipsis when cut; empty on answers recorded

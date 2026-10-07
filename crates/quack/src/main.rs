@@ -677,11 +677,7 @@ impl SearchArgs {
     }
 
     const fn detail(&self) -> SearchDetail {
-        if self.explain {
-            SearchDetail::Workings
-        } else {
-            SearchDetail::Hits
-        }
+        SearchDetail::explained(self.explain)
     }
 
     /// `quack search`: one search, no model call unless reranking asks the
@@ -713,7 +709,7 @@ impl SearchArgs {
             TextOrJson::Json => writeln!(
                 out,
                 "{}",
-                serde_json::to_string_pretty(&outcome.to_json(self.explain))?
+                serde_json::to_string_pretty(&outcome.body(self.detail()))?
             )?,
         }
         out.flush()?;

@@ -48,6 +48,7 @@
 {% endif %}
 <section class="mt-8">
   <h2 class="text-sm font-semibold uppercase text-slate-400">API tokens</h2>
+  <p class="mt-1 text-sm text-slate-400">Send a token as <code>Authorization: Bearer</code>. The <a class="text-blue-400 hover:underline" href="/api/v1/docs">API reference</a> lists every route; <a class="text-blue-400 hover:underline" href="/api/v1/openapi.json">openapi.json</a> is its OpenAPI 3.1 document.</p>
   <table class="data-table mt-2 w-full text-sm" aria-label="API tokens"><tbody>
     {% for t in tokens %}<tr class="border-b border-slate-800"><td class="wrap-anywhere">{{ t.name }}</td><td class="font-mono text-xs"><div class="max-w-[12rem] truncate" title="{{ t.token_hash }}">{{ t.token_hash }}</div></td><td class="whitespace-nowrap">{% if let Some(at) = t.expires_at %}expires {{ When::Clock.html(at.as_str())|safe }}{% else %}no expiry{% endif %}</td><td class="whitespace-nowrap">{% if let Some(at) = t.last_used_at %}used {{ When::Relative.html(at.as_str())|safe }}{% else %}never used{% endif %}</td><td class="text-right"><form method="post" action="/w/{{ ws.membership.workspace.id }}/tokens/{{ t.token_hash }}/revoke"><button class="text-red-400 hover:underline">Revoke</button></form></td></tr>{% endfor %}
   </tbody></table>

@@ -26,7 +26,7 @@ use crate::ontology::{MENTIONS_RELATION, Ontology, ROOT_CLASS, store as ontology
 use crate::storage::workspace::WorkspaceDb;
 
 /// The form an export takes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum GraphFormat {
     /// `nodes.csv`, `edges.csv`, and `provenance.csv`.

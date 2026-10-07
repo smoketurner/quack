@@ -17,7 +17,7 @@ use quack_core::graph::store::{
     Asserted, Assertion, Keep, NewEdge, NewNode, NodeEdit, Revalidation,
 };
 use quack_core::graph::{
-    Edge, ExtractSource, GraphStatus, Node, Properties, Standing, extract, resolve,
+    Edge, ExtractSource, GraphResult, GraphStatus, Node, Properties, Standing, extract, resolve,
     store as graph_store, tables,
 };
 use quack_core::ids::{ClassId, EdgeId, NodeId, RelationId, RunId, WorkspaceId};
@@ -26,6 +26,7 @@ use quack_core::okf;
 use quack_core::ontology::store as ontology_store;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::server::api::okf::Download;
 use crate::server::auth::{Access, Identity, Need};
@@ -37,15 +38,24 @@ use quack_core::jobs::JobId;
 use quack_core::ontology::{Ontology, OntologyVersion};
 use quack_core::progress::{ChunkDone, RunControl};
 
+/// An entity's neighborhood, or a class's members.
+///
 /// The search and path bodies are [`SearchGraphArgs`] and [`FindPathArgs`]:
 /// in the body, never the query string, since entity names are workspace
 /// content and a URL ends up in logs.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/graph/search",
+    tag = "graph",
+    request_body = SearchGraphArgs,
+    responses((status = 200, description = "The entity's neighborhood, or a class's members", body = GraphResult)),
+)]
 pub(crate) async fn search(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Json(q): Json<SearchGraphArgs>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<GraphResult>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let query = q
         .query()
@@ -76,15 +86,23 @@ pub(crate) async fn search(
             Some(detail),
         )
         .await?;
-    Ok(Json(serde_json::to_value(result?)?))
+    Ok(Json(result?))
 }
 
+/// The shortest path between two entities.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/graph/path",
+    tag = "graph",
+    request_body = FindPathArgs,
+    responses((status = 200, description = "The path", body = GraphResult)),
+)]
 pub(crate) async fn path(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Json(q): Json<FindPathArgs>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<GraphResult>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let query = q
         .query()
@@ -114,27 +132,36 @@ pub(crate) async fn path(
             Some(detail),
         )
         .await?;
-    Ok(Json(serde_json::to_value(result?)?))
+    Ok(Json(result?))
 }
 
+/// The graph's size, and what is stale or pending.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/graph/status",
+    tag = "graph",
+    responses((status = 200, description = "The graph's status", body = GraphStatus)),
+)]
 pub(crate) async fn status(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<GraphStatus>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "graph_status")
         .await?;
     let status = app.read(&id, graph_store::status).await?;
-    Ok(Json(serde_json::to_value(status)?))
+    Ok(Json(status))
 }
 
 /// `GET .../graph/export?format=csv|graphml|jsonld&include_provisional=true`.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct ExportQuery {
     #[serde(default)]
     format: GraphFormat,
+    /// Also export what an auto-accepted ontology version produced.
     #[serde(default)]
     include_provisional: bool,
 }
@@ -142,6 +169,17 @@ pub(crate) struct ExportQuery {
 /// The whole graph as an attachment (a tar of the CSV bundle, `GraphML`, or
 /// JSON-LD), streamed like the OKF export and audited as `export` with
 /// `{format, nodes, edges, provenance}` when it ends.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/graph/export",
+    tag = "graph",
+    params(ExportQuery),
+    responses((status = 200, description = "The graph, as an attachment in `format`", content(
+        (Vec<u8> = "application/x-tar"),
+        (String = "application/graphml+xml"),
+        (Object = "application/ld+json"),
+    ))),
+)]
 pub(crate) async fn export(
     State(app): State<App>,
     identity: Identity,
@@ -170,7 +208,7 @@ pub(crate) async fn export(
         .await
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, ToSchema)]
 pub(crate) struct ExtractRequest {
     /// `all` (default), `tables`, or `documents`.
     #[serde(default)]
@@ -186,12 +224,22 @@ pub(crate) struct ExtractRequest {
 
 /// Build the graph. Tables run now; documents run in the background with
 /// the cost (chunk count) in the 202 response and an audit row when done.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/graph/extract",
+    tag = "graph",
+    request_body(content = Option<ExtractRequest>, description = "Optional; everything when absent"),
+    responses(
+        (status = 200, description = "Tables only, done", body = ExtractionStarted),
+        (status = 202, description = "Documents run in the background", body = ExtractionStarted),
+    ),
+)]
 pub(crate) async fn extract(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     body: Option<Json<ExtractRequest>>,
-) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+) -> ApiResult<(StatusCode, Json<ExtractionStarted>)> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let request = body.map(|b| b.0).unwrap_or_default();
     let started = access
@@ -208,12 +256,12 @@ pub(crate) async fn extract(
             },
         )
         .await?;
-    Ok((started.status_code(), Json(serde_json::to_value(started)?)))
+    Ok((started.status_code(), Json(started)))
 }
 
 /// What starting an extraction did: table work finishes within the
 /// request; document work goes on in the background as a run.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum ExtractionStarted {
     Done {
@@ -239,7 +287,7 @@ impl ExtractionStarted {
 }
 
 /// The model calls a document pass will make.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct ExtractionCost {
     pub chunks: usize,
     pub model: String,
@@ -477,6 +525,12 @@ impl DocumentJob {
 
 /// What a revalidation would drop, per class and relation id the
 /// ontology no longer defines; nothing changes.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/graph/revalidate",
+    tag = "graph",
+    responses((status = 200, description = "What a revalidation would drop", body = Revalidation)),
+)]
 pub(crate) async fn revalidation_preview(
     State(app): State<App>,
     identity: Identity,
@@ -492,23 +546,28 @@ pub(crate) async fn revalidation_preview(
 /// Drop what the preview counted. The body carries the preview's totals;
 /// with none, or with totals the graph no longer matches, nothing is
 /// dropped and the answer is 409 with the current totals.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/graph/revalidate",
+    tag = "graph",
+    request_body(content = Option<DropApproval>, description = "The preview's totals"),
+    responses((status = 200, description = "What was dropped", body = Revalidation)),
+)]
 pub(crate) async fn revalidate(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     approval: Option<Json<DropApproval>>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<Revalidation>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let approval = approval.map(|Json(approval)| approval).unwrap_or_default();
-    Ok(Json(serde_json::to_value(
-        access.revalidate_graph(&app, approval).await?,
-    )?))
+    Ok(Json(access.revalidate_graph(&app, approval).await?))
 }
 
 /// The totals the caller saw in the preview and agreed to drop: the API's
 /// body and the graph page's form. Totals left out are zero, which
 /// approves only a revalidation that drops nothing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ToSchema)]
 pub(crate) struct DropApproval {
     #[serde(default)]
     pub dropped_nodes: u64,
@@ -536,45 +595,71 @@ impl DropApproval {
     }
 }
 
+/// Mark the provisional graph reviewed.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/graph/review",
+    tag = "graph",
+    responses((status = 200, description = "The graph's status", body = GraphStatus)),
+)]
 pub(crate) async fn review(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<GraphStatus>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
-    Ok(Json(serde_json::to_value(
-        access.review_graph(&app).await?,
-    )?))
+    Ok(Json(access.review_graph(&app).await?))
 }
 
+/// Merge proposals waiting for a decision.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct MergeList {
+    pub merges: Vec<MergeProposal>,
+}
+
+/// Merge proposals waiting for a decision.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/graph/merges",
+    tag = "graph",
+    responses((status = 200, description = "The pending merges", body = MergeList)),
+)]
 pub(crate) async fn merges(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<MergeList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "graph_merges")
         .await?;
     let pending = app.read(&id, resolve::pending).await?;
-    Ok(Json(serde_json::json!({ "merges": pending })))
+    Ok(Json(MergeList { merges: pending }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct DecideMerge {
     /// `accept` or `reject`; anything else is refused while the body is read.
     pub action: MergeDecision,
 }
 
+/// Accept or reject one merge proposal.
+#[utoipa::path(
+    put,
+    path = "/workspaces/{id}/graph/merges/{mid}",
+    tag = "graph",
+    request_body = DecideMerge,
+    responses((status = 200, description = "The proposal as decided", body = MergeProposal)),
+)]
 pub(crate) async fn decide_merge(
     State(app): State<App>,
     identity: Identity,
     Path((id, mid)): Path<(WorkspaceId, String)>,
     Json(body): Json<DecideMerge>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<MergeProposal>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let proposal = access.decide_merge(&app, &mid, body.action).await?;
-    Ok(Json(serde_json::to_value(proposal)?))
+    Ok(Json(proposal))
 }
 
 /// The graph writes the API and the web console share.
@@ -647,7 +732,7 @@ impl Access {
 }
 
 /// A node a person asserts over the API.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct CreateNode {
     pub label: String,
     pub class: ClassId,
@@ -657,7 +742,7 @@ pub(crate) struct CreateNode {
 }
 
 /// An edge a person asserts over the API, between nodes by id.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct CreateEdge {
     pub source: NodeId,
     pub target: NodeId,
@@ -668,13 +753,24 @@ pub(crate) struct CreateEdge {
 }
 
 /// A node correction over the API: [`NodeEdit`] plus the note.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct UpdateNode {
     #[serde(flatten)]
     pub edit: NodeEdit,
     pub note: Option<String>,
 }
 
+/// Assert a node; one with the same label and class comes back unchanged.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/graph/nodes",
+    tag = "graph",
+    request_body = CreateNode,
+    responses(
+        (status = 201, description = "Created", body = Asserted<Node>),
+        (status = 200, description = "It already existed", body = Asserted<Node>),
+    ),
+)]
 pub(crate) async fn create_node(
     State(app): State<App>,
     identity: Identity,
@@ -691,6 +787,14 @@ pub(crate) async fn create_node(
     Ok((status, Json(added)))
 }
 
+/// Relabel, reclass, or change a node's properties.
+#[utoipa::path(
+    patch,
+    path = "/workspaces/{id}/graph/nodes/{nid}",
+    tag = "graph",
+    request_body = UpdateNode,
+    responses((status = 200, description = "The node as it now is", body = Node)),
+)]
 pub(crate) async fn update_node(
     State(app): State<App>,
     identity: Identity,
@@ -701,6 +805,13 @@ pub(crate) async fn update_node(
     Ok(Json(access.update_node(&app, &nid, body).await?))
 }
 
+/// Delete a node and its edges.
+#[utoipa::path(
+    delete,
+    path = "/workspaces/{id}/graph/nodes/{nid}",
+    tag = "graph",
+    responses((status = 200, description = "The node deleted", body = Node)),
+)]
 pub(crate) async fn delete_node(
     State(app): State<App>,
     identity: Identity,
@@ -710,6 +821,17 @@ pub(crate) async fn delete_node(
     Ok(Json(access.delete_node(&app, &nid).await?))
 }
 
+/// Assert an edge; one that already exists comes back unchanged.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/graph/edges",
+    tag = "graph",
+    request_body = CreateEdge,
+    responses(
+        (status = 201, description = "Created", body = Asserted<Edge>),
+        (status = 200, description = "It already existed", body = Asserted<Edge>),
+    ),
+)]
 pub(crate) async fn create_edge(
     State(app): State<App>,
     identity: Identity,
@@ -726,6 +848,13 @@ pub(crate) async fn create_edge(
     Ok((status, Json(added)))
 }
 
+/// Delete an edge.
+#[utoipa::path(
+    delete,
+    path = "/workspaces/{id}/graph/edges/{eid}",
+    tag = "graph",
+    responses((status = 200, description = "The edge deleted", body = Edge)),
+)]
 pub(crate) async fn delete_edge(
     State(app): State<App>,
     identity: Identity,

@@ -13,6 +13,7 @@ mod jobs;
 pub(crate) mod members;
 pub(crate) mod okf;
 pub(crate) mod ontology;
+pub(crate) mod openapi;
 pub(crate) mod query;
 mod saved;
 mod sessions;
@@ -21,7 +22,7 @@ pub(crate) mod workspaces;
 
 use axum::Router;
 use axum::response::sse::Event;
-use axum::routing::{delete, get, post};
+use axum::routing::{MethodRouter, delete, get, patch, post, put};
 
 use super::state::App;
 
@@ -41,7 +42,20 @@ pub(crate) enum StreamEvent {
 }
 
 impl StreamEvent {
-    fn as_str(self) -> &'static str {
+    /// Every event, for the API document's `x-sse-events`.
+    pub(crate) const ALL: [Self; 9] = [
+        Self::Status,
+        Self::Text,
+        Self::ToolStarted,
+        Self::ToolFinished,
+        Self::PermissionRequired,
+        Self::Complete,
+        Self::Error,
+        Self::Jobs,
+        Self::Job,
+    ];
+
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Status => "status",
             Self::Text => "text",
@@ -61,8 +75,52 @@ impl StreamEvent {
     }
 }
 
-pub(crate) fn router(app: &App) -> Router<App> {
-    Router::new()
+/// The API's router, and every path it registers, so a test can hold the
+/// API document to the routes that exist.
+pub(crate) struct ApiRoutes {
+    router: Router<App>,
+    paths: Vec<&'static str>,
+}
+
+impl ApiRoutes {
+    fn new() -> Self {
+        Self {
+            router: Router::new(),
+            paths: Vec::new(),
+        }
+    }
+
+    fn route(self, path: &'static str, methods: MethodRouter<App>) -> Self {
+        let Self { router, mut paths } = self;
+        paths.push(path);
+        Self {
+            router: router.route(path, methods),
+            paths,
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        let Self { router, mut paths } = self;
+        paths.extend(other.paths);
+        Self {
+            router: router.merge(other.router),
+            paths,
+        }
+    }
+
+    /// Every path, as the router and the document spell it.
+    #[cfg(test)]
+    pub(crate) fn paths(&self) -> &[&'static str] {
+        &self.paths
+    }
+
+    pub(crate) fn into_router(self) -> Router<App> {
+        self.router
+    }
+}
+
+pub(crate) fn router(app: &App) -> ApiRoutes {
+    ApiRoutes::new()
         .merge(control_routes(app))
         .route("/workspaces/{id}/audit", get(workspaces::audit_detail))
         .route("/workspaces/{id}/query", post(query::query))
@@ -92,10 +150,7 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/workspaces/{id}/tables", get(tables::list))
         .route("/workspaces/{id}/tables/describe", post(tables::describe))
         .route("/workspaces/{id}/tables/schema", get(tables::schema))
-        .route(
-            "/workspaces/{id}/tables/note",
-            axum::routing::put(tables::note),
-        )
+        .route("/workspaces/{id}/tables/note", put(tables::note))
         .route("/workspaces/{id}/tables/retype", post(tables::retype))
         .route(
             "/workspaces/{id}/context",
@@ -139,15 +194,15 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/admin/users", get(admin::users).post(admin::create_user))
         .route(
             "/admin/users/{user}",
-            axum::routing::patch(admin::update_user).delete(admin::delete_user),
+            patch(admin::update_user).delete(admin::delete_user),
         )
         .route("/admin/audit", get(admin::audit))
 }
 
 /// Signing in, and the workspaces themselves: listing, creating,
 /// restoring, settings, snapshots, deletion.
-fn control_routes(app: &App) -> Router<App> {
-    Router::new()
+fn control_routes(app: &App) -> ApiRoutes {
+    ApiRoutes::new()
         .route(
             "/auth/login",
             super::throttled_login(app, post(auth::login)),
@@ -172,8 +227,8 @@ fn control_routes(app: &App) -> Router<App> {
 
 /// The knowledge graph's routes: search and path, status, the builds, the
 /// merge queue, and a person's node and edge edits.
-fn graph_routes() -> Router<App> {
-    Router::new()
+fn graph_routes() -> ApiRoutes {
+    ApiRoutes::new()
         .route("/workspaces/{id}/graph/search", post(graph::search))
         .route("/workspaces/{id}/graph/path", post(graph::path))
         .route("/workspaces/{id}/graph/status", get(graph::status))
@@ -187,12 +242,12 @@ fn graph_routes() -> Router<App> {
         .route("/workspaces/{id}/graph/merges", get(graph::merges))
         .route(
             "/workspaces/{id}/graph/merges/{mid}",
-            axum::routing::put(graph::decide_merge),
+            put(graph::decide_merge),
         )
         .route("/workspaces/{id}/graph/nodes", post(graph::create_node))
         .route(
             "/workspaces/{id}/graph/nodes/{nid}",
-            axum::routing::patch(graph::update_node).delete(graph::delete_node),
+            patch(graph::update_node).delete(graph::delete_node),
         )
         .route("/workspaces/{id}/graph/edges", post(graph::create_edge))
         .route(
@@ -202,8 +257,8 @@ fn graph_routes() -> Router<App> {
 }
 
 /// Members by hand, and the roles the identity provider's groups carry.
-fn membership_routes() -> Router<App> {
-    Router::new()
+fn membership_routes() -> ApiRoutes {
+    ApiRoutes::new()
         .route(
             "/workspaces/{id}/members",
             get(members::list).post(members::add),
@@ -220,8 +275,8 @@ fn membership_routes() -> Router<App> {
 }
 
 /// The ontology's routes: the current one, its candidates, and its versions.
-fn ontology_routes() -> Router<App> {
-    Router::new()
+fn ontology_routes() -> ApiRoutes {
+    ApiRoutes::new()
         .route(
             "/workspaces/{id}/ontology",
             get(ontology::show).put(ontology::replace),
@@ -236,7 +291,7 @@ fn ontology_routes() -> Router<App> {
         )
         .route(
             "/workspaces/{id}/ontology/candidates/{cid}",
-            axum::routing::put(ontology::decide),
+            put(ontology::decide),
         )
         .route(
             "/workspaces/{id}/ontology/versions",

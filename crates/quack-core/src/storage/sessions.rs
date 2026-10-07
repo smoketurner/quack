@@ -39,6 +39,7 @@ use super::writer::Writer;
     serde::Serialize,
     serde::Deserialize,
     schemars::JsonSchema,
+    utoipa::ToSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum ChatMode {
@@ -52,7 +53,9 @@ pub enum ChatMode {
 
 text_enum!(ChatMode, "mode", { Chat => "chat", Query => "query" });
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
     User,
@@ -78,7 +81,7 @@ pub enum Sharing {
 
 flag_enum!(Sharing, false => Private, true => Shared);
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct SessionRow {
     pub id: SessionId,
     pub title: Option<String>,
@@ -142,7 +145,7 @@ pub enum SessionViewer {
 
 /// What a tool message stores beside its summary, which is the message's
 /// content.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct ToolMeta {
     pub tool: ToolName,
     pub detail: String,
@@ -183,7 +186,9 @@ impl From<&ToolStep> for ToolMeta {
 
 /// What an assistant message stores beside its answer. Empty parts are
 /// left out of the stored JSON.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 pub struct AssistantMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chart: Option<ChartSpec>,
@@ -219,7 +224,9 @@ impl AssistantMeta {
 
 /// What a user message stores beside its text: the documents the person
 /// limited the question to.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 pub struct UserMeta {
     #[serde(default, skip_serializing_if = "DocumentScope::is_everything")]
     pub documents: DocumentScope,
@@ -239,7 +246,7 @@ impl UserMeta {
 
 /// A message's metadata, by its role. Serialized untagged, so the stored
 /// JSON and every API body are the fields themselves.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum MessageMeta {
     User(UserMeta),
@@ -265,7 +272,7 @@ impl MessageMeta {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct MessageRow {
     pub id: MessageId,
     pub session_id: SessionId,
@@ -781,8 +788,19 @@ pub fn save_summary(
 }
 
 /// How a session is exported.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
+#[schema(as = TranscriptFormat)]
 pub enum ExportFormat {
     /// Questions, steps, and answers.
     #[default]

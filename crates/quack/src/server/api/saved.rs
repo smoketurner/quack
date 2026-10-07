@@ -7,28 +7,42 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use quack_core::ids::{SavedId, SessionId, WorkspaceId};
-use quack_core::saved::{self, Answer, RunStatus, SavedQuestion};
+use quack_core::saved::{self, Answer, RunStatus, SavedQuestion, SavedRun};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
 
+/// The workspace's saved questions.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SavedList {
+    pub saved: Vec<SavedQuestion>,
+}
+
+/// The workspace's saved questions.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/saved",
+    tag = "saved",
+    responses((status = 200, description = "The saved questions", body = SavedList)),
+)]
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SavedList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "saved questions")
         .await?;
     let questions = app.read(&id, saved::list).await?;
-    Ok(Json(serde_json::json!({ "saved": questions })))
+    Ok(Json(SavedList { saved: questions }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct NewSaved {
     pub name: String,
     /// The session the answer is in.
@@ -40,12 +54,19 @@ pub(crate) struct NewSaved {
 
 /// Save an answer the caller can see. Audited as `save`; a refused save
 /// (no SQL, a write, a name in use) is an error row.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/saved",
+    tag = "saved",
+    request_body = NewSaved,
+    responses((status = 201, description = "Saved", body = SavedQuestion)),
+)]
 pub(crate) async fn create(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Json(body): Json<NewSaved>,
-) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+) -> ApiResult<(StatusCode, Json<SavedQuestion>)> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let session = access.visible_session(&app, &body.session_id).await?;
     let db = app.workspace_db(&id).await?;
@@ -67,7 +88,7 @@ pub(crate) async fn create(
             Some(serde_json::json!({ "session": session.id, "message": body.message })),
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(serde_json::to_value(result?)?)))
+    Ok((StatusCode::CREATED, Json(result?)))
 }
 
 impl Access {
@@ -83,11 +104,25 @@ impl Access {
     }
 }
 
+/// A saved question and its newest run.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SavedDetail {
+    pub question: SavedQuestion,
+    pub last_run: Option<SavedRun>,
+}
+
+/// A saved question and its newest run.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/saved/{saved}",
+    tag = "saved",
+    responses((status = 200, description = "The saved question", body = SavedDetail)),
+)]
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
     Path((id, saved)): Path<(WorkspaceId, SavedId)>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SavedDetail>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let question = access.saved_question(&app, &saved).await?;
     let wanted = saved.clone();
@@ -105,13 +140,17 @@ pub(crate) async fn show(
             None,
         )
         .await?;
-    Ok(Json(
-        serde_json::json!({ "question": question, "last_run": last_run }),
-    ))
+    Ok(Json(SavedDetail { question, last_run }))
 }
 
 /// Remove a saved question and its runs: its creator, or an owner, may.
 /// Audited as `delete`.
+#[utoipa::path(
+    delete,
+    path = "/workspaces/{id}/saved/{saved}",
+    tag = "saved",
+    responses((status = 204, description = "Removed")),
+)]
 pub(crate) async fn remove(
     State(app): State<App>,
     identity: Identity,
@@ -139,11 +178,17 @@ pub(crate) async fn remove(
 /// Run the saved SQL now, no model, and answer with the run: it runs on
 /// the writer like the agent's `run_sql`, so no job is needed. Audited as
 /// `saved_run` with the run id, its status, and `changed`.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/saved/{saved}/run",
+    tag = "saved",
+    responses((status = 200, description = "The run, with its result sets", body = SavedRun)),
+)]
 pub(crate) async fn run(
     State(app): State<App>,
     identity: Identity,
     Path((id, saved)): Path<(WorkspaceId, SavedId)>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SavedRun>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let question = access.saved_question(&app, &saved).await?;
     let db = app.workspace_db(&id).await?;
@@ -166,12 +211,15 @@ pub(crate) async fn run(
             })),
         )
         .await?;
-    Ok(Json(serde_json::to_value(run)?))
+    Ok(Json(run))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct RunsQuery {
+    /// Runs at most, newest first.
     #[serde(default = "default_limit")]
+    #[param(default = 20)]
     pub limit: u32,
 }
 
@@ -179,12 +227,26 @@ fn default_limit() -> u32 {
     20
 }
 
+/// A saved question's runs, newest first.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SavedRuns {
+    pub runs: Vec<SavedRun>,
+}
+
+/// A saved question's runs, newest first.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/saved/{saved}/runs",
+    tag = "saved",
+    params(RunsQuery),
+    responses((status = 200, description = "The runs", body = SavedRuns)),
+)]
 pub(crate) async fn runs(
     State(app): State<App>,
     identity: Identity,
     Path((id, saved)): Path<(WorkspaceId, SavedId)>,
     Query(q): Query<RunsQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SavedRuns>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.saved_question(&app, &saved).await?;
     access
@@ -200,5 +262,5 @@ pub(crate) async fn runs(
     let runs = app
         .read(&id, move |db| saved::runs(db, &saved, limit))
         .await?;
-    Ok(Json(serde_json::json!({ "runs": runs })))
+    Ok(Json(SavedRuns { runs }))
 }

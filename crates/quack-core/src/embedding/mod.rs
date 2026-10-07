@@ -55,7 +55,7 @@ pub enum Input {
 }
 
 /// The prefix put before each role's input. Empty means none.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Prompts {
     pub query: String,
     /// May contain [`TITLE_PLACEHOLDER`].
@@ -141,7 +141,7 @@ impl ResolvedPrompts {
 
 /// Everything that decides what vector a text becomes. Two vectors are
 /// comparable only when their profiles are equal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Profile {
     /// The model as configured, with Ollama's implicit `:latest` removed.
     pub model: String,

@@ -14,7 +14,15 @@ pub const MAX_POINTS: usize = 200;
 pub const MAX_SERIES: usize = 8;
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    utoipa::ToSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum ChartKind {
@@ -31,21 +39,21 @@ text_enum!(ChartKind, "chart kind", {
     Pie => "pie",
 });
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Axis {
     pub label: String,
     /// Category labels, one per point (or per pie slice).
     pub values: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Series {
     pub name: String,
     /// One value per x label; a label the series has no row for is 0.
     pub values: Vec<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct ChartSpec {
     pub title: String,
     pub kind: ChartKind,

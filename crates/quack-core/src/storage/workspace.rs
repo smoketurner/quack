@@ -25,7 +25,7 @@ use crate::ontology::store::{self as ontology_store, Acceptance};
 use crate::ontology::{Measure, Ontology, Property};
 use crate::saved;
 use crate::storage::control::ResourceKind;
-use crate::storage::profile::{self, TableNote, TableProfile};
+use crate::storage::profile::{self, ColumnType, ColumnWarning, TableNote, TableProfile};
 use crate::text::OneLine;
 
 mod terms;
@@ -445,8 +445,19 @@ const READ_ONLY_KEYWORDS: &[&str] = &[
 ];
 
 /// How a streamed result set is written ([`WorkspaceDb::stream_query`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
+#[schema(as = SqlExportFormat)]
 pub enum ExportFormat {
     #[default]
     Csv,
@@ -567,7 +578,7 @@ impl JsonRow<'_> {
 }
 
 /// Query result set from a `DuckDB` workspace database.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct QueryResults {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
@@ -3631,7 +3642,7 @@ impl WorkspaceDb {
 }
 
 /// Column metadata from DESCRIBE, with what the ontology says of it.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ColumnInfo {
     pub name: String,
     #[serde(rename = "type")]
@@ -3643,7 +3654,7 @@ pub struct ColumnInfo {
 }
 
 /// What a column means, from its ontology property.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct ColumnMeaning {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -3685,7 +3696,7 @@ impl fmt::Display for ColumnMeaning {
 }
 
 /// The user tables and columns SQL completion offers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct SqlSchema {
     pub tables: Vec<TableColumns>,
     /// Some tables or columns were left out to stay within the caps.
@@ -3708,7 +3719,7 @@ impl SqlSchema {
 }
 
 /// One table's name and its columns, in column order.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct TableColumns {
     pub name: SqlName,
     pub columns: Vec<SqlName>,
@@ -3717,7 +3728,7 @@ pub struct TableColumns {
 /// An identifier and how a statement writes it: bare when `DuckDB` reads
 /// it unquoted as the same name (lowercase letters, digits, and
 /// underscores, not a reserved keyword), quoted otherwise.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct SqlName {
     pub name: String,
     pub sql: String,
@@ -3765,39 +3776,63 @@ impl TableDescription {
     /// its sentence and the type that fixes it, the measures, and the
     /// sample rows.
     #[must_use]
-    pub fn to_json(&self) -> serde_json::Value {
-        let warnings: Vec<serde_json::Value> = self
-            .warnings
-            .iter()
-            .map(|f| {
-                let mut value = serde_json::json!({
-                    "column": f.column,
-                    "message": f.warning.to_string(),
-                    "fix": f.warning.fix(),
-                });
-                if let (Some(object), Ok(serde_json::Value::Object(kind))) =
-                    (value.as_object_mut(), serde_json::to_value(f.warning))
-                {
-                    object.extend(kind);
-                }
-                value
-            })
-            .collect();
-        serde_json::json!({
-            "table": self.table_name,
-            "row_count": self.row_count,
-            "note": self.note,
-            "columns": self.columns,
-            "profile": self.profile,
-            "warnings": warnings,
-            "measures": self.measures,
-            "sample": { "columns": self.sample_rows.columns, "rows": self.sample_rows.rows },
-        })
+    pub fn body(&self) -> TableDescriptionBody {
+        TableDescriptionBody {
+            table: self.table_name.clone(),
+            row_count: self.row_count,
+            note: self.note.clone(),
+            columns: self.columns.clone(),
+            profile: self.profile.clone(),
+            warnings: self
+                .warnings
+                .iter()
+                .map(|f| WarningBody {
+                    column: f.column.clone(),
+                    message: f.warning.to_string(),
+                    fix: f.warning.fix(),
+                    warning: f.warning,
+                })
+                .collect(),
+            measures: self.measures.clone(),
+            sample: self.sample_rows.clone(),
+        }
     }
 }
 
+/// A table's description as every interface sends it.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct TableDescriptionBody {
+    pub table: String,
+    /// Exact row count at describe time.
+    pub row_count: i64,
+    /// The owner's note on the table.
+    pub note: Option<String>,
+    pub columns: Vec<ColumnInfo>,
+    /// The stored profile, when it was taken at the current row count.
+    pub profile: Option<TableProfile>,
+    pub warnings: Vec<WarningBody>,
+    /// The ontology's measures over this table.
+    pub measures: Vec<Measure>,
+    /// A few rows.
+    pub sample: QueryResults,
+}
+
+/// One column's warning: what it is, in a sentence, and the type that
+/// fixes it.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct WarningBody {
+    pub column: String,
+    pub message: String,
+    /// The type every value converts to, when retyping fixes it.
+    pub fix: Option<ColumnType>,
+    #[serde(flatten)]
+    pub warning: ColumnWarning,
+}
+
 /// Where a document is in ingestion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum DocumentStatus {
     /// Registered; its bytes wait on the work queue.
@@ -3835,7 +3870,7 @@ impl DocumentStatus {
 text_enum_sql!(DocumentStatus);
 
 /// Document metadata row.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct DocumentInfo {
     pub id: DocumentId,
     pub filename: String,
@@ -3946,7 +3981,15 @@ impl DocumentInfo {
 
 /// How a document reached the workspace.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    utoipa::ToSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentSource {
@@ -3984,7 +4027,7 @@ impl DocumentSource {
 
 /// What a person may change on a document: each `Some` is applied, an
 /// empty text clears the field.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentFields {
     pub title: Option<String>,
@@ -4168,7 +4211,7 @@ pub struct NewChunk<'a> {
 }
 
 /// A chunk returned from retrieval, with what a citation needs.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ChunkSearchResult {
     pub id: ChunkId,
     pub content: String,
@@ -4181,6 +4224,7 @@ pub struct ChunkSearchResult {
     /// BM25; hybrid: reciprocal rank fusion.
     pub score: f64,
     /// When the chunk's document was ingested (UTC).
+    #[schema(value_type = String)]
     pub ingested_at: DateTime,
     /// What the chunk holds: body text, a table, a note, or code.
     #[serde(default)]
@@ -4196,7 +4240,7 @@ pub struct ChunkSearchResult {
 /// Where a hit stood in each ranking of one search, for a person checking
 /// why retrieval found or missed a passage. Ranks count from 1; a ranking
 /// that did not return the hit leaves its fields empty.
-#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct Ranks {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_rank: Option<u32>,
@@ -4372,6 +4416,7 @@ impl SamplePool {
     serde::Serialize,
     serde::Deserialize,
     schemars::JsonSchema,
+    utoipa::ToSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
@@ -4395,7 +4440,15 @@ text_enum!(SearchMode, "search mode", {
 /// list keeps a document matching any of its entries; every field given
 /// must hold.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    utoipa::ToSchema,
 )]
 #[serde(deny_unknown_fields)]
 pub struct DocumentFilter {
