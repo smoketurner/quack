@@ -1,5 +1,0 @@
-Contact: https://github.com/smoketurner/quack/security/advisories/new
-Policy: https://github.com/smoketurner/quack/blob/main/SECURITY.md
-Preferred-Languages: en
-Canonical: https://github.com/smoketurner/quack/blob/main/.well-known/security.txt
-Expires: 2027-10-06T00:00:00.000Z
