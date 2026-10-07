@@ -1,0 +1,10 @@
+{% if !active.is_empty() %}
+<div class="mt-2 flex flex-wrap items-center gap-2 rounded border border-slate-800 bg-slate-900 px-3 py-1 text-xs text-slate-300">
+  <span class="font-semibold uppercase text-slate-400">Running</span>
+  {% for j in active %}
+  <span class="truncate" title="{{ j.label }}">#{{ j.number }} {{ j.kind }} · {{ j.label }}{% if !j.progress.is_empty() %} · {{ j.progress }}{% endif %}</span>
+  {% endfor %}
+  {% if more > 0 %}<span class="text-slate-400">and {{ more }} more</span>{% endif %}
+  <a class="ml-auto text-blue-400 hover:underline" href="/w/{{ ws_id }}/jobs">Jobs</a>
+</div>
+{% endif %}

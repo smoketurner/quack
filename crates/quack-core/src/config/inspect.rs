@@ -478,6 +478,9 @@ const PROVIDER_KEYS: &[&str] = &[
 /// The keys a `[providers.NAME.models."ID"]` table accepts.
 const MODEL_KEYS: &[&str] = &["temperature", "effort", "background_effort", "images"];
 
+/// The keys a `[server.webhooks]` table accepts.
+const WEBHOOK_KEYS: &[&str] = &["url", "secret_env", "kinds", "timeout_seconds"];
+
 /// The keys a `[server.oidc]` table accepts.
 const OIDC_KEYS: &[&str] = &[
     "issuer_url",
@@ -927,6 +930,14 @@ fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         Some(render_list(&proxies)),
         Some(String::from("[]")),
     );
+    if let Some(hook) = &server.webhooks {
+        let mut s = inventory.section(String::from("server.webhooks"));
+        s.required_text("url", &hook.url);
+        s.required_text("secret_env", &hook.secret_env);
+        let kinds: Vec<String> = hook.kinds.iter().map(|k| k.as_str().to_owned()).collect();
+        s.optional("kinds", Some(render_list(&kinds)), Some(String::from("[]")));
+        s.literal("timeout_seconds", hook.timeout_seconds, 10);
+    }
     let Some(oidc) = &server.oidc else {
         return;
     };
@@ -1198,19 +1209,24 @@ impl UnknownKey {
                 continue;
             };
             for key in table.keys() {
-                if name == "server" && key == "oidc" {
+                if name == "server" && (key == "oidc" || key == "webhooks") {
                     continue;
                 }
                 if !keys.contains(&key.as_str()) {
                     unknown.push(Self::new(name, key, keys));
                 }
             }
-            if name == "server"
-                && let Some(oidc) = table.get("oidc").and_then(TomlValue::as_table)
-            {
-                for key in oidc.keys() {
-                    if !OIDC_KEYS.contains(&key.as_str()) {
-                        unknown.push(Self::new("server.oidc", key, OIDC_KEYS));
+            if name == "server" {
+                for (nested, section, allowed) in [
+                    ("oidc", "server.oidc", OIDC_KEYS),
+                    ("webhooks", "server.webhooks", WEBHOOK_KEYS),
+                ] {
+                    if let Some(nested) = table.get(nested).and_then(TomlValue::as_table) {
+                        for key in nested.keys() {
+                            if !allowed.contains(&key.as_str()) {
+                                unknown.push(Self::new(section, key, allowed));
+                            }
+                        }
                     }
                 }
             }

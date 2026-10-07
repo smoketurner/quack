@@ -109,9 +109,9 @@ signed-in user and reads no workspace, so it writes no audit row.
   `clock` (chat messages, versions, the audit log, token expiry) is the time of day, with the
   date when not today; `relative` (jobs, documents, sessions, token last use) is written by the
   server as "5 min ago", "3 h ago", or the date, and the page leaves it as written, so nothing
-  changes under the reader. While a document processes, the Documents page polls
-  `.../documents/status` and swaps in only each row's status and the note (`hx-swap-oob`),
-  never the whole table.
+  changes under the reader. While a document processes, the Documents page refetches
+  `.../documents/status` on each job event (`jobs-changed`, from the page's one job stream) and
+  swaps in only each row's status and the note (`hx-swap-oob`), never the whole table.
   Chat messages show when they were asked or answered, and an answer how many milliseconds it
   took (`duration_ms` on the response object and the assistant message's metadata). A SQL
   result shows its row count and the statement's own run time in milliseconds
@@ -152,8 +152,12 @@ workspace content, so it never goes in the URL: `web::flash::keep` stashes it in
 process's memory (`Flashes`, one minute) under a random id, and the browser carries only the
 id in an `HttpOnly` `quack_flash` cookie; the landing page's `Flashed` extractor takes it, so
 it shows once. The graph page's searches and the Tables page's choice of table are posted
-forms for the same reason. The documents list polls its rows fragment only while a
-row is processing (marked `data-pending`).
+forms for the same reason. The documents list refetches its rows fragment on job events
+only while a row is processing (marked `data-pending`). Every workspace page carries the job
+strip (`#jobs-strip` in `base.html`): it holds the page's `data-jobs-stream`, and
+`followJobs` in `app.js` turns each stream event into `jobs-changed` for any fragment that
+listens, shows a toast when a background job finishes, and offers "Notify me" for browser
+notifications while the page is hidden.
 
 ## Assets
 
