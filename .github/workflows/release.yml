@@ -65,7 +65,13 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
       - name: Setup Rust toolchain
-        run: rustup show
+        # As ci.yml: only the pinned toolchain, so rust-cache's key matches the
+        # caches CI saved on main.
+        shell: bash
+        run: |
+          rustup show
+          pinned=$(rustup show active-toolchain | awk '{print $1}')
+          rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
       # Restore-only. A release run must never write a cache entry, but it does
       # read the one CI saved on main, and that is where this job's time went:
       # `lookup-only` only probes for the key and downloads nothing, so gates
