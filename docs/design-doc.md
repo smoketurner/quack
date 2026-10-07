@@ -2831,16 +2831,24 @@ installers.
     (`[server.oidc].redirect_uri`) or `[server].secure_cookies` is `always`. A cookie minted
     behind a TLS-terminating proxy, even a same-host one on loopback, thus never travels
     over a plaintext downgrade, while plain HTTP on a laptop still works. The sign-in state
-    cookie follows the same rule. `X-Forwarded-Proto` is not trusted here (issue #246).
+    cookie follows the same rule. `X-Forwarded-Proto` is never read (issue #246).
+  - A request that would change something and carries no bearer token is refused (403) when
+    its `Origin`, or `Referer` without one, names another host: a page elsewhere can make the
+    browser post with the session cookie, or, in local mode, with no credential at all. A
+    request with neither header (curl, a script) passes.
 - **Rate limiting covers everything a caller can reach.**
   - One `tower_governor` limiter, keyed by peer address, covers the web UI, REST API, and
-    MCP. The password endpoints (`POST /login`, `POST /api/v1/auth/login`) add a tighter
-    one, keyed the same way (2 requests per second, bursting to 10); the general budget suits
-    browsing and is too loose to make guessing expensive.
+    MCP: one request back each second, bursting to 120. The password endpoints (`POST
+    /login`, `POST /api/v1/auth/login`) add a tighter one, keyed the same way (one request
+    back every 2 seconds, bursting to 10); the general budget suits browsing and is too loose
+    to make guessing expensive.
   - No limiter keys on what the request says about itself: keyed on the unvalidated
     `Authorization` header, each random bearer got a fresh bucket (issue #237). Everyone
-    behind one address (a NAT, a same-host reverse proxy) shares one budget.
-    `X-Forwarded-For` is not trusted; any client can write it.
+    behind one address (a NAT) shares one budget. Behind a reverse proxy listed in
+    `[server].trusted_proxies`, the key is the client its `X-Forwarded-For` names
+    (`quack_core::net`, every line, read from the right past the trusted hops); from any
+    other peer the header is ignored, since any client can write it. `Forwarded` is never
+    read: a proxy that writes `X-Forwarded-For` passes a client's own `Forwarded` through.
   - `/healthz`, `/readyz`, and `/metrics` are outside every limiter: a throttled health
     check reads as a dead server. `/readyz` answers 503 until `control.db` answers a query,
     the data directory takes a write, and the vault key can be read; `quack ready` calls it

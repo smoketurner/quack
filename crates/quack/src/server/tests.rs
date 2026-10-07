@@ -273,6 +273,62 @@ impl Harness {
     }
 }
 
+/// A browser on another site cannot make this one change anything: a
+/// state-changing request whose Origin (or Referer) names another host is
+/// refused, with a cookie or without one, while the same host, a request
+/// with no Origin (a script), and a bearer-token call all pass.
+#[tokio::test]
+async fn a_request_from_another_site_changes_nothing() {
+    let h = harness(ServeMode::Login).await;
+    h.user("ada", UserKind::Standard).await;
+    let login = |origin: Option<&str>, host: Option<&str>| {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        if let Some(host) = host {
+            request = request.header(header::HOST, host);
+        }
+        request
+            .body(Body::from("username=ada&password=pw"))
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    let (status, _, _) = h
+        .send(login(
+            Some("https://evil.example"),
+            Some("quack.local:8080"),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "another site's form");
+    let (status, _, _) = h
+        .send(login(
+            Some("http://quack.local:8080"),
+            Some("quack.local:8080"),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "this site's own form");
+    let (status, _, _) = h.send(login(None, None)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "a script sends no Origin");
+
+    let token = h.login("ada").await;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/auth/logout")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::ORIGIN, "https://evil.example")
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, _, _) = h.send(request).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a bearer call is the caller's own"
+    );
+}
+
 /// Every response, a page, the API, or a static file, tells the browser to
 /// run only this server's scripts, load no image from elsewhere, not sniff
 /// types, and not be framed; no template carries an inline handler the

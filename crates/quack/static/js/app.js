@@ -522,9 +522,6 @@
     setWorking(view, "Waiting for your answer…");
   }
 
-  // The Jobs page follows the job stream instead of polling: every change
-  // asks htmx to refetch the rows, at most once per quarter second. If the
-  // stream drops, the browser reconnects on its own (EventSource retries).
   // A job's last known state, so a finish is announced once.
   var jobStates = {};
   var FINISHED = { succeeded: true, failed: true, cancelled: true };
@@ -552,11 +549,13 @@
     }
   }
 
+  // Note a job's state; whether it changed.
   function noteJob(job) {
-    if (!job || !job.id) return;
+    if (!job || !job.id) return false;
     var before = jobStates[job.id];
     jobStates[job.id] = job.state;
     if (job.kind !== "chat" && FINISHED[job.state] && before && !FINISHED[before]) announceJob(job);
+    return before !== job.state;
   }
 
   // The strip's "Notify me": asks once, remembered in this browser.
@@ -578,10 +577,18 @@
     strip.insertAdjacentElement("afterend", button);
   }
 
+  // Every page follows the job stream instead of polling. A job that starts
+  // or ends refetches the strip and the page's rows within a quarter
+  // second; progress alone refetches them at most every five seconds, since
+  // each refetch counts against the rate limit and is an audited page read.
+  // If the stream drops, the browser reconnects on its own.
+  var PROGRESS_REFRESH_MS = 5000;
+
   function followJobs() {
     var rows = document.querySelector("[data-jobs-stream]");
     if (!rows || !window.EventSource) return;
     var pending = null;
+    var lastProgress = 0;
     function refresh() {
       if (pending) return;
       pending = setTimeout(function () {
@@ -591,8 +598,14 @@
     }
     var source = new EventSource(rows.getAttribute("data-jobs-stream"));
     source.addEventListener("job", function (ev) {
-      try { noteJob(JSON.parse(ev.data)); } catch (e) { /* a refresh still follows */ }
-      refresh();
+      var changed = true;
+      try { changed = noteJob(JSON.parse(ev.data)); } catch (e) { /* refresh as for a change */ }
+      if (changed) {
+        refresh();
+      } else if (Date.now() - lastProgress >= PROGRESS_REFRESH_MS) {
+        lastProgress = Date.now();
+        refresh();
+      }
     });
     source.addEventListener("jobs", function (ev) {
       try { JSON.parse(ev.data).forEach(function (job) { jobStates[job.id] = job.state; }); } catch (e) { /* a refresh still follows */ }
