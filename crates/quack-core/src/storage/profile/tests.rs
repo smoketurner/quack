@@ -155,3 +155,21 @@ fn notes_set_replace_clear_and_refuse() {
     let long = "x".repeat(TableNote::MAX_CHARS + 1);
     assert!(TableNote::set(&db, "orders", &long, None).is_err());
 }
+
+/// Column types are stored as named pairs: a column whose name holds a
+/// comma or an equals sign, which the `col=TYPE` text cannot carry, comes
+/// back whole.
+#[test]
+fn column_types_round_trip_any_column_name() {
+    let types = ColumnTypes::new(vec![
+        (String::from("total, net"), ColumnType::Double),
+        (String::from("a=b"), ColumnType::Bigint),
+    ]);
+    let json = serde_json::to_string(&types).unwrap_or_default();
+    assert_eq!(
+        json,
+        r#"[{"column":"total, net","type":"DOUBLE"},{"column":"a=b","type":"BIGINT"}]"#
+    );
+    let back: ColumnTypes = serde_json::from_str(&json).unwrap_or_default();
+    assert_eq!(back, types);
+}

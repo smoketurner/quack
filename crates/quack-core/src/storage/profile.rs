@@ -110,9 +110,36 @@ text_enum!(ColumnType, "column type", {
     Boolean => "BOOLEAN",
 });
 
-/// Columns to retype after a load, from `--types col=TYPE,...`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Columns to retype after a load, from `--types col=TYPE,...`. Stored and
+/// sent as a list of [`ColumnRetype`]s, which keeps any column name whole;
+/// the `col=TYPE` text is for typing on a command line.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "Vec<ColumnRetype>", from = "Vec<ColumnRetype>")]
 pub struct ColumnTypes(Vec<(String, ColumnType)>);
+
+/// One column and the type it is given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ColumnRetype {
+    pub column: String,
+    #[serde(rename = "type")]
+    pub kind: ColumnType,
+}
+
+impl From<ColumnTypes> for Vec<ColumnRetype> {
+    fn from(types: ColumnTypes) -> Self {
+        types
+            .0
+            .into_iter()
+            .map(|(column, kind)| ColumnRetype { column, kind })
+            .collect()
+    }
+}
+
+impl From<Vec<ColumnRetype>> for ColumnTypes {
+    fn from(list: Vec<ColumnRetype>) -> Self {
+        Self(list.into_iter().map(|r| (r.column, r.kind)).collect())
+    }
+}
 
 impl ColumnTypes {
     #[must_use]

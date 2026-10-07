@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS _quack_saved_runs (
     statements JSON NOT NULL
 );";
 
+/// Runs kept per saved question, newest first, beside the newest
+/// completed one.
+const KEPT_RUNS: u32 = 100;
+
 /// A question with the statements its answer ran.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct SavedQuestion {
@@ -469,6 +473,23 @@ pub fn run(db: &WorkspaceDb, question: &SavedQuestion, max_rows: u32) -> Result<
             serde_json::to_string(&statements)?
         ],
     )?;
+    // A saved question run from cron every minute would add half a million
+    // runs a year; the newest are kept, and the newest completed one, which
+    // the next run compares with, whatever its age.
+    db.connection().execute(
+        "DELETE FROM _quack_saved_runs WHERE saved_id = ? \
+         AND id NOT IN (SELECT id FROM _quack_saved_runs WHERE saved_id = ? \
+                        ORDER BY id DESC LIMIT ?) \
+         AND id NOT IN (SELECT id FROM _quack_saved_runs WHERE saved_id = ? AND status = ? \
+                        ORDER BY id DESC LIMIT 1)",
+        duckdb::params![
+            question.id,
+            question.id,
+            KEPT_RUNS,
+            question.id,
+            RunStatus::Ok.as_str()
+        ],
+    )?;
     let mut run = runs(db, &question.id, 1)?
         .into_iter()
         .next()
@@ -690,6 +711,32 @@ mod tests {
         assert_eq!(history[1].statements[0].digest, fourth.statements[0].digest);
         assert!(remove(&db, &saved.id).unwrap());
         assert!(runs(&db, &saved.id, 10).unwrap().is_empty());
+    }
+
+    /// The run history is bounded: the newest runs are kept, and the
+    /// newest completed one even when a long streak of failures follows it.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn old_runs_are_dropped_but_the_last_completed_one_is_kept() {
+        let db = db();
+        let session = session_with(&db, "overdue?", vec![step(OVERDUE, Some(1))]);
+        let saved = save(&db, "overdue", &session, Answer::Last, None).unwrap();
+        for _ in 0..105 {
+            run(&db, &saved, 100).unwrap();
+        }
+        assert_eq!(runs(&db, &saved.id, 1_000).unwrap().len(), 100);
+
+        let completed = run(&db, &saved, 100).unwrap();
+        db.execute_statement("DROP TABLE invoices").unwrap();
+        for _ in 0..100 {
+            assert_eq!(run(&db, &saved, 100).unwrap().status, RunStatus::Failed);
+        }
+        let kept = runs(&db, &saved.id, 1_000).unwrap();
+        assert_eq!(kept.len(), 101, "100 newest, and the last completed");
+        assert_eq!(
+            last_completed(&db, &saved.id).unwrap().map(|r| r.id),
+            Some(completed.id)
+        );
     }
 
     #[test]
