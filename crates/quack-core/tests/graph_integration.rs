@@ -176,30 +176,37 @@ fn workspace() -> WorkspaceDb {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 0,
-        content: "Orgenics ships to Kenya from its plant.",
-        heading: Some("Vendors"),
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: None,
+    db.chunk_writer(
+        &DocumentId::from("doc-1"),
+        "Orgenics ships to Kenya from its plant.",
+    )
+    .and_then(|writer| {
+        writer.insert(&NewChunk {
+            id: &ChunkId::from("c1"),
+            chunk_index: 0,
+            content: "Orgenics ships to Kenya from its plant.",
+            heading: Some("Vendors"),
+            page: None,
+            kind: SectionKind::Body,
+            locator: None,
+            embedding: None,
+        })
     })
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c2"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 1,
-        content: "FAIL this one",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "FAIL this one")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c2"),
+                chunk_index: 1,
+                content: "FAIL this one",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
     store::save(
         &db,
         &ontology(),
@@ -290,16 +297,21 @@ fn extraction_samples_evenly_across_documents() {
     )
     .unwrap();
     for i in 0..4 {
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from(format!("l{i}")),
-            document_id: &DocumentId::from("doc-2"),
-            chunk_index: i,
-            content: "Filler text about nothing in particular.",
-            heading: None,
-            page: None,
-            kind: SectionKind::Body,
-            locator: None,
-            embedding: None,
+        db.chunk_writer(
+            &DocumentId::from("doc-2"),
+            "Filler text about nothing in particular.",
+        )
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from(format!("l{i}")),
+                chunk_index: i,
+                content: "Filler text about nothing in particular.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
         })
         .unwrap();
     }
@@ -420,18 +432,20 @@ async fn rejected_merge_is_not_reproposed_when_provenance_flips_orientation() {
     graph_store::add_provenance(&db, &acme, &chunk("c2")).unwrap();
     let acme_corp = graph_store::upsert_node(&db, &node("Acme Corp")).unwrap();
     graph_store::add_provenance(&db, &acme_corp, &chunk("c1")).unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c3"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 2,
-        content: "Acme Corp is an acme.",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "Acme Corp is an acme.")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c3"),
+                chunk_index: 2,
+                content: "Acme Corp is an acme.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
     // First pass: Acme (2 provenance) keeps; Acme Corp (1) drops.
     resolve::resolve(&writer, Some(&letters()), &options)
         .await
@@ -488,18 +502,20 @@ async fn pending_pair_is_not_duplicated_when_provenance_flips_orientation() {
     graph_store::add_provenance(&db, &acme, &chunk("c2")).unwrap();
     let acme_corp = graph_store::upsert_node(&db, &node("Acme Corp")).unwrap();
     graph_store::add_provenance(&db, &acme_corp, &chunk("c1")).unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c3"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 2,
-        content: "Acme Corp is an acme.",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "Acme Corp is an acme.")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c3"),
+                chunk_index: 2,
+                content: "Acme Corp is an acme.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
     resolve::resolve(&writer, Some(&letters()), &options)
         .await
         .unwrap();
@@ -538,18 +554,20 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c3"),
-        document_id: &DocumentId::from("doc-2"),
-        chunk_index: 0,
-        content: "Orgenics ships to Nowhere.",
-        heading: None,
-        page: None,
-        kind: SectionKind::Body,
-        locator: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-2"), "Orgenics ships to Nowhere.")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c3"),
+                chunk_index: 0,
+                content: "Orgenics ships to Nowhere.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
     let node = |label: &str, class: &str| NewNode {
         label: label.to_owned(),
         class_id: ClassId::from(class.to_owned()),
@@ -1111,16 +1129,21 @@ async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
     )
     .unwrap();
     for i in 0..150 {
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from(format!("l{i:03}")),
-            document_id: &DocumentId::from("doc-2"),
-            chunk_index: i,
-            content: "Filler text about nothing in particular.",
-            heading: None,
-            page: None,
-            kind: SectionKind::Body,
-            locator: None,
-            embedding: None,
+        db.chunk_writer(
+            &DocumentId::from("doc-2"),
+            "Filler text about nothing in particular.",
+        )
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from(format!("l{i:03}")),
+                chunk_index: i,
+                content: "Filler text about nothing in particular.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
         })
         .unwrap();
     }

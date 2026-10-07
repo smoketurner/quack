@@ -95,17 +95,20 @@ async fn seed_hail_chunks(db: &SharedDb) {
         .iter()
         .enumerate()
         {
-            guard.insert_chunk(&NewChunk {
-                id: &ChunkId::from(format!("c{i}")),
-                document_id: &DocumentId::from("d"),
-                chunk_index: u32::try_from(i).unwrap_or(0),
-                content: text,
-                heading: None,
-                page: None,
-                kind: SectionKind::Body,
-                locator: None,
-                embedding: None,
-            })?;
+            guard
+                .chunk_writer(&DocumentId::from("d"), text)
+                .and_then(|writer| {
+                    writer.insert(&NewChunk {
+                        id: &ChunkId::from(format!("c{i}")),
+                        chunk_index: u32::try_from(i).unwrap_or(0),
+                        content: text,
+                        heading: None,
+                        page: None,
+                        kind: SectionKind::Body,
+                        locator: None,
+                        embedding: None,
+                    })
+                })?;
         }
         Ok(())
     })
@@ -125,18 +128,18 @@ fn an_entity_filter_resolves_to_its_chunks_or_says_why_it_cannot() {
         .is_ok()
     );
     assert!(
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c1"),
-            document_id: &DocumentId::from("doc-1"),
-            chunk_index: 0,
-            content: "Acme ships to Kenya.",
-            heading: None,
-            page: None,
-            kind: SectionKind::Body,
-            locator: None,
-            embedding: None,
-        })
-        .is_ok()
+        db.chunk_writer(&DocumentId::from("doc-1"), "Acme ships to Kenya.")
+            .and_then(|writer| writer.insert(&NewChunk {
+                id: &ChunkId::from("c1"),
+                chunk_index: 0,
+                content: "Acme ships to Kenya.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            }))
+            .is_ok()
     );
     let node = |label: &str| NewNode {
         label: String::from(label),
@@ -492,17 +495,20 @@ async fn seed_document(db: &SharedDb, name: &str, count: u32, text: &str) {
             &NewDocument::new(&id, &name, "text/markdown", 1).with_status(DocumentStatus::Ready),
         )?;
         for i in 0..count {
-            guard.insert_chunk(&NewChunk {
-                id: &ChunkId::from(format!("{name}-{i}")),
-                document_id: &id,
-                chunk_index: i,
-                content: &format!("{text} {i}"),
-                heading: None,
-                page: None,
-                kind: SectionKind::Body,
-                locator: None,
-                embedding: None,
-            })?;
+            guard
+                .chunk_writer(&id, &format!("{text} {i}"))
+                .and_then(|writer| {
+                    writer.insert(&NewChunk {
+                        id: &ChunkId::from(format!("{name}-{i}")),
+                        chunk_index: i,
+                        content: &format!("{text} {i}"),
+                        heading: None,
+                        page: None,
+                        kind: SectionKind::Body,
+                        locator: None,
+                        embedding: None,
+                    })
+                })?;
         }
         guard.set_document_chunk_count(&id, count)
     })
@@ -1083,17 +1089,20 @@ async fn search_documents_top_k_is_capped_regardless_of_what_the_model_asks_for(
                 .with_status(DocumentStatus::Ready),
         )?;
         for i in 0..(MAX_SEARCH_TOP_K * 2) {
-            guard.insert_chunk(&NewChunk {
-                id: &ChunkId::from(format!("c{i}")),
-                document_id: &DocumentId::from("d"),
-                chunk_index: i,
-                content: &format!("Hail fell in county {i}."),
-                heading: None,
-                page: None,
-                kind: SectionKind::Body,
-                locator: None,
-                embedding: None,
-            })?;
+            guard
+                .chunk_writer(&DocumentId::from("d"), &format!("Hail fell in county {i}."))
+                .and_then(|writer| {
+                    writer.insert(&NewChunk {
+                        id: &ChunkId::from(format!("c{i}")),
+                        chunk_index: i,
+                        content: &format!("Hail fell in county {i}."),
+                        heading: None,
+                        page: None,
+                        kind: SectionKind::Body,
+                        locator: None,
+                        embedding: None,
+                    })
+                })?;
         }
         Ok(())
     })

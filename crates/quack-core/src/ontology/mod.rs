@@ -9,6 +9,7 @@
 
 pub mod candidates;
 pub mod documents;
+pub mod edit;
 pub mod induction;
 pub mod store;
 

@@ -99,18 +99,20 @@ fn seed(db: &WorkspaceDb, chunks: u32, width: usize) {
     .unwrap();
     let vector = vec![1.0_f32; width];
     for i in 0..chunks {
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from(format!("c{i}")),
-            document_id: &DocumentId::from("d"),
-            chunk_index: i,
-            content: &format!("storm report {i}"),
-            heading: Some("Reports"),
-            page: None,
-            kind: SectionKind::Body,
-            locator: None,
-            embedding: Some(&Vector::from(vector.clone())),
-        })
-        .unwrap();
+        db.chunk_writer(&DocumentId::from("d"), &format!("storm report {i}"))
+            .and_then(|writer| {
+                writer.insert(&NewChunk {
+                    id: &ChunkId::from(format!("c{i}")),
+                    chunk_index: i,
+                    content: &format!("storm report {i}"),
+                    heading: Some("Reports"),
+                    page: None,
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: Some(&Vector::from(vector.clone())),
+                })
+            })
+            .unwrap();
     }
 }
 

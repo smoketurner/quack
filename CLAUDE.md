@@ -145,7 +145,8 @@ rig's conversation memory (`llm::memory::History`: `SessionMemory` under `Transc
 rig's token window over `[analysis].history_token_budget`), and with
 `[analysis].compact_history` the turns it leaves out become a chat-model summary kept in
 `_quack_session_summaries`. Retrieval is hybrid (exact cosine scan plus quack's own
-BM25 over `_quack_terms`, reciprocal rank fusion in `WorkspaceDb::explain_search`;
+BM25 over `_quack_terms`, each document's chunks stemmed under the language
+`WorkspaceDb::chunk_writer` detects once for it, reciprocal rank fusion in `WorkspaceDb::explain_search`;
 no DuckDB extension is ever loaded, see design doc section 14), then an optional reranker
 (`analysis::rerank`, `[retrieval].rerank = "none" | "model" | "reranker"`; `model` over-fetches
 `rerank_candidates` and has the chat model order them, `reranker` has the dedicated rerank
@@ -317,6 +318,8 @@ It lives in the `_quack_ontology_*` tables; `ontology::store::save` validates, c
 mapped tables and columns against the workspace, and writes a new version with a JSON
 snapshot, `since_version` carried over for items that already existed. JSON is the only
 interchange form (export, import, `PUT /ontology`); a file is never the source of truth.
+The ontology page's forms edit a property's meaning and the measures (`ontology::edit::Edit`,
+applied to the current version and saved through `store::save`).
 A class or relation id changes only through `ontology::store::rename` (`quack ontology rename`,
 `POST .../ontology/rename`, the ontology page's Rename form): `IdRenames` on the save's
 `Revision` moves, in the save's transaction, the ontology's own references, `since_version`,

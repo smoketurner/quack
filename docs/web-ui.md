@@ -72,8 +72,12 @@ signed-in user and reads no workspace, so it writes no audit row.
   outcome. A search the core refuses (an unknown document, vector mode with no embedding
   model) is shown on the page, not as a failed page. The chat form offers the same
   documents in a multi-select; picked ones go out as the turn's `document_ids`.
-- **`ontology.html`** shows the class tree, relations, properties, and mappings; the JSON
-  editor; the version list with the diff to the previous version; the propose form; the
+- **`ontology.html`** shows the class tree, relations, properties with their meaning, mappings,
+  and measures; an Edit meaning form per property (description, unit, comma-separated
+  synonyms; a blank field clears it); forms to add a measure (id, a table from a list of the
+  workspace's tables, expression, description) and to change or remove one, each a new
+  version through `ontology::store::save`, its refusal (such as an expression that is not a
+  read of the table) shown on the page; the JSON editor; the version list with the diff to the previous version; the propose form; the
   Rename form, which gives a class or relation a new id and moves the graph's nodes and
   edges with it; the paged review queue with bulk accept and reject; and links to download
   the ontology's JSON and its JSON Schema.

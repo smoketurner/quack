@@ -949,7 +949,9 @@ which leaves keyword-exact questions (part numbers, policy IDs) unanswered.
   languages), so `renewals` meets `renewal`. Each document is stemmed under its own
   language (`storage::workspace::Language`, `Stemming`): at ingest `whatlang` detects it
   from the first 8,000 characters of text and `_quack_documents.language` records the ISO
-  639-3 code. `[retrieval].languages = ["auto"]` (the default) detects any language and
+  639-3 code. The language is resolved once per document: `WorkspaceDb::chunk_writer` detects
+  and records it and hands back a `ChunkWriter` that indexes every chunk of that document
+  under its stemming, with no lookup per chunk. `[retrieval].languages = ["auto"]` (the default) detects any language and
   falls back to English when the detector is unsure; a list of Snowball names
   (`["english", "german"]`) detects among them, and one name fixes it. A language without
   a stemmer (Chinese, Japanese, Korean, Polish) is only lowercased. Runs of Han, Hiragana,
@@ -1067,12 +1069,12 @@ when read: every value empty, at least half empty, numbers stored as text and da
 text (at least 90% of values cast), and a key that repeats (the mapping's key column, or a
 column named `id`). A mistyped-text warning names the type that fixes it only when every value
 converts. The prompt's tables block, `describe_table`, `find_tables`, the Tables page, REST
-`POST .../tables/describe`, MCP `describe_table`, and `quack tables` show them.
+`POST .../tables/describe`, MCP `describe_table`, `quack tables`, and the terminal's `/schema` show them.
 
 **Table notes.** A member or owner writes a note per table (`quack tables T --note TEXT`,
 `PUT .../tables/note`, the Tables page; blank removes it; at most 2,000 characters), kept in
 `_quack_table_notes` and audited as `table_note`. It renders under the table wherever the table
-is described, the prompt included, and feeds the table search.
+is described, the prompt and the terminal's `/schema` included, and feeds the table search.
 
 **Replacing a document.** `quack ingest FILE --replace [ID]` (the newest ready document
 with the file's name when no id is given), `POST .../documents?replace={doc}`, and the
@@ -1107,13 +1109,16 @@ access control: class and relation names alone reveal what a workspace is about.
 and a range class, each satisfied by any subclass. Properties are typed
 `string | number | date | enum | boolean` and inherited, and may carry a `description`, a
 `unit`, and `synonyms`: a column a mapping gives a property renders as `- col (TYPE):
-description [unit] (also: synonyms)` in the tables block, `describe_table`, and the Tables
-page, and its synonyms feed the table search (issue #403). **Measures** are named calculations
+description [unit] (also: synonyms)` in the tables block, `describe_table`, the terminal's
+`/schema`, and the Tables page, and its synonyms feed the table search (issue #403). **Measures** are named calculations
 over one table (`{"id": "revenue", "table": "orders", "expression": "sum(amount) / 100.0",
 "description": ...}`); a save checks `SELECT <expression> FROM <table>` is one read that plans,
 keeps one over a table that is gone (like a mapping), and the prompt lists up to 30 of them
 after the tables block, `describe_table` a table's own. Measures version, export, and diff with
-the rest of the ontology. Every ontology implicitly contains
+the rest of the ontology. Besides the JSON, the ontology page edits a property's description,
+unit, and synonyms and adds, changes, and removes measures with forms (`ontology::edit::Edit`),
+each saved as a new version through the same `store::save`, whose refusal the page shows.
+Every ontology implicitly contains
 the `mentions` relation (`entity` to `entity`), so extraction never has to invent one. Ids
 are `snake_case` and stable; a rename is a new id plus a migration of nodes and edges.
 

@@ -8,6 +8,9 @@ updates:
       prefix: "deps"
     cooldown:
       default-days: 7
+    ignore:
+      # pdf_oxide 0.3.78 does not build against office_oxide 0.1.12+; remove once a pdf_oxide release does.
+      - dependency-name: "office_oxide"
     groups:
       rust-dependencies:
         patterns:

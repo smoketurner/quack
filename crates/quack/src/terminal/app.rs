@@ -2334,18 +2334,7 @@ impl App {
                     Err(CoreError::Analysis(format!("no table named '{table}'")))
                 }
             },
-            |app, described| {
-                let mut text = format!("{} ({} rows)\n", described.table_name, described.row_count);
-                for column in &described.columns {
-                    let line = format!("  {} {}\n", column.name, column.column_type);
-                    text.push_str(&line);
-                }
-                let mut buf = Vec::new();
-                if described.sample_rows.write_table(&mut buf).is_ok() {
-                    text.push_str(&String::from_utf8_lossy(&buf));
-                }
-                app.note(MessageKind::Sql, text);
-            },
+            |app, described| app.note(MessageKind::Sql, described.to_string()),
         );
     }
 

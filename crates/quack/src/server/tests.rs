@@ -889,16 +889,17 @@ async fn a_documents_chunks_page_through_the_api_and_open_on_the_passage_page() 
         .iter()
         .enumerate()
         {
-            db.insert_chunk(&NewChunk {
-                id: &ChunkId::from(format!("c{i}")),
-                document_id: &id,
-                chunk_index: u32::try_from(i).unwrap_or_default(),
-                content: text,
-                heading: (i == 1).then_some("Perils"),
-                page: Some(2),
-                kind: SectionKind::Body,
-                locator: None,
-                embedding: None,
+            db.chunk_writer(&id, text).and_then(|writer| {
+                writer.insert(&NewChunk {
+                    id: &ChunkId::from(format!("c{i}")),
+                    chunk_index: u32::try_from(i).unwrap_or_default(),
+                    content: text,
+                    heading: (i == 1).then_some("Perils"),
+                    page: Some(2),
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: None,
+                })
             })?;
         }
         db.set_document_chunk_count(&id, 3)
@@ -2380,6 +2381,143 @@ async fn ontology_is_versioned_over_the_api_and_the_web_page() {
     assert!(html.contains("vendor") && html.contains("v4"), "{html}");
 }
 
+/// The ontology page edits a property's meaning and the measures through
+/// forms, each a new version through the same save, and shows what the
+/// save refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn ontology_page_forms_edit_property_meanings_and_measures() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let viewer = h.user("viewer", UserKind::Standard).await;
+    let ws = h.workspace("o", &owner).await;
+    h.app
+        .control
+        .set_member(&ws, &viewer, Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    h.app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message))
+        .run(|db| db.execute_statement("CREATE TABLE orders AS SELECT 250 AS amount"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let owner_token = h.login("owner").await;
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/ontology/init"),
+            &owner_token,
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let owner_cookie = h.web_session("owner").await;
+    let page = format!("/w/{ws}/ontology");
+    let submit = |path: String, form: &'static str| h.submit(path, owner_cookie.clone(), form);
+
+    let (to, html) = submit(
+        format!("{page}/properties/country"),
+        "description=Where+it+is+based&unit=&synonyms=nation%2C+land%2C+",
+    )
+    .await;
+    assert_eq!(to, page);
+    assert!(
+        html.contains("described property country; saved as version 2"),
+        "{html}"
+    );
+    assert!(html.contains("Where it is based"), "{html}");
+    assert!(html.contains("(also: land, nation)"), "{html}");
+    let (status, body) = h
+        .get(&format!("/api/v1/workspaces/{ws}/ontology"), &owner_token)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let country = body["properties"]
+        .as_array()
+        .and_then(|p| p.iter().find(|p| p["id"] == "country"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(country["description"], "Where it is based");
+    assert_eq!(country.get("unit"), None);
+    assert_eq!(country["synonyms"], serde_json::json!(["land", "nation"]));
+
+    let (_, html) = submit(
+        format!("{page}/measures"),
+        "id=revenue&table=orders&expression=sum(amount)+%2F+100.0&description=",
+    )
+    .await;
+    assert!(
+        html.contains("added measure revenue; saved as version 3"),
+        "{html}"
+    );
+    assert!(html.contains("revenue = sum(amount) / 100.0"), "{html}");
+
+    // The save's own check refuses an expression that is not a read of the
+    // table, and the page says why; nothing is stored.
+    let (_, html) = submit(
+        format!("{page}/measures/revenue"),
+        "table=orders&expression=sum(missing_column)&description=",
+    )
+    .await;
+    assert!(html.contains("role=\"alert\""), "{html}");
+    assert!(
+        html.contains("measure &#39;revenue&#39; is not a read of &#39;orders&#39;"),
+        "{html}"
+    );
+    let (_, html) = submit(
+        format!("{page}/measures"),
+        "id=revenue&table=orders&expression=count(*)",
+    )
+    .await;
+    assert!(html.contains("already exists"), "{html}");
+    let (_, html) = submit(format!("{page}/properties/nope"), "description=x").await;
+    assert!(html.contains("no property"), "{html}");
+
+    let (_, html) = submit(
+        format!("{page}/measures/revenue"),
+        "table=orders&expression=sum(amount)&description=Gross+revenue+in+cents",
+    )
+    .await;
+    assert!(
+        html.contains("changed measure revenue; saved as version 4"),
+        "{html}"
+    );
+    assert!(
+        html.contains("revenue = sum(amount): Gross revenue in cents"),
+        "{html}"
+    );
+    let (_, html) = submit(format!("{page}/measures/revenue/remove"), "").await;
+    assert!(
+        html.contains("removed measure revenue; saved as version 5"),
+        "{html}"
+    );
+    assert!(!html.contains("revenue = "), "{html}");
+
+    // A viewer sees no forms and may not post them.
+    let viewer_cookie = h.web_session("viewer").await;
+    let (status, html, _) = h.page(&page, Some(&viewer_cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !html.contains("/ontology/properties/") && !html.contains("/ontology/measures"),
+        "{html}"
+    );
+    let (status, _, _) = h
+        .form(
+            &format!("{page}/measures"),
+            Some(&viewer_cookie),
+            "id=x&table=orders&expression=count(*)",
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let writes = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("ontology")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(writes.len(), 5);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ontology_proposals_are_reviewed_over_the_api_and_the_page() {
     let h = harness(ServeMode::Local).await;
@@ -2965,6 +3103,28 @@ async fn responses_are_not_cached_unless_the_handler_sets_a_policy() {
 // --- web UI ------------------------------------------------------------------
 
 impl Harness {
+    /// Sign `name` in through the login form; the session cookie's value.
+    async fn web_session(&self, name: &str) -> String {
+        let (_, _, headers) = self
+            .form("/login", None, &format!("username={name}&password=pw"))
+            .await;
+        headers
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|c| c.split(';').next())
+            .and_then(|c| c.strip_prefix("quack_session="))
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Post `form` to `path` as a signed-in person and land where it
+    /// redirects.
+    async fn submit(&self, path: String, cookie: String, form: &str) -> (String, String) {
+        let (status, _, headers) = self.form(&path, Some(&cookie), form).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        self.land(&headers, Some(&cookie)).await
+    }
+
     async fn page(
         &self,
         path: &str,
@@ -6012,17 +6172,19 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
             &NewDocument::new(&DocumentId::from("d"), "a.md", "text/markdown", 1)
                 .with_status(DocumentStatus::Ready),
         )?;
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c"),
-            document_id: &DocumentId::from("d"),
-            chunk_index: 0,
-            content: "levee report",
-            heading: None,
-            page: None,
-            kind: SectionKind::Body,
-            locator: None,
-            embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
-        })?;
+        db.chunk_writer(&DocumentId::from("d"), "levee report")
+            .and_then(|writer| {
+                writer.insert(&NewChunk {
+                    id: &ChunkId::from("c"),
+                    chunk_index: 0,
+                    content: "levee report",
+                    heading: None,
+                    page: None,
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+                })
+            })?;
         db.execute_statement("UPDATE _quack_chunks SET embedding_profile = 'older'")
     })
     .await
@@ -9209,17 +9371,19 @@ async fn seed_renewal_documents(h: &Harness, ws: &WorkspaceId) {
             db.insert_document(
                 &NewDocument::new(&id, name, "text/markdown", 1).with_status(DocumentStatus::Ready),
             )?;
-            db.insert_chunk(&NewChunk {
-                id: &ChunkId::from(format!("{id}-c0")),
-                document_id: &id,
-                chunk_index: 0,
-                content: "Renewal terms for the policy year.",
-                heading: None,
-                page: None,
-                kind: SectionKind::Body,
-                locator: None,
-                embedding: None,
-            })?;
+            db.chunk_writer(&id, "Renewal terms for the policy year.")
+                .and_then(|writer| {
+                    writer.insert(&NewChunk {
+                        id: &ChunkId::from(format!("{id}-c0")),
+                        chunk_index: 0,
+                        content: "Renewal terms for the policy year.",
+                        heading: None,
+                        page: None,
+                        kind: SectionKind::Body,
+                        locator: None,
+                        embedding: None,
+                    })
+                })?;
             db.set_document_chunk_count(&id, 1)?;
         }
         db.set_document_fields(
