@@ -223,17 +223,36 @@ impl CitationRegistry {
                 out.push_str(piece);
                 continue;
             };
-            let digits = inside.trim();
-            let parsed = if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
-                None
-            } else {
-                digits.parse::<u32>().ok()
+            // `[3]`, or a group the model wrote as `[2, 3]`: each number
+            // that names a registered chunk becomes its own marker.
+            let numbers: Option<Vec<u32>> = inside
+                .split(',')
+                .map(|part| {
+                    let digits = part.trim();
+                    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+                        None
+                    } else {
+                        digits.parse::<u32>().ok()
+                    }
+                })
+                .collect();
+            let Some(numbers) = numbers else {
+                if !is_channel_marker(inside) {
+                    // Not a marker; a provider's channel token is dropped.
+                    out.push('[');
+                    out.push_str(inside);
+                    out.push(']');
+                }
+                out.push_str(after);
+                continue;
             };
-            match parsed.and_then(|n| registered.iter().find(|c| c.n == n)) {
-                Some(source) => {
-                    let renumbered = if let Some(pos) =
-                        cited.iter().position(|c| c.chunk_id == source.chunk_id)
-                    {
+            for n in numbers {
+                // A number the model invented is dropped.
+                let Some(source) = registered.iter().find(|c| c.n == n) else {
+                    continue;
+                };
+                let renumbered =
+                    if let Some(pos) = cited.iter().position(|c| c.chunk_id == source.chunk_id) {
                         u32::try_from(pos).unwrap_or(u32::MAX).saturating_add(1)
                     } else {
                         let next = u32::try_from(cited.len())
@@ -244,19 +263,9 @@ impl CitationRegistry {
                         cited.push(c);
                         next
                     };
-                    out.push('[');
-                    out.push_str(&renumbered.to_string());
-                    out.push(']');
-                }
-                None if parsed.is_some() || is_channel_marker(inside) => {
-                    // A marker the model invented, or a provider's channel
-                    // token that leaked into the text: dropped.
-                }
-                None => {
-                    out.push('[');
-                    out.push_str(inside);
-                    out.push(']');
-                }
+                out.push('[');
+                out.push_str(&renumbered.to_string());
+                out.push(']');
             }
             out.push_str(after);
         }
@@ -341,6 +350,31 @@ mod tests {
                 .map(|c| (c.n, c.chunk_id.as_str()))
                 .collect::<Vec<_>>(),
             vec![(1, "c"), (2, "a"), (3, "b")]
+        );
+    }
+
+    #[test]
+    fn a_group_of_markers_is_checked_number_by_number() {
+        let registry = CitationRegistry::default();
+        assert_eq!(
+            registry
+                .register(&[hit("a", "p.pdf", 0), hit("b", "p.pdf", 1)])
+                .first(),
+            1
+        );
+        let CitedAnswer { text, citations } = registry.validate(
+            "Covered [2, 1]. Partly made up [1, 7]. All made up [3, 4]. A list [a, b] and [1,].",
+        );
+        assert_eq!(
+            text,
+            "Covered [1][2]. Partly made up [2]. All made up . A list [a, b] and [1,]."
+        );
+        assert_eq!(
+            citations
+                .iter()
+                .map(|c| c.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"]
         );
     }
 
