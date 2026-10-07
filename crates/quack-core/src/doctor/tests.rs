@@ -120,38 +120,74 @@ fn embedding_config(model: &str, extra: &str) -> Config {
     config
 }
 
-#[test]
+/// An Ollama whose `/api/embed` answers every request with one vector of
+/// `width` numbers, for `requests` connections.
 #[expect(clippy::unwrap_used, reason = "test")]
-fn the_width_probe_names_the_fix_when_the_model_disagrees() {
-    let config = embedding_config("embeddinggemma", "");
-    let model = config.embedding_model_ref().unwrap().unwrap();
-    let show = |json: serde_json::Value| -> OllamaShow { serde_json::from_value(json).unwrap() };
-    let gemma = || {
-        show(serde_json::json!({
-            "model_info": { "general.architecture": "gemma3", "gemma3.embedding_length": 768 }
-        }))
-    };
-    assert_eq!(gemma().embedding_length(), Some(768));
+async fn embed_server(width: usize, requests: usize) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        for _ in 0..requests {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 8192];
+            drop(stream.read(&mut buf).await);
+            let body = serde_json::json!({ "embeddings": [vec![0.1_f32; width]] }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            drop(stream.write_all(response.as_bytes()).await);
+        }
+    });
+    base
+}
 
-    let wrong = width_check(model, Dimension::new(1024), Ok(gemma())).unwrap();
-    assert_eq!(wrong.status, Status::Fail);
-    assert!(
-        wrong.summary.contains("768-dimensional"),
-        "{}",
-        wrong.summary
-    );
-    assert_eq!(
-        wrong.fix.as_deref(),
-        Some("set dimension = 768 under [embedding]")
-    );
-    assert_eq!(
-        width_check(model, Dimension::new(768), Ok(gemma()))
+/// The width comes from an embedding call, not the model's metadata,
+/// which can name an inner width a final projection changes.
+#[tokio::test]
+#[expect(clippy::unwrap_used, reason = "test")]
+async fn the_width_probe_measures_a_call_and_names_the_fix() {
+    Egress::scope(Some(Egress::NoWorkspace), async {
+        let config = |base: &str, dimension: u32| -> Config {
+            toml::from_str(&format!(
+                "[providers.o]\ntype = \"ollama\"\nbase_url = \"{base}\"\nmax_retries = 0\n\
+                 [embedding]\nmodel = \"o/embeddinggemma-2\"\ndimension = {dimension}\n"
+            ))
             .unwrap()
-            .status,
-        Status::Ok
-    );
-    assert!(width_check(model, Dimension::new(768), Ok(show(serde_json::json!({})))).is_none());
-    assert!(width_check(model, Dimension::new(768), Err(Probe::Rejected(401))).is_none());
+        };
+        let measure = |config: Config| async move {
+            let embedder = Embeddings::from_config(&config).await.unwrap().unwrap();
+            let model = config.embedding_model_ref().unwrap().unwrap();
+            let dimension = config.embedding.dimension.unwrap();
+            let check = width_check(
+                model,
+                dimension,
+                embedder.measure_width().await.map_err(|e| e.to_string()),
+            );
+            (check.status, check.summary, check.fix)
+        };
+
+        let (status, summary, fix) = measure(config(&embed_server(768, 1).await, 1024)).await;
+        assert_eq!(status, Status::Fail);
+        assert!(
+            summary.contains("makes 768-dimensional vectors"),
+            "{summary}"
+        );
+        assert_eq!(
+            fix.as_deref(),
+            Some("set dimension = 768 under [embedding]")
+        );
+
+        let (status, summary, _) = measure(config(&embed_server(768, 1).await, 768)).await;
+        assert_eq!(status, Status::Ok, "{summary}");
+
+        // Nothing listening: the call's failure is the finding.
+        let (status, summary, _) = measure(config("http://127.0.0.1:9", 768)).await;
+        assert_eq!(status, Status::Fail);
+        assert!(summary.contains("an embedding call failed"), "{summary}");
+    })
+    .await;
 }
 
 #[test]
