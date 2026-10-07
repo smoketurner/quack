@@ -223,10 +223,13 @@ instead of polling.
 `job_id`, `number`, `kind`, `state`, `workspace_id`, `owner`, the three times, and `progress`,
 never the label or outcome, which can carry workspace content; a receiver asks `GET
 .../jobs/{job}` with its own token for those. The body is signed with HMAC-SHA256 (aws-lc-rs)
-under the secret `secret_env` names, as `X-Quack-Signature: sha256=<hex>`, and `quack serve`
-refuses to start when that variable is unset. `kinds` narrows the report (every kind but chat
-turns by default). Delivery goes through `Proxies::client`, with one retry after two seconds,
-and a failure is logged.
+under the secret `secret_env` names, over `<timestamp>.<body>`, as `X-Quack-Signature:
+sha256=<hex>`, with the Unix timestamp in `X-Quack-Timestamp`, so a receiver that refuses an old
+timestamp refuses a replayed delivery; `quack serve` refuses to start when that variable is unset.
+`kinds` narrows the report (every kind but chat turns by default). Each delivery runs on its own
+task, four at a time, so a slow endpoint never makes the reader of job events fall behind; it
+goes through `Proxies::client`, with one retry after two seconds, and a failure is logged.
+Jobs that end while the server stops are reported too.
 
 Cancelling a queued job ends it without running, including one whose task has not yet
 run for the first time. A running job sees its cancel token and

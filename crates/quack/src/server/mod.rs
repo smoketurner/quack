@@ -600,7 +600,7 @@ pub(crate) async fn serve(
     if let Some(hook) =
         Webhook::from_config(app.config.server.webhooks.as_ref()).context("[server.webhooks]")?
     {
-        drop(hook.spawn(app.jobs.subscribe(), app.stopping.clone()));
+        drop(hook.spawn(app.jobs.subscribe()));
     }
     let listener = tokio::net::TcpListener::bind(addr)
         .await

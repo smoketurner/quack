@@ -4,16 +4,19 @@
 //! The body carries no workspace content: ids, kind, state, times, and
 //! progress, never the job's label or outcome text. A receiver that wants
 //! those asks `GET .../jobs/{job}` with its own token, which keeps
-//! authorization and the audit with the existing route. The body is signed
-//! with HMAC-SHA256 under the secret in `secret_env`, as
-//! `X-Quack-Signature: sha256=<hex>`.
+//! authorization and the audit with the existing route. Each delivery is
+//! signed with HMAC-SHA256 under the secret in `secret_env` over
+//! `<timestamp>.<body>`, as `X-Quack-Signature: sha256=<hex>`, with the
+//! Unix timestamp in `X-Quack-Timestamp`: a receiver that refuses an old
+//! timestamp refuses a replayed delivery.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_lc_rs::hmac;
 use serde::Serialize;
-use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{Semaphore, broadcast};
+use tokio_util::task::TaskTracker;
 
 use super::{JobInfo, JobKind, JobProgress, JobState};
 use crate::config::WebhookConfig;
@@ -23,8 +26,14 @@ use crate::ids::{UserId, WorkspaceId};
 use crate::jobs::{JobId, JobNumber};
 use crate::proxy::Proxies;
 
-/// The header that carries the body's signature.
+/// The header that carries the signature.
 pub const SIGNATURE_HEADER: &str = "x-quack-signature";
+
+/// The header that carries the signed Unix timestamp.
+pub const TIMESTAMP_HEADER: &str = "x-quack-timestamp";
+
+/// Deliveries in flight at once; the rest wait their turn on their tasks.
+const IN_FLIGHT: usize = 4;
 
 /// How long a failed delivery waits before its one retry.
 const RETRY_AFTER: Duration = Duration::from_secs(2);
@@ -111,18 +120,22 @@ impl Webhook {
             }
     }
 
-    /// `sha256=<hex>` of `body` under the secret.
-    fn signature(&self, body: &[u8]) -> String {
-        format!("sha256={}", hex_lower(hmac::sign(&self.key, body).as_ref()))
+    /// `sha256=<hex>` of `<timestamp>.<body>` under the secret.
+    fn signature(&self, timestamp: i64, body: &[u8]) -> String {
+        let mut signed = format!("{timestamp}.").into_bytes();
+        signed.extend_from_slice(body);
+        format!(
+            "sha256={}",
+            hex_lower(hmac::sign(&self.key, &signed).as_ref())
+        )
     }
 
-    /// Report every finished job `jobs` broadcasts until `stopping`.
+    /// Report every finished job `jobs` broadcasts, each on a task of its
+    /// own so a slow endpoint never holds up reading the broadcast, until
+    /// the queue's channel closes: jobs that end while the server stops
+    /// are reported too. The task ends once its deliveries have.
     #[must_use]
-    pub fn spawn(
-        self,
-        mut jobs: broadcast::Receiver<JobInfo>,
-        stopping: CancellationToken,
-    ) -> tokio::task::JoinHandle<()> {
+    pub fn spawn(self, mut jobs: broadcast::Receiver<JobInfo>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let client = match Proxies::from_env().client().timeout(self.timeout).build() {
                 Ok(client) => client,
@@ -131,14 +144,21 @@ impl Webhook {
                     return;
                 }
             };
+            let hook = Arc::new(self);
+            let slots = Arc::new(Semaphore::new(IN_FLIGHT));
+            let deliveries = TaskTracker::new();
             loop {
-                let job = tokio::select! {
-                    biased;
-                    () = stopping.cancelled() => return,
-                    received = jobs.recv() => received,
-                };
-                match job {
-                    Ok(job) if self.reports(&job) => self.deliver(&client, &job).await,
+                match jobs.recv().await {
+                    Ok(job) if hook.reports(&job) => {
+                        let (hook, client, slots) =
+                            (Arc::clone(&hook), client.clone(), Arc::clone(&slots));
+                        deliveries.spawn(async move {
+                            let Ok(_slot) = slots.acquire_owned().await else {
+                                return;
+                            };
+                            hook.deliver(&client, &job).await;
+                        });
+                    }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
                         tracing::warn!(
@@ -146,13 +166,18 @@ impl Webhook {
                             "the webhook fell behind; some finished jobs were not reported"
                         );
                     }
-                    Err(broadcast::error::RecvError::Closed) => return,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        deliveries.close();
+                        deliveries.wait().await;
+                        return;
+                    }
                 }
             }
         })
     }
 
-    /// POST the job, and once more after a short wait if that fails.
+    /// POST the job, and once more after a short wait if that fails; each
+    /// attempt is signed with its own timestamp.
     async fn deliver(&self, client: &reqwest::Client, job: &JobInfo) {
         let body = match serde_json::to_vec(&JobFinished::from(job)) {
             Ok(body) => body,
@@ -161,12 +186,13 @@ impl Webhook {
                 return;
             }
         };
-        let signature = self.signature(&body);
         for attempt in 1..=2_u8 {
+            let timestamp = jiff::Timestamp::now().as_second();
             let sent = client
                 .post(self.url.clone())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .header(SIGNATURE_HEADER, &signature)
+                .header(TIMESTAMP_HEADER, timestamp.to_string())
+                .header(SIGNATURE_HEADER, self.signature(timestamp, &body))
                 .body(body.clone())
                 .send()
                 .await;
