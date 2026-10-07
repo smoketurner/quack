@@ -38,13 +38,14 @@ use quack_core::jobs::{
     JobContext, JobCounts, JobId, JobInfo, JobKind, JobNumber, JobQueue, JobResult, JobSpec,
     JobState, Lane, LaneKey,
 };
+use quack_core::llm::oauth::KeySource;
 use quack_core::llm::{self, Embeddings};
 use quack_core::okf::{self, DirSink};
 use quack_core::prefix::PrefixMatch;
 use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
-use quack_core::storage::control::ResourceKind;
+use quack_core::storage::control::{ControlPlane, ResourceKind};
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, MessageRole, Sharing, Transcript,
@@ -52,8 +53,8 @@ use quack_core::storage::sessions::{
 use quack_core::storage::workspace::{
     Pinning, QueryCanceller, QueryResults, SqlSchema, StatementKind, WorkspaceDb,
 };
+use quack_core::vault::Vault;
 
-use crate::ModeArg;
 use crate::confirm::Confirm;
 use crate::embeddings_cli::{self, EmbeddingsAction};
 use crate::graph_cli::GraphAction;
@@ -69,6 +70,7 @@ use crate::terminal::picker::{Picked, Picker};
 use crate::terminal::selection::{Edge, Located, Selection, TranscriptView};
 use crate::terminal::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
 use crate::text_or_json::TextOrJson;
+use crate::{ImportAction, ImportContext, ModeArg};
 
 /// The spinner's frame interval; it ticks only while a job is active.
 const SPINNER_MS: u64 = 80;
@@ -555,6 +557,7 @@ enum CliJob {
     ContextImport(String),
     ContextExport(String),
     Import(ImportRequest),
+    SavedImport(ImportAction),
     Ingest(PathBuf),
     Search(String),
 }
@@ -567,7 +570,7 @@ impl CliJob {
             Self::Embeddings(_) => JobKind::Embeddings,
             Self::Saved(_) => JobKind::Sql,
             Self::Okf(_) | Self::ContextExport(_) => JobKind::Export,
-            Self::ContextImport(_) | Self::Import(_) => JobKind::Import,
+            Self::ContextImport(_) | Self::Import(_) | Self::SavedImport(_) => JobKind::Import,
             Self::Ingest(_) => JobKind::Ingest,
             Self::Search(_) => JobKind::Search,
         }
@@ -584,6 +587,7 @@ impl CliJob {
             Self::ContextImport(_) => String::from("Importing the context"),
             Self::ContextExport(_) => String::from("Exporting the context"),
             Self::Import(request) => format!("import {}", request.url),
+            Self::SavedImport(action) => action.label(),
             Self::Search(query) => format!("search {}", one_line(query)),
             Self::Ingest(path) => path.file_name().map_or_else(
                 || path.display().to_string(),
@@ -609,6 +613,7 @@ impl CliJob {
             | Self::Okf(_)
             | Self::ContextImport(_)
             | Self::ContextExport(_)
+            | Self::SavedImport(_)
             | Self::Search(_) => {
                 Message::new(MessageKind::System, format!("{}\u{2026}", self.label()))
             }
@@ -697,6 +702,22 @@ impl CliJob {
                 ));
             }
             Self::Import(request) => return Self::import(env, &request, control).await,
+            Self::SavedImport(action) => {
+                let control_plane = ControlPlane::open(&env.config).await?;
+                let vault = Vault::new(env.config.data_dir(), KeySource::Keychain);
+                action
+                    .run(
+                        &ImportContext {
+                            config: &env.config,
+                            workspace: &env.workspace_id,
+                            control: &control_plane,
+                            vault: &vault,
+                            db: &env.db,
+                        },
+                        &mut out,
+                    )
+                    .await?;
+            }
             Self::Ingest(path) => return Self::ingest(env, &path, control).await,
             Self::Search(query) => return Self::search(env, &query).await,
         }
@@ -2079,6 +2100,11 @@ impl App {
             SlashCommand::Ontology { action } => self.run_job(CliJob::Ontology(action)),
             SlashCommand::Delete { id } => self.delete_document(id),
             SlashCommand::Import {
+                action: Some(action),
+                ..
+            } => self.run_job(CliJob::SavedImport(action)),
+            SlashCommand::Import {
+                action: None,
                 url,
                 table,
                 source_table,
@@ -2093,7 +2119,7 @@ impl App {
                     source_table,
                     headers,
                     json_pointer,
-                    ..ImportRequest::new(url, table)
+                    ..ImportRequest::new(url.unwrap_or_default(), table.unwrap_or_default())
                 }));
             }
             SlashCommand::Path { route } => self.show_path(&route),

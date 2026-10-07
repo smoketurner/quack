@@ -17,7 +17,7 @@ use crate::embeddings_cli::EmbeddingsAction;
 use crate::graph_cli::GraphAction;
 use crate::ontology_cli::OntologyAction;
 use crate::saved_cli::SavedAction;
-use crate::{ExportFlags, ModeArg};
+use crate::{ExportFlags, ImportAction, ModeArg};
 
 /// The argument id of a command that takes the rest of the line as typed
 /// (a statement, a path, an entity name), so quotes and spacing survive.
@@ -58,11 +58,21 @@ pub(crate) enum SlashCommand {
         #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "PATH")]
         path: String,
     },
-    /// Pull rows from a SQLite file or a URL
-    #[command(name = "/import", disable_help_flag = true)]
+    /// Pull rows from a SQLite file, a URL, or S3; or list, refresh, or
+    /// remove an import saved with `quack import --save`
+    #[command(
+        name = "/import",
+        disable_help_flag = true,
+        args_conflicts_with_subcommands = true,
+        subcommand_negates_reqs = true
+    )]
     Import {
-        url: String,
-        table: String,
+        #[command(subcommand)]
+        action: Option<ImportAction>,
+        #[arg(required = true)]
+        url: Option<String>,
+        #[arg(required = true)]
+        table: Option<String>,
         source_table: Option<String>,
         /// Run this query on the source instead of reading a table
         #[arg(long, value_name = "SQL")]

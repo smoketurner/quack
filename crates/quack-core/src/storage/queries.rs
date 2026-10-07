@@ -97,6 +97,15 @@ pub enum ProviderTokens {
     Provider,
 }
 
+/// The sealed secret a saved import refreshes with, kept with the
+/// workspace it belongs to.
+#[derive(Iden)]
+pub enum ImportCredentials {
+    Table,
+    ImportId,
+    WorkspaceId,
+}
+
 /// Each OAuth client's private key for `private_key_jwt`, sealed like the
 /// tokens; its timestamp column is `created_at`, as the key is replaced
 /// whole, never updated.

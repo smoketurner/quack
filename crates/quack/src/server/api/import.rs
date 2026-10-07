@@ -17,12 +17,22 @@ use utoipa::ToSchema;
 
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult, ErrorCode};
-use crate::server::run;
+use crate::server::run::{self, BackgroundRun, RunKind};
 use crate::server::state::{App, ServeMode};
+use std::sync::Arc;
+
+use axum::http::StatusCode;
+use quack_core::ids::ImportId;
 use quack_core::import::{
-    self, ImportPolicy, ImportRequest, ImportSummary, JsonPointer, SourceHeader,
+    self, ImportPolicy, ImportRequest, ImportSecrets, ImportSummary, JsonPointer, KeepSecret,
+    LoadStatus, RefreshWith, SavedImport, SourceHeader,
 };
 use quack_core::jobs::JobId;
+use quack_core::llm::oauth::KeySource;
+use quack_core::progress::ChunkDone;
+use quack_core::storage::control::ResourceKind;
+use quack_core::storage::writer::Writer;
+use quack_core::vault::Vault;
 
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct ImportBody {
@@ -45,6 +55,26 @@ pub(crate) struct ImportBody {
     pub bearer_env: Option<String>,
     /// Where a JSON download's rows sit (RFC 6901), as `/data/items`.
     pub json_pointer: Option<String>,
+    /// Save the import under this name, so it can be refreshed.
+    pub save: Option<String>,
+    /// Keep the URL's password and the header values with the saved
+    /// import, sealed under the vault key.
+    pub store_credential: Option<bool>,
+}
+
+impl ImportBody {
+    /// The name to save the import under, and whether to keep its secret.
+    pub(crate) fn saving(&self) -> Option<(String, KeepSecret)> {
+        let keep = if self.store_credential.unwrap_or(false) {
+            KeepSecret::Sealed
+        } else {
+            KeepSecret::No
+        };
+        self.save
+            .as_deref()
+            .and_then(str::non_blank)
+            .map(|name| (name.to_owned(), keep))
+    }
 }
 
 /// A blank query, source table, or types (an empty form field) is none.
@@ -101,8 +131,9 @@ pub(crate) async fn import(
     Json(body): Json<ImportBody>,
 ) -> ApiResult<Json<Imported>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let saving = body.saving();
     Ok(Json(
-        run_import(&app, &access, &ImportRequest::try_from(body)?).await?,
+        run_import(&app, &access, &ImportRequest::try_from(body)?, saving).await?,
     ))
 }
 
@@ -114,6 +145,9 @@ pub(crate) struct Imported {
     pub summary: ImportSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_job: Option<JobId>,
+    /// The saved import, when the request asked to save it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved: Option<SavedImport>,
 }
 
 /// The import the API and the web form share: run it, audit it either way.
@@ -121,6 +155,7 @@ pub(crate) async fn run_import(
     app: &App,
     access: &Access,
     request: &ImportRequest,
+    saving: Option<(String, KeepSecret)>,
 ) -> ApiResult<Imported> {
     let source = request.url.redacted();
     let kind = request
@@ -150,6 +185,16 @@ pub(crate) async fn run_import(
             return Err(ApiError::from(refused));
         }
         return Err(ApiError::bad_request(refused.to_string()));
+    }
+    if let Some((name, keep)) = &saving {
+        request
+            .check_saveable(*keep)
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        let name = name.clone();
+        app.read(&access.membership.workspace.id, move |db| {
+            SavedImport::check_name(db, &name)
+        })
+        .await?;
     }
     let db = app.workspace_db(&access.membership.workspace.id).await?;
     let embeddings = access
@@ -185,6 +230,14 @@ pub(crate) async fn run_import(
         .await?;
     let summary =
         outcome.map_err(|e| ApiError::from(e).unprocessable_as(ErrorCode::ImportFailed))?;
+    let saved = match saving {
+        Some((name, keep)) => Some(
+            access
+                .save_import(app, &db, &name, request, &summary, keep)
+                .await?,
+        ),
+        None => None,
+    };
     let graph_job = run::follow_ingest(
         app,
         access,
@@ -193,5 +246,233 @@ pub(crate) async fn run_import(
         vec![summary.document_id.clone()],
     )
     .await?;
-    Ok(Imported { summary, graph_job })
+    Ok(Imported {
+        summary,
+        graph_job,
+        saved,
+    })
+}
+
+impl Access {
+    /// Where this workspace's saved imports keep their sealed secrets.
+    fn secrets<'a>(&'a self, app: &'a App, vault: &'a Vault) -> ImportSecrets<'a> {
+        ImportSecrets {
+            control: &app.control,
+            vault,
+            workspace: &self.membership.workspace.id,
+        }
+    }
+
+    /// Refresh `saved` as an audited background job: replaced when the
+    /// source changed, with the graph follow-up after a load.
+    pub(crate) async fn refresh_import(&self, app: &App, saved: SavedImport) -> ApiResult<JobId> {
+        let embeddings = self
+            .model(
+                app,
+                AuditAction::Import,
+                Embeddings::from_config(&app.config).await,
+            )
+            .await?;
+        let run = BackgroundRun::start(
+            app,
+            self,
+            RunKind::IMPORT_REFRESH,
+            serde_json::json!({ "import": saved.id, "name": saved.name, "source": saved.source }),
+        )
+        .await?;
+        let (app_for_job, access_for_job) = (Arc::clone(app), self.clone());
+        let job = run.submit(move |ctx| async move {
+            let cancel = ctx.cancel_token();
+            let progress = |done: ChunkDone| ctx.progress(done.done, done.total);
+            let control = RunControl {
+                progress: &progress,
+                cancel: Some(&cancel),
+            };
+            let app = app_for_job;
+            let workspace = access_for_job.membership.workspace.id.clone();
+            let db = app
+                .workspace_db(&workspace)
+                .await
+                .map_err(|e| e.message)?;
+            let policy = if app.mode == ServeMode::Local {
+                ImportPolicy::owner()
+            } else {
+                ImportPolicy::server(&app.config)
+            };
+            let vault = Vault::new(app.config.data_dir(), KeySource::Keychain);
+            let summary = access_for_job
+                .secrets(&app, &vault)
+                .refresh(
+                    &saved,
+                    RefreshWith {
+                        config: &app.config,
+                        db: &db,
+                        policy,
+                        embedder: embeddings.as_ref(),
+                        control,
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            if summary.status == LoadStatus::Loaded
+                && let Err(e) = run::follow_ingest(
+                    &app,
+                    &access_for_job,
+                    db,
+                    embeddings,
+                    vec![summary.document_id.clone()],
+                )
+                .await
+            {
+                tracing::warn!(error = %e.message, "the graph follow-up of a refresh could not be queued");
+            }
+            Ok(summary)
+        });
+        Ok(job)
+    }
+
+    /// Remove `saved` and its sealed secret, audited; its table stays.
+    pub(crate) async fn remove_import(&self, app: &App, saved: &SavedImport) -> ApiResult<()> {
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let vault = Vault::new(app.config.data_dir(), KeySource::Keychain);
+        self.secrets(app, &vault).remove(&db, saved).await?;
+        self.audit(
+            app,
+            AuditAction::Delete,
+            Some(ResourceKind::SavedImport.id(&saved.id)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "name": saved.name })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Save `request`, which ran as `summary`, under `name`, by the caller.
+    async fn save_import(
+        &self,
+        app: &App,
+        db: &Writer,
+        name: &str,
+        request: &ImportRequest,
+        summary: &ImportSummary,
+        keep: KeepSecret,
+    ) -> ApiResult<SavedImport> {
+        let vault = Vault::new(app.config.data_dir(), KeySource::Keychain);
+        Ok(self
+            .secrets(app, &vault)
+            .save(
+                db,
+                name,
+                request,
+                summary,
+                keep,
+                Some(self.identity.user_id.as_str()),
+            )
+            .await?)
+    }
+
+    /// The saved import named `name` (or with that id) in this workspace.
+    pub(crate) async fn saved_import(&self, app: &App, name: &str) -> ApiResult<SavedImport> {
+        let name = name.to_owned();
+        app.read(&self.membership.workspace.id, move |db| {
+            SavedImport::named(db, &name)
+        })
+        .await
+    }
+}
+
+/// The imports saved in a workspace.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SavedImports {
+    pub imports: Vec<SavedImport>,
+}
+
+/// Every import saved in the workspace, with how each last ran.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/imports",
+    tag = "import",
+    params(WorkspaceId),
+    responses((status = 200, description = "The saved imports", body = SavedImports)),
+)]
+pub(crate) async fn list_saved(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+) -> ApiResult<Json<SavedImports>> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access
+        .audit_read(&app, AuditAction::List, "saved imports")
+        .await?;
+    let imports = app.read(&id, SavedImport::list).await?;
+    Ok(Json(SavedImports { imports }))
+}
+
+/// Import and save the import under `save`, so it can be refreshed. A URL
+/// password or header value needs `store_credential`.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/imports",
+    tag = "import",
+    request_body = ImportBody,
+    params(WorkspaceId),
+    responses((status = 201, description = "Imported and saved", body = Imported)),
+)]
+pub(crate) async fn save(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+    Json(body): Json<ImportBody>,
+) -> ApiResult<(StatusCode, Json<Imported>)> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let Some(saving) = body.saving() else {
+        return Err(ApiError::bad_request(
+            "a saved import needs a name in `save`",
+        ));
+    };
+    let imported = run_import(&app, &access, &ImportRequest::try_from(body)?, Some(saving)).await?;
+    Ok((StatusCode::CREATED, Json(imported)))
+}
+
+/// A refresh running in the background.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct RefreshStarted {
+    pub job: JobId,
+}
+
+/// Run a saved import again as a background job; its table is replaced
+/// only when the source changed. Audited as an import run.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/imports/{import}/refresh",
+    tag = "import",
+    responses((status = 202, description = "The refresh is running", body = RefreshStarted)),
+)]
+pub(crate) async fn refresh(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, import)): Path<(WorkspaceId, ImportId)>,
+) -> ApiResult<(StatusCode, Json<RefreshStarted>)> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let saved = access.saved_import(&app, import.as_str()).await?;
+    let job = access.refresh_import(&app, saved).await?;
+    Ok((StatusCode::ACCEPTED, Json(RefreshStarted { job })))
+}
+
+/// Remove a saved import and any secret sealed for it; its table stays.
+#[utoipa::path(
+    delete,
+    path = "/workspaces/{id}/imports/{import}",
+    tag = "import",
+    responses((status = 204, description = "Removed")),
+)]
+pub(crate) async fn remove(
+    State(app): State<App>,
+    identity: Identity,
+    Path((id, import)): Path<(WorkspaceId, ImportId)>,
+) -> ApiResult<StatusCode> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let saved = access.saved_import(&app, import.as_str()).await?;
+    access.remove_import(&app, &saved).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

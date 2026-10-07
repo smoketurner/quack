@@ -236,6 +236,11 @@ id_type!(
 );
 
 id_type!(
+    /// An import saved under a name so it can be refreshed.
+    ImportId
+);
+
+id_type!(
     /// A stored summary of a session's earlier turns.
     SummaryId
 );

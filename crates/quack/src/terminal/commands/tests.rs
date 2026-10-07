@@ -303,9 +303,24 @@ fn free_text_arrives_as_typed_and_the_rest_splits_like_a_shell_line() {
     ));
     assert!(matches!(
         SlashCommand::parse("/import sqlite:/tmp/a.db t --query \"SELECT * FROM x WHERE y = 'z'\""),
-        Ok(SlashCommand::Import { url, table, source_table: None, query: Some(q), .. })
+        Ok(SlashCommand::Import { action: None, url: Some(url), table: Some(table), source_table: None, query: Some(q), .. })
             if url == "sqlite:/tmp/a.db" && table == "t" && q == "SELECT * FROM x WHERE y = 'z'"
     ));
+    assert!(matches!(
+        SlashCommand::parse("/import refresh nightly"),
+        Ok(SlashCommand::Import { action: Some(ImportAction::Refresh { name }), .. }) if name == "nightly"
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/import list"),
+        Ok(SlashCommand::Import {
+            action: Some(ImportAction::List { .. }),
+            ..
+        })
+    ));
+    assert!(
+        SlashCommand::parse("/import sqlite:/tmp/a.db").is_err(),
+        "a table is needed"
+    );
     assert!(matches!(
         SlashCommand::parse(
             "/import https://api.example.com/sales.json sales -H 'X-Team: data' --bearer-env SALES_TOKEN --json-pointer /data/items"

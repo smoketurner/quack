@@ -197,6 +197,19 @@ impl ColumnTypes {
 }
 
 /// `col=TYPE`, several separated by commas or given one flag at a time.
+/// The `COLUMN=TYPE,...` text `FromStr` reads back.
+impl fmt::Display for ColumnTypes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, (column, kind)) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{column}={}", kind.as_str())?;
+        }
+        Ok(())
+    }
+}
+
 impl std::str::FromStr for ColumnTypes {
     type Err = Error;
 
