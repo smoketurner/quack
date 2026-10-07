@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::embedding::Dimension;
 use crate::error::{Error, Result};
 use crate::ingestion::budget::DecompressionBudget;
+use crate::jobs::JobKind;
 use crate::net::TrustedProxies;
 use crate::ontology::documents::DocumentEvidenceOptions;
 use crate::ontology::induction::TableEvidenceOptions;
@@ -1324,6 +1325,32 @@ pub struct ServerConfig {
     /// How `quack serve` writes its log lines: `text` for a terminal,
     /// `json` (one object per line) for a log collector.
     pub log_format: LogFormat,
+    /// A POST to an endpoint of the operator's when a background job
+    /// finishes (`jobs::webhook`).
+    pub webhooks: Option<WebhookConfig>,
+}
+
+/// `[server.webhooks]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookConfig {
+    /// Where finished jobs are sent.
+    pub url: String,
+    /// The environment variable holding the secret each body is signed
+    /// with (HMAC-SHA256, as the `X-Quack-Signature` header `sha256=<hex>`).
+    pub secret_env: String,
+    /// The job kinds to report; every kind but chat turns when empty.
+    #[serde(default)]
+    pub kinds: Vec<JobKind>,
+    /// How long one delivery may take.
+    #[serde(default = "WebhookConfig::default_timeout")]
+    pub timeout_seconds: u32,
+}
+
+impl WebhookConfig {
+    const fn default_timeout() -> u32 {
+        10
+    }
 }
 
 /// `[server].log_format`.
@@ -1548,6 +1575,7 @@ impl Default for ServerConfig {
             trusted_proxies: TrustedProxies::default(),
             oidc: None,
             log_format: LogFormat::Text,
+            webhooks: None,
         }
     }
 }

@@ -8167,6 +8167,49 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
     );
 }
 
+/// Every workspace page carries the job strip and its stream, so jobs and
+/// their completion show wherever a person is; the strip is a fragment
+/// refetched on job events, audited like the Jobs page's rows.
+#[tokio::test]
+async fn every_workspace_page_follows_the_jobs_stream() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("olive", UserKind::Standard).await;
+    let ws = h.workspace("sales", &owner).await;
+    let token = h.login("olive").await;
+    let stream = format!("data-jobs-stream=\"/api/v1/workspaces/{ws}/jobs/stream\"");
+    for page in ["chat", "documents", "graph", "tables", "jobs"] {
+        let (status, html, _) = h.page(&format!("/w/{ws}/{page}"), Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(
+            html.matches(&stream).count(),
+            1,
+            "{page} follows one stream: {html}"
+        );
+        assert!(html.contains(&format!("/w/{ws}/jobs/strip")), "{page}");
+    }
+    let page_rows = || async {
+        h.audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("page")),
+            ..AuditFilter::default()
+        })
+        .await
+        .len()
+    };
+    let before = page_rows().await;
+    let (status, strip, _) = h.page(&format!("/w/{ws}/jobs/strip"), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !strip.contains("Running"),
+        "no active jobs, no strip: {strip}"
+    );
+    assert_eq!(
+        page_rows().await,
+        before + 1,
+        "the strip is audited as a page read"
+    );
+}
+
 /// A session's creator renames it and another member may not; search finds
 /// text only in the sessions the caller may read, and both are audited with
 /// the text kept in the workspace's detail rows.

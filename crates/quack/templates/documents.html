@@ -38,6 +38,6 @@
 <div id="rows" class="mt-2">
 {{ rows|safe }}
 </div>
-<div hidden hx-get="/w/{{ ws.membership.workspace.id }}/documents/status" hx-trigger="every 3s [document.querySelector('#doc-pending[data-pending]')]" hx-swap="innerHTML"></div>
+<div hidden hx-get="/w/{{ ws.membership.workspace.id }}/documents/status" hx-trigger="jobs-changed from:body [document.querySelector('#doc-pending[data-pending]')]" hx-swap="innerHTML"></div>
 {% endif %}
 {% endblock %}
