@@ -18,16 +18,35 @@ Two rules hold for every release:
 `quack doctor` after the upgrade says whether the workspace's vectors are stale
 (`quack embeddings refresh -w NAME` is its fix line).
 
-## Unreleased
+## v2026.10.4
 
-- Config: `[retrieval].languages` added (default `["auto"]`): what a document may be
-  detected as for keyword stemming, `"auto"` or Snowball language names.
-- Schema: workspace 13. The first open of each workspace detects every document's language
-  from its first chunks and rebuilds the keyword index (`_quack_terms`), reading every chunk
-  once. `control.db` unchanged (migration 8).
+- Breaking: `postgres://` import sources are removed (#458). Export the query to a SQLite
+  file or a CSV or Parquet file and import that, or fetch the file over HTTP(S) or from S3.
+  Imports already loaded stay as tables.
+- Schema: workspace 14, from 11. The first open of each workspace upgrades it in place and
+  does not run again: it profiles every user table (12), detects each document's language and
+  rebuilds the keyword index, reading every chunk once (13), and adds `_quack_imports` for saved
+  imports (14). Expect the first open of a large workspace to take longer. An older quack
+  refuses the upgraded file, so back up or take a snapshot first.
+- `control.db`: migrations 9 to 11 run on start: user lifecycle and login lockout, group roles,
+  and the sealed credentials of saved imports.
+- Config: keys added, each defaulted so an existing file keeps its behavior:
+  - `[ingestion]`: `max_decompressed_mb` (1024), `table_rows_as_table` (20).
+  - `[retrieval]`: `languages` (`["auto"]`).
+  - `[analysis]`: `step_result_rows` (50), `title_sessions` (false).
+  - `[graph]`: `follow_ingest` (`"off"`).
+  - `[import]`: `allow_server_credentials` (false). With logins, S3 and `--bearer-env` imports
+    are refused until it is set.
+  - `[server]`: `shutdown_grace_seconds` (20), `log_format` (`"text"`), `login_lockout_attempts`
+    (5) and `login_lockout_minutes` (15), `trusted_proxies` (empty). Five wrong passwords in a
+    row now lock an account for 15 minutes; set `login_lockout_attempts = 0` to keep only the
+    rate limit. Behind a reverse proxy, list it in `trusted_proxies` so client addresses come
+    from its forwarded headers.
+  - `[server.oidc]`: `groups_claim`. `[server.webhooks]`: `url`, `secret_env`, `kinds`,
+    `timeout_seconds` (10).
+  - `[providers.NAME]`: `max_retries` (3) and `retry_backoff_ms` (500).
+  No keys were removed.
 - Embeddings: no refresh needed.
-
-The version-bump pull request renames this section to the tag.
 
 ## v2026.10.3
 
