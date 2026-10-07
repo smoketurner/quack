@@ -9447,11 +9447,21 @@ async fn users_are_disabled_locked_out_and_removed_over_the_api() {
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    // A locked account answers exactly as a name that does not exist does.
+    let (_, nobody) = h
+        .call(
+            Method::POST,
+            "/api/v1/auth/login",
+            None,
+            Some(serde_json::json!({ "username": "nobody", "password": "pw2" })),
+        )
+        .await;
+    assert_eq!(body["error"], nobody["error"], "{body} {nobody}");
     assert!(
         body["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("try again"),
+            .contains("locks for 15 minutes after 2 wrong passwords"),
         "{body}"
     );
     let (status, _) = h

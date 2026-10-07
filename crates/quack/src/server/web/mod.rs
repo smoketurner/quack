@@ -1161,7 +1161,9 @@ async fn login_submit(
     let token = match password_login(&app, peer, request_id, &form.username, &form.password).await {
         Ok(login) => login.token,
         Err(e) if e.status == StatusCode::UNAUTHORIZED => {
-            return Ok(Flash::error("/login", "wrong username or password").into_response());
+            return Ok(
+                Flash::error("/login", app.config.server.lockout().refusal()).into_response(),
+            );
         }
         Err(e) => return Err(e.into()),
     };

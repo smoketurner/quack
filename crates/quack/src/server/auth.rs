@@ -246,15 +246,12 @@ pub(crate) async fn password_login(
 
     let user = match checked {
         PasswordCheck::Verified(user) => user,
-        // A disabled account answers as a wrong password would: the
-        // response says nothing about whether the name exists.
-        PasswordCheck::Wrong(_) | PasswordCheck::Disabled(_) => {
-            return Err(ApiError::unauthorized("wrong username or password"));
-        }
-        PasswordCheck::Locked { until, .. } => {
-            return Err(ApiError::unauthorized(format!(
-                "too many wrong passwords; try again after {until}"
-            )));
+        // Every refusal answers alike: the response says nothing about
+        // whether the name exists, is disabled, or is locked.
+        PasswordCheck::Wrong(_) | PasswordCheck::Disabled(_) | PasswordCheck::Locked { .. } => {
+            return Err(ApiError::unauthorized(
+                app.config.server.lockout().refusal(),
+            ));
         }
     };
     let token = app.sessions.open(&user.id, None)?;

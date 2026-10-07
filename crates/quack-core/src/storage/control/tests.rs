@@ -1217,6 +1217,54 @@ fn every_audit_action_is_documented() {
     );
 }
 
+/// Wrong passwords sent at once each count toward the lock, and a lock
+/// that has run out starts the count over, so one more typo does not lock
+/// the account again.
+#[tokio::test]
+async fn concurrent_wrong_passwords_all_count_and_an_expired_lock_starts_over() {
+    let (_dir, cp) = open().await;
+    let bob = cp
+        .create_user("bob", "correct-horse", UserKind::Standard, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let lockout = Lockout {
+        attempts: 4,
+        minutes: 15,
+    };
+    let guesses: Vec<_> = (0..4)
+        .map(|_| {
+            let cp = cp.clone();
+            tokio::spawn(async move { cp.check_password("bob", "guess", lockout).await })
+        })
+        .collect();
+    for guess in guesses {
+        guess
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    assert!(
+        matches!(
+            cp.check_password("bob", "correct-horse", lockout).await,
+            Ok(PasswordCheck::Locked { .. })
+        ),
+        "four wrong passwords at once lock the account"
+    );
+
+    // The lock runs out; one wrong password then counts as the first.
+    cp.set_failed_logins(&bob.id, 4, Some("2000-01-01T00:00:00Z"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(matches!(
+        cp.check_password("bob", "typo", lockout).await,
+        Ok(PasswordCheck::Wrong(Some(_)))
+    ));
+    assert!(matches!(
+        cp.check_password("bob", "correct-horse", lockout).await,
+        Ok(PasswordCheck::Verified(_))
+    ));
+}
+
 /// Disabling refuses the password before it is checked and enabling takes
 /// it back; too many wrong passwords lock the account for the configured
 /// minutes, and a right one or an enable clears the count.

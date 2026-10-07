@@ -332,6 +332,15 @@ impl UserRow {
     pub fn is_disabled(&self) -> bool {
         self.disabled_at.is_some()
     }
+
+    /// Whether a lockout for wrong passwords holds now; a lock that has
+    /// run out stays recorded until the next attempt clears it.
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        self.locked_until
+            .as_deref()
+            .is_some_and(ControlPlane::still_locked)
+    }
 }
 
 impl FromRow<'_, SqliteRow> for UserRow {
@@ -2451,9 +2460,9 @@ impl ControlPlane {
 
     /// Check a password under `lockout`, and record the outcome on the
     /// user's row: a wrong one counts toward the lock, a right one clears
-    /// the count. A disabled or locked account is refused before the hash
-    /// is checked; the dummy hash is still verified when there is no such
-    /// user, so timing says nothing about who exists.
+    /// the count. The hash is verified for every attempt, against a dummy
+    /// when there is no such user, before a disabled or locked account is
+    /// refused, so timing says nothing about who exists or is locked.
     ///
     /// # Errors
     ///
@@ -2485,24 +2494,24 @@ impl ControlPlane {
             let locked: Option<String> = r.try_get("locked_until")?;
             let failed: i64 = r.try_get("failed_logins")?;
             hash = r.try_get("password_hash")?;
-            if disabled.is_some() {
-                return Ok(PasswordCheck::Disabled(id));
-            }
-            if let Some(until) = locked.filter(|until| Self::still_locked(until)) {
-                return Ok(PasswordCheck::Locked { user_id: id, until });
-            }
-            found = Some((id, u32::try_from(failed).unwrap_or(u32::MAX)));
+            found = Some((id, disabled.is_some(), locked, failed > 0));
         }
         let password = password.to_owned();
         let hash = StoredPasswordHash::stored_or_dummy(hash);
         let ok = tokio::task::spawn_blocking(move || hash.verifies(&password))
             .await
             .map_err(|e| Error::Config(format!("password verification task failed: {e}")))?;
-        let Some((id, failed)) = found else {
+        let Some((id, disabled, locked, counted)) = found else {
             return Ok(PasswordCheck::Wrong(None));
         };
+        if disabled {
+            return Ok(PasswordCheck::Disabled(id));
+        }
+        if let Some(until) = locked.clone().filter(|until| Self::still_locked(until)) {
+            return Ok(PasswordCheck::Locked { user_id: id, until });
+        }
         if ok {
-            if failed > 0 {
+            if counted || locked.is_some() {
                 self.set_failed_logins(&id, 0, None).await?;
             }
             return match self.get_user(&id).await? {
@@ -2510,22 +2519,54 @@ impl ControlPlane {
                 None => Ok(PasswordCheck::Wrong(None)),
             };
         }
-        let failed = failed.saturating_add(1);
-        let until = lockout.locks_after(failed).then(|| {
-            Timestamp::now()
-                .checked_add(SignedDuration::from_mins(i64::from(lockout.minutes)))
-                .unwrap_or(Timestamp::MAX)
-                .to_string()
-        });
-        self.set_failed_logins(&id, failed, until.as_deref())
-            .await?;
-        match until {
+        match self.count_wrong_password(&id, lockout).await? {
             Some(until) => {
                 tracing::warn!(user_id = %id, until, "account locked after repeated wrong passwords");
                 Ok(PasswordCheck::Locked { user_id: id, until })
             }
             None => Ok(PasswordCheck::Wrong(Some(id))),
         }
+    }
+
+    /// Count one more wrong password for `id` and lock the account when
+    /// `lockout` says so, returning the lock's end. The count is read and
+    /// written in one immediate transaction, so wrong passwords sent at
+    /// once each count; a lock that has run out starts the count over.
+    async fn count_wrong_password(&self, id: &UserId, lockout: Lockout) -> Result<Option<String>> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let bound = Bound::new(
+            Query::select()
+                .columns([Users::FailedLogins, Users::LockedUntil])
+                .from(Users::Table)
+                .and_where(Expr::col(Users::Id).eq(id)),
+        )?;
+        let Some(row) = bound.query().fetch_optional(&mut *tx).await? else {
+            return Ok(None);
+        };
+        let failed: i64 = row.try_get("failed_logins")?;
+        let locked: Option<String> = row.try_get("locked_until")?;
+        let before = if locked.is_some() {
+            0
+        } else {
+            u32::try_from(failed).unwrap_or(u32::MAX)
+        };
+        let failed = before.saturating_add(1);
+        let until = lockout.locks_after(failed).then(|| {
+            Timestamp::now()
+                .checked_add(SignedDuration::from_mins(i64::from(lockout.minutes)))
+                .unwrap_or(Timestamp::MAX)
+                .to_string()
+        });
+        let bound = Bound::new(
+            Query::update()
+                .table(Users::Table)
+                .value(Users::FailedLogins, i64::from(failed))
+                .value(Users::LockedUntil, until.as_deref())
+                .and_where(Expr::col(Users::Id).eq(id)),
+        )?;
+        bound.query().execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(until)
     }
 
     /// Whether a stored `locked_until` is still in the future.
