@@ -402,3 +402,62 @@ fn named_links_keep_their_id_and_covered_relations_are_skipped() {
     assert_eq!(labelled_link("- Killed In: [x](y.md)"), None);
     assert_eq!(labelled_link("- table [t](../t.md)"), None);
 }
+
+/// Two file names with one slug get two document files, and an entity's
+/// provenance links the file of the document it came from.
+#[test]
+fn documents_whose_names_share_a_slug_get_their_own_files() {
+    use crate::ids::{ChunkId, DocumentId};
+    use crate::storage::workspace::NewDocument;
+
+    let (db, _) = harbour_workspace();
+    for (id, name) in [("doc-aaaaaa", "Report.pdf"), ("doc-bbbbbb", "report.pdf")] {
+        db.insert_document(&NewDocument::new(
+            &DocumentId::from(id),
+            name,
+            "application/pdf",
+            1,
+        ))
+        .unwrap_or_else(|e| unreachable_db(&e.to_string()));
+    }
+    let node = graph_store::upsert_node(
+        &db,
+        &graph_store::NewNode {
+            label: String::from("Mombasa"),
+            class_id: ClassId::from("harbour"),
+            properties: Properties::default(),
+            standing: Standing::Reviewed,
+        },
+    )
+    .unwrap_or_else(|e| unreachable_db(&e.to_string()));
+    graph_store::add_provenance(
+        &db,
+        &node,
+        &graph_store::Source::chunk(&DocumentId::from("doc-bbbbbb"), &ChunkId::from("c1"), 0.9),
+    )
+    .unwrap_or_else(|e| unreachable_db(&e.to_string()));
+
+    let mut bundle = Bundle::default();
+    export(&db, "ws", &mut bundle).unwrap_or_else(|e| unreachable_db(&e.to_string()));
+    let mut documents: Vec<&str> = bundle
+        .files
+        .iter()
+        .map(|f| f.path.as_str())
+        .filter(|p| p.starts_with("documents/"))
+        .collect();
+    documents.sort_unstable();
+    assert_eq!(
+        documents,
+        ["documents/report-pdf-bbbbbb.md", "documents/report-pdf.md"]
+    );
+    let mombasa = bundle
+        .files
+        .iter()
+        .find(|f| f.path == "entities/harbour/mombasa.md")
+        .map(|f| f.content.clone())
+        .unwrap_or_default();
+    assert!(
+        mombasa.contains("[report.pdf](../../documents/report-pdf-bbbbbb.md)"),
+        "{mombasa}"
+    );
+}
