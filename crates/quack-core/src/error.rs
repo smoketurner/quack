@@ -33,6 +33,10 @@ pub enum Error {
     #[error("saved question '{0}' already exists")]
     SavedQuestionExists(String),
 
+    /// A saved import already has this name.
+    #[error("a saved import named '{0}' exists; refresh it, or remove it first")]
+    SavedImportExists(String),
+
     /// An answer that cannot become a saved question, and why.
     #[error("cannot save this answer: {0}")]
     Unsavable(#[from] Unsavable),

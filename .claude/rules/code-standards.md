@@ -47,7 +47,8 @@ and code — this file is the gate, the doc is the detail.
       (API token hashes, and HPKE-sealed OAuth tokens of signed-in users and of model
       providers), each OAuth client's HPKE-sealed `private_key_jwt` signing key in
       `client_keys`, each client quack registered itself (RFC 7591) with its HPKE-sealed
-      `registration_access_token` in `client_registrations` (the vault key is never in the
+      `registration_access_token` in `client_registrations`, each saved import's sealed
+      secret (its URL and header values) in `import_credentials` (the vault key is never in the
       database), and the access `audit_log`. `audit_log` is append-only: no `UPDATE`/`DELETE` path.
 - [ ] Every request that touches a workspace writes an `audit_log` row, including denied
       ones, and a `_quack_audit` detail row inside the workspace under the same UUID v7.

@@ -38,6 +38,9 @@ pub enum Purpose {
     /// (RFC 7591 and 7592); the subject is the registration's name, the
     /// issuer.
     RegistrationToken,
+    /// A saved import's URL and header values, for its refresh; the subject
+    /// is the import's id.
+    ImportCredential,
 }
 
 text_enum!(Purpose, "vault purpose", {
@@ -45,6 +48,7 @@ text_enum!(Purpose, "vault purpose", {
     ProviderToken => "provider-token",
     ClientKey => "client-key",
     RegistrationToken => "registration-token",
+    ImportCredential => "import-credential",
 });
 
 impl Purpose {

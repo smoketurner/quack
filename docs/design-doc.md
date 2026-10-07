@@ -1049,6 +1049,22 @@ server: its AWS identity, a token from its environment. `quack serve` with login
 both (403, code `server_credentials`, a denied audit row) unless
 `[import].allow_server_credentials` is on.
 
+**Saved imports.** `--save NAME` (the `save` field over REST and on the Tables page form)
+keeps an import in `_quack_imports` (`import::SavedImport`) so it can run again:
+`quack import refresh NAME`, `/import refresh NAME` in the terminal, `POST
+.../imports/{import}/refresh` (202 and an `import` job in the workspace's serial import
+lane, audited as an `import` run), or the Tables page's Refresh button. A refresh rebuilds
+the request and replaces the table through the `--replace` path: the old rows serve until
+the new ones are ready, and identical bytes report `source unchanged` and change nothing.
+Each run records its time, row count, or error, which `quack import list` and the page show.
+The workspace file never holds a secret: the URL is stored redacted and the headers by
+name. A refresh gets its secret from the `--bearer-env` variable (only its name is saved),
+or from the URL and header values the owner kept with `--store-credential`, sealed under
+the vault key in `control.db` (`import_credentials`, deleted with the workspace). An import
+with a password or a header value and neither is refused before it runs. Nothing
+schedules refreshes: cron runs `quack import refresh NAME` (`docs/operations.md`).
+`quack import remove NAME` drops the saved import and its secret; its table stays.
+
 **Table naming.** The sanitized file stem. One live document owns a table: a changed file
 with the same name is refused (`Error::TableTaken`, 409) unless it replaces its
 predecessor. A name starting with `_quack_` or `graph_` is refused at ingest and import
@@ -2295,7 +2311,11 @@ PATCH  /api/v1/workspaces/{id}/graph/nodes/{nid}   {label?, class?, properties?,
 DELETE /api/v1/workspaces/{id}/graph/nodes/{nid}   the node with its edges
 POST   /api/v1/workspaces/{id}/graph/edges         {source, target, relation, properties?, note?} by node id: 201, or 200 when asserted
 DELETE /api/v1/workspaces/{id}/graph/edges/{eid}
-POST   /api/v1/workspaces/{id}/import              {url, table, query?, source_table?, limit?, types?}
+POST   /api/v1/workspaces/{id}/import              {url, table, query?, source_table?, limit?, types?, headers?, bearer_env?, json_pointer?, save?, store_credential?}
+GET    /api/v1/workspaces/{id}/imports             saved imports, with how each last ran
+POST   /api/v1/workspaces/{id}/imports             import and save (`save` is required); 201
+POST   /api/v1/workspaces/{id}/imports/{import}/refresh   run a saved import again; 202 and a job
+DELETE /api/v1/workspaces/{id}/imports/{import}    remove a saved import and its sealed secret
 GET    /api/v1/workspaces/{id}/embeddings          current, stale, and missing vectors against the configured profile, and the plan
 POST   /api/v1/workspaces/{id}/embeddings/refresh  200 when current, else 202 with the plan and the job
 GET    /api/v1/workspaces/{id}/okf                 the bundle as a tar (import is POST .../documents with a tar)
@@ -2540,7 +2560,9 @@ quack saved list [--format text|json] | add NAME --from-session ID [--message N]
             | remove NAME
 # A saved question re-runs an answer's SQL without the model (section 8.1); cron is the
 # scheduler, and --exit-code exits 5 when the result changed.
-quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N]
+quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N] [--types COL=TYPE]
+            [-H 'NAME: VALUE'] [--bearer-env VAR] [--json-pointer /PATH] [--save NAME [--store-credential]]
+quack import list [--format text|json] | refresh NAME | remove NAME
 quack okf export DIR|-
 quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
 quack auth jwks [PROVIDER] [--rotate [--activate]]

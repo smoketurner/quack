@@ -113,6 +113,7 @@ cargo run --bin quack -- graph export DIR|- [--format csv|graphml|jsonld] [--inc
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
 cargo run --bin quack -- import sqlite:/path/src.db --table t --from orders [--types col=TYPE]   # snapshot a SQLite query, an http(s) data file (-H 'Name: value', --bearer-env VAR, --json-pointer /data), or s3://bucket/key as a table
+cargo run --bin quack -- import ... --save NAME [--store-credential] | import list | refresh NAME | remove NAME   # import::SavedImport in _quack_imports; a refresh replaces the table only when the source changed; cron schedules it
 cargo run --bin quack -- auth login|status|logout PROVIDER ; auth jwks [PROVIDER] [--rotate [--activate]]  # OAuth tokens; a client's public key
 cargo run --bin quack -- auth register [--issuer URL] [--device-code|--token-env VAR|--open] [--replace] [--print] | unregister   # RFC 7591/7592 client registration
 cargo run --bin quack -- config [--changed] [--format json]                      # every recognized setting, its value and origin, the file's unknown keys, the env vars read

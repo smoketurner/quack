@@ -29,7 +29,9 @@ version with a SHA-384 checksum of its file.
   with their registration access tokens in `client_registrations` (version 8), each user's
   lifecycle columns (`disabled_at`, `password_changed_at`, `failed_logins`, `locked_until`;
   version 9), the roles an identity provider's groups carry in `group_roles` and which
-  memberships that provider granted (`members.granted_by`; version 10), and the access
+  memberships that provider granted (`members.granted_by`; version 10), the secret a saved
+  import refreshes with, sealed, keyed by the import's id, and deleted with its workspace
+  (`import_credentials`; version 11), and the access
   `audit_log`. The vault seals every token and key. The audit log is append-only; no code
   path may `UPDATE` or `DELETE` it.
 
@@ -77,6 +79,8 @@ open:
   stemmings in `_quack_meta.languages`, and rebuilds the term index: each chunk stemmed
   under its document's language, runs of Chinese, Japanese, and Korean as character
   bigrams (issue #395).
+- **14**: Adds `_quack_imports`, the imports saved under a name for `quack import refresh`
+  (issue #402). The table starts empty and needs no backfill.
 
 A column that needs no backfill needs no bump: `ADD COLUMN IF NOT EXISTS` on open adds it,
 and rows written earlier read as `NULL`. `_quack_documents.page_count`, `pages_unreadable`,

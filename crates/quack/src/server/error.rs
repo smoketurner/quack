@@ -101,6 +101,8 @@ pub(crate) enum ErrorCode {
     WorkspaceExists,
     /// A saved question by that name exists.
     SavedQuestionExists,
+    /// A saved import already has the name.
+    SavedImportExists,
     /// The work was cancelled before it finished.
     Cancelled,
 }
@@ -173,6 +175,7 @@ impl ErrorCode {
             CoreError::TableTaken { .. } => (Self::TableTaken, StatusCode::CONFLICT),
             CoreError::WorkspaceExists(_) => (Self::WorkspaceExists, StatusCode::CONFLICT),
             CoreError::SavedQuestionExists(_) => (Self::SavedQuestionExists, StatusCode::CONFLICT),
+            CoreError::SavedImportExists(_) => (Self::SavedImportExists, StatusCode::CONFLICT),
             // A request is never cancelled through its own handler today (only
             // background jobs are); should one be, it lost to a later action.
             CoreError::Cancelled => (Self::Cancelled, StatusCode::CONFLICT),

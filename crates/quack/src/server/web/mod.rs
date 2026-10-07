@@ -27,7 +27,8 @@ use jiff::tz::TimeZone;
 use axum_extra::extract::Form as MultiForm;
 use quack_core::analysis::events::ToolStep;
 use quack_core::ids::{
-    CandidateId, ClassId, DocumentId, EdgeId, NodeId, RelationId, SessionId, UserId, WorkspaceId,
+    CandidateId, ClassId, DocumentId, EdgeId, ImportId, NodeId, RelationId, SessionId, UserId,
+    WorkspaceId,
 };
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::edit::Edit;
@@ -79,7 +80,7 @@ use quack_core::graph::{
     ExtractSource, GraphResult, GraphStatus, Origin, Properties, Standing as GraphStanding,
     resolve, store as graph_store,
 };
-use quack_core::import::ImportRequest;
+use quack_core::import::{ImportRequest, SavedImport};
 use quack_core::ingestion::parser::SectionKind;
 use quack_core::jobs::JobNumber;
 use quack_core::llm::Embeddings;
@@ -605,6 +606,8 @@ impl TableView {
 struct TablesPage {
     page: Page,
     tables: Vec<String>,
+    /// Imports saved for refreshing, with how each last ran.
+    imports: Vec<SavedImport>,
     selected: Option<TableView>,
     error: Option<String>,
     notice: Option<String>,
@@ -628,6 +631,7 @@ impl TablesPage {
             None
         };
         let list = app.read(id, WorkspaceDb::list_tables).await?;
+        let imports = app.read(id, SavedImport::list).await?;
         let mut page = Page::in_workspace(app, Tab::Tables, &access);
         if let Some(table) = &selected {
             page.title.clone_from(&table.name);
@@ -635,6 +639,7 @@ impl TablesPage {
         html(&Self {
             page,
             tables: list,
+            imports,
             selected,
             error,
             notice,
@@ -993,6 +998,8 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/tables/note", post(table_note))
         .route("/w/{id}/tables/retype", post(table_retype))
         .route("/w/{id}/import", post(import_submit))
+        .route("/w/{id}/imports/{import}/refresh", post(import_refresh))
+        .route("/w/{id}/imports/{import}/remove", post(import_remove))
         .route("/w/{id}/sql", get(sql_page).post(sql_run))
         .route("/w/{id}/sql.csv", post(sql_csv))
         .route("/w/{id}/context", get(context_page).post(context_save))
@@ -1783,6 +1790,53 @@ async fn table_retype(
     .into_response())
 }
 
+/// The Tables page's Refresh button: the saved import runs again as a job.
+async fn import_refresh(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, import)): Path<(WorkspaceId, ImportId)>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let back = format!("/w/{id}/tables");
+    let outcome = match access.saved_import(&app, import.as_str()).await {
+        Ok(saved) => {
+            let name = saved.name.clone();
+            access
+                .refresh_import(&app, saved)
+                .await
+                .map(|job| format!("refresh of {name} queued as job {job}"))
+        }
+        Err(e) => Err(e),
+    };
+    Ok(match outcome {
+        Ok(notice) => Flash::notice(back, notice),
+        Err(e) => Flash::error(back, e.message),
+    }
+    .into_response())
+}
+
+/// The Tables page's Remove button: the saved import goes, its table stays.
+async fn import_remove(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, import)): Path<(WorkspaceId, ImportId)>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let back = format!("/w/{id}/tables");
+    let outcome = match access.saved_import(&app, import.as_str()).await {
+        Ok(saved) => access
+            .remove_import(&app, &saved)
+            .await
+            .map(|()| format!("removed saved import {}; its table stays", saved.name)),
+        Err(e) => Err(e),
+    };
+    Ok(match outcome {
+        Ok(notice) => Flash::notice(back, notice),
+        Err(e) => Flash::error(back, e.message),
+    }
+    .into_response())
+}
+
 async fn import_submit(
     State(app): State<App>,
     WebUser(identity): WebUser,
@@ -1790,12 +1844,13 @@ async fn import_submit(
     Form(form): Form<ImportBody>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let saving = form.saving();
     let request = match ImportRequest::try_from(form) {
         Ok(request) => request,
         Err(e) => return Ok(Flash::error(format!("/w/{id}/tables"), e.message).into_response()),
     };
     Ok(
-        match import_api::run_import(&app, &access, &request).await {
+        match import_api::run_import(&app, &access, &request, saving).await {
             Ok(imported) => match imported.graph_job {
                 Some(job) => Flash::notice(
                     format!("/w/{id}/tables"),

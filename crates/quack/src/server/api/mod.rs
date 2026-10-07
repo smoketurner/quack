@@ -160,6 +160,15 @@ pub(crate) fn router(app: &App) -> ApiRoutes {
         .merge(ontology_routes())
         .route("/workspaces/{id}/okf", get(okf::export))
         .route("/workspaces/{id}/import", post(import::import))
+        .route(
+            "/workspaces/{id}/imports",
+            get(import::list_saved).post(import::save),
+        )
+        .route(
+            "/workspaces/{id}/imports/{import}/refresh",
+            post(import::refresh),
+        )
+        .route("/workspaces/{id}/imports/{import}", delete(import::remove))
         .merge(graph_routes())
         .route("/workspaces/{id}/jobs", get(jobs::list))
         .route("/workspaces/{id}/jobs/stream", get(jobs::stream))

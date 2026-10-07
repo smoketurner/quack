@@ -53,6 +53,9 @@ pub struct ImportRequest {
     pub headers: Vec<SourceHeader>,
     /// Where a JSON download's rows sit, when an envelope wraps them.
     pub json_pointer: Option<JsonPointer>,
+    /// The document a refresh replaces: it keeps serving until the new
+    /// rows are ready, and identical rows leave it in place.
+    pub replaces: Option<DocumentId>,
 }
 
 /// One header an HTTP(S) download sends. `Debug` shows only the name, so a
@@ -252,6 +255,17 @@ pub struct ImportSummary {
     /// The source with any password removed.
     pub source: String,
     pub document_id: DocumentId,
+    pub status: LoadStatus,
+}
+
+/// Whether an import loaded rows, or found its source as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadStatus {
+    Loaded,
+    /// A refresh found the same bytes as the document it replaces, and
+    /// left that document and its table in place.
+    Unchanged,
 }
 
 /// The kind of source a URL names.
@@ -474,12 +488,36 @@ impl<M: EmbeddingModel> Importing<'_, M> {
                 .source(DocumentSource::Import)
                 .title(Some(&source))
                 .types(request.types.clone())
+                .replaces(request.replaces.as_ref())
                 .control(self.control),
             self.embedder,
         )
         .await?;
         let result = match outcome {
             IngestOutcome::Ingested(result) => result,
+            IngestOutcome::Duplicate(existing)
+                if request.replaces.as_ref() == Some(&existing.id) =>
+            {
+                let table = existing
+                    .tables
+                    .as_ref()
+                    .and_then(|tables| tables.first())
+                    .cloned()
+                    .unwrap_or_else(|| table.as_str().to_owned());
+                let described = {
+                    let table = table.clone();
+                    db.run(move |db| db.describe_table(&table)).await?
+                };
+                tracing::info!(table = %table, source = %source, "the import's source is unchanged");
+                return Ok(ImportSummary {
+                    table,
+                    rows: u64::try_from(described.row_count).unwrap_or(0),
+                    columns: described.columns.into_iter().map(|c| c.name).collect(),
+                    source,
+                    document_id: existing.id,
+                    status: LoadStatus::Unchanged,
+                });
+            }
             IngestOutcome::Duplicate(existing) => {
                 return Err(Error::Ingestion(format!(
                     "the source's rows are identical to document {} ({}); delete it first to reload",
@@ -513,6 +551,7 @@ impl<M: EmbeddingModel> Importing<'_, M> {
             columns,
             source,
             document_id: result.document_id,
+            status: LoadStatus::Loaded,
         })
     }
 
@@ -622,6 +661,7 @@ impl ImportRequest {
             types: ColumnTypes::default(),
             headers: Vec::new(),
             json_pointer: None,
+            replaces: None,
         }
     }
 
@@ -973,8 +1013,10 @@ fn is_private_address(ip: IpAddr) -> bool {
 }
 
 mod s3;
+mod saved;
 
 use s3::S3Object;
+pub use saved::{ImportSecrets, KeepSecret, RefreshWith, SavedImport};
 
 #[cfg(test)]
 mod tests;
