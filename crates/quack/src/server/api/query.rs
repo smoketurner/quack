@@ -739,7 +739,7 @@ impl Access {
 pub(crate) struct SearchQuery {
     pub query: String,
     pub top_k: Option<u32>,
-    /// Documents to search within, each by id, id prefix, or file name.
+    /// Documents to search within, each by id, id prefix, file name, or title.
     #[serde(default)]
     pub document_ids: Vec<String>,
     /// A graph entity whose source passages to search within.

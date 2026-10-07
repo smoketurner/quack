@@ -1259,7 +1259,7 @@ pub struct TurnRequest<'a> {
     pub policy: WritePolicy,
     pub message: &'a str,
     /// The documents the person limits the question to, each by id, id
-    /// prefix, or file name; empty for the whole workspace.
+    /// prefix, file name, or title; empty for the whole workspace.
     pub documents: &'a [String],
     pub sink: EventSink,
     pub cancel: CancellationToken,

@@ -706,7 +706,7 @@ struct SearchArgs {
     /// What to search for; a "quoted phrase" must appear exactly
     query: String,
 
-    /// Search only these documents (ids, id prefixes, or file names)
+    /// Search only these documents (ids, id prefixes, file names, or titles)
     #[arg(long = "in", value_name = "DOCUMENT", num_args = 1..)]
     documents: Vec<String>,
 

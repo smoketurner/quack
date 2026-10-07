@@ -2184,6 +2184,34 @@ fn document_chunks_page_in_order_and_documents_resolve_by_id_name_or_prefix() {
             "{error}"
         );
     }
+    // An exact title names a document too; one several share is refused.
+    let mut titled = documents;
+    for (doc, title) in titled.iter_mut().zip(["Returns policy"]) {
+        doc.title = Some(String::from(title));
+    }
+    assert_eq!(
+        DocumentInfo::find(&titled, "Returns policy")
+            .map(|d| d.id.as_str())
+            .ok(),
+        Some("doc-aaaa")
+    );
+    assert!(DocumentInfo::find(&titled, "returns policy").is_err());
+    let mut twice = titled.clone();
+    twice.extend(titled.iter().cloned().map(|mut d| {
+        d.id = DocumentId::from("doc-bbbb");
+        d.filename = String::from("policy-2.md");
+        d
+    }));
+    let shared = DocumentInfo::find(&twice, "Returns policy")
+        .map(|d| d.id.clone())
+        .map_err(|e| e.to_string());
+    assert!(
+        shared
+            .as_ref()
+            .is_err_and(|e| e.contains("2 documents are titled 'Returns policy'")
+                && e.contains("doc-bbbb (policy-2.md, \"Returns policy\")")),
+        "{shared:?}"
+    );
 }
 
 /// Every row of a statement streams out in each format, the shapes the

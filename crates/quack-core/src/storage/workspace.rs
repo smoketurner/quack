@@ -3966,34 +3966,62 @@ impl DocumentInfo {
     }
 
     /// The document in `documents` the model named: by id, exact file
-    /// name, or id prefix.
+    /// name, exact title (the name the prompt's inventory shows), or id
+    /// prefix.
     ///
     /// # Errors
     ///
     /// A name that matches none is an error listing the documents there
     /// are, so the caller corrects it rather than reading an empty result
-    /// as "the workspace has nothing on this".
+    /// as "the workspace has nothing on this"; a title several documents
+    /// share is an error naming them.
     pub fn find<'a>(documents: &'a [Self], want: &str) -> Result<&'a Self> {
         let want = want.trim();
-        let found = documents
+        let listed = |documents: &mut dyn Iterator<Item = &Self>| -> String {
+            documents
+                .map(|d| match d.title.as_deref() {
+                    Some(title) => format!(
+                        "{} ({}, \"{}\")",
+                        d.id,
+                        OneLine(&d.filename),
+                        OneLine(title)
+                    ),
+                    None => format!("{} ({})", d.id, OneLine(&d.filename)),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if let Some(found) = documents
             .iter()
             .find(|d| d.id.as_str() == want || d.filename == want)
-            .or_else(|| {
-                documents
-                    .iter()
-                    .find(|d| !want.is_empty() && d.id.as_str().starts_with(want))
-            });
-        found.ok_or_else(|| {
-            let known: Vec<String> = documents
-                .iter()
-                .map(|d| format!("{} ({})", d.id, OneLine(&d.filename)))
-                .collect();
-            Error::Analysis(format!(
-                "no document matches '{want}'; pass an id (a prefix is enough) or an exact \
-                 file name from list_documents. Documents: {}",
-                known.join(", ")
-            ))
-        })
+        {
+            return Ok(found);
+        }
+        let titled: Vec<&Self> = documents
+            .iter()
+            .filter(|d| !want.is_empty() && d.title.as_deref().map(str::trim) == Some(want))
+            .collect();
+        match titled.as_slice() {
+            [one] => return Ok(one),
+            [] => {}
+            several => {
+                return Err(Error::Analysis(format!(
+                    "{} documents are titled '{want}'; pass one's id or file name: {}",
+                    several.len(),
+                    listed(&mut several.iter().copied())
+                )));
+            }
+        }
+        documents
+            .iter()
+            .find(|d| !want.is_empty() && d.id.as_str().starts_with(want))
+            .ok_or_else(|| {
+                Error::Analysis(format!(
+                    "no document matches '{want}'; pass an id (a prefix is enough), an exact \
+                     file name, or an exact title from list_documents. Documents: {}",
+                    listed(&mut documents.iter())
+                ))
+            })
     }
 
     /// The tables a row from before `tables` was recorded loaded into: the

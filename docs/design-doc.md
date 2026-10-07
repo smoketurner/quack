@@ -1008,7 +1008,7 @@ which leaves keyword-exact questions (part numbers, policy IDs) unanswered.
   `rerank_rank`, `rerank_score`); `score` stays the fused value. `WorkspaceDb::explain_search`
   returns both legs' candidates, the fused list, and the quoted phrases that filtered it.
 - *One search for every interface:* `analysis::search::DocumentSearch` holds the query,
-  `top_k`, the documents to search within (ids, prefixes, or file names), a graph entity, a
+  `top_k`, the documents to search within (ids, prefixes, file names, or titles), a graph entity, a
   `DocumentFilter`, and the mode (`hybrid`, `keyword`, `vector`; hybrid runs keyword alone
   without an embedding model, vector fails without one). `search_documents`, REST and MCP
   `search`, `quack search`, the terminal's `/search`, and the Search page all resolve it the
