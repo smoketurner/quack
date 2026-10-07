@@ -22,9 +22,11 @@ Two rules hold for every release:
 
 - Config: `[retrieval].languages` added (default `["auto"]`): what a document may be
   detected as for keyword stemming, `"auto"` or Snowball language names.
-- Schema: workspace 13. The first open of each workspace detects every document's language
+- Schema: workspace 14. The first open of each workspace detects every document's language
   from its first chunks and rebuilds the keyword index (`_quack_terms`), reading every chunk
-  once. `control.db` unchanged (migration 8).
+  once, and adds `_quack_imports` for saved imports. `control.db` migrations 9 to 11
+  (applied on start): user lifecycle, group roles, and the sealed credentials of saved
+  imports.
 - Embeddings: no refresh needed.
 - Config: `[ingestion].vision_model` added (unset by default): the model that reads images
   and scanned PDF pages at ingest. Without it, image uploads are refused and a PDF with no
