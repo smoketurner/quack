@@ -184,7 +184,8 @@ pub(crate) struct QueryArgs {
     #[schemars(with = "Option<ChatMode>")]
     pub mode: Option<String>,
     /// Limit the question to these documents: ids from `list_documents`
-    /// (prefixes accepted) or exact file names; omit for every document.
+    /// (prefixes accepted), exact file names, or exact titles; omit for
+    /// every document.
     #[serde(default)]
     pub document_ids: Vec<String>,
 }
@@ -197,7 +198,7 @@ pub(crate) struct SearchArgs {
     /// Chunks to return (default from the workspace configuration).
     pub top_k: Option<u32>,
     /// Search only these documents: ids from `list_documents` (prefixes
-    /// accepted) or exact file names.
+    /// accepted), exact file names, or exact titles.
     #[serde(default)]
     pub document_ids: Vec<String>,
     /// Search only the passages this knowledge-graph entity was extracted

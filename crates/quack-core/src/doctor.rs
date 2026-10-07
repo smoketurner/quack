@@ -29,7 +29,7 @@ use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
 use crate::llm::sampling::{Sampling, Wire, check_tool_calls};
-use crate::llm::{ChatClient, ProviderModels, RerankModel};
+use crate::llm::{ChatClient, Embeddings, ProviderModels, RerankModel};
 use crate::oidc::SignIn;
 use crate::proxy::Proxies;
 use crate::storage::control::ControlPlane;
@@ -295,21 +295,6 @@ impl Probing {
             Self::Offline => None,
             Self::Online { timeout } => Some(timeout),
         }
-    }
-
-    /// The client the probes share, or `None` offline.
-    fn client(self) -> Option<reqwest::Client> {
-        let Self::Online { timeout } = self else {
-            return None;
-        };
-        Proxies::from_env()
-            .client()
-            .timeout(timeout)
-            .connect_timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .inspect_err(|e| tracing::warn!(error = %e, "cannot build the probe client"))
-            .ok()
     }
 }
 
@@ -792,20 +777,22 @@ async fn check_embedding_model(report: &mut Report, config: &Config, probing: Pr
         Ok(Some(model)) => {
             check_model(report, Area::Embeddings, config, model, probing).await;
             report.push(prompts_check(config, model));
-            if let (Some(http), ProviderType::Ollama, Some(configured)) = (
-                probing.client(),
-                model.provider.provider_type,
-                config.embedding.dimension,
-            ) {
-                let base = model
-                    .provider
-                    .base_url
-                    .clone()
-                    .unwrap_or(ProviderType::OLLAMA_BASE_URL);
-                let show = OllamaShow::fetch(&http, &base, model.model).await;
-                if let Some(check) = width_check(model, configured, show) {
-                    report.push(check);
-                }
+            if let (Some(timeout), Some(configured)) =
+                (probing.timeout(), config.embedding.dimension)
+            {
+                let measured = match Embeddings::from_config(config).await {
+                    Ok(Some(embedder)) => {
+                        match tokio::time::timeout(timeout, embedder.measure_width()).await {
+                            Ok(measured) => measured.map_err(|e| e.to_string()),
+                            Err(_) => {
+                                Err(format!("no answer within {} seconds", timeout.as_secs()))
+                            }
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(e) => Err(e.to_string()),
+                };
+                report.push(width_check(model, configured, measured));
             }
         }
         Err(e) => report.push(Check::new(Area::Embeddings, Status::Fail, e.to_string())),
@@ -906,69 +893,34 @@ fn prompts_check(config: &Config, model: ModelRef<'_>) -> Check {
     }
 }
 
-/// What Ollama's `/api/show` says about a model, read from its metadata
-/// without loading it.
-#[derive(serde::Deserialize)]
-struct OllamaShow {
-    #[serde(default)]
-    model_info: serde_json::Map<String, serde_json::Value>,
-}
-
-impl OllamaShow {
-    async fn fetch(http: &reqwest::Client, base: &BaseUrl, model: &str) -> Result<Self, Probe> {
-        let url = format!("{}/api/show", base.root());
-        let response = http
-            .post(url)
-            .json(&serde_json::json!({ "model": model }))
-            .send()
-            .await
-            .map_err(Probe::from)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Probe::Unexpected(format!("HTTP {}", status.as_u16())));
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| Probe::Unexpected(ErrorChain(&e).to_string()))
-    }
-
-    /// The model's vector width: `<architecture>.embedding_length`.
-    fn embedding_length(&self) -> Option<u32> {
-        self.model_info
-            .iter()
-            .find(|(key, _)| key.ends_with(".embedding_length"))
-            .and_then(|(_, value)| value.as_u64())
-            .and_then(|n| u32::try_from(n).ok())
-    }
-}
-
-/// Whether the configured width is the one the model makes. `None` when
-/// the probe could not tell; `check_model` already reported an
-/// unreachable provider or a missing model.
+/// Whether the configured width is the one the model makes, from one
+/// embedding call's `measured` width or why the call failed.
 fn width_check(
     model: ModelRef<'_>,
     configured: Dimension,
-    show: Result<OllamaShow, Probe>,
-) -> Option<Check> {
-    let reported = show.ok()?.embedding_length()?;
-    Some(if reported == configured.get() {
-        Check::new(
+    measured: Result<usize, String>,
+) -> Check {
+    match measured {
+        Ok(width) if configured.fits(width) => Check::new(
             Area::Embeddings,
             Status::Ok,
-            format!("{model}: makes {reported}-dimensional vectors, as [embedding].dimension says"),
-        )
-    } else {
-        Check::new(
+            format!("{model}: makes {width}-dimensional vectors, as [embedding].dimension says"),
+        ),
+        Ok(width) => Check::new(
             Area::Embeddings,
             Status::Fail,
             format!(
-                "{model}: makes {reported}-dimensional vectors but [embedding].dimension is \
+                "{model}: makes {width}-dimensional vectors but [embedding].dimension is \
                  {configured}; every embedding call fails until they agree"
             ),
         )
-        .fix(format!("set dimension = {reported} under [embedding]"))
-    })
+        .fix(format!("set dimension = {width} under [embedding]")),
+        Err(e) => Check::new(
+            Area::Embeddings,
+            Status::Fail,
+            format!("{model}: an embedding call failed: {e}"),
+        ),
+    }
 }
 
 /// Credentials, transport, and whether the provider serves the model.
