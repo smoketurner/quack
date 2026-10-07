@@ -70,8 +70,8 @@
     {% endif %}
     {% if ws.can_write %}
     <form method="post" action="/w/{{ ws.membership.workspace.id }}/import" class="mt-6 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
-      <h2 class="font-medium">Import from a database or a URL</h2>
-      <p class="mt-1 text-xs text-slate-400">postgres://user:password@host/db, sqlite:/path/to.db, or https://host/file.csv (also .parquet, .json, .xlsx). The password is used once and never stored.</p>
+      <h2 class="font-medium">Import from a SQLite file or a URL</h2>
+      <p class="mt-1 text-xs text-slate-400">sqlite:/path/to.db, or https://host/file.csv (also .parquet, .json, .xlsx). A password in the URL is used once and never stored.</p>
       {% if selected.is_none() %}{% if let Some(error) = error %}<p role="alert" class="mt-2 rounded border border-red-900 bg-red-950 px-2 py-1 text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}{% endif %}
       <div class="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
         <input aria-label="Source URL" name="url" placeholder="source URL" required class="rounded border border-slate-700 px-2 py-1 md:col-span-2">

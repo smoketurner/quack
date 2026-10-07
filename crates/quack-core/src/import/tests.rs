@@ -6,10 +6,6 @@ use crate::storage::profile::ColumnTypes;
 #[test]
 fn urls_classify_and_redact() {
     assert_eq!(
-        SourceUrl::from("postgres://u:p@h/db").kind().ok(),
-        Some(SourceKind::Postgres)
-    );
-    assert_eq!(
         SourceUrl::from("sqlite:/tmp/x.db").kind().ok(),
         Some(SourceKind::Sqlite)
     );
@@ -17,7 +13,17 @@ fn urls_classify_and_redact() {
         SourceUrl::from("https://x/y.csv").kind().ok(),
         Some(SourceKind::Http)
     );
-    assert!(SourceUrl::from("mysql://h/db").kind().is_err());
+    for unsupported in [
+        "postgres://u:p@h/db",
+        "postgresql://h/db",
+        "mysql://h/db",
+        "s3://b/k.csv",
+    ] {
+        assert!(
+            SourceUrl::from(unsupported).kind().is_err(),
+            "{unsupported}"
+        );
+    }
     assert!(SourceUrl::from("ftp://h/f").kind().is_err());
     assert_eq!(
         SourceUrl::from("postgres://alice:secret@db.local:5432/sales").redacted(),
@@ -627,26 +633,17 @@ async fn sqlite_imports_refuse_quacks_own_data_directory() {
     );
 }
 
-/// sqlx's Any driver parses the source as a URL, which a Windows path does
-/// not survive: the path goes over as `sqlite:` and `/` separators, with
-/// the characters sqlx would read as a query or an escape encoded, and
-/// any query kept.
-#[test]
-fn a_sqlite_source_connects_by_a_url_every_platform_parses() {
-    let url = |s: &str| SourceUrl::from(String::from(s)).connect_url();
-    assert_eq!(
-        url(r"sqlite://C:\Users\me\data\src.db"),
-        "sqlite:C:/Users/me/data/src.db"
-    );
-    assert_eq!(url("sqlite:///srv/data/src.db"), "sqlite:/srv/data/src.db");
-    assert_eq!(
-        url("sqlite:rel/src.db?mode=ro"),
-        "sqlite:rel/src.db?mode=ro"
-    );
-    assert_eq!(url("sqlite:/a/100%#1.db"), "sqlite:/a/100%25%231.db");
-    assert_eq!(
-        url("postgres://u:p@h/db"),
-        "postgres://u:p@h/db",
-        "other sources go over as given"
-    );
+/// The source opens read-only by path: a file that is not there is an
+/// error, never an empty database created in its place.
+#[tokio::test]
+async fn a_missing_sqlite_source_is_an_error_and_is_not_created() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| no_tempdir(&e.to_string()));
+    let missing = dir.path().join("absent.db");
+    let err = fetch_rows(&missing, "SELECT 1", 10)
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("cannot open the source"), "{err}");
+    assert!(!missing.exists());
 }
