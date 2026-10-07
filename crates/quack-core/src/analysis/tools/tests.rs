@@ -2082,3 +2082,83 @@ async fn reading_a_graph_view_holds_the_turns_writes() {
         Some(Gate::Refused(Hold::ReadDocuments))
     );
 }
+
+/// A question limited to some documents gets the graph's nodes, but quotes
+/// and cites source passages only from those documents.
+#[tokio::test]
+async fn a_scoped_graph_search_cites_only_the_scopes_documents() {
+    let (sink, _rx) = events::channel();
+    let recorder = TurnRecorder::new(sink);
+    let db = shared_db();
+    let seeded = db
+        .run(|db| {
+            ontology_store::save(
+                db,
+                &Ontology::builtin_default(),
+                Revision::reviewed(Some("tester"), None),
+            )?;
+            for (doc, file, chunk, text) in [
+                ("doc-a", "a.md", "ca", "Acme ships to Kenya."),
+                ("doc-b", "b.md", "cb", "Acme opened an office in Lagos."),
+            ] {
+                let id = DocumentId::from(doc);
+                db.insert_document(
+                    &NewDocument::new(&id, file, "text/markdown", 1)
+                        .with_status(DocumentStatus::Ready),
+                )?;
+                db.chunk_writer(&id, text)?.insert(&NewChunk {
+                    id: &ChunkId::from(chunk),
+                    chunk_index: 0,
+                    content: text,
+                    heading: None,
+                    page: None,
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: None,
+                })?;
+            }
+            let acme = graph::store::upsert_node(
+                db,
+                &NewNode {
+                    label: String::from("Acme"),
+                    class_id: ClassId::from("organization"),
+                    properties: Properties::default(),
+                    standing: Standing::Reviewed,
+                },
+            )?;
+            for (doc, chunk) in [("doc-a", "ca"), ("doc-b", "cb")] {
+                graph::store::add_provenance(
+                    db,
+                    &acme,
+                    &graph::store::Source::chunk(
+                        &DocumentId::from(doc),
+                        &ChunkId::from(chunk),
+                        1.0,
+                    ),
+                )?;
+            }
+            DocumentScope::resolve(db, &[String::from("a.md")])
+        })
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    let turn = Turn::new(recorder, WritePolicy::Deny).within(seeded);
+    let tools = GraphTools::<EmbedModel> {
+        db: ReaderDb::new(Arc::clone(&db)),
+        embedding_model: None,
+        options: GraphConfig::default(),
+        mode: ChatMode::Chat,
+    };
+    let args = serde_json::from_value::<SearchGraphArgs>(json!({ "entity": "Acme" }))
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    let found = SearchGraphTool(tools)
+        .call(&mut turn.context(), args)
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    assert!(found.contains("Acme (organization)"), "{found}");
+    assert!(found.contains("Acme ships to Kenya."), "{found}");
+    assert!(!found.contains("Lagos"), "{found}");
+    assert!(
+        found.contains("1 sources from documents outside this question's scope (a.md)"),
+        "{found}"
+    );
+}

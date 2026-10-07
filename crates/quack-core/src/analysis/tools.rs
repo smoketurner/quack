@@ -2316,12 +2316,24 @@ async fn format_graph_result(
         .collect();
     let hidden_chunks = all_chunk_ids.len().saturating_sub(MAX_GRAPH_SOURCES);
     let chunk_ids: Vec<ChunkId> = all_chunk_ids.into_iter().take(MAX_GRAPH_SOURCES).collect();
-    let (chunks, ontology) = db
+    let (mut chunks, ontology) = db
         .with_db(move |db| {
             let chunks = db.chunks_by_ids(&chunk_ids)?;
             Ok((chunks, ontology_store::current(db)?))
         })
         .await?;
+    // The graph is the workspace's, but a question limited to some
+    // documents quotes and cites only those.
+    let before = chunks.len();
+    chunks.retain(|chunk| turn.scope().includes(&chunk.document_id));
+    let out_of_scope = before.saturating_sub(chunks.len());
+    if out_of_scope > 0 {
+        writeln!(
+            out,
+            "\n{out_of_scope} sources from documents outside this question's scope ({}) are not shown.",
+            turn.scope().names()
+        )?;
+    }
     if !chunks.is_empty() {
         let markers = turn.cite(&chunks);
         writeln!(

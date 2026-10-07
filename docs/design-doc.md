@@ -1036,7 +1036,10 @@ which leaves keyword-exact questions (part numbers, policy IDs) unanswered.
   (`_quack_messages.metadata`, `UserMeta`), and `search_documents` intersects the model's
   `document_ids` with them: the model may narrow the scope, and naming only documents
   outside it is an error saying which documents the person chose. `read_document` and
-  `always_retrieve` stay within the scope too; pinned documents are still injected.
+  `always_retrieve` stay within the scope too; pinned documents are still injected. The graph
+  is the workspace's, so `search_graph` and `find_path` still show every node and edge, but
+  they quote and cite source passages only from the scope's documents and say how many they
+  leave out.
 
 **Citations.** Every retrieved chunk carries `document_id`, `filename`, `title`, `page`,
 `heading`, and its fused score. The agent cites with `[n]` markers mapped to these chunks.

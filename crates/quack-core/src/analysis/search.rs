@@ -463,6 +463,12 @@ impl DocumentScope {
         &self.0
     }
 
+    /// Whether `document` is in scope.
+    #[must_use]
+    pub fn includes(&self, document: &DocumentId) -> bool {
+        self.is_everything() || self.0.iter().any(|d| d.id == *document)
+    }
+
     /// The documents a search of `named` (empty for every document) may
     /// cover within this scope.
     ///
