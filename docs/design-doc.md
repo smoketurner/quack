@@ -2206,7 +2206,9 @@ token) or the `quack_session` cookie. Its contract is an OpenAPI 3.1 document at
 Redoc. Both sit beside `/healthz`: no sign-in, no audit row, no rate limit, and
 `Cache-Control: no-cache`, since the document describes the routes and reveals no workspace
 content. Every path the router registers is in the document, and a test fails when one is
-not. The two Server-Sent Events streams list their events, each with its data's schema, in
+not. Path and query parameters come from each handler's `Path` and `Query` extractors
+(utoipa's `axum_extras`), and a test fails when a route's path segment is missing from any
+of its operations. The two Server-Sent Events streams list their events, each with its data's schema, in
 the operation's `x-sse-events` extension, generated from the one `StreamEvent` enum. Every
 answer to a question is the same object print mode emits (`AgentResponseBody` in
 `quack_core::analysis::agent`):

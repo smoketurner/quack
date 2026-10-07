@@ -951,7 +951,6 @@ impl FromRow<'_, SqliteRow> for AuditRow {
 /// defaults to 100 rows a page.
 #[derive(Debug, Clone, serde::Deserialize, utoipa::IntoParams)]
 #[serde(default)]
-#[into_params(parameter_in = Query)]
 pub struct AuditFilter {
     #[serde(deserialize_with = "blank_as_none")]
     pub user_id: Option<UserId>,

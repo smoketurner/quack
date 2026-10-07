@@ -543,7 +543,11 @@ types included), served at `/api/v1/openapi.json` and rendered by Redoc at `/api
 both beside `/healthz` (no sign-in, no audit, no limiter). A new route goes through
 `api::ApiRoutes::route` and needs its annotation in `ApiDoc`'s `paths`; the tests in
 `api/openapi/tests.rs` fail otherwise, and also when a method the router answers is not
-documented. Every API error is `{"error", "code"}` with a stable `server::error::ErrorCode`
+documented. Parameters come from the handler's signature through utoipa's `axum_extras`:
+a tuple `Path<(..)>` is named from the route template, a lone `Path<WorkspaceId>` or
+`Path<UserId>` and every query struct go in `params(...)` (the ids implement `IntoParams`
+for their segment), and `Query<T>` supplies the location, so no `parameter_in` is written;
+a test fails when a path segment or a query field is missing. Every API error is `{"error", "code"}` with a stable `server::error::ErrorCode`
 (`ErrorCode::of` maps each core error, `of_turn` each `FailureKind`); the SSE `error` event
 carries the same JSON, and `error::coded_errors` gives the framework's own errors under
 `/api/` (rejections, 405, 429, 504) the same body. Tests drive the router with

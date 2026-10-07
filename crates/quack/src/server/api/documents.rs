@@ -34,7 +34,6 @@ use utoipa::ToSchema;
 /// `YYYY-MM-DD`, each field given narrowing the listing.
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct ListFilter {
     /// File types, as extensions or MIME types.
     types: Option<String>,
@@ -90,7 +89,7 @@ pub(crate) struct DocumentList {
     get,
     path = "/workspaces/{id}/documents",
     tag = "documents",
-    params(ListFilter),
+    params(WorkspaceId, ListFilter),
     responses((status = 200, description = "The documents", body = DocumentList)),
 )]
 pub(crate) async fn list(
@@ -144,7 +143,6 @@ pub(crate) async fn show(
 /// `?from=&limit=` on `GET .../documents/{doc}/chunks`: chunk positions
 /// from `from` on, `limit` of them.
 #[derive(Debug, Clone, Copy, Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct ChunkPage {
     /// The first chunk's position, from 0.
     #[serde(default)]
@@ -266,7 +264,6 @@ pub(crate) struct UploadFiles {
 /// `?replace={doc}` on `POST .../documents`: the one file in the request
 /// replaces that ready document.
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct UploadQuery {
     /// A ready document the one uploaded file takes the place of.
     pub replace: Option<DocumentId>,
@@ -297,7 +294,7 @@ pub(crate) enum Uploaded {
     post,
     path = "/workspaces/{id}/documents",
     tag = "documents",
-    params(UploadQuery),
+    params(WorkspaceId, UploadQuery),
     request_body(content(
         (UploadFiles = "multipart/form-data"),
         (PastedText = "application/json"),

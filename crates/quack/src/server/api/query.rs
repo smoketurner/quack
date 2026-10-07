@@ -367,6 +367,7 @@ pub(crate) struct CompleteEvent {
     path = "/workspaces/{id}/query",
     tag = "query",
     request_body = QueryRequest,
+    params(WorkspaceId),
     responses((status = 200, description = "The response object", body = AgentResponseBody)),
 )]
 pub(crate) async fn query(
@@ -412,6 +413,7 @@ pub(crate) async fn query(
     path = "/workspaces/{id}/query/stream",
     tag = "query",
     request_body = QueryRequest,
+    params(WorkspaceId),
     responses((status = 200, description = "Server-Sent Events, named in `x-sse-events`", content_type = "text/event-stream", body = String)),
 )]
 pub(crate) async fn stream(
@@ -521,6 +523,7 @@ pub(crate) struct ExportRequest {
     path = "/workspaces/{id}/sql/export",
     tag = "query",
     request_body = ExportRequest,
+    params(WorkspaceId),
     responses((status = 200, description = "Every row, as an attachment in `format`", content(
         (String = "text/csv"),
         (String = "application/x-ndjson"),
@@ -560,6 +563,7 @@ pub(crate) struct SqlOutcome {
     path = "/workspaces/{id}/sql",
     tag = "query",
     request_body = SqlRequest,
+    params(WorkspaceId),
     responses((status = 200, description = "The result, capped at `[analysis].max_query_rows`", body = SqlOutcome)),
 )]
 pub(crate) async fn sql(
@@ -782,6 +786,7 @@ impl SearchQuery {
     path = "/workspaces/{id}/search",
     tag = "query",
     request_body = SearchQuery,
+    params(WorkspaceId),
     responses((status = 200, description = "The passages found", body = SearchBody)),
 )]
 pub(crate) async fn search(

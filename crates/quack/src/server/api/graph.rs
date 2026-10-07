@@ -48,6 +48,7 @@ use quack_core::progress::{ChunkDone, RunControl};
     path = "/workspaces/{id}/graph/search",
     tag = "graph",
     request_body = SearchGraphArgs,
+    params(WorkspaceId),
     responses((status = 200, description = "The entity's neighborhood, or a class's members", body = GraphResult)),
 )]
 pub(crate) async fn search(
@@ -95,6 +96,7 @@ pub(crate) async fn search(
     path = "/workspaces/{id}/graph/path",
     tag = "graph",
     request_body = FindPathArgs,
+    params(WorkspaceId),
     responses((status = 200, description = "The path", body = GraphResult)),
 )]
 pub(crate) async fn path(
@@ -140,6 +142,7 @@ pub(crate) async fn path(
     get,
     path = "/workspaces/{id}/graph/status",
     tag = "graph",
+    params(WorkspaceId),
     responses((status = 200, description = "The graph's status", body = GraphStatus)),
 )]
 pub(crate) async fn status(
@@ -157,7 +160,6 @@ pub(crate) async fn status(
 
 /// `GET .../graph/export?format=csv|graphml|jsonld&include_provisional=true`.
 #[derive(Deserialize, Default, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct ExportQuery {
     #[serde(default)]
     format: GraphFormat,
@@ -173,7 +175,7 @@ pub(crate) struct ExportQuery {
     get,
     path = "/workspaces/{id}/graph/export",
     tag = "graph",
-    params(ExportQuery),
+    params(WorkspaceId, ExportQuery),
     responses((status = 200, description = "The graph, as an attachment in `format`", content(
         (Vec<u8> = "application/x-tar"),
         (String = "application/graphml+xml"),
@@ -229,6 +231,7 @@ pub(crate) struct ExtractRequest {
     path = "/workspaces/{id}/graph/extract",
     tag = "graph",
     request_body(content = Option<ExtractRequest>, description = "Optional; everything when absent"),
+    params(WorkspaceId),
     responses(
         (status = 200, description = "Tables only, done", body = ExtractionStarted),
         (status = 202, description = "Documents run in the background", body = ExtractionStarted),
@@ -529,6 +532,7 @@ impl DocumentJob {
     get,
     path = "/workspaces/{id}/graph/revalidate",
     tag = "graph",
+    params(WorkspaceId),
     responses((status = 200, description = "What a revalidation would drop", body = Revalidation)),
 )]
 pub(crate) async fn revalidation_preview(
@@ -551,6 +555,7 @@ pub(crate) async fn revalidation_preview(
     path = "/workspaces/{id}/graph/revalidate",
     tag = "graph",
     request_body(content = Option<DropApproval>, description = "The preview's totals"),
+    params(WorkspaceId),
     responses((status = 200, description = "What was dropped", body = Revalidation)),
 )]
 pub(crate) async fn revalidate(
@@ -600,6 +605,7 @@ impl DropApproval {
     post,
     path = "/workspaces/{id}/graph/review",
     tag = "graph",
+    params(WorkspaceId),
     responses((status = 200, description = "The graph's status", body = GraphStatus)),
 )]
 pub(crate) async fn review(
@@ -622,6 +628,7 @@ pub(crate) struct MergeList {
     get,
     path = "/workspaces/{id}/graph/merges",
     tag = "graph",
+    params(WorkspaceId),
     responses((status = 200, description = "The pending merges", body = MergeList)),
 )]
 pub(crate) async fn merges(
@@ -766,6 +773,7 @@ pub(crate) struct UpdateNode {
     path = "/workspaces/{id}/graph/nodes",
     tag = "graph",
     request_body = CreateNode,
+    params(WorkspaceId),
     responses(
         (status = 201, description = "Created", body = Asserted<Node>),
         (status = 200, description = "It already existed", body = Asserted<Node>),
@@ -827,6 +835,7 @@ pub(crate) async fn delete_node(
     path = "/workspaces/{id}/graph/edges",
     tag = "graph",
     request_body = CreateEdge,
+    params(WorkspaceId),
     responses(
         (status = 201, description = "Created", body = Asserted<Edge>),
         (status = 200, description = "It already existed", body = Asserted<Edge>),

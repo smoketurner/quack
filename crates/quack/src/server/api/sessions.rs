@@ -19,7 +19,6 @@ use crate::server::error::{ApiError, ApiResult};
 use crate::server::state::{App, with_db};
 
 #[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct ListQuery {
     /// Sessions at most, newest first.
     #[serde(default = "default_limit")]
@@ -42,7 +41,7 @@ pub(crate) struct SessionList {
     get,
     path = "/workspaces/{id}/sessions",
     tag = "sessions",
-    params(ListQuery),
+    params(WorkspaceId, ListQuery),
     responses((status = 200, description = "The sessions", body = SessionList)),
 )]
 pub(crate) async fn list(
@@ -297,7 +296,6 @@ impl Access {
     }
 }
 #[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct ExportQuery {
     #[serde(default)]
     pub format: ExportFormat,

@@ -26,6 +26,7 @@ pub(crate) struct CurrentContext {
     get,
     path = "/workspaces/{id}/context",
     tag = "context",
+    params(WorkspaceId),
     responses((status = 200, description = "The current context", content(
         (CurrentContext = "application/json"),
         (String = "text/markdown"),
@@ -74,6 +75,7 @@ pub(crate) struct SavedContext {
     path = "/workspaces/{id}/context",
     tag = "context",
     request_body = ReplaceContext,
+    params(WorkspaceId),
     responses((status = 200, description = "The new version", body = SavedContext)),
 )]
 pub(crate) async fn replace(
@@ -111,7 +113,6 @@ impl Access {
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct VersionsQuery {
     /// Versions at most, newest first.
     #[serde(default = "default_limit")]
@@ -134,7 +135,7 @@ pub(crate) struct ContextHistory {
     get,
     path = "/workspaces/{id}/context/versions",
     tag = "context",
-    params(VersionsQuery),
+    params(WorkspaceId, VersionsQuery),
     responses((status = 200, description = "The versions", body = ContextHistory)),
 )]
 pub(crate) async fn versions(

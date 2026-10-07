@@ -28,6 +28,7 @@ pub(crate) struct TableList {
     get,
     path = "/workspaces/{id}/tables",
     tag = "tables",
+    params(WorkspaceId),
     responses((status = 200, description = "The tables", body = TableList)),
 )]
 pub(crate) async fn list(
@@ -48,6 +49,7 @@ pub(crate) async fn list(
     get,
     path = "/workspaces/{id}/tables/schema",
     tag = "tables",
+    params(WorkspaceId),
     responses((status = 200, description = "Tables and columns", body = SqlSchema)),
 )]
 pub(crate) async fn schema(
@@ -73,6 +75,7 @@ pub(crate) struct DescribeTable {
     path = "/workspaces/{id}/tables/describe",
     tag = "tables",
     request_body = DescribeTable,
+    params(WorkspaceId),
     responses((status = 200, description = "The table", body = TableDescriptionBody)),
 )]
 pub(crate) async fn describe(
@@ -99,6 +102,7 @@ pub(crate) struct SetNote {
     path = "/workspaces/{id}/tables/note",
     tag = "tables",
     request_body = SetNote,
+    params(WorkspaceId),
     responses((status = 200, description = "The table as it now is", body = TableDescriptionBody)),
 )]
 pub(crate) async fn note(
@@ -129,6 +133,7 @@ pub(crate) struct RetypeColumn {
     path = "/workspaces/{id}/tables/retype",
     tag = "tables",
     request_body = RetypeColumn,
+    params(WorkspaceId),
     responses((status = 200, description = "The table as it now is", body = TableDescriptionBody)),
 )]
 pub(crate) async fn retype(
