@@ -550,6 +550,9 @@ enum Screened {
     Internal,
     /// It writes something named `graph_`.
     ReservedGraph,
+    /// A read of a `graph_` view, whose labels and properties were
+    /// extracted from document text.
+    GraphRead,
 }
 
 /// What a statement from the agent passes before it runs: no internal
@@ -570,6 +573,10 @@ impl SqlGate {
     async fn check(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolError> {
         let kind = match self.classify(sql).await? {
             Screened::Kind(kind) => kind,
+            Screened::GraphRead => {
+                turn.read_documents();
+                return Ok(Gate::Read);
+            }
             Screened::Internal => return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED))),
             Screened::ReservedGraph => {
                 return Ok(Gate::Reject(String::from(graph::views::RESERVED_REFUSED)));
@@ -606,8 +613,12 @@ impl SqlGate {
 
     /// Classify `sql` for a chart, which only reads: any write is
     /// refused as not permitted, and that is not the turn's refused write.
-    async fn check_read_only(&self, sql: &str) -> Result<Gate, ToolError> {
+    async fn check_read_only(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolError> {
         Ok(match self.classify(sql).await? {
+            Screened::GraphRead => {
+                turn.read_documents();
+                Gate::Read
+            }
             Screened::Internal => Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)),
             Screened::Kind(StatementKind::Read) => Gate::Read,
             Screened::Kind(StatementKind::Invalid(msg)) => {
@@ -632,6 +643,9 @@ impl SqlGate {
                 let kind = db.classify_statement(&sql)?;
                 if graph::views::write_names_reserved(&sql, &kind) {
                     return Ok(Screened::ReservedGraph);
+                }
+                if kind == StatementKind::Read && db.references_graph_view(&sql)? {
+                    return Ok(Screened::GraphRead);
                 }
                 Ok(Screened::Kind(kind))
             })
@@ -1273,8 +1287,8 @@ impl ViewImageTool {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ViewImageArgs {
-    /// The image document: an id from `list_documents` (a prefix is enough)
-    /// or its exact file name
+    /// The image document: an id from `list_documents` (a prefix is enough),
+    /// its exact file name, or its exact title
     pub document: String,
     /// What to find out from the image, as a full question
     pub question: String,
@@ -1824,7 +1838,7 @@ impl Tool for CreateChartTool {
     ) -> Result<Self::Output, Self::Error> {
         let turn = Turn::of(context)?;
         let step = turn.recorder.start(ToolName::CreateChart, args.sql.trim());
-        let rejected = match self.gate.check_read_only(&args.sql).await? {
+        let rejected = match self.gate.check_read_only(&args.sql, &turn).await? {
             Gate::Reject(message) => Some(message),
             Gate::Refused(hold) => Some(String::from(hold.refusal())),
             Gate::Read | Gate::Write => None,

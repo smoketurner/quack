@@ -2045,3 +2045,40 @@ async fn graph_views_read_through_run_sql_and_refuse_changes() {
         "{described}"
     );
 }
+
+/// A read of a `graph_` view hands the model extracted document text, as
+/// `search_graph` does, so a write after it is held like one after a
+/// search; a read of an ordinary table is not.
+#[tokio::test]
+async fn reading_a_graph_view_holds_the_turns_writes() {
+    let (sink, _rx) = events::channel();
+    let recorder = TurnRecorder::new(sink);
+    let db = shared_db();
+    db.run(|db| {
+        db.execute_statement("CREATE TABLE sales AS SELECT 1 AS n")?;
+        db.execute_statement("CREATE VIEW graph_person AS SELECT 'Ada' AS label")
+    })
+    .await
+    .unwrap_or_else(|e| fail_test(&e.to_string()));
+    let refused = RefusalFlag::default();
+    let gated = gate(
+        &db,
+        WritePolicy::Allow(Approver::Nobody),
+        &refused,
+        &recorder,
+    );
+    assert_eq!(
+        gated.check("SELECT n FROM sales").await.ok(),
+        Some(Gate::Read)
+    );
+    assert_eq!(gated.turn.exposure(), Exposure::None);
+    assert_eq!(
+        gated.check("SELECT label FROM graph_person").await.ok(),
+        Some(Gate::Read)
+    );
+    assert_eq!(gated.turn.exposure(), Exposure::Documents);
+    assert_eq!(
+        gated.check("DELETE FROM sales").await.ok(),
+        Some(Gate::Refused(Hold::ReadDocuments))
+    );
+}

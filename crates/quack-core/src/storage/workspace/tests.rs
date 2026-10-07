@@ -2168,7 +2168,12 @@ fn document_chunks_page_in_order_and_documents_resolve_by_id_name_or_prefix() {
             "{want}"
         );
     }
-    for want in ["", "pol", "doc-b"] {
+    assert!(
+        DocumentInfo::find(&documents, " ")
+            .err()
+            .is_some_and(|e| e.to_string().contains("no document named"))
+    );
+    for want in ["pol", "doc-b"] {
         let error = DocumentInfo::find(&documents, want)
             .map(|d| d.id.clone())
             .map_err(|e| e.to_string());
@@ -2697,4 +2702,66 @@ fn a_bad_document_filter_is_refused_with_the_reason() {
         .map(|e| e.to_string());
     assert!(backwards.is_some_and(|e| e.contains("is after until")));
     assert!(DocumentFilter::default().is_empty());
+}
+
+/// An id prefix or a file name that several documents share is refused,
+/// never a pick of the first, and a miss in a large workspace lists 20
+/// documents and counts the rest.
+#[test]
+fn ambiguous_document_names_are_refused_and_misses_are_capped() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    for (id, filename) in [("doc-aaaa", "policy.md"), ("doc-bbbb", "policy-2.md")] {
+        db.insert_document(&NewDocument::new(
+            &DocumentId::from(id),
+            filename,
+            "text/markdown",
+            1,
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let twice = db.list_documents().unwrap_or_else(|e| fail(&e.to_string()));
+    let titled = twice.clone();
+    let prefix = DocumentInfo::find(&twice, "doc-")
+        .err()
+        .map(|e| e.to_string());
+    assert!(
+        prefix
+            .as_deref()
+            .is_some_and(|e| e.contains("2 documents have ids starting with 'doc-'")),
+        "{prefix:?}"
+    );
+    let mut same_name = twice;
+    for document in &mut same_name {
+        document.filename = String::from("policy.md");
+    }
+    let named = DocumentInfo::find(&same_name, "policy.md")
+        .err()
+        .map(|e| e.to_string());
+    assert!(
+        named
+            .as_deref()
+            .is_some_and(|e| e.contains("2 documents are named 'policy.md'")),
+        "{named:?}"
+    );
+    // A miss in a large workspace lists 20 documents and counts the rest.
+    let many: Vec<DocumentInfo> = (0..25)
+        .map(|i| {
+            let mut d = titled
+                .first()
+                .cloned()
+                .unwrap_or_else(|| fail("a document"));
+            d.id = DocumentId::from(format!("id-{i:02}"));
+            d
+        })
+        .collect();
+    let miss = DocumentInfo::find(&many, "nothing")
+        .err()
+        .map(|e| e.to_string());
+    assert!(
+        miss.as_deref().is_some_and(|e| e.contains("id-19")
+            && !e.contains("id-20")
+            && e.contains("and 5 more")),
+        "{miss:?}"
+    );
 }

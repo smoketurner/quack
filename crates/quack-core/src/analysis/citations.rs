@@ -224,7 +224,8 @@ impl CitationRegistry {
                 continue;
             };
             // `[3]`, or a group the model wrote as `[2, 3]`: each number
-            // that names a registered chunk becomes its own marker.
+            // that names a registered chunk becomes its own marker. A group
+            // that names none is text, such as a range `[10, 20]`, and stays.
             let numbers: Option<Vec<u32>> = inside
                 .split(',')
                 .map(|part| {
@@ -246,6 +247,13 @@ impl CitationRegistry {
                 out.push_str(after);
                 continue;
             };
+            if numbers.len() > 1 && !numbers.iter().any(|n| registered.iter().any(|c| c.n == *n)) {
+                out.push('[');
+                out.push_str(inside);
+                out.push(']');
+                out.push_str(after);
+                continue;
+            }
             for n in numbers {
                 // A number the model invented is dropped.
                 let Some(source) = registered.iter().find(|c| c.n == n) else {
@@ -363,11 +371,11 @@ mod tests {
             1
         );
         let CitedAnswer { text, citations } = registry.validate(
-            "Covered [2, 1]. Partly made up [1, 7]. All made up [3, 4]. A list [a, b] and [1,].",
+            "Covered [2, 1]. Partly made up [1, 7]. A range [3, 4]. A list [a, b] and [1,].",
         );
         assert_eq!(
             text,
-            "Covered [1][2]. Partly made up [2]. All made up . A list [a, b] and [1,]."
+            "Covered [1][2]. Partly made up [2]. A range [3, 4]. A list [a, b] and [1,]."
         );
         assert_eq!(
             citations

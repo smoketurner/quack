@@ -2068,6 +2068,15 @@ fn a_person_corrects_a_node_under_the_ontology() {
     let added = graph_store::create_node(&db, &vendor("Acme Pharma", "Acme Pharma"), &ada).unwrap();
     let po1 = graph_store::find_node(&db, "PO-1", None).unwrap();
     graph_store::create_edge(&db, &supplied_by(&po1.id, &added.subject.id), &ada).unwrap();
+    let vector = Vector::new(vec![0.5; 4], Dimension::new(4)).unwrap();
+    db.set_node_embedding(&added.subject.id, &vector).unwrap();
+    let needing = |db: &WorkspaceDb| -> bool {
+        graph_store::nodes_needing_embedding(db, 1_000)
+            .unwrap()
+            .iter()
+            .any(|n| n.id == added.subject.id)
+    };
+    assert!(!needing(&db), "embedded under the current profile");
     let edited = graph_store::update_node(
         &db,
         &added.subject.id,
@@ -2082,6 +2091,8 @@ fn a_person_corrects_a_node_under_the_ontology() {
     )
     .unwrap();
     assert_eq!(edited.label, "Acme Pharmaceuticals");
+    // A new label clears the old label's vector, so it is embedded again.
+    assert!(needing(&db), "the renamed node needs a new vector");
     assert_eq!(
         edited.properties.get("country"),
         Some(&serde_json::json!("Kenya"))
@@ -2285,4 +2296,24 @@ async fn an_ingest_follow_up_extracts_what_the_setting_names() {
     .unwrap()
     .unwrap();
     assert_eq!(nothing.to_string(), "graph: nothing new to extract");
+
+    // A newer ontology makes the graph stale; a follow-up that extracts
+    // only new documents does not make it current again.
+    let current = store::current(&db).unwrap().unwrap();
+    store::save(
+        &db,
+        &current,
+        Revision::reviewed(Some("test"), Some("v next")),
+    )
+    .unwrap();
+    assert!(graph_store::status(&db).unwrap().stale);
+    FollowUp {
+        db: &writer,
+        config: &config,
+        embeddings: None,
+    }
+    .run(std::slice::from_ref(&doc), RunControl::unobserved())
+    .await
+    .unwrap();
+    assert!(graph_store::status(&db).unwrap().stale, "still stale");
 }

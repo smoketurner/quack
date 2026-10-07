@@ -2452,6 +2452,9 @@ impl OpenedWorkspace {
                     writeln!(out, "replaced  {relative} ({old} -> {new})")?;
                 }
                 Outcome::Skipped(id) => writeln!(out, "skipped   {relative} (identical to {id})")?,
+                Outcome::Moved { document, from } => {
+                    writeln!(out, "moved     {from} -> {relative} ({document})")?;
+                }
                 Outcome::Failed(error) => writeln!(out, "failed    {relative}: {error}")?,
             }
         }
@@ -2494,7 +2497,7 @@ impl OpenedWorkspace {
             .iter()
             .filter_map(|r| match &r.outcome {
                 Outcome::Ingested(id) | Outcome::Replaced { new: id, .. } => Some(id.clone()),
-                Outcome::Skipped(_) | Outcome::Failed(_) => None,
+                Outcome::Skipped(_) | Outcome::Moved { .. } | Outcome::Failed(_) => None,
             })
             .collect();
         self.follow_ingest(&ws_db, embedding_model.as_ref(), &stored, &mut out)

@@ -1290,6 +1290,21 @@ impl WorkspaceDb {
         }
     }
 
+    /// Whether a statement reads one of the graph's `graph_` views, as
+    /// `DuckDB` parsed it, or by its words when it cannot be serialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the serialization query itself fails.
+    pub fn references_graph_view(&self, sql: &str) -> Result<bool> {
+        Ok(match self.referenced_base_tables(sql)? {
+            Some(names) => names.iter().any(|n| graph::views::is_reserved(n)),
+            None => sql
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(graph::views::is_reserved),
+        })
+    }
+
     fn create_internal_tables(&self) -> Result<()> {
         self.rename_legacy_tables()?;
         let dim = self.embedding_dimension();
@@ -1853,6 +1868,21 @@ impl WorkspaceDb {
             Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
             None => Ok(None),
         }
+    }
+
+    /// Record that `id`'s file now sits at `source_path` under the same
+    /// folder. Its name stays the one it was ingested under, which its
+    /// stored copy in `files/` is named after.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn move_document(&self, id: &DocumentId, source_path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _quack_documents SET source_path = ? WHERE id = ?",
+            duckdb::params![source_path, id],
+        )?;
+        Ok(())
     }
 
     /// Every ready document a run of the folder `source_root` stored, by
@@ -3955,6 +3985,39 @@ pub struct DocumentInfo {
     pub language: Option<String>,
 }
 
+/// One way a name can name a document, in the order `DocumentInfo::find`
+/// tries them.
+#[derive(Debug, Clone, Copy)]
+enum NameMatch {
+    Id,
+    FileName,
+    Title,
+    IdPrefix,
+}
+
+impl NameMatch {
+    const IN_ORDER: [Self; 4] = [Self::Id, Self::FileName, Self::Title, Self::IdPrefix];
+
+    fn matches(self, document: &DocumentInfo, want: &str) -> bool {
+        match self {
+            Self::Id => document.id.as_str() == want,
+            Self::FileName => document.filename == want,
+            Self::Title => document.title.as_deref().map(str::trim) == Some(want),
+            Self::IdPrefix => document.id.as_str().starts_with(want),
+        }
+    }
+
+    /// How an error says several documents match this way.
+    const fn phrase(self) -> &'static str {
+        match self {
+            Self::Id => "have the id",
+            Self::FileName => "are named",
+            Self::Title => "are titled",
+            Self::IdPrefix => "have ids starting with",
+        }
+    }
+}
+
 impl DocumentInfo {
     /// The title when one exists, else the filename.
     #[must_use]
@@ -3962,20 +4025,25 @@ impl DocumentInfo {
         self.title.as_deref().unwrap_or(&self.filename)
     }
 
-    /// The document in `documents` the model named: by id, exact file
-    /// name, exact title (the name the prompt's inventory shows), or id
-    /// prefix.
+    /// The document in `documents` a person or the model named: by id,
+    /// exact file name, exact title (the name the prompt's inventory
+    /// shows), or id prefix, tried in that order.
     ///
     /// # Errors
     ///
-    /// A name that matches none is an error listing the documents there
-    /// are, so the caller corrects it rather than reading an empty result
-    /// as "the workspace has nothing on this"; a title several documents
-    /// share is an error naming them.
+    /// A name that matches several documents the same way is an error
+    /// naming them, never a pick. A name that matches none is an error
+    /// listing some of the documents there are, so the caller corrects it
+    /// rather than reading an empty result as "the workspace has nothing on
+    /// this".
     pub fn find<'a>(documents: &'a [Self], want: &str) -> Result<&'a Self> {
+        /// Documents a listing in an error names at most.
+        const LISTED: usize = 20;
         let want = want.trim();
-        let listed = |documents: &mut dyn Iterator<Item = &Self>| -> String {
-            documents
+        let listed = |matches: &[&Self]| -> String {
+            let mut names: Vec<String> = matches
+                .iter()
+                .take(LISTED)
                 .map(|d| match d.title.as_deref() {
                     Some(title) => format!(
                         "{} ({}, \"{}\")",
@@ -3985,40 +4053,41 @@ impl DocumentInfo {
                     ),
                     None => format!("{} ({})", d.id, OneLine(&d.filename)),
                 })
-                .collect::<Vec<_>>()
-                .join(", ")
+                .collect();
+            if matches.len() > LISTED {
+                names.push(format!(
+                    "and {} more; list_documents names them all",
+                    matches.len().saturating_sub(LISTED)
+                ));
+            }
+            names.join(", ")
         };
-        if let Some(found) = documents
-            .iter()
-            .find(|d| d.id.as_str() == want || d.filename == want)
-        {
-            return Ok(found);
+        if want.is_empty() {
+            return Err(Error::Analysis(String::from(
+                "no document named; pass an id, a file name, or a title from list_documents",
+            )));
         }
-        let titled: Vec<&Self> = documents
-            .iter()
-            .filter(|d| !want.is_empty() && d.title.as_deref().map(str::trim) == Some(want))
-            .collect();
-        match titled.as_slice() {
-            [one] => return Ok(one),
-            [] => {}
-            several => {
-                return Err(Error::Analysis(format!(
-                    "{} documents are titled '{want}'; pass one's id or file name: {}",
-                    several.len(),
-                    listed(&mut several.iter().copied())
-                )));
+        for way in NameMatch::IN_ORDER {
+            let found: Vec<&Self> = documents.iter().filter(|d| way.matches(d, want)).collect();
+            match found.as_slice() {
+                [] => {}
+                [one] => return Ok(one),
+                several => {
+                    return Err(Error::Analysis(format!(
+                        "{} documents {} '{want}'; pass one's full id: {}",
+                        several.len(),
+                        way.phrase(),
+                        listed(several)
+                    )));
+                }
             }
         }
-        documents
-            .iter()
-            .find(|d| !want.is_empty() && d.id.as_str().starts_with(want))
-            .ok_or_else(|| {
-                Error::Analysis(format!(
-                    "no document matches '{want}'; pass an id (a prefix is enough), an exact \
-                     file name, or an exact title from list_documents. Documents: {}",
-                    listed(&mut documents.iter())
-                ))
-            })
+        let all: Vec<&Self> = documents.iter().collect();
+        Err(Error::Analysis(format!(
+            "no document matches '{want}'; pass an id (a prefix is enough), an exact file name, \
+             or an exact title from list_documents. Documents: {}",
+            listed(&all)
+        )))
     }
 
     /// The tables a row from before `tables` was recorded loaded into: the
