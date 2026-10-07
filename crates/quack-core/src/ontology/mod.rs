@@ -21,6 +21,7 @@ use schemars::{JsonSchema, Schema, schema_for};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{Error, Result};
+use crate::graph::views;
 use crate::ids::{ClassId, RelationId};
 use crate::storage::workspace::quote_ident;
 use crate::text::OneLine;
@@ -852,6 +853,15 @@ impl Ontology {
             if class.id == ROOT_CLASS {
                 return Err(Error::Ontology(format!(
                     "'{ROOT_CLASS}' is the implicit root and cannot be declared"
+                )));
+            }
+            // Each class's view is `graph_<id>`, and `graph_edges` is the
+            // edge view: a class by that id would have no view of its own.
+            if Some(class.id.as_str()) == views::EDGES_VIEW.strip_prefix(views::PREFIX) {
+                return Err(Error::Ontology(format!(
+                    "class id '{}' is taken by the graph's edge view ({}); choose another",
+                    class.id,
+                    views::EDGES_VIEW
                 )));
             }
             if !seen.insert(class.id.as_str()) {

@@ -127,6 +127,33 @@ impl SessionTitler {
         ));
     }
 
+    /// After a turn is recorded, start a title for `session` when titling
+    /// is on and the session still carries its derived title. The stored
+    /// session decides, not the replayed history, which the token window
+    /// may cut; and a cancelled first turn is titled by the next.
+    pub async fn follow_turn(config: &Config, db: &Arc<Writer>, session: &SessionId) {
+        let id = session.clone();
+        let untitled = db
+            .run(move |db| {
+                Ok(sessions::get_session(db, &id)?
+                    .is_some_and(|s| s.title_by == sessions::TitleSource::Derived))
+            })
+            .await;
+        match untitled {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "the session keeps its derived title");
+                return;
+            }
+        }
+        match Self::from_config(config).await {
+            Ok(Some(titler)) => titler.spawn(Arc::clone(db), session.clone()),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "the session keeps its derived title"),
+        }
+    }
+
     /// Wait, at most `limit`, for titles still being written: a command
     /// that answers one question and exits (`quack -p`, `saved run
     /// --refresh`) calls this after printing, or its runtime would drop the

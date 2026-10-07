@@ -19,6 +19,7 @@ use quack_core::ingestion::parser::SectionKind;
 use quack_core::ingestion::parser::{FileType, PageCounts};
 use quack_core::ingestion::tree::{Folder, FolderReport, Outcome, Prune};
 use quack_core::llm::CancellationToken;
+use quack_core::llm::egress::Egress;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::{ControlPlane, WorkspaceName};
 use quack_core::storage::profile::TableProfile;
@@ -2752,6 +2753,51 @@ async fn an_image_without_a_vision_model_is_refused() {
             .unwrap()
             .iter()
             .any(|d| d.filename == "chart.png")
+    );
+}
+
+/// An image the vision model could not read fails as a document and
+/// leaves no stored copy behind.
+#[tokio::test]
+async fn an_image_the_model_cannot_read_leaves_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config: Config = toml::from_str(
+        "[ingestion]\nvision_model = \"down/vision\"\n\
+         [providers.down]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\nmax_retries = 0\n",
+    )
+    .unwrap();
+    config.general.data_dir = dir.path().to_path_buf();
+    let db = WorkspaceDb::open(&config, "ws-unread").unwrap();
+    let writer = writer_of(&db);
+    let failed = Egress::scope(
+        Some(Egress::NoWorkspace),
+        ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-unread",
+            &ingestion::NewFile::new("chart.png", b"\x89PNG\r\n\x1a\n"),
+            None::<&Embedder<MockEmbeddingModel>>,
+        ),
+    )
+    .await;
+    assert!(failed.is_err());
+    let document = db
+        .list_all_documents()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.filename == "chart.png")
+        .unwrap();
+    assert_eq!(document.status, DocumentStatus::Error);
+    let files: Vec<String> = std::fs::read_dir(config.workspace_files_dir("ws-unread"))
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !files.iter().any(|f| f.starts_with(document.id.as_str())),
+        "{files:?}"
     );
 }
 
