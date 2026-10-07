@@ -1174,6 +1174,10 @@ pub struct ImportConfig {
     /// private, and link-local addresses, including cloud metadata
     /// endpoints. The CLI, the terminal, and `--local` always may.
     pub allow_private_hosts: bool,
+    /// Whether `quack serve` (with logins) may import from S3 with the
+    /// server's AWS identity, or send a bearer token read from the server's
+    /// environment. The CLI, the terminal, and `--local` always may.
+    pub allow_server_credentials: bool,
 }
 
 impl ImportConfig {
@@ -1192,6 +1196,7 @@ impl Default for ImportConfig {
             timeout_seconds: 300,
             allow_local_files: false,
             allow_private_hosts: false,
+            allow_server_credentials: false,
         }
     }
 }

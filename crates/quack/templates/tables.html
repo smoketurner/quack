@@ -70,8 +70,8 @@
     {% endif %}
     {% if ws.can_write %}
     <form method="post" action="/w/{{ ws.membership.workspace.id }}/import" class="mt-6 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
-      <h2 class="font-medium">Import from a SQLite file or a URL</h2>
-      <p class="mt-1 text-xs text-slate-400">sqlite:/path/to.db, or https://host/file.csv (also .parquet, .json, .xlsx). A password in the URL is used once and never stored.</p>
+      <h2 class="font-medium">Import from a SQLite file, a URL, or S3</h2>
+      <p class="mt-1 text-xs text-slate-400">sqlite:/path/to.db, https://host/file.csv (also .parquet, .json, .xlsx), or s3://bucket/key.csv. A password in the URL and header values are used once and never stored.</p>
       {% if selected.is_none() %}{% if let Some(error) = error %}<p role="alert" class="mt-2 rounded border border-red-900 bg-red-950 px-2 py-1 text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}{% endif %}
       <div class="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
         <input aria-label="Source URL" name="url" placeholder="source URL" required class="rounded border border-slate-700 px-2 py-1 md:col-span-2">
@@ -79,6 +79,9 @@
         <input aria-label="Source table" name="source_table" placeholder="source table (or leave empty and give a query)" class="rounded border border-slate-700 px-2 py-1">
         <textarea aria-label="Source query" name="query" rows="2" placeholder="SELECT ... (optional)" class="rounded border border-slate-700 px-2 py-1 font-mono text-xs md:col-span-2"></textarea>
         <input aria-label="Column types" name="types" placeholder="column types (optional): amount=DOUBLE, placed=DATE" class="rounded border border-slate-700 px-2 py-1 font-mono text-xs md:col-span-2">
+        <textarea aria-label="Request headers" name="headers" rows="2" placeholder="headers for an https download (optional), one per line: X-Api-Key: ..." class="rounded border border-slate-700 px-2 py-1 font-mono text-xs md:col-span-2"></textarea>
+        <input aria-label="JSON pointer" name="json_pointer" placeholder="rows inside a JSON download (optional): /data/items" class="rounded border border-slate-700 px-2 py-1 font-mono text-xs">
+        <input aria-label="Bearer token variable" name="bearer_env" placeholder="bearer token from server variable (optional)" class="rounded border border-slate-700 px-2 py-1 font-mono text-xs">
       </div>
       <button type="submit" class="mt-2 rounded bg-blue-600 px-3 py-1 text-white hover:bg-blue-500">Import</button>
     </form>

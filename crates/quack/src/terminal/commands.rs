@@ -8,6 +8,7 @@ use std::sync::LazyLock;
 use clap::error::ErrorKind;
 use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
 use quack_core::graph::traverse::Hops;
+use quack_core::import::{JsonPointer, SourceHeader};
 use quack_core::ingestion::parser::FileType;
 use quack_core::jobs::JobNumber;
 use quack_core::storage::workspace::{SqlName, looks_like_direct_sql};
@@ -66,6 +67,15 @@ pub(crate) enum SlashCommand {
         /// Run this query on the source instead of reading a table
         #[arg(long, value_name = "SQL")]
         query: Option<String>,
+        /// Send a header with an http(s) download, as `NAME: VALUE`
+        #[arg(long = "header", short = 'H', value_name = "NAME: VALUE")]
+        headers: Vec<SourceHeader>,
+        /// Send `Authorization: Bearer` with the token in this variable
+        #[arg(long, value_name = "VAR")]
+        bearer_env: Option<String>,
+        /// Load the array of rows at this pointer inside a JSON download
+        #[arg(long, value_name = "POINTER")]
+        json_pointer: Option<JsonPointer>,
     },
     /// List ingested documents
     #[command(name = "/docs")]

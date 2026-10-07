@@ -64,6 +64,9 @@ pub(crate) enum ErrorCode {
     DelegationFailed,
     /// The workspace's provider allow-list refused the model.
     ProviderRefused,
+    /// An import would use the server's own credentials, which
+    /// `[import].allow_server_credentials` does not allow.
+    ServerCredentials,
     /// The server's configuration does not allow the request.
     InvalidConfig,
     /// An id prefix matches more than one record.
@@ -146,6 +149,7 @@ impl ErrorCode {
             // the workspace's allow-list keeps its content from the provider.
             CoreError::Delegation { .. } => (Self::DelegationFailed, StatusCode::FORBIDDEN),
             CoreError::ProviderRefused(_) => (Self::ProviderRefused, StatusCode::FORBIDDEN),
+            CoreError::ServerCredentials => (Self::ServerCredentials, StatusCode::FORBIDDEN),
             CoreError::Config(_) => (Self::InvalidConfig, StatusCode::BAD_REQUEST),
             CoreError::Ambiguous { .. } => (Self::Ambiguous, StatusCode::BAD_REQUEST),
             CoreError::NoChatModel { .. } => (Self::NoChatModel, StatusCode::BAD_REQUEST),

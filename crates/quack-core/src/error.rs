@@ -157,6 +157,15 @@ pub enum Error {
     #[error("account disabled")]
     AccountDisabled,
 
+    /// An import would authenticate as this process (S3 with its AWS
+    /// identity, or a bearer token from its environment) for a caller
+    /// `[import].allow_server_credentials` does not cover.
+    #[error(
+        "S3 and environment-variable credentials use the server's own identity; run \
+         `quack import` on the host, or set [import].allow_server_credentials"
+    )]
+    ServerCredentials,
+
     /// A workspace snapshot that is not one, is from a newer quack, or
     /// names a path outside the workspace (`storage::backup`).
     #[error("snapshot error: {0}")]

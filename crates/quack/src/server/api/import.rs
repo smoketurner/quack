@@ -1,6 +1,7 @@
-//! `POST .../import`: rows from a SQLite file or a data file over HTTP(S)
-//! as a workspace table. Needs the write permission; audited as
-//! `import` with the redacted source (the password never lands anywhere).
+//! `POST .../import`: rows from a SQLite file, a data file over HTTP(S), or
+//! an S3 object as a workspace table. Needs the write permission; audited
+//! as `import` with the redacted source and the headers' names (a password
+//! or header value never lands anywhere).
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -18,12 +19,14 @@ use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult, ErrorCode};
 use crate::server::run;
 use crate::server::state::{App, ServeMode};
-use quack_core::import::{self, ImportPolicy, ImportRequest, ImportSummary};
+use quack_core::import::{
+    self, ImportPolicy, ImportRequest, ImportSummary, JsonPointer, SourceHeader,
+};
 use quack_core::jobs::JobId;
 
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct ImportBody {
-    /// `sqlite://...`, or an `http(s)://` data file.
+    /// `sqlite://...`, an `http(s)://` data file, or `s3://bucket/key`.
     pub url: String,
     /// The workspace table the rows load into.
     pub table: String,
@@ -35,6 +38,13 @@ pub(crate) struct ImportBody {
     pub limit: Option<u64>,
     /// `COLUMN=TYPE` pairs, comma-separated, as `quack import --types`.
     pub types: Option<String>,
+    /// Headers an `http(s)://` download sends, one `Name: value` per line.
+    pub headers: Option<String>,
+    /// The server's environment variable whose token goes as
+    /// `Authorization: Bearer`; needs `[import].allow_server_credentials`.
+    pub bearer_env: Option<String>,
+    /// Where a JSON download's rows sit (RFC 6901), as `/data/items`.
+    pub json_pointer: Option<String>,
 }
 
 /// A blank query, source table, or types (an empty form field) is none.
@@ -44,18 +54,32 @@ impl TryFrom<ImportBody> for ImportRequest {
     fn try_from(body: ImportBody) -> ApiResult<Self> {
         let given =
             |field: Option<String>| field.as_deref().and_then(str::non_blank).map(str::to_owned);
+        let bad = |e: CoreError| ApiError::bad_request(e.to_string());
         let types: ColumnTypes = given(body.types)
             .map(|t| t.parse())
             .transpose()
-            .map_err(|e: CoreError| ApiError::bad_request(e.to_string()))?
+            .map_err(bad)?
             .unwrap_or_default();
+        let mut headers = given(body.headers)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(str::non_blank)
+            .map(str::parse::<SourceHeader>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(bad)?;
+        headers.extend(given(body.bearer_env).map(SourceHeader::BearerEnv));
+        let json_pointer = given(body.json_pointer)
+            .map(|p| p.parse::<JsonPointer>())
+            .transpose()
+            .map_err(bad)?;
         Ok(Self {
-            url: body.url.into(),
-            table: body.table,
             query: given(body.query),
             source_table: given(body.source_table),
             limit: body.limit,
             types,
+            headers,
+            json_pointer,
+            ..Self::new(body.url, body.table)
         })
     }
 }
@@ -99,10 +123,34 @@ pub(crate) async fn run_import(
     request: &ImportRequest,
 ) -> ApiResult<Imported> {
     let source = request.url.redacted();
-    request
+    let kind = request
         .url
         .kind()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // `--local` is the owner at a keyboard; anyone else is held to
+    // `[import]`: no files from the server's disk, no private hosts, and no
+    // credentials of the server's own.
+    let policy = if app.mode == ServeMode::Local {
+        ImportPolicy::owner()
+    } else {
+        ImportPolicy::server(&app.config)
+    };
+    if let Err(refused) = request.check(kind, policy) {
+        if matches!(refused, CoreError::ServerCredentials) {
+            let detail = serde_json::json!({ "source": source, "table": request.table });
+            access
+                .audit(
+                    app,
+                    AuditAction::Import,
+                    None,
+                    Outcome::Denied,
+                    Some(detail),
+                )
+                .await?;
+            return Err(ApiError::from(refused));
+        }
+        return Err(ApiError::bad_request(refused.to_string()));
+    }
     let db = app.workspace_db(&access.membership.workspace.id).await?;
     let embeddings = access
         .model(
@@ -111,13 +159,6 @@ pub(crate) async fn run_import(
             Embeddings::from_config(&app.config).await,
         )
         .await?;
-    // `--local` is the owner at a keyboard; anyone else is held to
-    // `[import]`: no files from the server's disk, no private hosts.
-    let policy = if app.mode == ServeMode::Local {
-        ImportPolicy::owner()
-    } else {
-        ImportPolicy::server(&app.config)
-    };
     let outcome = import::Importing {
         config: &app.config,
         db: &db,
@@ -134,6 +175,8 @@ pub(crate) async fn run_import(
         "table": request.table,
         "query": request.query,
         "source_table": request.source_table,
+        "headers": request.headers.iter().map(SourceHeader::name).collect::<Vec<_>>(),
+        "json_pointer": request.json_pointer.as_ref().map(ToString::to_string),
         "rows": outcome.as_ref().ok().map(|s| s.rows),
     });
     let audit_outcome = Outcome::of(&outcome);

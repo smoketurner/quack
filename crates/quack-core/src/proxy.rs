@@ -11,6 +11,7 @@ use std::net::IpAddr;
 use std::sync::LazyLock;
 
 use aws_smithy_http_client::proxy::ProxyConfig;
+use aws_smithy_runtime_api::client::http::SharedHttpClient;
 use http::uri::Authority;
 use hyper_util::client::proxy::matcher::Matcher;
 use reqwest::{NoProxy, Proxy, Url};
@@ -336,6 +337,33 @@ impl Proxies {
                 ProxyConfig::disabled()
             }
         }
+    }
+
+    /// The AWS SDK's HTTPS client through these proxies, on the crypto
+    /// module `crypto::install_default_provider` installs: FIPS on Linux,
+    /// where the feature is on (docs/crypto.md).
+    #[must_use]
+    pub fn aws_client(&self) -> SharedHttpClient {
+        use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
+        #[cfg(target_os = "linux")]
+        let mode = CryptoMode::AwsLcFips;
+        #[cfg(not(target_os = "linux"))]
+        let mode = CryptoMode::AwsLc;
+        let proxy = self.aws();
+        // `build_https` takes no proxy; the SDK builds its own default
+        // client through this function for the same reason.
+        aws_smithy_http_client::Builder::new().build_with_connector_fn(
+            move |settings, components| {
+                let mut connector = aws_smithy_http_client::Connector::builder()
+                    .tls_provider(tls::Provider::Rustls(mode.clone()))
+                    .proxy_config(proxy.clone());
+                connector.set_connector_settings(settings.cloned());
+                if let Some(components) = components {
+                    connector.set_sleep_impl(components.sleep_impl());
+                }
+                connector.build()
+            },
+        )
     }
 
     /// Whether a request to `url` goes through a proxy.

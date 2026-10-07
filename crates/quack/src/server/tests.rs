@@ -5393,6 +5393,68 @@ async fn import_bundle_audits_both_the_ontology_restore_and_the_candidate_run() 
     );
 }
 
+/// A signed-in user may not import with the server's own credentials (S3,
+/// a bearer token from the server's environment) unless the config allows
+/// it; the refusal is a 403 with its code and a denied audit row. Options a
+/// source cannot take are a 400.
+#[tokio::test]
+async fn server_credentials_are_refused_to_signed_in_users() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("olive", UserKind::Standard).await;
+    let ws = h.workspace("sales", &owner).await;
+    let token = h.login("olive").await;
+    let path = format!("/api/v1/workspaces/{ws}/import");
+    for body in [
+        serde_json::json!({ "url": "s3://bucket/sales.csv", "table": "t" }),
+        serde_json::json!({
+            "url": "https://example.com/sales.csv",
+            "table": "t",
+            "bearer_env": "AWS_SECRET_ACCESS_KEY"
+        }),
+    ] {
+        let (status, answer) = h.call(Method::POST, &path, Some(&token), Some(body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+        assert_eq!(answer["code"], "server_credentials", "{answer}");
+        assert!(
+            answer["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("allow_server_credentials"),
+            "{answer}"
+        );
+    }
+    let denied = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("import")),
+            outcome: Some(Outcome::Denied),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(denied.len(), 2, "{denied:?}");
+    for body in [
+        serde_json::json!({
+            "url": "sqlite:/tmp/a.db",
+            "table": "t",
+            "source_table": "t",
+            "headers": "X-Api-Key: k"
+        }),
+        serde_json::json!({
+            "url": "https://example.com/a.json",
+            "table": "t",
+            "json_pointer": "data"
+        }),
+        serde_json::json!({
+            "url": "https://example.com/a.json",
+            "table": "t",
+            "headers": "no colon here"
+        }),
+    ] {
+        let (status, answer) = h.call(Method::POST, &path, Some(&token), Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_redacted() {
     let h = harness(ServeMode::Local).await;
