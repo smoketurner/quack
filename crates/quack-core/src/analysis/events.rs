@@ -152,6 +152,13 @@ pub enum Delivery {
     TurnGone,
 }
 
+impl Delivery {
+    /// What every interface says when an answer came after the turn
+    /// stopped waiting.
+    pub const TURN_GONE: &'static str =
+        "The question that asked for this write has already ended; nothing ran.";
+}
+
 /// The interface's answer to a permission request: the API body's
 /// `decision` and the audit detail's, as `deny`, `allow`, `allow_turn`.
 #[derive(
@@ -163,12 +170,37 @@ pub enum Decision {
     /// This statement only.
     Allow,
     /// This statement and every later write in the same turn held for the
-    /// same reason (the terminal's `a`). The interface keeps its own flag for
-    /// the turns after.
+    /// same reason.
     AllowTurn,
 }
 
 impl Decision {
+    /// Every answer, in the order an interface offers them.
+    pub const CHOICES: [Self; 3] = [Self::Allow, Self::Deny, Self::AllowTurn];
+
+    /// What a write prompt says above the statement, in every interface.
+    pub const HEADING: &'static str = "This statement changes the workspace:";
+
+    /// The words every interface offers the answer under.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Allow => "Run it",
+            Self::Deny => "Don't run it",
+            Self::AllowTurn => "Allow for this turn",
+        }
+    }
+
+    /// What every interface says once the turn has the answer.
+    #[must_use]
+    pub const fn reply(self) -> &'static str {
+        match self {
+            Self::Allow => "Ran it.",
+            Self::Deny => "Not run.",
+            Self::AllowTurn => "Ran it; the rest of this turn's writes run too.",
+        }
+    }
+
     /// The text form, as the API body and the audit detail carry it.
     #[must_use]
     pub const fn as_str(self) -> &'static str {

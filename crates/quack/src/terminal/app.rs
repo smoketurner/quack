@@ -3,7 +3,6 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -100,13 +99,23 @@ No chat model is configured, so questions cannot be answered yet. SQL, file
 loading, and every /command work without one. Set [general].chat_model (or
 QUACK_MODEL) to PROVIDER/MODEL; `quack doctor` checks the setup and suggests one.";
 
-/// The choices every write prompt offers.
-const RUN_IT: &str = "Run it?  y = yes   n = no   a = yes, and allow writes for this session";
+/// The key that gives each answer at a write prompt.
+pub(crate) const fn answer_key(decision: Decision) -> char {
+    match decision {
+        Decision::Allow => 'y',
+        Decision::Deny => 'n',
+        Decision::AllowTurn => 'a',
+    }
+}
 
-/// The answer to `a` at a write prompt.
-const ALLOWED_FOR_SESSION: &str = "Allowed. Writes are permitted for the rest of this session.";
-/// An allow given after the question stopped waiting (cancelled) ran nothing.
-const TURN_GONE: &str = "That question had already ended; nothing ran.";
+/// Every answer with its key, as `[y] Run it   [n] Don't run it   ...`.
+pub(crate) fn answer_keys() -> String {
+    Decision::CHOICES
+        .into_iter()
+        .map(|decision| format!("[{}] {}", answer_key(decision), decision.label()))
+        .collect::<Vec<_>>()
+        .join("   ")
+}
 
 /// What a transcript message is, which decides how it is drawn.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -283,32 +292,12 @@ impl From<&JobInfo> for Ticket {
     }
 }
 
-/// A decision the user owes. Prompts are modal, answered in order, while
-/// every job keeps running.
-enum Prompt {
-    /// A write the agent wants to make in the turn run by `job`.
-    Agent {
-        job: Ticket,
-        request: PermissionRequest,
-    },
-    /// A typed statement that modifies the workspace.
-    Sql(String),
-}
-
-impl Prompt {
-    fn sql(&self) -> &str {
-        match self {
-            Self::Agent { request, .. } => &request.sql,
-            Self::Sql(sql) => sql,
-        }
-    }
-
-    fn notice(&self) -> Option<&'static str> {
-        match self {
-            Self::Agent { request, .. } => request.hold.notice(),
-            Self::Sql(_) => None,
-        }
-    }
+/// A write the agent wants to make in the turn run by `job`: a decision
+/// the user owes. Prompts are modal, answered in order, while every job
+/// keeps running.
+struct Prompt {
+    job: Ticket,
+    request: PermissionRequest,
 }
 
 /// What the permission overlay asks about: the front prompt, described when
@@ -954,9 +943,8 @@ pub(crate) struct App {
     workspace_id: WorkspaceId,
     db: SharedDb,
     reader_db: ReaderDb,
-    /// Writes allowed for the session (`--allow-write`, or `a` at a
-    /// prompt). Shared with queued turns, which read it when they start.
-    allow_write: Arc<AtomicBool>,
+    /// `--allow-write`: the agent's writes run without asking.
+    allow_write: bool,
     /// `/steps`: show tool details whole instead of a preview.
     pub(crate) expand_steps: bool,
     /// Each message's wrapped lines, by index, with the fingerprint they
@@ -1022,7 +1010,7 @@ impl App {
             workspace_id,
             db,
             reader_db,
-            allow_write: Arc::new(AtomicBool::new(writes.allows_unasked())),
+            allow_write: writes.allows_unasked(),
             expand_steps: false,
             wrap_cache: RefCell::new(Vec::new()),
             msg_rx,
@@ -1372,8 +1360,7 @@ impl App {
             }
             AppMsg::TurnClosed(job) => {
                 // Nothing will answer its prompts now.
-                self.prompts
-                    .retain(|p| !matches!(p, Prompt::Agent { job: owner, .. } if owner.id == job));
+                self.prompts.retain(|prompt| prompt.job.id != job);
                 if let Some(turn) = self.turns.iter_mut().find(|t| t.job.id == job) {
                     turn.progress = turn.progress.closed();
                 }
@@ -1400,24 +1387,18 @@ impl App {
 
     pub(crate) fn pending_write(&self) -> Option<PendingWrite<'_>> {
         let prompt = self.prompts.front()?;
-        let heading = match prompt {
-            Prompt::Agent { job, .. } => {
-                let speaker = self
-                    .turns
-                    .iter()
-                    .find(|turn| turn.job.id == job.id)
-                    .map_or_else(
-                        || String::from("The agent"),
-                        |turn| turn.speaker(&self.session_id),
-                    );
-                format!("{speaker} wants to run:")
-            }
-            Prompt::Sql(_) => String::from("Your statement modifies the workspace:"),
-        };
+        let speaker = self
+            .turns
+            .iter()
+            .find(|turn| turn.job.id == prompt.job.id)
+            .map_or_else(
+                || String::from("The agent"),
+                |turn| turn.speaker(&self.session_id),
+            );
         Some(PendingWrite {
-            heading,
-            sql: prompt.sql(),
-            notice: prompt.notice(),
+            heading: format!("{speaker}: {}", Decision::HEADING),
+            sql: &prompt.request.sql,
+            notice: prompt.request.hold.notice(),
             waiting: self.prompts.len().saturating_sub(1),
         })
     }
@@ -1561,12 +1542,14 @@ impl App {
         self.note(
             MessageKind::System,
             format!(
-                "{} wants to run a statement that modifies the workspace:\n{}\n{notice}{RUN_IT}",
+                "{}: {}\n{}\n{notice}{}",
                 turn.speaker(&self.session_id),
-                request.sql
+                Decision::HEADING,
+                request.sql,
+                answer_keys()
             ),
         );
-        self.prompts.push_back(Prompt::Agent {
+        self.prompts.push_back(Prompt {
             job: turn.job,
             request,
         });
@@ -1598,7 +1581,7 @@ impl App {
         for result in response.graph.iter().filter(|r| !r.is_empty()) {
             self.note(MessageKind::System, result.to_string());
         }
-        if response.write_refused && !self.writes_allowed() {
+        if response.write_refused && !self.allow_write {
             self.note(
                 MessageKind::System,
                 "A write was refused this turn. Answer y next time, or restart with --allow-write.",
@@ -1607,10 +1590,6 @@ impl App {
         turn.streaming = None;
         turn.open_step = None;
         self.scroll = Scroll::Latest;
-    }
-
-    fn writes_allowed(&self) -> bool {
-        self.allow_write.load(Ordering::Relaxed)
     }
 
     /// The newest turn of the session on screen, queued or running.
@@ -1629,12 +1608,10 @@ impl App {
     fn cancel_turn(&mut self, job: Ticket) {
         let mut kept = VecDeque::new();
         for prompt in self.prompts.drain(..) {
-            match prompt {
-                Prompt::Agent {
-                    job: owner,
-                    request,
-                } if owner.id == job.id => request.deny(),
-                other => kept.push_back(other),
+            if prompt.job.id == job.id {
+                prompt.request.deny();
+            } else {
+                kept.push_back(prompt);
             }
         }
         self.prompts = kept;
@@ -1732,9 +1709,7 @@ impl App {
     /// after that is dropped with the runtime at its next await.
     async fn stop_jobs(&mut self) {
         for prompt in self.prompts.drain(..) {
-            if let Prompt::Agent { request, .. } = prompt {
-                request.deny();
-            }
+            prompt.request.deny();
         }
         let left = self.jobs.shutdown(QUIT_GRACE).await;
         if !left.is_empty() {
@@ -1766,13 +1741,9 @@ impl App {
         if ctrl_c {
             // The prompt on screen first, then this session's newest turn.
             match self.prompts.front() {
-                Some(Prompt::Agent { job, .. }) => {
-                    let job = *job;
+                Some(prompt) => {
+                    let job = prompt.job;
                     self.cancel_turn(job);
-                    return;
-                }
-                Some(Prompt::Sql(_)) => {
-                    self.handle_permission_key(KeyCode::Esc);
                     return;
                 }
                 None => {
@@ -1847,59 +1818,26 @@ impl App {
     /// The answer a key gives, if it is one: `y`, `n` (or Esc), `a`.
     fn handle_permission_key(&mut self, code: KeyCode) {
         let answer = match code {
-            KeyCode::Char('y' | 'Y') => Decision::Allow,
-            KeyCode::Char('a' | 'A') => Decision::AllowTurn,
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => Decision::Deny,
+            KeyCode::Esc => Decision::Deny,
+            KeyCode::Char(key) => {
+                let Some(answer) = Decision::CHOICES
+                    .into_iter()
+                    .find(|decision| answer_key(*decision) == key.to_ascii_lowercase())
+                else {
+                    return;
+                };
+                answer
+            }
             _ => return,
         };
         let Some(prompt) = self.prompts.pop_front() else {
             return;
         };
-        match prompt {
-            Prompt::Sql(sql) => self.decide_pending_sql(sql, answer),
-            Prompt::Agent { request, .. } => self.decide_agent_write(request, answer),
-        }
-    }
-
-    /// The user's answer to a write the agent asked for.
-    fn decide_agent_write(&mut self, request: PermissionRequest, answer: Decision) {
-        match answer {
-            Decision::Allow => match request.allow() {
-                Delivery::Delivered => self.note(MessageKind::System, "Allowed."),
-                Delivery::TurnGone => self.note(MessageKind::System, TURN_GONE),
-            },
-            Decision::AllowTurn => {
-                // The rest of this turn through the request, the turns
-                // after (queued ones included) through the shared flag each
-                // reads when it starts.
-                let delivered = request.allow_for_turn();
-                self.allow_write.store(true, Ordering::Relaxed);
-                self.note(MessageKind::System, ALLOWED_FOR_SESSION);
-                if delivered == Delivery::TurnGone {
-                    self.note(MessageKind::System, TURN_GONE);
-                }
-            }
-            Decision::Deny => {
-                request.deny();
-                self.note(MessageKind::System, "Refused.");
-            }
-        }
-    }
-
-    /// The user's answer to a typed statement's write prompt.
-    fn decide_pending_sql(&mut self, sql: String, answer: Decision) {
-        match answer {
-            Decision::Deny => {
-                self.note(MessageKind::System, "Refused.");
-                return;
-            }
-            Decision::AllowTurn => {
-                self.allow_write.store(true, Ordering::Relaxed);
-                self.note(MessageKind::System, ALLOWED_FOR_SESSION);
-            }
-            Decision::Allow => {}
-        }
-        self.execute_direct_sql(sql, Side::Write);
+        let reply = match prompt.request.answer(answer) {
+            Delivery::Delivered => answer.reply(),
+            Delivery::TurnGone => Delivery::TURN_GONE,
+        };
+        self.note(MessageKind::System, reply);
     }
 
     /// What the popup offers for the input, if it is showing: one line
@@ -2767,10 +2705,9 @@ impl App {
     }
 
     /// `/sql`, or a line that starts like a statement: the same gate the
-    /// agent's statements pass. Internal tables are refused, an invalid
+    /// agent's statements pass. Internal tables are refused, and an invalid
     /// statement is reported (or asked as a question, when it was only
-    /// guessed to be SQL), and a write asks y/n/a unless writes are
-    /// already allowed for the session.
+    /// guessed to be SQL).
     fn run_direct_sql(&mut self, sql: String, intent: SqlIntent) {
         self.note(MessageKind::User, sql.clone());
         // Classifying is a parse: the reader pool does it, off the loop.
@@ -2782,7 +2719,7 @@ impl App {
         );
     }
 
-    /// Run a classified statement, or ask before a write.
+    /// Run a classified statement.
     fn gate_direct_sql(&mut self, sql: String, kind: CoreResult<StatementKind>, intent: SqlIntent) {
         // DuckDB could not parse it, so a question that happens to start
         // with a keyword goes to the model after all.
@@ -2800,16 +2737,9 @@ impl App {
         self.last_sql = Some(sql.clone());
         match kind {
             Ok(StatementKind::Read) => self.execute_direct_sql(sql, Side::Read),
-            Ok(StatementKind::Write) if self.writes_allowed() => {
-                self.execute_direct_sql(sql, Side::Write);
-            }
-            Ok(StatementKind::Write) => {
-                self.note(
-                    MessageKind::System,
-                    format!("This statement modifies the workspace.\n{RUN_IT}"),
-                );
-                self.prompts.push_back(Prompt::Sql(sql));
-            }
+            // A person's own statement runs as typed, as the web SQL page
+            // runs it; only the agent's writes ask.
+            Ok(StatementKind::Write) => self.execute_direct_sql(sql, Side::Write),
             Ok(StatementKind::Invalid(message)) => self.note(MessageKind::Error, message),
             Err(e) => self.note(MessageKind::Error, e.to_string()),
         }
@@ -2861,14 +2791,11 @@ impl App {
         let db = Arc::clone(&self.db);
         let reader_db = self.reader_db.clone();
         let session_id = self.session_id.clone();
-        let allow_write = Arc::clone(&self.allow_write);
+        let policy = WritePolicy::Ask.allowed_if(self.allow_write);
         let spec = JobSpec::new(JobKind::Chat, one_line(&message))
             .workspace(self.workspace_id.clone())
             .lane(Lane::serial(&LaneKey::Session(session_id.clone())));
         let job = Ticket::from(&self.jobs.submit(spec, move |ctx| async move {
-            // Read when the turn starts, so an `a` answered while it
-            // waited applies to it.
-            let policy = WritePolicy::Ask.allowed_if(allow_write.load(Ordering::Relaxed));
             // The turn emits TurnComplete or Failed itself; the returned
             // value is the same response, and the job keeps its outline.
             match (llm::TurnRequest {

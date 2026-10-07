@@ -194,12 +194,9 @@ async fn slash_commands_run_sql_schema_and_cli_verbs_without_a_terminal() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let mut app = app(dir.path());
 
-    // A write asks first; `y` runs it as a job.
+    // A person's own write runs as typed, as a job, without asking.
     app.handle_slash_command("/sql CREATE TABLE t AS SELECT 1 AS a, 'x' AS b");
     db_settle(&mut app).await;
-    assert!(app.awaiting_permission());
-    assert!(matches!(app.prompts.front(), Some(Prompt::Sql(_))));
-    app.handle_key_event(KeyCode::Char('y'), KeyModifiers::NONE);
     assert!(!app.awaiting_permission());
     settle(&mut app).await;
     assert_eq!(last(&app).kind, MessageKind::Sql);
@@ -626,7 +623,7 @@ fn overlay(app: &App) -> String {
     let rows = screen(app);
     let start = rows
         .iter()
-        .rposition(|row| row.contains("Run this statement?"))
+        .rposition(|row| row.contains("[y] Run it"))
         .and_then(|end| {
             rows.iter()
                 .take(end)
@@ -648,7 +645,10 @@ async fn the_overlay_shows_a_pending_agent_write_after_the_transcript_clears() {
     app.clear_transcript();
     assert!(app.messages.is_empty());
     let drawn = overlay(&app);
-    assert!(drawn.contains("The agent wants to run:"), "{drawn}");
+    assert!(
+        drawn.contains(&format!("The agent: {}", Decision::HEADING)),
+        "{drawn}"
+    );
     assert!(drawn.contains("DELETE FROM t"), "{drawn}");
 
     app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
@@ -656,13 +656,13 @@ async fn the_overlay_shows_a_pending_agent_write_after_the_transcript_clears() {
     assert!(!pending.await.unwrap_or_else(|e| fail(&e.to_string())));
 }
 
-/// Writes allowed for the session (`a`, `--allow-write`) still ask once a
-/// turn has read document text, and the prompt says why.
+/// Writes allowed for the session (`--allow-write`) still ask once a turn
+/// has read document text, and the prompt says why.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_held_for_document_text_asks_with_the_reason_though_writes_are_allowed() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let mut app = app(dir.path());
-    app.allow_write.store(true, Ordering::Relaxed);
+    app.allow_write = true;
     let turn = waiting_turn(&app);
     let job = turn.job.id;
     app.turns.push(turn);
@@ -737,29 +737,36 @@ async fn after_resume_the_overlay_names_the_writes_own_session() {
     db_settle(&mut app).await;
     assert_eq!(app.session_id, other.id);
     let drawn = overlay(&app);
-    assert!(drawn.contains(&format!("{whose} wants to run:")), "{drawn}");
+    assert!(
+        drawn.contains(&format!("{whose}: {}", Decision::HEADING)),
+        "{drawn}"
+    );
     assert!(drawn.contains("DELETE FROM t"), "{drawn}");
 
     app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
     assert!(!pending.await.unwrap_or_else(|e| fail(&e.to_string())));
 }
 
+/// `a` allows the writes of the turn that asked, not the session's: the
+/// words and keys are the ones every interface offers.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_typed_write_stays_on_screen_when_a_new_session_lands_after_it() {
+async fn a_allows_the_turn_that_asked_and_nothing_after_it() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let mut app = app(dir.path());
-    // Classifying the write and switching sessions are applied in the
-    // order typed: the prompt first, then the clear.
-    app.handle_slash_command("/sql DELETE FROM t");
-    app.handle_slash_command("/new");
-    db_settle(&mut app).await;
-    assert!(matches!(app.prompts.front(), Some(Prompt::Sql(_))));
+    let turn = waiting_turn(&app);
+    let job = turn.job.id;
+    app.turns.push(turn);
+    let pending = ask_to_write(&mut app, job, "DELETE FROM t").await;
     let drawn = overlay(&app);
     assert!(
-        drawn.contains("Your statement modifies the workspace:"),
+        drawn.contains("[y] Run it   [n] Don't run it   [a] Allow for this turn"),
         "{drawn}"
     );
-    assert!(drawn.contains("DELETE FROM t"), "{drawn}");
+
+    app.handle_key_event(KeyCode::Char('a'), KeyModifiers::NONE);
+    assert!(pending.await.unwrap_or_else(|e| fail(&e.to_string())));
+    assert_eq!(last(&app).content, Decision::AllowTurn.reply());
+    assert!(!app.allow_write, "the session still asks");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -924,8 +931,10 @@ async fn a_dropped_file_loads_at_once_and_other_pastes_are_typed_in() {
 
     // A write prompt takes keys only; a paste does not answer or queue.
     app.clear_input();
-    app.handle_slash_command("/sql CREATE TABLE t AS SELECT 1 AS a");
-    db_settle(&mut app).await;
+    let turn = waiting_turn(&app);
+    let job = turn.job.id;
+    app.turns.push(turn);
+    let _pending = ask_to_write(&mut app, job, "CREATE TABLE t AS SELECT 1 AS a").await;
     assert!(app.awaiting_permission());
     let before = app.messages.len();
     app.handle_terminal_event(&Event::Paste(dropped));
@@ -1361,7 +1370,7 @@ async fn sql_completion_follows_ingests_and_typed_statements() {
     app.set_input("SELECT * FROM sales s WHERE s.re");
     assert_eq!(offered(&app), ["region", "revenue"]);
 
-    app.allow_write.store(true, Ordering::Relaxed);
+    app.allow_write = true;
     app.handle_slash_command("/sql CREATE TABLE stores (id INTEGER)");
     settle(&mut app).await;
     db_settle(&mut app).await;
@@ -1944,8 +1953,10 @@ fn a_press_outside_the_transcript_or_under_a_list_selects_nothing() {
 async fn a_press_while_a_write_waits_for_an_answer_selects_nothing() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let mut app = app_with_two_notes(dir.path());
-    app.handle_slash_command("/sql CREATE TABLE t AS SELECT 1 AS a");
-    db_settle(&mut app).await;
+    let turn = waiting_turn(&app);
+    let job = turn.job.id;
+    app.turns.push(turn);
+    let _pending = ask_to_write(&mut app, job, "CREATE TABLE t AS SELECT 1 AS a").await;
     assert!(app.awaiting_permission());
     drop(screen(&app));
     app.handle_terminal_event(&mouse(MouseEventKind::Down(MouseButton::Left), 5, 2));

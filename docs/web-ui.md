@@ -204,7 +204,8 @@ notifications while the page is hidden.
   passage each one cites, and the chart spec as an ECharts option with the toolbox's
   save-as-image and read-only data view, `stack` on bar and line series when the spec is
   stacked, and a Download CSV link built from the spec as a data URL. A `permission_required` event
-  becomes a card with the statement, Run it, Don't run it, and Allow for this turn, posted to
+  becomes a card with the event's `heading`, the statement, and a button per entry of its
+  `choices` (the words `analysis::events::Decision` gives every interface), posted to
   `.../sessions/{sid}/permissions/{request}`, and the time the turn stops waiting. When the event carries a `notice`
   (its `reason` is `read_documents`: the turn read document text, so the write is asked for even
   under "Run changes without asking"), the card shows that sentence; the text lives in

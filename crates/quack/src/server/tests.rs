@@ -15,6 +15,7 @@
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::http::{Method, Request, StatusCode, header};
+use quack_core::analysis::events::Decision;
 use quack_core::config::{
     BaseUrl, Config, FollowIngest, ProviderConfig, ProviderName, ProviderType, RetryPolicy,
     SecureCookies,
@@ -8026,6 +8027,16 @@ async fn a_turn_that_read_a_document_asks_or_refuses_its_write_under_allow_write
             assert_eq!(
                 request["notice"],
                 Hold::ReadDocuments.notice().unwrap_or_default(),
+                "{request}"
+            );
+            assert_eq!(request["heading"], Decision::HEADING, "{request}");
+            assert_eq!(
+                request["choices"],
+                serde_json::json!([
+                    {"decision": "allow", "label": "Run it", "reply": Decision::Allow.reply()},
+                    {"decision": "deny", "label": "Don't run it", "reply": Decision::Deny.reply()},
+                    {"decision": "allow_turn", "label": "Allow for this turn", "reply": Decision::AllowTurn.reply()},
+                ]),
                 "{request}"
             );
             assert_eq!(

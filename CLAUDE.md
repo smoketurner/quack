@@ -245,7 +245,10 @@ retried with the real names (twice at most), and an empty reply is asked for onc
 workspace and its settings; a turn's recorder, write policy, refusal flag, and chart and graph
 results are one `analysis::tools::Turn`, handed to every call as a runtime scope of rig's
 `ToolContext` (`.tool_context(turn.context())` on the run). `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
-prompts y/n/a and `-p` refuses and exits 3. Once a turn has retrieved document or graph text
+prompts y/n/a (`a` covers the rest of that turn) and `-p` refuses and exits 3. Every
+interface offers the answers in `analysis::events::Decision`'s words (`label`, `reply`,
+`HEADING`; the SSE event carries them as `choices`). SQL a person types (the terminal's
+direct SQL and `/sql`, the web SQL page) runs as typed; only the agent's writes ask. Once a turn has retrieved document or graph text
 (`search_documents`, `search_graph`, `find_path`, `always_retrieve`, a `describe_class` that names
 example entities; `Turn::read_documents`),
 no write of that turn runs unasked, whatever was allowed: `WritePolicy::decide` asks where the

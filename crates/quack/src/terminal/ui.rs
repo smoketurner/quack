@@ -14,7 +14,7 @@ use ratatui::widgets::{
     Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
 };
 
-use crate::terminal::app::{App, Message, MessageKind, PendingWrite};
+use crate::terminal::app::{App, Message, MessageKind, PendingWrite, answer_keys};
 use crate::terminal::clipboard::CopyStatus;
 use crate::terminal::commands::Suggestion;
 use crate::terminal::markdown;
@@ -656,14 +656,10 @@ impl PendingWrite<'_> {
         lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                "Run this statement?",
+                answer_keys(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  [y] run   [n] refuse   [a] run and allow writes this session",
-                Style::default().fg(Color::Yellow),
             ),
         ]));
         lines

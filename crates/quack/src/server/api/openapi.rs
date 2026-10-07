@@ -176,6 +176,7 @@ const COOKIE: &str = "session";
         query::CompleteEvent,
         query::ToolStartedEvent,
         query::PermissionEvent,
+        query::Choice,
         workspaces::AuditFormat,
         admin::AuditShape,
         GraphFormat,
