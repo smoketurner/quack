@@ -218,11 +218,18 @@ impl Oidc {
                 .reconciled
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(user.id.clone(), digest.clone());
-            if seen.as_deref() != Some(digest.as_str()) {
+                .get(&user.id)
+                .is_some_and(|seen| *seen == digest);
+            if !seen {
                 control
                     .reconcile_idp_memberships(&user, groups, origin)
                     .await?;
+                // Recorded only once it took: a failed reconcile is tried
+                // again on the token's next request.
+                self.reconciled
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(user.id.clone(), digest);
             }
         }
         Ok(user)

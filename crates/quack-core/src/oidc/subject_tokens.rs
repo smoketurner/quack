@@ -161,29 +161,33 @@ impl SubjectTokens {
             return Ok(Stored::Unrenewable(token));
         };
         match self.sign_in.renew(refresh).await {
-            Ok(Renewal::Renewed(renewed)) => {
+            Ok(Renewal::Renewed {
+                token: renewed,
+                reissued,
+            }) => {
+                let Some(reissued) = reissued else {
+                    self.tokens.store(&self.control, user, &renewed).await?;
+                    return Ok(Stored::Current(renewed));
+                };
+                let named = self
+                    .control
+                    .find_user_by_oidc_subject(&reissued.subject)
+                    .await?;
+                let Some(row) = named.filter(|row| row.id == *user) else {
+                    self.end_sign_in(user, origin, "the renewed ID token names another subject")
+                        .await?;
+                    return Ok(Stored::Revoked);
+                };
                 self.tokens.store(&self.control, user, &renewed).await?;
+                if let Some(groups) = reissued.groups.listed() {
+                    self.control
+                        .reconcile_idp_memberships(&row, groups, origin)
+                        .await?;
+                }
                 Ok(Stored::Current(renewed))
             }
             Ok(Renewal::Revoked(reason)) => {
-                tracing::info!(user = %user, %reason, "the issuer ended the sign-in");
-                self.tokens.clear(&self.control, user).await?;
-                self.presented
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(user);
-                {
-                    let mut revocations = self
-                        .revocations
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    let Revocations(count) = revocations.entry(user.clone()).or_default();
-                    *count = count.saturating_add(1);
-                }
-                self.sessions.close_user(user);
-                self.control
-                    .record_audit(&origin.denied_session(user))
-                    .await?;
+                self.end_sign_in(user, origin, &reason).await?;
                 Ok(Stored::Revoked)
             }
             Err(e) => {
@@ -191,6 +195,30 @@ impl SubjectTokens {
                 Ok(Stored::Unreachable(token))
             }
         }
+    }
+
+    /// End a sign-in the issuer no longer vouches for: the stored and
+    /// presented tokens, every session, and a denied `session` row from
+    /// `origin`. The caller holds the user's renewal lock.
+    async fn end_sign_in(&self, user: &UserId, origin: &Origin, reason: &str) -> Result<()> {
+        tracing::info!(user = %user, %reason, "the issuer ended the sign-in");
+        self.tokens.clear(&self.control, user).await?;
+        self.presented
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(user);
+        {
+            let mut revocations = self
+                .revocations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Revocations(count) = revocations.entry(user.clone()).or_default();
+            *count = count.saturating_add(1);
+        }
+        self.sessions.close_user(user);
+        self.control
+            .record_audit(&origin.denied_session(user))
+            .await
     }
 
     /// Remember the access token a person presented as a bearer, until it
