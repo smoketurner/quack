@@ -7,7 +7,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use quack_core::analysis::table_search;
 use quack_core::storage::profile::{ColumnTypes, TableNote};
-use quack_core::storage::workspace::{TableDescription, WorkspaceDb};
+use quack_core::storage::workspace::WorkspaceDb;
 
 use crate::text_or_json::TextOrJson;
 
@@ -53,7 +53,24 @@ impl TablesArgs {
             TextOrJson::Json => {
                 writeln!(out, "{}", serde_json::to_string_pretty(&described.body())?)?;
             }
-            TextOrJson::Text => write!(out, "{}", Described(&described))?,
+            TextOrJson::Text => {
+                write!(out, "{described}")?;
+                let fixes: Vec<String> = described
+                    .warnings
+                    .iter()
+                    .filter_map(|flagged| {
+                        let fix = flagged.warning.fix()?;
+                        Some(format!("{}={fix}", flagged.column))
+                    })
+                    .collect();
+                if !fixes.is_empty() {
+                    writeln!(
+                        out,
+                        "\nFix with: quack tables {table} --retype {}",
+                        fixes.join(",")
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -96,44 +113,6 @@ impl TablesArgs {
     }
 }
 
-/// One table for a person.
-struct Described<'a>(&'a TableDescription);
-
-impl std::fmt::Display for Described<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let d = self.0;
-        writeln!(f, "{} ({} rows)", d.table_name, d.row_count)?;
-        if let Some(note) = &d.note {
-            writeln!(f, "Note: {note}")?;
-        }
-        writeln!(f, "Columns:")?;
-        for column in &d.columns {
-            write!(f, "  {} {}", column.name, column.column_type)?;
-            if let Some(meaning) = &column.meaning {
-                write!(f, "{meaning}")?;
-            }
-            writeln!(f)?;
-        }
-        if !d.warnings.is_empty() {
-            writeln!(f, "Warnings:")?;
-            for flagged in &d.warnings {
-                write!(f, "  {}: {}", flagged.column, flagged.warning)?;
-                if let Some(fix) = flagged.warning.fix() {
-                    write!(f, " (fix: --retype {}={fix})", flagged.column)?;
-                }
-                writeln!(f)?;
-            }
-        }
-        if !d.measures.is_empty() {
-            writeln!(f, "Measures:")?;
-            for measure in &d.measures {
-                writeln!(f, "  {measure}")?;
-            }
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "test setup")]
@@ -167,14 +146,18 @@ mod tests {
         assert_eq!(run(&db, &[]).unwrap(), "orders (1 rows, 2 warnings)\n");
 
         let shown = run(&db, &["orders", "--note", "amounts in cents"]).unwrap();
-        assert!(shown.contains("Note: amounts in cents"), "{shown}");
         assert!(
-            shown.contains("amount: numbers stored as text (100% parse as numbers); cast before summing or comparing (fix: --retype amount=DOUBLE)"),
+            shown.contains("Note (from the owner): amounts in cents"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("amount: numbers stored as text (100% parse as numbers); cast before summing or comparing\n")
+                && shown.contains("Fix with: quack tables orders --retype id=DOUBLE,amount=DOUBLE"),
             "{shown}"
         );
         let fixed = run(&db, &["orders", "--retype", "amount=DOUBLE,id=BIGINT"]).unwrap();
         assert!(
-            fixed.contains("  amount DOUBLE") && !fixed.contains("Warnings"),
+            fixed.contains("  - amount (DOUBLE)") && !fixed.contains("Warnings"),
             "{fixed}"
         );
         assert_eq!(

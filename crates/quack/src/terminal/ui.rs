@@ -709,6 +709,10 @@ impl Message {
             .as_ref()
             .map(|c| format!("{c:?}"))
             .hash(&mut hasher);
+        if let Some(result) = &self.result {
+            result.columns.hash(&mut hasher);
+            result.rows.hash(&mut hasher);
+        }
         width.hash(&mut hasher);
         (expand && self.kind == MessageKind::Step).hash(&mut hasher);
         hasher.finish()
