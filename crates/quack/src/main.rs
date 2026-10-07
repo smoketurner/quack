@@ -243,8 +243,8 @@ enum Commands {
     #[command(subcommand)]
     Graph(graph_cli::GraphAction),
 
-    /// Pull rows from Postgres, SQLite, or a data file over HTTP(S) into
-    /// a workspace table (the Rust-side replacement for ATTACH)
+    /// Pull rows from a SQLite file or a data file over HTTP(S) into a
+    /// workspace table (the Rust-side replacement for ATTACH)
     Import(ImportArgs),
 
     /// Move the workspace as an Open Knowledge Format bundle
@@ -537,8 +537,7 @@ struct McpArgs {
 
 #[derive(clap::Args)]
 struct ImportArgs {
-    /// A Postgres URL (user, password, host, database), a SQLite path
-    /// as `sqlite:PATH`, or an http(s) URL of a data file
+    /// A SQLite path as `sqlite:PATH`, or an http(s) URL of a data file
     url: String,
     /// The workspace table to create (replaced when it exists)
     #[arg(long)]

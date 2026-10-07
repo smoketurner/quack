@@ -40,7 +40,7 @@ API Activity event with that name.
 | `search` | A document search without the agent (`POST .../search`, the web Search page, the MCP `search` tool); the detail holds the query and what it was limited to | `allowed`, `denied`, `error` | API: Read |
 | `sql` | A statement run directly (`/sql`, the SQL page, the MCP `sql` tool) | `allowed`, `denied` (a write without the write scope, an internal table), `error` | API: Read |
 | `ingest` | A file is uploaded, a document replaced, a bundle imported | `allowed`, `denied`, `error` | API: Create |
-| `import` | A Postgres, SQLite, or URL import is started | `allowed`, `error` | API: Create |
+| `import` | A SQLite or URL import is started | `allowed`, `error` | API: Create |
 | `export` | A workspace is exported as an OKF bundle, the graph as CSV, GraphML, or JSON-LD (the detail holds `format`, `nodes`, `edges`, `provenance`), or a statement's rows are streamed out | `allowed`, `denied` (a write statement), `error` | API: Read |
 | `delete` | A document, session, saved question, workspace, or other resource is deleted | `allowed`, `denied`, `error` | API: Delete |
 | `snapshot` | A workspace is written out as a snapshot (`quack workspace snapshot`, `GET .../snapshot`, the Settings page) | `allowed`, `error` | API: Update |

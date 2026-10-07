@@ -57,7 +57,7 @@ pub(crate) enum SlashCommand {
         #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "PATH")]
         path: String,
     },
-    /// Pull rows from Postgres, SQLite, or a URL
+    /// Pull rows from a SQLite file or a URL
     #[command(name = "/import", disable_help_flag = true)]
     Import {
         url: String,

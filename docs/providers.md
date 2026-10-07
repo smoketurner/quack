@@ -298,7 +298,6 @@ them.
 - Amazon Bedrock's `converse` API and AWS credential calls take one proxy. When
   `HTTP_PROXY` and `HTTPS_PROXY` differ they use `HTTPS_PROXY`, and an `http://` Bedrock
   `base_url` is reached directly.
-- `quack import` from Postgres connects over TCP and uses no proxy.
 - A proxy that inspects TLS presents its own certificate. Add its certificate authority
   to the operating system's trust store.
 - With `[import].allow_private_hosts` off, an import through a proxy checks only an

@@ -2,11 +2,11 @@
 //! (design doc 6.2, issue #21): the scanner and httpfs extensions cannot
 //! be compiled into the static binary, so rows are pulled here and loaded
 //! as a workspace table through the same path a CSV upload takes. Sources:
-//! Postgres and SQLite through sqlx (every column cast to text on the
-//! source side, so any type comes through), and a CSV, Parquet, JSON, or
-//! workbook file over HTTP(S) through reqwest. Credentials in the URL are
-//! used once and never stored: the document row and the audit detail
-//! carry the redacted URL.
+//! a SQLite file through sqlx, opened read-only (every column cast to text
+//! on the source side, so any type comes through), and a CSV, Parquet,
+//! JSON, or workbook file over HTTP(S) through reqwest. Credentials in the
+//! URL are used once and never stored: the document row and the audit
+//! detail carry the redacted URL.
 
 use std::fmt::{self, Write as _};
 use std::net::{IpAddr, SocketAddr};
@@ -15,8 +15,9 @@ use std::time::Duration;
 
 use crate::embedding::EmbeddingModel;
 use futures::TryStreamExt as _;
+use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{
-    AssertSqlSafe, Column, Connection as _, Executor as _, Row, SqlSafeStr as _, Statement as _,
+    AssertSqlSafe, Column, ConnectOptions as _, Executor as _, Row, SqlSafeStr as _, Statement as _,
 };
 
 use crate::config::Config;
@@ -119,13 +120,12 @@ pub struct ImportSummary {
 /// The kind of source a URL names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceKind {
-    Postgres,
     Sqlite,
     Http,
 }
 
-/// A source URL: `postgres://...`, `sqlite://path` or `sqlite:path`, or an
-/// `http(s)://` URL of a data file. It can carry a password, so `Debug`
+/// A source URL: `sqlite://path` or `sqlite:path`, or an `http(s)://` URL
+/// of a data file. It can carry a password, so `Debug`
 /// and `Display` show it redacted; only `SourceUrl::expose` gives the
 /// whole of it, to connect with.
 #[derive(Clone, PartialEq, Eq)]
@@ -169,20 +169,13 @@ impl SourceUrl {
     /// Returns an error for a scheme quack does not import from.
     pub fn kind(&self) -> Result<SourceKind> {
         let lower = self.0.trim().to_ascii_lowercase();
-        if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
-            Ok(SourceKind::Postgres)
-        } else if lower.starts_with("sqlite:") {
+        if lower.starts_with("sqlite:") {
             Ok(SourceKind::Sqlite)
         } else if lower.starts_with("http://") || lower.starts_with("https://") {
             Ok(SourceKind::Http)
-        } else if lower.starts_with("mysql://") || lower.starts_with("s3://") {
-            Err(Error::Ingestion(format!(
-                "{} sources are not supported yet; Postgres, SQLite, and HTTP(S) files are",
-                lower.split("://").next().unwrap_or("such")
-            )))
         } else {
             Err(Error::Ingestion(String::from(
-                "the source must be a postgres://, sqlite:, or http(s):// URL",
+                "the source must be a sqlite: file or an http(s):// data file",
             )))
         }
     }
@@ -238,31 +231,6 @@ impl SourceUrl {
         let rest = self.0.trim().get("sqlite:".len()..).unwrap_or_default();
         let rest = rest.strip_prefix("//").unwrap_or(rest);
         Path::new(rest.split_once('?').map_or(rest, |(path, _)| path))
-    }
-
-    /// What sqlx connects to: the URL as given, except a `sqlite:` one,
-    /// which becomes `sqlite:` and the path with `/` separators. sqlx's Any
-    /// driver parses the string as a URL first, which a Windows path
-    /// (`sqlite://C:\data\src.db`) does not survive; `sqlite:C:/data/src.db`
-    /// does, and SQLite opens it. `%`, `?`, and `#` in the path are
-    /// percent-encoded, since sqlx decodes the path and splits off a query.
-    fn connect_url(&self) -> String {
-        if !matches!(self.kind(), Ok(SourceKind::Sqlite)) {
-            return self.0.clone();
-        }
-        let raw = self.0.trim().get("sqlite:".len()..).unwrap_or_default();
-        let query = raw.split_once('?').map(|(_, q)| q);
-        let path = self
-            .sqlite_path()
-            .to_string_lossy()
-            .replace('\\', "/")
-            .replace('%', "%25")
-            .replace('?', "%3F")
-            .replace('#', "%23");
-        match query {
-            Some(query) => format!("sqlite:{path}?{query}"),
-            None => format!("sqlite:{path}"),
-        }
     }
 
     /// Whether a `sqlite:` URL points inside `data_dir`: the control
@@ -432,12 +400,12 @@ impl<M: EmbeddingModel> Importing<'_, M> {
                      cannot be imported into a workspace",
                 )))
             }
-            SourceKind::Postgres | SourceKind::Sqlite => {
+            SourceKind::Sqlite => {
                 let sql = request.source_query()?;
                 let fetch = async {
                     tokio::time::timeout(
                         timeout,
-                        fetch_rows(&request.url.connect_url(), &sql, limit),
+                        fetch_rows(request.url.sqlite_path(), &sql, limit),
                     )
                     .await
                     .map_err(|_| {
@@ -523,11 +491,15 @@ struct Fetched {
     rows: u64,
 }
 
-async fn fetch_rows(url: &str, inner: &str, limit: u64) -> Result<Fetched> {
-    sqlx::any::install_default_drivers();
-    let mut conn = sqlx::AnyConnection::connect(url)
+async fn fetch_rows(path: &Path, inner: &str, limit: u64) -> Result<Fetched> {
+    // Read-only, and opened by path rather than parsed from a URL, so a
+    // Windows path needs no rewriting and the source is never changed.
+    let mut conn = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .connect()
         .await
-        .map_err(|e| Error::Ingestion(format!("cannot connect to the source: {e}")))?;
+        .map_err(|e| Error::Ingestion(format!("cannot open the source: {e}")))?;
     let probe = format!("SELECT * FROM ({inner}) AS quack_q LIMIT 0");
     let prepared = (&mut conn)
         .prepare(AssertSqlSafe(probe).into_sql_str())

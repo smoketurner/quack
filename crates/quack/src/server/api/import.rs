@@ -1,5 +1,5 @@
-//! `POST .../import`: rows from Postgres, SQLite, or a data file over
-//! HTTP(S) as a workspace table. Needs the write permission; audited as
+//! `POST .../import`: rows from a SQLite file or a data file over HTTP(S)
+//! as a workspace table. Needs the write permission; audited as
 //! `import` with the redacted source (the password never lands anywhere).
 
 use axum::Json;
@@ -23,7 +23,7 @@ use quack_core::jobs::JobId;
 
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct ImportBody {
-    /// `postgres://...`, `sqlite://...`, or an `http(s)://` data file.
+    /// `sqlite://...`, or an `http(s)://` data file.
     pub url: String,
     /// The workspace table the rows load into.
     pub table: String,

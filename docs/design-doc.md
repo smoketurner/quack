@@ -107,7 +107,7 @@ Assumptions about the current deployment, to be confirmed:
 |  ontology/     model in tables, induction (propose), candidates, versions      |
 |  graph/        extraction guided by ontology, resolution, traversal, store     |
 |  llm/          rig providers, the turn loop, oauth (PKCE / device code)        |
-|  import.rs     Postgres, SQLite, and HTTP snapshots (no ATTACH)                |
+|  import.rs     SQLite and HTTP snapshots (no ATTACH)                           |
 |  okf.rs        Open Knowledge Format export and import                         |
 |  config.rs, crypto.rs, error.rs, progress.rs                                   |
 +------------------------------------------------------------------------------+
@@ -1024,11 +1024,13 @@ that would exceed what is left is skipped with a visible "(omitted)" line, not t
 | CSV, TSV, Parquet, JSON, JSONL | `read_csv_auto` / `read_parquet` / `read_json_auto` | Table in `data.duckdb` |
 | Excel `.xlsx`, `.xls`, `.ods` | `calamine` (pure Rust) writes each sheet as CSV under `files/` for `read_csv_auto` | One table per data sheet: `<stem>` for one sheet, `<stem>_<sheet>` otherwise; recorded on the document row so deleting it drops them |
 | stdin (print mode) | sniffed | Temporary table `stdin` |
-| Postgres, SQLite | `quack import URL --table T (--from SOURCE_TABLE \| --query SQL) [--limit N]`, `POST .../import`, the Tables page form, `/import` in the terminal (below) | Table in `data.duckdb`, a snapshot of the source at import time |
+| SQLite | `quack import URL --table T (--from SOURCE_TABLE \| --query SQL) [--limit N]`, `POST .../import`, the Tables page form, `/import` in the terminal (below) | Table in `data.duckdb`, a snapshot of the source at import time |
 | CSV, Parquet, JSON, workbooks over HTTP(S) | The same command with an `http(s)://` URL naming any file `quack ingest` loads as a table (`parser::table_extensions`: CSV, TSV, Parquet, JSON, JSONL, and XLSX, XLSM, XLS, ODS workbooks): reqwest fetches the file and it goes through the usual reader under the requested table name | Table in `data.duckdb` |
-| MySQL, S3 | Not yet: MySQL needs the sqlx driver enabled and its identifier quoting; S3 needs request signing (the `object_store` crate is the candidate). The scanner and httpfs extensions stay out (section 15). | — |
+| Postgres, MySQL | Not supported: `postgres://` and `mysql://` URLs are refused. Export the rows to a file, or put the file behind HTTP(S). The scanner extensions stay out (section 15). | — |
+| S3 | Not yet: S3 needs request signing. The httpfs extension stays out (section 15). | — |
 
-**Database import.** sqlx runs the query on the source with every column cast to text. Rows
+**SQLite import.** sqlx opens the file read-only by path and runs the query with every
+column cast to text. Rows
 pass through `files/<table>.csv` and `read_csv_auto`, so `DuckDB` sniffs the types. The table
 is a document (source `import`, title the redacted URL), deletable like any other. The URL's
 password is used once and never stored; audit rows carry the redacted URL. Caps:
@@ -3233,11 +3235,12 @@ Every gap is a GitHub issue unless the item says otherwise.
    PPTX through `zip` + `quick-xml`, workbooks through `calamine` as one table per sheet,
    each format carrying its own title. Sections 6.1, 6.2.
 6. ~~No `ATTACH` to external databases~~ (#21, closed): `quack import`, the Rust-side
-   replacement, snapshots a Postgres or SQLite query or a data file over HTTP(S) into a
+   replacement, snapshots a SQLite query or a data file over HTTP(S) into a
    workspace table through the CSV path (`quack_core::import`). A live `ATTACH` (queries
    pushed to the source) is not offered: the scanner extensions cannot ship in the static
    binary, and a snapshot keeps the classification boundary simple, since the rows live in
-   the workspace file like any upload. MySQL and S3 are the next sources. Section 6.2,
+   the workspace file like any upload. Postgres and MySQL are not offered; S3 is the next
+   source. Section 6.2,
    step 13.
 7. ~~Document registry lacks `sha256` dedup, `source`, `title`~~ (#22, closed): identical
    bytes are skipped everywhere and name the existing document; `source` is `upload`,
@@ -3324,8 +3327,8 @@ Every gap is a GitHub issue unless the item says otherwise.
   classified inside it; `control.db` holds access control only; audit split at the boundary
 - Documents: upload, paste, path, stdin; PDF, Markdown, text, HTML, DOCX, PPTX; chunk
   metadata; hybrid retrieval; citations; pinned documents; SHA dedup; chat and query modes
-- Tables: CSV/TSV/Parquet/JSON/JSONL/XLSX; snapshot imports from Postgres, SQLite, and
-  http(s) data files through `quack import` (no `ATTACH`; MySQL and S3 URLs are refused)
+- Tables: CSV/TSV/Parquet/JSON/JSONL/XLSX; snapshot imports from SQLite and http(s) data
+  files through `quack import` (no `ATTACH`; Postgres, MySQL, and S3 URLs are refused)
 - Ontology: stored in workspace tables with inheritance, relations with domain/range, typed
   properties, table mappings, built-in default, versioning with snapshot, diff, restore,
   and stale detection; JSON import and export

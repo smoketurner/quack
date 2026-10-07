@@ -30,7 +30,6 @@ to cross-compile for the static musl build, and one certain rustls backend at ru
 - Features:
   - `reqwest` with `rustls`; `rig` sends through it (its `reqwest` transport, which
     takes TLS from those features).
-  - `sqlx` with `tls-rustls-aws-lc-rs` (the Postgres import).
   - The AWS SDK behind the Bedrock provider (`aws-config` and `aws-sdk-bedrockruntime`
     with `default-https-client`) on `aws-smithy-http-client`'s `rustls-aws-lc`. Linux adds
     `rustls-aws-lc-fips`, and there `llm::bedrock` selects `CryptoMode::AwsLcFips`.
@@ -75,11 +74,10 @@ to cross-compile for the static musl build, and one certain rustls backend at ru
 ## TLS versions and post-quantum readiness
 
 What quack negotiates, from the resolved features (`rustls` with `aws_lc_rs`,
-`prefer-post-quantum`, and `std`; `reqwest` with `rustls`; `sqlx` with
-`tls-rustls-aws-lc-rs`):
+`prefer-post-quantum`, and `std`; `reqwest` with `rustls`):
 
 - **Outbound only.** Every TLS connection quack makes is outbound: model providers, an
-  OpenID Connect issuer, a Postgres source, an `https://` import. `quack serve` speaks plain
+  OpenID Connect issuer, an `https://` import. `quack serve` speaks plain
   HTTP. Inbound TLS belongs to the proxy in front of it (`[server].trusted_proxies` names
   it), which is also where the inbound cipher policy lives.
 - **TLS 1.3 and TLS 1.2**, rustls's default protocol versions, with aws-lc-rs's default
