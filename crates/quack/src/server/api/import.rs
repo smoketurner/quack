@@ -67,6 +67,7 @@ impl TryFrom<ImportBody> for ImportRequest {
     path = "/workspaces/{id}/import",
     tag = "import",
     request_body = ImportBody,
+    params(WorkspaceId),
     responses((status = 200, description = "What was imported", body = Imported)),
 )]
 pub(crate) async fn import(

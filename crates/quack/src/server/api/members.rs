@@ -25,6 +25,7 @@ pub(crate) struct MemberList {
     get,
     path = "/workspaces/{id}/members",
     tag = "members",
+    params(WorkspaceId),
     responses((status = 200, description = "The members", body = MemberList)),
 )]
 pub(crate) async fn list(
@@ -62,6 +63,7 @@ fn default_role() -> Role {
     path = "/workspaces/{id}/members",
     tag = "members",
     request_body = AddMember,
+    params(WorkspaceId),
     responses((status = 200, description = "The member", body = NewMember)),
 )]
 pub(crate) async fn add(
@@ -182,6 +184,7 @@ pub(crate) struct GroupList {
     get,
     path = "/workspaces/{id}/groups",
     tag = "members",
+    params(WorkspaceId),
     responses((status = 200, description = "The groups", body = GroupList)),
 )]
 pub(crate) async fn groups(
@@ -210,6 +213,7 @@ pub(crate) struct GroupRole {
     path = "/workspaces/{id}/groups",
     tag = "members",
     request_body = GroupRole,
+    params(WorkspaceId),
     responses((status = 200, description = "The group's role", body = GroupRoleRow)),
 )]
 pub(crate) async fn set_group(

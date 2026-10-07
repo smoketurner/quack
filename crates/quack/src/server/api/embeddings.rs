@@ -41,6 +41,7 @@ pub(crate) struct EmbeddingsReport {
     get,
     path = "/workspaces/{id}/embeddings",
     tag = "embeddings",
+    params(WorkspaceId),
     responses((status = 200, description = "The vectors' standing", body = EmbeddingsReport)),
 )]
 pub(crate) async fn show(
@@ -67,6 +68,7 @@ pub(crate) async fn show(
     post,
     path = "/workspaces/{id}/embeddings/refresh",
     tag = "embeddings",
+    params(WorkspaceId),
     responses(
         (status = 200, description = "Every vector is current", body = RefreshStarted),
         (status = 202, description = "A run embeds the stale and missing ones", body = RefreshStarted),

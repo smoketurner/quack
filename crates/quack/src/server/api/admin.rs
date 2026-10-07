@@ -76,6 +76,7 @@ pub(crate) struct UpdateUser {
     path = "/admin/users/{user}",
     tag = "admin",
     request_body = UpdateUser,
+    params(UserId),
     responses((status = 200, description = "The user as it now is", body = UserRow)),
 )]
 pub(crate) async fn update_user(
@@ -100,6 +101,7 @@ pub(crate) struct UserDeleted {
     delete,
     path = "/admin/users/{user}",
     tag = "admin",
+    params(UserId),
     responses((status = 200, description = "Deleted", body = UserDeleted)),
 )]
 pub(crate) async fn delete_user(
@@ -219,7 +221,6 @@ pub(crate) enum AuditShape {
 
 /// Which shape `GET /audit` answers with.
 #[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct AuditShapeQuery {
     #[serde(default)]
     pub format: AuditShape,

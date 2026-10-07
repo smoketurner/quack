@@ -7,6 +7,31 @@
 /// `Display`, `FromStr`, serde as the bare string, `sqlx` decoding and a
 /// `sea-query` value for `control.db`, and `DuckDB` `ToSql`/`FromSql`.
 macro_rules! id_type {
+    // An id a REST route takes as its only path segment: `axum_extras`
+    // documents a lone `Path<Id>` through `IntoParams`, which needs the
+    // segment's name.
+    ($(#[$doc:meta])* $name:ident, path = $segment:literal, $description:literal) => {
+        id_type!($(#[$doc])* $name);
+
+        impl utoipa::IntoParams for $name {
+            fn into_params(
+                parameter_in_provider: impl Fn() -> Option<utoipa::openapi::path::ParameterIn>,
+            ) -> Vec<utoipa::openapi::path::Parameter> {
+                vec![
+                    utoipa::openapi::path::ParameterBuilder::new()
+                        .name($segment)
+                        .parameter_in(
+                            parameter_in_provider()
+                                .unwrap_or(utoipa::openapi::path::ParameterIn::Path),
+                        )
+                        .required(utoipa::openapi::Required::True)
+                        .description(Some($description))
+                        .schema(Some(<Self as utoipa::PartialSchema>::schema()))
+                        .build(),
+                ]
+            }
+        }
+    };
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
         #[derive(
@@ -148,12 +173,16 @@ macro_rules! id_type {
 
 id_type!(
     /// A workspace, as `control.db` records it.
-    WorkspaceId
+    WorkspaceId,
+    path = "id",
+    "The workspace's id"
 );
 
 id_type!(
     /// A server user.
-    UserId
+    UserId,
+    path = "user",
+    "The user's id"
 );
 
 id_type!(

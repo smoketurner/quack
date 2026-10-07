@@ -109,6 +109,7 @@ pub(crate) struct JobList {
     get,
     path = "/workspaces/{id}/jobs",
     tag = "jobs",
+    params(WorkspaceId),
     responses((status = 200, description = "The jobs", body = JobList)),
 )]
 pub(crate) async fn list(
@@ -170,6 +171,7 @@ pub(crate) async fn cancel(
     get,
     path = "/workspaces/{id}/jobs/stream",
     tag = "jobs",
+    params(WorkspaceId),
     responses((status = 200, description = "Server-Sent Events, named in `x-sse-events`", content_type = "text/event-stream", body = String)),
 )]
 pub(crate) async fn stream(

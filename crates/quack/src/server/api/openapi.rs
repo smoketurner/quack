@@ -18,12 +18,9 @@ use quack_core::jobs::JobInfo;
 use quack_core::ontology::candidates::Queue;
 use quack_core::storage::sessions::ExportFormat as TranscriptFormat;
 use serde_json::json;
-use utoipa::openapi::path::{Operation, Parameter, ParameterBuilder, ParameterIn, PathItem};
-use utoipa::openapi::schema::{ObjectBuilder, Type};
+use utoipa::openapi::path::{Operation, PathItem};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
-use utoipa::openapi::{
-    ContentBuilder, Ref, RefOr, Required, ResponseBuilder, extensions::ExtensionsBuilder,
-};
+use utoipa::openapi::{ContentBuilder, Ref, RefOr, ResponseBuilder, extensions::ExtensionsBuilder};
 use utoipa::{Modify, OpenApi, ToSchema};
 
 use super::StreamEvent;
@@ -222,10 +219,6 @@ impl Modify for Conventions {
             )
             .build();
         for (path, item) in &mut openapi.paths.paths {
-            let parameters: Vec<Parameter> = PathParam::all_in(path)
-                .into_iter()
-                .map(PathParam::parameter)
-                .collect();
             let stream = EventStream::at(path);
             for operation in Endpoint::operations_mut(item) {
                 // Handler names repeat across modules (`list`, `show`); the
@@ -235,13 +228,6 @@ impl Modify for Conventions {
                     operation.tags.as_ref().and_then(|tags| tags.first()),
                 ) {
                     *id = format!("{tag}_{id}");
-                }
-                if !parameters.is_empty() {
-                    let listed = operation.parameters.get_or_insert_with(Vec::new);
-                    let mut all: Vec<RefOr<Parameter>> =
-                        parameters.iter().cloned().map(RefOr::T).collect();
-                    all.append(listed);
-                    *listed = all;
                 }
                 operation
                     .responses
@@ -258,123 +244,6 @@ impl Modify for Conventions {
                 }
             }
         }
-    }
-}
-
-/// One `{name}` segment of a path, and what it names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PathParam {
-    Workspace,
-    Document,
-    Job,
-    Saved,
-    Session,
-    PermissionRequest,
-    User,
-    Group,
-    Node,
-    Edge,
-    Merge,
-    Candidate,
-    Version,
-}
-
-impl PathParam {
-    /// The parameters a path template names, in order; `None` for a name
-    /// this table does not know, so the coverage test can catch it.
-    pub(crate) fn parse_all(path: &str) -> Vec<Option<Self>> {
-        path.split('/')
-            .filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}'))
-            .map(Self::named)
-            .collect()
-    }
-
-    fn all_in(path: &str) -> Vec<Self> {
-        Self::parse_all(path).into_iter().flatten().collect()
-    }
-
-    fn named(name: &str) -> Option<Self> {
-        Some(match name {
-            "id" => Self::Workspace,
-            "doc" => Self::Document,
-            "job" => Self::Job,
-            "saved" => Self::Saved,
-            "sid" => Self::Session,
-            "request" => Self::PermissionRequest,
-            "user" => Self::User,
-            "group" => Self::Group,
-            "nid" => Self::Node,
-            "eid" => Self::Edge,
-            "mid" => Self::Merge,
-            "cid" => Self::Candidate,
-            "v" => Self::Version,
-            _ => return None,
-        })
-    }
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Workspace => "id",
-            Self::Document => "doc",
-            Self::Job => "job",
-            Self::Saved => "saved",
-            Self::Session => "sid",
-            Self::PermissionRequest => "request",
-            Self::User => "user",
-            Self::Group => "group",
-            Self::Node => "nid",
-            Self::Edge => "eid",
-            Self::Merge => "mid",
-            Self::Candidate => "cid",
-            Self::Version => "v",
-        }
-    }
-
-    const fn description(self) -> &'static str {
-        match self {
-            Self::Workspace => "The workspace's id",
-            Self::Document => "The document's id",
-            Self::Job => "The job's id",
-            Self::Saved => "The saved question's name or id",
-            Self::Session => "The session's id",
-            Self::PermissionRequest => {
-                "The request id of the `permission_required` event being answered"
-            }
-            Self::User => "The user's id",
-            Self::Group => "The identity provider's group name",
-            Self::Node => "The graph node's id",
-            Self::Edge => "The graph edge's id",
-            Self::Merge => "The merge proposal's id",
-            Self::Candidate => "The ontology candidate's id",
-            Self::Version => "The ontology version, from 1",
-        }
-    }
-
-    fn parameter(self) -> Parameter {
-        let schema = match self {
-            Self::Version => ObjectBuilder::new()
-                .schema_type(Type::Integer)
-                .minimum(Some(1)),
-            Self::Workspace
-            | Self::Document
-            | Self::Job
-            | Self::Saved
-            | Self::Session
-            | Self::PermissionRequest
-            | Self::User
-            | Self::Group
-            | Self::Node
-            | Self::Edge
-            | Self::Merge
-            | Self::Candidate => ObjectBuilder::new().schema_type(Type::String),
-        };
-        ParameterBuilder::new()
-            .name(self.name())
-            .parameter_in(ParameterIn::Path)
-            .required(Required::True)
-            .description(Some(self.description()))
-            .schema(Some(schema.build()))
-            .build()
     }
 }
 

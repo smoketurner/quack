@@ -27,6 +27,7 @@ pub(crate) struct SavedList {
     get,
     path = "/workspaces/{id}/saved",
     tag = "saved",
+    params(WorkspaceId),
     responses((status = 200, description = "The saved questions", body = SavedList)),
 )]
 pub(crate) async fn list(
@@ -59,6 +60,7 @@ pub(crate) struct NewSaved {
     path = "/workspaces/{id}/saved",
     tag = "saved",
     request_body = NewSaved,
+    params(WorkspaceId),
     responses((status = 201, description = "Saved", body = SavedQuestion)),
 )]
 pub(crate) async fn create(
@@ -215,7 +217,6 @@ pub(crate) async fn run(
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct RunsQuery {
     /// Runs at most, newest first.
     #[serde(default = "default_limit")]

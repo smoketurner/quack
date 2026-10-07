@@ -136,6 +136,7 @@ impl Identity {
     get,
     path = "/workspaces/{id}",
     tag = "workspaces",
+    params(WorkspaceId),
     responses((status = 200, description = "The workspace", body = Membership)),
 )]
 pub(crate) async fn show(
@@ -165,6 +166,7 @@ pub(crate) struct UpdateWorkspace {
     path = "/workspaces/{id}",
     tag = "workspaces",
     request_body = UpdateWorkspace,
+    params(WorkspaceId),
     responses((status = 200, description = "The workspace as it now is", body = Membership)),
 )]
 pub(crate) async fn update(
@@ -202,6 +204,7 @@ pub(crate) async fn update(
     get,
     path = "/workspaces/{id}/snapshot",
     tag = "workspaces",
+    params(WorkspaceId),
     responses((status = 200, description = "The snapshot", content_type = "application/x-tar", body = Vec<u8>)),
 )]
 pub(crate) async fn snapshot(
@@ -267,7 +270,6 @@ pub(crate) async fn snapshot(
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct RestoreQuery {
     /// The new workspace's name; the snapshot's own when absent.
     pub name: Option<String>,
@@ -314,6 +316,7 @@ pub(crate) async fn restore(
     delete,
     path = "/workspaces/{id}",
     tag = "workspaces",
+    params(WorkspaceId),
     responses((status = 204, description = "Deleted")),
 )]
 pub(crate) async fn delete(
@@ -433,7 +436,6 @@ impl Access {
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct AuditQuery {
     /// Rows at most, newest first.
     #[serde(default = "default_limit")]
@@ -478,7 +480,7 @@ pub(crate) enum AuditEntries {
     get,
     path = "/workspaces/{id}/audit",
     tag = "workspaces",
-    params(AuditQuery),
+    params(WorkspaceId, AuditQuery),
     responses((status = 200, description = "The audit detail", body = AuditDetail)),
 )]
 pub(crate) async fn audit_detail(

@@ -16,9 +16,11 @@ use quack_core::storage::control::{AuditFilter, ControlPlane};
 use quack_core::web_sessions::WebSessions;
 use tower::ServiceExt;
 
-use super::{DOCUMENT_PATH, Endpoint, PAGE_PATH, PathParam, StreamEvent, openapi};
+use super::{DOCUMENT_PATH, Endpoint, PAGE_PATH, StreamEvent, openapi};
 use crate::server::state::{App, AppState, ServeMode};
 use crate::server::{self, api};
+use utoipa::openapi::RefOr;
+use utoipa::openapi::path::ParameterIn;
 
 #[expect(clippy::panic, reason = "test failure path")]
 fn fail(msg: &str) -> ! {
@@ -150,20 +152,94 @@ async fn every_method_the_router_answers_is_documented() {
     }
 }
 
+/// `axum_extras` documents a path's parameters from the handler's `Path`
+/// extractor, so a handler that reads one some other way leaves it out.
 #[test]
-fn every_path_parameter_is_described() {
-    for path in openapi().paths.paths.keys() {
-        assert!(
-            PathParam::parse_all(path).iter().all(Option::is_some),
-            "{path} names a parameter PathParam does not know"
-        );
+fn every_path_parameter_comes_from_its_handler() {
+    let mut missing = Vec::new();
+    for (path, item) in &openapi().paths.paths {
+        let named: Vec<&str> = path
+            .split('/')
+            .filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}'))
+            .collect();
+        for (method, operation) in Endpoint::operations(item) {
+            let documented: Vec<&str> = operation
+                .parameters
+                .iter()
+                .flatten()
+                .filter_map(|p| match p {
+                    RefOr::T(parameter) => Some(parameter),
+                    RefOr::Ref(_) => None,
+                })
+                .filter(|p| p.parameter_in == ParameterIn::Path)
+                .map(|p| p.name.as_str())
+                .collect();
+            if documented != named {
+                missing.push(format!("{method} {path}: {documented:?}"));
+            }
+        }
     }
-    let params = openapi().paths.paths["/workspaces/{id}/documents/{doc}"]
-        .get
-        .as_ref()
-        .and_then(|op| op.parameters.as_ref())
-        .map_or(0, Vec::len);
-    assert_eq!(params, 2);
+    assert!(missing.is_empty(), "{missing:#?}");
+}
+
+/// A parameter's location as the document spells it; `ParameterIn` has
+/// no `Debug` without utoipa's `debug` feature.
+fn location(parameter_in: &ParameterIn) -> &'static str {
+    match parameter_in {
+        ParameterIn::Path => "path",
+        ParameterIn::Query => "query",
+        ParameterIn::QueryString => "querystring",
+        ParameterIn::Header => "header",
+        ParameterIn::Cookie => "cookie",
+    }
+}
+
+/// Query structs list no `parameter_in`; `axum_extras` takes it from the
+/// handler's `Query<T>`, so their fields must land in the query, beside the
+/// path parameters.
+#[test]
+fn query_structs_are_documented_as_query_parameters() {
+    let document = openapi();
+    for (path, method, expected) in [
+        (
+            "/workspaces/{id}/documents/{doc}/chunks",
+            "GET",
+            vec![
+                ("id", "path"),
+                ("doc", "path"),
+                ("from", "query"),
+                ("limit", "query"),
+            ],
+        ),
+        ("/admin/audit", "GET", vec![("format", "query")]),
+    ] {
+        let operation = document
+            .paths
+            .paths
+            .get(path)
+            .map(Endpoint::operations)
+            .into_iter()
+            .flatten()
+            .find(|(m, _)| *m == method)
+            .map(|(_, operation)| operation);
+        let listed: Vec<(&str, &str)> = operation
+            .and_then(|op| op.parameters.as_ref())
+            .into_iter()
+            .flatten()
+            .filter_map(|p| match p {
+                RefOr::T(parameter) => {
+                    Some((parameter.name.as_str(), location(&parameter.parameter_in)))
+                }
+                RefOr::Ref(_) => None,
+            })
+            .collect();
+        for wanted in &expected {
+            assert!(
+                listed.contains(wanted),
+                "{method} {path} lacks {wanted:?}: {listed:?}"
+            );
+        }
+    }
 }
 
 /// Every operation answers errors with the coded body, and the code enum

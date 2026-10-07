@@ -37,6 +37,7 @@ pub(crate) const CHUNKS_IN_FLIGHT: usize = 8;
     get,
     path = "/workspaces/{id}/okf",
     tag = "okf",
+    params(WorkspaceId),
     responses((status = 200, description = "The bundle", content_type = "application/x-tar", body = Vec<u8>)),
 )]
 pub(crate) async fn export(

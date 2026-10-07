@@ -32,6 +32,7 @@ use quack_core::progress::{ChunkDone, RunControl};
     get,
     path = "/workspaces/{id}/ontology",
     tag = "ontology",
+    params(WorkspaceId),
     responses((status = 200, description = "The ontology", body = Ontology)),
 )]
 pub(crate) async fn show(
@@ -53,6 +54,7 @@ pub(crate) async fn show(
     get,
     path = "/workspaces/{id}/ontology/schema",
     tag = "ontology",
+    params(WorkspaceId),
     responses((status = 200, description = "A JSON Schema (draft 2020-12)", body = Object)),
 )]
 pub(crate) async fn schema(
@@ -73,6 +75,7 @@ pub(crate) async fn schema(
     path = "/workspaces/{id}/ontology",
     tag = "ontology",
     request_body(content = Ontology, description = "The interchange form `GET .../ontology/schema` describes"),
+    params(WorkspaceId),
     responses((status = 200, description = "The stored version", body = Ontology)),
 )]
 pub(crate) async fn replace(
@@ -93,6 +96,7 @@ pub(crate) async fn replace(
     post,
     path = "/workspaces/{id}/ontology/init",
     tag = "ontology",
+    params(WorkspaceId),
     responses((status = 200, description = "The stored version", body = Ontology)),
 )]
 pub(crate) async fn init(
@@ -206,7 +210,6 @@ impl Access {
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct VersionsQuery {
     /// Versions at most, newest first.
     #[serde(default = "default_limit")]
@@ -229,7 +232,7 @@ pub(crate) struct VersionList {
     get,
     path = "/workspaces/{id}/ontology/versions",
     tag = "ontology",
-    params(VersionsQuery),
+    params(WorkspaceId, VersionsQuery),
     responses((status = 200, description = "The versions", body = VersionList)),
 )]
 pub(crate) async fn versions(
@@ -248,7 +251,6 @@ pub(crate) async fn versions(
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct DiffQuery {
     /// The older version to compare against; default: the one before.
     pub against: Option<OntologyVersion>,
@@ -339,6 +341,7 @@ pub(crate) struct RenameRequest {
     path = "/workspaces/{id}/ontology/rename",
     tag = "ontology",
     request_body = RenameRequest,
+    params(WorkspaceId),
     responses((status = 200, description = "The stored version", body = Ontology)),
 )]
 pub(crate) async fn rename(
@@ -388,6 +391,7 @@ pub(crate) enum Proposed {
     path = "/workspaces/{id}/ontology/propose",
     tag = "ontology",
     request_body(content = Option<ProposeRequest>, description = "Optional; table evidence alone when absent"),
+    params(WorkspaceId),
     responses(
         (status = 200, description = "The table pass queued its candidates", body = TableProposal),
         (status = 202, description = "The document pass runs in the background", body = DocumentRunStarted),
@@ -583,7 +587,6 @@ impl Access {
 }
 
 #[derive(Deserialize, Default, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
 pub(crate) struct CandidatesQuery {
     /// `pending` (default) or `low_support`.
     #[serde(default)]
@@ -601,7 +604,7 @@ pub(crate) struct CandidateList {
     get,
     path = "/workspaces/{id}/ontology/candidates",
     tag = "ontology",
-    params(CandidatesQuery),
+    params(WorkspaceId, CandidatesQuery),
     responses((status = 200, description = "The candidates", body = CandidateList)),
 )]
 pub(crate) async fn list_candidates(
@@ -638,6 +641,7 @@ pub(crate) struct DecideManyRequest {
     path = "/workspaces/{id}/ontology/candidates",
     tag = "ontology",
     request_body = DecideManyRequest,
+    params(WorkspaceId),
     responses((status = 200, description = "What was decided", body = CandidatesDecided)),
 )]
 pub(crate) async fn decide_many(
