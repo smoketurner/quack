@@ -2005,10 +2005,11 @@ impl WorkspaceDb {
     }
 
     /// Replace a deleted user's id and name in this file with
-    /// [`REMOVED_USER`]: the sessions they made, the documents they
-    /// ingested, the context versions they edited, and the detail audit
-    /// rows that name them. The access audit in `control.db` keeps the id.
-    /// Returns how many rows changed.
+    /// [`REMOVED_USER`]: the sessions, saved questions, and saved imports
+    /// they made, the documents they ingested, the context versions and
+    /// table notes they edited, their assertions in the graph and the merges
+    /// they decided, and the detail audit rows that name them. The access
+    /// audit in `control.db` keeps the id. Returns how many rows changed.
     ///
     /// # Errors
     ///
@@ -2029,7 +2030,27 @@ impl WorkspaceDb {
                 user_id.as_str(),
             ),
             (
+                "UPDATE _quack_saved_questions SET created_by = ? WHERE created_by = ?",
+                user_id.as_str(),
+            ),
+            (
+                "UPDATE _quack_imports SET created_by = ? WHERE created_by = ?",
+                user_id.as_str(),
+            ),
+            (
                 "UPDATE _quack_context SET edited_by = ? WHERE edited_by = ?",
+                username,
+            ),
+            (
+                "UPDATE _quack_table_notes SET edited_by = ? WHERE edited_by = ?",
+                username,
+            ),
+            (
+                "UPDATE _quack_provenance SET author = ? WHERE author = ?",
+                username,
+            ),
+            (
+                "UPDATE _quack_graph_merges SET decided_by = ? WHERE decided_by = ?",
                 username,
             ),
         ] {

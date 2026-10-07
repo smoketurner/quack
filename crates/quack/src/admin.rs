@@ -547,24 +547,25 @@ impl UserAction {
             writeln!(out, "Nothing removed.")?;
             return Ok(());
         }
+        // Every workspace forgets the user before the account goes: one that
+        // cannot be opened stops here with the user still there, and the
+        // command can be run again.
+        for ws in control.list_workspaces().await? {
+            let db = WorkspaceDb::open(config, ws.id.as_str()).with_context(|| {
+                format!(
+                    "workspace '{}' could not be opened, so user '{}' was not removed; \
+                     run the command again once it opens",
+                    ws.name, user.username
+                )
+            })?;
+            let changed = db.forget_user(&user.id, &user.username)?;
+            if changed > 0 {
+                writeln!(out, "'{}': {changed} row(s) now name \"removed\"", ws.name)?;
+            }
+        }
         let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli);
         control.delete_user(&user.id, entry).await?;
         writeln!(out, "Removed user '{}' ({})", user.username, user.id)?;
-        for ws in control.list_workspaces().await? {
-            match WorkspaceDb::open(config, ws.id.as_str()) {
-                Ok(db) => {
-                    let changed = db.forget_user(&user.id, &user.username)?;
-                    if changed > 0 {
-                        writeln!(out, "'{}': {changed} row(s) now name \"removed\"", ws.name)?;
-                    }
-                }
-                Err(e) => writeln!(
-                    out,
-                    "'{}': could not open the workspace ({e}); remove the user again through `quack serve` to rewrite its rows",
-                    ws.name
-                )?,
-            }
-        }
         out.flush()?;
         Ok(())
     }

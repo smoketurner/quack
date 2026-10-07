@@ -1589,3 +1589,34 @@ async fn group_roles_are_set_listed_and_removed() {
         1
     );
 }
+
+/// A provider grant never displaces a membership a person holds: when one
+/// lands while the provider's groups are being read, its insert does
+/// nothing and the person's role stands.
+#[tokio::test]
+async fn a_provider_grant_never_displaces_a_hand_granted_membership() {
+    let (_dir, cp) = open().await;
+    let ws = cp
+        .create_workspace(&workspace_name("w"), None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let ada = cp
+        .create_user("ada", "pw-long-enough", UserKind::Standard, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.set_member(&ws.id, &ada.id, Role::Owner, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    ControlPlane::member_insert(&ws.id, &ada.id, Role::Viewer, GrantedBy::Idp)
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .query()
+        .execute(&cp.pool)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        cp.member_role(&ws.id, &ada.id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string())),
+        Some(Role::Owner)
+    );
+}

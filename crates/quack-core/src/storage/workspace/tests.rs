@@ -2765,3 +2765,46 @@ fn ambiguous_document_names_are_refused_and_misses_are_capped() {
         "{miss:?}"
     );
 }
+
+/// A deleted user leaves no id or name behind in any table that records
+/// who made or changed something.
+#[test]
+fn forget_user_rewrites_every_table_that_names_a_person() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    for sql in [
+        "INSERT INTO _quack_saved_questions \
+         (id, name, question, mode, statements, session_id, created_by) \
+         VALUES ('q', 'n', 'q', 'chat', '[]', 's', 'u-bob')",
+        "INSERT INTO _quack_imports (id, name, url, table_name, created_by) \
+         VALUES ('i', 'n', 'https://x/f.csv', 't', 'u-bob')",
+        "INSERT INTO _quack_table_notes (table_name, note, edited_by) VALUES ('t', 'n', 'bob')",
+        "INSERT INTO _quack_provenance (subject_id, author) VALUES ('s', 'bob')",
+        "INSERT INTO _quack_graph_merges (id, keep_node_id, drop_node_id, distance, decided_by) \
+         VALUES ('m', 'a', 'b', 0.1, 'bob')",
+    ] {
+        db.execute_statement(sql)
+            .unwrap_or_else(|e| fail(&format!("{sql}: {e}")));
+    }
+    let changed = db
+        .forget_user(&UserId::from("u-bob"), "bob")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(changed, 5);
+    for (table, column) in [
+        ("_quack_saved_questions", "created_by"),
+        ("_quack_imports", "created_by"),
+        ("_quack_table_notes", "edited_by"),
+        ("_quack_provenance", "author"),
+        ("_quack_graph_merges", "decided_by"),
+    ] {
+        let left: i64 = db
+            .connection()
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE {column} IN ('u-bob', 'bob')"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(left, 0, "{table}.{column}");
+    }
+}

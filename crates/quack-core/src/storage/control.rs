@@ -2659,22 +2659,31 @@ impl ControlPlane {
         role: Role,
         granted_by: GrantedBy,
     ) -> Result<Bound> {
-        Ok(Bound::new(
-            Query::insert()
-                .into_table(Members::Table)
-                .columns([
-                    Members::WorkspaceId,
-                    Members::UserId,
-                    Members::Role,
-                    Members::GrantedBy,
-                ])
-                .values([
-                    workspace_id.into(),
-                    user_id.into(),
-                    role.as_str().into(),
-                    granted_by.as_str().into(),
-                ])?,
-        )?)
+        let mut insert = Query::insert()
+            .into_table(Members::Table)
+            .columns([
+                Members::WorkspaceId,
+                Members::UserId,
+                Members::Role,
+                Members::GrantedBy,
+            ])
+            .values([
+                workspace_id.into(),
+                user_id.into(),
+                role.as_str().into(),
+                granted_by.as_str().into(),
+            ])?
+            .to_owned();
+        // The provider never displaces a membership someone holds: one a
+        // person granted while the provider's groups were being read wins.
+        if granted_by == GrantedBy::Idp {
+            insert.on_conflict(
+                OnConflict::columns([Members::WorkspaceId, Members::UserId])
+                    .do_nothing()
+                    .to_owned(),
+            );
+        }
+        Ok(Bound::new(&insert)?)
     }
 
     /// Remove a membership, and record `audit` in the same transaction
@@ -2913,7 +2922,10 @@ impl ControlPlane {
                                 .table(Members::Table)
                                 .value(Members::Role, role.as_str())
                                 .and_where(Expr::col(Members::WorkspaceId).eq(workspace))
-                                .and_where(Expr::col(Members::UserId).eq(user_id)),
+                                .and_where(Expr::col(Members::UserId).eq(user_id))
+                                .and_where(
+                                    Expr::col(Members::GrantedBy).eq(GrantedBy::Idp.as_str()),
+                                ),
                         )?,
                         entry(workspace),
                     ));
@@ -2935,7 +2947,8 @@ impl ControlPlane {
                         Query::delete()
                             .from_table(Members::Table)
                             .and_where(Expr::col(Members::WorkspaceId).eq(workspace))
-                            .and_where(Expr::col(Members::UserId).eq(user_id)),
+                            .and_where(Expr::col(Members::UserId).eq(user_id))
+                            .and_where(Expr::col(Members::GrantedBy).eq(GrantedBy::Idp.as_str())),
                     )?,
                     entry(workspace),
                 ));
