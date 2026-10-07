@@ -32,6 +32,11 @@ pub(crate) struct TablesArgs {
 }
 
 impl TablesArgs {
+    /// Whether it sets a note or retypes a column.
+    pub(crate) fn writes(&self) -> bool {
+        self.note.is_some() || !self.retype.is_empty()
+    }
+
     pub(crate) fn run(self, db: &WorkspaceDb, out: &mut impl Write) -> Result<()> {
         let Some(table) = self.table else {
             return Self::list(db, self.format, out);

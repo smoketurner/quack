@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block content %}
+{% if let Some(ws) = page.workspace %}
+<h1 class="text-xl font-semibold">Saved questions</h1>
+<p class="mt-1 text-sm text-slate-400">A saved question is an answer's SQL kept under a name. Run runs it again without the model and says whether any result changed since the last run. Save an answer from the chat, or with <code>/saved add NAME</code> in the terminal.</p>
+{% if let Some(error) = error %}<p role="alert" class="mt-3 rounded border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}
+{% if let Some(notice) = notice %}<p role="status" class="mt-3 rounded border border-green-900 bg-green-950 px-3 py-2 text-sm text-green-300 wrap-anywhere">{{ notice }}</p>{% endif %}
+{% if let Some(r) = run %}
+<section class="mt-6 rounded border border-slate-800 bg-slate-900 p-4" aria-labelledby="run">
+  <h2 id="run" class="text-lg font-semibold">{{ r.name }}: {{ r.verdict }}</h2>
+  {% for s in r.statements %}
+  <pre class="mt-3 whitespace-pre-wrap font-mono text-sm text-slate-300">{{ s.sql }}</pre>
+  {% if !s.rows.is_empty() %}
+  <div class="mt-2 overflow-x-auto">
+    <table class="min-w-full text-sm">
+      <thead><tr class="border-b border-slate-700 text-left">{% for c in s.columns %}<th scope="col" class="px-3 py-2 font-mono whitespace-nowrap">{{ c }}</th>{% endfor %}</tr></thead>
+      <tbody>{% for row in s.rows %}<tr class="border-b border-slate-800">{% for v in row %}<td class="px-3 py-1"><div class="max-w-xs truncate" title="{{ v }}">{{ v }}</div></td>{% endfor %}</tr>{% endfor %}</tbody>
+    </table>
+  </div>
+  {% endif %}
+  <p class="mt-1 text-xs text-slate-400">{{ s.outcome }}</p>
+  {% endfor %}
+</section>
+{% endif %}
+{% if saved.is_empty() %}
+<p class="mt-6 text-sm text-slate-400">No saved questions yet.</p>
+{% else %}
+<ul class="mt-6 space-y-3">
+  {% for s in saved %}
+  <li class="rounded border border-slate-800 bg-slate-900 p-3">
+    <div class="flex flex-wrap items-center gap-2">
+      <span class="font-medium wrap-anywhere">{{ s.question.name }}</span>
+      <span class="text-xs text-slate-400">{{ s.question.mode.as_str() }} · {{ s.question.statements.len() }} statements · pinned {{ s.question.pinned_at }}</span>
+      <form method="post" action="/w/{{ ws.membership.workspace.id }}/saved/{{ s.question.id }}/run" class="ml-auto">
+        <button type="submit" class="rounded bg-blue-600 px-3 py-1 text-sm text-white hover:bg-blue-500">Run</button>
+      </form>
+      {% if s.removable %}
+      <form method="post" action="/w/{{ ws.membership.workspace.id }}/saved/{{ s.question.id }}/remove" data-confirm="Remove the saved question {{ s.question.name }}? Its runs go with it.">
+        <button type="submit" class="rounded border border-slate-700 px-3 py-1 text-sm hover:bg-slate-800">Remove</button>
+      </form>
+      {% endif %}
+    </div>
+    <p class="mt-1 text-sm text-slate-300 wrap-anywhere">{{ s.question.question }}</p>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endif %}
+{% endblock %}

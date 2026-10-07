@@ -62,6 +62,16 @@ signed-in user and reads no workspace, so it writes no audit row.
   visit is audited as opening the document; a position the document does not have is a 404
   page. The chunk is shown whatever the document's status, so a citation in an old answer
   still opens after its document was replaced.
+- **`saved.html`** (`/w/{id}/saved`, `server::web::saved`) lists the saved questions with
+  Run and, for the creator or an owner, Remove (asked first). Run shows each statement, its
+  kept rows, and `StatementRun::outcome` (the line `quack saved run` prints), then the run's
+  verdict. The chat page's Save form posts a name and the current session to
+  `/w/{id}/saved`, which saves the session's last answer; a refused save lands back on the
+  chat with the reason. Every action goes through the `Access` methods the `.../saved` REST
+  routes use (`list_saved`, `save_answer`, `run_saved`, `remove_saved`), so the audit rows
+  match. The chat page also links the session's Markdown and SQL export
+  (`GET .../sessions/{sid}/export`), and Settings links the workspace's OKF bundle
+  (`GET .../okf`).
 - **`search.html`** (`/w/{id}/search`, `server::web::search`) runs one document search
   without the model. The form posts its query in the body (search text is workspace
   content, and a URL ends up in logs) with a multi-select of the newest 200 ready
@@ -204,7 +214,8 @@ notifications while the page is hidden.
   passage each one cites, and the chart spec as an ECharts option with the toolbox's
   save-as-image and read-only data view, `stack` on bar and line series when the spec is
   stacked, and a Download CSV link built from the spec as a data URL. A `permission_required` event
-  becomes a card with the statement, Run it, Don't run it, and Allow for this turn, posted to
+  becomes a card with the event's `heading`, the statement, and a button per entry of its
+  `choices` (the words `analysis::events::Decision` gives every interface), posted to
   `.../sessions/{sid}/permissions/{request}`, and the time the turn stops waiting. When the event carries a `notice`
   (its `reason` is `read_documents`: the turn read document text, so the write is asked for even
   under "Run changes without asking"), the card shows that sentence; the text lives in

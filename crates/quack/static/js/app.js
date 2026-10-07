@@ -299,6 +299,27 @@
     return rest;
   }
 
+  function setMode(form, chat) {
+    var sid = chat.getAttribute("data-session");
+    if (!sid) return;
+    var status = document.getElementById("status");
+    var wanted = form.mode.value;
+    fetch("/api/v1/workspaces/" + chat.getAttribute("data-workspace") + "/sessions/" + sid, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: wanted }),
+      credentials: "same-origin"
+    }).then(function (res) {
+      if (res.ok) {
+        chat.setAttribute("data-mode", wanted);
+        status.textContent = "Mode set to " + wanted + " for this session.";
+        return;
+      }
+      form.mode.value = chat.getAttribute("data-mode");
+      return errorMessage(res).then(function (message) { status.textContent = "Mode not changed: " + message; });
+    });
+  }
+
   function submitAsk(form, chat) {
     var ws = chat.getAttribute("data-workspace");
     var messages = document.getElementById("messages");
@@ -438,10 +459,12 @@
         view.article.appendChild(c);
         renderChart(c, r.chart);
       }
-      (r.graph || []).forEach(function (result) {
+      (r.graph || []).forEach(function (result, i) {
+        if (!result.nodes.length) return;
         var g = el("div", "graph mt-3 h-72 rounded border border-slate-800");
         view.article.appendChild(g);
         renderGraph(g, result);
+        view.article.appendChild(el("p", "mt-1 text-xs text-slate-400", r.graph_summaries[i]));
       });
       if (r.citations && r.citations.length) {
         var ol = el("ol", "mt-3 space-y-1 text-sm text-slate-400");
@@ -475,12 +498,12 @@
   }
 
   // A write the agent wants to run waits for the person: the statement,
-  // three answers, and the time the turn stops waiting. The answer goes to
-  // the API; the step that follows shows what happened.
+  // the answers the server offers, and the time the turn stops waiting.
+  // The answer goes to the API; the step that follows shows what happened.
   function askPermission(view, p, ws) {
     var expires = new Date(p.expires_at);
     var card = el("div", "mt-3 rounded border border-amber-700 p-3 text-sm");
-    card.appendChild(el("p", "font-medium", "This statement changes the workspace:"));
+    card.appendChild(el("p", "font-medium", p.heading));
     card.appendChild(el("pre", "mt-2 whitespace-pre-wrap font-mono text-slate-200", p.sql));
     if (p.notice) {
       card.appendChild(el("p", "mt-2 text-amber-200", p.notice));
@@ -491,24 +514,24 @@
       buttons.remove();
       note.textContent = "Not run: no answer by " + expires.toLocaleTimeString() + ".";
     }, Math.max(0, expires - new Date()));
-    [["allow", "Run it", "rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500"],
-     ["deny", "Don't run it", "rounded border border-slate-700 px-3 py-2 hover:bg-slate-800"],
-     ["allow_turn", "Allow for this turn", "rounded border border-slate-700 px-3 py-2 hover:bg-slate-800"]
-    ].forEach(function (choice) {
-      var b = el("button", choice[2], choice[1]);
+    p.choices.forEach(function (choice) {
+      var style = choice.decision === "allow"
+        ? "rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500"
+        : "rounded border border-slate-700 px-3 py-2 hover:bg-slate-800";
+      var b = el("button", style, choice.label);
       b.type = "button";
       b.addEventListener("click", function () {
         clearTimeout(timer);
         buttons.remove();
-        note.textContent = choice[0] === "deny" ? "Not run." : "Running it…";
+        note.textContent = "…";
         fetch("/api/v1/workspaces/" + ws + "/sessions/" + p.session_id + "/permissions/" + p.request, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ decision: choice[0] }),
+          body: JSON.stringify({ decision: choice.decision }),
           credentials: "same-origin"
         }).then(function (res) {
           if (res.ok) {
-            if (choice[0] !== "deny") note.textContent = "Ran it.";
+            note.textContent = choice.reply;
             return;
           }
           return errorMessage(res).then(function (message) { note.textContent = "Not run: " + message; });
@@ -639,10 +662,11 @@
     var chat = document.getElementById("chat");
     var form = document.getElementById("ask");
     if (chat && form) {
-      // A session's mode is fixed when it is created; the selector only
-      // chooses the mode of a new session.
+      // The selector shows the session's mode and changes it, as the
+      // terminal's /mode does; with no session yet it picks the new one's.
       var mode = chat.getAttribute("data-mode");
-      if (mode) { form.mode.value = mode; form.mode.disabled = true; form.mode.title = "Set when the session was created"; }
+      if (mode) form.mode.value = mode;
+      form.mode.addEventListener("change", function () { setMode(form, chat); });
       form.addEventListener("submit", function (ev) { ev.preventDefault(); submitAsk(form, chat); });
       // Enter sends; Shift+Enter adds a line.
       form.prompt.addEventListener("keydown", function (ev) {

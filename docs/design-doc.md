@@ -1128,12 +1128,12 @@ when read: every value empty, at least half empty, numbers stored as text and da
 text (at least 90% of values cast), and a key that repeats (the mapping's key column, or a
 column named `id`). A mistyped-text warning names the type that fixes it only when every value
 converts. The prompt's tables block, `describe_table`, `find_tables`, the Tables page, REST
-`POST .../tables/describe`, MCP `describe_table`, `quack tables`, and the terminal's `/schema` show them.
+`POST .../tables/describe`, MCP `describe_table`, `quack tables`, and the terminal's `/tables TABLE` show them.
 
 **Table notes.** A member or owner writes a note per table (`quack tables T --note TEXT`,
 `PUT .../tables/note`, the Tables page; blank removes it; at most 2,000 characters), kept in
 `_quack_table_notes` and audited as `table_note`. It renders under the table wherever the table
-is described, the prompt and the terminal's `/schema` included, and feeds the table search.
+is described, the prompt and the terminal's `/tables TABLE` included, and feeds the table search.
 
 **Replacing a document.** `quack ingest FILE --replace [ID]` (the newest ready document
 with the file's name when no id is given), `POST .../documents?replace={doc}`, and the
@@ -1169,7 +1169,7 @@ and a range class, each satisfied by any subclass. Properties are typed
 `string | number | date | enum | boolean` and inherited, and may carry a `description`, a
 `unit`, and `synonyms`: a column a mapping gives a property renders as `- col (TYPE):
 description [unit] (also: synonyms)` in the tables block, `describe_table`, the terminal's
-`/schema`, and the Tables page, and its synonyms feed the table search (issue #403). **Measures** are named calculations
+`/tables TABLE`, and the Tables page, and its synonyms feed the table search (issue #403). **Measures** are named calculations
 over one table (`{"id": "revenue", "table": "orders", "expression": "sum(amount) / 100.0",
 "description": ...}`); a save checks `SELECT <expression> FROM <table>` is one read that plans,
 keeps one over a table that is gone (like a mapping), and the prompt lists up to 30 of them
@@ -1701,9 +1701,9 @@ anything `graph_` is refused (section 6.4); reading the graph views is a read.
 
 | Interface | Read | Write |
 |-----------|------|-------|
-| TUI | run | prompt `y`/`n`/`a` showing the SQL; `a` covers the rest of the turn and the session, until a turn reads document text (below) |
+| TUI | run | prompt `y`/`n`/`a` showing the SQL; `a` covers the rest of that turn (below) |
 | Print mode | run | refuse unless `--allow-write`; the answer completes and the exit code is 3 |
-| Web / REST | run | `allow_write: true` from a member with the write scope runs every write (asked for without it, 403). Otherwise a streamed turn (`query/stream`) from someone who may write asks: the turn holds the write in memory (`server::permissions::Permissions`) and sends a `permission_required` event (`{request, session_id, sql, reason, notice, expires_at}`, `reason` being `not_permitted` or `read_documents`, and `notice` the sentence to show the person for that reason, or `null`); the person who asked answers with `POST .../sessions/{sid}/permissions/{request}` `{"decision": "allow" \| "deny" \| "allow_turn"}` (204; 404 unknown or expired; 409 already answered; 410 when the turn had already stopped waiting, its stream gone or cancelled, so nothing ran; 403 for anyone else or without write access), and the turn goes on. No answer within `[server].permission_timeout_seconds` (300) refuses the write; a restart ends the waiting turn. The web chat shows the statement with Run it, Don't run it, and Allow for this turn, and when the turn stops waiting; "Run changes without asking" sets `allow_write`. Each answer, refusal, and expiry writes an `audit_log` row (action `permission`) and a `_quack_audit` detail `{request, sql, decision}`; an allow that reached no turn is a denied row with `decision: "gone"` and the answer given, never an allowed one. A non-streamed `query`, or a caller who may not write, is refused as before: 200 with `write_refused: true` |
+| Web / REST | run | `allow_write: true` from a member with the write scope runs every write (asked for without it, 403). Otherwise a streamed turn (`query/stream`) from someone who may write asks: the turn holds the write in memory (`server::permissions::Permissions`) and sends a `permission_required` event (`{request, session_id, sql, reason, notice, expires_at, heading, choices}`, `reason` being `not_permitted` or `read_documents`, and `notice` the sentence to show the person for that reason, or `null`); the person who asked answers with `POST .../sessions/{sid}/permissions/{request}` `{"decision": "allow" \| "deny" \| "allow_turn"}` (204; 404 unknown or expired; 409 already answered; 410 when the turn had already stopped waiting, its stream gone or cancelled, so nothing ran; 403 for anyone else or without write access), and the turn goes on. No answer within `[server].permission_timeout_seconds` (300) refuses the write; a restart ends the waiting turn. `heading` and `choices` (each `{decision, label, reply}`) are `analysis::events::Decision`'s own words, the ones the terminal shows beside its `y`, `n`, and `a` keys; the web chat shows the statement with those buttons, and when the turn stops waiting; "Run changes without asking" sets `allow_write`. Each answer, refusal, and expiry writes an `audit_log` row (action `permission`) and a `_quack_audit` detail `{request, sql, decision}`; an allow that reached no turn is a denied row with `decision: "gone"` and the answer given, never an allowed one. A non-streamed `query`, or a caller who may not write, is refused as before: 200 with `write_refused: true` |
 | MCP | run | refuse unless `quack mcp --allow-write` set the policy at launch (stdio has no tokens); `write_refused: true` in the structured content and a sentence in the text. Over HTTP the token's `write` scope decides |
 | Desktop | planned | native confirm dialog (section 11.6) |
 
@@ -1711,7 +1711,7 @@ anything `graph_` is refused (section 6.4); reading the graph views is a read.
 carry instructions (prompt injection), and under allow-write nothing else stands between a
 model that follows one and the statement. So once a turn has retrieved document or graph
 text, each later write in that turn needs a person's approval, whatever was allowed up front
-(`--allow-write`, `allow_write: true`, the terminal's `a`, a token's write scope):
+(`--allow-write`, `allow_write: true`, a token's write scope):
 
 | Where the turn runs | A write after the turn read document text |
 |---------------------|-------------------------------------------|
@@ -1866,7 +1866,8 @@ and the session they came from) and `_quack_saved_runs` (one row per run).
 
 - **Saving pins SQL.** A saved question is made from an answered turn: the person names the
   answer they just got (`quack saved add NAME --from-session ID [--message N]`, the
-  terminal's `/saved add NAME` for its last answer, `POST .../saved`; the terminal's other
+  terminal's `/saved add NAME` for its last answer, the chat page's Save form for the
+  session's last answer, `POST .../saved`; the Saved page, the terminal's other
   `/saved` verbs and the `.../saved` routes in 11.2 list, show, run, and remove). quack keeps the
   question text and the `run_sql` statements that returned rows, in order, each classified
   again as a read. An answer that ran no such statement, or one that ran a write, cannot be
@@ -2253,8 +2254,16 @@ and ask again. The UI covers:
 - Workspace list and switcher; workspace settings (classification label, allowed providers,
   members, API tokens); a separate context page with the editor and its version history.
 - Chat: thread list, streaming answer with a collapsible steps block, citations as links
-  to the document's row, charts and graph results inline, the allow-writes checkbox, a
-  mode selector for new sessions, Stop, an empty state that lists what the workspace holds.
+  to the document's row, charts and graph results inline (each graph with the one-line
+  summary the terminal prints under it, `GraphResult::summary`), the allow-writes checkbox, a
+  mode selector that sets a new session's mode and changes the current one's
+  (`PATCH .../sessions/{sid}`, as `/mode` does), Stop, a form that saves the session's last
+  answer as a saved question, Markdown and SQL export links for the session, and an empty
+  state that lists what the workspace holds.
+- Saved (`/w/{id}/saved`, `server::web::saved`): the workspace's saved questions, each with
+  Run (no model; the rows of each statement, its outcome line, and the run's verdict) and,
+  for its creator or an owner, Remove; the same `Access` operations as the `.../saved`
+  routes, audited the same way.
 - Documents: upload (multi-file), paste text, status with progress, pin, delete.
 - Search (`/w/{id}/search`): a POST form (query, a multi-select of ready documents, the
   mode, an optional graph entity) that runs the same search as the agent without the model
@@ -2493,19 +2502,23 @@ what is being approved. Input starting with `SELECT`/`WITH`/`FROM`/
 `DESCRIBE`/`SHOW`/`PIVOT`/`SUMMARIZE` is direct SQL when `DuckDB` can parse it; a line it
 cannot parse ("show me the first rows") is asked as a question when a chat model is set,
 with a note saying so, and `/sql` always runs its line as a statement. Direct SQL and `/sql` pass the agent's
-gate: internal tables refused, writes ask `y`/`n`/`a`, `max_query_rows` rows shown. A line that
+gate: internal tables refused, `max_query_rows` rows shown. A statement a person types runs as
+typed, a write included, as on the web SQL page; only the agent's writes ask. A line that
 is the path of a loadable file (or several, shell-quoted) is loaded; several names cut short
 by a word starting with `#`, which the shell split reads as a comment, are refused whole. The session turns on
 bracketed paste, so a file dropped on the terminal arrives as one paste of its path: into
 an empty input it loads at once, announced on a green `↑` line with its job number, and
 into text already typed it is inserted like any other paste.
 
-Slash commands: `/help`, `/tables`, `/schema TABLE`, `/sql`, `/ingest PATH` (`/attach`),
+Slash commands: `/help`, `/tables [TABLE] [--note TEXT] [--retype COL=TYPE]` (`quack tables`'s
+arguments and output), `/sql`, `/ingest PATH` (`/attach`),
 `/import`, `/docs`, `/search QUERY` (each hit's leg ranks, then both legs and the rerank
-outcome), `/pin`, `/unpin`, `/delete`, `/ontology ...` and `/graph ...`, `/graph
+outcome), `/scope [DOCUMENT..]` (limits the next questions to those documents, as the web
+chat's document picker limits one, until `/scope` with none; the header shows it), `/pin`, `/unpin`, `/delete` (asks `y`/`n` first), `/ontology ...` and `/graph ...`, `/graph
 ENTITY`, `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/saved [list | add
 NAME | run NAME | show NAME | remove NAME]` (`add` pins this session's last answer;
-`--refresh` and `--exit-code` are refused as command-line flags), `/sessions`,
+`--refresh` and `--exit-code` are refused as command-line flags), `/sessions` (`d` in its
+list deletes the highlighted session after a `y`, as the web's delete button asks first),
 `/resume`, `/new`, `/mode`, `/share`, `/unshare`, `/export [--sql|--markdown] [FILE]`,
 `/jobs`, `/cancel N`, `/steps`, `/model`, `/workspace`, `/clear`, `/quit`.
 `/model` shows the configured models, then lists each provider's models as a job

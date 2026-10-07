@@ -15,7 +15,7 @@ pub(crate) mod okf;
 pub(crate) mod ontology;
 pub(crate) mod openapi;
 pub(crate) mod query;
-mod saved;
+pub(crate) mod saved;
 mod sessions;
 mod tables;
 pub(crate) mod workspaces;

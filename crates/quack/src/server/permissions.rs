@@ -82,9 +82,7 @@ impl From<Refusal> for ApiError {
             Refusal::NotYours => {
                 Self::forbidden("only the person whose question asked for the write may decide it")
             }
-            Refusal::Gone { .. } => {
-                Self::gone("the question that asked for this write has already ended; nothing ran")
-            }
+            Refusal::Gone { .. } => Self::gone(Delivery::TURN_GONE),
         }
     }
 }

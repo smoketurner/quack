@@ -138,7 +138,9 @@ statements). There is no scheduler: cron runs it, and `--exit-code` exits 5 on a
 through `saved_cli` (`add` pins the session's last answer; `--refresh` and `--exit-code` are
 parse errors there), and the REST routes under `.../saved` (`server/api/saved.rs`) list, save,
 show, run, and remove, audited as `save`, `saved_run`, `open`, `list`, and `delete`; a run
-answers directly, no job.
+answers directly, no job. The web Saved page (`server/web/saved.rs`) and the chat page's Save
+form go through the same `Access` methods (`list_saved`, `save_answer`, `run_saved`,
+`remove_saved`).
 
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
 file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model through
@@ -163,7 +165,8 @@ documents, graph entity, `DocumentFilter`, mode `hybrid|keyword|vector`), is the
 page (`/w/{id}/search`); a person can limit a question to documents (`document_ids` on REST
 and MCP `query`, `-p --documents`, the chat's document picker): `DocumentScope` is resolved
 when the turn starts, noted in the system prompt, recorded on the user message
-(`UserMeta`), and intersected with the model's `document_ids`. Citations are registered per turn
+(`UserMeta`), and intersected with the model's `document_ids`; the terminal's `/scope DOC..`
+holds one for its next questions until `/scope` alone lifts it. Citations are registered per turn
 (`analysis::citations`) and validated before the answer is returned. Sessions have a mode,
 `chat` or `query`; `--mode` / `/mode` set it. The workspace context (owner-written
 instructions, `quack_core::storage::context`, versioned in `_quack_context`) is injected
@@ -245,7 +248,10 @@ retried with the real names (twice at most), and an empty reply is asked for onc
 workspace and its settings; a turn's recorder, write policy, refusal flag, and chart and graph
 results are one `analysis::tools::Turn`, handed to every call as a runtime scope of rig's
 `ToolContext` (`.tool_context(turn.context())` on the run). `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
-prompts y/n/a and `-p` refuses and exits 3. Once a turn has retrieved document or graph text
+prompts y/n/a (`a` covers the rest of that turn) and `-p` refuses and exits 3. Every
+interface offers the answers in `analysis::events::Decision`'s words (`label`, `reply`,
+`HEADING`; the SSE event carries them as `choices`). SQL a person types (the terminal's
+direct SQL and `/sql`, the web SQL page) runs as typed; only the agent's writes ask. Once a turn has retrieved document or graph text
 (`search_documents`, `search_graph`, `find_path`, `always_retrieve`, a `describe_class` that names
 example entities; `Turn::read_documents`),
 no write of that turn runs unasked, whatever was allowed: `WritePolicy::decide` asks where the

@@ -202,7 +202,17 @@ fn provisional_results_are_dropped_with_their_edges_and_provenance() {
     assert_eq!(kept.provenance.len(), 1);
     assert_eq!(kept.roots, [NodeId::from("a")]);
     assert_eq!(kept.status.dropped_provisional, 1);
-    assert_eq!(kept.without_provisional().status.dropped_provisional, 1);
+    let mut kept = kept.without_provisional();
+    assert_eq!(kept.status.dropped_provisional, 1);
+
+    // The line under the result says what was left out and how current it is.
+    kept.status.stale = true;
+    assert_eq!(
+        kept.summary().to_string(),
+        "2 nodes, 1 edges, 1 sources; 1 provisional nodes left out, since query mode answers \
+         from reviewed ones only; the graph was built with an older ontology version"
+    );
+    assert!(kept.to_string().ends_with(&format!("{}\n", kept.summary())));
 }
 
 #[test]

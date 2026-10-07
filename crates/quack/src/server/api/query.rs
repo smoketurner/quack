@@ -14,7 +14,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::Stream;
 use quack_core::analysis::agent::{AgentResponse, AgentResponseBody};
-use quack_core::analysis::events::{self, AgentEvent, FailureKind, ToolName, TurnFailure};
+use quack_core::analysis::events::{
+    self, AgentEvent, Decision, FailureKind, ToolName, TurnFailure,
+};
 use quack_core::analysis::policy::{Hold, WritePolicy};
 use quack_core::analysis::search::{DocumentSearch, SearchBody, SearchDetail, SearchOutcome};
 use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
@@ -349,6 +351,33 @@ pub(crate) struct PermissionEvent {
     pub notice: Option<&'static str>,
     /// When the turn stops waiting and refuses the write (RFC 3339).
     pub expires_at: String,
+    /// What to show above the statement.
+    pub heading: &'static str,
+    /// The answers to offer, in order, each with its words.
+    pub choices: Vec<Choice>,
+}
+
+/// One answer a permission prompt offers.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct Choice {
+    pub decision: Decision,
+    pub label: &'static str,
+    /// What to say once the turn has the answer.
+    pub reply: &'static str,
+}
+
+impl Choice {
+    /// Every answer, as every interface offers it.
+    fn all() -> Vec<Self> {
+        Decision::CHOICES
+            .into_iter()
+            .map(|decision| Self {
+                decision,
+                label: decision.label(),
+                reply: decision.reply(),
+            })
+            .collect()
+    }
 }
 
 /// SSE `complete`: the response object, and its answer as HTML.
@@ -358,6 +387,9 @@ pub(crate) struct CompleteEvent {
     pub response: AgentResponseBody,
     /// The answer rendered from Markdown, for a page to swap in.
     pub answer_html: String,
+    /// Each entry of `graph` in one line, as the terminal prints it under
+    /// the tree: its size and what a reader must know to trust it.
+    pub graph_summaries: Vec<String>,
 }
 
 /// One agent turn: the answer, its citations, and every step. A write the
@@ -474,6 +506,8 @@ pub(crate) async fn stream(
                         reason: hold,
                         notice: hold.notice(),
                         expires_at: held.expires_at.to_string(),
+                        heading: Decision::HEADING,
+                        choices: Choice::all(),
                     })
                     .unwrap_or_default()
             }
@@ -482,6 +516,11 @@ pub(crate) async fn stream(
                 // The web page swaps this in for the streamed plain text.
                 let payload = CompleteEvent {
                     answer_html: to_html(&response.content),
+                    graph_summaries: response
+                        .graph
+                        .iter()
+                        .map(|result| result.summary().to_string())
+                        .collect(),
                     response: response.body(&turn.session_id),
                 };
                 StreamEvent::Complete
