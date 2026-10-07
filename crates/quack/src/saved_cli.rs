@@ -19,8 +19,10 @@ use quack_core::storage::workspace::QueryResults;
 use quack_core::storage::writer::Writer;
 
 use crate::QueryFormat;
-use crate::print::PrintTurn;
+use crate::TITLE_GRACE;
+use crate::print::{AnswerTo, PrintTurn};
 use crate::text_or_json::TextOrJson;
+use quack_core::llm::titles::SessionTitler;
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum SavedAction {
@@ -214,9 +216,12 @@ async fn refresh_pin(
         documents: &[],
         format: TextOrJson::Text,
         verbose: model.verbose,
+        // The run's result owns stdout; the refreshed answer is commentary.
+        answer_to: AnswerTo::Stderr,
     }
     .run()
     .await;
+    SessionTitler::finish_pending(TITLE_GRACE).await;
     if outcome.is_err() {
         let id = session_id.clone();
         drop(

@@ -2620,7 +2620,7 @@ quack auth unregister [--issuer URL] [--yes]
 quack config [--changed] [--format json]
 quack doctor [-w NAME] [--offline] [--format json]
 quack serve [--bind ADDR] [--local]
-quack ready [URL]    GET /readyz on the server (the default URL from [server].bind), exit 0 or 1; the image's health check
+quack ready [--url URL]    GET /readyz on the server (the default URL from [server].bind), exit 0 or 1; the image's health check
 quack vault export-key [--to FILE] [-y]    the vault key, to a 0600 file or (after a yes) stdout
 quack mcp [-w NAME] [--allow-write]
 quack user add [--admin] | list [--format json] ; quack token create|list|revoke ;

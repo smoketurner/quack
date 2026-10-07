@@ -4,8 +4,10 @@
 //! the answer up, and never replaces a title a person gave
 //! (`sessions::set_model_title`).
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+use tokio_util::task::TaskTracker;
 
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
@@ -108,10 +110,11 @@ impl SessionTitler {
 
     /// Title `session` on its own task at background priority, carrying the
     /// caller's provider scope and acting person; a failure is logged, and
-    /// the session keeps its derived title.
+    /// the session keeps its derived title. A process that exits after its
+    /// turn waits for the task through [`Self::finish_pending`].
     pub fn spawn(self, db: Arc<Writer>, session: SessionId) {
         let (acting, egress) = (Acting::current(), Egress::current());
-        tokio::spawn(Acting::scope(
+        PENDING.spawn(Acting::scope(
             acting,
             Egress::scope(
                 egress,
@@ -123,4 +126,20 @@ impl SessionTitler {
             ),
         ));
     }
+
+    /// Wait, at most `limit`, for titles still being written: a command
+    /// that answers one question and exits (`quack -p`, `saved run
+    /// --refresh`) calls this after printing, or its runtime would drop the
+    /// title mid-call. A server or a terminal session outlives the task.
+    pub async fn finish_pending(limit: Duration) {
+        PENDING.close();
+        if tokio::time::timeout(limit, PENDING.wait()).await.is_err() {
+            tracing::warn!(
+                "a session title was still being written at exit; it keeps its derived title"
+            );
+        }
+    }
 }
+
+/// The title tasks this process started.
+static PENDING: LazyLock<TaskTracker> = LazyLock::new(TaskTracker::new);
