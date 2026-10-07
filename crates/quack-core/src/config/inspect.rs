@@ -398,6 +398,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "effort",
             "background_effort",
             "compact_history",
+            "title_sessions",
         ],
     ),
     (
@@ -855,6 +856,11 @@ fn analysis(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "compact_history",
         analysis.compact_history,
         default.compact_history,
+    );
+    s.literal(
+        "title_sessions",
+        analysis.title_sessions,
+        default.title_sessions,
     );
 }
 

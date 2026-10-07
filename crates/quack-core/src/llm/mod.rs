@@ -11,6 +11,7 @@ pub mod memory;
 pub mod oauth;
 pub mod sampling;
 mod slot;
+pub mod titles;
 pub mod vision;
 
 use jiff::{Timestamp, Zoned};
@@ -1304,6 +1305,7 @@ impl TurnRequest<'_> {
                 return Err(e);
             }
         };
+        let first_turn = history.is_empty();
 
         tracing::info!(chat_model = %chat, session = %session_id, prior_messages = history.len(), "starting agent turn");
 
@@ -1377,6 +1379,13 @@ impl TurnRequest<'_> {
             (session_id.to_owned(), message.to_owned(), response.clone());
         db.run(move |guard| sessions::record_turn(guard, &session, &text, asked_at, &recorded))
             .await?;
+        if first_turn && !response.cancelled {
+            match titles::SessionTitler::from_config(config).await {
+                Ok(Some(titler)) => titler.spawn(Arc::clone(&db), session_id.to_owned()),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "the session keeps its derived title"),
+            }
+        }
         Ok(response)
     }
 }

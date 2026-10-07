@@ -1344,6 +1344,7 @@ impl WorkspaceDb {
                 created_at TIMESTAMP DEFAULT now(),
                 updated_at TIMESTAMP DEFAULT now()
             );
+            ALTER TABLE _quack_sessions ADD COLUMN IF NOT EXISTS title_by TEXT;
             CREATE TABLE IF NOT EXISTS _quack_messages (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,

@@ -1788,6 +1788,9 @@ pub struct AnalysisConfig {
     /// dropping them. Off by default: each new summary is one more model
     /// call before a turn.
     pub compact_history: bool,
+    /// Have the chat model title each session after its first turn, at
+    /// background effort; a title a person gives is never replaced.
+    pub title_sessions: bool,
 }
 
 impl AnalysisConfig {
@@ -1821,6 +1824,7 @@ impl Default for AnalysisConfig {
             effort: None,
             background_effort: None,
             compact_history: false,
+            title_sessions: false,
         }
     }
 }

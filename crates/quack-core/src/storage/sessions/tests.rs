@@ -733,3 +733,136 @@ fn the_documents_a_question_was_limited_to_are_kept_on_its_message() {
         "an unscoped question stores no metadata"
     );
 }
+
+/// A person's title sticks: the model's does not replace it, and a blank
+/// rename gives back the title the first question derives.
+#[test]
+fn a_person_renames_a_session_and_the_model_never_overrides_it() {
+    let db = db();
+    let session =
+        create_session(&db, "p/m", ChatMode::Chat, None).unwrap_or_else(|e| fail(&e.to_string()));
+    record_turn(
+        &db,
+        &session.id,
+        "  which   vendors were late in March?  ",
+        Timestamp::now(),
+        &response("Two vendors.", vec![]),
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let derived = get_session(&db, &session.id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("no session"));
+    assert_eq!(
+        derived.title.as_deref(),
+        Some("which vendors were late in March?")
+    );
+    assert_eq!(derived.title_by, TitleSource::Derived);
+
+    assert!(set_model_title(&db, &session.id, "Late vendors, March").unwrap_or(false));
+    let renamed = set_session_title(&db, &session.id, "  Vendor   delays ")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(renamed.title.as_deref(), Some("Vendor delays"));
+    assert_eq!(renamed.title_by, TitleSource::Person);
+    assert!(!set_model_title(&db, &session.id, "Something else").unwrap_or(true));
+    assert_eq!(
+        get_session(&db, &session.id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.title),
+        Some(String::from("Vendor delays"))
+    );
+
+    let restored =
+        set_session_title(&db, &session.id, "   ").unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        restored.title.as_deref(),
+        Some("which vendors were late in March?")
+    );
+    assert_eq!(restored.title_by, TitleSource::Derived);
+    assert!(set_session_title(&db, &SessionId::from("missing"), "x").is_err());
+}
+
+/// Search matches questions and answers case-insensitively, takes `%` and
+/// `_` as themselves, skips tool rows, and never shows another member's
+/// private session, so its count gives nothing away either.
+#[test]
+fn message_search_matches_text_and_keeps_to_visible_sessions() {
+    let db = db();
+    let ada = UserId::from("ada");
+    let bob = UserId::from("bob");
+    let turn = |owner: &UserId, question: &str, answer: &str| {
+        let session = create_session(&db, "p/m", ChatMode::Chat, Some(owner))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        record_turn(
+            &db,
+            &session.id,
+            question,
+            Timestamp::now(),
+            &response(
+                answer,
+                vec![step(ToolName::RunSql, "SELECT 'Freight'", "1 rows")],
+            ),
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        session
+    };
+    let mine = turn(
+        &ada,
+        "How much did FREIGHT cost?",
+        "Freight was 12% of spend.",
+    );
+    let private = turn(&bob, "freight for bob only", "Bob's freight is private.");
+    let shared = turn(
+        &bob,
+        "freight shared with the team",
+        "Shared freight answer.",
+    );
+    set_session_sharing(&db, &shared.id, Sharing::Shared).unwrap_or_else(|e| fail(&e.to_string()));
+
+    let for_ada = search_messages(&db, "freight", &SessionViewer::User(ada), 50)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let sessions: Vec<&SessionId> = for_ada.iter().map(|h| &h.session_id).collect();
+    assert!(sessions.contains(&&mine.id) && sessions.contains(&&shared.id));
+    assert!(!sessions.contains(&&private.id), "{for_ada:?}");
+    assert_eq!(
+        for_ada.len(),
+        4,
+        "a question and an answer in each visible session"
+    );
+    assert!(for_ada.iter().all(|h| h.role != MessageRole::Tool));
+    let first = for_ada
+        .iter()
+        .find(|h| h.session_id == mine.id && h.role == MessageRole::User)
+        .unwrap_or_else(|| fail("no hit"));
+    assert_eq!(first.seq, 1);
+    assert!(first.snippet.contains("FREIGHT"), "{first:?}");
+    assert_eq!(
+        first.session_title.as_deref(),
+        Some("How much did FREIGHT cost?")
+    );
+
+    let everyone = search_messages(&db, "freight", &SessionViewer::All, 50)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(everyone.len(), 6);
+    let percent = search_messages(&db, "12%", &SessionViewer::All, 50)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(percent.len(), 1, "% is matched as itself");
+    assert!(
+        search_messages(&db, "1_%", &SessionViewer::All, 50)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .is_empty(),
+        "_ is matched as itself"
+    );
+    assert!(
+        search_messages(&db, "  ", &SessionViewer::All, 50)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .is_empty()
+    );
+    assert_eq!(
+        search_messages(&db, "freight", &SessionViewer::All, 2)
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .len(),
+        2
+    );
+}

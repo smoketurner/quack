@@ -9,7 +9,7 @@ use quack_core::analysis::events::Decision;
 use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::sessions::{
-    self, ChatMode, ExportFormat, MessageRow, SessionRow, Sharing, Transcript,
+    self, ChatMode, ExportFormat, MessageHit, MessageRow, SessionRow, Sharing, Transcript,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -28,6 +28,69 @@ pub(crate) struct ListQuery {
 
 fn default_limit() -> u32 {
     50
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+pub(crate) struct SearchQuery {
+    /// The text to find in questions and answers, case-insensitive.
+    pub q: String,
+    /// Hits at most, newest first.
+    #[serde(default = "default_limit")]
+    #[param(default = 50)]
+    pub limit: u32,
+}
+
+/// Questions and answers that matched, in sessions the caller may read.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct MessageHits {
+    pub hits: Vec<MessageHit>,
+}
+
+/// Find text in the questions and answers of the sessions the caller may
+/// read; a session they may not read never counts. Audited as `search`,
+/// the text in the detail row.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/sessions/search",
+    tag = "sessions",
+    params(WorkspaceId, SearchQuery),
+    responses((status = 200, description = "The matches", body = MessageHits)),
+)]
+pub(crate) async fn search(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+    Query(q): Query<SearchQuery>,
+) -> ApiResult<Json<MessageHits>> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let hits = access.search_sessions(&app, &q.q, q.limit.min(200)).await?;
+    Ok(Json(MessageHits { hits }))
+}
+
+impl Access {
+    /// The caller's matches for `query`, audited as a `search`.
+    pub(crate) async fn search_sessions(
+        &self,
+        app: &App,
+        query: &str,
+        limit: u32,
+    ) -> ApiResult<Vec<MessageHit>> {
+        let (viewer, text) = (self.session_viewer(), query.to_owned());
+        let hits = app
+            .read(&self.membership.workspace.id, move |db| {
+                sessions::search_messages(db, &text, &viewer, limit)
+            })
+            .await?;
+        self.audit(
+            app,
+            AuditAction::Search,
+            None,
+            Outcome::Allowed,
+            Some(serde_json::json!({ "sessions": query, "hits": hits.len() })),
+        )
+        .await?;
+        Ok(hits)
+    }
 }
 
 /// The sessions the caller may read.
@@ -125,10 +188,14 @@ pub(crate) struct UpdateSession {
     pub shared: Option<Sharing>,
     /// `chat` or `query`: the explicit way to change a session's mode.
     pub mode: Option<ChatMode>,
+    /// A new title; an empty one gives back the title the first question
+    /// derives.
+    pub title: Option<String>,
 }
 
-/// Share a session with every member or take it back, or change its
-/// mode. Its creator, or an owner, may. Audited as `share` and `mode`.
+/// Share a session with every member or take it back, change its mode, or
+/// rename it. Its creator, or an owner, may. Audited as `share`, `mode`,
+/// and `rename`.
 #[utoipa::path(
     patch,
     path = "/workspaces/{id}/sessions/{sid}",
@@ -143,16 +210,20 @@ pub(crate) async fn update(
     Json(body): Json<UpdateSession>,
 ) -> ApiResult<Json<SessionRow>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    if body.shared.is_none() && body.mode.is_none() {
-        return Err(ApiError::bad_request("give shared or mode"));
+    if body.shared.is_none() && body.mode.is_none() && body.title.is_none() {
+        return Err(ApiError::bad_request("give shared, mode, or title"));
     }
     let shared = match body.shared {
         Some(sharing) => Some(access.set_session_sharing(&app, &sid, sharing).await?),
         None => None,
     };
-    let session = match body.mode {
+    let moded = match body.mode {
         Some(mode) => Some(access.set_session_mode(&app, &sid, mode).await?),
         None => shared,
+    };
+    let session = match body.title {
+        Some(title) => Some(access.rename_session(&app, &sid, &title).await?),
+        None => moded,
     };
     let session =
         session.ok_or_else(|| ApiError::from(ResourceKind::Session.missing(sid.as_str())))?;
@@ -266,6 +337,39 @@ impl Access {
             Some(ResourceKind::Session.id(sid)),
             Outcome::Allowed,
             Some(serde_json::json!({ "shared": bool::from(sharing) })),
+        )
+        .await?;
+        Ok(updated)
+    }
+
+    /// Rename a session; a blank title gives back the derived one. The
+    /// title is workspace content, so it goes in the detail row only.
+    pub(crate) async fn rename_session(
+        &self,
+        app: &App,
+        sid: &SessionId,
+        title: &str,
+    ) -> ApiResult<SessionRow> {
+        let session = self
+            .own_session(
+                app,
+                sid,
+                AuditAction::Rename,
+                "only the session's creator or an owner may rename it",
+            )
+            .await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let (session_id, title) = (session.id, title.to_owned());
+        let updated = with_db(db, move |db| {
+            sessions::set_session_title(db, &session_id, &title)
+        })
+        .await?;
+        self.audit(
+            app,
+            AuditAction::Rename,
+            Some(ResourceKind::Session.id(sid)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "title": updated.title, "title_by": updated.title_by })),
         )
         .await?;
         Ok(updated)
