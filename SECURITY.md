@@ -5,9 +5,7 @@
 Please report security vulnerabilities responsibly. **Do not** open a public GitHub issue.
 
 Use GitHub's private vulnerability reporting on this repository (Security tab, "Report a
-vulnerability"). The machine-readable form of this policy (RFC 9116) is
-[`.well-known/security.txt`](.well-known/security.txt); publish it at the project's web
-origin, not from `quack serve`, where the contact would be the operator's.
+vulnerability").
 
 Include where possible:
 
