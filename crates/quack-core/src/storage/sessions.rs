@@ -81,10 +81,41 @@ pub enum Sharing {
 
 flag_enum!(Sharing, false => Private, true => Shared);
 
+/// Who gave a session its title.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TitleSource {
+    /// The first question, cut short.
+    #[default]
+    Derived,
+    /// A person renamed it; nothing else changes it.
+    Person,
+    /// The chat model summed up the first turn (`[analysis].title_sessions`).
+    Model,
+}
+
+text_enum!(TitleSource, "title source", {
+    Derived => "derived",
+    Person => "person",
+    Model => "model",
+});
+
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct SessionRow {
     pub id: SessionId,
     pub title: Option<String>,
+    /// Who gave it its title.
+    pub title_by: TitleSource,
     pub mode: ChatMode,
     pub model: String,
     /// The server user who started it; `None` from the CLI and TUI.
@@ -113,6 +144,10 @@ impl TryFrom<&duckdb::Row<'_>> for SessionRow {
             message_count: row.get(6)?,
             created_by: row.get(7)?,
             sharing: row.get(8)?,
+            title_by: row
+                .get::<_, Option<String>>(9)?
+                .and_then(|by| by.parse().ok())
+                .unwrap_or_default(),
         })
     }
 }
@@ -331,7 +366,11 @@ const TITLE_CHARS: usize = 80;
 const SESSION_COLUMNS: &str = "s.id, s.title, s.mode, s.model, CAST(s.created_at AS VARCHAR), \
      CAST(s.updated_at AS VARCHAR), \
      (SELECT count(*) FROM _quack_messages m WHERE m.session_id = s.id), s.created_by, \
-     COALESCE(s.shared, false)";
+     COALESCE(s.shared, false), s.title_by";
+
+/// The rule [`SessionRow::visible_to`] states, in SQL over `s`: the one
+/// placeholder is the viewing user's id.
+const VISIBLE_TO_USER: &str = "(s.created_by IS NULL OR s.created_by = ? OR s.shared)";
 
 /// Start a new session for `model` (`provider/model`) in `mode`, owned by
 /// `created_by` in server mode.
@@ -426,7 +465,7 @@ pub fn list_sessions_for(
     };
     let sql = format!(
         "SELECT {SESSION_COLUMNS} FROM _quack_sessions s \
-         WHERE s.created_by IS NULL OR s.created_by = ? OR s.shared \
+         WHERE {VISIBLE_TO_USER} \
          ORDER BY s.updated_at DESC, s.id DESC LIMIT ?"
     );
     let mut stmt = db.connection().prepare(&sql)?;
@@ -574,19 +613,188 @@ pub fn record_turn(
     )?;
 
     if session.title.is_none() {
-        let title: String = user_message
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(TITLE_CHARS)
-            .collect();
         db.connection().execute(
-            "UPDATE _quack_sessions SET title = ? WHERE id = ?",
-            duckdb::params![title, session_id],
+            "UPDATE _quack_sessions SET title = ?, title_by = ? WHERE id = ?",
+            duckdb::params![
+                SessionTitle::of(user_message).0,
+                TitleSource::Derived.as_str(),
+                session_id
+            ],
         )?;
     }
     Ok(())
+}
+
+/// A session title: one line, at most `TITLE_CHARS` characters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTitle(String);
+
+impl SessionTitle {
+    /// `text` on one line, its whitespace collapsed, cut to the limit.
+    #[must_use]
+    pub fn of(text: &str) -> Self {
+        Self(
+            text.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(TITLE_CHARS)
+                .collect(),
+        )
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Rename a session. A blank title gives it back the one its first question
+/// derives; any other is the person's, and the model never replaces it.
+///
+/// # Errors
+///
+/// Returns `NotFound` when the session does not exist, or a storage error.
+pub fn set_session_title(
+    db: &WorkspaceDb,
+    session_id: &SessionId,
+    title: &str,
+) -> Result<SessionRow> {
+    let given = SessionTitle::of(title);
+    let (title, by) = if given.as_str().is_empty() {
+        let first: Option<String> = db
+            .connection()
+            .query_row(
+                "SELECT content FROM _quack_messages WHERE session_id = ? AND role = 'user' \
+                 ORDER BY seq LIMIT 1",
+                duckdb::params![session_id],
+                |row| row.get(0),
+            )
+            .or_else(|e| match e {
+                duckdb::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        (
+            first.map(|text| SessionTitle::of(&text).0),
+            TitleSource::Derived,
+        )
+    } else {
+        (Some(given.0), TitleSource::Person)
+    };
+    let changed = db.connection().execute(
+        "UPDATE _quack_sessions SET title = ?, title_by = ? WHERE id = ?",
+        duckdb::params![title, by.as_str(), session_id],
+    )?;
+    if changed == 0 {
+        return Err(ResourceKind::Session.missing(session_id.as_str()));
+    }
+    get_session(db, session_id)?.ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))
+}
+
+/// Give a session the title the model wrote, unless a person named it.
+/// Returns whether the title changed.
+///
+/// # Errors
+///
+/// Returns a storage error.
+pub fn set_model_title(db: &WorkspaceDb, session_id: &SessionId, title: &str) -> Result<bool> {
+    let title = SessionTitle::of(title);
+    if title.as_str().is_empty() {
+        return Ok(false);
+    }
+    let changed = db.connection().execute(
+        "UPDATE _quack_sessions SET title = ?, title_by = ? \
+         WHERE id = ? AND COALESCE(title_by, 'derived') <> ?",
+        duckdb::params![
+            title.as_str(),
+            TitleSource::Model.as_str(),
+            session_id,
+            TitleSource::Person.as_str()
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// A question or answer that matched a search, in a session the viewer may
+/// read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct MessageHit {
+    pub session_id: SessionId,
+    pub session_title: Option<String>,
+    /// The message's position in its session, which the chat page anchors.
+    pub seq: i64,
+    pub role: MessageRole,
+    /// The text around the first match.
+    pub snippet: String,
+    pub created_at: String,
+}
+
+/// Characters of context on each side of the match in a snippet.
+const SNIPPET_CONTEXT: i64 = 60;
+
+/// The questions and answers containing `query` (case-insensitive, as
+/// typed: `%` and `_` match themselves), newest first, in the sessions
+/// `viewer` may read. The visibility rule is part of the query, so neither
+/// the hits nor their count reveal a session the viewer may not open.
+///
+/// # Errors
+///
+/// Returns a storage error.
+pub fn search_messages(
+    db: &WorkspaceDb,
+    query: &str,
+    viewer: &SessionViewer,
+    limit: u32,
+) -> Result<Vec<MessageHit>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pattern = format!(
+        "%{}%",
+        query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    let visible = match viewer {
+        SessionViewer::All => "true",
+        SessionViewer::User(_) => VISIBLE_TO_USER,
+    };
+    let sql = format!(
+        "SELECT m.session_id, s.title, m.seq, m.role, \
+         substr(m.content, greatest(1, instr(lower(m.content), lower(?)) - {SNIPPET_CONTEXT}), \
+                length(?) + 2 * {SNIPPET_CONTEXT}), \
+         CAST(m.created_at AS VARCHAR) \
+         FROM _quack_messages m JOIN _quack_sessions s ON s.id = m.session_id \
+         WHERE m.role IN ('user', 'assistant') AND m.content ILIKE ? ESCAPE '\\' AND {visible} \
+         ORDER BY m.created_at DESC, m.seq DESC LIMIT ?"
+    );
+    let mut stmt = db.connection().prepare(&sql)?;
+    let limit = i64::from(limit);
+    let mut rows = match viewer {
+        SessionViewer::All => stmt.query(duckdb::params![query, query, pattern, limit])?,
+        SessionViewer::User(user) => {
+            stmt.query(duckdb::params![query, query, pattern, user, limit])?
+        }
+    };
+    let mut hits = Vec::new();
+    while let Some(row) = rows.next()? {
+        let role: String = row.get(3)?;
+        hits.push(MessageHit {
+            session_id: row.get(0)?,
+            session_title: row.get(1)?,
+            seq: row.get(2)?,
+            role: role.parse()?,
+            snippet: row
+                .get::<_, String>(4)?
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            created_at: row.get(5)?,
+        });
+    }
+    Ok(hits)
 }
 
 /// The session's turns to replay to the model, oldest first: each question

@@ -1803,6 +1803,20 @@ message.
 - Server mode: sessions carry `created_by`. Members see their own, any marked `shared`, and
   any with no creator (started from the CLI or the TUI). `owner` sees all sessions in the
   workspace for audit.
+- Title: the first question, cut to 80 characters, until someone renames the session:
+  `/rename TITLE` in the terminal, `PATCH /sessions/{id}` with `title`, or the chat page's
+  form. A blank title gives back the derived one. `_quack_sessions.title_by` says who named
+  it (`derived`, `person`, `model`). With `[analysis].title_sessions` (off by default), the
+  chat model titles a session after its first turn, at background priority and effort, and
+  never replaces a title a person gave (`llm::titles`, `sessions::set_model_title`). Renames
+  are audited as `rename`, with the title in the workspace's detail row only.
+- Search: `quack sessions --search TEXT`, `/sessions TEXT` (the picker, narrowed to the
+  sessions that mention it), `GET /sessions/search?q=`, and the chat page's search box find
+  the text in questions and answers, case-insensitive and as typed
+  (`sessions::search_messages`, `ILIKE` with `%` and `_` escaped). The visibility rule is
+  part of the query, so neither a hit nor the count reveals a session the caller may not
+  read. Each hit links to its message (`/w/{id}/chat?session=...#m-{seq}`). `/resume` also
+  takes the start of a session's title.
 
 ### 8.1 Saved questions
 
@@ -2334,8 +2348,9 @@ GET    /api/v1/workspaces/{id}/context             current; Markdown or JSON by 
 PUT    /api/v1/workspaces/{id}/context
 GET    /api/v1/workspaces/{id}/context/versions
 GET    /api/v1/workspaces/{id}/sessions[?limit=50] | /{sid}
+GET    /api/v1/workspaces/{id}/sessions/search?q=TEXT[&limit=50]   matches in sessions the caller may read; audited as search
 DELETE /api/v1/workspaces/{id}/sessions/{sid}     creator or owner
-PATCH  /api/v1/workspaces/{id}/sessions/{sid}     {shared} | {mode} (creator or owner; audited as share, mode)
+PATCH  /api/v1/workspaces/{id}/sessions/{sid}     {shared} | {mode} | {title} (creator or owner; audited as share, mode, rename)
                                                   a session's mode is set when it is created;
                                                   `mode` on a later query is ignored
 GET    /api/v1/workspaces/{id}/sessions/{sid}/export?format=sql|markdown

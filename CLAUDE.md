@@ -101,7 +101,7 @@ cargo run --bin quack -- docs [--tag ID TAG | --untag ID TAG | --author ID NAME 
 cargo run --bin quack -- -p "question" -w ws [-f text|json] [--documents DOC,..]   # one agent turn; steps on stderr; --documents limits it to those documents
 cargo run --bin quack -- search QUERY -w ws [--in DOC..] [--keyword|--vector] [--explain] [-f text|json]   # analysis::search::DocumentSearch without the model: each hit's vector, keyword, and rerank rank
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
-cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
+cargo run --bin quack -- sessions [--search TEXT] | export ID [--sql]          # sessions live in the workspace file; /rename, /sessions TEXT, and /resume TITLE in the terminal; [analysis].title_sessions has the model title them
 cargo run --bin quack -- saved list | add NAME --from-session ID | run NAME [--refresh] [--exit-code] | show NAME | remove NAME   # an answer's SQL re-run without the model; exit 5 when changed; cron schedules it
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
 cargo run --bin quack -- ontology rename class|relation OLD NEW                   # a new id as a new version; the graph's nodes and edges move with it

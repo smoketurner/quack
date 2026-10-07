@@ -48,7 +48,8 @@ use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, ResourceKind};
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{
-    self, ChatMode, ExportFormat, MessageRole, Sharing, Transcript,
+    self, ChatMode, ExportFormat, MessageRole, SessionRow, SessionViewer, Sharing, TitleSource,
+    Transcript,
 };
 use quack_core::storage::workspace::{
     Pinning, QueryCanceller, QueryResults, SqlSchema, StatementKind, WorkspaceDb,
@@ -2057,7 +2058,9 @@ impl App {
             SlashCommand::Cancel { job } => self.cancel_job(job),
             SlashCommand::Help => self.note(MessageKind::System, SlashCommand::help()),
             SlashCommand::Workspace => self.show_workspace(),
-            SlashCommand::Sessions => self.show_sessions(),
+            SlashCommand::Sessions { query: None } => self.show_sessions(),
+            SlashCommand::Sessions { query: Some(text) } => self.show_matching_sessions(text),
+            SlashCommand::Rename { title } => self.rename_session(title.unwrap_or_default()),
             SlashCommand::Resume { id } => self.switch_session(id),
             SlashCommand::New => self.new_session(),
             SlashCommand::Mode { mode: None } => self.show_mode(),
@@ -2222,6 +2225,55 @@ impl App {
         );
     }
 
+    /// `/sessions TEXT`: the picker, holding the sessions whose questions or
+    /// answers contain `text`, newest match first.
+    fn show_matching_sessions(&mut self, text: String) {
+        self.on_db_ok(
+            Side::Read,
+            move |db| {
+                let hits =
+                    sessions::search_messages(db, &text, &SessionViewer::All, PICKER_SESSIONS)?;
+                let mut rows: Vec<SessionRow> = Vec::new();
+                for hit in hits {
+                    if rows.iter().all(|row| row.id != hit.session_id)
+                        && let Some(row) = sessions::get_session(db, &hit.session_id)?
+                    {
+                        rows.push(row);
+                    }
+                }
+                Ok(rows)
+            },
+            |app, rows| {
+                if rows.is_empty() {
+                    app.note(MessageKind::System, "No session mentions that.");
+                    return;
+                }
+                app.picker = Some(Picker::sessions(rows, app.session_id.clone()));
+            },
+        );
+    }
+
+    /// `/rename [TITLE]`: a new title, or with none the derived one again.
+    fn rename_session(&mut self, title: String) {
+        let session = self.session_id.clone();
+        self.on_db_ok(
+            Side::Write,
+            move |db| sessions::set_session_title(db, &session, &title),
+            |app, renamed| {
+                let title = renamed.title.unwrap_or_default();
+                app.note(
+                    MessageKind::System,
+                    match renamed.title_by {
+                        TitleSource::Person => format!("Renamed to \"{title}\"."),
+                        TitleSource::Derived | TitleSource::Model => {
+                            format!("Named after its first question again: \"{title}\".")
+                        }
+                    },
+                );
+            },
+        );
+    }
+
     /// `/resume PREFIX`: find the session, then load its messages, both on
     /// the reader; input typed meanwhile waits for the switch.
     fn switch_session(&mut self, prefix: String) {
@@ -2231,7 +2283,31 @@ impl App {
             Side::Read,
             move |db| {
                 let sessions = sessions::list_sessions(db, 1000)?;
-                let found = match PrefixMatch::of(sessions, &prefix, |s| s.id.as_str()) {
+                let by_id = PrefixMatch::of(sessions.clone(), &prefix, |s| s.id.as_str());
+                let by_title = || {
+                    let wanted = prefix.to_lowercase();
+                    let titled: Vec<SessionRow> = sessions
+                        .into_iter()
+                        .filter(|s| {
+                            s.title
+                                .as_deref()
+                                .is_some_and(|t| t.to_lowercase().starts_with(&wanted))
+                        })
+                        .collect();
+                    match titled.len() {
+                        0 => PrefixMatch::None,
+                        1 => titled
+                            .into_iter()
+                            .next()
+                            .map_or(PrefixMatch::None, PrefixMatch::One),
+                        _ => PrefixMatch::Many(titled),
+                    }
+                };
+                let matched = match by_id {
+                    PrefixMatch::None => by_title(),
+                    found => found,
+                };
+                let found = match matched {
                     PrefixMatch::One(session) if session.id == current => Found::Current,
                     PrefixMatch::One(session) => Found::One(Replay::load(db, &session.id)?),
                     PrefixMatch::None => Found::None(prefix),

@@ -185,6 +185,7 @@ pub(crate) fn router(app: &App) -> ApiRoutes {
         .route("/workspaces/{id}/saved/{saved}/run", post(saved::run))
         .route("/workspaces/{id}/saved/{saved}/runs", get(saved::runs))
         .route("/workspaces/{id}/sessions", get(sessions::list))
+        .route("/workspaces/{id}/sessions/search", get(sessions::search))
         .route(
             "/workspaces/{id}/sessions/{sid}",
             get(sessions::show)

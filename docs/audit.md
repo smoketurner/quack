@@ -58,6 +58,7 @@ API Activity event with that name.
 | `embeddings_status` | The vectors' status is read | `allowed` | API: Read |
 | `session_read` | A session's transcript, or the workspace's audit detail, is read | `allowed`, `denied` | API: Read |
 | `share` | A session is shared or unshared | `allowed`, `denied` | API: Update |
+| `rename` | A session is renamed or given back its derived title; the title is in the workspace's detail row | `allowed`, `denied` | API: Update |
 | `mode` | A session's mode changes | `allowed` | API: Update |
 | `cancel` | A job is cancelled | `allowed`, `error` | API: Update |
 | `permission` | A person answers a write the agent waits on, or the wait expires | `allowed`, `denied` | API: Update |

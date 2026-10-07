@@ -8129,6 +8129,170 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
     );
 }
 
+/// A session's creator renames it and another member may not; search finds
+/// text only in the sessions the caller may read, and both are audited with
+/// the text kept in the workspace's detail rows.
+#[tokio::test]
+async fn sessions_are_renamed_by_their_creator_and_searched_within_what_one_may_read() {
+    use quack_core::analysis::agent::AgentResponse;
+    use quack_core::error::Result as CoreResult;
+    use quack_core::ids::SessionId;
+    use quack_core::storage::sessions::{self, ChatMode};
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("olive", UserKind::Standard).await;
+    let ws = h.workspace("sales", &owner).await;
+    let ada = h.user("ada", UserKind::Standard).await;
+    let bob = h.user("bob", UserKind::Standard).await;
+    for u in [&ada, &bob] {
+        h.app
+            .control
+            .set_member(&ws, u, Role::Member, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let (adas, bobs) = {
+        let (ada, bob) = (ada.clone(), bob.clone());
+        db.run(move |db| {
+            let turn = |owner: &UserId, question: &str| -> CoreResult<SessionId> {
+                let session = sessions::create_session(db, "m", ChatMode::Chat, Some(owner))?;
+                sessions::record_turn(
+                    db,
+                    &session.id,
+                    question,
+                    jiff::Timestamp::now(),
+                    &AgentResponse {
+                        content: String::from("Freight answer."),
+                        ..AgentResponse::default()
+                    },
+                )?;
+                Ok(session.id)
+            };
+            Ok((
+                turn(&ada, "freight costs in March")?,
+                turn(&bob, "freight for bob")?,
+            ))
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    let ada_token = h.login("ada").await;
+    let bob_token = h.login("bob").await;
+    let session = |sid: &SessionId| format!("/api/v1/workspaces/{ws}/sessions/{sid}");
+
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &session(&adas),
+            Some(&bob_token),
+            Some(serde_json::json!({ "title": "stolen" })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "bob cannot see ada's session: {body}"
+    );
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &session(&adas),
+            Some(&ada_token),
+            Some(serde_json::json!({ "title": "  March freight " })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["title"], "March freight");
+    assert_eq!(body["title_by"], "person");
+    let (_, body) = h
+        .call(
+            Method::PATCH,
+            &session(&adas),
+            Some(&ada_token),
+            Some(serde_json::json!({ "title": "" })),
+        )
+        .await;
+    assert_eq!(body["title"], "freight costs in March");
+    assert_eq!(body["title_by"], "derived");
+
+    let search = format!("/api/v1/workspaces/{ws}/sessions/search?q=FREIGHT");
+    let (status, body) = h.get(&search, &ada_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hits = body["hits"].as_array().cloned().unwrap_or_default();
+    assert_eq!(hits.len(), 2, "ada's question and answer only: {body}");
+    assert!(hits.iter().all(|hit| hit["session_id"] == adas.as_str()));
+    let (_, body) = h.get(&search, &bob_token).await;
+    assert!(
+        body["hits"]
+            .as_array()
+            .is_some_and(|hits| hits.iter().all(|hit| hit["session_id"] == bobs.as_str())),
+        "{body}"
+    );
+
+    // The web console: anchors on each message, the search fragment linking
+    // to them within what the caller may read, and the rename form.
+    let (_, page, _) = h
+        .page(&format!("/w/{ws}/chat?session={adas}"), Some(&ada_token))
+        .await;
+    assert!(
+        page.contains("id=\"m-1\"") && page.contains("id=\"m-2\""),
+        "{page}"
+    );
+    assert!(page.contains(&format!("/chat/{adas}/rename")), "{page}");
+    let (_, fragment, _) = h
+        .page(&format!("/w/{ws}/chat/search?q=freight"), Some(&ada_token))
+        .await;
+    assert!(
+        fragment.contains(&format!("session={adas}#m-1")),
+        "{fragment}"
+    );
+    assert!(!fragment.contains(bobs.as_str()), "{fragment}");
+    let (status, _, _) = h
+        .form(
+            &format!("/w/{ws}/chat/{adas}/rename"),
+            Some(&ada_token),
+            "title=Freight+by+month",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, page, _) = h
+        .page(&format!("/w/{ws}/chat?session={adas}"), Some(&ada_token))
+        .await;
+    assert!(page.contains("Freight by month"), "{page}");
+
+    let renames = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("rename")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(renames.len(), 3, "{renames:?}");
+    let searches = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("search")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(searches.len(), 3, "{searches:?}");
+    let detail = db
+        .run(|db| audit::list(db, 100))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        detail.iter().any(|row| row
+            .detail
+            .as_ref()
+            .is_some_and(|d| d["title"] == "March freight")),
+        "the title is kept in the workspace, not control.db"
+    );
+}
+
 /// The shipments ontology the graph tests build from: three classes
 /// keyed by name or purchase order, two relations, one mapping.
 fn shipments_ontology() -> serde_json::Value {

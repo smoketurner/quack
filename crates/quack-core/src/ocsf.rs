@@ -73,6 +73,7 @@ impl EventClass {
             AuditAction::Context
             | AuditAction::Member
             | AuditAction::Share
+            | AuditAction::Rename
             | AuditAction::Mode
             | AuditAction::Cancel
             | AuditAction::Permission

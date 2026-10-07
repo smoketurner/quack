@@ -149,6 +149,7 @@ const COOKIE: &str = "session";
         saved::run,
         saved::runs,
         sessions::list,
+        sessions::search,
         sessions::show,
         sessions::update,
         sessions::remove,

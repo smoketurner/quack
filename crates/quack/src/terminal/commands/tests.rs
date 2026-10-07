@@ -333,6 +333,22 @@ fn free_text_arrives_as_typed_and_the_rest_splits_like_a_shell_line() {
     ));
     assert!(SlashCommand::parse("/import https://x/a.json t --json-pointer data").is_err());
     assert!(matches!(
+        SlashCommand::parse("/rename  Q3 --freight review "),
+        Ok(SlashCommand::Rename { title: Some(t) }) if t == "Q3 --freight review"
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/rename"),
+        Ok(SlashCommand::Rename { title: None })
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/sessions"),
+        Ok(SlashCommand::Sessions { query: None })
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/sessions late \"vendors\""),
+        Ok(SlashCommand::Sessions { query: Some(q) }) if q == "late \"vendors\""
+    ));
+    assert!(matches!(
         SlashCommand::parse("/export --sql 'the session.sql'"),
         Ok(SlashCommand::Export { flags, file: Some(f) })
             if flags.format() == ExportFormat::Sql && f == "the session.sql"
