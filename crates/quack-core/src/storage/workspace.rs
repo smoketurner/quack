@@ -944,6 +944,43 @@ impl WorkspaceDb {
         })
     }
 
+    /// The schema version a workspace's file records, read through a
+    /// read-only connection so nothing is created or upgraded: 0 for a file
+    /// from before versions were recorded. [`Self::open`] upgrades a file
+    /// older than [`Self::schema_version`] in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::WorkspaceLocked` when another process holds the
+    /// file, or an error if it cannot be read.
+    pub fn recorded_schema(config: &Config, workspace_id: &str) -> Result<u32> {
+        let db_path = config.workspace_db_path(workspace_id);
+        let read_only = duckdb::Config::default()
+            .with(
+                "storage_compatibility_version",
+                STORAGE_COMPATIBILITY_VERSION,
+            )?
+            .access_mode(duckdb::AccessMode::ReadOnly)?;
+        let conn = duckdb::Connection::open_with_flags(&db_path, read_only).map_err(|e| {
+            if e.to_string().contains("Could not set lock") {
+                Error::WorkspaceLocked {
+                    path: db_path.clone(),
+                }
+            } else {
+                Error::from(e)
+            }
+        })?;
+        match Self::recorded(&conn, MetaKey::SchemaVersion)? {
+            None => Ok(0),
+            Some(text) => text
+                .parse::<u32>()
+                .map_err(|_| Error::WorkspaceSchemaUnreadable {
+                    path: db_path,
+                    recorded: text,
+                }),
+        }
+    }
+
     /// Open (or create) the `DuckDB` database for a workspace.
     ///
     /// Creates the `_quack_` internal tables if they do not exist, and

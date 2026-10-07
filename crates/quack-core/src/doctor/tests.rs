@@ -399,6 +399,29 @@ async fn the_workspace_check_reports_versions_and_fails_on_a_newer_file() {
     );
     assert!(check.summary.contains(&versions), "{check:?}");
 
+    // An older file is reported, not upgraded: the doctor leaves the way
+    // back to the quack that wrote it.
+    let db = WorkspaceDb::open(config, workspace.id.as_str()).unwrap();
+    db.set_meta(MetaKey::SchemaVersion, "11").unwrap();
+    drop(db);
+    let report = run(&inspection, &offline()).await;
+    let checks = find(&report, Area::Workspace);
+    let check = checks.first().unwrap();
+    assert_eq!(check.status, Status::Info, "{check:?}");
+    assert!(check.summary.contains("schema version 11"), "{check:?}");
+    assert!(
+        check
+            .fix
+            .as_deref()
+            .unwrap()
+            .contains("copy the data directory")
+    );
+    assert_eq!(
+        WorkspaceDb::recorded_schema(config, workspace.id.as_str()).unwrap(),
+        11,
+        "the doctor left the file as it was"
+    );
+
     let db = WorkspaceDb::open(config, workspace.id.as_str()).unwrap();
     db.set_meta(MetaKey::SchemaVersion, "99").unwrap();
     db.set_meta(MetaKey::WrittenByQuack, "9.9.9").unwrap();
