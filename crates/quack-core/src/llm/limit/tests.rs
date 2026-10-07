@@ -440,3 +440,36 @@ fn a_token_that_is_no_header_value_is_refused() {
     let client = LimitedHttp::default().with_oauth_bearer("tok\n1");
     assert!(client.is_err_and(|e| e.to_string().contains("not a header value")));
 }
+
+/// A request backing off between retries holds no permit: another request
+/// for the same one-permit gate is sent during the wait instead of queuing
+/// behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_waits_out_its_backoff_without_the_permit() {
+    let (url, _) = status_server(vec![503, 200]).await;
+    let client = || {
+        LimitedHttp::for_provider(
+            &name("backoff-test"),
+            &ProviderConfig {
+                retry: RetryPolicy {
+                    max_retries: 1,
+                    backoff: Duration::from_millis(1_500),
+                },
+                ..provider(ProviderType::Openai, Some(1), &url)
+            },
+        )
+    };
+    let throttled = tokio::spawn(status_of(client(), url.clone()));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = Instant::now();
+    assert_eq!(status_of(client(), url.clone()).await, Ok(200));
+    assert!(
+        started.elapsed() < Duration::from_millis(1_000),
+        "the second request waited {:?} behind the first one's backoff",
+        started.elapsed()
+    );
+    assert_eq!(
+        throttled.await.unwrap_or_else(|e| fail(&e.to_string())),
+        Ok(200)
+    );
+}

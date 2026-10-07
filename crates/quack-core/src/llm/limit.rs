@@ -534,13 +534,14 @@ impl HttpClientExt for LimitedHttp {
         let body: Bytes = body.into();
         let model = GateKey::model_of(&body);
         let permit = self.gates.permit(model.clone());
+        let gates = self.gates.clone();
         let authorize = self.authorize.clone();
         let headers = self.headers.clone();
         let attempts = self.attempts.clone();
         let provider = self.provider_name();
         async move {
             let waited = Instant::now();
-            let permit = permit.await.map_err(http_client::Error::instance)?;
+            let mut permit = permit.await.map_err(http_client::Error::instance)?;
             telemetry::provider_permit_wait(&provider, model.as_deref(), waited.elapsed());
             let blueprint = Blueprint { parts, body };
             let mut attempt = 0_u32;
@@ -566,7 +567,14 @@ impl HttpClientExt for LimitedHttp {
                         if let Some(a) = &attempts {
                             a.note(model.as_deref(), attempt, wait, &format!("HTTP {status}"));
                         }
+                        // The backoff waits without the permit: an interactive
+                        // request should not queue behind a throttled one.
+                        drop(permit);
                         tokio::time::sleep(wait).await;
+                        permit = gates
+                            .permit(model.clone())
+                            .await
+                            .map_err(http_client::Error::instance)?;
                     }
                     Err(error) => {
                         telemetry::provider_request(
@@ -584,7 +592,14 @@ impl HttpClientExt for LimitedHttp {
                         if let Some(a) = &attempts {
                             a.note(model.as_deref(), attempt, wait, &error.to_string());
                         }
+                        // The backoff waits without the permit: an interactive
+                        // request should not queue behind a throttled one.
+                        drop(permit);
                         tokio::time::sleep(wait).await;
+                        permit = gates
+                            .permit(model.clone())
+                            .await
+                            .map_err(http_client::Error::instance)?;
                     }
                 }
                 attempt = attempt.saturating_add(1);
@@ -637,13 +652,14 @@ impl HttpClientExt for LimitedHttp {
         let body: Bytes = body.into();
         let model = GateKey::model_of(&body);
         let permit = self.gates.permit(model.clone());
+        let gates = self.gates.clone();
         let authorize = self.authorize.clone();
         let headers = self.headers.clone();
         let attempts = self.attempts.clone();
         let provider = self.provider_name();
         async move {
             let waited = Instant::now();
-            let permit = permit.await.map_err(http_client::Error::instance)?;
+            let mut permit = permit.await.map_err(http_client::Error::instance)?;
             telemetry::provider_permit_wait(&provider, model.as_deref(), waited.elapsed());
             let blueprint = Blueprint { parts, body };
             let mut attempt = 0_u32;
@@ -674,7 +690,14 @@ impl HttpClientExt for LimitedHttp {
                         if let Some(a) = &attempts {
                             a.note(model.as_deref(), attempt, wait, &format!("HTTP {status}"));
                         }
+                        // The backoff waits without the permit: an interactive
+                        // request should not queue behind a throttled one.
+                        drop(permit);
                         tokio::time::sleep(wait).await;
+                        permit = gates
+                            .permit(model.clone())
+                            .await
+                            .map_err(http_client::Error::instance)?;
                     }
                     Err(error) => {
                         telemetry::provider_request(
@@ -692,7 +715,14 @@ impl HttpClientExt for LimitedHttp {
                         if let Some(a) = &attempts {
                             a.note(model.as_deref(), attempt, wait, &error.to_string());
                         }
+                        // The backoff waits without the permit: an interactive
+                        // request should not queue behind a throttled one.
+                        drop(permit);
                         tokio::time::sleep(wait).await;
+                        permit = gates
+                            .permit(model.clone())
+                            .await
+                            .map_err(http_client::Error::instance)?;
                     }
                 }
                 attempt = attempt.saturating_add(1);
