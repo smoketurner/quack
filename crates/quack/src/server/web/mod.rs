@@ -42,7 +42,9 @@ use quack_core::storage::control::{
     TokenRow, UserKind, UserRow, WorkspaceChanges, WorkspaceTimes,
 };
 use quack_core::storage::profile::Share;
-use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
+use quack_core::storage::sessions::{
+    self, MessageHit, MessageRole, MessageRow, SessionRow, Sharing,
+};
 use quack_core::storage::workspace::{
     Cell, ChunkSearchResult, ColumnMeaning, DocumentInfo, DocumentSource, DocumentStatus,
     ExportFormat, Pinning, ResultSort, SortDirection, TableDescription,
@@ -380,6 +382,8 @@ impl When {
 }
 
 struct MessageView {
+    /// Its position in the session, which `#m-{seq}` links to.
+    seq: i64,
     role: String,
     /// When the question was asked or the answer finished.
     at: Option<Moment>,
@@ -496,6 +500,15 @@ struct JobView {
     progress: String,
     outcome: Option<String>,
     queued_at: Moment,
+}
+
+/// The chat page's session search results, swapped in under the box.
+#[derive(Template)]
+#[template(path = "chat_hits.html")]
+struct ChatHits {
+    ws_id: String,
+    query: String,
+    hits: Vec<MessageHit>,
 }
 
 #[derive(Template)]
@@ -972,6 +985,8 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/chat", get(chat))
         .route("/w/{id}/chat/{sid}/delete", post(delete_session))
         .route("/w/{id}/chat/{sid}/share", post(share_session))
+        .route("/w/{id}/chat/{sid}/rename", post(rename_session))
+        .route("/w/{id}/chat/search", get(search_sessions))
         .route("/w/{id}/chat/{sid}/unshare", post(unshare_session))
         .route("/w/{id}/documents", get(documents).post(upload))
         .route("/w/{id}/documents/rows", get(document_rows))
@@ -1215,6 +1230,7 @@ impl MessageView {
 
     fn question(row: &MessageRow) -> Self {
         Self {
+            seq: row.seq,
             role: String::from("user"),
             at: Moment::from_utc_text(&row.created_at),
             duration_ms: None,
@@ -1231,6 +1247,7 @@ impl MessageView {
     fn answer(row: &MessageRow, steps: &[ToolStep]) -> Self {
         let meta = row.assistant().cloned().unwrap_or_default();
         Self {
+            seq: row.seq,
             role: String::from("assistant"),
             at: Moment::from_utc_text(&row.created_at),
             duration_ms: meta.duration_ms,
@@ -1332,6 +1349,52 @@ async fn share_session(
         .set_session_sharing(&app, &sid, Sharing::Shared)
         .await?;
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
+}
+
+#[derive(Deserialize)]
+struct RenameForm {
+    #[serde(default)]
+    title: String,
+}
+
+/// The chat page's rename form; a blank title gives back the derived one.
+async fn rename_session(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, sid)): Path<(WorkspaceId, SessionId)>,
+    Form(form): Form<RenameForm>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access.rename_session(&app, &sid, &form.title).await?;
+    Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
+}
+
+#[derive(Deserialize)]
+struct SessionSearch {
+    #[serde(default)]
+    q: String,
+}
+
+/// The chat page's search box: the matching questions and answers in the
+/// sessions the caller may read, each linking to its message.
+async fn search_sessions(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Query(search): Query<SessionSearch>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let query = search.q.trim().to_owned();
+    let hits = if query.is_empty() {
+        Vec::new()
+    } else {
+        access.search_sessions(&app, &query, 50).await?
+    };
+    html(&ChatHits {
+        ws_id: id.to_string(),
+        query,
+        hits,
+    })
 }
 
 async fn unshare_session(

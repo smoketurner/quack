@@ -149,11 +149,24 @@ pub(crate) enum SlashCommand {
         action: Option<SavedAction>,
     },
     /// Pick a recent session to resume
-    #[command(name = "/sessions")]
-    Sessions,
-    /// Switch to a session (id prefix accepted) and replay it
+    #[command(name = "/sessions", disable_help_flag = true)]
+    Sessions {
+        /// Only the sessions whose questions or answers contain this text
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "TEXT")]
+        query: Option<String>,
+    },
+    /// Rename this session; with no title, its first question names it again
+    #[command(name = "/rename", disable_help_flag = true)]
+    Rename {
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "TITLE")]
+        title: Option<String>,
+    },
+    /// Switch to a session (an id prefix, or a title's start) and replay it
     #[command(name = "/resume", disable_help_flag = true)]
-    Resume { id: String },
+    Resume {
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "ID | TITLE")]
+        id: String,
+    },
     /// Start a fresh session
     #[command(name = "/new")]
     New,

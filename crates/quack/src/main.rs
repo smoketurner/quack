@@ -49,7 +49,9 @@ use quack_core::proxy::Proxies;
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, ResourceKind, WorkspaceRow};
 use quack_core::storage::profile::{ColumnTypes, TableProfile};
-use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
+use quack_core::storage::sessions::{
+    self, ChatMode, ExportFormat, SessionViewer, Sharing, Transcript,
+};
 use quack_core::storage::workspace::{
     DocumentFields, Pinning, QueryResults, SearchMode, StatementKind, WorkspaceDb,
 };
@@ -351,6 +353,11 @@ struct SessionsArgs {
     /// Maximum number of sessions to show
     #[arg(long, default_value_t = 20)]
     limit: u32,
+
+    /// Show the questions and answers containing this text instead,
+    /// newest first, each with its session and message number
+    #[arg(long, value_name = "TEXT")]
+    search: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -1297,7 +1304,10 @@ async fn open_workspace(cli: &Cli) -> Result<WorkspaceDb> {
 /// `quack sessions`: the session list.
 async fn run_sessions(cli: &Cli, args: &SessionsArgs) -> Result<ExitCode> {
     let ws_db = open_workspace(cli).await?;
-    list_sessions(&ws_db, args.format, args.limit)?;
+    match &args.search {
+        Some(text) => search_sessions(&ws_db, text, args.format, args.limit)?,
+        None => list_sessions(&ws_db, args.format, args.limit)?,
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2049,6 +2059,25 @@ fn list_sessions(db: &WorkspaceDb, format: TextOrJson, limit: u32) -> Result<()>
             } else {
                 ""
             }
+        )
+    })?;
+    out.flush()?;
+    Ok(())
+}
+
+fn search_sessions(db: &WorkspaceDb, text: &str, format: TextOrJson, limit: u32) -> Result<()> {
+    let hits = sessions::search_messages(db, text, &SessionViewer::All, limit)?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    format.write_rows(&mut out, &hits, "Nothing matched.", |out, hit| {
+        writeln!(
+            out,
+            "{}#{}  {}  {}  ({})",
+            hit.session_id,
+            hit.seq,
+            hit.role.as_str(),
+            hit.snippet,
+            hit.session_title.as_deref().unwrap_or("untitled")
         )
     })?;
     out.flush()?;

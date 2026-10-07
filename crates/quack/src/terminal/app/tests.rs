@@ -2072,3 +2072,69 @@ fn clear_transcript_clears_the_wrap_cache_so_a_replay_renders_fresh() {
         "clear_transcript must reset the render cache so a repopulation cannot reuse stale slots",
     );
 }
+
+/// `/rename` names the session, `/resume` finds a session by the start of
+/// its title as well as its id, and `/sessions TEXT` opens the picker on
+/// the sessions that mention the text.
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_are_renamed_and_found_by_title_and_by_what_they_say() {
+    use quack_core::analysis::agent::AgentResponse;
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut app = app(dir.path());
+    let other = app
+        .db
+        .run_at(Priority::Interactive, |db| {
+            let session = sessions::create_session(db, "m", ChatMode::Chat, None)?;
+            sessions::record_turn(
+                db,
+                &session.id,
+                "Quarterly freight review",
+                Timestamp::now(),
+                &AgentResponse {
+                    content: String::from("Freight rose 4%."),
+                    ..AgentResponse::default()
+                },
+            )?;
+            Ok(session)
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+
+    app.handle_slash_command("/rename   Vendor delays  ");
+    db_settle(&mut app).await;
+    assert!(
+        last(&app).content.contains("Renamed to \"Vendor delays\""),
+        "{}",
+        last(&app).content
+    );
+    let current = app.session_id.clone();
+    let titled = app
+        .db
+        .run_at(Priority::Interactive, move |db| {
+            sessions::get_session(db, &current)
+        })
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| s.title);
+    assert_eq!(titled.as_deref(), Some("Vendor delays"));
+
+    app.handle_slash_command("/sessions FREIGHT");
+    db_settle(&mut app).await;
+    assert!(
+        app.picker.is_some(),
+        "the picker opens on the matching session"
+    );
+    app.picker = None;
+    app.handle_slash_command("/sessions nothing like this");
+    db_settle(&mut app).await;
+    assert!(app.picker.is_none());
+    assert!(last(&app).content.contains("No session mentions that."));
+
+    app.handle_slash_command("/resume quarterly fr");
+    db_settle(&mut app).await;
+    assert_eq!(
+        app.session_id, other.id,
+        "a title's start finds the session"
+    );
+}

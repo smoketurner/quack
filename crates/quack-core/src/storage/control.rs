@@ -697,6 +697,8 @@ pub enum AuditAction {
     EmbeddingsStatus,
     SessionRead,
     Share,
+    /// A session was renamed, or given back its derived title.
+    Rename,
     Mode,
     Cancel,
     /// A person's decision on a write the agent wanted to run.
@@ -751,6 +753,7 @@ history_enum!(AuditAction, Unknown, {
     EmbeddingsStatus => "embeddings_status",
     SessionRead => "session_read",
     Share => "share",
+    Rename => "rename",
     Mode => "mode",
     Cancel => "cancel",
     Permission => "permission",

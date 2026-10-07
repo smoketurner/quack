@@ -401,6 +401,69 @@ mod tests {
         assert_eq!(tables, ["customers"], "the dictated drop did not run");
     }
 
+    /// With `[analysis].title_sessions`, the chat model titles a session
+    /// after its first turn, in the background; later turns do not ask again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_model_titles_a_session_after_its_first_turn() {
+        let ollama = ScriptedOllama::serve(vec![
+            scripted_ollama::Reply::Text("Two vendors were late in March."),
+            scripted_ollama::Reply::Text(r#"{"title": "Late vendors in March"}"#),
+            scripted_ollama::Reply::Text("Cipla was one of them."),
+        ])
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = ollama.config().unwrap_or_else(|e| fail(&e.to_string()));
+        config.general.data_dir = dir.path().to_path_buf();
+        config.analysis.title_sessions = true;
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        let session = sessions::create_session(&db, "scripted/model", ChatMode::Chat, None)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
+        let reader_db = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
+        let ask = |prompt: &'static str| PrintTurn {
+            config: &config,
+            db: Arc::clone(&db),
+            reader_db: reader_db.clone(),
+            session_id: &session.id,
+            policy: WritePolicy::Deny,
+            prompt,
+            documents: &[],
+            format: TextOrJson::Json,
+            verbose: false,
+        };
+        let egress = || Some(Egress::Workspace(AllowedProviders::All));
+        Egress::scope(egress(), ask("which vendors were late in March?").run())
+            .await
+            .unwrap_or_else(|e| fail(&format!("{e:#}")));
+        let title = || async {
+            let id = session.id.clone();
+            db.run(move |db| sessions::get_session(db, &id))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.title)
+        };
+        let mut seen = None;
+        for _ in 0..200 {
+            seen = title().await;
+            if seen.as_deref() == Some("Late vendors in March") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(seen.as_deref(), Some("Late vendors in March"));
+        Egress::scope(egress(), ask("which ones?").run())
+            .await
+            .unwrap_or_else(|e| fail(&format!("{e:#}")));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            title().await.as_deref(),
+            Some("Late vendors in March"),
+            "a later turn does not title again"
+        );
+    }
+
     /// What stands on stdout is the validated answer (issue #64): printed
     /// whole when nothing streamed, not repeated when the stream matched
     /// it, and printed again after a note when validation changed it.
