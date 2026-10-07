@@ -27,8 +27,8 @@ use quack_core::llm::oauth::{CachedToken, KeySource, TokenManager};
 use quack_core::oidc::OidcSubject;
 use quack_core::storage::control::Origin;
 use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, SealedOwner, UserKind,
-    WorkspaceName,
+    AuditAction, AuditEntry, AuditFilter, Channel, ControlPlane, Outcome, Role, SealedOwner,
+    UserKind, WorkspaceName,
 };
 use quack_core::vault::Vault;
 use quack_core::web_sessions::WebSessions;
@@ -63,6 +63,8 @@ struct IssuerState {
     /// The JWK set `/jwks` serves.
     jwks: Vec<Value>,
     refresh_error: Option<&'static str>,
+    /// Claims of an ID token a refresh returns too; none when unset.
+    refresh_id_claims: Option<Value>,
     refreshes: usize,
     /// Whether discovery lists a pushed authorization request endpoint.
     par: bool,
@@ -140,14 +142,18 @@ async fn token(
         }
         Some("refresh_token") => {
             state.refreshes = state.refreshes.saturating_add(1);
-            match state.refresh_error {
-                Some(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
-                None => (
-                    StatusCode::OK,
-                    Json(
-                        json!({ "access_token": "renewed", "token_type": "Bearer", "expires_in": 3600 }),
-                    ),
-                ),
+            if let Some(error) = state.refresh_error {
+                (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
+            } else {
+                let mut token = json!({ "access_token": "renewed", "token_type": "Bearer", "expires_in": 3600 });
+                if let Some(claims) = &state.refresh_id_claims {
+                    token["id_token"] = json!(format!(
+                        "{}.{}.sig",
+                        URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#),
+                        URL_SAFE_NO_PAD.encode(claims.to_string())
+                    ));
+                }
+                (StatusCode::OK, Json(token))
             }
         }
         Some("urn:ietf:params:oauth:grant-type:token-exchange") => {
@@ -677,6 +683,73 @@ async fn an_expiring_sign_in_is_renewed_and_a_revoked_one_ends_every_session() {
         ended.contains(&(Outcome::Denied, Some(user.id))),
         "{ended:?}"
     );
+}
+
+/// A renewal's ID token carries the person's groups now, so leaving or
+/// joining a group at the issuer reaches quack without a new sign-in; one
+/// naming another subject ends the sign-in.
+#[tokio::test]
+async fn a_renewal_reconciles_groups_and_a_changed_subject_ends_the_sign_in() {
+    let h = Harness::build_with(None, "https://quack.example.com", |oidc| {
+        oidc.groups_claim = Some(String::from("groups"));
+    })
+    .await;
+    let sales = h
+        .app
+        .control
+        .create_workspace(
+            &WorkspaceName::from_str("sales").unwrap_or_else(|e| fail(&e.to_string())),
+            None,
+            setup_audit(),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    h.app
+        .control
+        .set_group_role(&sales.id, "finance", Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let role = || async {
+        h.app
+            .control
+            .list_members(&sales.id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .into_iter()
+            .find(|m| m.username == "ada")
+            .map(|m| m.role)
+    };
+    let base = h.issuer.lock().map(|s| s.base.clone()).unwrap_or_default();
+    let renewed_as = |subject: &str| {
+        json!({
+            "iss": base, "sub": subject, "aud": "quack",
+            "exp": Timestamp::now().as_second().saturating_add(3600),
+            "groups": ["finance"],
+        })
+    };
+
+    h.issuer(|s| s.lifetime = 30);
+    let session = h.sign_in("sub-ada", "ada").await;
+    assert_eq!(role().await, None, "the sign-in's token named no group");
+    h.issuer(|s| s.refresh_id_claims = Some(renewed_as("sub-ada")));
+    assert_eq!(h.me(&session).await.0, StatusCode::OK);
+    assert_eq!(role().await, Some(Role::Viewer));
+
+    h.issuer(|s| {
+        s.lifetime = 30;
+        s.refresh_id_claims = Some(renewed_as("sub-mallory"));
+    });
+    let session = h.sign_in("sub-ada", "ada").await;
+    assert_eq!(h.me(&session).await.0, StatusCode::UNAUTHORIZED);
+    let user = h
+        .app
+        .control
+        .find_user_by_oidc_subject(&OidcSubject::from("sub-ada"))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| fail("no user"));
+    assert!(!h.has_token(&user.id).await);
 }
 
 #[tokio::test]

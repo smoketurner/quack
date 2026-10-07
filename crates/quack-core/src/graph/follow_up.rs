@@ -123,6 +123,7 @@ impl FollowUp<'_> {
             };
             let mut offset = 0;
             loop {
+                control.check()?;
                 let mapping = mapping.clone();
                 let batch = db
                     .run(move |db| tables::extract_batch(db, &mapping, standing, offset))
@@ -159,8 +160,18 @@ impl FollowUp<'_> {
             }
         }
         summary.resolution = resolve::resolve(db, embeddings, &config.graph).await?;
+        // A follow-up extracts only the new documents, so it may name the
+        // ontology the graph is built with only when nothing was built
+        // before: a graph built under an older version stays stale until a
+        // full extract or a revalidation brings the rest up to date.
         let version = ontology.saved_version()?;
-        db.run(move |db| store::set_built_with(db, version)).await?;
+        db.run(move |db| {
+            if store::built_with(db)?.is_none() {
+                store::set_built_with(db, version)?;
+            }
+            Ok(())
+        })
+        .await?;
         Ok(Some(summary))
     }
 }

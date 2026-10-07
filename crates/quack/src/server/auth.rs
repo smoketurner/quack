@@ -246,15 +246,12 @@ pub(crate) async fn password_login(
 
     let user = match checked {
         PasswordCheck::Verified(user) => user,
-        // A disabled account answers as a wrong password would: the
-        // response says nothing about whether the name exists.
-        PasswordCheck::Wrong(_) | PasswordCheck::Disabled(_) => {
-            return Err(ApiError::unauthorized("wrong username or password"));
-        }
-        PasswordCheck::Locked { until, .. } => {
-            return Err(ApiError::unauthorized(format!(
-                "too many wrong passwords; try again after {until}"
-            )));
+        // Every refusal answers alike: the response says nothing about
+        // whether the name exists, is disabled, or is locked.
+        PasswordCheck::Wrong(_) | PasswordCheck::Disabled(_) | PasswordCheck::Locked { .. } => {
+            return Err(ApiError::unauthorized(
+                app.config.server.lockout().refusal(),
+            ));
         }
     };
     let token = app.sessions.open(&user.id, None)?;
@@ -504,6 +501,52 @@ impl Access {
 
     /// Whether the caller meets `need`, for a second check inside a handler
     /// (a write statement on the SQL endpoint, `allow_write` on a query).
+    /// Whether what let this caller in still holds: for a stream that
+    /// outlives its request. The session is still open or the token still
+    /// exists and runs, the account still exists and is enabled, and its
+    /// membership still permits `need`. A failed lookup counts as no.
+    pub(crate) async fn still_holds(&self, app: &App, need: Need) -> bool {
+        if app.mode == ServeMode::Local {
+            return true;
+        }
+        let credential = match &self.identity.credential {
+            Credential::Session(token) => matches!(
+                app.sessions.lookup(token.as_str()),
+                SessionLookup::Active { .. }
+            ),
+            Credential::Token(token) => app
+                .control
+                .find_token(&token.token_hash)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|row| !row.is_expired(jiff::Timestamp::now())),
+            Credential::Local | Credential::IdentityProvider => true,
+        };
+        if !credential {
+            return false;
+        }
+        let user = app.control.get_user(&self.identity.user_id).await;
+        if user.ok().flatten().is_none_or(|u| u.is_disabled()) {
+            return false;
+        }
+        let Ok(role) = app
+            .control
+            .member_role(&self.membership.workspace.id, &self.identity.user_id)
+            .await
+        else {
+            return false;
+        };
+        let now = Self {
+            identity: self.identity.clone(),
+            membership: Membership {
+                workspace: self.membership.workspace.clone(),
+                standing: Standing::of(role),
+            },
+        };
+        now.permits(need)
+    }
+
     pub(crate) fn permits(&self, need: Need) -> bool {
         if self.identity.lacks_scope(need.scope) {
             return false;
@@ -679,9 +722,16 @@ impl Identity {
         Err(ApiError::forbidden(reason))
     }
 
-    /// Server admins only; everything else is 403.
+    /// Server admins only; everything else is 403. An API token acts for
+    /// its admin owner only when it carries the `admin` scope itself: a
+    /// read or write token an admin made for one workspace is not a key to
+    /// the whole server.
     pub(crate) fn require_admin(&self) -> ApiResult<()> {
-        if self.kind == UserKind::Admin {
+        let scoped = match &self.credential {
+            Credential::Token(token) => token.has_scope(Scope::Admin),
+            Credential::Local | Credential::Session(_) | Credential::IdentityProvider => true,
+        };
+        if self.kind == UserKind::Admin && scoped {
             Ok(())
         } else {
             Err(ApiError::forbidden("admin only"))

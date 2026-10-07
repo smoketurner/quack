@@ -268,16 +268,22 @@ impl TableCards {
         let n = docs.len() as f64;
         #[expect(clippy::cast_precision_loss, reason = "counts of tokens")]
         let average = docs.iter().map(|(_, _, len)| *len as f64).sum::<f64>() / n;
+        // Each query term's inverse document frequency, counted once.
+        let idf: HashMap<&String, f64> = terms
+            .iter()
+            .map(|term| {
+                #[expect(clippy::cast_precision_loss, reason = "a count of tables")]
+                let df = docs.iter().filter(|(_, d, _)| d.contains_key(term)).count() as f64;
+                (term, ((n - df + 0.5) / (df + 0.5)).ln_1p())
+            })
+            .collect();
         let mut scored: Vec<(&str, f64)> = Vec::new();
         for (table, tf, len) in &docs {
             let mut score = 0.0;
             for term in &terms {
-                let Some(&count) = tf.get(term) else {
+                let (Some(&count), Some(&idf)) = (tf.get(term), idf.get(term)) else {
                     continue;
                 };
-                #[expect(clippy::cast_precision_loss, reason = "a count of tables")]
-                let df = docs.iter().filter(|(_, d, _)| d.contains_key(term)).count() as f64;
-                let idf = ((n - df + 0.5) / (df + 0.5)).ln_1p();
                 let count = f64::from(count);
                 #[expect(clippy::cast_precision_loss, reason = "a count of tokens")]
                 let norm = 1.0 - B + B * (*len as f64) / average.max(1.0);

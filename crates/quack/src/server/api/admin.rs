@@ -163,11 +163,12 @@ impl Identity {
             .ok_or_else(|| ApiError::not_found("no such user"))
     }
 
-    /// Delete a user: their sessions end, their row goes with its
-    /// memberships, tokens, and stored sign-in, and every workspace file
-    /// replaces their id and name with a fixed marker. The access audit
-    /// keeps every row that names them. Returns how many workspace rows
-    /// were rewritten.
+    /// Delete a user: every workspace file replaces their id and name with
+    /// a fixed marker first, then their sessions end and their row goes
+    /// with its memberships, tokens, and stored sign-in. A workspace that
+    /// fails stops the deletion with the user still there, so it can be
+    /// run again. The access audit keeps every row that names them.
+    /// Returns how many workspace rows were rewritten.
     pub(crate) async fn delete_user(&self, app: &App, user: &UserId) -> ApiResult<usize> {
         self.admin_of_users(app)?;
         if *user == self.user_id {
@@ -180,11 +181,6 @@ impl Identity {
             .get_user(user)
             .await?
             .ok_or_else(|| ApiError::not_found("no such user"))?;
-        app.sessions.close_user(user);
-        let entry = self
-            .audit(AuditAction::Admin, Outcome::Allowed)
-            .on(ResourceKind::User.id(user.as_str()));
-        app.control.delete_user(user, entry).await?;
         let mut forgotten = 0_usize;
         for workspace in app.control.list_workspaces().await? {
             let (id, name) = (user.clone(), row.username.clone());
@@ -195,6 +191,11 @@ impl Identity {
                 .await?;
             forgotten = forgotten.saturating_add(changed);
         }
+        app.sessions.close_user(user);
+        let entry = self
+            .audit(AuditAction::Admin, Outcome::Allowed)
+            .on(ResourceKind::User.id(user.as_str()));
+        app.control.delete_user(user, entry).await?;
         Ok(forgotten)
     }
 

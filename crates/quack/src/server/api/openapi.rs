@@ -402,8 +402,23 @@ pub(crate) async fn page() -> ApiResult<Response> {
     }
     .render()
     .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(([(header::CACHE_CONTROL, "no-cache")], Html(html)).into_response())
+    Ok((
+        [
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONTENT_SECURITY_POLICY, DOCS_PAGE_POLICY),
+        ],
+        Html(html),
+    )
+        .into_response())
 }
+
+/// The server's page policy with one allowance: Redoc validates schemas
+/// with Ajv, which compiles them with `new Function`. The page shows only
+/// the API's own description, never workspace content.
+const DOCS_PAGE_POLICY: &str = "default-src 'self'; script-src 'self' 'unsafe-eval'; \
+     style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; \
+     connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; \
+     frame-ancestors 'none'";
 
 #[cfg(test)]
 mod tests;

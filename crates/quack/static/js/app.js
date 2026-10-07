@@ -79,6 +79,15 @@
     });
   }
 
+  // Text for an ECharts formatter, which returns HTML: labels come from
+  // extracted document text, so every character that could start markup
+  // is escaped.
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
   // A GraphResult ({nodes, edges, roots}) as an ECharts force graph, nodes
   // coloured by class; clicking a node scrolls its inspector entry into view.
   function graphOption(result) {
@@ -86,7 +95,7 @@
     result.nodes.forEach(function (n) { if (classes.indexOf(n.class_id) < 0) classes.push(n.class_id); });
     var roots = result.roots || [];
     return {
-      tooltip: { formatter: function (p) { return p.dataType === "edge" ? p.data.label.formatter : p.data.name + " (" + classes[p.data.category] + ")"; } },
+      tooltip: { formatter: function (p) { return escapeHtml(p.dataType === "edge" ? p.data.label.formatter : p.data.name + " (" + classes[p.data.category] + ")"); } },
       legend: [{ data: classes, bottom: 0 }],
       series: [{
         type: "graph",
@@ -241,7 +250,7 @@
     var form = el("form");
     form.method = "post";
     form.action = "/w/" + ws + "/chat/" + sessionId + "/delete";
-    form.onsubmit = function () { return confirm("Delete this session?"); };
+    form.setAttribute("data-confirm", "Delete this session?");
     var button = el("button", "rounded px-2 py-1 text-slate-500 hover:bg-red-950 hover:text-red-400", "×");
     button.type = "submit";
     button.title = "Delete session";
@@ -513,9 +522,6 @@
     setWorking(view, "Waiting for your answer…");
   }
 
-  // The Jobs page follows the job stream instead of polling: every change
-  // asks htmx to refetch the rows, at most once per quarter second. If the
-  // stream drops, the browser reconnects on its own (EventSource retries).
   // A job's last known state, so a finish is announced once.
   var jobStates = {};
   var FINISHED = { succeeded: true, failed: true, cancelled: true };
@@ -543,11 +549,13 @@
     }
   }
 
+  // Note a job's state; whether it changed.
   function noteJob(job) {
-    if (!job || !job.id) return;
+    if (!job || !job.id) return false;
     var before = jobStates[job.id];
     jobStates[job.id] = job.state;
     if (job.kind !== "chat" && FINISHED[job.state] && before && !FINISHED[before]) announceJob(job);
+    return before !== job.state;
   }
 
   // The strip's "Notify me": asks once, remembered in this browser.
@@ -569,10 +577,18 @@
     strip.insertAdjacentElement("afterend", button);
   }
 
+  // Every page follows the job stream instead of polling. A job that starts
+  // or ends refetches the strip and the page's rows within a quarter
+  // second; progress alone refetches them at most every five seconds, since
+  // each refetch counts against the rate limit and is an audited page read.
+  // If the stream drops, the browser reconnects on its own.
+  var PROGRESS_REFRESH_MS = 5000;
+
   function followJobs() {
     var rows = document.querySelector("[data-jobs-stream]");
     if (!rows || !window.EventSource) return;
     var pending = null;
+    var lastProgress = 0;
     function refresh() {
       if (pending) return;
       pending = setTimeout(function () {
@@ -582,8 +598,14 @@
     }
     var source = new EventSource(rows.getAttribute("data-jobs-stream"));
     source.addEventListener("job", function (ev) {
-      try { noteJob(JSON.parse(ev.data)); } catch (e) { /* a refresh still follows */ }
-      refresh();
+      var changed = true;
+      try { changed = noteJob(JSON.parse(ev.data)); } catch (e) { /* refresh as for a change */ }
+      if (changed) {
+        refresh();
+      } else if (Date.now() - lastProgress >= PROGRESS_REFRESH_MS) {
+        lastProgress = Date.now();
+        refresh();
+      }
     });
     source.addEventListener("jobs", function (ev) {
       try { JSON.parse(ev.data).forEach(function (job) { jobStates[job.id] = job.state; }); } catch (e) { /* a refresh still follows */ }
@@ -595,6 +617,19 @@
   // Relative times go stale; swapped-in rows arrive as UTC.
   setInterval(function () { formatTimes(); }, 30000);
   document.addEventListener("htmx:after:swap", function () { formatTimes(); });
+
+  // Behaviour the templates declare with data attributes, since the page's
+  // policy runs no inline script: a form with data-confirm asks first, and a
+  // checkbox with data-select-all sets every box its selector matches.
+  document.addEventListener("submit", function (ev) {
+    var message = ev.target.getAttribute && ev.target.getAttribute("data-confirm");
+    if (message && !window.confirm(message)) ev.preventDefault();
+  }, true);
+  document.addEventListener("click", function (ev) {
+    var selector = ev.target.getAttribute && ev.target.getAttribute("data-select-all");
+    if (!selector) return;
+    document.querySelectorAll(selector).forEach(function (box) { box.checked = ev.target.checked; });
+  });
 
   document.addEventListener("DOMContentLoaded", function () {
     formatTimes();

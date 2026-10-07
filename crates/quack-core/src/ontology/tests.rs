@@ -298,3 +298,25 @@ fn the_schema_matches_what_import_accepts() {
     let parsed = Ontology::from_json(&std::fs::read_to_string(example).unwrap());
     assert!(parsed.is_ok(), "{parsed:?}");
 }
+
+/// A class whose view would be the edge view's name is refused.
+#[test]
+fn a_class_named_like_the_edge_view_is_refused() {
+    let mut ontology = Ontology::builtin_default();
+    let mut class = ontology
+        .classes
+        .first()
+        .cloned()
+        .unwrap_or_else(|| fail("a class"));
+    class.id = ClassId::from("edges");
+    ontology.classes.push(class);
+    let error = ontology
+        .validate()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        error.contains("taken by the graph's edge view (graph_edges)"),
+        "{error}"
+    );
+}

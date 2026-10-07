@@ -44,7 +44,8 @@ pub(crate) enum ErrorCode {
     Busy,
     /// The request ran longer than the server allows.
     Timeout,
-    /// The server failed; the message says how.
+    /// The server failed; the server's log has what happened, which the
+    /// response does not repeat.
     Internal,
     /// A model provider needs `quack auth login` first.
     AuthRequired,
@@ -172,6 +173,9 @@ impl ErrorCode {
                 (Self::UnknownValue, StatusCode::UNPROCESSABLE_ENTITY)
             }
             CoreError::Unsavable(_) => (Self::Unsavable, StatusCode::UNPROCESSABLE_ENTITY),
+            // A file or a source that could not be ingested, or a document
+            // that cannot be replaced now: the caller's input, said in full.
+            CoreError::Ingestion(_) => (Self::Unprocessable, StatusCode::UNPROCESSABLE_ENTITY),
             CoreError::QueryTimeout { .. } => {
                 (Self::QueryTimeout, StatusCode::UNPROCESSABLE_ENTITY)
             }
@@ -187,7 +191,6 @@ impl ErrorCode {
             | CoreError::Embedding(_)
             | CoreError::Llm(_)
             | CoreError::Vault(_)
-            | CoreError::Ingestion(_)
             | CoreError::Io(_)
             | CoreError::TomlParse(_)
             | CoreError::Json(_)
@@ -319,9 +322,14 @@ impl ApiError {
 }
 
 impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
+    fn into_response(mut self) -> Response {
         if self.status.is_server_error() && self.retry_after.is_none() {
             tracing::error!(status = %self.status, code = ?self.code, "{}", self.message);
+        }
+        // An unexpected failure's text can name paths and internals: the
+        // log has it, the caller gets the code.
+        if self.code == ErrorCode::Internal {
+            self.message = String::from("internal error; the server log has the details");
         }
         let mut response = (self.status, Json(self.body())).into_response();
         if let Some(challenge) = self
@@ -436,6 +444,29 @@ mod tests {
 
     fn text(value: &str) -> String {
         value.to_owned()
+    }
+
+    /// A 500's body carries its code and a fixed sentence, never the
+    /// failure's own text, which can name paths and internals.
+    #[tokio::test]
+    async fn an_internal_error_keeps_its_text_out_of_the_body() {
+        let response = ApiError::from(CoreError::Io(std::io::Error::other(
+            "/srv/quack/data.duckdb: disk full",
+        )))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(body["code"], "internal");
+        assert!(!body.to_string().contains("/srv/quack"), "{body}");
+        // An ingestion failure is the caller's input, said in full.
+        let refused = ApiError::from(CoreError::Ingestion(text(
+            "cannot replace a.md: superseded",
+        )));
+        assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]

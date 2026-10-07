@@ -142,6 +142,24 @@ impl Check {
         }
     }
 
+    /// A workspace an older quack wrote, which the next open upgrades in
+    /// place; reported without opening it.
+    fn pending_upgrade(name: &str, recorded: u32) -> Self {
+        Self::new(
+            Area::Workspace,
+            Status::Info,
+            format!(
+                "'{name}' has schema version {recorded}; this quack upgrades it to version {} the \
+                 next time it opens it, and an older quack then refuses it",
+                WorkspaceDb::schema_version()
+            ),
+        )
+        .fix(
+            "to keep a way back, copy the data directory, or take a snapshot with the quack that \
+             wrote it, before the next command opens the workspace",
+        )
+    }
+
     /// A workspace with no row: only the default one is created by using
     /// it, so any other name is a failure.
     fn missing_workspace(name: &str, default: &str) -> Self {
@@ -608,6 +626,15 @@ async fn check_workspace(
             Status::Ok,
             format!("'{name}' is registered; its database file is created on first use"),
         ));
+        return;
+    }
+    // A file an older quack wrote is upgraded in place by any open: the
+    // doctor only reads its version, so running it before a backup leaves
+    // the way back intact.
+    if let Ok(recorded) = WorkspaceDb::recorded_schema(config, row.id.as_str())
+        && recorded < WorkspaceDb::schema_version()
+    {
+        report.push(Check::pending_upgrade(name, recorded));
         return;
     }
     match WorkspaceDb::open(config, row.id.as_str()) {

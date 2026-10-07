@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 use crate::ids::{DocumentId, ImportId, WorkspaceId};
 use crate::progress::RunControl;
 use crate::storage::control::{ControlPlane, ResourceKind, SealedOwner};
+use crate::storage::profile::{ColumnRetype, ColumnTypes};
 use crate::storage::workspace::WorkspaceDb;
 use crate::storage::writer::Writer;
 use crate::vault::{Opened, Purpose, Vault};
@@ -39,8 +40,9 @@ pub struct SavedImport {
     pub query: Option<String>,
     pub source_table: Option<String>,
     pub limit: Option<u64>,
-    /// `COLUMN=TYPE,...`, as `--types` takes it.
-    pub types: Option<String>,
+    /// The columns retyped after each load.
+    #[schema(value_type = Vec<ColumnRetype>)]
+    pub types: ColumnTypes,
     pub json_pointer: Option<String>,
     /// The environment variable a refresh reads its bearer token from.
     pub bearer_env: Option<String>,
@@ -75,7 +77,11 @@ impl TryFrom<&duckdb::Row<'_>> for SavedImport {
             query: row.get(4)?,
             source_table: row.get(5)?,
             limit: row.get(6)?,
-            types: row.get(7)?,
+            types: row
+                .get::<_, Option<String>>(7)?
+                .map(|json| serde_json::from_str(&json))
+                .transpose()?
+                .unwrap_or_default(),
             json_pointer: row.get(8)?,
             bearer_env: row.get(9)?,
             header_names: header_names
@@ -222,7 +228,9 @@ impl SavedImport {
             SourceHeader::BearerEnv(name) => Some(name.as_str()),
             SourceHeader::Given { .. } => None,
         });
-        let types = (!request.types.is_empty()).then(|| request.types.to_string());
+        let types = (!request.types.is_empty())
+            .then(|| serde_json::to_string(&request.types))
+            .transpose()?;
         db.connection().execute(
             "INSERT INTO _quack_imports (id, name, url, table_name, query, source_table, \
              row_limit, types, json_pointer, bearer_env, header_names, sealed_secret, \
@@ -301,7 +309,7 @@ impl SavedImport {
             query: self.query.clone(),
             source_table: self.source_table.clone(),
             limit: self.limit,
-            types: self.types.as_deref().unwrap_or_default().parse()?,
+            types: self.types.clone(),
             headers,
             json_pointer: self
                 .json_pointer
@@ -389,8 +397,13 @@ impl ImportSecrets<'_> {
             })
             .await
         };
-        if saved.is_err() && secret.is_some() {
-            self.control.delete_sealed(owner).await?;
+        // The save's own error is the one to report; a secret left behind
+        // is logged, and a later save under the same id replaces it.
+        if saved.is_err()
+            && secret.is_some()
+            && let Err(e) = self.control.delete_sealed(owner).await
+        {
+            tracing::warn!(error = %e, "the secret of an import that was not saved could not be removed");
         }
         saved
     }
@@ -465,9 +478,12 @@ impl ImportSecrets<'_> {
                 .run(move |db| saved.record_run(db, result.as_ref().map_err(String::as_str)))
                 .await
         };
-        let summary = outcome?;
-        recorded?;
-        Ok(summary)
+        // The import's outcome is what happened to the table; a run that
+        // could not be recorded is logged and does not change it.
+        if let Err(e) = recorded {
+            tracing::warn!(import = %saved.name, error = %e, "the refresh could not be recorded");
+        }
+        outcome
     }
 
     /// Remove `saved` and its sealed secret; its table stays.

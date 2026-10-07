@@ -2168,7 +2168,12 @@ fn document_chunks_page_in_order_and_documents_resolve_by_id_name_or_prefix() {
             "{want}"
         );
     }
-    for want in ["", "pol", "doc-b"] {
+    assert!(
+        DocumentInfo::find(&documents, " ")
+            .err()
+            .is_some_and(|e| e.to_string().contains("no document named"))
+    );
+    for want in ["pol", "doc-b"] {
         let error = DocumentInfo::find(&documents, want)
             .map(|d| d.id.clone())
             .map_err(|e| e.to_string());
@@ -2697,4 +2702,109 @@ fn a_bad_document_filter_is_refused_with_the_reason() {
         .map(|e| e.to_string());
     assert!(backwards.is_some_and(|e| e.contains("is after until")));
     assert!(DocumentFilter::default().is_empty());
+}
+
+/// An id prefix or a file name that several documents share is refused,
+/// never a pick of the first, and a miss in a large workspace lists 20
+/// documents and counts the rest.
+#[test]
+fn ambiguous_document_names_are_refused_and_misses_are_capped() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    for (id, filename) in [("doc-aaaa", "policy.md"), ("doc-bbbb", "policy-2.md")] {
+        db.insert_document(&NewDocument::new(
+            &DocumentId::from(id),
+            filename,
+            "text/markdown",
+            1,
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let twice = db.list_documents().unwrap_or_else(|e| fail(&e.to_string()));
+    let titled = twice.clone();
+    let prefix = DocumentInfo::find(&twice, "doc-")
+        .err()
+        .map(|e| e.to_string());
+    assert!(
+        prefix
+            .as_deref()
+            .is_some_and(|e| e.contains("2 documents have ids starting with 'doc-'")),
+        "{prefix:?}"
+    );
+    let mut same_name = twice;
+    for document in &mut same_name {
+        document.filename = String::from("policy.md");
+    }
+    let named = DocumentInfo::find(&same_name, "policy.md")
+        .err()
+        .map(|e| e.to_string());
+    assert!(
+        named
+            .as_deref()
+            .is_some_and(|e| e.contains("2 documents are named 'policy.md'")),
+        "{named:?}"
+    );
+    // A miss in a large workspace lists 20 documents and counts the rest.
+    let many: Vec<DocumentInfo> = (0..25)
+        .map(|i| {
+            let mut d = titled
+                .first()
+                .cloned()
+                .unwrap_or_else(|| fail("a document"));
+            d.id = DocumentId::from(format!("id-{i:02}"));
+            d
+        })
+        .collect();
+    let miss = DocumentInfo::find(&many, "nothing")
+        .err()
+        .map(|e| e.to_string());
+    assert!(
+        miss.as_deref().is_some_and(|e| e.contains("id-19")
+            && !e.contains("id-20")
+            && e.contains("and 5 more")),
+        "{miss:?}"
+    );
+}
+
+/// A deleted user leaves no id or name behind in any table that records
+/// who made or changed something.
+#[test]
+fn forget_user_rewrites_every_table_that_names_a_person() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    for sql in [
+        "INSERT INTO _quack_saved_questions \
+         (id, name, question, mode, statements, session_id, created_by) \
+         VALUES ('q', 'n', 'q', 'chat', '[]', 's', 'u-bob')",
+        "INSERT INTO _quack_imports (id, name, url, table_name, created_by) \
+         VALUES ('i', 'n', 'https://x/f.csv', 't', 'u-bob')",
+        "INSERT INTO _quack_table_notes (table_name, note, edited_by) VALUES ('t', 'n', 'bob')",
+        "INSERT INTO _quack_provenance (subject_id, author) VALUES ('s', 'bob')",
+        "INSERT INTO _quack_graph_merges (id, keep_node_id, drop_node_id, distance, decided_by) \
+         VALUES ('m', 'a', 'b', 0.1, 'bob')",
+    ] {
+        db.execute_statement(sql)
+            .unwrap_or_else(|e| fail(&format!("{sql}: {e}")));
+    }
+    let changed = db
+        .forget_user(&UserId::from("u-bob"), "bob")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(changed, 5);
+    for (table, column) in [
+        ("_quack_saved_questions", "created_by"),
+        ("_quack_imports", "created_by"),
+        ("_quack_table_notes", "edited_by"),
+        ("_quack_provenance", "author"),
+        ("_quack_graph_merges", "decided_by"),
+    ] {
+        let left: i64 = db
+            .connection()
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE {column} IN ('u-bob', 'bob')"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(left, 0, "{table}.{column}");
+    }
 }

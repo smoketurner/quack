@@ -209,8 +209,10 @@ impl AuditRow {
     }
 }
 
-/// Whether an exported event carries the question's text. It is workspace
-/// content, so the default leaves it out.
+/// Whether an exported event carries the question's text. An export with
+/// detail carries what the detail rows hold, statements and file names
+/// among them; the question is held back by default because it is what a
+/// person typed freely, and goes out only when asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptText {
     Omit,

@@ -72,6 +72,57 @@ pub(crate) struct PrintTurn<'a> {
     pub format: TextOrJson,
     /// Full tool inputs and outputs on stderr.
     pub verbose: bool,
+    /// The stream the answer goes to.
+    pub answer_to: AnswerTo,
+}
+
+/// Where a turn's answer goes: stdout for `quack -p`, whose answer is its
+/// output; stderr when the command's own result owns stdout, as `saved run
+/// --refresh` prints the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerTo {
+    Stdout,
+    Stderr,
+}
+
+impl AnswerTo {
+    fn stream(self) -> AnswerStream {
+        match self {
+            Self::Stdout => AnswerStream::Stdout(std::io::stdout()),
+            Self::Stderr => AnswerStream::Stderr(std::io::stderr()),
+        }
+    }
+}
+
+/// The unlocked stream an answer is written to.
+enum AnswerStream {
+    Stdout(std::io::Stdout),
+    Stderr(std::io::Stderr),
+}
+
+impl AnswerStream {
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::Stdout(out) => out.is_terminal(),
+            Self::Stderr(err) => err.is_terminal(),
+        }
+    }
+}
+
+impl Write for AnswerStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stdout(out) => out.write(buf),
+            Self::Stderr(err) => err.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Stdout(out) => out.flush(),
+            Self::Stderr(err) => err.flush(),
+        }
+    }
 }
 
 impl PrintTurn<'_> {
@@ -111,7 +162,7 @@ impl PrintTurn<'_> {
         // subscriber writes to stderr from the agent's threads, and holding the
         // lock here deadlocks the turn the moment a tool logs anything.
         let mut err = std::io::stderr();
-        let mut out = std::io::stdout();
+        let mut out = self.answer_to.stream();
         // What went to stdout as it streamed, to compare with the validated
         // answer at the end. Text streams only on a terminal: a pipeline gets
         // the validated answer alone (issue #64).
@@ -387,6 +438,7 @@ mod tests {
             documents: &[],
             format: TextOrJson::Json,
             verbose: false,
+            answer_to: AnswerTo::Stdout,
         };
         // The command's scope: the workspace allows every provider.
         let egress = Egress::Workspace(AllowedProviders::All);
@@ -431,6 +483,7 @@ mod tests {
             documents: &[],
             format: TextOrJson::Json,
             verbose: false,
+            answer_to: AnswerTo::Stdout,
         };
         let egress = || Some(Egress::Workspace(AllowedProviders::All));
         Egress::scope(egress(), ask("which vendors were late in March?").run())

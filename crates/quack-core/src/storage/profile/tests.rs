@@ -86,6 +86,32 @@ fn a_stored_profile_is_shown_only_at_its_row_count() {
     );
 }
 
+/// After a write the profiles are taken on a reader and stored by the
+/// writer, which ends up with the same rows a refresh on it would write.
+#[tokio::test]
+async fn after_a_write_the_writer_stores_profiles_read_beside_it() {
+    let writer = Writer::spawn(db()).unwrap();
+    writer
+        .run(|db| db.execute_statement("CREATE TABLE t AS SELECT range AS n FROM range(5)"))
+        .await
+        .unwrap();
+    TableProfile::after_write(&writer).await;
+    assert!(
+        writer
+            .run(|db| TableProfile::current(db, "t", 5))
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    writer
+        .run(|db| db.execute_statement("DROP TABLE t"))
+        .await
+        .unwrap();
+    TableProfile::after_write(&writer).await;
+    assert!(writer.run(TableProfile::all).await.unwrap().is_empty());
+}
+
 #[test]
 fn views_and_empty_tables_profile_without_warnings() {
     let db = db();
@@ -154,4 +180,22 @@ fn notes_set_replace_clear_and_refuse() {
     assert!(TableNote::set(&db, "ghost", "x", None).is_err());
     let long = "x".repeat(TableNote::MAX_CHARS + 1);
     assert!(TableNote::set(&db, "orders", &long, None).is_err());
+}
+
+/// Column types are stored as named pairs: a column whose name holds a
+/// comma or an equals sign, which the `col=TYPE` text cannot carry, comes
+/// back whole.
+#[test]
+fn column_types_round_trip_any_column_name() {
+    let types = ColumnTypes::new(vec![
+        (String::from("total, net"), ColumnType::Double),
+        (String::from("a=b"), ColumnType::Bigint),
+    ]);
+    let json = serde_json::to_string(&types).unwrap_or_default();
+    assert_eq!(
+        json,
+        r#"[{"column":"total, net","type":"DOUBLE"},{"column":"a=b","type":"BIGINT"}]"#
+    );
+    let back: ColumnTypes = serde_json::from_str(&json).unwrap_or_default();
+    assert_eq!(back, types);
 }

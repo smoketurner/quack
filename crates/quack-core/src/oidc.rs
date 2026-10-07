@@ -157,11 +157,23 @@ impl Groups {
 /// What renewing a signed-in user's token found.
 #[derive(Debug)]
 pub enum Renewal {
-    /// The issuer still vouches for them: the new token.
-    Renewed(CachedToken),
+    /// The issuer still vouches for them: the new token, and what the new
+    /// ID token says of them when the issuer sent one.
+    Renewed {
+        token: CachedToken,
+        reissued: Option<Reissued>,
+    },
     /// The issuer refused the refresh token (revoked, expired, the account
     /// disabled); the session must end.
     Revoked(String),
+}
+
+/// A renewal's ID token: the subject, which must be the one the sign-in
+/// named (`OpenID` Connect Core 12.2), and the person's groups now.
+#[derive(Debug)]
+pub struct Reissued {
+    pub subject: OidcSubject,
+    pub groups: Groups,
 }
 
 /// Who a token names, in an ID token or an access token alike: every claim
@@ -311,6 +323,18 @@ impl Claims {
 
     /// `OpenID` Connect Core 3.1.3.7 steps 2, 3, 4, 9, and 11.
     fn check(&self, issuer: &str, client_id: &str, nonce: &str, now: Timestamp) -> Result<()> {
+        self.check_issued(issuer, client_id, now)?;
+        if self.nonce.as_deref() != Some(nonce) {
+            return Err(sign_in_error(
+                "the ID token does not carry this sign-in's nonce",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Steps 2, 3, 4, and 9: what a renewal's ID token, which carries no
+    /// nonce of a sign-in, must pass too.
+    fn check_issued(&self, issuer: &str, client_id: &str, now: Timestamp) -> Result<()> {
         if self.iss != issuer {
             return Err(sign_in_error(format!(
                 "the ID token names issuer '{}', not '{issuer}'",
@@ -331,11 +355,6 @@ impl Claims {
             .map_err(|e| sign_in_error(format!("the ID token expiry is out of range: {e}")))?;
         if expires.checked_add(CLOCK_LEEWAY).unwrap_or(Timestamp::MAX) <= now {
             return Err(sign_in_error("the ID token has expired"));
-        }
-        if self.nonce.as_deref() != Some(nonce) {
-            return Err(sign_in_error(
-                "the ID token does not carry this sign-in's nonce",
-            ));
         }
         Ok(())
     }
@@ -660,6 +679,22 @@ impl SignIn {
         })
     }
 
+    /// What a renewal's ID token says, once it passes the checks a sign-in's
+    /// does but the nonce.
+    async fn reissued(&self, id_token: &str, issuer: &str) -> Result<Reissued> {
+        let claims = Claims::of(id_token)?;
+        claims.check_issued(issuer, self.client_id().await?, Timestamp::now())?;
+        let claim = &self.config.subject_claim;
+        let subject = claims
+            .person
+            .subject(claim)
+            .ok_or_else(|| sign_in_error(format!("the renewed ID token has no {claim} claim")))?;
+        Ok(Reissued {
+            groups: claims.person.groups(self.config.groups_claim.as_deref()),
+            subject,
+        })
+    }
+
     /// Ask the issuer for a new token with the stored refresh token.
     ///
     /// # Errors
@@ -668,7 +703,7 @@ impl SignIn {
     /// reason that is not about this user (a misconfigured client); a
     /// refusal of the grant itself is [`Renewal::Revoked`].
     pub async fn renew(&self, refresh: &SecretString) -> Result<Renewal> {
-        let (client, _, credential) = self.client().await?;
+        let (client, issuer, credential) = self.client().await?;
         let outcome = client
             .exchange_refresh_token(&RefreshToken::new(refresh.expose_secret().to_owned()))
             .request_async(&self.http.sender(&credential))
@@ -679,7 +714,11 @@ impl SignIn {
                 if token.refresh_token.is_none() {
                     token.refresh_token = Some(refresh.clone());
                 }
-                Ok(Renewal::Renewed(token))
+                let reissued = match response.extra_fields().id_token.as_deref() {
+                    Some(id_token) => Some(self.reissued(id_token, &issuer).await?),
+                    None => None,
+                };
+                Ok(Renewal::Renewed { token, reissued })
             }
             Err(RequestTokenError::ServerResponse(refused))
                 if *refused.error() == BasicErrorResponseType::InvalidGrant =>

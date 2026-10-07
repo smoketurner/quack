@@ -84,6 +84,27 @@ the person's tokens and renews them. When the issuer revokes the grant or disabl
 account, quack ends all of that person's sessions. Without the `offline_access` scope, the
 issuer sends no refresh token, and a sign-in lasts only as long as quack's session limits.
 
+### Memberships from the identity provider's groups
+
+Set `groups_claim` to the claim that lists a person's groups, and give each group a role
+in a workspace with `quack member add --group NAME --role ROLE -w WORKSPACE`:
+
+```toml
+[server.oidc]
+# ...as above
+groups_claim = "groups"
+```
+
+quack sets a person's memberships from the claim at each sign-in, at each renewal whose
+response carries a new ID token, and on the first request with each new access token
+presented as a bearer. In each workspace the person gets the highest role among their
+groups. Leaving every group with a role in a workspace removes the membership. quack
+changes only memberships it granted from groups; a membership an owner granted by hand
+stays. A renewal whose ID token names a different subject ends the sign-in. When the claim
+is missing from a token, the person is in no group; when Entra ID leaves the groups out
+because the person has too many, quack changes nothing. `quack doctor` warns when the
+issuer does not list the claim.
+
 ### Accepting the identity provider's access tokens
 
 Set `audience`, and the REST API and MCP also accept access tokens the issuer mints for

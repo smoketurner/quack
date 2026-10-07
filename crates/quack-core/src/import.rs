@@ -353,9 +353,10 @@ impl SourceUrl {
         let Ok(mut parsed) = reqwest::Url::parse(url) else {
             return mask_userinfo(url);
         };
-        if parsed.username().is_empty() && parsed.password().is_none() {
-            // No credentials to redact: keep the URL verbatim so sqlite
-            // paths and `@`-in-path/query URLs are unchanged (the old
+        if parsed.password().is_none() {
+            // No password to redact: keep the URL verbatim, a username
+            // included, which names an account and is no secret. sqlite
+            // paths and `@`-in-path/query URLs stay unchanged too (the old
             // first-`@` split corrupted the latter with a spurious `:***`).
             return url.to_owned();
         }

@@ -347,6 +347,51 @@ async fn a_first_sign_in_creates_a_plain_user_and_never_takes_a_name() {
     );
 }
 
+/// A saved import's secret belongs to its workspace: a restored copy
+/// holds the same import ids, and its secret neither reads, replaces, nor
+/// deletes the original's.
+#[tokio::test]
+async fn an_import_secret_is_kept_per_workspace_for_the_same_import_id() {
+    let (_dir, cp) = open().await;
+    let original = cp
+        .create_workspace(&workspace_name("sales"), None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let restored = cp
+        .create_workspace(&workspace_name("sales-restored"), None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let import = ImportId::from("imp-1");
+    let owner = |workspace| SealedOwner::Import {
+        workspace,
+        import: &import,
+    };
+    let sealed = |id: &str| Sealed {
+        key_id: id.to_owned(),
+        enc: vec![1],
+        ciphertext: vec![2],
+    };
+    cp.put_sealed(owner(&original.id), &sealed("original"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        cp.sealed(owner(&restored.id)).await.ok().flatten(),
+        None,
+        "the restored copy cannot read the original's secret"
+    );
+    cp.put_sealed(owner(&restored.id), &sealed("restored"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.delete_sealed(owner(&restored.id))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        cp.sealed(owner(&original.id)).await.ok().flatten(),
+        Some(sealed("original")),
+        "the original's secret stands"
+    );
+}
+
 #[tokio::test]
 async fn a_sealed_token_is_replaced_in_place_and_goes_with_its_user() {
     let (_dir, cp) = open().await;
@@ -1217,6 +1262,54 @@ fn every_audit_action_is_documented() {
     );
 }
 
+/// Wrong passwords sent at once each count toward the lock, and a lock
+/// that has run out starts the count over, so one more typo does not lock
+/// the account again.
+#[tokio::test]
+async fn concurrent_wrong_passwords_all_count_and_an_expired_lock_starts_over() {
+    let (_dir, cp) = open().await;
+    let bob = cp
+        .create_user("bob", "correct-horse", UserKind::Standard, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let lockout = Lockout {
+        attempts: 4,
+        minutes: 15,
+    };
+    let guesses: Vec<_> = (0..4)
+        .map(|_| {
+            let cp = cp.clone();
+            tokio::spawn(async move { cp.check_password("bob", "guess", lockout).await })
+        })
+        .collect();
+    for guess in guesses {
+        guess
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    assert!(
+        matches!(
+            cp.check_password("bob", "correct-horse", lockout).await,
+            Ok(PasswordCheck::Locked { .. })
+        ),
+        "four wrong passwords at once lock the account"
+    );
+
+    // The lock runs out; one wrong password then counts as the first.
+    cp.set_failed_logins(&bob.id, 4, Some("2000-01-01T00:00:00Z"))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(matches!(
+        cp.check_password("bob", "typo", lockout).await,
+        Ok(PasswordCheck::Wrong(Some(_)))
+    ));
+    assert!(matches!(
+        cp.check_password("bob", "correct-horse", lockout).await,
+        Ok(PasswordCheck::Verified(_))
+    ));
+}
+
 /// Disabling refuses the password before it is checked and enabling takes
 /// it back; too many wrong passwords lock the account for the configured
 /// minutes, and a right one or an enable clears the count.
@@ -1495,4 +1588,57 @@ async fn group_roles_are_set_listed_and_removed() {
             .len(),
         1
     );
+}
+
+/// A provider grant never displaces a membership a person holds: when one
+/// lands while the provider's groups are being read, its insert does
+/// nothing and the person's role stands.
+#[tokio::test]
+async fn a_provider_grant_never_displaces_a_hand_granted_membership() {
+    let (_dir, cp) = open().await;
+    let ws = cp
+        .create_workspace(&workspace_name("w"), None, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let ada = cp
+        .create_user("ada", "pw-long-enough", UserKind::Standard, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    cp.set_member(&ws.id, &ada.id, Role::Owner, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    ControlPlane::member_insert(&ws.id, &ada.id, Role::Viewer, GrantedBy::Idp)
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .query()
+        .execute(&cp.pool)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        cp.member_role(&ws.id, &ada.id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string())),
+        Some(Role::Owner)
+    );
+}
+
+/// Joining a workspace's whole audit to its access rows binds far more ids
+/// than SQLite allows in one statement: the lookup goes in batches.
+#[tokio::test]
+async fn audit_rows_are_found_for_more_ids_than_one_statement_binds() {
+    let (_dir, cp) = open().await;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let entry = setup_audit();
+        ids.push(entry.id.clone());
+        cp.record_audit(&entry)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    // Ids with no row pad the list past SQLite's 32,766-variable limit.
+    ids.extend((0..33_000).map(|_| AuditId::generate()));
+    let rows = cp
+        .audit_rows_by_ids(&ids)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(rows.len(), 3);
 }

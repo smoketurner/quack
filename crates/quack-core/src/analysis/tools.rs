@@ -550,6 +550,9 @@ enum Screened {
     Internal,
     /// It writes something named `graph_`.
     ReservedGraph,
+    /// A read of a `graph_` view, whose labels and properties were
+    /// extracted from document text.
+    GraphRead,
 }
 
 /// What a statement from the agent passes before it runs: no internal
@@ -570,6 +573,10 @@ impl SqlGate {
     async fn check(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolError> {
         let kind = match self.classify(sql).await? {
             Screened::Kind(kind) => kind,
+            Screened::GraphRead => {
+                turn.read_documents();
+                return Ok(Gate::Read);
+            }
             Screened::Internal => return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED))),
             Screened::ReservedGraph => {
                 return Ok(Gate::Reject(String::from(graph::views::RESERVED_REFUSED)));
@@ -606,8 +613,12 @@ impl SqlGate {
 
     /// Classify `sql` for a chart, which only reads: any write is
     /// refused as not permitted, and that is not the turn's refused write.
-    async fn check_read_only(&self, sql: &str) -> Result<Gate, ToolError> {
+    async fn check_read_only(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolError> {
         Ok(match self.classify(sql).await? {
+            Screened::GraphRead => {
+                turn.read_documents();
+                Gate::Read
+            }
             Screened::Internal => Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)),
             Screened::Kind(StatementKind::Read) => Gate::Read,
             Screened::Kind(StatementKind::Invalid(msg)) => {
@@ -632,6 +643,9 @@ impl SqlGate {
                 let kind = db.classify_statement(&sql)?;
                 if graph::views::write_names_reserved(&sql, &kind) {
                     return Ok(Screened::ReservedGraph);
+                }
+                if kind == StatementKind::Read && db.references_graph_view(&sql)? {
+                    return Ok(Screened::GraphRead);
                 }
                 Ok(Screened::Kind(kind))
             })
@@ -761,9 +775,7 @@ impl Tool for RunSqlTool {
                 let results = if read_only {
                     db.read_only(|db| Ok(db.execute_query_capped(&sql, max_rows)))?
                 } else {
-                    let results = db.execute_query_capped(&sql, max_rows);
-                    TableProfile::after_write(db);
-                    results
+                    db.execute_query_capped(&sql, max_rows)
                 };
                 Ok((results, shape))
             })
@@ -776,6 +788,7 @@ impl Tool for RunSqlTool {
             // statement itself errored, since an earlier
             // statement in a batch can have already run.
             self.gate.db.observe_write().await;
+            TableProfile::after_write(&self.db).await;
         }
         match results {
             Ok(results) => {
@@ -1273,8 +1286,8 @@ impl ViewImageTool {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ViewImageArgs {
-    /// The image document: an id from `list_documents` (a prefix is enough)
-    /// or its exact file name
+    /// The image document: an id from `list_documents` (a prefix is enough),
+    /// its exact file name, or its exact title
     pub document: String,
     /// What to find out from the image, as a full question
     pub question: String,
@@ -1824,7 +1837,7 @@ impl Tool for CreateChartTool {
     ) -> Result<Self::Output, Self::Error> {
         let turn = Turn::of(context)?;
         let step = turn.recorder.start(ToolName::CreateChart, args.sql.trim());
-        let rejected = match self.gate.check_read_only(&args.sql).await? {
+        let rejected = match self.gate.check_read_only(&args.sql, &turn).await? {
             Gate::Reject(message) => Some(message),
             Gate::Refused(hold) => Some(String::from(hold.refusal())),
             Gate::Read | Gate::Write => None,
@@ -2302,12 +2315,24 @@ async fn format_graph_result(
         .collect();
     let hidden_chunks = all_chunk_ids.len().saturating_sub(MAX_GRAPH_SOURCES);
     let chunk_ids: Vec<ChunkId> = all_chunk_ids.into_iter().take(MAX_GRAPH_SOURCES).collect();
-    let (chunks, ontology) = db
+    let (mut chunks, ontology) = db
         .with_db(move |db| {
             let chunks = db.chunks_by_ids(&chunk_ids)?;
             Ok((chunks, ontology_store::current(db)?))
         })
         .await?;
+    // The graph is the workspace's, but a question limited to some
+    // documents quotes and cites only those.
+    let before = chunks.len();
+    chunks.retain(|chunk| turn.scope().includes(&chunk.document_id));
+    let out_of_scope = before.saturating_sub(chunks.len());
+    if out_of_scope > 0 {
+        writeln!(
+            out,
+            "\n{out_of_scope} sources from documents outside this question's scope ({}) are not shown.",
+            turn.scope().names()
+        )?;
+    }
     if !chunks.is_empty() {
         let markers = turn.cite(&chunks);
         writeln!(

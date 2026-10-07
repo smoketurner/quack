@@ -420,12 +420,13 @@ pub struct ScopedDocument {
 pub struct DocumentScope(Vec<ScopedDocument>);
 
 impl DocumentScope {
-    /// The ready documents `names` name, each by id, id prefix, or file
-    /// name; the whole workspace when `names` is empty.
+    /// The ready documents `names` name, each by id, file name, title, or
+    /// id prefix; the whole workspace when `names` is empty.
     ///
     /// # Errors
     ///
-    /// A name that matches no document, or one that is not ready.
+    /// A name that matches no document or several, or one that is not
+    /// ready.
     pub fn resolve(db: &WorkspaceDb, names: &[String]) -> Result<Self> {
         if names.is_empty() {
             return Ok(Self::default());
@@ -460,6 +461,12 @@ impl DocumentScope {
     #[must_use]
     pub fn documents(&self) -> &[ScopedDocument] {
         &self.0
+    }
+
+    /// Whether `document` is in scope.
+    #[must_use]
+    pub fn includes(&self, document: &DocumentId) -> bool {
+        self.is_everything() || self.0.iter().any(|d| d.id == *document)
     }
 
     /// The documents a search of `named` (empty for every document) may

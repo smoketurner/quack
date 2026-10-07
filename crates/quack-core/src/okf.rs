@@ -7,7 +7,7 @@
 //! induction. Design doc section 17, issue #36.
 
 use crate::analysis::table_search;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Write as _};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -669,7 +669,16 @@ impl<S: BundleSink> Exporter<'_, S> {
     }
 
     fn documents(&mut self, documents: &[DocumentInfo]) -> Result<()> {
+        let paths: HashMap<String, String> = self
+            .db
+            .connection()
+            .prepare(DOCUMENT_PATH_QUERY)?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<duckdb::Result<_>>()?;
         for document in documents {
+            let Some(path) = paths.get(&document.id.to_string()) else {
+                continue;
+            };
             let mut text = FrontMatter::generated(ConceptType::Document)
                 .field("title", document.display_name())
                 .field("resource", document.filename.clone())
@@ -689,11 +698,7 @@ impl<S: BundleSink> Exporter<'_, S> {
                     writeln!(text, "- table: [{table}](../tables/{}.md)", slug(table))?;
                 }
             }
-            self.listed(
-                &format!("documents/{}.md", slug(&document.filename)),
-                document.display_name(),
-                &text,
-            )?;
+            self.listed(path, document.display_name(), &text)?;
         }
         Ok(())
     }
@@ -866,6 +871,27 @@ macro_rules! sql_slug {
     };
 }
 
+/// The `docs` view: every live document with the file it is written to,
+/// `documents/{filename}.md` by slug, suffixed as entities are when two
+/// file names share a slug (`Report.pdf` and `report.pdf`, or one name in
+/// two folders).
+macro_rules! document_paths {
+    () => {
+        concat!(
+            "docs AS ( \
+               SELECT id, 'documents/' || s || \
+                      CASE WHEN row_number() OVER (PARTITION BY s ORDER BY filename, id) = 1 \
+                           THEN '' ELSE '-' || reverse(right(id, 6)) END || '.md' AS path \
+               FROM (SELECT id, filename, ",
+            sql_slug!("filename"),
+            " AS s FROM _quack_documents WHERE status <> 'superseded'))"
+        )
+    };
+}
+
+/// Each live document's id and the file it is written to.
+const DOCUMENT_PATH_QUERY: &str = concat!("WITH ", document_paths!(), " SELECT id, path FROM docs");
+
 /// Every graph node with the file it is written to, its outbound links
 /// (with each target's file), and its provenance, in node order.
 ///
@@ -875,7 +901,9 @@ macro_rules! sql_slug {
 /// The window computes that once in `DuckDB`, which spills to disk as it
 /// needs, instead of a path map over every node in memory.
 const ENTITY_QUERY: &str = concat!(
-    "WITH n AS ( \
+    "WITH ",
+    document_paths!(),
+    ", n AS ( \
        SELECT id, label, class_id, properties, provisional, ",
     sql_slug!("class_id"),
     " AS class_slug, ",
@@ -897,6 +925,7 @@ const ENTITY_QUERY: &str = concat!(
               to_json(list({'table_name': pr.table_name, 'row_key': pr.row_key, \
                             'chunk_id': pr.chunk_id, \
                             'document': coalesce(d.filename, pr.document_id), \
+                            'document_path': docs.path, \
                             'confidence': coalesce(pr.confidence, 1.0), \
                             'author': pr.author, 'note': pr.note, \
                             'asserted_at': CAST(pr.asserted_at AS VARCHAR)} \
@@ -904,6 +933,7 @@ const ENTITY_QUERY: &str = concat!(
        FROM _quack_provenance pr \
        JOIN _quack_graph_nodes g ON g.id = pr.subject_id \
        LEFT JOIN _quack_documents d ON d.id = pr.document_id \
+       LEFT JOIN docs ON docs.id = pr.document_id \
        GROUP BY pr.subject_id) \
      SELECT p.id, p.label, p.class_id, CAST(p.properties AS VARCHAR), p.provisional, \
             p.path, links.links, sources.sources \
@@ -928,14 +958,17 @@ struct EntityLink {
 }
 
 /// Where a node came from: a table row, a document chunk (`document` is
-/// the file name, or the id when the document is gone), or a person's
-/// assertion.
+/// the file name, or the id when the document is gone; `document_path`
+/// its file in the bundle, `None` when the bundle has none), or a
+/// person's assertion.
 #[derive(Deserialize)]
 struct EntitySource {
     table_name: String,
     row_key: String,
     chunk_id: String,
     document: Option<String>,
+    #[serde(default)]
+    document_path: Option<String>,
     confidence: f64,
     #[serde(default)]
     author: Option<String>,
@@ -1037,12 +1070,16 @@ impl EntitySource {
                 slug(&self.table_name),
                 self.row_key
             ),
-            (true, Some(document)) => format!(
-                "- document [{document}](../../documents/{}.md) chunk `{}` (confidence {:.2})",
-                slug(document),
-                self.chunk_id,
-                self.confidence
-            ),
+            (true, Some(document)) => match &self.document_path {
+                Some(path) => format!(
+                    "- document [{document}](../../{path}) chunk `{}` (confidence {:.2})",
+                    self.chunk_id, self.confidence
+                ),
+                None => format!(
+                    "- document {document} chunk `{}` (confidence {:.2})",
+                    self.chunk_id, self.confidence
+                ),
+            },
             (true, None) => String::from("- unknown"),
         }
     }

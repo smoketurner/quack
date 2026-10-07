@@ -18,5 +18,13 @@ seed text txt md
 seed html html htm
 seed docx docx
 seed pptx pptx
-seed xlsx xlsx xlsm xlsb
+seed epub epub
+seed odt odt
+seed eml eml
+seed mbox mbox
+seed vtt vtt
+seed srt srt
+seed code rs py js ts go sql sh
+seed rtf rtf
+seed xlsx xlsx xlsm xlsb xls ods
 seed chunker md txt

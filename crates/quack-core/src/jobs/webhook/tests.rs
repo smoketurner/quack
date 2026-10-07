@@ -79,18 +79,32 @@ fn finished_jobs_of_the_named_kinds_are_reported() {
     assert!(!imports.reports(&job(JobKind::Ingest, JobState::Succeeded)));
 }
 
-/// RFC 4231 test case 2: HMAC-SHA256 of "what do ya want for nothing?"
-/// under "Jefe".
+/// The signature is HMAC-SHA256 of `<timestamp>.<body>`: RFC 4231 test
+/// case 2's message, "what do ya want for nothing?", signed as the body
+/// of timestamp 0 under its key "Jefe" differs from the bare message's
+/// MAC, and a different timestamp signs differently.
 #[test]
-fn the_signature_is_hmac_sha256_of_the_body() {
-    assert_eq!(
-        hook("https://hooks.example.com/q", vec![]).signature(b"what do ya want for nothing?"),
+fn the_signature_covers_the_timestamp_and_the_body() {
+    let hook = hook("https://hooks.example.com/q", vec![]);
+    let body = b"what do ya want for nothing?";
+    let expected = {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, b"Jefe");
+        format!(
+            "sha256={}",
+            hex_lower(hmac::sign(&key, b"0.what do ya want for nothing?").as_ref())
+        )
+    };
+    assert_eq!(hook.signature(0, body), expected);
+    assert_ne!(
+        hook.signature(0, body),
         "sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
     );
+    assert_ne!(hook.signature(0, body), hook.signature(1, body));
 }
 
-/// What a test endpoint received: each request's signature and body.
-type Received = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+/// What a test endpoint received: each request's timestamp, signature,
+/// and body.
+type Received = Arc<Mutex<Vec<(i64, String, Vec<u8>)>>>;
 
 /// An endpoint that refuses the first POST and takes the rest.
 async fn endpoint() -> (String, Received) {
@@ -102,12 +116,15 @@ async fn endpoint() -> (String, Received) {
 
     async fn take(State(seen): State<Received>, headers: HeaderMap, body: Bytes) -> StatusCode {
         let mut seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
-        let signature = headers
-            .get(SIGNATURE_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_owned();
-        seen.push((signature, body.to_vec()));
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let timestamp = header(TIMESTAMP_HEADER).parse().unwrap_or_default();
+        seen.push((timestamp, header(SIGNATURE_HEADER), body.to_vec()));
         if seen.len() == 1 {
             StatusCode::INTERNAL_SERVER_ERROR
         } else {
@@ -138,8 +155,7 @@ async fn endpoint() -> (String, Received) {
 async fn a_finished_job_is_posted_signed_and_retried_once() {
     let (url, seen) = endpoint().await;
     let (sender, receiver) = broadcast::channel(8);
-    let stopping = CancellationToken::new();
-    let task = hook(&url, vec![]).spawn(receiver, stopping.clone());
+    let task = hook(&url, vec![]).spawn(receiver);
     drop(sender.send(job(JobKind::Ingest, JobState::Running)));
     let finished = job(JobKind::Ingest, JobState::Succeeded);
     drop(sender.send(finished.clone()));
@@ -149,7 +165,8 @@ async fn a_finished_job_is_posted_signed_and_retried_once() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    stopping.cancel();
+    // The queue's channel closing ends the task once its deliveries have.
+    drop(sender);
     drop(task.await);
     let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
     assert_eq!(
@@ -157,8 +174,12 @@ async fn a_finished_job_is_posted_signed_and_retried_once() {
         2,
         "the running job is not reported; the finished one is retried once"
     );
-    let (signature, body) = seen.last().cloned().unwrap_or_default();
-    assert_eq!(signature, hook(&url, vec![]).signature(&body));
+    let (timestamp, signature, body) = seen.last().cloned().unwrap_or_default();
+    assert!(
+        (jiff::Timestamp::now().as_second() - timestamp).abs() < 60,
+        "the timestamp is the time of sending: {timestamp}"
+    );
+    assert_eq!(signature, hook(&url, vec![]).signature(timestamp, &body));
     let sent: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or_else(|e| fail(&e.to_string()));
     assert_eq!(

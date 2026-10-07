@@ -8,7 +8,7 @@
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
-use sea_query::{Cond, DynIden, Expr, ExprTrait, IntoIden, OnConflict, Order, Query};
+use sea_query::{Cond, Condition, DynIden, Expr, ExprTrait, IntoIden, OnConflict, Order, Query};
 use serde::{Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{FromRow, Row, SqlitePool};
@@ -331,6 +331,15 @@ impl UserRow {
     #[must_use]
     pub fn is_disabled(&self) -> bool {
         self.disabled_at.is_some()
+    }
+
+    /// Whether a lockout for wrong passwords holds now; a lock that has
+    /// run out stays recorded until the next attempt clears it.
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        self.locked_until
+            .as_deref()
+            .is_some_and(ControlPlane::still_locked)
     }
 }
 
@@ -1147,14 +1156,35 @@ pub enum SealedOwner<'a> {
 }
 
 /// Where an owner's sealed value lives: its table, key column and key, the
-/// column that records when it was written, and the workspace column a row
-/// that goes with its workspace also fills.
+/// column that records when it was written, and for a row that goes with
+/// its workspace, the workspace column, which is part of its key.
 struct SealedRow {
     table: DynIden,
     key: DynIden,
     id: String,
     stamp: DynIden,
     workspace: Option<(DynIden, String)>,
+}
+
+impl SealedRow {
+    /// The condition that selects this owner's row: its key, and its
+    /// workspace when the row is kept per workspace.
+    fn matching(&self) -> Condition {
+        let mut condition = Condition::all().add(Expr::col(self.key.clone()).eq(self.id.as_str()));
+        if let Some((column, workspace)) = &self.workspace {
+            condition = condition.add(Expr::col(column.clone()).eq(workspace.as_str()));
+        }
+        condition
+    }
+
+    /// The columns an insert conflicts on: the key, with the workspace.
+    fn conflict_columns(&self) -> Vec<DynIden> {
+        self.workspace
+            .iter()
+            .map(|(column, _)| column.clone())
+            .chain(std::iter::once(self.key.clone()))
+            .collect()
+    }
 }
 
 impl SealedOwner<'_> {
@@ -2057,7 +2087,7 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn sealed(&self, owner: SealedOwner<'_>) -> Result<Option<Sealed>> {
-        let SealedRow { table, key, id, .. } = owner.row();
+        let row = owner.row();
         let bound = Bound::new(
             Query::select()
                 .columns([
@@ -2065,8 +2095,8 @@ impl ControlPlane {
                     SealedColumns::Enc,
                     SealedColumns::Ciphertext,
                 ])
-                .from(table)
-                .and_where(Expr::col(key).eq(id)),
+                .from(row.table.clone())
+                .cond_where(row.matching()),
         )?;
         Ok(bound.query_as().fetch_optional(&self.pool).await?)
     }
@@ -2105,16 +2135,10 @@ impl ControlPlane {
         expected: &Sealed,
         sealed: &Sealed,
     ) -> Result<bool> {
-        let SealedRow {
-            table,
-            key,
-            id,
-            stamp,
-            ..
-        } = owner.row();
+        let row = owner.row();
         let bound = Bound::new(
             Query::update()
-                .table(table)
+                .table(row.table.clone())
                 .values([
                     (
                         SealedColumns::KeyId.into_iden(),
@@ -2125,9 +2149,9 @@ impl ControlPlane {
                         SealedColumns::Ciphertext.into_iden(),
                         sealed.ciphertext.clone().into(),
                     ),
-                    (stamp, Expr::current_timestamp()),
+                    (row.stamp.clone(), Expr::current_timestamp()),
                 ])
-                .and_where(Expr::col(key).eq(id))
+                .cond_where(row.matching())
                 .and_where(Expr::col(SealedColumns::KeyId).eq(expected.key_id.as_str()))
                 .and_where(Expr::col(SealedColumns::Enc).eq(expected.enc.clone())),
         )?;
@@ -2151,15 +2175,17 @@ impl ControlPlane {
     /// The insert that keeps `owner`'s sealed value: replacing the one
     /// before it, or only when there is none.
     fn sealed_insert(owner: SealedOwner<'_>, sealed: &Sealed, replace: bool) -> Result<Bound> {
+        let row = owner.row();
+        let conflict_columns = row.conflict_columns();
         let SealedRow {
             table,
             key,
             id,
             stamp,
             workspace,
-        } = owner.row();
+        } = row;
         let conflict = if replace {
-            OnConflict::column(key.clone())
+            OnConflict::columns(conflict_columns)
                 .update_columns([
                     SealedColumns::KeyId.into_iden(),
                     SealedColumns::Enc.into_iden(),
@@ -2168,7 +2194,9 @@ impl ControlPlane {
                 ])
                 .to_owned()
         } else {
-            OnConflict::column(key.clone()).do_nothing().to_owned()
+            OnConflict::columns(conflict_columns)
+                .do_nothing()
+                .to_owned()
         };
         let bound = Bound::new(
             Query::insert()
@@ -2202,11 +2230,11 @@ impl ControlPlane {
 
     /// The delete that forgets `owner`'s sealed value.
     fn sealed_delete(owner: SealedOwner<'_>) -> Result<Bound> {
-        let SealedRow { table, key, id, .. } = owner.row();
+        let row = owner.row();
         Ok(Bound::new(
             Query::delete()
-                .from_table(table)
-                .and_where(Expr::col(key).eq(id)),
+                .from_table(row.table.clone())
+                .cond_where(row.matching()),
         )?)
     }
 
@@ -2451,9 +2479,9 @@ impl ControlPlane {
 
     /// Check a password under `lockout`, and record the outcome on the
     /// user's row: a wrong one counts toward the lock, a right one clears
-    /// the count. A disabled or locked account is refused before the hash
-    /// is checked; the dummy hash is still verified when there is no such
-    /// user, so timing says nothing about who exists.
+    /// the count. The hash is verified for every attempt, against a dummy
+    /// when there is no such user, before a disabled or locked account is
+    /// refused, so timing says nothing about who exists or is locked.
     ///
     /// # Errors
     ///
@@ -2485,24 +2513,24 @@ impl ControlPlane {
             let locked: Option<String> = r.try_get("locked_until")?;
             let failed: i64 = r.try_get("failed_logins")?;
             hash = r.try_get("password_hash")?;
-            if disabled.is_some() {
-                return Ok(PasswordCheck::Disabled(id));
-            }
-            if let Some(until) = locked.filter(|until| Self::still_locked(until)) {
-                return Ok(PasswordCheck::Locked { user_id: id, until });
-            }
-            found = Some((id, u32::try_from(failed).unwrap_or(u32::MAX)));
+            found = Some((id, disabled.is_some(), locked, failed > 0));
         }
         let password = password.to_owned();
         let hash = StoredPasswordHash::stored_or_dummy(hash);
         let ok = tokio::task::spawn_blocking(move || hash.verifies(&password))
             .await
             .map_err(|e| Error::Config(format!("password verification task failed: {e}")))?;
-        let Some((id, failed)) = found else {
+        let Some((id, disabled, locked, counted)) = found else {
             return Ok(PasswordCheck::Wrong(None));
         };
+        if disabled {
+            return Ok(PasswordCheck::Disabled(id));
+        }
+        if let Some(until) = locked.clone().filter(|until| Self::still_locked(until)) {
+            return Ok(PasswordCheck::Locked { user_id: id, until });
+        }
         if ok {
-            if failed > 0 {
+            if counted || locked.is_some() {
                 self.set_failed_logins(&id, 0, None).await?;
             }
             return match self.get_user(&id).await? {
@@ -2510,22 +2538,54 @@ impl ControlPlane {
                 None => Ok(PasswordCheck::Wrong(None)),
             };
         }
-        let failed = failed.saturating_add(1);
-        let until = lockout.locks_after(failed).then(|| {
-            Timestamp::now()
-                .checked_add(SignedDuration::from_mins(i64::from(lockout.minutes)))
-                .unwrap_or(Timestamp::MAX)
-                .to_string()
-        });
-        self.set_failed_logins(&id, failed, until.as_deref())
-            .await?;
-        match until {
+        match self.count_wrong_password(&id, lockout).await? {
             Some(until) => {
                 tracing::warn!(user_id = %id, until, "account locked after repeated wrong passwords");
                 Ok(PasswordCheck::Locked { user_id: id, until })
             }
             None => Ok(PasswordCheck::Wrong(Some(id))),
         }
+    }
+
+    /// Count one more wrong password for `id` and lock the account when
+    /// `lockout` says so, returning the lock's end. The count is read and
+    /// written in one immediate transaction, so wrong passwords sent at
+    /// once each count; a lock that has run out starts the count over.
+    async fn count_wrong_password(&self, id: &UserId, lockout: Lockout) -> Result<Option<String>> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let bound = Bound::new(
+            Query::select()
+                .columns([Users::FailedLogins, Users::LockedUntil])
+                .from(Users::Table)
+                .and_where(Expr::col(Users::Id).eq(id)),
+        )?;
+        let Some(row) = bound.query().fetch_optional(&mut *tx).await? else {
+            return Ok(None);
+        };
+        let failed: i64 = row.try_get("failed_logins")?;
+        let locked: Option<String> = row.try_get("locked_until")?;
+        let before = if locked.is_some() {
+            0
+        } else {
+            u32::try_from(failed).unwrap_or(u32::MAX)
+        };
+        let failed = before.saturating_add(1);
+        let until = lockout.locks_after(failed).then(|| {
+            Timestamp::now()
+                .checked_add(SignedDuration::from_mins(i64::from(lockout.minutes)))
+                .unwrap_or(Timestamp::MAX)
+                .to_string()
+        });
+        let bound = Bound::new(
+            Query::update()
+                .table(Users::Table)
+                .value(Users::FailedLogins, i64::from(failed))
+                .value(Users::LockedUntil, until.as_deref())
+                .and_where(Expr::col(Users::Id).eq(id)),
+        )?;
+        bound.query().execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(until)
     }
 
     /// Whether a stored `locked_until` is still in the future.
@@ -2599,22 +2659,31 @@ impl ControlPlane {
         role: Role,
         granted_by: GrantedBy,
     ) -> Result<Bound> {
-        Ok(Bound::new(
-            Query::insert()
-                .into_table(Members::Table)
-                .columns([
-                    Members::WorkspaceId,
-                    Members::UserId,
-                    Members::Role,
-                    Members::GrantedBy,
-                ])
-                .values([
-                    workspace_id.into(),
-                    user_id.into(),
-                    role.as_str().into(),
-                    granted_by.as_str().into(),
-                ])?,
-        )?)
+        let mut insert = Query::insert()
+            .into_table(Members::Table)
+            .columns([
+                Members::WorkspaceId,
+                Members::UserId,
+                Members::Role,
+                Members::GrantedBy,
+            ])
+            .values([
+                workspace_id.into(),
+                user_id.into(),
+                role.as_str().into(),
+                granted_by.as_str().into(),
+            ])?
+            .to_owned();
+        // The provider never displaces a membership someone holds: one a
+        // person granted while the provider's groups were being read wins.
+        if granted_by == GrantedBy::Idp {
+            insert.on_conflict(
+                OnConflict::columns([Members::WorkspaceId, Members::UserId])
+                    .do_nothing()
+                    .to_owned(),
+            );
+        }
+        Ok(Bound::new(&insert)?)
     }
 
     /// Remove a membership, and record `audit` in the same transaction
@@ -2853,7 +2922,10 @@ impl ControlPlane {
                                 .table(Members::Table)
                                 .value(Members::Role, role.as_str())
                                 .and_where(Expr::col(Members::WorkspaceId).eq(workspace))
-                                .and_where(Expr::col(Members::UserId).eq(user_id)),
+                                .and_where(Expr::col(Members::UserId).eq(user_id))
+                                .and_where(
+                                    Expr::col(Members::GrantedBy).eq(GrantedBy::Idp.as_str()),
+                                ),
                         )?,
                         entry(workspace),
                     ));
@@ -2875,7 +2947,8 @@ impl ControlPlane {
                         Query::delete()
                             .from_table(Members::Table)
                             .and_where(Expr::col(Members::WorkspaceId).eq(workspace))
-                            .and_where(Expr::col(Members::UserId).eq(user_id)),
+                            .and_where(Expr::col(Members::UserId).eq(user_id))
+                            .and_where(Expr::col(Members::GrantedBy).eq(GrantedBy::Idp.as_str())),
                     )?,
                     entry(workspace),
                 ));
@@ -3172,11 +3245,15 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn audit_rows_by_ids(&self, ids: &[AuditId]) -> Result<Vec<AuditRow>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
+        // In batches: SQLite caps the variables one statement binds, and an
+        // export of a whole workspace's audit names every row.
+        const BATCH: usize = 500;
+        let mut rows = Vec::with_capacity(ids.len());
+        for batch in ids.chunks(BATCH) {
+            let bound = AuditFilter::by_ids(batch)?;
+            rows.extend(bound.query_as::<AuditRow>().fetch_all(&self.pool).await?);
         }
-        let bound = AuditFilter::by_ids(ids)?;
-        Ok(bound.query_as().fetch_all(&self.pool).await?)
+        Ok(rows)
     }
 
     /// A workspace's detail rows joined to their access rows by the shared

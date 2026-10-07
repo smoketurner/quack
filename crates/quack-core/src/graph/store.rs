@@ -869,10 +869,24 @@ pub fn update_node(
     if let Some(patch) = &edit.properties {
         properties.patch(patch);
     }
+    // A new label makes the node's vector stale: cleared, it is embedded
+    // again from the new label, so matching and merges stop finding the
+    // old name.
+    let relabelled = label != current.label;
     tx.execute(
         "UPDATE _quack_graph_nodes SET label = ?, normalized_label = ?, class_id = ?, \
-         properties = ?, provisional = false WHERE id = ?",
-        duckdb::params![label, normalized, class_id, properties.to_json(), id],
+         properties = ?, provisional = false, \
+         embedding = CASE WHEN ? THEN NULL ELSE embedding END, \
+         embedding_profile = CASE WHEN ? THEN NULL ELSE embedding_profile END WHERE id = ?",
+        duckdb::params![
+            label,
+            normalized,
+            class_id,
+            properties.to_json(),
+            relabelled,
+            relabelled,
+            id
+        ],
     )?;
     assertion.write(db, id.as_str())?;
     tx.commit()?;

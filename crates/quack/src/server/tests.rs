@@ -29,7 +29,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 use super::state::{App, AppState, ServeMode, with_db};
-use crate::server::auth::{Access, Credential, Identity};
+use crate::server::auth::{Access, Credential, Identity, Need};
 use crate::server::queue::UploadJob;
 use crate::server::run::{BackgroundRun, RunKind, RunReport};
 use quack_core::jobs::{JobKind, LaneKey};
@@ -270,6 +270,144 @@ impl Harness {
             }
         }
         fail("document never left the queue")
+    }
+}
+
+/// What let a long-lived stream in is checked again while it runs: a
+/// member who is removed, or an account that is disabled, no longer holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn access_no_longer_holds_once_a_member_is_removed_or_disabled() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("w", &owner).await;
+    let access = h.owner_access(&ws, &owner).await;
+    assert!(access.still_holds(&h.app, Need::READ).await);
+    h.app
+        .control
+        .remove_member(&ws, &owner, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(!access.still_holds(&h.app, Need::READ).await, "removed");
+    h.app
+        .control
+        .set_member(&ws, &owner, Role::Viewer, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        access.still_holds(&h.app, Need::READ).await,
+        "a viewer reads"
+    );
+    h.app
+        .control
+        .disable_user(&owner, setup_audit())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(!access.still_holds(&h.app, Need::READ).await, "disabled");
+}
+
+/// A browser on another site cannot make this one change anything: a
+/// state-changing request whose Origin (or Referer) names another host is
+/// refused, with a cookie or without one, while the same host, a request
+/// with no Origin (a script), and a bearer-token call all pass.
+#[tokio::test]
+async fn a_request_from_another_site_changes_nothing() {
+    let h = harness(ServeMode::Login).await;
+    h.user("ada", UserKind::Standard).await;
+    let login = |origin: Option<&str>, host: Option<&str>| {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        if let Some(host) = host {
+            request = request.header(header::HOST, host);
+        }
+        request
+            .body(Body::from("username=ada&password=pw"))
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    let (status, _, _) = h
+        .send(login(
+            Some("https://evil.example"),
+            Some("quack.local:8080"),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "another site's form");
+    let (status, _, _) = h
+        .send(login(
+            Some("http://quack.local:8080"),
+            Some("quack.local:8080"),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "this site's own form");
+    let (status, _, _) = h.send(login(None, None)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "a script sends no Origin");
+
+    let token = h.login("ada").await;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/auth/logout")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::ORIGIN, "https://evil.example")
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, _, _) = h.send(request).await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a bearer call is the caller's own"
+    );
+}
+
+/// Every response, a page, the API, or a static file, tells the browser to
+/// run only this server's scripts, load no image from elsewhere, not sniff
+/// types, and not be framed; no template carries an inline handler the
+/// policy would block.
+#[tokio::test]
+async fn every_response_carries_the_security_headers() {
+    let h = harness(ServeMode::Login).await;
+    for path in [
+        "/login",
+        "/api/v1/workspaces",
+        "/static/js/app.js",
+        "/healthz",
+    ] {
+        let request = Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let (_, _, headers) = h.send_bytes(request).await;
+        let policy = headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            policy.contains("script-src 'self'") && policy.contains("frame-ancestors 'none'"),
+            "{path}: {policy}"
+        );
+        assert_eq!(
+            headers
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff"),
+            "{path}"
+        );
+    }
+    let templates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+    for entry in std::fs::read_dir(&templates).unwrap_or_else(|e| fail(&e.to_string())) {
+        let path = entry.unwrap_or_else(|e| fail(&e.to_string())).path();
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&e.to_string()));
+        for handler in [
+            " onclick=",
+            " onsubmit=",
+            " onchange=",
+            " oninput=",
+            " onload=",
+        ] {
+            assert!(!text.contains(handler), "{}: {handler}", path.display());
+        }
     }
 }
 
@@ -1535,6 +1673,20 @@ async fn the_vision_model_reads_images_and_they_are_served() {
     h.wait_ready(&ws, &notes, &token).await;
     let (status, _) = h.get(&format!("{base}/{notes}/image"), &token).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let opens = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("open")),
+            outcome: Some(Outcome::Error),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert!(
+        opens
+            .iter()
+            .any(|r| r.entry.resource_id.as_deref() == Some(notes.as_str())),
+        "a missing image is audited as an error, not an allowed open: {opens:?}"
+    );
 
     let plain = harness(ServeMode::Login).await;
     let owner = plain.user("owner", UserKind::Standard).await;
@@ -1771,6 +1923,75 @@ async fn uploads_are_queued_processed_pinned_and_deleted() {
         deletes.first().and_then(|r| r.entry.resource_id.clone()),
         Some(csv_id)
     );
+}
+
+/// A password changes only through the person's own sign-in: an API
+/// token, of any scope, is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_api_token_cannot_change_a_password() {
+    let h = harness(ServeMode::Login).await;
+    let ada = h.user("ada", UserKind::Standard).await;
+    let ws = h.workspace("a", &ada).await;
+    let token = h
+        .app
+        .control
+        .create_token(&ws, &ada, "t", &[Scope::Admin], None, setup_audit())
+        .await
+        .map_or_else(
+            |e| fail(&e.to_string()),
+            |issued| issued.secret.expose().to_owned(),
+        );
+    let (status, body) = h
+        .post(
+            "/api/v1/auth/password",
+            &token,
+            serde_json::json!({ "current": "pw", "new": "another-password" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// An admin's read or write token for one workspace is not a key to the
+/// server: user administration, restores, and the admin audit refuse it.
+/// A token the admin gave the admin scope is.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admins_workspace_token_does_not_administer_the_server() {
+    let h = harness(ServeMode::Login).await;
+    let root = h.user("root", UserKind::Admin).await;
+    let ws = h.workspace("a", &root).await;
+    let token = |scopes: &'static [Scope]| {
+        let (h, ws, root) = (&h, &ws, &root);
+        async move {
+            h.app
+                .control
+                .create_token(ws, root, "t", scopes, None, setup_audit())
+                .await
+                .map_or_else(
+                    |e| fail(&e.to_string()),
+                    |issued| issued.secret.expose().to_owned(),
+                )
+        }
+    };
+    let read = token(&[Scope::Read]).await;
+    let write = token(&[Scope::Read, Scope::Write]).await;
+    let admin = token(&[Scope::Admin]).await;
+    for secret in [&read, &write] {
+        for path in ["/api/v1/admin/users", "/api/v1/admin/audit"] {
+            let (status, _) = h.get(path, secret).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        }
+        let (status, _) = h
+            .call(
+                Method::POST,
+                "/api/v1/admin/users",
+                Some(secret),
+                Some(serde_json::json!({ "username": "eve", "password": "pw-long-enough" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (status, body) = h.get("/api/v1/admin/users", &admin).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -9085,13 +9306,21 @@ async fn sql_export_streams_every_row_and_refuses_writes() {
                 ..AuditFilter::default()
             })
             .await;
-        if exports.len() >= 3 {
+        if exports.len() >= 4 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(exports.len(), 3, "{exports:?}");
-    assert!(exports.iter().any(|r| r.entry.outcome == Outcome::Denied));
+    // Two streamed exports, the refused write, and the refused internal
+    // table: every refusal is on the record.
+    assert_eq!(exports.len(), 4, "{exports:?}");
+    assert_eq!(
+        exports
+            .iter()
+            .filter(|r| r.entry.outcome == Outcome::Denied)
+            .count(),
+        2
+    );
 
     // The web download streams the whole result too.
     let (_, _, headers) = h.form("/login", None, "username=owner&password=pw").await;
@@ -9354,11 +9583,21 @@ async fn users_are_disabled_locked_out_and_removed_over_the_api() {
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    // A locked account answers exactly as a name that does not exist does.
+    let (_, nobody) = h
+        .call(
+            Method::POST,
+            "/api/v1/auth/login",
+            None,
+            Some(serde_json::json!({ "username": "nobody", "password": "pw2" })),
+        )
+        .await;
+    assert_eq!(body["error"], nobody["error"], "{body} {nobody}");
     assert!(
         body["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("try again"),
+            .contains("locks for 15 minutes after 2 wrong passwords"),
         "{body}"
     );
     let (status, _) = h

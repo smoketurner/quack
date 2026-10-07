@@ -1,4 +1,5 @@
 use super::*;
+use quack_core::storage::workspace::QueryResults;
 
 fn text_of(rows: &[Vec<Span<'static>>]) -> Vec<String> {
     rows.iter()
@@ -114,4 +115,21 @@ fn chart_fingerprint_covers_the_plot_not_just_the_title() {
         make(scatter).fingerprint(width, false),
         "line and scatter differ only in graph_type",
     );
+}
+
+/// A step's kept rows are drawn when steps expand, so they key the cache.
+#[test]
+fn a_steps_rows_change_its_fingerprint() {
+    let step = |n: i64| Message {
+        kind: MessageKind::Step,
+        content: String::from("run_sql"),
+        chart: None,
+        detail: None,
+        result: Some(QueryResults {
+            columns: vec![String::from("n")],
+            rows: vec![vec![serde_json::json!(n)]],
+        }),
+    };
+    assert_ne!(step(1).fingerprint(80, true), step(2).fingerprint(80, true));
+    assert_eq!(step(1).fingerprint(80, true), step(1).fingerprint(80, true));
 }

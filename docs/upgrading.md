@@ -13,13 +13,22 @@ Two rules hold for every release:
   lists every key in force and the ones in the file it does not recognize.
 - A workspace file records the schema version and the quack version that wrote it. A newer
   quack upgrades the file on first open; an older quack refuses a file a newer one wrote
-  (`docs/migrations.md`). Back up before a release that moves the schema, or take a snapshot.
+  (`docs/migrations.md`). Before a release that moves the schema, copy the data directory or
+  run `quack workspace snapshot` with the release you are leaving: a snapshot the new binary
+  takes opens, and so upgrades, the workspace first.
 
-`quack doctor` after the upgrade says whether the workspace's vectors are stale
-(`quack embeddings refresh -w NAME` is its fix line).
+`quack doctor` with the new binary reads each workspace's schema version without upgrading it,
+says which will be upgraded on their next open, and, once they are current, whether their
+vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
 
 ## v2026.10.4
 
+- Breaking: `-w NAME` no longer creates a workspace that does not exist; it exits 2 (#434).
+  Create one first with `quack workspace create NAME`. Only `[general].default_workspace` is
+  still created on first use.
+- Breaking: `[general].default_workspace` must be a valid workspace name (not blank, no `/`,
+  `\`, or `.`), or the config is refused at startup (#434). A workspace already named so
+  still opens with `-w`.
 - Breaking: `postgres://` import sources are removed (#458). Export the query to a SQLite
   file or a CSV or Parquet file and import that, or fetch the file over HTTP(S) or from S3.
   Imports already loaded stay as tables.
@@ -28,8 +37,8 @@ Two rules hold for every release:
   rebuilds the keyword index, reading every chunk once (13), and adds `_quack_imports` for saved
   imports (14). Expect the first open of a large workspace to take longer. An older quack
   refuses the upgraded file, so back up or take a snapshot first.
-- `control.db`: migrations 9 to 11 run on start: user lifecycle and login lockout, group roles,
-  and the sealed credentials of saved imports.
+- `control.db`: migrations 9 to 12 run on start: user lifecycle and login lockout, group roles,
+  and the sealed credentials of saved imports, kept per workspace.
 - Config: keys added, each defaulted so an existing file keeps its behavior:
   - `[ingestion]`: `max_decompressed_mb` (1024), `table_rows_as_table` (20).
   - `[retrieval]`: `languages` (`["auto"]`).

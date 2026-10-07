@@ -1,6 +1,7 @@
 //! A folder of files as documents: the sorted walk of what quack can load,
 //! and the run that ingests each file, replaces the one a changed file
-//! stands for, skips an unchanged one, and reports the files that are gone.
+//! stands for, skips an unchanged one, follows a moved one to its new
+//! path, and reports the files that are gone.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -34,7 +35,9 @@ impl TreeFile {
 }
 
 /// A folder's files in path order: those quack loads, and those it does
-/// not. Directories and files whose name starts with `.` are left out.
+/// not. Directories and files whose name starts with `.` are left out, and
+/// symbolic links are not followed, as `find` does not: a link can point
+/// outside the folder or back up into it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Tree {
     pub files: Vec<TreeFile>,
@@ -52,20 +55,20 @@ impl Tree {
         let mut tree = Self::default();
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
-            let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)?
-                .map(|entry| entry.map(|e| e.path()))
+            let mut entries: Vec<(PathBuf, std::fs::FileType)> = std::fs::read_dir(&dir)?
+                .map(|entry| entry.and_then(|e| Ok((e.path(), e.file_type()?))))
                 .collect::<std::io::Result<_>>()?;
             // Popped last-first, so push in reverse to read in path order.
-            entries.sort();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
             entries.reverse();
-            for path in entries {
+            for (path, kind) in entries {
                 let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
-                if name.starts_with('.') {
+                if name.starts_with('.') || kind.is_symlink() {
                     continue;
                 }
-                if path.is_dir() {
+                if kind.is_dir() {
                     stack.push(path);
                     continue;
                 }
@@ -98,6 +101,13 @@ pub enum Outcome {
     },
     /// Identical bytes are already this document.
     Skipped(DocumentId),
+    /// Identical bytes are this folder's document from a path that no
+    /// longer has a file: the file moved, and the document now records
+    /// its new path.
+    Moved {
+        document: DocumentId,
+        from: String,
+    },
     /// Parsing or storing failed; the document row carries the message.
     Failed(String),
 }
@@ -167,10 +177,25 @@ impl<M: EmbeddingModel> Folder<'_, M> {
     /// fails, or the run is cancelled; a file that does not parse is a
     /// `Failed` outcome, not an error.
     pub async fn run(self) -> Result<FolderReport> {
-        let tree = Tree::walk(self.root)?;
+        let mut tree = Tree::walk(self.root)?;
         let source_root = std::fs::canonicalize(self.root)?
             .to_string_lossy()
             .into_owned();
+        let present: BTreeSet<String> = tree.files.iter().map(|f| f.relative.clone()).collect();
+        // A path that already has a document goes first: a changed file
+        // replaces its document before any other file is matched against
+        // its old bytes, so content that moved into a new path while its
+        // old path changed is ingested, not skipped as a duplicate.
+        let root = source_root.clone();
+        let known: BTreeSet<String> = self
+            .db
+            .run(move |db| db.documents_under(&root))
+            .await?
+            .into_iter()
+            .filter_map(|d| d.source_path)
+            .collect();
+        tree.files
+            .sort_by_key(|f| (!known.contains(&f.relative), f.relative.clone()));
         let total = u32::try_from(tree.files.len()).unwrap_or(u32::MAX);
         let started = Instant::now();
         let mut results = Vec::with_capacity(tree.files.len());
@@ -178,7 +203,7 @@ impl<M: EmbeddingModel> Folder<'_, M> {
         for (index, file) in tree.files.iter().enumerate() {
             self.control.check()?;
             let unit = Instant::now();
-            let outcome = match self.one(&source_root, file).await {
+            let outcome = match self.one(&source_root, file, &present).await {
                 Ok(outcome) => outcome,
                 Err(Error::Cancelled) => return Err(Error::Cancelled),
                 Err(e) => {
@@ -198,7 +223,7 @@ impl<M: EmbeddingModel> Folder<'_, M> {
                 elapsed: started.elapsed(),
             });
         }
-        let present: BTreeSet<&str> = tree.files.iter().map(|f| f.relative.as_str()).collect();
+        results.sort_by(|a, b| a.relative.cmp(&b.relative));
         let root = source_root.clone();
         let gone: Vec<DocumentInfo> = self
             .db
@@ -226,8 +251,14 @@ impl<M: EmbeddingModel> Folder<'_, M> {
     }
 
     /// Ingest one file, replacing the ready document at its path under
-    /// `source_root`.
-    async fn one(&self, source_root: &str, file: &TreeFile) -> Result<Outcome> {
+    /// `source_root`, or moving this folder's document of the same bytes
+    /// to it when that document's path has no file in `present`.
+    async fn one(
+        &self,
+        source_root: &str,
+        file: &TreeFile,
+        present: &BTreeSet<String>,
+    ) -> Result<Outcome> {
         let path = file.path.clone();
         let data = parse_off_runtime(move || Ok(std::fs::read(path)?)).await?;
         let (root, relative) = (source_root.to_owned(), file.relative.clone());
@@ -262,7 +293,24 @@ impl<M: EmbeddingModel> Folder<'_, M> {
                 },
                 None => Outcome::Ingested(result.document_id),
             },
-            IngestOutcome::Duplicate(existing) => Outcome::Skipped(existing.id),
+            IngestOutcome::Duplicate(existing) => {
+                let moved_from = existing.source_path.clone().filter(|from| {
+                    existing.source_root.as_deref() == Some(source_root)
+                        && *from != file.relative
+                        && !present.contains(from)
+                });
+                match moved_from {
+                    Some(from) => {
+                        let (id, to) = (existing.id.clone(), file.relative.clone());
+                        self.db.run(move |db| db.move_document(&id, &to)).await?;
+                        Outcome::Moved {
+                            document: existing.id,
+                            from,
+                        }
+                    }
+                    None => Outcome::Skipped(existing.id),
+                }
+            }
         })
     }
 }

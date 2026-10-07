@@ -19,6 +19,7 @@ use quack_core::ingestion::parser::SectionKind;
 use quack_core::ingestion::parser::{FileType, PageCounts};
 use quack_core::ingestion::tree::{Folder, FolderReport, Outcome, Prune};
 use quack_core::llm::CancellationToken;
+use quack_core::llm::egress::Egress;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::{ControlPlane, WorkspaceName};
 use quack_core::storage::profile::TableProfile;
@@ -2755,6 +2756,51 @@ async fn an_image_without_a_vision_model_is_refused() {
     );
 }
 
+/// An image the vision model could not read fails as a document and
+/// leaves no stored copy behind.
+#[tokio::test]
+async fn an_image_the_model_cannot_read_leaves_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config: Config = toml::from_str(
+        "[ingestion]\nvision_model = \"down/vision\"\n\
+         [providers.down]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\nmax_retries = 0\n",
+    )
+    .unwrap();
+    config.general.data_dir = dir.path().to_path_buf();
+    let db = WorkspaceDb::open(&config, "ws-unread").unwrap();
+    let writer = writer_of(&db);
+    let failed = Egress::scope(
+        Some(Egress::NoWorkspace),
+        ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-unread",
+            &ingestion::NewFile::new("chart.png", b"\x89PNG\r\n\x1a\n"),
+            None::<&Embedder<MockEmbeddingModel>>,
+        ),
+    )
+    .await;
+    assert!(failed.is_err());
+    let document = db
+        .list_all_documents()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.filename == "chart.png")
+        .unwrap();
+    assert_eq!(document.status, DocumentStatus::Error);
+    let files: Vec<String> = std::fs::read_dir(config.workspace_files_dir("ws-unread"))
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !files.iter().any(|f| f.starts_with(document.id.as_str())),
+        "{files:?}"
+    );
+}
+
 /// Deleting an image document removes the image it keeps.
 #[tokio::test]
 async fn deleting_an_image_document_removes_its_image() {
@@ -3501,11 +3547,93 @@ fn outcome_kinds(report: &FolderReport) -> Vec<(String, &'static str)> {
                 Outcome::Ingested(_) => "ingested",
                 Outcome::Replaced { .. } => "replaced",
                 Outcome::Skipped(_) => "skipped",
+                Outcome::Moved { .. } => "moved",
                 Outcome::Failed(_) => "failed",
             };
             (r.relative.clone(), kind)
         })
         .collect()
+}
+
+/// A file moved within the folder is followed to its new path, so
+/// `--prune` never deletes the only document of content that is still
+/// there; content that moved into a new path while its old path changed is
+/// ingested, not skipped; and symbolic links are not followed.
+#[tokio::test]
+async fn a_moved_file_is_followed_and_never_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-folder").unwrap();
+    let writer = writer_of(&db);
+    let root = dir.path().join("notes");
+    write_under(&root, "a.md", "Alpha content.");
+    write_under(&root, "b.md", "Bravo content.");
+    folder_run(&config, &writer, &root, Prune::Keep).await;
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let root_text = canonical.to_string_lossy();
+    let alpha = db
+        .newest_document_at_path(&root_text, "a.md")
+        .unwrap()
+        .unwrap();
+
+    // a.md moves to sub/c.md.
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::rename(root.join("a.md"), root.join("sub/c.md")).unwrap();
+    let moved = folder_run(&config, &writer, &root, Prune::Delete).await;
+    assert_eq!(
+        outcome_kinds(&moved),
+        [
+            (String::from("b.md"), "skipped"),
+            (String::from("sub/c.md"), "moved"),
+        ]
+    );
+    assert!(moved.gone.is_empty(), "{:?}", moved.gone);
+    let at_new = db
+        .newest_document_at_path(&root_text, "sub/c.md")
+        .unwrap()
+        .unwrap();
+    assert_eq!(at_new.id, alpha.id);
+    assert!(
+        db.newest_document_at_path(&root_text, "a.md")
+            .unwrap()
+            .is_none()
+    );
+
+    // b.md's old content moves to a.md, which sorts first, while b.md
+    // changes: b.md replaces its document first, so a.md is new content.
+    write_under(&root, "a.md", "Bravo content.");
+    write_under(&root, "b.md", "Bravo, revised.");
+    let swapped = folder_run(&config, &writer, &root, Prune::Delete).await;
+    assert_eq!(
+        outcome_kinds(&swapped),
+        [
+            (String::from("a.md"), "ingested"),
+            (String::from("b.md"), "replaced"),
+            (String::from("sub/c.md"), "skipped"),
+        ]
+    );
+    let live: Vec<String> = db
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .filter_map(|d| d.source_path)
+        .collect();
+    assert_eq!(live.len(), 3, "{live:?}");
+
+    // A link to a directory above the folder is not walked.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.path(), root.join("up")).unwrap();
+        let linked = folder_run(&config, &writer, &root, Prune::Keep).await;
+        assert!(
+            linked
+                .results
+                .iter()
+                .all(|r| !r.relative.starts_with("up/")),
+            "{:?}",
+            outcome_kinds(&linked)
+        );
+    }
 }
 
 /// A folder run ingests every supported file with its path, lists the

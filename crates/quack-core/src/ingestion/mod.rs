@@ -536,24 +536,28 @@ impl<M: EmbeddingModel> Processing<'_, M> {
         }
     }
 
-    /// Have the vision model read the image, keep the original under
-    /// `files/`, and chunk what the model wrote as a Markdown document
-    /// titled after the file.
+    /// Have the vision model read the image, chunk what it wrote as a
+    /// Markdown document titled after the file, and then keep the original
+    /// under `files/`.
     async fn image(&self, format: ImageFormat, file_type: FileType) -> Result<IngestResult> {
         let (config, filename) = (self.config, self.file.filename);
         let reader = ImageReader::for_ingest(config)
             .await?
             .ok_or_else(|| Error::NoVisionModel(filename.to_owned()))?;
-        let stored = StoredImage::of(config, self.workspace_id, self.document_id, format);
-        stored.write(self.file.data).await?;
         let text = self
             .file
             .control
             .or_cancelled(reader.read(self.file.data, format, "Read this image."))
             .await?;
         let markdown = format!("# {}\n\n{text}\n", OneLine(filename));
-        self.chunk(TextFormat::Markdown, file_type, markdown.as_bytes())
-            .await
+        let result = self
+            .chunk(TextFormat::Markdown, file_type, markdown.as_bytes())
+            .await?;
+        // Kept last: a read or a chunking step that fails leaves no file.
+        StoredImage::of(config, self.workspace_id, self.document_id, format)
+            .write(self.file.data)
+            .await?;
+        Ok(result)
     }
 
     /// Parse and chunk a text document, record what it says about itself,

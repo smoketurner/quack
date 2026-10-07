@@ -54,14 +54,15 @@ use state::{App, AppState, ServeMode};
 /// How long one request may take. Agent turns can be slow.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Rate limit per peer address ([`CallerKey`]): sustained rate and burst.
-const RATE_PER_SECOND: u64 = 1;
+/// Rate limit per peer address ([`CallerKey`]): one request back every
+/// period, up to the burst.
+const RATE_PERIOD: Duration = Duration::from_secs(1);
 const RATE_BURST: u32 = 120;
 
 /// The same, for the two endpoints that check a password. The general limit
 /// is sized for a browsing session and is far too loose to make password
 /// guessing expensive, so the login routes carry their own (issue #73).
-const LOGIN_RATE_PER_SECOND: u64 = 2;
+const LOGIN_RATE_PERIOD: Duration = Duration::from_secs(2);
 const LOGIN_RATE_BURST: u32 = 10;
 
 /// How often a limiter drops the per-key state that has fallen back to a
@@ -145,7 +146,7 @@ pub(crate) fn throttled_login(
     route: axum::routing::MethodRouter<App>,
 ) -> axum::routing::MethodRouter<App> {
     let config = GovernorConfigBuilder::default()
-        .per_second(LOGIN_RATE_PER_SECOND)
+        .period(LOGIN_RATE_PERIOD)
         .burst_size(LOGIN_RATE_BURST)
         .key_extractor(CallerKey(Arc::clone(app)))
         .finish()
@@ -166,7 +167,7 @@ pub(crate) fn router(app: App) -> Router {
         .unwrap_or(usize::MAX)
         .saturating_mul(1024 * 1024);
     let governor = GovernorConfigBuilder::default()
-        .per_second(RATE_PER_SECOND)
+        .period(RATE_PERIOD)
         .burst_size(RATE_BURST)
         .key_extractor(CallerKey(Arc::clone(&app)))
         .finish()
@@ -196,6 +197,7 @@ pub(crate) fn router(app: App) -> Router {
             web::flash::keep,
         ))
         .layer(axum::middleware::map_response(no_store))
+        .layer(axum::middleware::from_fn(same_origin))
         // Every request gets an empty acting slot, which the identity
         // extractor fills once it knows the caller, and an empty egress
         // slot, which `Access::resolve` fills with the workspace's
@@ -213,6 +215,7 @@ pub(crate) fn router(app: App) -> Router {
         .route(api::openapi::PAGE_PATH, get(api::openapi::page))
         .merge(web::assets())
         .merge(limited)
+        .layer(axum::middleware::map_response(security_headers))
         .layer(DefaultBodyLimit::max(upload_limit))
         .layer(axum::middleware::from_fn(record_request))
         // One span per request, carrying the id the request-id layer set
@@ -281,6 +284,31 @@ async fn no_store(mut response: axum::response::Response) -> axum::response::Res
         );
         headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
         headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    }
+    response
+}
+
+/// What the browser may load and run for any page: scripts and data only
+/// from this server, images only from it or inline, never framed. The web
+/// UI's scripts are all files under `/static`; styles may be inline, which
+/// `ECharts`, htmx's indicators, and Redoc write.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; \
+     style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; \
+     connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; \
+     frame-ancestors 'none'";
+
+/// The headers every response carries so a browser does not guess types,
+/// leak paths to other sites, or run what a page did not ship.
+async fn security_headers(mut response: axum::response::Response) -> axum::response::Response {
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "same-origin"),
+    ] {
+        if !headers.contains_key(&name) {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
     }
     response
 }
@@ -429,6 +457,63 @@ async fn metrics(
 
 /// Run the rest of the request with an acting slot and an egress slot of
 /// its own.
+/// Refuse a state-changing request a browser sent from another site: a
+/// form or script elsewhere can make the browser post with the session
+/// cookie, or, in local mode, with no credential at all. A request with a
+/// bearer token is the caller's own; one without an `Origin` or `Referer`
+/// header did not come from a page (curl, a script) and passes; otherwise
+/// the header's host must be the host the request was sent to.
+async fn same_origin(
+    request: Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if CrossSite::of(&request).is_some() {
+        return error::ApiError::forbidden(
+            "a request from another site may not change anything here",
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
+/// A state-changing request from a page on another host.
+struct CrossSite;
+
+impl CrossSite {
+    fn of(request: &Request<axum::body::Body>) -> Option<Self> {
+        let safe = matches!(
+            *request.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+        );
+        let headers = request.headers();
+        if safe || headers.contains_key(header::AUTHORIZATION) {
+            return None;
+        }
+        let page = headers
+            .get(header::ORIGIN)
+            .or_else(|| headers.get(header::REFERER))?
+            .to_str()
+            .ok()?;
+        let from = page.parse::<axum::http::Uri>().ok();
+        let from = from.as_ref().and_then(axum::http::Uri::authority);
+        let to = headers
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .or_else(|| {
+                request
+                    .uri()
+                    .authority()
+                    .map(axum::http::uri::Authority::as_str)
+            });
+        match (from, to) {
+            (Some(from), Some(to)) if from.as_str().eq_ignore_ascii_case(to) => None,
+            // An `Origin: null` (a sandboxed frame, a redirect) or an
+            // unreadable header is a page this server cannot vouch for.
+            _ => Some(Self),
+        }
+    }
+}
+
 async fn request_slots(
     request: Request<axum::body::Body>,
     next: axum::middleware::Next,
@@ -515,7 +600,7 @@ pub(crate) async fn serve(
     if let Some(hook) =
         Webhook::from_config(app.config.server.webhooks.as_ref()).context("[server.webhooks]")?
     {
-        drop(hook.spawn(app.jobs.subscribe(), app.stopping.clone()));
+        drop(hook.spawn(app.jobs.subscribe()));
     }
     let listener = tokio::net::TcpListener::bind(addr)
         .await

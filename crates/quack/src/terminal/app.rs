@@ -870,13 +870,11 @@ impl DirectSql {
             Side::Write => {
                 let result = db
                     .run(move |db| {
-                        let result = db
-                            .cancellable(&canceller, |db| db.execute_query_capped(&sql, max_rows));
-                        TableProfile::after_write(db);
-                        result
+                        db.cancellable(&canceller, |db| db.execute_query_capped(&sql, max_rows))
                     })
                     .await;
                 reader.observe_write().await;
+                TableProfile::after_write(&db).await;
                 result
             }
             Side::Read => {

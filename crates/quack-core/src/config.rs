@@ -1404,6 +1404,22 @@ impl Lockout {
     pub fn locks_after(self, failed: u32) -> bool {
         self.attempts > 0 && failed >= self.attempts
     }
+
+    /// What every refused login says, whatever refused it: a wrong
+    /// password, no such user, a disabled account, or a lock. The same
+    /// words tell no one which names exist.
+    #[must_use]
+    pub fn refusal(self) -> String {
+        if self.attempts == 0 {
+            String::from("wrong username or password")
+        } else {
+            format!(
+                "wrong username or password; an account locks for {} minutes after {} wrong \
+                 passwords in a row",
+                self.minutes, self.attempts
+            )
+        }
+    }
 }
 
 /// `[server.oidc]`: people sign in to `quack serve` with the organization's

@@ -250,17 +250,8 @@ pub(crate) async fn read_image(
     access: &Access,
     doc: &DocumentId,
 ) -> ApiResult<axum::response::Response> {
-    access
-        .audit(
-            app,
-            AuditAction::Open,
-            Some(ResourceKind::Document.id(doc)),
-            Outcome::Allowed,
-            Some(serde_json::json!({ "image": true })),
-        )
-        .await?;
     let wanted = doc.clone();
-    let image = app
+    let found = app
         .read(&access.membership.workspace.id, move |db| {
             let document = db
                 .document(&wanted)?
@@ -268,7 +259,21 @@ pub(crate) async fn read_image(
             db.stored_image(&document)
                 .ok_or_else(|| ResourceKind::Document.missing(format!("an image named {wanted}")))
         })
+        .await;
+    access
+        .audit(
+            app,
+            AuditAction::Open,
+            Some(ResourceKind::Document.id(doc)),
+            if found.is_ok() {
+                Outcome::Allowed
+            } else {
+                Outcome::Error
+            },
+            Some(serde_json::json!({ "image": true })),
+        )
         .await?;
+    let image = found?;
     let bytes = image.read().await?;
     Ok(([(header::CONTENT_TYPE, image.format().mime_type())], bytes).into_response())
 }

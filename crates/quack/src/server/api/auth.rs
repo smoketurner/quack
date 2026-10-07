@@ -153,6 +153,13 @@ pub(crate) async fn change_password(
     if app.mode == ServeMode::Local {
         return Err(ApiError::bad_request("local mode has no passwords"));
     }
+    // A password is the person's own: an API token, made for one workspace
+    // and any scope, never changes it.
+    if matches!(identity.credential, Credential::Token(_)) {
+        return Err(ApiError::forbidden(
+            "an API token cannot change a password; sign in to change it",
+        ));
+    }
     let checked = app
         .control
         .check_password(

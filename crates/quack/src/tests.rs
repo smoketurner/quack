@@ -288,3 +288,18 @@ fn search_and_documents_flags_parse() {
     assert_eq!(print.documents, ["a.md", "b.pdf"]);
     assert!(Cli::try_parse_from(["quack", "--documents", "a.md"]).is_err());
 }
+
+/// `quack ready` reaches the server where it binds: loopback for an
+/// unspecified address, and an IPv6 host in brackets.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test: the addresses are literals")]
+fn ready_builds_a_url_for_every_bind_address() {
+    for (bind, url) in [
+        ("0.0.0.0:8080", "http://127.0.0.1:8080"),
+        ("10.0.0.5:9000", "http://10.0.0.5:9000"),
+        ("[::]:8080", "http://[::1]:8080"),
+        ("[::1]:8080", "http://[::1]:8080"),
+    ] {
+        assert_eq!(ReadyArgs::url_for(bind.parse().unwrap()), url, "{bind}");
+    }
+}

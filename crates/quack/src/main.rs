@@ -44,6 +44,7 @@ use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile};
 use quack_core::llm::Embeddings;
 use quack_core::llm::egress::Egress;
 use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt, TokenManager, TokenStatus};
+use quack_core::llm::titles::SessionTitler;
 use quack_core::okf::{self, Bundle, DirSink, TarSink};
 use quack_core::ontology::store::Revision;
 use quack_core::prefix::PrefixMatch;
@@ -69,7 +70,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::confirm::Confirm;
-use crate::print::{PrintTurn, TurnOutcome};
+use crate::print::{AnswerTo, PrintTurn, TurnOutcome};
 use crate::server::state::ServeMode;
 use crate::stdio::{NamedInput, StdioPath};
 use crate::terminal::SessionSetup;
@@ -298,7 +299,8 @@ enum VaultAction {
     /// Print the vault key, or write it to a file only its owner can read;
     /// a copy of control.db restored on another host needs it as vault.key
     ExportKey {
-        /// Write the key here (mode 0600) instead of printing it
+        /// Write the key here (mode 0600) instead of printing it (`-`
+        /// prints it)
         #[arg(long, value_name = "FILE")]
         to: Option<PathBuf>,
         /// Print without asking
@@ -320,7 +322,7 @@ impl VaultAction {
         };
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        if let Some(path) = to {
+        if let Some(path) = to.filter(|path| path.as_os_str() != "-") {
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -337,9 +339,12 @@ impl VaultAction {
                 .with_context(|| format!("failed to write {}", path.display()))?;
             writeln!(out, "Wrote the vault key to {}", path.display())?;
         } else {
+            // The question and a refusal go to stderr: stdout carries the
+            // key alone, so `quack vault export-key > vault.key` is the key.
             let question = "The vault key unseals every token in control.db. Print it?";
-            if !Confirm::Ask.ask_to_drop(yes, &mut out, question)? {
-                writeln!(out, "Not printed.")?;
+            let mut err = std::io::stderr().lock();
+            if !Confirm::Ask.ask_to_drop(yes, &mut err, question)? {
+                writeln!(err, "Not printed.")?;
                 return Ok(ExitCode::FAILURE);
             }
             writeln!(out, "{key}")?;
@@ -383,6 +388,22 @@ struct ReadyArgs {
 }
 
 impl ReadyArgs {
+    /// The URL a server bound to `bind` answers on: an unspecified address
+    /// is reached on loopback of the same family, and an IPv6 host is
+    /// written in brackets.
+    fn url_for(bind: std::net::SocketAddr) -> String {
+        let host = match bind.ip() {
+            std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            }
+            std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            }
+            ip => ip,
+        };
+        format!("http://{}", std::net::SocketAddr::new(host, bind.port()))
+    }
+
     /// `quack ready`: `GET /readyz` on the server and exit by its answer. The
     /// container image's health check runs this, since the image has no shell.
     async fn run(self) -> Result<ExitCode> {
@@ -396,12 +417,7 @@ impl ReadyArgs {
                     config.server.bind
                 )
             })?;
-            let host = if bind.ip().is_unspecified() {
-                String::from("127.0.0.1")
-            } else {
-                bind.ip().to_string()
-            };
-            format!("http://{host}:{}", bind.port())
+            Self::url_for(bind)
         };
         let client = Proxies::from_env()
             .client()
@@ -410,16 +426,23 @@ impl ReadyArgs {
             .context("could not build the HTTP client")?;
         let readyz = format!("{}/readyz", url.trim_end_matches('/'));
         let response = client.get(&readyz).send().await;
+        // The body is read before stdout is locked: no lock across an await.
+        let answer = match response {
+            Ok(response) if response.status().is_success() => Ok(None),
+            Ok(response) => {
+                let status = response.status();
+                Ok(Some((status, response.text().await.unwrap_or_default())))
+            }
+            Err(e) => Err(e),
+        };
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        match response {
-            Ok(response) if response.status().is_success() => {
+        match answer {
+            Ok(None) => {
                 writeln!(out, "ready")?;
                 Ok(ExitCode::SUCCESS)
             }
-            Ok(response) => {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
+            Ok(Some((status, body))) => {
                 writeln!(out, "not ready ({status}): {body}")?;
                 Ok(ExitCode::FAILURE)
             }
@@ -1251,6 +1274,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         documents: &cli.documents,
         format,
         verbose: cli.verbose,
+        answer_to: AnswerTo::Stdout,
     }
     .run()
     .await;
@@ -1258,6 +1282,8 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         let id = session_id.clone();
         drop(db.run(move |db| sessions::delete_if_empty(db, &id)).await);
     }
+    // The answer is out; a title the turn started finishes before exit.
+    SessionTitler::finish_pending(TITLE_GRACE).await;
     Ok(match outcome? {
         TurnOutcome::WriteRefused => ExitCode::from(Exit::WriteRefused),
         TurnOutcome::Answered => ExitCode::SUCCESS,
@@ -1307,6 +1333,10 @@ async fn load_piped_stdin(
 
 /// How long a non-terminal stdin has to deliver a byte or close.
 const STDIN_GRACE: Duration = Duration::from_secs(1);
+
+/// How long a command that answers one question waits, after printing, for
+/// the session title its first turn started.
+pub(crate) const TITLE_GRACE: Duration = Duration::from_secs(30);
 
 /// Whether stdin is worth reading: a pipe or socket is when it becomes
 /// readable (data or end of file) within [`STDIN_GRACE`]; anything else
@@ -1489,9 +1519,16 @@ impl ImportCommand {
             vault: &vault,
             db: &db,
         };
-        let stdout = std::io::stdout();
         match self.action {
-            Some(action) => action.run(&context, &mut stdout.lock()).await?,
+            // Written to a buffer, then to stdout: the stdout lock is never
+            // held across the action's awaits, and what it reported before
+            // a failure still prints.
+            Some(action) => {
+                let mut report = Vec::new();
+                let ran = action.run(&context, &mut report).await;
+                std::io::stdout().lock().write_all(&report)?;
+                ran?;
+            }
             None => self.run.run(&context).await?,
         }
         Ok(ExitCode::SUCCESS)
@@ -2452,6 +2489,9 @@ impl OpenedWorkspace {
                     writeln!(out, "replaced  {relative} ({old} -> {new})")?;
                 }
                 Outcome::Skipped(id) => writeln!(out, "skipped   {relative} (identical to {id})")?,
+                Outcome::Moved { document, from } => {
+                    writeln!(out, "moved     {from} -> {relative} ({document})")?;
+                }
                 Outcome::Failed(error) => writeln!(out, "failed    {relative}: {error}")?,
             }
         }
@@ -2494,7 +2534,7 @@ impl OpenedWorkspace {
             .iter()
             .filter_map(|r| match &r.outcome {
                 Outcome::Ingested(id) | Outcome::Replaced { new: id, .. } => Some(id.clone()),
-                Outcome::Skipped(_) | Outcome::Failed(_) => None,
+                Outcome::Skipped(_) | Outcome::Moved { .. } | Outcome::Failed(_) => None,
             })
             .collect();
         self.follow_ingest(&ws_db, embedding_model.as_ref(), &stored, &mut out)
@@ -2656,8 +2696,10 @@ async fn run_query(
     .await?;
 
     let results = ws_db.execute_query(sql).context("query execution failed")?;
-    if ws_db.classify_statement(sql)? != StatementKind::Read {
-        TableProfile::after_write(&ws_db);
+    if ws_db.classify_statement(sql)? != StatementKind::Read
+        && let Err(e) = TableProfile::refresh_stale(&ws_db)
+    {
+        tracing::warn!(error = %e, "could not refresh table profiles after a write");
     }
 
     let stdout = std::io::stdout();

@@ -223,10 +223,13 @@ instead of polling.
 `job_id`, `number`, `kind`, `state`, `workspace_id`, `owner`, the three times, and `progress`,
 never the label or outcome, which can carry workspace content; a receiver asks `GET
 .../jobs/{job}` with its own token for those. The body is signed with HMAC-SHA256 (aws-lc-rs)
-under the secret `secret_env` names, as `X-Quack-Signature: sha256=<hex>`, and `quack serve`
-refuses to start when that variable is unset. `kinds` narrows the report (every kind but chat
-turns by default). Delivery goes through `Proxies::client`, with one retry after two seconds,
-and a failure is logged.
+under the secret `secret_env` names, over `<timestamp>.<body>`, as `X-Quack-Signature:
+sha256=<hex>`, with the Unix timestamp in `X-Quack-Timestamp`, so a receiver that refuses an old
+timestamp refuses a replayed delivery; `quack serve` refuses to start when that variable is unset.
+`kinds` narrows the report (every kind but chat turns by default). Each delivery runs on its own
+task, four at a time, so a slow endpoint never makes the reader of job events fall behind; it
+goes through `Proxies::client`, with one retry after two seconds, and a failure is logged.
+Jobs that end while the server stops are reported too.
 
 Cancelling a queued job ends it without running, including one whose task has not yet
 run for the first time. A running job sees its cancel token and
@@ -1036,7 +1039,10 @@ which leaves keyword-exact questions (part numbers, policy IDs) unanswered.
   (`_quack_messages.metadata`, `UserMeta`), and `search_documents` intersects the model's
   `document_ids` with them: the model may narrow the scope, and naming only documents
   outside it is an error saying which documents the person chose. `read_document` and
-  `always_retrieve` stay within the scope too; pinned documents are still injected.
+  `always_retrieve` stay within the scope too; pinned documents are still injected. The graph
+  is the workspace's, so `search_graph` and `find_path` still show every node and edge, but
+  they quote and cite source passages only from the scope's documents and say how many they
+  leave out.
 
 **Citations.** Every retrieved chunk carries `document_id`, `filename`, `title`, `page`,
 `heading`, and its fused score. The agent cites with `[n]` markers mapped to these chunks.
@@ -2305,7 +2311,7 @@ answer to a question is the same object print mode emits (`AgentResponseBody` in
 
 ```
 GET    /healthz                                   liveness, no auth
-GET    /readyz                                    readiness, no auth: 200 {control_db, data_dir, vault_key} each `ok`, else 503 with the failing probe's error
+GET    /readyz                                    readiness, no auth: 200 {control_db, data_dir, vault_key} each `ok`, else 503 naming the failing probe (its error goes to the log); checked at most every 2 s
 GET    /metrics                                   Prometheus text; loopback, or an admin's bearer
 GET    /api/v1/openapi.json                       the OpenAPI 3.1 document, no auth
 GET    /api/v1/docs                               the document rendered by Redoc, no auth
@@ -2581,7 +2587,7 @@ quack -p "PROMPT" [-w NAME] [-f text|json] [--mode chat|query] [--documents DOC,
 quack search QUERY [-w NAME] [--in DOC..] [--keyword | --vector] [--explain] [-k N] [-f text|json]
 quack -q "SQL" [-w NAME] [-f table|json|ndjson|csv|markdown] [--stdin]
 quack workspace create NAME | list [--format json] | rename NAME NEW_NAME
-quack workspace delete NAME [-y] | snapshot NAME [--to FILE] | restore FILE|- [--name NAME]
+quack workspace delete NAME [-y] | snapshot NAME [--to FILE|-] | restore FILE|- [--name NAME]
 quack ingest FILE|DIR|- [-w NAME] [--filename N] [--title T] [--author A] [--authored DATE] [--tag T].. [--pin] [--no-embed] [--replace [ID]] [--prune]
 quack docs [--format json] [--all] [--pin ID | --unpin ID | --delete ID | --tag ID TAG | --untag ID TAG | --author ID NAME | --authored ID DATE]
 quack embeddings refresh [-w NAME] [-y]
@@ -2620,8 +2626,8 @@ quack auth unregister [--issuer URL] [--yes]
 quack config [--changed] [--format json]
 quack doctor [-w NAME] [--offline] [--format json]
 quack serve [--bind ADDR] [--local]
-quack ready [URL]    GET /readyz on the server (the default URL from [server].bind), exit 0 or 1; the image's health check
-quack vault export-key [--to FILE] [-y]    the vault key, to a 0600 file or (after a yes) stdout
+quack ready [--url URL]    GET /readyz on the server (the default URL from [server].bind), exit 0 or 1; the image's health check
+quack vault export-key [--to FILE|-] [-y]    the vault key, to a 0600 file or (after a yes) stdout
 quack mcp [-w NAME] [--allow-write]
 quack user add [--admin] | list [--format json] ; quack token create|list|revoke ;
 quack member add|remove|list ; quack audit [filters] [--format text|json|csv|ocsf]   (server admin)
@@ -2663,7 +2669,7 @@ through `WorkspaceDb::open`. Windows lets no other handle read a DuckDB file in 
 is the one path on every OS (#448). In `quack serve` the tar is spooled to an unnamed file
 under the data directory while the file is closed, and the download streams from it; the
 workspace's requests wait for the copy, not the download, and other workspaces never wait.
-`quack workspace snapshot NAME [--to FILE]`, the Settings page's download, and
+`quack workspace snapshot NAME [--to FILE|-]`, the Settings page's download, and
 `GET .../snapshot` write it; `quack workspace restore FILE [--name N]` and
 `POST /api/v1/workspaces/restore` read it: a new row (the manifest's name unless given),
 the tar unpacked into the new directory (paths that leave it are refused), the settings
@@ -2828,16 +2834,24 @@ installers.
     (`[server.oidc].redirect_uri`) or `[server].secure_cookies` is `always`. A cookie minted
     behind a TLS-terminating proxy, even a same-host one on loopback, thus never travels
     over a plaintext downgrade, while plain HTTP on a laptop still works. The sign-in state
-    cookie follows the same rule. `X-Forwarded-Proto` is not trusted here (issue #246).
+    cookie follows the same rule. `X-Forwarded-Proto` is never read (issue #246).
+  - A request that would change something and carries no bearer token is refused (403) when
+    its `Origin`, or `Referer` without one, names another host: a page elsewhere can make the
+    browser post with the session cookie, or, in local mode, with no credential at all. A
+    request with neither header (curl, a script) passes.
 - **Rate limiting covers everything a caller can reach.**
   - One `tower_governor` limiter, keyed by peer address, covers the web UI, REST API, and
-    MCP. The password endpoints (`POST /login`, `POST /api/v1/auth/login`) add a tighter
-    one, keyed the same way (2 requests per second, bursting to 10); the general budget suits
-    browsing and is too loose to make guessing expensive.
+    MCP: one request back each second, bursting to 120. The password endpoints (`POST
+    /login`, `POST /api/v1/auth/login`) add a tighter one, keyed the same way (one request
+    back every 2 seconds, bursting to 10); the general budget suits browsing and is too loose
+    to make guessing expensive.
   - No limiter keys on what the request says about itself: keyed on the unvalidated
     `Authorization` header, each random bearer got a fresh bucket (issue #237). Everyone
-    behind one address (a NAT, a same-host reverse proxy) shares one budget.
-    `X-Forwarded-For` is not trusted; any client can write it.
+    behind one address (a NAT) shares one budget. Behind a reverse proxy listed in
+    `[server].trusted_proxies`, the key is the client its `X-Forwarded-For` names
+    (`quack_core::net`, every line, read from the right past the trusted hops); from any
+    other peer the header is ignored, since any client can write it. `Forwarded` is never
+    read: a proxy that writes `X-Forwarded-For` passes a client's own `Forwarded` through.
   - `/healthz`, `/readyz`, and `/metrics` are outside every limiter: a throttled health
     check reads as a dead server. `/readyz` answers 503 until `control.db` answers a query,
     the data directory takes a write, and the vault key can be read; `quack ready` calls it
