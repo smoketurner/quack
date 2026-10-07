@@ -19,13 +19,13 @@ use std::str::FromStr;
 use jiff::{SignedDuration, Timestamp};
 
 use super::queries::{
-    ApiTokens, AuditLog, Bound, ClientKeys, ClientRegistrations, GroupRoles, Members,
-    ProviderTokens, SealedColumns, UserTokens, Users, Workspaces,
+    ApiTokens, AuditLog, Bound, ClientKeys, ClientRegistrations, GroupRoles, ImportCredentials,
+    Members, ProviderTokens, SealedColumns, UserTokens, Users, Workspaces,
 };
 use crate::config::{Config, Lockout, ProviderName};
 use crate::crypto::sha256_hex;
 use crate::error::{Error, Result};
-use crate::ids::{AuditId, UserId, WorkspaceId};
+use crate::ids::{AuditId, ImportId, UserId, WorkspaceId};
 use crate::ocsf::PromptText;
 use crate::oidc::OidcSubject;
 use crate::storage::audit::AuditDetailRow;
@@ -697,6 +697,8 @@ pub enum AuditAction {
     EmbeddingsStatus,
     SessionRead,
     Share,
+    /// A session was renamed, or given back its derived title.
+    Rename,
     Mode,
     Cancel,
     /// A person's decision on a write the agent wanted to run.
@@ -751,6 +753,7 @@ history_enum!(AuditAction, Unknown, {
     EmbeddingsStatus => "embeddings_status",
     SessionRead => "session_read",
     Share => "share",
+    Rename => "rename",
     Mode => "mode",
     Cancel => "cancel",
     Permission => "permission",
@@ -789,6 +792,8 @@ pub enum ResourceKind {
     Resource,
     Audit,
     SavedQuestion,
+    /// An import saved under a name for refreshing.
+    SavedImport,
     /// An identity provider's group, named in a workspace's group roles.
     Group,
     /// A stored name this build does not define, as a newer build wrote
@@ -817,6 +822,7 @@ history_enum!(ResourceKind, Unknown, {
     Resource => "resource",
     Audit => "audit",
     SavedQuestion => "saved_question",
+    SavedImport => "saved_import",
     Group => "group",
 });
 
@@ -1132,12 +1138,47 @@ pub enum SealedOwner<'a> {
     /// `llm::oauth::client_key::ClientKeyName`; `client_keys`;
     /// `vault::Purpose::ClientKey`).
     ClientKey(&'a str),
+    /// A saved import's secret, kept with its workspace
+    /// (`import_credentials`; `vault::Purpose::ImportCredential`).
+    Import {
+        workspace: &'a WorkspaceId,
+        import: &'a ImportId,
+    },
+}
+
+/// Where an owner's sealed value lives: its table, key column and key, the
+/// column that records when it was written, and the workspace column a row
+/// that goes with its workspace also fills.
+struct SealedRow {
+    table: DynIden,
+    key: DynIden,
+    id: String,
+    stamp: DynIden,
+    workspace: Option<(DynIden, String)>,
 }
 
 impl SealedOwner<'_> {
+    fn row(self) -> SealedRow {
+        let (table, key, id, stamp) = self.unscoped();
+        let workspace = match self {
+            Self::Import { workspace, .. } => Some((
+                ImportCredentials::WorkspaceId.into_iden(),
+                workspace.to_string(),
+            )),
+            Self::User(_) | Self::Provider(_) | Self::ClientKey(_) => None,
+        };
+        SealedRow {
+            table,
+            key,
+            id,
+            stamp,
+            workspace,
+        }
+    }
+
     /// The table, its key column, this owner's key, and the column that
     /// records when the row was written.
-    fn row(self) -> (DynIden, DynIden, String, DynIden) {
+    fn unscoped(self) -> (DynIden, DynIden, String, DynIden) {
         match self {
             Self::User(user) => (
                 UserTokens::Table.into_iden(),
@@ -1156,6 +1197,12 @@ impl SealedOwner<'_> {
                 ClientKeys::Name.into_iden(),
                 name.to_owned(),
                 ClientKeys::CreatedAt.into_iden(),
+            ),
+            Self::Import { import, .. } => (
+                ImportCredentials::Table.into_iden(),
+                ImportCredentials::ImportId.into_iden(),
+                import.to_string(),
+                SealedColumns::UpdatedAt.into_iden(),
             ),
         }
     }
@@ -2010,7 +2057,7 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn sealed(&self, owner: SealedOwner<'_>) -> Result<Option<Sealed>> {
-        let (table, key, id, _) = owner.row();
+        let SealedRow { table, key, id, .. } = owner.row();
         let bound = Bound::new(
             Query::select()
                 .columns([
@@ -2058,7 +2105,13 @@ impl ControlPlane {
         expected: &Sealed,
         sealed: &Sealed,
     ) -> Result<bool> {
-        let (table, key, id, stamp) = owner.row();
+        let SealedRow {
+            table,
+            key,
+            id,
+            stamp,
+            ..
+        } = owner.row();
         let bound = Bound::new(
             Query::update()
                 .table(table)
@@ -2098,7 +2151,13 @@ impl ControlPlane {
     /// The insert that keeps `owner`'s sealed value: replacing the one
     /// before it, or only when there is none.
     fn sealed_insert(owner: SealedOwner<'_>, sealed: &Sealed, replace: bool) -> Result<Bound> {
-        let (table, key, id, stamp) = owner.row();
+        let SealedRow {
+            table,
+            key,
+            id,
+            stamp,
+            workspace,
+        } = owner.row();
         let conflict = if replace {
             OnConflict::column(key.clone())
                 .update_columns([
@@ -2114,20 +2173,28 @@ impl ControlPlane {
         let bound = Bound::new(
             Query::insert()
                 .into_table(table)
-                .columns([
-                    key,
-                    SealedColumns::KeyId.into_iden(),
-                    SealedColumns::Enc.into_iden(),
-                    SealedColumns::Ciphertext.into_iden(),
-                    stamp,
-                ])
-                .values([
-                    id.into(),
-                    sealed.key_id.as_str().into(),
-                    sealed.enc.clone().into(),
-                    sealed.ciphertext.clone().into(),
-                    Expr::current_timestamp(),
-                ])?
+                .columns(
+                    [
+                        key,
+                        SealedColumns::KeyId.into_iden(),
+                        SealedColumns::Enc.into_iden(),
+                        SealedColumns::Ciphertext.into_iden(),
+                        stamp,
+                    ]
+                    .into_iter()
+                    .chain(workspace.as_ref().map(|(column, _)| column.clone())),
+                )
+                .values(
+                    [
+                        id.into(),
+                        sealed.key_id.as_str().into(),
+                        sealed.enc.clone().into(),
+                        sealed.ciphertext.clone().into(),
+                        Expr::current_timestamp(),
+                    ]
+                    .into_iter()
+                    .chain(workspace.map(|(_, value)| value.into())),
+                )?
                 .on_conflict(conflict),
         )?;
         Ok(bound)
@@ -2135,7 +2202,7 @@ impl ControlPlane {
 
     /// The delete that forgets `owner`'s sealed value.
     fn sealed_delete(owner: SealedOwner<'_>) -> Result<Bound> {
-        let (table, key, id, _) = owner.row();
+        let SealedRow { table, key, id, .. } = owner.row();
         Ok(Bound::new(
             Query::delete()
                 .from_table(table)

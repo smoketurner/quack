@@ -27,7 +27,8 @@ use jiff::tz::TimeZone;
 use axum_extra::extract::Form as MultiForm;
 use quack_core::analysis::events::ToolStep;
 use quack_core::ids::{
-    CandidateId, ClassId, DocumentId, EdgeId, NodeId, RelationId, SessionId, UserId, WorkspaceId,
+    CandidateId, ClassId, DocumentId, EdgeId, ImportId, NodeId, RelationId, SessionId, UserId,
+    WorkspaceId,
 };
 use quack_core::ontology::candidates::{CandidateAction, Queue};
 use quack_core::ontology::edit::Edit;
@@ -42,7 +43,9 @@ use quack_core::storage::control::{
     TokenRow, UserKind, UserRow, WorkspaceChanges, WorkspaceTimes,
 };
 use quack_core::storage::profile::Share;
-use quack_core::storage::sessions::{self, MessageRole, MessageRow, SessionRow, Sharing};
+use quack_core::storage::sessions::{
+    self, MessageHit, MessageRole, MessageRow, SessionRow, Sharing,
+};
 use quack_core::storage::workspace::{
     Cell, ChunkSearchResult, ColumnMeaning, DocumentInfo, DocumentSource, DocumentStatus,
     ExportFormat, Pinning, ResultSort, SortDirection, TableDescription,
@@ -79,7 +82,7 @@ use quack_core::graph::{
     ExtractSource, GraphResult, GraphStatus, Origin, Properties, Standing as GraphStanding,
     resolve, store as graph_store,
 };
-use quack_core::import::ImportRequest;
+use quack_core::import::{ImportRequest, SavedImport};
 use quack_core::ingestion::parser::SectionKind;
 use quack_core::jobs::JobNumber;
 use quack_core::llm::Embeddings;
@@ -380,6 +383,8 @@ impl When {
 }
 
 struct MessageView {
+    /// Its position in the session, which `#m-{seq}` links to.
+    seq: i64,
     role: String,
     /// When the question was asked or the answer finished.
     at: Option<Moment>,
@@ -525,6 +530,15 @@ impl JobStrip {
     }
 }
 
+/// The chat page's session search results, swapped in under the box.
+#[derive(Template)]
+#[template(path = "chat_hits.html")]
+struct ChatHits {
+    ws_id: String,
+    query: String,
+    hits: Vec<MessageHit>,
+}
+
 #[derive(Template)]
 #[template(path = "jobs_rows.html")]
 struct JobRows {
@@ -632,6 +646,8 @@ impl TableView {
 struct TablesPage {
     page: Page,
     tables: Vec<String>,
+    /// Imports saved for refreshing, with how each last ran.
+    imports: Vec<SavedImport>,
     selected: Option<TableView>,
     error: Option<String>,
     notice: Option<String>,
@@ -655,6 +671,7 @@ impl TablesPage {
             None
         };
         let list = app.read(id, WorkspaceDb::list_tables).await?;
+        let imports = app.read(id, SavedImport::list).await?;
         let mut page = Page::in_workspace(app, Tab::Tables, &access);
         if let Some(table) = &selected {
             page.title.clone_from(&table.name);
@@ -662,6 +679,7 @@ impl TablesPage {
         html(&Self {
             page,
             tables: list,
+            imports,
             selected,
             error,
             notice,
@@ -999,6 +1017,8 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/chat", get(chat))
         .route("/w/{id}/chat/{sid}/delete", post(delete_session))
         .route("/w/{id}/chat/{sid}/share", post(share_session))
+        .route("/w/{id}/chat/{sid}/rename", post(rename_session))
+        .route("/w/{id}/chat/search", get(search_sessions))
         .route("/w/{id}/chat/{sid}/unshare", post(unshare_session))
         .route("/w/{id}/documents", get(documents).post(upload))
         .route("/w/{id}/documents/rows", get(document_rows))
@@ -1021,6 +1041,8 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/tables/note", post(table_note))
         .route("/w/{id}/tables/retype", post(table_retype))
         .route("/w/{id}/import", post(import_submit))
+        .route("/w/{id}/imports/{import}/refresh", post(import_refresh))
+        .route("/w/{id}/imports/{import}/remove", post(import_remove))
         .route("/w/{id}/sql", get(sql_page).post(sql_run))
         .route("/w/{id}/sql.csv", post(sql_csv))
         .route("/w/{id}/context", get(context_page).post(context_save))
@@ -1243,6 +1265,7 @@ impl MessageView {
 
     fn question(row: &MessageRow) -> Self {
         Self {
+            seq: row.seq,
             role: String::from("user"),
             at: Moment::from_utc_text(&row.created_at),
             duration_ms: None,
@@ -1259,6 +1282,7 @@ impl MessageView {
     fn answer(row: &MessageRow, steps: &[ToolStep]) -> Self {
         let meta = row.assistant().cloned().unwrap_or_default();
         Self {
+            seq: row.seq,
             role: String::from("assistant"),
             at: Moment::from_utc_text(&row.created_at),
             duration_ms: meta.duration_ms,
@@ -1360,6 +1384,52 @@ async fn share_session(
         .set_session_sharing(&app, &sid, Sharing::Shared)
         .await?;
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
+}
+
+#[derive(Deserialize)]
+struct RenameForm {
+    #[serde(default)]
+    title: String,
+}
+
+/// The chat page's rename form; a blank title gives back the derived one.
+async fn rename_session(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, sid)): Path<(WorkspaceId, SessionId)>,
+    Form(form): Form<RenameForm>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access.rename_session(&app, &sid, &form.title).await?;
+    Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
+}
+
+#[derive(Deserialize)]
+struct SessionSearch {
+    #[serde(default)]
+    q: String,
+}
+
+/// The chat page's search box: the matching questions and answers in the
+/// sessions the caller may read, each linking to its message.
+async fn search_sessions(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Query(search): Query<SessionSearch>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let query = search.q.trim().to_owned();
+    let hits = if query.is_empty() {
+        Vec::new()
+    } else {
+        access.search_sessions(&app, &query, 50).await?
+    };
+    html(&ChatHits {
+        ws_id: id.to_string(),
+        query,
+        hits,
+    })
 }
 
 async fn unshare_session(
@@ -1824,6 +1894,53 @@ async fn table_retype(
     .into_response())
 }
 
+/// The Tables page's Refresh button: the saved import runs again as a job.
+async fn import_refresh(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, import)): Path<(WorkspaceId, ImportId)>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let back = format!("/w/{id}/tables");
+    let outcome = match access.saved_import(&app, import.as_str()).await {
+        Ok(saved) => {
+            let name = saved.name.clone();
+            access
+                .refresh_import(&app, saved)
+                .await
+                .map(|job| format!("refresh of {name} queued as job {job}"))
+        }
+        Err(e) => Err(e),
+    };
+    Ok(match outcome {
+        Ok(notice) => Flash::notice(back, notice),
+        Err(e) => Flash::error(back, e.message),
+    }
+    .into_response())
+}
+
+/// The Tables page's Remove button: the saved import goes, its table stays.
+async fn import_remove(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path((id, import)): Path<(WorkspaceId, ImportId)>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let back = format!("/w/{id}/tables");
+    let outcome = match access.saved_import(&app, import.as_str()).await {
+        Ok(saved) => access
+            .remove_import(&app, &saved)
+            .await
+            .map(|()| format!("removed saved import {}; its table stays", saved.name)),
+        Err(e) => Err(e),
+    };
+    Ok(match outcome {
+        Ok(notice) => Flash::notice(back, notice),
+        Err(e) => Flash::error(back, e.message),
+    }
+    .into_response())
+}
+
 async fn import_submit(
     State(app): State<App>,
     WebUser(identity): WebUser,
@@ -1831,12 +1948,13 @@ async fn import_submit(
     Form(form): Form<ImportBody>,
 ) -> WebResult<Response> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let saving = form.saving();
     let request = match ImportRequest::try_from(form) {
         Ok(request) => request,
         Err(e) => return Ok(Flash::error(format!("/w/{id}/tables"), e.message).into_response()),
     };
     Ok(
-        match import_api::run_import(&app, &access, &request).await {
+        match import_api::run_import(&app, &access, &request, saving).await {
             Ok(imported) => match imported.graph_job {
                 Some(job) => Flash::notice(
                     format!("/w/{id}/tables"),

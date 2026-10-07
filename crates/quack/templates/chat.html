@@ -7,6 +7,10 @@
       <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-400">Sessions</h2>
       <a class="text-sm text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/chat">New</a>
     </div>
+    <form role="search" method="get" action="/w/{{ ws.membership.workspace.id }}/chat/search" hx-get="/w/{{ ws.membership.workspace.id }}/chat/search" hx-target="#session-hits" class="mt-2">
+      <input type="search" name="q" aria-label="Search the sessions" placeholder="Search questions and answers" hx-get="/w/{{ ws.membership.workspace.id }}/chat/search" hx-target="#session-hits" hx-trigger="input changed delay:300ms, search" class="w-full rounded border border-slate-700 px-2 py-1 text-sm">
+    </form>
+    <div id="session-hits" class="mt-1" aria-live="polite"></div>
     <ul id="sessions" class="mt-2 space-y-1 text-sm">
       {% for s in sessions %}
       <li class="group flex items-start gap-1">
@@ -22,6 +26,13 @@
     </ul>
   </aside>
   <section id="chat" class="min-w-0" data-workspace="{{ ws.membership.workspace.id }}" {% if let Some(current) = current %}data-session="{{ current.id }}" data-mode="{{ current.mode.as_str() }}"{% endif %}>
+    {% if let Some(current) = current %}
+    <form method="post" action="/w/{{ ws.membership.workspace.id }}/chat/{{ current.id }}/rename" class="mb-3 flex flex-wrap items-center gap-2 text-sm">
+      <label class="sr-only" for="session-title">Session title</label>
+      <input id="session-title" name="title" value="{{ current.title.as_deref().unwrap_or("") }}" placeholder="untitled; a blank title names it after its first question" class="min-w-0 flex-1 rounded border border-slate-700 px-2 py-1">
+      <button type="submit" class="rounded border border-slate-700 px-2 py-1 text-xs hover:bg-slate-800">Rename</button>
+    </form>
+    {% endif %}
     {% if messages.is_empty() %}
     <div id="empty" class="rounded border border-slate-800 bg-slate-900 p-4 text-sm text-slate-400 wrap-anywhere">
       <p>{% if let Some(current) = current %}This session has no messages yet.{% else %}Ask about what this workspace holds.{% endif %}</p>
@@ -33,7 +44,7 @@
     {% endif %}
     <div id="messages" class="space-y-4" role="log" aria-label="Conversation" aria-live="polite">
       {% for m in messages %}
-      <article class="rounded border border-slate-800 bg-slate-900 p-4 msg-{{ m.role }}">
+      <article id="m-{{ m.seq }}" class="rounded border border-slate-800 bg-slate-900 p-4 msg-{{ m.role }}">
         <div class="flex flex-wrap items-baseline gap-x-2 text-xs text-slate-400"><span class="font-semibold uppercase">{{ m.role }}</span>{% if let Some(at) = m.at %}{{ When::Clock.element(at)|safe }}{% endif %}{% if let Some(ms) = m.duration_ms %}<span>· answered in {{ ms }} ms</span>{% endif %}</div>
         {% if !m.steps.is_empty() %}
         <details class="mt-2 text-sm"><summary class="cursor-pointer text-slate-400">{{ m.steps.len() }} steps</summary>

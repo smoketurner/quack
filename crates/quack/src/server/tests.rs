@@ -215,6 +215,24 @@ impl Harness {
             .rows
     }
 
+    /// The rows `filter` matches once `done` holds for them: a streamed
+    /// response is audited when its stream ends, which can be after the
+    /// client has read the last byte.
+    async fn audit_eventually(
+        &self,
+        filter: AuditFilter,
+        done: impl Fn(&[AuditRow]) -> bool,
+    ) -> Vec<AuditRow> {
+        for _ in 0..250 {
+            let rows = self.audit(filter.clone()).await;
+            if done(&rows) {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        fail("the audit rows never arrived")
+    }
+
     /// What a request from the workspace's owner resolves to, for work the
     /// test starts without a request.
     async fn owner_access(&self, ws: &WorkspaceId, owner: &UserId) -> Access {
@@ -5012,23 +5030,15 @@ async fn okf_bundles_export_as_tar_and_import_as_documents_and_candidates() {
         "{paths:?}"
     );
     // The export streams, so it is audited when the stream ends.
-    let mut exported = false;
-    for _ in 0..100 {
-        exported = h
-            .audit(AuditFilter {
-                workspace_id: Some(ws.clone()),
-                action: Some(String::from("export")),
-                ..AuditFilter::default()
-            })
-            .await
-            .iter()
-            .any(|r| r.entry.outcome == Outcome::Allowed);
-        if exported {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert!(exported, "the finished export is audited as allowed");
+    h.audit_eventually(
+        AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("export")),
+            ..AuditFilter::default()
+        },
+        |rows| rows.iter().any(|r| r.entry.outcome == Outcome::Allowed),
+    )
+    .await;
     assert!(
         paths.contains(&"ontology/classes/organization.md"),
         "{paths:?}"
@@ -5453,6 +5463,139 @@ async fn server_credentials_are_refused_to_signed_in_users() {
         let (status, answer) = h.call(Method::POST, &path, Some(&token), Some(body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
     }
+}
+
+/// A SQLite source file with `rows` vendors, outside the data directory.
+async fn vendor_source(dir: &std::path::Path, rows: &str) -> String {
+    use sqlx::{Connection as _, Executor as _};
+    let path = dir.join("vendors.db");
+    let mut conn =
+        sqlx::SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    let insert = format!("INSERT INTO vendors VALUES {rows}");
+    conn.execute("CREATE TABLE IF NOT EXISTS vendors (id INTEGER, name TEXT)")
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    conn.execute("DELETE FROM vendors")
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    conn.execute(sqlx::query(sqlx::AssertSqlSafe(insert)))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    format!("sqlite://{}", path.display())
+}
+
+/// Start a saved import's refresh and wait for its job.
+async fn refresh_job(h: &Harness, path: &str, ws: &WorkspaceId) -> serde_json::Value {
+    let (status, answer) = h.call(Method::POST, path, None, None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{answer}");
+    let job = answer["job"].as_str().unwrap_or_default().to_owned();
+    wait_for_job(h, ws, &job, "").await
+}
+
+/// An import saved over the API is listed, refreshes as a background job
+/// (unchanged, then replaced), and can be removed; its table stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saved_import_lists_refreshes_and_is_removed_over_the_api() {
+    let h = harness(ServeMode::Local).await;
+    let (_, body) = h
+        .call(
+            Method::POST,
+            "/api/v1/workspaces",
+            None,
+            Some(serde_json::json!({ "name": "saved-imports" })),
+        )
+        .await;
+    let ws = WorkspaceId::from(body["id"].as_str().unwrap_or_default());
+    let source_dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let url = vendor_source(source_dir.path(), "(1, 'Orgenics'), (2, 'Aurobindo')").await;
+    let imports = format!("/api/v1/workspaces/{ws}/imports");
+
+    let body = serde_json::json!({ "url": url, "table": "vendors", "source_table": "vendors" });
+    let (status, answer) = h
+        .call(Method::POST, &imports, None, Some(body.clone()))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a name is needed: {answer}"
+    );
+    let mut named = body;
+    named["save"] = serde_json::json!("vendor list");
+    let (status, answer) = h
+        .call(Method::POST, &imports, None, Some(named.clone()))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    assert_eq!(answer["rows"], 2);
+    assert_eq!(answer["saved"]["name"], "vendor list");
+    let id = answer["saved"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let (status, answer) = h.call(Method::POST, &imports, None, Some(named)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["code"], "saved_import_exists");
+
+    let refresh_path = format!("{imports}/{id}/refresh");
+    let job = refresh_job(&h, &refresh_path, &ws).await;
+    assert_eq!(job["state"], "succeeded", "{job}");
+    assert!(
+        job["outcome"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("source unchanged"),
+        "{job}"
+    );
+    vendor_source(
+        source_dir.path(),
+        "(1, 'Orgenics'), (2, 'Aurobindo'), (3, 'Cipla')",
+    )
+    .await;
+    let job = refresh_job(&h, &refresh_path, &ws).await;
+    assert_eq!(job["state"], "succeeded", "{job}");
+    let (_, listed) = h.get(&imports, "").await;
+    assert_eq!(listed["imports"][0]["last_rows"], 3, "{listed}");
+    let (_, rows) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql"),
+            "",
+            serde_json::json!({ "sql": "SELECT count(*) FROM vendors" }),
+        )
+        .await;
+    assert_eq!(rows["rows"][0][0], 3, "{rows}");
+
+    // The Tables page lists it, and its Refresh button queues a job.
+    let (_, page, _) = h.page(&format!("/w/{ws}/tables"), None).await;
+    assert!(page.contains("vendor list"), "{page}");
+    assert!(page.contains(&format!("/imports/{id}/refresh")), "{page}");
+    let (status, _, headers) = h
+        .form(&format!("/w/{ws}/imports/{id}/refresh"), None, "")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (to, html) = h.land(&headers, None).await;
+    assert_eq!(to, format!("/w/{ws}/tables"));
+    assert!(
+        html.contains("refresh of vendor list queued as job"),
+        "{html}"
+    );
+
+    let (status, _) = h
+        .call(Method::DELETE, &format!("{imports}/{id}"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, listed) = h.get(&imports, "").await;
+    assert_eq!(listed["imports"], serde_json::json!([]), "{listed}");
+    let (status, _) = h
+        .call(Method::POST, &format!("{imports}/{id}/refresh"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, tables) = h.get(&format!("/api/v1/workspaces/{ws}/tables"), "").await;
+    assert_eq!(
+        tables["tables"],
+        serde_json::json!(["vendors"]),
+        "the table stays"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -8029,6 +8172,170 @@ async fn every_workspace_page_follows_the_jobs_stream() {
     );
 }
 
+/// A session's creator renames it and another member may not; search finds
+/// text only in the sessions the caller may read, and both are audited with
+/// the text kept in the workspace's detail rows.
+#[tokio::test]
+async fn sessions_are_renamed_by_their_creator_and_searched_within_what_one_may_read() {
+    use quack_core::analysis::agent::AgentResponse;
+    use quack_core::error::Result as CoreResult;
+    use quack_core::ids::SessionId;
+    use quack_core::storage::sessions::{self, ChatMode};
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("olive", UserKind::Standard).await;
+    let ws = h.workspace("sales", &owner).await;
+    let ada = h.user("ada", UserKind::Standard).await;
+    let bob = h.user("bob", UserKind::Standard).await;
+    for u in [&ada, &bob] {
+        h.app
+            .control
+            .set_member(&ws, u, Role::Member, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let (adas, bobs) = {
+        let (ada, bob) = (ada.clone(), bob.clone());
+        db.run(move |db| {
+            let turn = |owner: &UserId, question: &str| -> CoreResult<SessionId> {
+                let session = sessions::create_session(db, "m", ChatMode::Chat, Some(owner))?;
+                sessions::record_turn(
+                    db,
+                    &session.id,
+                    question,
+                    jiff::Timestamp::now(),
+                    &AgentResponse {
+                        content: String::from("Freight answer."),
+                        ..AgentResponse::default()
+                    },
+                )?;
+                Ok(session.id)
+            };
+            Ok((
+                turn(&ada, "freight costs in March")?,
+                turn(&bob, "freight for bob")?,
+            ))
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    let ada_token = h.login("ada").await;
+    let bob_token = h.login("bob").await;
+    let session = |sid: &SessionId| format!("/api/v1/workspaces/{ws}/sessions/{sid}");
+
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &session(&adas),
+            Some(&bob_token),
+            Some(serde_json::json!({ "title": "stolen" })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "bob cannot see ada's session: {body}"
+    );
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &session(&adas),
+            Some(&ada_token),
+            Some(serde_json::json!({ "title": "  March freight " })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["title"], "March freight");
+    assert_eq!(body["title_by"], "person");
+    let (_, body) = h
+        .call(
+            Method::PATCH,
+            &session(&adas),
+            Some(&ada_token),
+            Some(serde_json::json!({ "title": "" })),
+        )
+        .await;
+    assert_eq!(body["title"], "freight costs in March");
+    assert_eq!(body["title_by"], "derived");
+
+    let search = format!("/api/v1/workspaces/{ws}/sessions/search?q=FREIGHT");
+    let (status, body) = h.get(&search, &ada_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hits = body["hits"].as_array().cloned().unwrap_or_default();
+    assert_eq!(hits.len(), 2, "ada's question and answer only: {body}");
+    assert!(hits.iter().all(|hit| hit["session_id"] == adas.as_str()));
+    let (_, body) = h.get(&search, &bob_token).await;
+    assert!(
+        body["hits"]
+            .as_array()
+            .is_some_and(|hits| hits.iter().all(|hit| hit["session_id"] == bobs.as_str())),
+        "{body}"
+    );
+
+    // The web console: anchors on each message, the search fragment linking
+    // to them within what the caller may read, and the rename form.
+    let (_, page, _) = h
+        .page(&format!("/w/{ws}/chat?session={adas}"), Some(&ada_token))
+        .await;
+    assert!(
+        page.contains("id=\"m-1\"") && page.contains("id=\"m-2\""),
+        "{page}"
+    );
+    assert!(page.contains(&format!("/chat/{adas}/rename")), "{page}");
+    let (_, fragment, _) = h
+        .page(&format!("/w/{ws}/chat/search?q=freight"), Some(&ada_token))
+        .await;
+    assert!(
+        fragment.contains(&format!("session={adas}#m-1")),
+        "{fragment}"
+    );
+    assert!(!fragment.contains(bobs.as_str()), "{fragment}");
+    let (status, _, _) = h
+        .form(
+            &format!("/w/{ws}/chat/{adas}/rename"),
+            Some(&ada_token),
+            "title=Freight+by+month",
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, page, _) = h
+        .page(&format!("/w/{ws}/chat?session={adas}"), Some(&ada_token))
+        .await;
+    assert!(page.contains("Freight by month"), "{page}");
+
+    let renames = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("rename")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(renames.len(), 3, "{renames:?}");
+    let searches = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("search")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(searches.len(), 3, "{searches:?}");
+    let detail = db
+        .run(|db| audit::list(db, 100))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        detail.iter().any(|row| row
+            .detail
+            .as_ref()
+            .is_some_and(|d| d["title"] == "March freight")),
+        "the title is kept in the workspace, not control.db"
+    );
+}
+
 /// The shipments ontology the graph tests build from: three classes
 /// keyed by name or purchase order, two relations, one mapping.
 fn shipments_ontology() -> serde_json::Value {
@@ -9325,10 +9632,13 @@ async fn a_workspace_round_trips_through_a_snapshot_and_is_renamed_and_deleted()
     assert_eq!(manifest.classification, "secret");
     assert_eq!(manifest.members.len(), 2, "{manifest:?}");
     let snapshots = h
-        .audit(AuditFilter {
-            action: Some(String::from("snapshot")),
-            ..AuditFilter::default()
-        })
+        .audit_eventually(
+            AuditFilter {
+                action: Some(String::from("snapshot")),
+                ..AuditFilter::default()
+            },
+            |rows| !rows.is_empty(),
+        )
         .await;
     assert_eq!(snapshots.len(), 1);
 

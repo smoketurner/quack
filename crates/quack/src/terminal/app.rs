@@ -38,22 +38,24 @@ use quack_core::jobs::{
     JobContext, JobCounts, JobId, JobInfo, JobKind, JobNumber, JobQueue, JobResult, JobSpec,
     JobState, Lane, LaneKey,
 };
+use quack_core::llm::oauth::KeySource;
 use quack_core::llm::{self, Embeddings};
 use quack_core::okf::{self, DirSink};
 use quack_core::prefix::PrefixMatch;
 use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
-use quack_core::storage::control::ResourceKind;
+use quack_core::storage::control::{ControlPlane, ResourceKind};
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{
-    self, ChatMode, ExportFormat, MessageRole, Sharing, Transcript,
+    self, ChatMode, ExportFormat, MessageRole, SessionRow, SessionViewer, Sharing, TitleSource,
+    Transcript,
 };
 use quack_core::storage::workspace::{
     Pinning, QueryCanceller, QueryResults, SqlSchema, StatementKind, WorkspaceDb,
 };
+use quack_core::vault::Vault;
 
-use crate::ModeArg;
 use crate::confirm::Confirm;
 use crate::embeddings_cli::{self, EmbeddingsAction};
 use crate::graph_cli::GraphAction;
@@ -69,6 +71,7 @@ use crate::terminal::picker::{Picked, Picker};
 use crate::terminal::selection::{Edge, Located, Selection, TranscriptView};
 use crate::terminal::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
 use crate::text_or_json::TextOrJson;
+use crate::{ImportAction, ImportContext, ModeArg};
 
 /// The spinner's frame interval; it ticks only while a job is active.
 const SPINNER_MS: u64 = 80;
@@ -555,6 +558,7 @@ enum CliJob {
     ContextImport(String),
     ContextExport(String),
     Import(ImportRequest),
+    SavedImport(ImportAction),
     Ingest(PathBuf),
     Search(String),
 }
@@ -567,7 +571,7 @@ impl CliJob {
             Self::Embeddings(_) => JobKind::Embeddings,
             Self::Saved(_) => JobKind::Sql,
             Self::Okf(_) | Self::ContextExport(_) => JobKind::Export,
-            Self::ContextImport(_) | Self::Import(_) => JobKind::Import,
+            Self::ContextImport(_) | Self::Import(_) | Self::SavedImport(_) => JobKind::Import,
             Self::Ingest(_) => JobKind::Ingest,
             Self::Search(_) => JobKind::Search,
         }
@@ -584,6 +588,7 @@ impl CliJob {
             Self::ContextImport(_) => String::from("Importing the context"),
             Self::ContextExport(_) => String::from("Exporting the context"),
             Self::Import(request) => format!("import {}", request.url),
+            Self::SavedImport(action) => action.label(),
             Self::Search(query) => format!("search {}", one_line(query)),
             Self::Ingest(path) => path.file_name().map_or_else(
                 || path.display().to_string(),
@@ -609,6 +614,7 @@ impl CliJob {
             | Self::Okf(_)
             | Self::ContextImport(_)
             | Self::ContextExport(_)
+            | Self::SavedImport(_)
             | Self::Search(_) => {
                 Message::new(MessageKind::System, format!("{}\u{2026}", self.label()))
             }
@@ -697,6 +703,22 @@ impl CliJob {
                 ));
             }
             Self::Import(request) => return Self::import(env, &request, control).await,
+            Self::SavedImport(action) => {
+                let control_plane = ControlPlane::open(&env.config).await?;
+                let vault = Vault::new(env.config.data_dir(), KeySource::Keychain);
+                action
+                    .run(
+                        &ImportContext {
+                            config: &env.config,
+                            workspace: &env.workspace_id,
+                            control: &control_plane,
+                            vault: &vault,
+                            db: &env.db,
+                        },
+                        &mut out,
+                    )
+                    .await?;
+            }
             Self::Ingest(path) => return Self::ingest(env, &path, control).await,
             Self::Search(query) => return Self::search(env, &query).await,
         }
@@ -2036,7 +2058,9 @@ impl App {
             SlashCommand::Cancel { job } => self.cancel_job(job),
             SlashCommand::Help => self.note(MessageKind::System, SlashCommand::help()),
             SlashCommand::Workspace => self.show_workspace(),
-            SlashCommand::Sessions => self.show_sessions(),
+            SlashCommand::Sessions { query: None } => self.show_sessions(),
+            SlashCommand::Sessions { query: Some(text) } => self.show_matching_sessions(text),
+            SlashCommand::Rename { title } => self.rename_session(title.unwrap_or_default()),
             SlashCommand::Resume { id } => self.switch_session(id),
             SlashCommand::New => self.new_session(),
             SlashCommand::Mode { mode: None } => self.show_mode(),
@@ -2079,6 +2103,11 @@ impl App {
             SlashCommand::Ontology { action } => self.run_job(CliJob::Ontology(action)),
             SlashCommand::Delete { id } => self.delete_document(id),
             SlashCommand::Import {
+                action: Some(action),
+                ..
+            } => self.run_job(CliJob::SavedImport(action)),
+            SlashCommand::Import {
+                action: None,
                 url,
                 table,
                 source_table,
@@ -2093,7 +2122,7 @@ impl App {
                     source_table,
                     headers,
                     json_pointer,
-                    ..ImportRequest::new(url, table)
+                    ..ImportRequest::new(url.unwrap_or_default(), table.unwrap_or_default())
                 }));
             }
             SlashCommand::Path { route } => self.show_path(&route),
@@ -2196,6 +2225,55 @@ impl App {
         );
     }
 
+    /// `/sessions TEXT`: the picker, holding the sessions whose questions or
+    /// answers contain `text`, newest match first.
+    fn show_matching_sessions(&mut self, text: String) {
+        self.on_db_ok(
+            Side::Read,
+            move |db| {
+                let hits =
+                    sessions::search_messages(db, &text, &SessionViewer::All, PICKER_SESSIONS)?;
+                let mut rows: Vec<SessionRow> = Vec::new();
+                for hit in hits {
+                    if rows.iter().all(|row| row.id != hit.session_id)
+                        && let Some(row) = sessions::get_session(db, &hit.session_id)?
+                    {
+                        rows.push(row);
+                    }
+                }
+                Ok(rows)
+            },
+            |app, rows| {
+                if rows.is_empty() {
+                    app.note(MessageKind::System, "No session mentions that.");
+                    return;
+                }
+                app.picker = Some(Picker::sessions(rows, app.session_id.clone()));
+            },
+        );
+    }
+
+    /// `/rename [TITLE]`: a new title, or with none the derived one again.
+    fn rename_session(&mut self, title: String) {
+        let session = self.session_id.clone();
+        self.on_db_ok(
+            Side::Write,
+            move |db| sessions::set_session_title(db, &session, &title),
+            |app, renamed| {
+                let title = renamed.title.unwrap_or_default();
+                app.note(
+                    MessageKind::System,
+                    match renamed.title_by {
+                        TitleSource::Person => format!("Renamed to \"{title}\"."),
+                        TitleSource::Derived | TitleSource::Model => {
+                            format!("Named after its first question again: \"{title}\".")
+                        }
+                    },
+                );
+            },
+        );
+    }
+
     /// `/resume PREFIX`: find the session, then load its messages, both on
     /// the reader; input typed meanwhile waits for the switch.
     fn switch_session(&mut self, prefix: String) {
@@ -2205,7 +2283,31 @@ impl App {
             Side::Read,
             move |db| {
                 let sessions = sessions::list_sessions(db, 1000)?;
-                let found = match PrefixMatch::of(sessions, &prefix, |s| s.id.as_str()) {
+                let by_id = PrefixMatch::of(sessions.clone(), &prefix, |s| s.id.as_str());
+                let by_title = || {
+                    let wanted = prefix.to_lowercase();
+                    let titled: Vec<SessionRow> = sessions
+                        .into_iter()
+                        .filter(|s| {
+                            s.title
+                                .as_deref()
+                                .is_some_and(|t| t.to_lowercase().starts_with(&wanted))
+                        })
+                        .collect();
+                    match titled.len() {
+                        0 => PrefixMatch::None,
+                        1 => titled
+                            .into_iter()
+                            .next()
+                            .map_or(PrefixMatch::None, PrefixMatch::One),
+                        _ => PrefixMatch::Many(titled),
+                    }
+                };
+                let matched = match by_id {
+                    PrefixMatch::None => by_title(),
+                    found => found,
+                };
+                let found = match matched {
                     PrefixMatch::One(session) if session.id == current => Found::Current,
                     PrefixMatch::One(session) => Found::One(Replay::load(db, &session.id)?),
                     PrefixMatch::None => Found::None(prefix),

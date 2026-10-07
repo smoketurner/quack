@@ -55,6 +55,22 @@ Retiring a whole deployment means deleting the data directory (`control.db`, eve
 workspace, `vault.key` if present) and the keychain entry `quack` / `vault`, and revoking
 the OAuth clients it registered (`quack auth unregister`).
 
+## Refreshing saved imports
+
+quack has no scheduler. An import saved with `--save NAME` runs again when something calls
+`quack import refresh NAME`. To refresh nightly, add a cron entry on the host that holds the
+data directory:
+
+```
+# m h dom mon dow  command
+15 2 * * *  quack import refresh orders -w sales
+```
+
+A refresh that finds the source unchanged prints `orders: source unchanged` and changes
+nothing. A failed refresh exits 1, keeps the rows from the run before, and records the
+error, which `quack import list` shows. Under `quack serve`, the Tables page's Refresh button
+and `POST /api/v1/workspaces/{id}/imports/{import}/refresh` run one on demand.
+
 ## Hardware sizing
 
 Measured on 2026-10-06 with the release binary (`v2026.10.3` plus the changes of this page,

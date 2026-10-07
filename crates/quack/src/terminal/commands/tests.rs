@@ -303,9 +303,24 @@ fn free_text_arrives_as_typed_and_the_rest_splits_like_a_shell_line() {
     ));
     assert!(matches!(
         SlashCommand::parse("/import sqlite:/tmp/a.db t --query \"SELECT * FROM x WHERE y = 'z'\""),
-        Ok(SlashCommand::Import { url, table, source_table: None, query: Some(q), .. })
+        Ok(SlashCommand::Import { action: None, url: Some(url), table: Some(table), source_table: None, query: Some(q), .. })
             if url == "sqlite:/tmp/a.db" && table == "t" && q == "SELECT * FROM x WHERE y = 'z'"
     ));
+    assert!(matches!(
+        SlashCommand::parse("/import refresh nightly"),
+        Ok(SlashCommand::Import { action: Some(ImportAction::Refresh { name }), .. }) if name == "nightly"
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/import list"),
+        Ok(SlashCommand::Import {
+            action: Some(ImportAction::List { .. }),
+            ..
+        })
+    ));
+    assert!(
+        SlashCommand::parse("/import sqlite:/tmp/a.db").is_err(),
+        "a table is needed"
+    );
     assert!(matches!(
         SlashCommand::parse(
             "/import https://api.example.com/sales.json sales -H 'X-Team: data' --bearer-env SALES_TOKEN --json-pointer /data/items"
@@ -317,6 +332,22 @@ fn free_text_arrives_as_typed_and_the_rest_splits_like_a_shell_line() {
                 && p.to_string() == "/data/items"
     ));
     assert!(SlashCommand::parse("/import https://x/a.json t --json-pointer data").is_err());
+    assert!(matches!(
+        SlashCommand::parse("/rename  Q3 --freight review "),
+        Ok(SlashCommand::Rename { title: Some(t) }) if t == "Q3 --freight review"
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/rename"),
+        Ok(SlashCommand::Rename { title: None })
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/sessions"),
+        Ok(SlashCommand::Sessions { query: None })
+    ));
+    assert!(matches!(
+        SlashCommand::parse("/sessions late \"vendors\""),
+        Ok(SlashCommand::Sessions { query: Some(q) }) if q == "late \"vendors\""
+    ));
     assert!(matches!(
         SlashCommand::parse("/export --sql 'the session.sql'"),
         Ok(SlashCommand::Export { flags, file: Some(f) })

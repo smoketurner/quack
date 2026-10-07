@@ -15,6 +15,7 @@ use quack_core::graph::extract;
 use quack_core::graph::follow_up::{FollowUp, FollowUpSummary};
 use quack_core::graph::resolve::ResolutionSummary;
 use quack_core::ids::{DocumentId, RunId};
+use quack_core::import::{ImportSummary, LoadStatus};
 use quack_core::jobs::{JobContext, JobId, JobKind, JobSpec, Lane, LaneKey};
 use quack_core::llm::Embeddings;
 use quack_core::ontology::{documents, store as ontology_store};
@@ -56,6 +57,13 @@ impl RunKind {
         resource: ResourceKind::GraphRun,
         label: "graph follow-up",
     };
+    /// A saved import run again (`POST .../imports/{id}/refresh`).
+    pub(crate) const IMPORT_REFRESH: Self = Self {
+        job: JobKind::Import,
+        action: AuditAction::Import,
+        resource: ResourceKind::SavedImport,
+        label: "import refresh",
+    };
     pub(crate) const ONTOLOGY: Self = Self {
         job: JobKind::Ontology,
         action: AuditAction::Propose,
@@ -81,6 +89,19 @@ impl RunReport for refresh::Summary {
             "{} chunks and {} graph node labels refreshed",
             self.chunks, self.nodes
         )
+    }
+}
+
+impl RunReport for ImportSummary {
+    fn detail(&self) -> Value {
+        serde_json::json!({ "summary": self })
+    }
+
+    fn message(&self) -> String {
+        match self.status {
+            LoadStatus::Unchanged => format!("{}: source unchanged", self.table),
+            LoadStatus::Loaded => format!("{}: {} rows, replaced", self.table, self.rows),
+        }
     }
 }
 

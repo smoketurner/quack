@@ -72,6 +72,9 @@ const TABLE_PROFILES: u32 = 12;
 /// are stemmed under it, with unspaced scripts as bigrams (issue #395):
 /// every document is detected and every chunk reindexed.
 const DOCUMENT_LANGUAGES: u32 = 13;
+/// Imports can be saved under a name and refreshed (`_quack_imports`);
+/// the table needs no backfill.
+const SAVED_IMPORTS: u32 = 14;
 
 /// The documents table, and the columns older files gain on open.
 const DOCUMENTS_DDL: &str = "
@@ -117,6 +120,31 @@ const DOCUMENTS_DDL: &str = "
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS metadata JSON;
     ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS language TEXT;";
 
+/// Imports saved under a name so `quack import refresh` can run them again
+/// (`import::saved`): what to read, where it loads, and how the last run
+/// went. Secrets are never here: a URL is stored redacted and a header by
+/// name; a secret the owner chose to keep is sealed in `control.db`.
+const SAVED_IMPORTS_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_imports (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    url TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    query TEXT,
+    source_table TEXT,
+    row_limit UBIGINT,
+    types TEXT,
+    json_pointer TEXT,
+    bearer_env TEXT,
+    header_names JSON,
+    sealed_secret BOOLEAN NOT NULL DEFAULT false,
+    document_id TEXT,
+    created_by TEXT,
+    created_at TIMESTAMP DEFAULT now(),
+    last_run_at TIMESTAMP,
+    last_rows UBIGINT,
+    last_error TEXT
+);";
+
 /// Summaries of the turns a session's history window leaves out
 /// (`[analysis].compact_history`), each with how many replayable messages,
 /// oldest first, it covers.
@@ -130,7 +158,7 @@ const SESSION_SUMMARIES_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_session_s
 
 /// Schema version of the internal tables, recorded in `_quack_meta`: the
 /// newest step above.
-const WORKSPACE_SCHEMA_VERSION: u32 = DOCUMENT_LANGUAGES;
+const WORKSPACE_SCHEMA_VERSION: u32 = SAVED_IMPORTS;
 
 /// The oldest `DuckDB` that must read a file created here, given to `DuckDB`
 /// when the file is opened. It is the bundled library's own default, named so
@@ -1314,6 +1342,7 @@ impl WorkspaceDb {
                 created_at TIMESTAMP DEFAULT now(),
                 updated_at TIMESTAMP DEFAULT now()
             );
+            ALTER TABLE _quack_sessions ADD COLUMN IF NOT EXISTS title_by TEXT;
             CREATE TABLE IF NOT EXISTS _quack_messages (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -1335,6 +1364,7 @@ impl WorkspaceDb {
         self.conn.execute_batch(DOCUMENTS_DDL)?;
         self.conn.execute_batch(&sql)?;
         self.conn.execute_batch(SESSION_SUMMARIES_DDL)?;
+        self.conn.execute_batch(SAVED_IMPORTS_DDL)?;
         self.conn.execute_batch(saved::DDL)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&graph::ddl(dim))?;
