@@ -83,7 +83,17 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
       - name: Setup Rust toolchain
-        run: rustup show
+        # rust-cache hashes every installed toolchain into its cache key, and a
+        # runner image preinstalls its own stable toolchain, which changes as
+        # images roll out. Pull-request runs landed on images whose stable
+        # differed from the one main saved its caches under, missed every
+        # cache, and rebuilt from nothing (21 minutes against 5). Keeping only
+        # the pinned toolchain makes the key depend on this repository alone.
+        shell: bash
+        run: |
+          rustup show
+          pinned=$(rustup show active-toolchain | awk '{print $1}')
+          rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -92,6 +102,13 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      # Rustdoc runs here, not in a job of its own: it needs every dependency
+      # compiled in check mode, which Clippy just did, so it takes seconds
+      # instead of the 15 to 18 minutes a separate job spent rebuilding them.
+      - name: Build the documentation with broken links denied
+        run: cargo doc --locked --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   test:
     name: Unit Tests (${{ matrix.name }})
@@ -116,7 +133,17 @@ jobs:
         if: matrix.install-deps != ''
         run: ${{ matrix.install-deps }} # zizmor: ignore[template-injection] — static matrix value
       - name: Setup Rust toolchain
-        run: rustup show
+        # rust-cache hashes every installed toolchain into its cache key, and a
+        # runner image preinstalls its own stable toolchain, which changes as
+        # images roll out. Pull-request runs landed on images whose stable
+        # differed from the one main saved its caches under, missed every
+        # cache, and rebuilt from nothing (21 minutes against 5). Keeping only
+        # the pinned toolchain makes the key depend on this repository alone.
+        shell: bash
+        run: |
+          rustup show
+          pinned=$(rustup show active-toolchain | awk '{print $1}')
+          rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -145,7 +172,17 @@ jobs:
         with:
           persist-credentials: false
       - name: Setup Rust toolchain
-        run: rustup show
+        # rust-cache hashes every installed toolchain into its cache key, and a
+        # runner image preinstalls its own stable toolchain, which changes as
+        # images roll out. Pull-request runs landed on images whose stable
+        # differed from the one main saved its caches under, missed every
+        # cache, and rebuilt from nothing (21 minutes against 5). Keeping only
+        # the pinned toolchain makes the key depend on this repository alone.
+        shell: bash
+        run: |
+          rustup show
+          pinned=$(rustup show active-toolchain | awk '{print $1}')
+          rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -179,30 +216,6 @@ jobs:
                 gh cache delete "$id"
               done
           done
-
-  docs:
-    name: Rustdoc
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
-      - name: Setup Rust toolchain
-        run: rustup show
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: "v1"
-          shared-key: "debug-${{ runner.os }}"
-          save-if: "false"
-      - name: Build the documentation with broken links denied
-        run: cargo doc --locked --workspace --no-deps
-        env:
-          RUSTDOCFLAGS: -D warnings
 
   dependency-review:
     name: Dependency Review
