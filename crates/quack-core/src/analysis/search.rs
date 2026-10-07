@@ -30,7 +30,7 @@ pub struct DocumentSearch {
     pub query: String,
     /// Hits to return.
     pub top_k: u32,
-    /// Documents to search within, each by id, id prefix, or file name;
+    /// Documents to search within, each by id, id prefix, file name, or title;
     /// empty for every document.
     pub documents: Vec<String>,
     /// A graph entity whose source passages to search within.

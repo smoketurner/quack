@@ -913,7 +913,7 @@ pub struct SearchDocumentsArgs {
     /// Number of chunks to return (default from config)
     pub top_k: Option<u32>,
     /// Restrict the search to these documents: ids from `list_documents`
-    /// (prefixes accepted) or exact file names
+    /// (prefixes accepted), exact file names, or exact titles
     #[serde(default)]
     pub document_ids: Vec<String>,
     /// Restrict the search to passages this entity was extracted from,
@@ -1131,8 +1131,8 @@ impl ReadDocumentTool {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ReadDocumentArgs {
-    /// The document: an id from `list_documents` (a prefix is enough) or
-    /// its exact file name
+    /// The document: an id from `list_documents` (a prefix is enough),
+    /// its exact file name, or its exact title
     pub document: String,
     /// Position of the first chunk to read, counting from 0 (default 0)
     pub from: Option<u32>,
@@ -1540,8 +1540,8 @@ impl Tool for ListDocumentsTool {
              searchable once its status is ready; a tabular file is loaded as a table instead. A \
              document marked with unreadable pages or pages without text was only partly read: \
              those pages are not searchable. To \
-             search within particular documents, pass their ids (a prefix is enough) or exact \
-             file names as search_documents' document_ids. Takes no arguments.",
+             search within particular documents, pass their ids (a prefix is enough), exact \
+             file names, or exact titles as search_documents' document_ids. Takes no arguments.",
         )
     }
 
