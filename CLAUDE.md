@@ -165,7 +165,8 @@ documents, graph entity, `DocumentFilter`, mode `hybrid|keyword|vector`), is the
 page (`/w/{id}/search`); a person can limit a question to documents (`document_ids` on REST
 and MCP `query`, `-p --documents`, the chat's document picker): `DocumentScope` is resolved
 when the turn starts, noted in the system prompt, recorded on the user message
-(`UserMeta`), and intersected with the model's `document_ids`. Citations are registered per turn
+(`UserMeta`), and intersected with the model's `document_ids`; the terminal's `/scope DOC..`
+holds one for its next questions until `/scope` alone lifts it. Citations are registered per turn
 (`analysis::citations`) and validated before the answer is returned. Sessions have a mode,
 `chat` or `query`; `--mode` / `/mode` set it. The workspace context (owner-written
 instructions, `quack_core::storage::context`, versioned in `_quack_context`) is injected

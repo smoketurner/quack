@@ -25,13 +25,13 @@ fn the_parser_definition_is_valid() {
 #[test]
 fn command_names_complete_by_prefix() {
     assert_eq!(words("/").len(), visible_subcommands(&TREE).count());
-    assert_eq!(words("/sch"), ["/schema"]);
+    assert_eq!(words("/ta"), ["/tables"]);
     assert_eq!(
         words("/s"),
         [
             "/sql",
-            "/schema",
             "/search",
+            "/scope",
             "/saved",
             "/sessions",
             "/share",
@@ -107,7 +107,7 @@ fn accepting_replaces_the_word_and_spaces_when_more_may_follow() {
         let item = completion.get(0)?;
         Some((completion.apply(line, item).0, item.finishes()))
     };
-    assert_eq!(apply("/sch"), Some((String::from("/schema "), false)));
+    assert_eq!(apply("/ta"), Some((String::from("/tables "), false)));
     assert_eq!(apply("/he"), Some((String::from("/help"), true)));
     assert_eq!(
         apply("/graph sta"),
@@ -150,7 +150,7 @@ fn help_lists_every_command_alias_and_usage() {
     for line in [
         "/help, /?",
         "/quit, /exit, /q",
-        "/schema TABLE",
+        "/tables [TABLE] [--note TEXT] [--retype COLUMN=TYPE]",
         "/mode [chat|query]",
         "/export [--sql] [--markdown] [FILE]",
         "/import URL TABLE [SOURCE_TABLE] [--query SQL]",
@@ -242,7 +242,8 @@ fn free_text_parses_and_missing_arguments_are_refused() {
         SlashCommand::parse("/ontology --help").map_err(|e| e.kind()),
         Err(ErrorKind::DisplayHelp)
     ));
-    assert!(!parses("/schema"));
+    assert!(!parses("/schema"), "/tables TABLE describes a table");
+    assert!(!parses("/tables --note x"), "a note needs a table");
     assert!(!parses("/graph"));
     assert!(!parses("/mode fast"));
     assert!(!parses("/nothing"));

@@ -17,6 +17,7 @@ use crate::embeddings_cli::EmbeddingsAction;
 use crate::graph_cli::GraphAction;
 use crate::ontology_cli::OntologyAction;
 use crate::saved_cli::SavedAction;
+use crate::tables_cli::TablesArgs;
 use crate::{ExportFlags, ImportAction, ModeArg};
 
 /// The argument id of a command that takes the rest of the line as typed
@@ -43,15 +44,10 @@ pub(crate) enum SlashCommand {
         #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "STATEMENT")]
         statement: Option<String>,
     },
-    /// List tables in the workspace
+    /// List tables; with TABLE, its columns, warnings, and sample rows, and
+    /// set its note or retype a column (as `quack tables`)
     #[command(name = "/tables")]
-    Tables,
-    /// Columns, types, and sample rows of a table
-    #[command(name = "/schema", disable_help_flag = true)]
-    Schema {
-        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "TABLE")]
-        table: String,
-    },
+    Tables(TablesArgs),
     /// Load a file (a path typed at the prompt or a file dropped on the terminal does the same)
     #[command(name = "/ingest", visible_alias = "/attach", disable_help_flag = true)]
     Ingest {
@@ -96,6 +92,13 @@ pub(crate) enum SlashCommand {
         #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "QUERY")]
         query: String,
     },
+    /// Limit the next questions to these documents (id, file name, or
+    /// title); with none, every document again (the web chat's picker)
+    #[command(name = "/scope")]
+    Scope {
+        #[arg(value_name = "DOCUMENT")]
+        documents: Vec<String>,
+    },
     /// Pin a document's full text into every prompt
     #[command(name = "/pin", disable_help_flag = true)]
     Pin { id: String },
@@ -105,7 +108,7 @@ pub(crate) enum SlashCommand {
     /// Delete a document with its chunks, table, and graph rows
     #[command(name = "/delete", disable_help_flag = true)]
     Delete { id: String },
-    /// The ontology: show, init, propose, review, accept, reject, rename, and versions
+    /// The ontology: every `quack ontology` verb (show, init, import, export, propose, review, rename, versions, ...)
     #[command(name = "/ontology")]
     Ontology {
         #[command(subcommand)]

@@ -1128,12 +1128,12 @@ when read: every value empty, at least half empty, numbers stored as text and da
 text (at least 90% of values cast), and a key that repeats (the mapping's key column, or a
 column named `id`). A mistyped-text warning names the type that fixes it only when every value
 converts. The prompt's tables block, `describe_table`, `find_tables`, the Tables page, REST
-`POST .../tables/describe`, MCP `describe_table`, `quack tables`, and the terminal's `/schema` show them.
+`POST .../tables/describe`, MCP `describe_table`, `quack tables`, and the terminal's `/tables TABLE` show them.
 
 **Table notes.** A member or owner writes a note per table (`quack tables T --note TEXT`,
 `PUT .../tables/note`, the Tables page; blank removes it; at most 2,000 characters), kept in
 `_quack_table_notes` and audited as `table_note`. It renders under the table wherever the table
-is described, the prompt and the terminal's `/schema` included, and feeds the table search.
+is described, the prompt and the terminal's `/tables TABLE` included, and feeds the table search.
 
 **Replacing a document.** `quack ingest FILE --replace [ID]` (the newest ready document
 with the file's name when no id is given), `POST .../documents?replace={doc}`, and the
@@ -1169,7 +1169,7 @@ and a range class, each satisfied by any subclass. Properties are typed
 `string | number | date | enum | boolean` and inherited, and may carry a `description`, a
 `unit`, and `synonyms`: a column a mapping gives a property renders as `- col (TYPE):
 description [unit] (also: synonyms)` in the tables block, `describe_table`, the terminal's
-`/schema`, and the Tables page, and its synonyms feed the table search (issue #403). **Measures** are named calculations
+`/tables TABLE`, and the Tables page, and its synonyms feed the table search (issue #403). **Measures** are named calculations
 over one table (`{"id": "revenue", "table": "orders", "expression": "sum(amount) / 100.0",
 "description": ...}`); a save checks `SELECT <expression> FROM <table>` is one read that plans,
 keeps one over a table that is gone (like a mapping), and the prompt lists up to 30 of them
@@ -2510,12 +2510,15 @@ bracketed paste, so a file dropped on the terminal arrives as one paste of its p
 an empty input it loads at once, announced on a green `↑` line with its job number, and
 into text already typed it is inserted like any other paste.
 
-Slash commands: `/help`, `/tables`, `/schema TABLE`, `/sql`, `/ingest PATH` (`/attach`),
+Slash commands: `/help`, `/tables [TABLE] [--note TEXT] [--retype COL=TYPE]` (`quack tables`'s
+arguments and output), `/sql`, `/ingest PATH` (`/attach`),
 `/import`, `/docs`, `/search QUERY` (each hit's leg ranks, then both legs and the rerank
-outcome), `/pin`, `/unpin`, `/delete`, `/ontology ...` and `/graph ...`, `/graph
+outcome), `/scope [DOCUMENT..]` (limits the next questions to those documents, as the web
+chat's document picker limits one, until `/scope` with none; the header shows it), `/pin`, `/unpin`, `/delete` (asks `y`/`n` first), `/ontology ...` and `/graph ...`, `/graph
 ENTITY`, `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/saved [list | add
 NAME | run NAME | show NAME | remove NAME]` (`add` pins this session's last answer;
-`--refresh` and `--exit-code` are refused as command-line flags), `/sessions`,
+`--refresh` and `--exit-code` are refused as command-line flags), `/sessions` (`d` in its
+list deletes the highlighted session after a `y`, as the web's delete button asks first),
 `/resume`, `/new`, `/mode`, `/share`, `/unshare`, `/export [--sql|--markdown] [FILE]`,
 `/jobs`, `/cancel N`, `/steps`, `/model`, `/workspace`, `/clear`, `/quit`.
 `/model` shows the configured models, then lists each provider's models as a job

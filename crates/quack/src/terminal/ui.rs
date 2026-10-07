@@ -14,7 +14,7 @@ use ratatui::widgets::{
     Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
 };
 
-use crate::terminal::app::{App, Message, MessageKind, PendingWrite, answer_keys};
+use crate::terminal::app::{App, Message, MessageKind, PendingPrompt};
 use crate::terminal::clipboard::CopyStatus;
 use crate::terminal::commands::Suggestion;
 use crate::terminal::markdown;
@@ -220,7 +220,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let strip = JobStrip::of(app);
     let strip_height = strip.height();
     let screen = frame.area();
-    let permission = app.pending_write().map(|pending| {
+    let permission = app.pending_prompt().map(|pending| {
         pending.lines(
             usize::from(screen.width),
             usize::from(screen.height.checked_div(3).unwrap_or_default()).max(1),
@@ -459,6 +459,14 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app.session_id.short().to_owned(),
             Style::default().fg(Color::DarkGray),
         ),
+        Span::styled(
+            match app.scope.documents().len() {
+                0 => String::new(),
+                1 => String::from(" \u{00B7} scope: 1 document"),
+                n => format!(" \u{00B7} scope: {n} documents"),
+            },
+            Style::default().fg(Color::Yellow),
+        ),
     ]);
 
     frame.render_widget(Paragraph::new(title), title_area);
@@ -598,9 +606,9 @@ pub(crate) struct Wrapped {
     rows: Vec<Row>,
 }
 
-impl PendingWrite<'_> {
-    /// The overlay: who asks, the statement wrapped to `width` in at most
-    /// `max_rows` rows, and the choices.
+impl PendingPrompt<'_> {
+    /// The overlay: what is asked, a write's statement wrapped to `width`
+    /// in at most `max_rows` rows, and the choices.
     pub(crate) fn lines(&self, width: usize, max_rows: usize) -> Vec<Line<'static>> {
         let mut heading = vec![
             Span::raw(" "),
@@ -618,7 +626,7 @@ impl PendingWrite<'_> {
             ));
         }
         let rows: Vec<Vec<Span<'static>>> = self
-            .sql
+            .body
             .lines()
             .flat_map(|line| wrap::wrap(&[Span::raw(line.to_owned())], width.saturating_sub(3)))
             .collect();
@@ -656,7 +664,7 @@ impl PendingWrite<'_> {
         lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                answer_keys(),
+                self.keys.clone(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),

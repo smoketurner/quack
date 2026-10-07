@@ -163,10 +163,11 @@ async fn graph_exports_go_to_a_directory() {
     );
 }
 
-/// `/schema` shows what `describe_table` shows: the owner's note and the
-/// profile's warnings beside the columns.
+/// `/tables TABLE` shows what `describe_table` shows: the owner's note and
+/// the profile's warnings beside the columns; it sets a note and retypes a
+/// column as `quack tables` and the Tables page do.
 #[tokio::test(flavor = "multi_thread")]
-async fn schema_shows_the_table_note_and_profile_warnings() {
+async fn tables_shows_notes_and_warnings_and_sets_them() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let mut app = app(dir.path());
     app.db
@@ -177,7 +178,7 @@ async fn schema_shows_the_table_note_and_profile_warnings() {
         })
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
-    app.handle_slash_command("/schema t");
+    app.handle_slash_command("/tables t");
     db_settle(&mut app).await;
     let content = &last(&app).content;
     assert_eq!(last(&app).kind, MessageKind::Sql);
@@ -187,6 +188,18 @@ async fn schema_shows_the_table_note_and_profile_warnings() {
     );
     assert!(content.contains("Warnings:\n  - empty: "), "{content}");
     assert!(content.contains("- id (INTEGER)"), "{content}");
+
+    app.handle_slash_command("/tables t --note \"One row per run.\" --retype id=BIGINT");
+    db_settle(&mut app).await;
+    let content = &last(&app).content;
+    assert!(
+        content.contains("Note (from the owner): One row per run."),
+        "{content}"
+    );
+    assert!(content.contains("- id (BIGINT)"), "{content}");
+    app.handle_slash_command("/tables t --retype id=DATE");
+    db_settle(&mut app).await;
+    assert_eq!(last(&app).kind, MessageKind::Error);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -204,7 +217,7 @@ async fn slash_commands_run_sql_schema_and_cli_verbs_without_a_terminal() {
     app.handle_slash_command("/tables");
     db_settle(&mut app).await;
     assert!(last(&app).content.contains('t'), "{}", last(&app).content);
-    app.handle_slash_command("/schema t");
+    app.handle_slash_command("/tables t");
     db_settle(&mut app).await;
     assert_eq!(last(&app).kind, MessageKind::Sql);
     assert!(
@@ -212,7 +225,7 @@ async fn slash_commands_run_sql_schema_and_cli_verbs_without_a_terminal() {
         "{}",
         last(&app).content
     );
-    app.handle_slash_command("/schema nope");
+    app.handle_slash_command("/tables nope");
     db_settle(&mut app).await;
     assert_eq!(last(&app).kind, MessageKind::Error);
 
@@ -623,7 +636,7 @@ fn overlay(app: &App) -> String {
     let rows = screen(app);
     let start = rows
         .iter()
-        .rposition(|row| row.contains("[y] Run it"))
+        .rposition(|row| row.contains("[y] "))
         .and_then(|end| {
             rows.iter()
                 .take(end)
@@ -799,10 +812,11 @@ fn a_long_statement_is_capped_with_a_count_of_the_rest() {
         .map(|n| format!("UPDATE t SET a = {n}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let pending = PendingWrite {
-        heading: String::from("The agent wants to run:"),
-        sql: &sql,
+    let pending = PendingPrompt {
+        heading: format!("The agent: {}", Decision::HEADING),
+        body: &sql,
         notice: None,
+        keys: answer_keys(),
         waiting: 0,
     };
     let lines: Vec<String> = pending
@@ -1111,6 +1125,118 @@ async fn the_sessions_box_resumes_the_highlighted_session() {
     assert_eq!(app.session_id, newer.id);
 }
 
+/// `d` in the sessions box deletes the highlighted session once the
+/// person says yes; deleting the one on screen starts a new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sessions_box_deletes_a_session_after_asking() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut app = app(dir.path());
+    let current = app.session_id.clone();
+    app.handle_slash_command("/sessions");
+    db_settle(&mut app).await;
+    assert!(screen(&app).join("\n").contains("d delete"));
+
+    app.handle_key_event(KeyCode::Char('d'), KeyModifiers::NONE);
+    assert!(app.picker.is_none());
+    let drawn = overlay(&app);
+    assert!(drawn.contains("Delete the session"), "{drawn}");
+    assert!(drawn.contains("[y] Delete   [n] Keep"), "{drawn}");
+    app.handle_key_event(KeyCode::Char('a'), KeyModifiers::NONE);
+    assert!(app.awaiting_permission(), "a answers writes only");
+    app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
+    assert_eq!(last(&app).content, "Kept.");
+
+    app.handle_slash_command("/sessions");
+    db_settle(&mut app).await;
+    app.handle_key_event(KeyCode::Char('d'), KeyModifiers::NONE);
+    app.handle_key_event(KeyCode::Char('y'), KeyModifiers::NONE);
+    db_settle(&mut app).await;
+    assert_ne!(app.session_id, current, "a new session replaces it");
+    let gone = app
+        .db
+        .run(move |db| sessions::get_session(db, &current))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(gone.is_none());
+}
+
+/// `/scope` limits the next questions to named documents, as the web
+/// chat's picker does for one question; no names lifts it.
+#[tokio::test(flavor = "multi_thread")]
+async fn scope_limits_questions_to_named_documents_until_lifted() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut app = app(dir.path());
+    let file = dir.path().join("policy.md");
+    std::fs::write(&file, "# Policy\n\nFlood is excluded.\n")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    app.run_job(CliJob::Ingest(file));
+    settle(&mut app).await;
+
+    app.handle_slash_command("/scope nothing.pdf");
+    db_settle(&mut app).await;
+    assert_eq!(last(&app).kind, MessageKind::Error);
+    assert!(app.scope.is_everything());
+
+    app.handle_slash_command("/scope policy.md");
+    db_settle(&mut app).await;
+    assert_eq!(app.scope.documents().len(), 1);
+    assert!(
+        last(&app).content.contains("policy.md only"),
+        "{}",
+        last(&app).content
+    );
+    assert!(screen(&app).join("\n").contains("scope: 1 document"));
+
+    app.handle_slash_command("/scope");
+    db_settle(&mut app).await;
+    assert!(app.scope.is_everything());
+    assert_eq!(last(&app).content, "Questions ask about every document.");
+}
+
+/// `/delete` names the document and deletes it only after a yes.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_asks_before_it_deletes_a_document() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut app = app(dir.path());
+    let file = dir.path().join("sales.csv");
+    std::fs::write(&file, "region,revenue\nnorth,10\n").unwrap_or_else(|e| fail(&e.to_string()));
+    app.run_job(CliJob::Ingest(file));
+    settle(&mut app).await;
+    let id = app
+        .db
+        .run(WorkspaceDb::list_documents)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .first()
+        .map_or_else(|| fail("no document"), |d| d.id.to_string());
+
+    app.handle_slash_command(&format!("/delete {id}"));
+    db_settle(&mut app).await;
+    let drawn = overlay(&app);
+    assert!(
+        drawn.contains("Delete sales.csv with its chunks, tables, and graph rows?"),
+        "{drawn}"
+    );
+    app.handle_key_event(KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(last(&app).content, "Kept.");
+
+    app.handle_slash_command(&format!("/delete {id}"));
+    db_settle(&mut app).await;
+    app.handle_key_event(KeyCode::Char('y'), KeyModifiers::NONE);
+    db_settle(&mut app).await;
+    assert!(
+        last(&app).content.starts_with("Deleted sales.csv"),
+        "{}",
+        last(&app).content
+    );
+    let left = app
+        .db
+        .run(WorkspaceDb::list_documents)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(left.is_empty());
+}
+
 #[test]
 fn a_turns_phase_follows_its_events_and_counts_seconds() {
     let at = |second: i64| {
@@ -1263,7 +1389,7 @@ async fn the_command_popup_picks_fills_in_and_runs() {
     typed(&mut app, "/s");
     assert_eq!(highlighted(&app).as_deref(), Some("/sql"));
     app.handle_key_event(KeyCode::Down, KeyModifiers::NONE);
-    assert_eq!(highlighted(&app).as_deref(), Some("/schema"));
+    assert_eq!(highlighted(&app).as_deref(), Some("/search"));
     app.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
     app.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
     assert_eq!(highlighted(&app).as_deref(), Some("/steps"));
@@ -1272,8 +1398,8 @@ async fn the_command_popup_picks_fills_in_and_runs() {
     // Esc hides it without cancelling anything; typing brings it back.
     app.handle_key_event(KeyCode::Esc, KeyModifiers::NONE);
     assert!(app.completion().is_none());
-    typed(&mut app, "c");
-    assert_eq!(highlighted(&app).as_deref(), Some("/schema"));
+    typed(&mut app, "e");
+    assert_eq!(highlighted(&app).as_deref(), Some("/search"));
 
     // Enter on a command that takes nothing fills it in and runs it.
     app.handle_key_event(KeyCode::Char('u'), KeyModifiers::CONTROL);

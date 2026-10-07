@@ -127,7 +127,7 @@ impl Picker {
                 " \u{2191}\u{2193} move \u{00B7} c cancel \u{00B7} enter details \u{00B7} esc close "
             }
             Listing::Sessions { .. } => {
-                " \u{2191}\u{2193} move \u{00B7} enter resume \u{00B7} esc close "
+                " \u{2191}\u{2193} move \u{00B7} enter resume \u{00B7} d delete \u{00B7} esc close "
             }
         }
     }

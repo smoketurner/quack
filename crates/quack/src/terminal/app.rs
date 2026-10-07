@@ -23,13 +23,13 @@ use quack_core::analysis::events::{
     self, AgentEvent, Decision, Delivery, PermissionRequest, ToolName, ToolStep,
 };
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::search::{DocumentSearch, SearchDetail};
+use quack_core::analysis::search::{DocumentScope, DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
 use quack_core::config::Config;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::follow_up::FollowUp;
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery, UnknownEntity};
-use quack_core::ids::{SessionId, WorkspaceId};
+use quack_core::ids::{DocumentId, SessionId, WorkspaceId};
 use quack_core::import::{self, ImportPolicy, ImportRequest, SourceHeader};
 use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
@@ -53,6 +53,7 @@ use quack_core::storage::sessions::{
 use quack_core::storage::workspace::{
     Pinning, QueryCanceller, QueryResults, SqlSchema, StatementKind, WorkspaceDb,
 };
+use quack_core::text::OneLine;
 use quack_core::vault::Vault;
 
 use crate::confirm::Confirm;
@@ -60,6 +61,7 @@ use crate::embeddings_cli::{self, EmbeddingsAction};
 use crate::graph_cli::GraphAction;
 use crate::ontology_cli::{self, OntologyAction};
 use crate::saved_cli::{self, SavedAction};
+use crate::tables_cli::TablesArgs;
 use crate::terminal::SessionSetup;
 use crate::terminal::chart::ChartData;
 use crate::terminal::clipboard::{Clipboard, CopyStatus};
@@ -295,19 +297,70 @@ impl From<&JobInfo> for Ticket {
 /// A write the agent wants to make in the turn run by `job`: a decision
 /// the user owes. Prompts are modal, answered in order, while every job
 /// keeps running.
-struct Prompt {
-    job: Ticket,
-    request: PermissionRequest,
+enum Prompt {
+    /// A write the agent wants to make in the turn run by `job`.
+    Write {
+        job: Ticket,
+        request: PermissionRequest,
+    },
+    /// A deletion the person asked for, held until they confirm it, as the
+    /// web asks before its delete buttons.
+    Delete(Deletion),
 }
 
-/// What the permission overlay asks about: the front prompt, described when
+impl Prompt {
+    /// Whether it is a write the turn run by `job` asked for.
+    fn is_write_of(&self, job: JobId) -> bool {
+        match self {
+            Self::Write { job: owner, .. } => owner.id == job,
+            Self::Delete(_) => false,
+        }
+    }
+
+    /// Refuse a write, or drop a deletion: nobody will answer it now.
+    fn refuse(self) {
+        match self {
+            Self::Write { request, .. } => request.deny(),
+            Self::Delete(_) => {}
+        }
+    }
+}
+
+/// What a confirmed `/delete` or the session list's `d` removes.
+pub(crate) enum Deletion {
+    Document { id: DocumentId, filename: String },
+    Session { id: SessionId, title: String },
+}
+
+impl Deletion {
+    /// The question the prompt asks.
+    fn question(&self) -> String {
+        match self {
+            Self::Document { filename, .. } => {
+                format!("Delete {filename} with its chunks, tables, and graph rows?")
+            }
+            Self::Session { title, .. } => {
+                format!("Delete the session '{title}' and its messages?")
+            }
+        }
+    }
+}
+
+/// The keys a deletion prompt takes.
+const CONFIRM_KEYS: &str = "[y] Delete   [n] Keep";
+
+/// What the prompt overlay asks about: the front prompt, described when
 /// drawn so it never depends on what the transcript still shows.
-pub(crate) struct PendingWrite<'a> {
-    /// Who asks, named from the session on screen now.
+pub(crate) struct PendingPrompt<'a> {
+    /// What is asked, and for a write who asks, named from the session on
+    /// screen now.
     pub(crate) heading: String,
-    pub(crate) sql: &'a str,
+    /// The statement a write would run; empty for a deletion.
+    pub(crate) body: &'a str,
     /// Why the write is held, when there is more to say than "this writes".
     pub(crate) notice: Option<&'static str>,
+    /// The answers and their keys.
+    pub(crate) keys: String,
     /// Prompts queued behind this one.
     pub(crate) waiting: usize,
 }
@@ -945,6 +998,9 @@ pub(crate) struct App {
     reader_db: ReaderDb,
     /// `--allow-write`: the agent's writes run without asking.
     allow_write: bool,
+    /// `/scope`: the documents questions are limited to; every document
+    /// when empty.
+    pub(crate) scope: DocumentScope,
     /// `/steps`: show tool details whole instead of a preview.
     pub(crate) expand_steps: bool,
     /// Each message's wrapped lines, by index, with the fingerprint they
@@ -1011,6 +1067,7 @@ impl App {
             db,
             reader_db,
             allow_write: writes.allows_unasked(),
+            scope: DocumentScope::default(),
             expand_steps: false,
             wrap_cache: RefCell::new(Vec::new()),
             msg_rx,
@@ -1360,7 +1417,7 @@ impl App {
             }
             AppMsg::TurnClosed(job) => {
                 // Nothing will answer its prompts now.
-                self.prompts.retain(|prompt| prompt.job.id != job);
+                self.prompts.retain(|prompt| !prompt.is_write_of(job));
                 if let Some(turn) = self.turns.iter_mut().find(|t| t.job.id == job) {
                     turn.progress = turn.progress.closed();
                 }
@@ -1385,21 +1442,33 @@ impl App {
         !self.prompts.is_empty()
     }
 
-    pub(crate) fn pending_write(&self) -> Option<PendingWrite<'_>> {
-        let prompt = self.prompts.front()?;
-        let speaker = self
-            .turns
-            .iter()
-            .find(|turn| turn.job.id == prompt.job.id)
-            .map_or_else(
-                || String::from("The agent"),
-                |turn| turn.speaker(&self.session_id),
-            );
-        Some(PendingWrite {
-            heading: format!("{speaker}: {}", Decision::HEADING),
-            sql: &prompt.request.sql,
-            notice: prompt.request.hold.notice(),
-            waiting: self.prompts.len().saturating_sub(1),
+    pub(crate) fn pending_prompt(&self) -> Option<PendingPrompt<'_>> {
+        let waiting = self.prompts.len().saturating_sub(1);
+        Some(match self.prompts.front()? {
+            Prompt::Write { job, request } => {
+                let speaker = self
+                    .turns
+                    .iter()
+                    .find(|turn| turn.job.id == job.id)
+                    .map_or_else(
+                        || String::from("The agent"),
+                        |turn| turn.speaker(&self.session_id),
+                    );
+                PendingPrompt {
+                    heading: format!("{speaker}: {}", Decision::HEADING),
+                    body: &request.sql,
+                    notice: request.hold.notice(),
+                    keys: answer_keys(),
+                    waiting,
+                }
+            }
+            Prompt::Delete(deletion) => PendingPrompt {
+                heading: deletion.question(),
+                body: "",
+                notice: None,
+                keys: String::from(CONFIRM_KEYS),
+                waiting,
+            },
         })
     }
 
@@ -1549,7 +1618,7 @@ impl App {
                 answer_keys()
             ),
         );
-        self.prompts.push_back(Prompt {
+        self.prompts.push_back(Prompt::Write {
             job: turn.job,
             request,
         });
@@ -1608,8 +1677,8 @@ impl App {
     fn cancel_turn(&mut self, job: Ticket) {
         let mut kept = VecDeque::new();
         for prompt in self.prompts.drain(..) {
-            if prompt.job.id == job.id {
-                prompt.request.deny();
+            if prompt.is_write_of(job.id) {
+                prompt.refuse();
             } else {
                 kept.push_back(prompt);
             }
@@ -1686,6 +1755,19 @@ impl App {
                     self.cancel_job(number);
                 }
             }
+            (KeyCode::Char('d'), KeyModifiers::NONE) => {
+                if let Some(Picked::Session(session)) = picker.picked() {
+                    let deletion = Deletion::Session {
+                        id: session.id.clone(),
+                        title: session
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| String::from("(untitled)")),
+                    };
+                    self.picker = None;
+                    self.prompts.push_back(Prompt::Delete(deletion));
+                }
+            }
             (KeyCode::Enter, _) => match picker.picked() {
                 Some(Picked::Job(job)) => {
                     let details = JobRow(job).details();
@@ -1709,7 +1791,7 @@ impl App {
     /// after that is dropped with the runtime at its next await.
     async fn stop_jobs(&mut self) {
         for prompt in self.prompts.drain(..) {
-            prompt.request.deny();
+            prompt.refuse();
         }
         let left = self.jobs.shutdown(QUIT_GRACE).await;
         if !left.is_empty() {
@@ -1741,9 +1823,13 @@ impl App {
         if ctrl_c {
             // The prompt on screen first, then this session's newest turn.
             match self.prompts.front() {
-                Some(prompt) => {
-                    let job = prompt.job;
+                Some(Prompt::Write { job, .. }) => {
+                    let job = *job;
                     self.cancel_turn(job);
+                    return;
+                }
+                Some(Prompt::Delete(_)) => {
+                    self.handle_permission_key(KeyCode::Esc);
                     return;
                 }
                 None => {
@@ -1815,7 +1901,8 @@ impl App {
         }
     }
 
-    /// The answer a key gives, if it is one: `y`, `n` (or Esc), `a`.
+    /// The answer a key gives to the front prompt, if it is one: `y`,
+    /// `n` (or Esc), and for a write `a`.
     fn handle_permission_key(&mut self, code: KeyCode) {
         let answer = match code {
             KeyCode::Esc => Decision::Deny,
@@ -1830,14 +1917,26 @@ impl App {
             }
             _ => return,
         };
+        if answer == Decision::AllowTurn && matches!(self.prompts.front(), Some(Prompt::Delete(_)))
+        {
+            return;
+        }
         let Some(prompt) = self.prompts.pop_front() else {
             return;
         };
-        let reply = match prompt.request.answer(answer) {
-            Delivery::Delivered => answer.reply(),
-            Delivery::TurnGone => Delivery::TURN_GONE,
-        };
-        self.note(MessageKind::System, reply);
+        match prompt {
+            Prompt::Write { request, .. } => {
+                let reply = match request.answer(answer) {
+                    Delivery::Delivered => answer.reply(),
+                    Delivery::TurnGone => Delivery::TURN_GONE,
+                };
+                self.note(MessageKind::System, reply);
+            }
+            Prompt::Delete(deletion) => match answer {
+                Decision::Allow => self.delete(deletion),
+                Decision::Deny | Decision::AllowTurn => self.note(MessageKind::System, "Kept."),
+            },
+        }
     }
 
     /// What the popup offers for the input, if it is showing: one line
@@ -2012,8 +2111,8 @@ impl App {
             } => self.run_job(CliJob::ContextExport(file)),
             SlashCommand::Pin { id } => self.set_pinned(id, Pinning::Pinned),
             SlashCommand::Unpin { id } => self.set_pinned(id, Pinning::Unpinned),
-            SlashCommand::Tables => self.show_tables(),
-            SlashCommand::Schema { table } => self.show_schema(table),
+            SlashCommand::Tables(args) => self.tables(args),
+            SlashCommand::Scope { documents } => self.set_scope(documents),
             SlashCommand::Ingest { path } => match FileLine::of(&path) {
                 Some(files) => self.load_files(files),
                 None => self.note(
@@ -2367,35 +2466,105 @@ impl App {
         );
     }
 
-    fn show_schema(&mut self, table: String) {
+    /// `/tables`: what `quack tables` prints, on the writer when it sets a
+    /// note or retypes a column, else on the reader.
+    fn tables(&mut self, args: TablesArgs) {
+        let writes = args.writes();
+        let side = if writes { Side::Write } else { Side::Read };
         self.on_db_ok(
-            Side::Read,
+            side,
             move |db| {
-                if db.list_tables()?.contains(&table) {
-                    db.describe_table(&table)
-                } else {
-                    Err(CoreError::Analysis(format!("no table named '{table}'")))
-                }
+                let mut out = Vec::new();
+                Ok(args
+                    .run(db, &mut out)
+                    .map(|()| String::from_utf8_lossy(&out).trim_end().to_owned()))
             },
-            |app, described| app.note(MessageKind::Sql, described.to_string()),
+            move |app, printed| match printed {
+                Ok(text) => {
+                    app.note(MessageKind::Sql, text);
+                    if writes {
+                        app.refresh_sql_schema();
+                    }
+                }
+                Err(e) => app.note(MessageKind::Error, format!("{e:#}")),
+            },
         );
     }
 
-    fn delete_document(&mut self, prefix: String) {
+    /// `/scope`: resolve the names now, so a typo is reported here rather
+    /// than by the next question; no names is every document.
+    fn set_scope(&mut self, names: Vec<String>) {
         self.on_db_ok(
-            Side::Write,
-            move |db| {
-                let doc = PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
-                    .one(ResourceKind::Document, &prefix)?;
-                db.delete_document(&doc.id).map(|_| doc.filename)
-            },
-            |app, filename| {
-                app.note(
-                    MessageKind::System,
-                    format!("Deleted {filename} with its chunks, tables, and graph rows."),
-                );
+            Side::Read,
+            move |db| DocumentScope::resolve(db, &names),
+            |app, scope| {
+                let text = if scope.is_everything() {
+                    String::from("Questions ask about every document.")
+                } else {
+                    let names: Vec<String> = scope
+                        .documents()
+                        .iter()
+                        .map(|d| OneLine(&d.filename).to_string())
+                        .collect();
+                    format!(
+                        "Questions ask about {} only, until /scope with no names.",
+                        names.join(", ")
+                    )
+                };
+                app.scope = scope;
+                app.note(MessageKind::System, text);
             },
         );
+    }
+
+    /// `/delete`: find the document, then ask before deleting it.
+    fn delete_document(&mut self, prefix: String) {
+        self.on_db_ok(
+            Side::Read,
+            move |db| {
+                PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
+                    .one(ResourceKind::Document, &prefix)
+            },
+            |app, doc| {
+                app.prompts.push_back(Prompt::Delete(Deletion::Document {
+                    id: doc.id,
+                    filename: doc.filename,
+                }));
+            },
+        );
+    }
+
+    /// Delete what the person confirmed. Deleting the session on screen
+    /// starts a new one, as the web lands on a fresh chat.
+    fn delete(&mut self, deletion: Deletion) {
+        match deletion {
+            Deletion::Document { id, filename } => self.on_db_ok(
+                Side::Write,
+                move |db| db.delete_document(&id),
+                move |app, _| {
+                    app.note(
+                        MessageKind::System,
+                        format!("Deleted {filename} with its chunks, tables, and graph rows."),
+                    );
+                },
+            ),
+            Deletion::Session { id, title } => {
+                let current = id == self.session_id;
+                self.on_db_ok(
+                    Side::Write,
+                    move |db| sessions::delete_session(db, &id),
+                    move |app, _| {
+                        app.note(
+                            MessageKind::System,
+                            format!("Deleted the session '{title}'."),
+                        );
+                        if current {
+                            app.new_session();
+                        }
+                    },
+                );
+            }
+        }
     }
 
     fn set_sharing(&mut self, sharing: Sharing) {
@@ -2758,21 +2927,6 @@ impl App {
         });
     }
 
-    fn show_tables(&mut self) {
-        self.on_db_ok(Side::Read, WorkspaceDb::list_tables, |app, tables| {
-            if tables.is_empty() {
-                app.note(MessageKind::System, "No tables yet.");
-                return;
-            }
-            let mut text = String::from("Tables:");
-            for table in tables {
-                text.push_str("\n  ");
-                text.push_str(&table);
-            }
-            app.note(MessageKind::System, text);
-        });
-    }
-
     /// Submit a question as a job in its session's lane: it starts once
     /// the session's previous turn has finished (its history includes that
     /// answer) and a worker is free, and streams into the transcript while
@@ -2792,6 +2946,13 @@ impl App {
         let reader_db = self.reader_db.clone();
         let session_id = self.session_id.clone();
         let policy = WritePolicy::Ask.allowed_if(self.allow_write);
+        // By id: the turn resolves them again when it starts.
+        let documents: Vec<String> = self
+            .scope
+            .documents()
+            .iter()
+            .map(|d| d.id.to_string())
+            .collect();
         let spec = JobSpec::new(JobKind::Chat, one_line(&message))
             .workspace(self.workspace_id.clone())
             .lane(Lane::serial(&LaneKey::Session(session_id.clone())));
@@ -2804,7 +2965,7 @@ impl App {
                 session_id: &session_id,
                 policy,
                 message: &message,
-                documents: &[],
+                documents: &documents,
                 sink,
                 cancel: ctx.cancel_token(),
             })
