@@ -79,6 +79,15 @@
     });
   }
 
+  // Text for an ECharts formatter, which returns HTML: labels come from
+  // extracted document text, so every character that could start markup
+  // is escaped.
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
   // A GraphResult ({nodes, edges, roots}) as an ECharts force graph, nodes
   // coloured by class; clicking a node scrolls its inspector entry into view.
   function graphOption(result) {
@@ -86,7 +95,7 @@
     result.nodes.forEach(function (n) { if (classes.indexOf(n.class_id) < 0) classes.push(n.class_id); });
     var roots = result.roots || [];
     return {
-      tooltip: { formatter: function (p) { return p.dataType === "edge" ? p.data.label.formatter : p.data.name + " (" + classes[p.data.category] + ")"; } },
+      tooltip: { formatter: function (p) { return escapeHtml(p.dataType === "edge" ? p.data.label.formatter : p.data.name + " (" + classes[p.data.category] + ")"); } },
       legend: [{ data: classes, bottom: 0 }],
       series: [{
         type: "graph",
@@ -241,7 +250,7 @@
     var form = el("form");
     form.method = "post";
     form.action = "/w/" + ws + "/chat/" + sessionId + "/delete";
-    form.onsubmit = function () { return confirm("Delete this session?"); };
+    form.setAttribute("data-confirm", "Delete this session?");
     var button = el("button", "rounded px-2 py-1 text-slate-500 hover:bg-red-950 hover:text-red-400", "×");
     button.type = "submit";
     button.title = "Delete session";
@@ -595,6 +604,19 @@
   // Relative times go stale; swapped-in rows arrive as UTC.
   setInterval(function () { formatTimes(); }, 30000);
   document.addEventListener("htmx:after:swap", function () { formatTimes(); });
+
+  // Behaviour the templates declare with data attributes, since the page's
+  // policy runs no inline script: a form with data-confirm asks first, and a
+  // checkbox with data-select-all sets every box its selector matches.
+  document.addEventListener("submit", function (ev) {
+    var message = ev.target.getAttribute && ev.target.getAttribute("data-confirm");
+    if (message && !window.confirm(message)) ev.preventDefault();
+  }, true);
+  document.addEventListener("click", function (ev) {
+    var selector = ev.target.getAttribute && ev.target.getAttribute("data-select-all");
+    if (!selector) return;
+    document.querySelectorAll(selector).forEach(function (box) { box.checked = ev.target.checked; });
+  });
 
   document.addEventListener("DOMContentLoaded", function () {
     formatTimes();

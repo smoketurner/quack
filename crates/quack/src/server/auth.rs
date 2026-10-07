@@ -679,9 +679,16 @@ impl Identity {
         Err(ApiError::forbidden(reason))
     }
 
-    /// Server admins only; everything else is 403.
+    /// Server admins only; everything else is 403. An API token acts for
+    /// its admin owner only when it carries the `admin` scope itself: a
+    /// read or write token an admin made for one workspace is not a key to
+    /// the whole server.
     pub(crate) fn require_admin(&self) -> ApiResult<()> {
-        if self.kind == UserKind::Admin {
+        let scoped = match &self.credential {
+            Credential::Token(token) => token.has_scope(Scope::Admin),
+            Credential::Local | Credential::Session(_) | Credential::IdentityProvider => true,
+        };
+        if self.kind == UserKind::Admin && scoped {
             Ok(())
         } else {
             Err(ApiError::forbidden("admin only"))

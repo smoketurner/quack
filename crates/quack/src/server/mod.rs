@@ -213,6 +213,7 @@ pub(crate) fn router(app: App) -> Router {
         .route(api::openapi::PAGE_PATH, get(api::openapi::page))
         .merge(web::assets())
         .merge(limited)
+        .layer(axum::middleware::map_response(security_headers))
         .layer(DefaultBodyLimit::max(upload_limit))
         .layer(axum::middleware::from_fn(record_request))
         // One span per request, carrying the id the request-id layer set
@@ -281,6 +282,31 @@ async fn no_store(mut response: axum::response::Response) -> axum::response::Res
         );
         headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
         headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    }
+    response
+}
+
+/// What the browser may load and run for any page: scripts and data only
+/// from this server, images only from it or inline, never framed. The web
+/// UI's scripts are all files under `/static`; styles may be inline, which
+/// `ECharts`, htmx's indicators, and Redoc write.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; \
+     style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; \
+     connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; \
+     frame-ancestors 'none'";
+
+/// The headers every response carries so a browser does not guess types,
+/// leak paths to other sites, or run what a page did not ship.
+async fn security_headers(mut response: axum::response::Response) -> axum::response::Response {
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "same-origin"),
+    ] {
+        if !headers.contains_key(&name) {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
     }
     response
 }

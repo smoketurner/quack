@@ -273,6 +273,56 @@ impl Harness {
     }
 }
 
+/// Every response, a page, the API, or a static file, tells the browser to
+/// run only this server's scripts, load no image from elsewhere, not sniff
+/// types, and not be framed; no template carries an inline handler the
+/// policy would block.
+#[tokio::test]
+async fn every_response_carries_the_security_headers() {
+    let h = harness(ServeMode::Login).await;
+    for path in [
+        "/login",
+        "/api/v1/workspaces",
+        "/static/js/app.js",
+        "/healthz",
+    ] {
+        let request = Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let (_, _, headers) = h.send_bytes(request).await;
+        let policy = headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            policy.contains("script-src 'self'") && policy.contains("frame-ancestors 'none'"),
+            "{path}: {policy}"
+        );
+        assert_eq!(
+            headers
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff"),
+            "{path}"
+        );
+    }
+    let templates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+    for entry in std::fs::read_dir(&templates).unwrap_or_else(|e| fail(&e.to_string())) {
+        let path = entry.unwrap_or_else(|e| fail(&e.to_string())).path();
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&e.to_string()));
+        for handler in [
+            " onclick=",
+            " onsubmit=",
+            " onchange=",
+            " oninput=",
+            " onload=",
+        ] {
+            assert!(!text.contains(handler), "{}: {handler}", path.display());
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unauthenticated_requests_are_rejected() {
     let h = harness(ServeMode::Login).await;
@@ -1771,6 +1821,49 @@ async fn uploads_are_queued_processed_pinned_and_deleted() {
         deletes.first().and_then(|r| r.entry.resource_id.clone()),
         Some(csv_id)
     );
+}
+
+/// An admin's read or write token for one workspace is not a key to the
+/// server: user administration, restores, and the admin audit refuse it.
+/// A token the admin gave the admin scope is.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admins_workspace_token_does_not_administer_the_server() {
+    let h = harness(ServeMode::Login).await;
+    let root = h.user("root", UserKind::Admin).await;
+    let ws = h.workspace("a", &root).await;
+    let token = |scopes: &'static [Scope]| {
+        let (h, ws, root) = (&h, &ws, &root);
+        async move {
+            h.app
+                .control
+                .create_token(ws, root, "t", scopes, None, setup_audit())
+                .await
+                .map_or_else(
+                    |e| fail(&e.to_string()),
+                    |issued| issued.secret.expose().to_owned(),
+                )
+        }
+    };
+    let read = token(&[Scope::Read]).await;
+    let write = token(&[Scope::Read, Scope::Write]).await;
+    let admin = token(&[Scope::Admin]).await;
+    for secret in [&read, &write] {
+        for path in ["/api/v1/admin/users", "/api/v1/admin/audit"] {
+            let (status, _) = h.get(path, secret).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        }
+        let (status, _) = h
+            .call(
+                Method::POST,
+                "/api/v1/admin/users",
+                Some(secret),
+                Some(serde_json::json!({ "username": "eve", "password": "pw-long-enough" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (status, body) = h.get("/api/v1/admin/users", &admin).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

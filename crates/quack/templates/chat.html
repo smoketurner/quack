@@ -20,7 +20,7 @@
         {% else %}
         <form method="post" action="/w/{{ ws.membership.workspace.id }}/chat/{{ s.id }}/share"><button type="submit" class="rounded px-2 py-1 text-slate-500 hover:bg-slate-800 hover:text-slate-300" title="Share with members" aria-label="Share with members">○</button></form>
         {% endif %}
-        <form method="post" action="/w/{{ ws.membership.workspace.id }}/chat/{{ s.id }}/delete" onsubmit="return confirm('Delete this session?')"><button type="submit" class="rounded px-2 py-1 text-slate-500 hover:bg-red-950 hover:text-red-400" title="Delete session" aria-label="Delete session">×</button></form>
+        <form method="post" action="/w/{{ ws.membership.workspace.id }}/chat/{{ s.id }}/delete" data-confirm="Delete this session?"><button type="submit" class="rounded px-2 py-1 text-slate-500 hover:bg-red-950 hover:text-red-400" title="Delete session" aria-label="Delete session">×</button></form>
       </li>
       {% endfor %}
     </ul>
