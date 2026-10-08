@@ -6,9 +6,6 @@
 //! (a cross-encoder) scoring each candidate through rig's `Rerank`
 //! operation.
 
-use std::future::Future;
-use std::pin::Pin;
-
 use rig::operation::RerankRequest;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -16,9 +13,6 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::llm::{RerankModel, SchemaCall};
 use crate::storage::workspace::{ChunkSearchResult, Ranks};
-
-/// Boxed future so implementations can be trait objects.
-pub type RankFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Ranked>>> + Send + 'a>>;
 
 /// One candidate's place in a reranker's answer: its index among the
 /// candidates, and the score that put it there when the reranker gives one
@@ -38,14 +32,54 @@ impl Ranked {
 }
 
 /// Orders retrieval candidates by relevance to a query.
-pub trait Reranker: Send + Sync {
+pub enum Reranker {
+    /// The chat model orders them listwise.
+    Model(Box<ModelReranker>),
+    /// A dedicated rerank model scores each one.
+    Scored(ScoredReranker),
+    /// A fixed order, named for the step summary.
+    #[cfg(test)]
+    Fixed {
+        name: &'static str,
+        rank: fn(&[ChunkSearchResult]) -> Result<Vec<Ranked>>,
+    },
+}
+
+impl Reranker {
+    /// The chat model, through the rerank one-shot built with
+    /// `background_effort` ([`ModelReranker`]).
+    #[must_use]
+    pub fn model(call: SchemaCall<RerankAnswer>) -> Self {
+        Self::Model(Box::new(ModelReranker { call }))
+    }
+
+    /// A dedicated rerank model.
+    #[must_use]
+    pub const fn scored(model: RerankModel) -> Self {
+        Self::Scored(ScoredReranker { model })
+    }
+
     /// The candidates in relevance order, best first. Candidates left
     /// out keep their fused order behind the ranked ones; indices out of
     /// range or repeated are ignored.
-    fn rank<'a>(&'a self, query: &'a str, candidates: &'a [ChunkSearchResult]) -> RankFuture<'a>;
+    async fn rank(&self, query: &str, candidates: &[ChunkSearchResult]) -> Result<Vec<Ranked>> {
+        match self {
+            Self::Model(reranker) => reranker.rank(query, candidates).await,
+            Self::Scored(reranker) => reranker.rank(query, candidates).await,
+            #[cfg(test)]
+            Self::Fixed { rank, .. } => rank(candidates),
+        }
+    }
 
     /// A short name for the tool step summary (`reranked by model`).
-    fn name(&self) -> &'static str;
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Model(_) => "model",
+            Self::Scored(_) => "reranker",
+            #[cfg(test)]
+            Self::Fixed { name, .. } => name,
+        }
+    }
 }
 
 /// Reorder `candidates` with `reranker` and keep the first `top_k`, each
@@ -53,7 +87,7 @@ pub trait Reranker: Send + Sync {
 /// fused order: retrieval must not fail because ranking did, so the error
 /// is logged and the summary says so.
 pub async fn apply(
-    reranker: &dyn Reranker,
+    reranker: &Reranker,
     query: &str,
     candidates: Vec<ChunkSearchResult>,
     top_k: usize,
@@ -187,16 +221,10 @@ pub struct ModelReranker {
     call: SchemaCall<RerankAnswer>,
 }
 
+/// The `SchemaCall` owns its model (sampled once, at construction), so the
+/// caller hands one built through `schema_call` rather than the turn's
+/// model, or the rerank call inherits the turn's `effort`.
 impl ModelReranker {
-    /// Wrap the rerank one-shot built with `background_effort`. The
-    /// `SchemaCall` owns its model (sampled once, at construction), so the
-    /// caller must hand one built through `schema_call` rather than the
-    /// turn's model, or the rerank call inherits the turn's `effort`.
-    #[must_use]
-    pub fn from_call(call: SchemaCall<RerankAnswer>) -> Self {
-        Self { call }
-    }
-
     /// The user message for one ranking call: the query and numbered
     /// passages, each cut to `max_chars`.
     fn request(query: &str, candidates: &[ChunkSearchResult], max_chars: usize) -> String {
@@ -214,17 +242,11 @@ impl ModelReranker {
     }
 }
 
-impl Reranker for ModelReranker {
-    fn rank<'a>(&'a self, query: &'a str, candidates: &'a [ChunkSearchResult]) -> RankFuture<'a> {
-        Box::pin(async move {
-            let request = Self::request(query, candidates, PASSAGE_CHARS);
-            let answer = self.call.answer(&request).await?;
-            Ok(answer.indices(candidates.len()))
-        })
-    }
-
-    fn name(&self) -> &'static str {
-        "model"
+impl ModelReranker {
+    async fn rank(&self, query: &str, candidates: &[ChunkSearchResult]) -> Result<Vec<Ranked>> {
+        let request = Self::request(query, candidates, PASSAGE_CHARS);
+        let answer = self.call.answer(&request).await?;
+        Ok(answer.indices(candidates.len()))
     }
 }
 
@@ -235,39 +257,27 @@ pub struct ScoredReranker {
 }
 
 impl ScoredReranker {
-    #[must_use]
-    pub const fn new(model: RerankModel) -> Self {
-        Self { model }
-    }
-}
-
-impl Reranker for ScoredReranker {
-    fn rank<'a>(&'a self, query: &'a str, candidates: &'a [ChunkSearchResult]) -> RankFuture<'a> {
-        Box::pin(async move {
-            let request = RerankRequest {
-                query: query.to_owned(),
-                documents: candidates.iter().map(|c| c.content.clone()).collect(),
-            };
-            let mut response = tokio::time::timeout(RERANK_TIMEOUT, self.model.rank(request))
-                .await
-                .map_err(|_| Error::Llm(String::from("the rerank model did not answer in time")))?
-                .map_err(|e| Error::Llm(format!("the rerank model failed: {e}")))?;
-            response
-                .results
-                .sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
-            Ok(response
-                .results
-                .into_iter()
-                .map(|r| Ranked {
-                    index: r.index,
-                    score: Some(r.relevance_score),
-                })
-                .collect())
-        })
-    }
-
-    fn name(&self) -> &'static str {
-        "reranker"
+    async fn rank(&self, query: &str, candidates: &[ChunkSearchResult]) -> Result<Vec<Ranked>> {
+        let request = RerankRequest {
+            query: query.to_owned(),
+            documents: candidates.iter().map(|c| c.content.clone()).collect(),
+        };
+        let mut response = tokio::time::timeout(RERANK_TIMEOUT, self.model.rank(request))
+            .await
+            .map_err(|_| Error::Llm(String::from("the rerank model did not answer in time")))?
+            .map_err(|e| Error::Llm(format!("the rerank model failed: {e}")))?;
+        // rig passes the server's order through as it came.
+        response
+            .results
+            .sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
+        Ok(response
+            .results
+            .into_iter()
+            .map(|r| Ranked {
+                index: r.index,
+                score: Some(r.relevance_score),
+            })
+            .collect())
     }
 }
 
@@ -297,40 +307,22 @@ mod tests {
         }
     }
 
-    struct Reverse;
-    impl Reranker for Reverse {
-        fn rank<'a>(
-            &'a self,
-            _query: &'a str,
-            candidates: &'a [ChunkSearchResult],
-        ) -> RankFuture<'a> {
-            Box::pin(async move { Ok((0..candidates.len()).rev().map(Ranked::at).collect()) })
-        }
-        fn name(&self) -> &'static str {
-            "reverse"
-        }
-    }
+    const REVERSE: Reranker = Reranker::Fixed {
+        name: "reverse",
+        rank: |candidates| Ok((0..candidates.len()).rev().map(Ranked::at).collect()),
+    };
 
-    struct Broken;
-    impl Reranker for Broken {
-        fn rank<'a>(
-            &'a self,
-            _query: &'a str,
-            _candidates: &'a [ChunkSearchResult],
-        ) -> RankFuture<'a> {
-            Box::pin(async move { Err(Error::Analysis(String::from("boom"))) })
-        }
-        fn name(&self) -> &'static str {
-            "broken"
-        }
-    }
+    const BROKEN: Reranker = Reranker::Fixed {
+        name: "broken",
+        rank: |_| Err(Error::Analysis(String::from("boom"))),
+    };
 
     #[tokio::test]
     async fn apply_reorders_and_truncates() {
         let Reranked {
             results: kept,
             outcome,
-        } = apply(&Reverse, "q", vec![hit(1), hit(2), hit(3)], 2).await;
+        } = apply(&REVERSE, "q", vec![hit(1), hit(2), hit(3)], 2).await;
         assert_eq!(outcome, RerankOutcome::Reranked("reverse"));
         let ids: Vec<&str> = kept.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["c3", "c2"]);
@@ -344,7 +336,7 @@ mod tests {
         let Reranked {
             results: kept,
             outcome,
-        } = apply(&Broken, "q", vec![hit(1), hit(2)], 5).await;
+        } = apply(&BROKEN, "q", vec![hit(1), hit(2)], 5).await;
         assert!(matches!(outcome, RerankOutcome::Failed(ref m) if m.contains("boom")));
         assert_eq!(kept.len(), 2);
         assert_eq!(kept.first().map(|c| c.id.as_str()), Some("c1"));
@@ -357,13 +349,13 @@ mod tests {
         let Reranked {
             results: kept,
             outcome,
-        } = apply(&Reverse, "q", vec![hit(1)], 5).await;
+        } = apply(&REVERSE, "q", vec![hit(1)], 5).await;
         assert_eq!(outcome, RerankOutcome::Skipped);
         assert_eq!(kept.len(), 1);
         let Reranked {
             results: kept,
             outcome,
-        } = apply(&Reverse, "q", Vec::new(), 5).await;
+        } = apply(&REVERSE, "q", Vec::new(), 5).await;
         assert_eq!(outcome, RerankOutcome::Skipped);
         assert!(kept.is_empty());
     }
@@ -411,7 +403,7 @@ mod tests {
         ))
         .unwrap();
         let model = config.rerank_model_ref().unwrap().unwrap();
-        let reranker = ScoredReranker::new(RerankModel::with_key(model, None).unwrap());
+        let reranker = Reranker::scored(RerankModel::with_key(model, None).unwrap());
         let Reranked { results, outcome } =
             apply(&reranker, "refunds?", vec![hit(1), hit(2), hit(3)], 2).await;
         assert_eq!(outcome, RerankOutcome::Reranked("reranker"));

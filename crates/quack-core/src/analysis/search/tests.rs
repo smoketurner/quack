@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::*;
 use crate::analysis::events::{self, TurnRecorder};
 use crate::analysis::policy::WritePolicy;
-use crate::analysis::rerank::{RankFuture, Ranked, Reranker};
+use crate::analysis::rerank::{Ranked, Reranker};
 use crate::analysis::tools::{
     NonBlank, ReadDocumentArgs, ReadDocumentTool, SearchDocumentsArgs, SearchDocumentsTool, Turn,
 };
@@ -178,25 +178,18 @@ fn a_search_stays_within_the_persons_scope_and_its_own_documents() {
     assert!(outside.is_some_and(|e| e.contains("limited this question")));
 }
 
-struct Reverse;
-
-impl Reranker for Reverse {
-    fn rank<'a>(&'a self, _query: &'a str, candidates: &'a [ChunkSearchResult]) -> RankFuture<'a> {
-        Box::pin(async move {
-            Ok((0..candidates.len())
-                .rev()
-                .map(|index| Ranked {
-                    index,
-                    score: Some(0.5),
-                })
-                .collect())
-        })
-    }
-
-    fn name(&self) -> &'static str {
-        "reverse"
-    }
-}
+const REVERSE: Reranker = Reranker::Fixed {
+    name: "reverse",
+    rank: |candidates| {
+        Ok((0..candidates.len())
+            .rev()
+            .map(|index| Ranked {
+                index,
+                score: Some(0.5),
+            })
+            .collect())
+    },
+};
 
 #[tokio::test]
 async fn an_outcome_reranks_keeps_top_k_and_renders_its_workings() {
@@ -218,7 +211,7 @@ async fn an_outcome_reranks_keeps_top_k_and_renders_its_workings() {
     assert_eq!(plain.explanation.fused.len(), 1);
     assert_eq!(plain.rerank, RerankOutcome::Skipped);
     let rerank = Rerank {
-        reranker: Arc::new(Reverse),
+        reranker: Arc::new(REVERSE),
         candidates: 5,
     };
     let reranked = SearchOutcome::rerank(explained, Some(&rerank), "renewal", 1).await;

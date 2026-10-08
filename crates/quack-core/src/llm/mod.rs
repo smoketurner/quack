@@ -24,24 +24,22 @@ use schemars::{Schema, schema_for};
 use secrecy::ExposeSecret;
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rig::prelude::*;
 
-use crate::analysis::agent::{AgentResponse, Analysis, Cutoff};
-use crate::analysis::events::{self, AgentEvent, EventSink, TurnFailure};
+use crate::analysis::agent::{AgentResponse, Analysis, CANCELLED_NOTE, Cutoff};
+use crate::analysis::events::{AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
-use crate::analysis::rerank::{
-    ModelReranker, RERANK_PROMPT, RERANK_TIMEOUT, RerankAnswer, Reranker, ScoredReranker,
-};
+use crate::analysis::rerank::{RERANK_PROMPT, RERANK_TIMEOUT, RerankAnswer, Reranker};
 use crate::analysis::search::DocumentScope;
-use crate::analysis::text_to_sql::PromptOptions;
+use crate::analysis::text_to_sql::{PromptOptions, Window};
 use crate::analysis::tools::Rerank;
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::{
-    BaseUrl, BedrockApi, BedrockEndpoint, Config, Effort, ModelRef, ModelSettings, ProviderAuth,
-    ProviderConfig, ProviderName, ProviderType, RerankMode, config_file_path,
+    AnalysisConfig, BaseUrl, BedrockApi, BedrockEndpoint, Config, Effort, ModelRef, ModelSettings,
+    ProviderAuth, ProviderConfig, ProviderName, ProviderType, RerankMode, config_file_path,
 };
 use crate::embedding::{Embedder, EmbeddingModel, Profile};
 use crate::error::{Error, Result};
@@ -53,8 +51,9 @@ use crate::ontology::documents::{self, OpenExtraction};
 use crate::priority::Priority;
 use crate::storage::control::ResourceKind;
 use crate::storage::{context, sessions};
+use crate::text::Tokens;
 use egress::Egress;
-use sampling::{Sampled, Wire};
+use sampling::{OllamaLoad, Sampled, Wire};
 pub use tokio_util::sync::CancellationToken;
 use vision::ImageReader;
 
@@ -158,6 +157,9 @@ const OLLAMA_EMBED_MIN_CTX: u32 = 2048;
 pub struct OllamaEndpoint {
     settings: ollama::OllamaConfig,
     http: LimitedHttp,
+    /// The largest context window a chat model is loaded with
+    /// (`[analysis].max_context_tokens`).
+    context_cap: Tokens,
 }
 
 impl OllamaEndpoint {
@@ -185,7 +187,13 @@ impl OllamaEndpoint {
         Ok(Self {
             settings,
             http: LimitedHttp::for_provider(name, provider).with_headers(provider.header_map()?),
+            context_cap: AnalysisConfig::default().max_context_tokens,
         })
+    }
+
+    /// How every request to `model` loads it.
+    fn load(&self, model: &str) -> OllamaLoad {
+        OllamaLoad::new(&self.settings.base_url, model, self.context_cap)
     }
 
     /// rig's client for the server.
@@ -468,11 +476,20 @@ impl ChatClient {
             ProviderType::Bedrock | ProviderType::BedrockMantle => {
                 Self::bedrock(&*bedrock::session(name, provider).await?, name, provider)
             }
-            ProviderType::Ollama | ProviderType::Openai | ProviderType::Anthropic => Self::connect(
-                name,
-                provider,
-                provider.auth.credential(config, name).await?.as_deref(),
-            ),
+            ProviderType::Ollama | ProviderType::Openai | ProviderType::Anthropic => {
+                let client = Self::connect(
+                    name,
+                    provider,
+                    provider.auth.credential(config, name).await?.as_deref(),
+                )?;
+                Ok(match client {
+                    Self::Ollama(endpoint) => Self::Ollama(OllamaEndpoint {
+                        context_cap: config.analysis.max_context_tokens,
+                        ..endpoint
+                    }),
+                    other => other,
+                })
+            }
         }
     }
 
@@ -599,27 +616,39 @@ impl ChatClient {
         let wire = self.wire();
         Ok(match self {
             Self::Ollama(endpoint) => Sampled::model(
-                endpoint.client().completion(model),
+                endpoint.client().native_completion(model),
                 model,
                 wire,
                 effort,
                 temperature,
+                Some(endpoint.load(model)),
             )?,
             Self::OpenAi(client) => {
-                Sampled::model(client.chat(model), model, wire, effort, temperature)?
+                Sampled::model(client.chat(model), model, wire, effort, temperature, None)?
             }
-            Self::Anthropic(client) => {
-                Sampled::model(client.completion(model), model, wire, effort, temperature)?
-            }
-            Self::Bedrock(client) => {
-                Sampled::model(client.completion(model), model, wire, effort, temperature)?
-            }
-            Self::Responses(client) => Sampled::model(
-                Unstored::model(client.responses(model)),
+            Self::Anthropic(client) => Sampled::model(
+                client.completion(model),
                 model,
                 wire,
                 effort,
                 temperature,
+                None,
+            )?,
+            Self::Bedrock(client) => Sampled::model(
+                client.completion(model),
+                model,
+                wire,
+                effort,
+                temperature,
+                None,
+            )?,
+            Self::Responses(client) => Sampled::model(
+                client.responses(model),
+                model,
+                wire,
+                effort,
+                temperature,
+                None,
             )?,
         })
     }
@@ -684,17 +713,17 @@ impl Rerank {
     /// A model the configuration names that does not resolve, or a
     /// provider that cannot be built.
     pub async fn from_config(config: &Config) -> Result<Option<Self>> {
-        let reranker: Arc<dyn Reranker> = match config.retrieval.rerank {
+        let reranker = match config.retrieval.rerank {
             RerankMode::None => return Ok(None),
             RerankMode::Reranker => match RerankModel::from_config(config).await? {
-                Some(model) => Arc::new(ScoredReranker::new(model)),
+                Some(model) => Arc::new(Reranker::scored(model)),
                 None => return Ok(None),
             },
             RerankMode::Model => {
                 let chat = config.chat_model_ref()?;
                 let client = ChatClient::build(config, &chat).await?;
                 match client.rerank_call(chat.model, config.model_settings(chat)) {
-                    Some(call) => Arc::new(ModelReranker::from_call(call)),
+                    Some(call) => Arc::new(Reranker::model(call)),
                     None => return Ok(None),
                 }
             }
@@ -709,56 +738,6 @@ impl Rerank {
 /// The key rig's `OpenAI` clients are built with when [`bedrock::Signer`]
 /// replaces their `Authorization` header with a `SigV4` one.
 const SIGNED_PLACEHOLDER_KEY: &str = "sigv4";
-
-/// A Responses API wire asked to keep nothing: every request carries
-/// `store: false`, so neither Bedrock nor `OpenAI` retains a copy of the
-/// conversation (Bedrock keeps one for 30 days by default) and no workspace content leaves the
-/// workspace file's boundary to be stored (design doc section 5). quack
-/// replays history itself and never uses `previous_response_id`.
-#[derive(Clone)]
-struct Unstored<W>(W);
-
-impl<W> Unstored<W> {
-    /// `model`, asking to store nothing.
-    fn model<T>(model: Model<W, T>) -> Model<Self, T> {
-        Model::new(Self(model.wire), model.transport)
-    }
-
-    fn request(
-        mut request: rig::completion::CompletionRequest,
-    ) -> rig::completion::CompletionRequest {
-        let mut params = match request.additional_params.take() {
-            Some(serde_json::Value::Object(map)) => map,
-            _ => serde_json::Map::new(),
-        };
-        params.insert(String::from("store"), serde_json::Value::Bool(false));
-        request.additional_params = Some(serde_json::Value::Object(params));
-        request
-    }
-}
-
-impl<W: rig::wire::Wire<Op = operation::Completion>> rig::wire::Wire for Unstored<W> {
-    type Op = operation::Completion;
-    type Payload = W::Payload;
-    type Frame = W::Frame;
-    type Decoder<'id> = W::Decoder<'id>;
-
-    fn describe(&self) -> rig::wire::Descriptor<'_> {
-        self.0.describe()
-    }
-
-    fn encode(
-        &self,
-        request: rig::completion::CompletionRequest,
-        mode: rig::wire::Mode,
-    ) -> std::result::Result<W::Payload, rig::error::EncodeError> {
-        self.0.encode(Self::request(request), mode)
-    }
-
-    fn decoder<'id>(&self) -> Self::Decoder<'id> {
-        self.0.decoder()
-    }
-}
 
 /// What one background call is for: its preamble, how long it may take,
 /// and the name errors and logs give it.
@@ -876,7 +855,7 @@ impl PlainCall {
                                 "provider token usage"
                             );
                         }
-                        final_text = Some(r.output);
+                        final_text = Some(r.output());
                     }
                     _ => {}
                 }
@@ -1308,26 +1287,6 @@ impl TurnRequest<'_> {
 
         tracing::info!(chat_model = %chat, session = %session_id, prior_messages = history.len(), "starting agent turn");
 
-        // Events pass through here on their way out so the text streamed so
-        // far is known if the turn is cancelled (issue #45).
-        let (inner_sink, mut inner_events) = events::channel();
-        let streamed: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        let forward = tokio::spawn({
-            let streamed = Arc::clone(&streamed);
-            let outer = sink.clone();
-            async move {
-                while let Some(event) = inner_events.recv().await {
-                    if let AgentEvent::TextDelta(text) = &event
-                        && let Ok(mut so_far) = streamed.lock()
-                    {
-                        so_far.push_str(text);
-                    }
-                    if outer.send(event).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
         let prompt_scope = prompt.scope.clone();
         // Someone is watching this turn: its model calls, and the tools' calls
         // inside it, go ahead of background work at the provider (design 4.1).
@@ -1344,35 +1303,35 @@ impl TurnRequest<'_> {
             history,
             message,
             asked,
+            cancel: cancel.clone(),
         };
-        let turn = Priority::Interactive.scope(dispatch(config, chat, analysis, inner_sink));
+        let turn = Priority::Interactive.scope(dispatch(config, chat, analysis, sink.clone()));
+        // The turn goes first: once the model is streaming, it sees the
+        // cancellation itself and ends with what it has. Before that, while
+        // the prompt is assembled, nothing has streamed and the turn is
+        // dropped here.
         let outcome = tokio::select! {
             biased;
-            () = cancel.cancelled() => None,
             outcome = turn => Some(outcome),
+            () = cancel.cancelled() => None,
         };
-        // Dropping the turn dropped its sink; the forwarder ends with it.
-        drop(forward.await);
 
         let response = if let Some(outcome) = outcome {
             outcome?
         } else {
-            let mut content = streamed.lock().map(|s| s.clone()).unwrap_or_default();
-            if !content.trim().is_empty() {
-                content.push_str("\n\n");
-            }
-            content.push_str(CANCELLED_NOTE);
             let response = AgentResponse {
-                content,
+                content: String::from(CANCELLED_NOTE),
                 cancelled: true,
                 duration_ms: Some(u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX)),
                 documents: prompt_scope,
                 ..AgentResponse::default()
             };
-            tracing::info!(session = %session_id, "agent turn cancelled");
             drop(sink.send(AgentEvent::TurnComplete(response.clone())));
             response
         };
+        if response.cancelled {
+            tracing::info!(session = %session_id, "agent turn cancelled");
+        }
 
         let (session, text, recorded) =
             (session_id.to_owned(), message.to_owned(), response.clone());
@@ -1414,8 +1373,13 @@ async fn start_turn<'c>(
     let session_id = session_id.to_owned();
     let pinned_token_budget = config.retrieval.pinned_token_budget;
     let context_max_tokens = config.context.max_tokens;
-    let ollama_context_cap = (chat.provider.provider_type == ProviderType::Ollama)
-        .then_some(config.analysis.max_context_tokens);
+    let window = match chat.provider.provider_type {
+        ProviderType::Ollama => Window::Ollama,
+        ProviderType::Openai
+        | ProviderType::Anthropic
+        | ProviderType::Bedrock
+        | ProviderType::BedrockMantle => Window::Provider,
+    };
     let read = session_id.clone();
     let documents = documents.to_vec();
     let prompt = db
@@ -1431,7 +1395,7 @@ async fn start_turn<'c>(
                 pinned_token_budget,
                 context: context::combined(guard)?,
                 context_max_tokens,
-                ollama_context_cap,
+                window,
                 question: None,
             };
             Ok(prompt)
@@ -1449,9 +1413,6 @@ async fn start_turn<'c>(
         history,
     })
 }
-
-/// What a cancelled turn's recorded answer ends with.
-pub const CANCELLED_NOTE: &str = "(Cancelled by the user before the answer was complete.)";
 
 /// Run `analysis` on the chat model's provider.
 async fn dispatch(

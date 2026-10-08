@@ -1,5 +1,6 @@
 use super::*;
-use crate::analysis::rerank::{ModelReranker, RerankOutcome, Reranked, apply};
+use crate::analysis::events;
+use crate::analysis::rerank::{RerankOutcome, Reranked, Reranker, apply};
 use crate::config::BedrockConfig;
 use crate::embedding::Dimension;
 use crate::ids::{ChunkId, ClassId, DocumentId, RelationId};
@@ -88,7 +89,7 @@ async fn graph_extraction_sends_the_ontology_schema() {
         ("type = \"ollama\"\n", r#""format":{"#),
         (
             "type = \"openai\"\napi = \"chat-completions\"\n",
-            r#""response_format":{"json_schema":{"#,
+            r#""response_format":{"type":"json_schema","json_schema":{"#,
         ),
     ] {
         let (root, seen) = capture_one().await;
@@ -235,7 +236,7 @@ async fn the_model_reranker_uses_background_effort_not_turn_effort() {
                 )
                 .unwrap_or_else(|e| fail(&e.to_string()))
         };
-        let reranker = ModelReranker::from_call(call);
+        let reranker = Reranker::model(call);
         // Two candidates, so `apply` makes the ranking call rather than skip.
         let Reranked { outcome, .. } = apply(
             &reranker,
@@ -619,32 +620,40 @@ async fn anthropic_sends_an_oauth_token_as_a_bearer() {
     .await;
 }
 
-#[test]
-fn responses_requests_ask_bedrock_to_store_nothing() {
-    let request = |params: Option<serde_json::Value>| rig::completion::CompletionRequest {
-        model: None,
-        chat_history: Vec::new(),
-        documents: Vec::new(),
-        tools: Vec::new(),
-        temperature: None,
-        max_tokens: None,
-        tool_choice: None,
-        additional_params: params,
-        output_schema: None,
-        record_telemetry_content: false,
-    };
-    let sent = Unstored::<()>::request(request(None)).additional_params;
-    assert_eq!(sent, Some(serde_json::json!({ "store": false })));
-    // Whatever else was asked is kept, and store is forced off.
-    let sent = Unstored::<()>::request(request(Some(serde_json::json!({
-        "store": true,
-        "reasoning": { "effort": "low" }
-    }))))
-    .additional_params;
-    assert_eq!(
-        sent,
-        Some(serde_json::json!({ "store": false, "reasoning": { "effort": "low" } }))
-    );
+/// A background call carries what its API is asked on every request: the
+/// Responses API stores nothing, and Ollama loads the model with a sized
+/// window and keeps it loaded, as a chat turn does.
+#[tokio::test]
+async fn background_calls_carry_store_and_the_ollama_load() {
+    Egress::scope(Some(Egress::NoWorkspace), async {
+        let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
+        for (provider, auth, sent) in [
+            (
+                "type = \"openai\"\napi = \"responses\"\n",
+                keyed,
+                vec![r#""store":false"#],
+            ),
+            (
+                "type = \"ollama\"\n",
+                "",
+                vec![r#""num_ctx":16384"#, r#""keep_alive":"30m""#],
+            ),
+        ] {
+            let (root, seen) = capture_one().await;
+            let config = parse(&format!(
+                "[general]\nchat_model = \"p/m\"\n[providers.p]\n{provider}{auth}base_url = \"{root}\"\n"
+            ));
+            let extractor = graph_extractor(&config, &Ontology::default())
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            assert!(extractor.extract("Orgenics ships to Kenya.").await.is_err());
+            let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
+            for field in sent {
+                assert!(request.contains(field), "{provider}: {field} in {request}");
+            }
+        }
+    })
+    .await;
 }
 
 #[test]

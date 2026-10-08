@@ -1,53 +1,37 @@
 use super::*;
 use crate::analysis::citations::CitationRegistry;
 
-#[test]
-fn the_ollama_window_rounds_up_within_bounds() {
-    let window = |tokens, cap| OllamaWindow::for_prompt(Tokens::new(tokens), Tokens::new(cap)).0;
-    assert_eq!(window(0, 32_768), 8_192);
-    assert_eq!(window(1_000, 32_768), 16_384);
-    // 12,875 prompt tokens plus headroom rounds to 24,576.
-    assert_eq!(window(12_875, 32_768), 24_576);
-    assert_eq!(window(100_000, 32_768), 32_768);
-    assert_eq!(window(100_000, 2_048), 8_192);
-}
 use crate::ids::{ChunkId, DocumentId};
-use rig::completion::PromptError;
-
-fn prompt_error(e: PromptError) -> rig::agent::StreamingError {
-    rig::agent::StreamingError::Prompt(e)
-}
 
 #[test]
 fn stream_errors_are_explained_for_the_user() {
     let config = AnalysisConfig::default();
-    let unknown = prompt_error(PromptError::UnknownToolCall {
+    let unknown = PromptError::UnknownToolCall {
         tool_name: String::from("container.exec"),
         available_tools: vec![String::from("run_sql")],
         allowed_tools: vec![String::from("run_sql")],
         chat_history: Vec::new(),
-    });
+    };
     assert!(StreamStop(&unknown).by_agent_loop());
-    let text = StreamStop(&unknown).explain(config.max_turns, Window::Ollama(OllamaWindow(8_192)));
+    let text = StreamStop(&unknown).explain(config.max_turns, Window::Ollama);
     assert!(text.contains("container.exec"), "{text}");
     assert!(text.contains("max_context_tokens"), "{text}");
     let text = StreamStop(&unknown).explain(config.max_turns, Window::Provider);
     assert!(!text.contains("Ollama"), "{text}");
 
-    let limit = prompt_error(PromptError::MaxTurnsError {
+    let limit = PromptError::MaxTurns {
         max_turns: 10,
         chat_history: Vec::new(),
         prompt: Message::user("q"),
-    });
+    };
     let text = StreamStop(&limit).explain(config.max_turns, Window::Provider);
     assert!(
         text.contains(&format!("{} tool calls", config.max_turns)),
         "{text}"
     );
 
-    let provider = rig::agent::StreamingError::Completion(ProviderError::Provider(String::from(
-        "connection refused",
-    )));
+    let provider =
+        PromptError::Provider(ProviderError::Provider(String::from("connection refused")));
     assert!(!StreamStop(&provider).by_agent_loop());
     let text = StreamStop(&provider).explain(config.max_turns, Window::Provider);
     assert!(text.contains("connection refused"), "{text}");
@@ -125,11 +109,11 @@ fn to_json_carries_every_field_and_derives_queries() {
 
 #[test]
 fn per_call_usage_accumulates_across_a_turns_completion_requests() {
-    let call = |input: u64, output: u64| rig::completion::Usage {
-        input_tokens: Some(input),
-        output_tokens: Some(output),
-        total_tokens: Some(input.saturating_add(output)),
-        ..rig::completion::Usage::default()
+    let call = |input: u64, output: u64| {
+        rig::completion::Usage::new()
+            .input_tokens(input)
+            .output_tokens(output)
+            .total_tokens(input.saturating_add(output))
     };
     let mut usage = TokenUsage::default();
     usage.add(call(400, 20));
@@ -172,7 +156,7 @@ fn turn_text_keeps_streamed_text_and_notes_early_stops() {
         "so far\n\n(why)"
     );
     assert_eq!(text("", Some("final"), None, Window::Provider), "final");
-    let empty = text("", Some(""), None, Window::Ollama(OllamaWindow(8_192)));
+    let empty = text("", Some(""), None, Window::Ollama);
     assert!(empty.contains("[analysis].max_context_tokens"), "{empty}");
     let empty = text("", None, None, Window::Provider);
     assert!(!empty.contains("Ollama"), "{empty}");
@@ -185,13 +169,7 @@ fn turn_text_keeps_streamed_text_and_notes_early_stops() {
 #[test]
 fn notes_are_added_after_the_citation_check() {
     let check = |text: &str| CitationRegistry::default().validate(text);
-    let answer = turn_text(
-        String::from("[7]"),
-        None,
-        None,
-        Window::Ollama(OllamaWindow(8_192)),
-        check,
-    );
+    let answer = turn_text(String::from("[7]"), None, None, Window::Ollama, check);
     assert!(
         answer.text.starts_with("(The model returned no text.")
             && answer.text.contains("raise [analysis].max_context_tokens"),

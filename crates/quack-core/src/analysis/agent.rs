@@ -3,14 +3,15 @@ use std::sync::{Arc, PoisonError};
 use std::time::Instant;
 
 use futures::StreamExt;
+use rig::completion::PromptError;
 use rig::prelude::*;
 use rig::streaming::{Item, PartKind, StreamEvent};
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{AnalysisConfig, GraphConfig, RetrievalConfig};
 use crate::embedding::{Embedder, EmbeddingModel, Input};
 use crate::error::{Error, Result};
 use crate::ids::SessionId;
-use crate::text::Tokens;
 
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
@@ -20,7 +21,7 @@ use super::policy::WritePolicy;
 use super::rerank::RerankAnswer;
 use super::search::DocumentScope;
 use super::table_search::{TableCards, TableLayout, user_tables};
-use super::text_to_sql::{Modeled, PromptOptions, Question, SystemPrompt};
+use super::text_to_sql::{Modeled, PromptOptions, Question, SystemPrompt, Window};
 use super::tools::{
     CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, FindTablesTool,
     GraphTools, ListDocumentsTool, ListTablesTool, ReadDocumentTool, ReaderDb, RunSqlTool,
@@ -29,7 +30,7 @@ use super::tools::{
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::{GraphResult, store as graph_store};
 use crate::llm::vision::ImageReader;
-use crate::llm::{ChatModel, OLLAMA_KEEP_ALIVE, RerankModel, SchemaCall};
+use crate::llm::{ChatModel, RerankModel, SchemaCall};
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
 
@@ -233,7 +234,13 @@ pub struct Analysis<'a, M> {
     pub message: &'a str,
     /// When the question arrived; the answer's `duration_ms` counts from here.
     pub asked: Instant,
+    /// Stops the turn. Once the model is streaming, the turn ends with what
+    /// it has so far: the text, the steps, the citations, and the usage.
+    pub cancel: CancellationToken,
 }
+
+/// What a cancelled turn's recorded answer ends with.
+pub const CANCELLED_NOTE: &str = "(Cancelled by the user before the answer was complete.)";
 
 impl<M> Analysis<'_, M>
 where
@@ -389,7 +396,7 @@ impl Cutoff {
         match reason? {
             FinishReason::Length => Some(Self::Length),
             FinishReason::ContentFilter => Some(Self::Filtered),
-            FinishReason::Stop | FinishReason::ToolCalls | FinishReason::Other(_) => None,
+            _ => None,
         }
     }
 
@@ -397,7 +404,7 @@ impl Cutoff {
     /// through before the stop.
     fn note(self, answered: bool, window: Window) -> String {
         let advice = match window {
-            Window::Ollama(_) => {
+            Window::Ollama => {
                 " With Ollama the answer shares the context window with the prompt and the \
                  model's reasoning; raise [analysis].max_context_tokens or ask a narrower \
                  question."
@@ -435,91 +442,6 @@ impl Cutoff {
     }
 }
 
-/// Who sizes the model's context window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Window {
-    /// The provider sizes its own.
-    Provider,
-    /// Ollama, asked for this `num_ctx`.
-    Ollama(OllamaWindow),
-}
-
-impl Window {
-    /// Ollama's window when the prompt options cap one, else the provider's.
-    fn for_turn(
-        prompt: &PromptOptions,
-        system_prompt: &str,
-        history: &[Message],
-        user_message: &str,
-    ) -> Self {
-        prompt.ollama_context_cap.map_or(Self::Provider, |cap| {
-            Self::Ollama(OllamaWindow::for_turn(
-                cap,
-                system_prompt,
-                history,
-                user_message,
-            ))
-        })
-    }
-}
-
-/// The `num_ctx` to ask Ollama for: the prompt's estimated tokens plus
-/// room for tool results and the answer, rounded up to 8,192, between
-/// 8,192 and `cap`. Ollama's default of 4,096 truncates the front of
-/// most workspace prompts, which loses the tool guidance and the question.
-///
-/// `num_ctx` is a load option: asking Ollama for a different value than
-/// the one the model is already loaded with forces a full model reload,
-/// which measured 4-5 seconds for `gpt-oss:20b` on this machine (`ollama
-/// serve`, repeated `/api/generate` calls that only changed `num_ctx`) —
-/// against single-digit milliseconds for a request that keeps the same
-/// value. A session's history only grows turn over turn until the
-/// history trim caps it, so the requested size is non-decreasing within
-/// a session; the step below is deliberately coarse (four tiers instead
-/// of one every 2,048 tokens) so a growing conversation crosses it, and
-/// pays that reload, at most three times instead of up to twelve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OllamaWindow(u32);
-
-impl OllamaWindow {
-    const HEADROOM: u32 = 8_192;
-    const FLOOR: u32 = 8_192;
-    const STEP: u32 = 8_192;
-
-    /// The window for a turn: the system prompt, the replayed history, and
-    /// the question, under `cap` (`[analysis].max_context_tokens`). Ollama
-    /// loads a model with a 4,096-token window unless the request says
-    /// otherwise and truncates the front of a longer prompt, which is where
-    /// the tool guidance is.
-    fn for_turn(cap: Tokens, system_prompt: &str, history: &[Message], user_message: &str) -> Self {
-        let history_chars = serde_json::to_string(history).map_or(0, |h| h.len());
-        let prompt = Tokens::of_chars(
-            system_prompt
-                .len()
-                .saturating_add(history_chars)
-                .saturating_add(user_message.len()),
-        );
-        if prompt > cap {
-            tracing::warn!(
-                prompt_tokens = %prompt,
-                %cap,
-                "the prompt is larger than [analysis].max_context_tokens; Ollama will truncate it"
-            );
-        }
-        Self::for_prompt(prompt, cap)
-    }
-
-    /// The window for a prompt of `prompt` tokens under `cap`.
-    fn for_prompt(prompt: Tokens, cap: Tokens) -> Self {
-        let needed = prompt.get().saturating_add(Self::HEADROOM);
-        let rounded = needed
-            .div_ceil(Self::STEP)
-            .saturating_mul(Self::STEP)
-            .max(Self::FLOOR);
-        Self(rounded.min(cap.get().max(Self::FLOOR)))
-    }
-}
-
 impl<M> Analysis<'_, M>
 where
     M: EmbeddingModel + Clone + Send + Sync + 'static,
@@ -544,11 +466,12 @@ where
             history,
             message: user_message,
             asked,
+            cancel,
         } = self;
         let read = PromptAndModel::read(&reader_db, &prompt).await?;
         let turn = Turn::new(recorder.clone(), write_policy).within(prompt.scope.clone());
         let Replay { history, dropped } = Replay::check(history);
-        let window = Window::for_turn(&prompt, &read.system_prompt, &history, user_message);
+        let window = prompt.window;
         let agent = BuildContext {
             shared_db: Arc::clone(&shared_db),
             reader_db,
@@ -558,7 +481,6 @@ where
             modeled: read.modeled,
             tables: read.tables,
             mode: prompt.mode,
-            window,
             rerank_model,
             reranker_call,
             images: images.filter(|_| read.has_images),
@@ -568,7 +490,7 @@ where
         let max_turns = usize::try_from(analysis_config.max_turns)
             .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
 
-        let mut stream = agent
+        let stream = agent
             .prompt(user_message)
             .history(history)
             .max_turns(max_turns)
@@ -576,72 +498,138 @@ where
             .tool_context(turn.context())
             .stream();
 
-        let mut output = ModelOutput::default();
-        let mut final_text: Option<String> = None;
-        let mut stopped: Option<String> = None;
-        // The final response carries rig's aggregate for the whole run; the
-        // per-call counts are the fallback for a turn that derails before it,
-        // which is exactly the turn whose cost is worth knowing.
-        let mut aggregate: Option<TokenUsage> = None;
-        let mut per_call = TokenUsage::default();
-        // How the latest model call stopped, when it stopped short.
-        let mut cutoff: Option<Cutoff> = None;
+        let streamed =
+            Streamed::read(stream, &cancel, recorder, analysis_config.max_turns, window).await?;
+        let cancelled = streamed.cancelled;
+        let (mut answer, usage) =
+            streamed.answer(window, |text| recorder.citations().validate(text));
+        if let Some(note) = dropped {
+            answer.text.push_str("\n\n(");
+            answer.text.push_str(&note);
+            answer.text.push(')');
+        }
+        let mut response = turn.finish(answer, usage, asked);
+        response.cancelled = cancelled;
+        Ok(response)
+    }
+}
 
-        while let Some(item) = stream.next().await {
+/// What a turn's stream produced, read item by item.
+#[derive(Default)]
+struct Streamed {
+    output: ModelOutput,
+    final_text: Option<String>,
+    /// Why the stream stopped early, when it did.
+    stopped: Option<String>,
+    /// The final response carries rig's aggregate for the whole run; the
+    /// per-call counts are the fallback for a turn that derails before it,
+    /// which is exactly the turn whose cost is worth knowing.
+    aggregate: Option<TokenUsage>,
+    per_call: TokenUsage,
+    /// How the latest model call stopped, when it stopped short.
+    cutoff: Option<Cutoff>,
+    cancelled: bool,
+}
+
+impl Streamed {
+    /// Read `stream` until it ends, stops early, or `cancel` fires.
+    ///
+    /// # Errors
+    ///
+    /// A model that could not be reached at all, with nothing streamed.
+    async fn read<S>(
+        stream: S,
+        cancel: &CancellationToken,
+        recorder: &TurnRecorder,
+        max_turns: u32,
+        window: Window,
+    ) -> Result<Self>
+    where
+        S: futures::Stream<Item = std::result::Result<MultiTurnStreamItem, PromptError>>,
+    {
+        let mut stream = std::pin::pin!(stream);
+        let mut this = Self::default();
+        loop {
+            // Checked first, and everything after the loop runs without
+            // waiting, so a cancelled turn finishes in the poll that sees
+            // the cancellation: `TurnRequest::run` relies on that.
+            let next = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    this.cancelled = true;
+                    break;
+                }
+                next = stream.next() => next,
+            };
+            let Some(item) = next else { break };
             let item = match item {
                 Ok(item) => item,
                 Err(e) => {
                     // A turn the model derailed (an unknown tool, the turn
-                    // limit) or that failed after text was streamed is still
-                    // a turn: keep the text, say what happened, record it. A
-                    // model that could not be reached at all stays an error.
+                    // limit), that the output limit or a filter cut, or that
+                    // failed after text was streamed is still a turn: keep
+                    // the text, say what happened, record it. A model that
+                    // could not be reached at all stays an error.
                     let stop = StreamStop(&e);
-                    if output.text.trim().is_empty() && !stop.by_agent_loop() {
+                    let answered = !this.output.text.trim().is_empty();
+                    if !answered && this.cutoff.is_none() && !stop.by_agent_loop() {
                         return Err(Error::Analysis(e.to_string()));
                     }
                     tracing::warn!(error = %e, "agent turn stopped early");
-                    stopped = Some(cutoff.map_or_else(
-                        || stop.explain(analysis_config.max_turns, window),
-                        |cut| cut.note(!output.text.trim().is_empty(), window),
+                    this.stopped = Some(this.cutoff.map_or_else(
+                        || stop.explain(max_turns, window),
+                        |cut| cut.note(answered, window),
                     ));
                     break;
                 }
             };
             match item {
                 MultiTurnStreamItem::StreamAssistantItem(Item::Event(event)) => {
-                    output.take(event, recorder);
+                    this.output.take(event, recorder);
                 }
                 MultiTurnStreamItem::FinalResponse(response) => {
                     if response.usage.is_reported() {
-                        aggregate = Some(response.usage.into());
+                        this.aggregate = Some(response.usage.into());
                     }
-                    final_text = Some(response.output);
+                    this.final_text = Some(response.output());
                 }
                 MultiTurnStreamItem::CompletionCall(call) => {
-                    per_call.add(call.usage);
-                    cutoff = Cutoff::of(call.finish_reason.as_ref());
-                    output.call_ended();
+                    this.per_call.add(call.usage);
+                    this.cutoff = Cutoff::of(call.finish_reason.as_ref());
+                    this.output.call_ended();
                 }
                 MultiTurnStreamItem::ToolCall { .. }
-                | MultiTurnStreamItem::ToolExecutionCommitted { .. } => output.call_kept(),
-                MultiTurnStreamItem::ModelTurnRetried { .. } => output.call_rejected(),
-                MultiTurnStreamItem::StreamAssistantItem(_)
-                | MultiTurnStreamItem::StreamUserItem(_) => {}
+                | MultiTurnStreamItem::ToolExecutionCommitted { .. } => this.output.call_kept(),
+                MultiTurnStreamItem::ModelTurnRetried { .. } => this.output.call_rejected(),
+                _ => {}
             }
         }
+        Ok(this)
+    }
 
-        // A turn that answered but was cut short says so; rig counts a
-        // partial answer as a valid one.
-        let stopped = stopped.or_else(|| cutoff.map(|cut| cut.note(true, window)));
-        let mut answer = turn_text(output.text, final_text, stopped, window, |text| {
-            recorder.citations().validate(text)
-        });
-        if let Some(note) = dropped {
-            answer.text.push_str("\n\n(");
-            answer.text.push_str(&note);
-            answer.text.push(')');
-        }
-        Ok(turn.finish(answer, aggregate.or_else(|| per_call.reported()), asked))
+    /// The answer, put through `check` (the citation check), and the usage.
+    fn answer(
+        self,
+        window: Window,
+        check: impl FnOnce(&str) -> CitedAnswer,
+    ) -> (CitedAnswer, Option<TokenUsage>) {
+        let usage = self.aggregate.or_else(|| self.per_call.reported());
+        let answer = if self.cancelled {
+            let mut answer = check(&self.output.text);
+            if !answer.text.trim().is_empty() {
+                answer.text.push_str("\n\n");
+            }
+            answer.text.push_str(CANCELLED_NOTE);
+            answer
+        } else {
+            // A turn that answered but was cut short says so; rig counts a
+            // partial answer as a valid one.
+            let stopped = self
+                .stopped
+                .or_else(|| self.cutoff.map(|cut| cut.note(true, window)));
+            turn_text(self.output.text, self.final_text, stopped, window, check)
+        };
+        (answer, usage)
     }
 }
 
@@ -694,7 +682,7 @@ fn turn_text(
     let mut answer = check(&raw);
     let note = stopped.or_else(|| {
         answer.text.trim().is_empty().then(|| {
-            String::from(if matches!(window, Window::Ollama(_)) {
+            String::from(if window == Window::Ollama {
                 "The model returned no text. With Ollama this usually means the answer or the \
                  prompt did not fit the context window; raise [analysis].max_context_tokens or \
                  ask a narrower question."
@@ -776,49 +764,47 @@ impl ModelOutput {
 }
 
 /// Why a turn's stream ended early.
-struct StreamStop<'a>(&'a rig::agent::StreamingError);
+struct StreamStop<'a>(&'a PromptError);
 
 impl StreamStop<'_> {
-    /// Whether the agent loop itself stopped it (rig's `PromptError`: an
-    /// unknown tool, the turn limit) rather than the provider call failing.
+    /// Whether the agent loop itself stopped it (an unknown tool, the turn
+    /// limit) rather than the provider call failing.
     const fn by_agent_loop(&self) -> bool {
-        matches!(self.0, rig::agent::StreamingError::Prompt(_))
+        matches!(
+            self.0,
+            PromptError::UnknownToolCall { .. }
+                | PromptError::MaxTurns { .. }
+                | PromptError::Cancelled { .. }
+                | PromptError::Memory(_)
+        )
     }
 
     /// A user-facing sentence, for a stop worth keeping the turn for.
     fn explain(&self, max_turns: u32, window: Window) -> String {
-        use rig::completion::PromptError;
         match self.0 {
-            rig::agent::StreamingError::Prompt(prompt_error) => match prompt_error {
-                PromptError::UnknownToolCall { tool_name, .. } => format!(
-                    "The model called a tool that does not exist ({tool_name}), so the turn \
-                     stopped.{}",
-                    match window {
-                        Window::Ollama(_) => {
-                            " With Ollama this usually means the prompt was cut to the context \
-                             window; check [analysis].max_context_tokens and the model's own \
-                             limit."
-                        }
-                        Window::Provider => "",
+            PromptError::UnknownToolCall { tool_name, .. } => format!(
+                "The model called a tool that does not exist ({tool_name}), so the turn \
+                 stopped.{}",
+                match window {
+                    Window::Ollama => {
+                        " With Ollama this usually means the prompt was cut to the context \
+                         window; check [analysis].max_context_tokens and the model's own \
+                         limit."
                     }
-                ),
-                PromptError::MaxTurnsError { .. } => format!(
-                    "The turn reached the limit of {max_turns} tool calls ([analysis].max_turns) \
-                     before the model answered."
-                ),
-                PromptError::PromptCancelled { reason, .. } => {
-                    format!("The turn was cancelled: {reason}")
+                    Window::Provider => "",
                 }
-                PromptError::CompletionError(e) => format!("The model call failed: {e}"),
-                PromptError::MemoryError(e) => format!("The turn failed: {e}"),
-                PromptError::Report(report) => format!("The turn failed: {report}"),
-            },
-            rig::agent::StreamingError::Completion(e) => {
-                format!("The model call failed part way through: {e}")
+            ),
+            PromptError::MaxTurns { .. } => format!(
+                "The turn reached the limit of {max_turns} tool calls ([analysis].max_turns) \
+                 before the model answered."
+            ),
+            PromptError::Cancelled { reason, .. } => {
+                format!("The turn was cancelled: {reason}")
             }
-            rig::agent::StreamingError::Report(report) => {
-                format!("The turn failed: {report}")
-            }
+            PromptError::Provider(e) => format!("The model call failed part way through: {e}"),
+            PromptError::Memory(e) => format!("The turn failed: {e}"),
+            PromptError::Report(report) => format!("The turn failed: {report}"),
+            other => format!("The turn failed: {other}"),
         }
     }
 }
@@ -860,7 +846,6 @@ struct BuildContext<'a> {
     modeled: Modeled,
     tables: TableLayout,
     mode: ChatMode,
-    window: Window,
     rerank_model: Option<RerankModel>,
     /// The model reranker's one-shot, sampled with `background_effort` by
     /// `dispatch`'s `schema_call`. `Some` only when `rerank = "model"`; the
@@ -918,23 +903,6 @@ impl BuildContext<'_> {
             .temperature(0.1)
             .add_hook(InvalidToolCalls)
             .add_hook(EmptyAnswer);
-        if let Window::Ollama(OllamaWindow(num_ctx)) = ctx.window {
-            // `keep_alive` is Ollama-only too (rig lifts it out of
-            // `additional_params` into the request's top-level field, never
-            // into `options`). Nothing was setting it, so every request fell
-            // back to Ollama's own default (`OLLAMA_KEEP_ALIVE`, 5 minutes
-            // unless the operator changed it) each time it decided whether to
-            // keep the model loaded. A turn with several tool calls, or an
-            // idle stretch between turns in a TUI or web session, can leave a
-            // gap longer than that, which pays a multi-second reload the same
-            // way a changed `num_ctx` does (measured live, both in the perf
-            // handoff). Sending it explicitly on every request keeps the
-            // model warm through longer gaps regardless of the server's
-            // default.
-            builder = builder.additional_params(
-                serde_json::json!({ "num_ctx": num_ctx, "keep_alive": OLLAMA_KEEP_ALIVE }),
-            );
-        }
 
         // The ontology is describable as soon as it exists: the prompt block
         // is capped, so a class the model wants the detail of may not be in it

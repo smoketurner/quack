@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use rig::tool::{Tool, ToolContext};
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
 use schemars::generate::SchemaSettings;
 use schemars::transform::{Transform, transform_subschemas};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
@@ -23,7 +23,7 @@ use super::chart::{ChartKind, ChartSpec, SeriesColumns};
 use super::citations::{ChunkLocation, Markers};
 use super::events::{DetailPreview, ToolName, TurnRecorder};
 use super::policy::{Exposure, Hold, RefusalFlag, WriteDecision, WritePolicy};
-use super::rerank::{ModelReranker, RerankAnswer, Reranker, ScoredReranker};
+use super::rerank::{RerankAnswer, Reranker};
 use super::search::{DocumentScope, DocumentSearch, SearchOutcome, SearchVectors};
 use super::table_search::TableCards;
 use super::text_to_sql::{ColumnLine, Modeled};
@@ -290,35 +290,18 @@ enum PoolOpen {
     Clones(Vec<error::Result<WorkspaceDb>>),
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum ToolError {
-    #[error("query error: {0}")]
-    Query(String),
-    #[error("analysis error: {0}")]
-    Analysis(String),
-    #[error("embedding error: {0}")]
-    Embedding(String),
-    #[error("format error: {0}")]
-    Fmt(String),
-}
-
-impl From<std::fmt::Error> for ToolError {
-    fn from(e: std::fmt::Error) -> Self {
-        Self::Fmt(e.to_string())
-    }
-}
-
-/// A core error as the model sees it, keeping its own category instead of
-/// always wrapping it as a query error — an `Error::Analysis` already reads
-/// as `"analysis error: ..."`, so wrapping it again in `ToolError::Query`
-/// would show the model `"query error: analysis error: ..."`.
-impl From<Error> for ToolError {
+/// A core error as the model reads it. rig shows the model only a generic
+/// line for an error it did not construct itself, and the model needs the
+/// text (a missing column, the ids that exist) to correct its next call.
+impl From<Error> for ToolExecutionError {
     fn from(e: Error) -> Self {
-        match e {
-            Error::Analysis(msg) => Self::Analysis(msg),
-            other => Self::Query(other.to_string()),
-        }
+        Self::other(e.to_string())
     }
+}
+
+/// A tool result that could not be written.
+fn format_failed(e: std::fmt::Error) -> ToolExecutionError {
+    ToolExecutionError::other(format!("format error: {e}"))
 }
 
 /// What one turn's tools share, handed to each call as a runtime scope of
@@ -402,10 +385,10 @@ impl Turn {
     }
 
     /// The turn a tool call belongs to.
-    fn of(context: &ToolContext) -> Result<Arc<Self>, ToolError> {
-        context.scope::<Self>().ok_or_else(|| {
-            ToolError::Analysis(String::from("the tool was called outside an agent turn"))
-        })
+    fn of(context: &ToolContext) -> Result<Arc<Self>, ToolExecutionError> {
+        context
+            .scope::<Self>()
+            .ok_or_else(|| ToolExecutionError::other("the tool was called outside an agent turn"))
     }
 }
 
@@ -570,7 +553,7 @@ impl SqlGate {
     /// policy allows it given what the turn has read, and a refusal is
     /// recorded on the turn. A permission prompt holds no connection while
     /// it waits.
-    async fn check(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolError> {
+    async fn check(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolExecutionError> {
         let kind = match self.classify(sql).await? {
             Screened::Kind(kind) => kind,
             Screened::GraphRead => {
@@ -613,7 +596,7 @@ impl SqlGate {
 
     /// Classify `sql` for a chart, which only reads: any write is
     /// refused as not permitted, and that is not the turn's refused write.
-    async fn check_read_only(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolError> {
+    async fn check_read_only(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolExecutionError> {
         Ok(match self.classify(sql).await? {
             Screened::GraphRead => {
                 turn.read_documents();
@@ -632,7 +615,7 @@ impl SqlGate {
 
     /// The statement's kind on a reader, unless it names an internal table
     /// or writes something in the reserved `graph_` space.
-    async fn classify(&self, sql: &str) -> Result<Screened, ToolError> {
+    async fn classify(&self, sql: &str) -> Result<Screened, ToolExecutionError> {
         let sql = sql.to_owned();
         Ok(self
             .db
@@ -724,7 +707,7 @@ pub struct RunSqlArgs {
 
 impl Tool for RunSqlTool {
     const NAME: &'static str = ToolName::RunSql.as_str();
-    type Error = ToolError;
+    type Error = ToolExecutionError;
     type Args = RunSqlArgs;
     type Output = String;
 
@@ -807,11 +790,12 @@ impl Tool for RunSqlTool {
                 text.push_str(&turn.recorder.budget_note());
                 Ok(text)
             }
-            // A failed statement is a result, not a tool failure: rig
-            // hides a tool error's message from the model, but DuckDB's
-            // text (candidate bindings, the missing table) is exactly
-            // what it needs to fix the statement and retry.
-            Err(e) => Ok(format!("{SQL_ERROR_PREFIX}{}", step.fail(e))),
+            // DuckDB's text (candidate bindings, the missing table) is
+            // what the model needs to fix the statement and retry.
+            Err(e) => Err(ToolExecutionError::invalid_args(format!(
+                "{SQL_ERROR_PREFIX}{}",
+                step.fail(e)
+            ))),
         }
     }
 }
@@ -833,7 +817,7 @@ const MAX_SEARCH_TOP_K: u32 = 50;
 /// A reranker, and how many candidates to over-fetch for it before the
 /// top `k` are kept.
 pub struct Rerank {
-    pub reranker: Arc<dyn Reranker>,
+    pub reranker: Arc<Reranker>,
     pub candidates: u32,
 }
 
@@ -881,9 +865,9 @@ impl<M> SearchDocumentsTool<M> {
         retrieval: &RetrievalConfig,
     ) -> Self {
         let search = Self::new(db, embedding_model, retrieval);
-        let reranker: Arc<dyn Reranker> = match (retrieval.rerank, reranker_call, rerank_model) {
+        let reranker = match (retrieval.rerank, reranker_call, rerank_model) {
             (RerankMode::None, _, _) => return search,
-            (RerankMode::Model, Some(call), _) => Arc::new(ModelReranker::from_call(call)),
+            (RerankMode::Model, Some(call), _) => Arc::new(Reranker::model(call)),
             (RerankMode::Model, None, _) => {
                 tracing::warn!(
                     "rerank = \"model\" but the background call was not built; keeping the fused \
@@ -891,7 +875,7 @@ impl<M> SearchDocumentsTool<M> {
                 );
                 return search;
             }
-            (RerankMode::Reranker, _, Some(model)) => Arc::new(ScoredReranker::new(model)),
+            (RerankMode::Reranker, _, Some(model)) => Arc::new(Reranker::scored(model)),
             (RerankMode::Reranker, _, None) => {
                 tracing::warn!(
                     "rerank = \"reranker\" without a rerank model; keeping the fused order"
@@ -945,7 +929,7 @@ where
     M: EmbeddingModel + Send + Sync,
 {
     const NAME: &'static str = ToolName::SearchDocuments.as_str();
-    type Error = ToolError;
+    type Error = ToolExecutionError;
     type Args = SearchDocumentsArgs;
     type Output = String;
 
@@ -1007,7 +991,12 @@ where
                     .await
                 {
                     Ok(vector) => Some(vector),
-                    Err(e) => return Err(ToolError::Embedding(step.fail(e).to_string())),
+                    Err(e) => {
+                        return Err(ToolExecutionError::provider(format!(
+                            "embedding error: {}",
+                            step.fail(e)
+                        )));
+                    }
                 }
             }
         };
@@ -1065,7 +1054,7 @@ where
             .await
             .unwrap_or_default();
         let markers = turn.cite(&results);
-        format_search_results(&results, markers, &entities).map_err(Into::into)
+        format_search_results(&results, markers, &entities).map_err(format_failed)
     }
 }
 
@@ -1157,7 +1146,7 @@ pub struct ReadDocumentArgs {
 
 impl Tool for ReadDocumentTool {
     const NAME: &'static str = ToolName::ReadDocument.as_str();
-    type Error = ToolError;
+    type Error = ToolExecutionError;
     type Args = ReadDocumentArgs;
     type Output = String;
 
@@ -1243,19 +1232,22 @@ impl Tool for ReadDocumentTool {
         };
         let (first, last) = (first.chunk_index, last.chunk_index);
         let markers = turn.cite(&kept);
-        let mut out = format_search_results(&kept, markers, &BTreeMap::new())?;
+        let mut out =
+            format_search_results(&kept, markers, &BTreeMap::new()).map_err(format_failed)?;
         if i64::from(last).saturating_add(1) >= total {
             writeln!(
                 out,
                 "End of {filename}: chunks {first} to {last} of {total}."
-            )?;
+            )
+            .map_err(format_failed)?;
         } else {
             writeln!(
                 out,
                 "Chunks {first} to {last} of {total} in {filename}; call read_document again \
                  with from = {} for the rest.",
                 last.saturating_add(1)
-            )?;
+            )
+            .map_err(format_failed)?;
         }
         Ok(out)
     }
@@ -1295,7 +1287,7 @@ pub struct ViewImageArgs {
 
 impl Tool for ViewImageTool {
     const NAME: &'static str = ToolName::ViewImage.as_str();
-    type Error = ToolError;
+    type Error = ToolExecutionError;
     type Args = ViewImageArgs;
     type Output = String;
 
@@ -1394,7 +1386,7 @@ pub struct DescribeTableArgs {
 
 impl Tool for DescribeTableTool {
     const NAME: &'static str = ToolName::DescribeTable.as_str();
-    type Error = ToolError;
+    type Error = ToolExecutionError;
     type Args = DescribeTableArgs;
     type Output = String;
 
@@ -1440,14 +1432,14 @@ impl Tool for DescribeTableTool {
             Ok(d) => d,
             Err((message, tables)) => {
                 let message = step.fail(message);
-                return Ok(format!(
+                return Err(ToolExecutionError::not_found(format!(
                     "{SQL_ERROR_PREFIX}{message}\nTables in this workspace: {}",
                     if tables.is_empty() {
                         String::from("none")
                     } else {
                         tables.join(", ")
                     }
-                ));
+                )));
             }
         };
 
@@ -1464,7 +1456,7 @@ pub struct ListTablesTool(pub ReaderDb);
 
 impl Tool for ListTablesTool {
     const NAME: &'static str = ToolName::ListTables.as_str();
-    type Error = ToolError;
+    type Error = ToolExecutionError;
     type Args = NoArgs;
     type Output = String;
 
@@ -1512,8 +1504,8 @@ impl Tool for ListTablesTool {
         let mut output = String::from("Tables:\n");
         for (table, count) in &tables {
             match count {
-                Some(n) => writeln!(output, "- {table} ({n} rows)")?,
-                None => writeln!(output, "- {table}")?,
+                Some(n) => writeln!(output, "- {table} ({n} rows)").map_err(format_failed)?,
+                None => writeln!(output, "- {table}").map_err(format_failed)?,
             }
         }
         Ok(output)
@@ -1562,7 +1554,7 @@ where
     M: EmbeddingModel + Send + Sync,
 {
     const NAME: &'static str = ToolName::FindTables.as_str();
-    type Error = ToolError;
+    type Error = ToolExecutionError;
     type Args = FindTablesArgs;
     type Output = String;
 
@@ -1594,7 +1586,12 @@ where
                 .await
             {
                 Ok(vector) => Some(vector),
-                Err(e) => return Err(ToolError::Embedding(step.fail(e).to_string())),
+                Err(e) => {
+                    return Err(ToolExecutionError::provider(format!(
+                        "embedding error: {}",
+                        step.fail(e)
+                    )));
+                }
             },
         };
         let top_k = args
@@ -1635,18 +1632,21 @@ where
             let Ok(desc) = desc else {
                 continue;
             };
-            writeln!(output, "- {} ({} rows)", desc.table_name, desc.row_count)?;
+            writeln!(output, "- {} ({} rows)", desc.table_name, desc.row_count)
+                .map_err(format_failed)?;
             if let Some(note) = &desc.note {
-                writeln!(output, "  Note (from the owner): {}", OneLine(note))?;
+                writeln!(output, "  Note (from the owner): {}", OneLine(note))
+                    .map_err(format_failed)?;
             }
             for col in &desc.columns {
-                writeln!(output, "  - {}", ColumnLine(col))?;
+                writeln!(output, "  - {}", ColumnLine(col)).map_err(format_failed)?;
             }
             for flagged in &desc.warnings {
-                writeln!(output, "  ! {}: {}", flagged.column, flagged.warning)?;
+                writeln!(output, "  ! {}: {}", flagged.column, flagged.warning)
+                    .map_err(format_failed)?;
             }
             for measure in &desc.measures {
-                writeln!(output, "  measure {measure}")?;
+                writeln!(output, "  measure {measure}").map_err(format_failed)?;
             }
         }
         Ok(output)
@@ -1661,7 +1661,7 @@ pub struct ListDocumentsTool(pub ReaderDb);
 
 impl Tool for ListDocumentsTool {
     const NAME: &'static str = ToolName::ListDocuments.as_str();
-    type Error = ToolError;
+    type Error = ToolExecutionError;
     type Args = NoArgs;
     type Output = String;
 
@@ -1722,7 +1722,7 @@ impl Tool for ListDocumentsTool {
                 doc.status,
                 doc.mime_type.as_deref().unwrap_or("unknown"),
                 doc.source,
-            )?;
+            ).map_err(format_failed)?;
         }
         Ok(output)
     }
@@ -1812,7 +1812,7 @@ pub struct CreateChartArgs {
 
 impl Tool for CreateChartTool {
     const NAME: &'static str = ToolName::CreateChart.as_str();
-    type Error = ToolError;
+    type Error = ToolExecutionError;
     type Args = CreateChartArgs;
     type Output = String;
 
@@ -1876,7 +1876,12 @@ impl Tool for CreateChartTool {
         });
         let spec = match spec {
             Ok(spec) => spec,
-            Err(e) => return Ok(format!("Chart not created: {}", step.fail(e))),
+            Err(e) => {
+                return Err(ToolExecutionError::invalid_args(format!(
+                    "Chart not created: {}",
+                    step.fail(e)
+                )));
+            }
         };
 
         let summary = format!(
@@ -1998,7 +2003,7 @@ where
     M: EmbeddingModel + Send + Sync,
 {
     const NAME: &'static str = ToolName::SearchGraph.as_str();
-    type Error = ToolError;
+    type Error = ToolExecutionError;
     type Args = SearchGraphArgs;
     type Output = String;
 
@@ -2124,7 +2129,7 @@ where
     M: EmbeddingModel + Send + Sync,
 {
     const NAME: &'static str = ToolName::FindPath.as_str();
-    type Error = ToolError;
+    type Error = ToolExecutionError;
     type Args = FindPathArgs;
     type Output = String;
 
@@ -2224,7 +2229,7 @@ impl EmptyLookup<'_> {
 
     /// What the model is told: that the graph has only unreviewed matches,
     /// that it has nothing, or which labels to try instead.
-    fn text(&self) -> Result<String, ToolError> {
+    fn text(&self) -> Result<String, ToolExecutionError> {
         let suggestions = match self {
             Self::AllProvisional => {
                 return Ok(String::from(
@@ -2250,7 +2255,8 @@ impl EmptyLookup<'_> {
                 .map(|label| OneLine(label).to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
-        )?;
+        )
+        .map_err(format_failed)?;
         Ok(out)
     }
 }
@@ -2298,7 +2304,7 @@ async fn format_graph_result(
     result: &GraphResult,
     turn: &Turn,
     db: &ReaderDb,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecutionError> {
     turn.read_documents();
     let tree = result.to_string();
     let mut out = if tree.chars().count() > MAX_GRAPH_TEXT_CHARS {
@@ -2331,7 +2337,7 @@ async fn format_graph_result(
             out,
             "\n{out_of_scope} sources from documents outside this question's scope ({}) are not shown.",
             turn.scope().names()
-        )?;
+        ).map_err(format_failed)?;
     }
     if !chunks.is_empty() {
         let markers = turn.cite(&chunks);
@@ -2339,7 +2345,8 @@ async fn format_graph_result(
             out,
             "\nSources (cite with the [n] marker). {}",
             Fenced::NOTICE
-        )?;
+        )
+        .map_err(format_failed)?;
         for (i, chunk) in chunks.iter().enumerate() {
             let n = markers.nth(i);
             let excerpt: String = chunk.content.trim().chars().take(200).collect();
@@ -2348,10 +2355,10 @@ async fn format_graph_result(
                 heading: None,
                 ..ChunkLocation::from(chunk)
             };
-            writeln!(out, "[{n}] {location}:\n{}", Fenced(&excerpt))?;
+            writeln!(out, "[{n}] {location}:\n{}", Fenced(&excerpt)).map_err(format_failed)?;
         }
         if hidden_chunks > 0 {
-            writeln!(out, "... and {hidden_chunks} more sources")?;
+            writeln!(out, "... and {hidden_chunks} more sources").map_err(format_failed)?;
         }
     }
     let rows: std::collections::BTreeSet<String> = result
@@ -2384,7 +2391,8 @@ async fn format_graph_result(
             out,
             "\nFrom table rows (run_sql can read them): {}{more}",
             shown.join("; ")
-        )?;
+        )
+        .map_err(format_failed)?;
     }
     Ok(out)
 }
@@ -2406,7 +2414,7 @@ pub struct DescribeClassArgs {
 
 impl Tool for DescribeClassTool {
     const NAME: &'static str = ToolName::DescribeClass.as_str();
-    type Error = ToolError;
+    type Error = ToolExecutionError;
     type Args = DescribeClassArgs;
     type Output = String;
 

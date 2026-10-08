@@ -5,7 +5,7 @@ use super::*;
 use crate::analysis::chart::ChartKind;
 use crate::analysis::events::{self, AgentEvent, Delivery};
 use crate::analysis::policy::Approver;
-use crate::analysis::rerank::{RankFuture, Ranked};
+use crate::analysis::rerank::Ranked;
 use crate::embedding::{Dimension, Profile, Prompts};
 use crate::graph::store::NewNode;
 use crate::graph::{Properties, Standing};
@@ -524,7 +524,7 @@ async fn read(
     document: &str,
     from: Option<u32>,
     limit: Option<u32>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecutionError> {
     let retrieval = RetrievalConfig {
         pinned_token_budget: Tokens::new(budget),
         ..RetrievalConfig::default()
@@ -701,7 +701,7 @@ struct Gated {
 }
 
 impl Gated {
-    async fn check(&self, sql: &str) -> Result<Gate, ToolError> {
+    async fn check(&self, sql: &str) -> Result<Gate, ToolExecutionError> {
         self.gate.check(sql, &self.turn).await
     }
 }
@@ -771,7 +771,7 @@ async fn a_tool_called_outside_a_turn_says_so() {
     let tool = ListTablesTool(ReaderDb::new(shared_db()));
     let outcome = tool.call(&mut ToolContext::new(), NoArgs).await;
     assert!(
-        matches!(&outcome, Err(ToolError::Analysis(m)) if m.contains("outside an agent turn")),
+        matches!(&outcome, Err(e) if e.model_feedback().is_some_and(|m| m.contains("outside an agent turn"))),
         "{outcome:?}"
     );
     let (sink, _rx) = events::channel();
@@ -990,19 +990,10 @@ async fn gate_refuses_statements_that_create_temp_tables() {
 /// to it and the step says so (issue #63).
 #[tokio::test]
 async fn search_tool_runs_keyword_only_without_a_model_and_applies_the_reranker() {
-    struct Reverse;
-    impl Reranker for Reverse {
-        fn rank<'a>(
-            &'a self,
-            _query: &'a str,
-            candidates: &'a [ChunkSearchResult],
-        ) -> RankFuture<'a> {
-            Box::pin(async move { Ok((0..candidates.len()).rev().map(Ranked::at).collect()) })
-        }
-        fn name(&self) -> &'static str {
-            "reverse"
-        }
-    }
+    const REVERSE: Reranker = Reranker::Fixed {
+        name: "reverse",
+        rank: |candidates| Ok((0..candidates.len()).rev().map(Ranked::at).collect()),
+    };
     let db = shared_db();
     seed_hail_chunks(&db).await;
     let (sink, _rx) = events::channel();
@@ -1034,7 +1025,7 @@ async fn search_tool_runs_keyword_only_without_a_model_and_applies_the_reranker(
     let reranked =
         SearchDocumentsTool::<EmbedModel>::new(ReaderDb::new(Arc::clone(&db)), None, &retrieval())
             .with_reranker(Rerank {
-                reranker: Arc::new(Reverse),
+                reranker: Arc::new(REVERSE),
                 candidates: 5,
             });
     let text = reranked
@@ -1209,6 +1200,18 @@ async fn run_sql_flags_a_statement_repeated_with_other_literals() {
 /// The retry loop the prompt promises: a binder error, with `DuckDB`'s
 /// candidate bindings, comes back as tool text the model can act on
 /// rather than as a tool failure whose message rig withholds.
+/// What the model reads for a call that failed: rig shows it an explicitly
+/// built error's message.
+fn model_feedback(out: Result<String, ToolExecutionError>) -> String {
+    match out {
+        Ok(text) => fail_test(&format!("expected a tool error, got: {text}")),
+        Err(e) => e
+            .model_feedback()
+            .unwrap_or_else(|| fail_test(&format!("no model feedback on {e:?}")))
+            .to_owned(),
+    }
+}
+
 #[tokio::test]
 async fn run_sql_hands_duckdb_errors_to_the_model_with_candidate_bindings() {
     let (sink, _rx) = events::channel();
@@ -1229,10 +1232,7 @@ async fn run_sql_hands_duckdb_errors_to_the_model_with_candidate_bindings() {
             },
         )
         .await;
-    let text = match out {
-        Ok(text) => text,
-        Err(e) => fail_test(&format!("expected tool text, got error: {e}")),
-    };
+    let text = model_feedback(out);
     assert!(text.starts_with(SQL_ERROR_PREFIX), "{text}");
     assert!(text.contains("Candidate bindings"), "{text}");
     assert!(text.contains("trip_distance"), "{text}");
@@ -1252,10 +1252,7 @@ async fn run_sql_hands_duckdb_errors_to_the_model_with_candidate_bindings() {
             },
         )
         .await;
-    let text = match out {
-        Ok(text) => text,
-        Err(e) => fail_test(&format!("expected tool text, got error: {e}")),
-    };
+    let text = model_feedback(out);
     assert!(text.starts_with(SQL_ERROR_PREFIX), "{text}");
     assert!(text.contains("Tables in this workspace: trips"), "{text}");
 
@@ -1850,6 +1847,7 @@ async fn run_sql_keeps_the_first_rows_on_its_step() {
         "SELECT * FROM range(5) t(n) ORDER BY n",
         "SELECT * FROM no_such_table",
     ] {
+        // The failing statement's error is its step's outcome.
         drop(
             tool.call(
                 &mut turn.context(),
@@ -1857,8 +1855,7 @@ async fn run_sql_keeps_the_first_rows_on_its_step() {
                     query: String::from(sql),
                 },
             )
-            .await
-            .unwrap_or_else(|e| fail_test(&format!("{sql}: {e}"))),
+            .await,
         );
     }
     let steps = recorder.steps();

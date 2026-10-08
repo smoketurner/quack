@@ -892,7 +892,8 @@ impl SpokenText for Message {
                     _ => None,
                 })
                 .collect(),
-            Self::Assistant { content, .. } => content
+            Self::Assistant(turn) => turn
+                .content
                 .iter()
                 .filter_map(|part| match part {
                     AssistantContent::Text(text) => Some(text.text.as_str()),

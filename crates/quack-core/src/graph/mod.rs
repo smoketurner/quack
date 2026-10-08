@@ -19,6 +19,7 @@ pub mod tables;
 pub mod traverse;
 pub mod views;
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::error::{Error, Result as CoreResult};
@@ -104,10 +105,11 @@ const ALIASES: &str = "aliases";
 
 /// A node's or edge's properties: always an object. Whatever else a model
 /// answered or a column held reads as no properties, so no caller checks
-/// the shape again.
+/// the shape again. Sorted by name, so rendering and the stored form do not
+/// depend on the order a model or a row gave them in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(transparent)]
-pub struct Properties(serde_json::Map<String, serde_json::Value>);
+pub struct Properties(BTreeMap<String, serde_json::Value>);
 
 impl Properties {
     /// From a stored JSON column: `NULL` or text that does not parse is
@@ -221,7 +223,7 @@ impl Properties {
     /// The stored form, for the JSON column.
     #[must_use]
     pub fn to_json(&self) -> String {
-        serde_json::Value::Object(self.0.clone()).to_string()
+        serde_json::Value::Object(self.0.clone().into_iter().collect()).to_string()
     }
 
     /// One value, flattened and cut: arrays join their elements, strings
@@ -253,7 +255,7 @@ impl Properties {
 impl From<serde_json::Value> for Properties {
     fn from(value: serde_json::Value) -> Self {
         match value {
-            serde_json::Value::Object(map) => Self(map),
+            serde_json::Value::Object(map) => Self::from(map),
             serde_json::Value::Null
             | serde_json::Value::Bool(_)
             | serde_json::Value::Number(_)
@@ -265,7 +267,7 @@ impl From<serde_json::Value> for Properties {
 
 impl From<serde_json::Map<String, serde_json::Value>> for Properties {
     fn from(map: serde_json::Map<String, serde_json::Value>) -> Self {
-        Self(map)
+        Self(map.into_iter().collect())
     }
 }
 
