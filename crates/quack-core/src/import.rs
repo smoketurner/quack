@@ -2,30 +2,37 @@
 //! (design doc 6.2, issue #21): the scanner and httpfs extensions cannot
 //! be compiled into the static binary, so rows are pulled here and loaded
 //! as a workspace table through the same path a CSV upload takes. Sources:
-//! Postgres and SQLite through sqlx (every column cast to text on the
-//! source side, so any type comes through), and a CSV, Parquet, JSON, or
-//! workbook file over HTTP(S) through reqwest. Credentials in the URL are
-//! used once and never stored: the document row and the audit detail
-//! carry the redacted URL.
+//! a SQLite file through sqlx, opened read-only (every column cast to text
+//! on the source side, so any type comes through), and a CSV, Parquet,
+//! JSON, or workbook file over HTTP(S) through reqwest, with any headers
+//! the caller gives, or from Amazon S3 (`s3`). Credentials in the URL or a
+//! header are used once and never stored: the document row and the audit
+//! detail carry the redacted URL and the headers' names.
 
 use std::fmt::{self, Write as _};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::str::FromStr;
 use std::time::Duration;
+
+use http::{HeaderName, HeaderValue, StatusCode};
 
 use crate::embedding::EmbeddingModel;
 use futures::TryStreamExt as _;
+use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{
-    AssertSqlSafe, Column, Connection as _, Executor as _, Row, SqlSafeStr as _, Statement as _,
+    AssertSqlSafe, Column, ConnectOptions as _, Executor as _, Row, SqlSafeStr as _, Statement as _,
 };
 
 use crate::config::Config;
 use crate::embedding::Embedder;
 use crate::error::{Error, Result};
 use crate::ids::DocumentId;
-use crate::ingestion::parser::{FileType, Load};
+use crate::ingestion::parser::FileType;
 use crate::ingestion::{self, IngestOutcome, NewFile, TableName};
 use crate::progress::RunControl;
+use crate::proxy::{Proxies, Route};
+use crate::storage::profile::{ColumnTypes, TableProfile};
 use crate::storage::workspace::{DocumentSource, WorkspaceDb, quote_ident};
 use crate::storage::writer::Writer;
 
@@ -40,6 +47,127 @@ pub struct ImportRequest {
     pub source_table: Option<String>,
     /// Rows to pull at most; capped by `[import].max_rows`.
     pub limit: Option<u64>,
+    /// Types to give the loaded table's columns.
+    pub types: ColumnTypes,
+    /// Headers an HTTP(S) download sends.
+    pub headers: Vec<SourceHeader>,
+    /// Where a JSON download's rows sit, when an envelope wraps them.
+    pub json_pointer: Option<JsonPointer>,
+    /// The document a refresh replaces: it keeps serving until the new
+    /// rows are ready, and identical rows leave it in place.
+    pub replaces: Option<DocumentId>,
+}
+
+/// One header an HTTP(S) download sends. `Debug` shows only the name, so a
+/// token never reaches a log.
+#[derive(Clone)]
+pub enum SourceHeader {
+    /// A header sent as given: `Name: value`.
+    Given {
+        name: HeaderName,
+        value: HeaderValue,
+    },
+    /// `Authorization: Bearer` with a token read from this process's
+    /// environment variable when the download starts, never stored.
+    BearerEnv(String),
+}
+
+impl fmt::Debug for SourceHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Given { name, .. } => write!(f, "{name}: ***"),
+            Self::BearerEnv(variable) => write!(f, "authorization: Bearer ${variable}"),
+        }
+    }
+}
+
+/// `Name: value`, as `curl -H` takes it.
+impl FromStr for SourceHeader {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let (name, value) = text
+            .split_once(':')
+            .ok_or_else(|| Error::Ingestion(String::from("a header is NAME: VALUE")))?;
+        let name = HeaderName::from_str(name.trim())
+            .map_err(|e| Error::Ingestion(format!("bad header name: {e}")))?;
+        let mut value = HeaderValue::from_str(value.trim())
+            .map_err(|_| Error::Ingestion(format!("bad value for header {name}")))?;
+        value.set_sensitive(true);
+        Ok(Self::Given { name, value })
+    }
+}
+
+impl SourceHeader {
+    /// The header's name, which is all an audit row records.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Given { name, .. } => name.as_str(),
+            Self::BearerEnv(_) => "authorization",
+        }
+    }
+
+    /// The header to send; `variable` looks up an environment variable.
+    fn resolve(
+        &self,
+        variable: impl Fn(&str) -> Option<String>,
+    ) -> Result<(HeaderName, HeaderValue)> {
+        match self {
+            Self::Given { name, value } => Ok((name.clone(), value.clone())),
+            Self::BearerEnv(name) => {
+                let token = variable(name)
+                    .filter(|token| !token.trim().is_empty())
+                    .ok_or_else(|| Error::Ingestion(format!("{name} is not set")))?;
+                let mut value = HeaderValue::from_str(&format!("Bearer {}", token.trim()))
+                    .map_err(|_| Error::Ingestion(format!("{name} is not a usable token")))?;
+                value.set_sensitive(true);
+                Ok((http::header::AUTHORIZATION, value))
+            }
+        }
+    }
+}
+
+/// Where a JSON document's rows sit (RFC 6901): `/data/items` for
+/// `{"data": {"items": [...]}}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonPointer(String);
+
+impl FromStr for JsonPointer {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let text = text.trim();
+        if !text.is_empty() && !text.starts_with('/') {
+            return Err(Error::Ingestion(format!(
+                "a JSON pointer starts with / (RFC 6901), as /data/items; got {text}"
+            )));
+        }
+        Ok(Self(text.to_owned()))
+    }
+}
+
+impl fmt::Display for JsonPointer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl JsonPointer {
+    /// The array of rows this points at inside `document`, as JSON.
+    fn rows(&self, document: &[u8]) -> Result<Vec<u8>> {
+        let value: serde_json::Value = serde_json::from_slice(document)
+            .map_err(|e| Error::Ingestion(format!("the download is not JSON: {e}")))?;
+        let rows = value
+            .pointer(&self.0)
+            .ok_or_else(|| Error::Ingestion(format!("the JSON has nothing at {self}")))?;
+        if !rows.is_array() {
+            return Err(Error::Ingestion(format!(
+                "the JSON at {self} is not an array of rows"
+            )));
+        }
+        Ok(serde_json::to_vec(rows)?)
+    }
 }
 
 /// Which sources a caller may reach (issue #42). The owner's interfaces
@@ -50,6 +178,17 @@ pub struct ImportPolicy {
     /// `sqlite:` paths on the local disk.
     pub local_files: bool,
     pub hosts: HostReach,
+    pub credentials: CredentialReach,
+}
+
+/// Whether an import may authenticate as this process: S3 with its AWS
+/// identity, or a bearer token from its environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialReach {
+    /// The process's own credentials.
+    Process,
+    /// Only what the caller gives in the URL or a header.
+    CallerOnly,
 }
 
 /// Which HTTP(S) hosts a download may reach.
@@ -71,6 +210,7 @@ impl ImportPolicy {
         Self {
             local_files: true,
             hosts: HostReach::Any,
+            credentials: CredentialReach::Process,
         }
     }
 
@@ -83,6 +223,11 @@ impl ImportPolicy {
                 HostReach::Any
             } else {
                 HostReach::PublicOnly
+            },
+            credentials: if config.import.allow_server_credentials {
+                CredentialReach::Process
+            } else {
+                CredentialReach::CallerOnly
             },
         }
     }
@@ -102,7 +247,7 @@ pub struct Importing<'a, M> {
 }
 
 /// What an import did.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct ImportSummary {
     pub table: String,
     pub rows: u64,
@@ -110,19 +255,30 @@ pub struct ImportSummary {
     /// The source with any password removed.
     pub source: String,
     pub document_id: DocumentId,
+    pub status: LoadStatus,
+}
+
+/// Whether an import loaded rows, or found its source as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadStatus {
+    Loaded,
+    /// A refresh found the same bytes as the document it replaces, and
+    /// left that document and its table in place.
+    Unchanged,
 }
 
 /// The kind of source a URL names.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
-    Postgres,
     Sqlite,
     Http,
+    S3,
 }
 
-/// A source URL: `postgres://...`, `sqlite://path` or `sqlite:path`, or an
-/// `http(s)://` URL of a data file. It can carry a password, so `Debug`
-/// and `Display` show it redacted; only [`SourceUrl::expose`] gives the
+/// A source URL: `sqlite://path` or `sqlite:path`, an `http(s)://` URL of a
+/// data file, or `s3://bucket/key`. It can carry a password, so `Debug`
+/// and `Display` show it redacted; only `SourceUrl::expose` gives the
 /// whole of it, to connect with.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SourceUrl(String);
@@ -165,20 +321,15 @@ impl SourceUrl {
     /// Returns an error for a scheme quack does not import from.
     pub fn kind(&self) -> Result<SourceKind> {
         let lower = self.0.trim().to_ascii_lowercase();
-        if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
-            Ok(SourceKind::Postgres)
-        } else if lower.starts_with("sqlite:") {
+        if lower.starts_with("sqlite:") {
             Ok(SourceKind::Sqlite)
         } else if lower.starts_with("http://") || lower.starts_with("https://") {
             Ok(SourceKind::Http)
-        } else if lower.starts_with("mysql://") || lower.starts_with("s3://") {
-            Err(Error::Ingestion(format!(
-                "{} sources are not supported yet; Postgres, SQLite, and HTTP(S) files are",
-                lower.split("://").next().unwrap_or("such")
-            )))
+        } else if lower.starts_with("s3://") {
+            Ok(SourceKind::S3)
         } else {
             Err(Error::Ingestion(String::from(
-                "the source must be a postgres://, sqlite:, or http(s):// URL",
+                "the source must be a sqlite: file, an http(s):// data file, or s3://bucket/key",
             )))
         }
     }
@@ -202,9 +353,10 @@ impl SourceUrl {
         let Ok(mut parsed) = reqwest::Url::parse(url) else {
             return mask_userinfo(url);
         };
-        if parsed.username().is_empty() && parsed.password().is_none() {
-            // No credentials to redact: keep the URL verbatim so sqlite
-            // paths and `@`-in-path/query URLs are unchanged (the old
+        if parsed.password().is_none() {
+            // No password to redact: keep the URL verbatim, a username
+            // included, which names an account and is no secret. sqlite
+            // paths and `@`-in-path/query URLs stay unchanged too (the old
             // first-`@` split corrupted the latter with a spurious `:***`).
             return url.to_owned();
         }
@@ -317,13 +469,18 @@ impl<M: EmbeddingModel> Importing<'_, M> {
     pub async fn run(self) -> Result<ImportSummary> {
         let (config, db, request) = (self.config, self.db, self.request);
         let table = TableName::given(&request.table)?;
+        table.check_unreserved()?;
         let limit = request
             .limit
             .unwrap_or(config.import.max_rows)
             .min(config.import.max_rows)
             .max(1);
         let source = request.url.redacted();
-        let pulled = self.pull(&table, limit).await?;
+        request.check(request.url.kind()?, self.policy)?;
+        let mut pulled = self.pull(&table, limit).await?;
+        if let Some(pointer) = &request.json_pointer {
+            pulled.bytes = pointer.rows(&pulled.bytes)?;
+        }
         let outcome = ingestion::ingest_file(
             config,
             db,
@@ -331,12 +488,37 @@ impl<M: EmbeddingModel> Importing<'_, M> {
             &NewFile::new(&pulled.filename, &pulled.bytes)
                 .source(DocumentSource::Import)
                 .title(Some(&source))
+                .types(request.types.clone())
+                .replaces(request.replaces.as_ref())
                 .control(self.control),
             self.embedder,
         )
         .await?;
         let result = match outcome {
             IngestOutcome::Ingested(result) => result,
+            IngestOutcome::Duplicate(existing)
+                if request.replaces.as_ref() == Some(&existing.id) =>
+            {
+                let table = existing
+                    .tables
+                    .as_ref()
+                    .and_then(|tables| tables.first())
+                    .cloned()
+                    .unwrap_or_else(|| table.as_str().to_owned());
+                let described = {
+                    let table = table.clone();
+                    db.run(move |db| db.describe_table(&table)).await?
+                };
+                tracing::info!(table = %table, source = %source, "the import's source is unchanged");
+                return Ok(ImportSummary {
+                    table,
+                    rows: u64::try_from(described.row_count).unwrap_or(0),
+                    columns: described.columns.into_iter().map(|c| c.name).collect(),
+                    source,
+                    document_id: existing.id,
+                    status: LoadStatus::Unchanged,
+                });
+            }
             IngestOutcome::Duplicate(existing) => {
                 return Err(Error::Ingestion(format!(
                     "the source's rows are identical to document {} ({}); delete it first to reload",
@@ -356,8 +538,12 @@ impl<M: EmbeddingModel> Importing<'_, M> {
             }
         } else {
             let table = loaded.clone();
-            db.run(move |db| cap_loaded_table(db, &table, limit))
-                .await?
+            db.run(move |db| {
+                let kept = cap_loaded_table(db, &table, limit)?;
+                TableProfile::refresh_or_warn(db, &table);
+                Ok(kept)
+            })
+            .await?
         };
         tracing::info!(table = %loaded, rows, source = %source, "imported external data");
         Ok(ImportSummary {
@@ -366,6 +552,7 @@ impl<M: EmbeddingModel> Importing<'_, M> {
             columns,
             source,
             document_id: result.document_id,
+            status: LoadStatus::Loaded,
         })
     }
 
@@ -375,15 +562,27 @@ impl<M: EmbeddingModel> Importing<'_, M> {
         let (config, request, policy, control) =
             (self.config, self.request, self.policy, self.control);
         let timeout = config.import.timeout();
+        let download = Download {
+            timeout,
+            max_mb: config.import.max_download_mb,
+            hosts: policy.hosts,
+            proxies: Proxies::from_env(),
+        };
         match request.url.kind()? {
             SourceKind::Http => {
-                let download = Download {
-                    timeout,
-                    max_mb: config.import.max_download_mb,
-                    hosts: policy.hosts,
-                };
+                let headers = request
+                    .headers
+                    .iter()
+                    .map(|header| header.resolve(|name| std::env::var(name).ok()))
+                    .collect::<Result<Vec<_>>>()?;
                 control
-                    .or_cancelled(download.fetch(&request.url, table.as_str()))
+                    .or_cancelled(download.fetch(&request.url, table.as_str(), headers))
+                    .await
+            }
+            SourceKind::S3 => {
+                let object = S3Object::parse(&request.url)?;
+                control
+                    .or_cancelled(download.fetch_s3(&object, table.as_str()))
                     .await
             }
             SourceKind::Sqlite if !policy.local_files => Err(Error::Ingestion(String::from(
@@ -396,17 +595,20 @@ impl<M: EmbeddingModel> Importing<'_, M> {
                      cannot be imported into a workspace",
                 )))
             }
-            SourceKind::Postgres | SourceKind::Sqlite => {
+            SourceKind::Sqlite => {
                 let sql = request.source_query()?;
                 let fetch = async {
-                    tokio::time::timeout(timeout, fetch_rows(request.url.expose(), &sql, limit))
-                        .await
-                        .map_err(|_| {
-                            Error::Ingestion(format!(
-                                "the source did not answer within {} s",
-                                timeout.as_secs()
-                            ))
-                        })?
+                    tokio::time::timeout(
+                        timeout,
+                        fetch_rows(request.url.sqlite_path(), &sql, limit),
+                    )
+                    .await
+                    .map_err(|_| {
+                        Error::Ingestion(format!(
+                            "the source did not answer within {} s",
+                            timeout.as_secs()
+                        ))
+                    })?
                 };
                 let fetched = control.or_cancelled(fetch).await?;
                 Ok(Pulled {
@@ -447,6 +649,53 @@ fn cap_loaded_table(db: &WorkspaceDb, table: &str, limit: u64) -> Result<KeptRow
 }
 
 impl ImportRequest {
+    /// An import of `url` into `table`, with no query, source table, limit,
+    /// types, headers, or JSON pointer yet.
+    #[must_use]
+    pub fn new(url: impl Into<SourceUrl>, table: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            table: table.into(),
+            query: None,
+            source_table: None,
+            limit: None,
+            types: ColumnTypes::default(),
+            headers: Vec::new(),
+            json_pointer: None,
+            replaces: None,
+        }
+    }
+
+    /// Refuse options the source cannot take, and credentials the caller
+    /// may not use: S3 signs with this process's AWS identity, and a bearer
+    /// token from the environment is this process's secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ServerCredentials`] for credentials the policy does
+    /// not cover, and an ingestion error for a misplaced option.
+    pub fn check(&self, kind: SourceKind, policy: ImportPolicy) -> Result<()> {
+        if !self.headers.is_empty() && kind != SourceKind::Http {
+            return Err(Error::Ingestion(String::from(
+                "headers go with an http(s):// source",
+            )));
+        }
+        if self.json_pointer.is_some() && kind == SourceKind::Sqlite {
+            return Err(Error::Ingestion(String::from(
+                "a JSON pointer goes with a downloaded JSON file",
+            )));
+        }
+        let process_credentials = kind == SourceKind::S3
+            || self
+                .headers
+                .iter()
+                .any(|header| matches!(header, SourceHeader::BearerEnv(_)));
+        if process_credentials && policy.credentials == CredentialReach::CallerOnly {
+            return Err(Error::ServerCredentials);
+        }
+        Ok(())
+    }
+
     /// The inner query the source runs: the caller's, or the whole source
     /// table.
     fn source_query(&self) -> Result<String> {
@@ -484,11 +733,15 @@ struct Fetched {
     rows: u64,
 }
 
-async fn fetch_rows(url: &str, inner: &str, limit: u64) -> Result<Fetched> {
-    sqlx::any::install_default_drivers();
-    let mut conn = sqlx::AnyConnection::connect(url)
+async fn fetch_rows(path: &Path, inner: &str, limit: u64) -> Result<Fetched> {
+    // Read-only, and opened by path rather than parsed from a URL, so a
+    // Windows path needs no rewriting and the source is never changed.
+    let mut conn = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .connect()
         .await
-        .map_err(|e| Error::Ingestion(format!("cannot connect to the source: {e}")))?;
+        .map_err(|e| Error::Ingestion(format!("cannot open the source: {e}")))?;
     let probe = format!("SELECT * FROM ({inner}) AS quack_q LIMIT 0");
     let prepared = (&mut conn)
         .prepare(AssertSqlSafe(probe).into_sql_str())
@@ -542,28 +795,21 @@ async fn fetch_rows(url: &str, inner: &str, limit: u64) -> Result<Fetched> {
 }
 
 /// How a download is bounded.
-struct Download {
+struct Download<'a> {
     timeout: Duration,
     max_mb: u64,
     hosts: HostReach,
+    proxies: &'a Proxies,
 }
 
-impl Download {
-    /// Download a data file; the workspace file name keeps the URL's
-    /// extension so the usual reader loads it, under the requested table name.
-    ///
-    /// When only public hosts may be reached, the name is resolved first,
-    /// every address is checked, and the connection is pinned to those
-    /// addresses so a second lookup cannot answer differently.
-    async fn fetch(&self, url: &SourceUrl, table: &str) -> Result<Pulled> {
-        let download = self;
-        let url = url.expose();
-        // The same extensions `quack ingest` loads as tables.
-        let extension = url
-            .split(['?', '#'])
+impl Download<'_> {
+    /// The extension of `name` when `quack ingest` loads it as a table, so
+    /// the usual reader takes the download under the requested table name.
+    fn table_extension(name: &str) -> Result<String> {
+        name.split(['?', '#'])
             .next()
             .and_then(|path| path.rsplit('/').next())
-            .filter(|name| FileType::of(name).is_some_and(|t| !matches!(t.load(), Load::Chunks(_))))
+            .filter(|name| FileType::of(name).is_some_and(|t| t.load().makes_tables()))
             .and_then(|name| name.rsplit_once('.'))
             .map(|(_, ext)| ext.to_ascii_lowercase())
             .ok_or_else(|| {
@@ -571,34 +817,108 @@ impl Download {
                     .map(|e| format!(".{e}"))
                     .collect();
                 Error::Ingestion(format!(
-                    "the URL must name a table file ending in {}",
+                    "the source must name a table file ending in {}",
                     accepted.join(", ")
                 ))
-            })?;
-        let parsed =
-            reqwest::Url::parse(url).map_err(|e| Error::Ingestion(format!("bad URL: {e}")))?;
-        let mut builder = reqwest::Client::builder().timeout(download.timeout);
-        if download.hosts == HostReach::PublicOnly {
-            let host = parsed
+            })
+    }
+
+    /// Download the data file at `url`, sending `headers`.
+    async fn fetch(
+        &self,
+        url: &SourceUrl,
+        table: &str,
+        headers: Vec<(HeaderName, HeaderValue)>,
+    ) -> Result<Pulled> {
+        let extension = Self::table_extension(url.expose())?;
+        let parsed = reqwest::Url::parse(url.expose())
+            .map_err(|e| Error::Ingestion(format!("bad URL: {e}")))?;
+        let response = self.get(parsed, headers).await?;
+        Ok(Pulled {
+            filename: format!("{table}.{extension}"),
+            bytes: self.body(response).await?,
+            columns: Vec::new(),
+            rows: None,
+        })
+    }
+
+    /// Download an S3 object. A bucket in another region than the
+    /// configured one answers 301 with its region; the GET is signed again
+    /// for that region once.
+    async fn fetch_s3(&self, object: &S3Object, table: &str) -> Result<Pulled> {
+        const BUCKET_REGION: &str = "x-amz-bucket-region";
+        let extension = Self::table_extension(object.key())?;
+        let signed = Box::pin(object.signed_get(self.proxies, None)).await?;
+        let mut response = self.get(signed.url, signed.headers).await?;
+        if response.status() == StatusCode::MOVED_PERMANENTLY
+            && let Some(region) = response
+                .headers()
+                .get(BUCKET_REGION)
+                .and_then(|region| region.to_str().ok())
+                .map(str::to_owned)
+        {
+            let signed = Box::pin(object.signed_get(self.proxies, Some(&region))).await?;
+            response = self.get(signed.url, signed.headers).await?;
+        }
+        Ok(Pulled {
+            filename: format!("{table}.{extension}"),
+            bytes: self.body(response).await?,
+            columns: Vec::new(),
+            rows: None,
+        })
+    }
+
+    /// Send a GET for `url` with `headers`; the response comes back whatever
+    /// its status.
+    ///
+    /// When only public hosts may be reached, the name is resolved first,
+    /// every address is checked, and the connection is pinned to those
+    /// addresses so a second lookup cannot answer differently. Through a
+    /// proxy the proxy resolves the name, and may be the only resolver that
+    /// can, so only an address written in the URL is checked here.
+    async fn get(
+        &self,
+        url: reqwest::Url,
+        headers: Vec<(HeaderName, HeaderValue)>,
+    ) -> Result<reqwest::Response> {
+        let mut builder = self.proxies.client().timeout(self.timeout);
+        if self.hosts == HostReach::PublicOnly {
+            let host = url
                 .host_str()
                 .ok_or_else(|| Error::Ingestion(String::from("the URL has no host")))?;
-            let port = parsed
+            let port = url
                 .port_or_known_default()
                 .ok_or_else(|| Error::Ingestion(String::from("the URL has no port")))?;
-            let addresses = public_addresses(host, port).await?;
-            builder = builder.resolve_to_addrs(host, &addresses);
-        }
-        if download.hosts == HostReach::PublicOnly {
+            match self.proxies.route(&url) {
+                Route::Direct => {
+                    let addresses = public_addresses(host, port).await?;
+                    builder = builder.resolve_to_addrs(host, &addresses);
+                }
+                Route::Proxied => {
+                    // An IPv6 host is bracketed in a URL.
+                    let literal = host.trim_start_matches('[').trim_end_matches(']');
+                    if let Ok(ip) = literal.parse::<IpAddr>() {
+                        refuse_private(host, ip)?;
+                    }
+                }
+            }
             builder = builder.redirect(reqwest::redirect::Policy::none());
         }
         let client = builder
             .build()
             .map_err(|e| Error::Ingestion(e.to_string()))?;
-        let mut response = client
-            .get(parsed)
+        let mut request = client.get(url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        request
             .send()
             .await
-            .map_err(|e| Error::Ingestion(format!("download failed: {e}")))?;
+            .map_err(|e| Error::Ingestion(format!("download failed: {e}")))
+    }
+
+    /// A successful response's body, within `[import].max_download_mb`.
+    async fn body(&self, mut response: reqwest::Response) -> Result<Vec<u8>> {
         if response.status().is_redirection() {
             return Err(Error::Ingestion(format!(
                 "download failed: the server answered {}; import the URL it points to",
@@ -611,11 +931,11 @@ impl Download {
                 response.status()
             )));
         }
-        let max_bytes = download.max_mb.saturating_mul(1024 * 1024);
+        let max_bytes = self.max_mb.saturating_mul(1024 * 1024);
         let too_large = || {
             Error::Ingestion(format!(
                 "the file is larger than [import].max_download_mb ({} MB)",
-                download.max_mb
+                self.max_mb
             ))
         };
         if response
@@ -636,12 +956,7 @@ impl Download {
             }
             bytes.extend_from_slice(&chunk);
         }
-        Ok(Pulled {
-            filename: format!("{table}.{extension}"),
-            bytes,
-            columns: Vec::new(),
-            rows: None,
-        })
+        Ok(bytes)
     }
 }
 
@@ -654,14 +969,20 @@ async fn public_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     if addresses.is_empty() {
         return Err(Error::Ingestion(format!("cannot resolve {host}")));
     }
-    if let Some(private) = addresses.iter().find(|a| is_private_address(a.ip())) {
-        return Err(Error::Ingestion(format!(
-            "{host} resolves to {}, a private address; the server does not import from \
-             its own network (set [import].allow_private_hosts to allow it)",
-            private.ip()
-        )));
+    for address in &addresses {
+        refuse_private(host, address.ip())?;
     }
     Ok(addresses)
+}
+
+fn refuse_private(host: &str, ip: IpAddr) -> Result<()> {
+    if is_private_address(ip) {
+        return Err(Error::Ingestion(format!(
+            "{host} resolves to {ip}, a private address; the server does not import from \
+             its own network (set [import].allow_private_hosts to allow it)"
+        )));
+    }
+    Ok(())
 }
 
 /// Loopback, unspecified, link-local (cloud metadata lives at
@@ -692,567 +1013,11 @@ fn is_private_address(ip: IpAddr) -> bool {
     }
 }
 
+mod s3;
+mod saved;
+
+use s3::S3Object;
+pub use saved::{ImportSecrets, KeepSecret, RefreshWith, SavedImport};
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::llm::Embeddings;
-
-    #[test]
-    fn urls_classify_and_redact() {
-        assert_eq!(
-            SourceUrl::from("postgres://u:p@h/db").kind().ok(),
-            Some(SourceKind::Postgres)
-        );
-        assert_eq!(
-            SourceUrl::from("sqlite:/tmp/x.db").kind().ok(),
-            Some(SourceKind::Sqlite)
-        );
-        assert_eq!(
-            SourceUrl::from("https://x/y.csv").kind().ok(),
-            Some(SourceKind::Http)
-        );
-        assert!(SourceUrl::from("mysql://h/db").kind().is_err());
-        assert!(SourceUrl::from("ftp://h/f").kind().is_err());
-        assert_eq!(
-            SourceUrl::from("postgres://alice:secret@db.local:5432/sales").redacted(),
-            "postgres://alice:***@db.local:5432/sales"
-        );
-        assert_eq!(
-            SourceUrl::from("postgres://db.local/sales").redacted(),
-            "postgres://db.local/sales"
-        );
-        assert_eq!(
-            SourceUrl::from("sqlite:/tmp/x.db").redacted(),
-            "sqlite:/tmp/x.db"
-        );
-    }
-
-    /// A raw `@` in the password must not leak its suffix, an `@` in the
-    /// path or query of a URL with no user info must not gain a spurious
-    /// `:***`, and the empty-username `:password@` shape still drops the
-    /// whole user info.
-    #[test]
-    fn redaction_drops_the_whole_password_and_keeps_non_userinfo_urls() {
-        // Passwords carrying a raw `@`: the whole password is gone.
-        assert_eq!(
-            SourceUrl::from("postgres://user:p@ss@host/db").redacted(),
-            "postgres://user:***@host/db"
-        );
-        assert_eq!(
-            SourceUrl::from("postgres://user:p@ss@10.255.255.1:1/db").redacted(),
-            "postgres://user:***@10.255.255.1:1/db"
-        );
-        // A percent-encoded `@` already redacted correctly; it still does.
-        assert_eq!(
-            SourceUrl::from("postgres://user:p%40ss@host/db").redacted(),
-            "postgres://user:***@host/db"
-        );
-        // Username only: the marker password is inserted, as before.
-        assert_eq!(
-            SourceUrl::from("postgres://alice@db.local/sales").redacted(),
-            "postgres://alice:***@db.local/sales"
-        );
-        // Empty username with a password: the user info is dropped.
-        assert_eq!(
-            SourceUrl::from("postgres://:secret@host/db").redacted(),
-            "postgres://host/db"
-        );
-        assert_eq!(
-            SourceUrl::from("postgres://:p@ss@host/db").redacted(),
-            "postgres://host/db"
-        );
-        assert_eq!(
-            SourceUrl::from("postgres://:secret@[::1]:5432/db?x=1#f").redacted(),
-            "postgres://[::1]:5432/db?x=1#f"
-        );
-        // An `@` in the path or query with no user info is left untouched.
-        assert_eq!(
-            SourceUrl::from("https://example.com/data@2024/sales.csv").redacted(),
-            "https://example.com/data@2024/sales.csv"
-        );
-        assert_eq!(
-            SourceUrl::from("https://example.com/search?q=foo@bar").redacted(),
-            "https://example.com/search?q=foo@bar"
-        );
-        // No credentials and a non-special scheme round-trip verbatim,
-        // including a mixed-case scheme (no parser normalization here).
-        assert_eq!(
-            SourceUrl::from("SQLite:/tmp/x.db?mode=ro").redacted(),
-            "SQLite:/tmp/x.db?mode=ro"
-        );
-        assert_eq!(
-            SourceUrl::from("sqlite://a/b.db?x=1").redacted(),
-            "sqlite://a/b.db?x=1"
-        );
-    }
-
-    /// URLs `Url::parse` rejects never come back verbatim: a raw `/`, `?`, or
-    /// `#` in the password, or an invalid port, is masked from `://` to the
-    /// last `@`, and no fragment of the password survives.
-    #[test]
-    fn unparseable_urls_never_leak_the_password() {
-        for (url, password, expected) in [
-            (
-                "postgres://user:pa/ss@host/db",
-                "pa/ss",
-                "postgres://user:***@host/db",
-            ),
-            (
-                "postgres://user:pa?ss@host/db",
-                "pa?ss",
-                "postgres://user:***@host/db",
-            ),
-            (
-                "postgres://user:pa#ss@host/db",
-                "pa#ss",
-                "postgres://user:***@host/db",
-            ),
-            (
-                "postgres://user:s3cr3t@host:99999/db",
-                "s3cr3t",
-                "postgres://user:***@host:99999/db",
-            ),
-            (
-                "postgres://user:s3cr3t@host:port/db",
-                "s3cr3t",
-                "postgres://user:***@host:port/db",
-            ),
-            (
-                "postgres://:pa/ss@host/db",
-                "pa/ss",
-                "postgres://***@host/db",
-            ),
-            (
-                "postgres://user:pa/ss@p@host:1/db",
-                "pa/ss@p",
-                "postgres://user:***@host:1/db",
-            ),
-        ] {
-            assert!(reqwest::Url::parse(url).is_err(), "{url} should not parse");
-            let red = SourceUrl::from(url).redacted();
-            assert_eq!(red, expected, "{url}");
-            for fragment in [password, "pa", "ss", "s3cr3t"] {
-                assert!(
-                    !red.contains(fragment),
-                    "{url}: password fragment {fragment:?} leaked into {red}"
-                );
-            }
-        }
-    }
-
-    /// The fallback leaves strings with no user info alone.
-    #[test]
-    fn masking_leaves_strings_without_user_info_unchanged() {
-        assert_eq!(mask_userinfo("not a url"), "not a url");
-        assert_eq!(
-            mask_userinfo("postgres://host:99999/db"),
-            "postgres://host:99999/db"
-        );
-        assert_eq!(mask_userinfo("sqlite:/tmp/a@b.db"), "sqlite:/tmp/a@b.db");
-    }
-
-    /// The redacted value holds none of the password and reparses to the
-    /// same host and path as the URL the import actually connects through.
-    #[expect(clippy::unwrap_used, reason = "test fixtures are known-good URLs")]
-    #[test]
-    fn redacted_url_reparses_to_the_same_host_with_no_password() {
-        for url in [
-            "postgres://user:p@ss@host/db",
-            "postgres://user:p@ss@10.255.255.1:1/db",
-            "postgres://alice:secret@db.local:5432/sales",
-            "postgres://:secret@host/db",
-            "postgres://:p@ss@host/db",
-        ] {
-            let red = SourceUrl::from(url).redacted();
-            assert!(!red.contains("secret"), "{url}: secret leaked into {red}");
-            assert!(!red.contains("p@ss"), "{url}: password leaked into {red}");
-            assert!(!red.contains("ss@"), "{url}: '@' suffix leaked into {red}");
-            let real = reqwest::Url::parse(url).unwrap();
-            let redacted = reqwest::Url::parse(&red).unwrap();
-            assert_eq!(real.host_str(), redacted.host_str(), "{url}: host changed");
-            assert_eq!(real.path(), redacted.path(), "{url}: path changed");
-        }
-    }
-
-    #[test]
-    fn queries_come_from_the_request_and_tables_are_checked() {
-        let base = ImportRequest {
-            url: SourceUrl::from(""),
-            table: String::from("t"),
-            query: None,
-            source_table: None,
-            limit: None,
-        };
-        assert!(base.source_query().is_err());
-        let by_table = ImportRequest {
-            source_table: Some(String::from("public.orders")),
-            ..base.clone()
-        };
-        assert_eq!(
-            by_table.source_query().ok().as_deref(),
-            Some("SELECT * FROM public.orders")
-        );
-        let bad = ImportRequest {
-            source_table: Some(String::from("orders; DROP TABLE x")),
-            ..base.clone()
-        };
-        assert!(bad.source_query().is_err());
-        let by_query = ImportRequest {
-            query: Some(String::from(" SELECT 1 AS n; ")),
-            ..base
-        };
-        assert_eq!(
-            by_query.source_query().ok().as_deref(),
-            Some("SELECT 1 AS n")
-        );
-    }
-
-    #[test]
-    fn private_addresses_are_recognized() {
-        let private = [
-            "127.0.0.1",
-            "0.0.0.0",
-            "10.1.2.3",
-            "172.16.0.9",
-            "192.168.1.1",
-            "169.254.169.254",
-            "100.64.0.1",
-            "224.0.0.1",
-            "::1",
-            "::",
-            "fd00::1",
-            "fe80::1",
-            "::ffff:127.0.0.1",
-            "::ffff:10.0.0.1",
-        ];
-        for text in private {
-            let ip: IpAddr = text.parse().unwrap_or_else(|_| IpAddr::from([1, 1, 1, 1]));
-            assert!(is_private_address(ip), "{text}");
-        }
-        let public = [
-            "1.1.1.1",
-            "8.8.8.8",
-            "100.128.0.1",
-            "2606:4700::1111",
-            "::ffff:1.1.1.1",
-        ];
-        for text in public {
-            let ip: IpAddr = text
-                .parse()
-                .unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]));
-            assert!(!is_private_address(ip), "{text}");
-        }
-    }
-
-    #[tokio::test]
-    async fn loopback_hosts_are_refused_without_the_private_host_grant() {
-        let download = Download {
-            timeout: Duration::from_secs(5),
-            max_mb: 1,
-            hosts: HostReach::PublicOnly,
-        };
-        let err = download
-            .fetch(&SourceUrl::from("http://127.0.0.1:9/x.csv"), "x")
-            .await
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(err.contains("private address"), "{err}");
-        let err = download
-            .fetch(&SourceUrl::from("http://localhost:9/x.csv"), "x")
-            .await
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(err.contains("private address"), "{err}");
-    }
-
-    /// A URL names a file `quack ingest` loads as a table, or it is
-    /// refused before any network use; a type the URL passes goes on to
-    /// the host check, which refuses loopback here.
-    #[tokio::test]
-    async fn urls_take_every_extension_ingest_loads_as_a_table() {
-        let download = Download {
-            timeout: Duration::from_secs(5),
-            max_mb: 1,
-            hosts: HostReach::PublicOnly,
-        };
-        for accepted in [
-            "http://127.0.0.1:9/book.ods",
-            "http://127.0.0.1:9/old.XLS?download=1",
-            "http://127.0.0.1:9/data.pq#part",
-            "http://127.0.0.1:9/rows.ndjson",
-        ] {
-            let err = download
-                .fetch(&SourceUrl::from(accepted), "t")
-                .await
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default();
-            assert!(err.contains("private address"), "{accepted}: {err}");
-        }
-        for refused in ["http://127.0.0.1:9/notes.pdf", "http://127.0.0.1:9/data"] {
-            let err = download
-                .fetch(&SourceUrl::from(refused), "t")
-                .await
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default();
-            assert!(
-                err.contains("must name a table file") && err.contains(".ods"),
-                "{refused}: {err}"
-            );
-        }
-    }
-
-    /// One HTTP exchange on a loopback port: answer `response` to the
-    /// first connection and return the URL to fetch.
-    async fn serve_once(response: &'static str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap_or_else(|e| unreachable_bind(&e.to_string()));
-        let port = listener.local_addr().map(|a| a.port()).unwrap_or_default();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-            let Ok((mut socket, _)) = listener.accept().await else {
-                return;
-            };
-            let mut buf = [0_u8; 4096];
-            drop(socket.read(&mut buf).await);
-            drop(socket.write_all(response.as_bytes()).await);
-            drop(socket.shutdown().await);
-        });
-        format!("http://127.0.0.1:{port}/data.csv")
-    }
-
-    #[expect(clippy::panic, reason = "test helper: a loopback port must bind")]
-    fn unreachable_bind(msg: &str) -> tokio::net::TcpListener {
-        panic!("cannot bind a loopback port: {msg}")
-    }
-
-    #[tokio::test]
-    async fn downloads_stop_at_the_byte_cap_and_the_owner_follows_redirects() {
-        let owner = Download {
-            timeout: Duration::from_secs(5),
-            max_mb: 0,
-            hosts: HostReach::Any,
-        };
-        let url = serve_once(
-            "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\na,b\n1,2\n3,4\n",
-        )
-        .await;
-        let err = owner
-            .fetch(&SourceUrl::from(url.as_str()), "t")
-            .await
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(err.contains("max_download_mb"), "{err}");
-
-        let url = serve_once(
-            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\na,b\n1,\r\n6\r\n2\n3,4\n\r\n0\r\n\r\n",
-        )
-        .await;
-        let err = owner
-            .fetch(&SourceUrl::from(url.as_str()), "t")
-            .await
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(err.contains("max_download_mb"), "{err}");
-
-        let roomy = Download { max_mb: 1, ..owner };
-        let url = serve_once(
-            "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\na,b\n1,2\n3,4\n",
-        )
-        .await;
-        let fetched = roomy.fetch(&SourceUrl::from(url.as_str()), "t").await;
-        assert!(
-            fetched.is_ok_and(|p| p.filename == "t.csv" && p.bytes == b"a,b\n1,2\n3,4\n"),
-            "the capped download of a small file succeeds"
-        );
-
-        // The owner may reach any host, so a redirect is followed: here to
-        // a closed port, which fails the download itself.
-        let url = serve_once(
-            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/other.csv\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        )
-        .await;
-        let err = roomy
-            .fetch(&SourceUrl::from(url.as_str()), "t")
-            .await
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(
-            err.contains("download failed") && !err.contains("302 Found"),
-            "{err}"
-        );
-    }
-
-    /// A file source has no query to limit: the cap applies after the
-    /// load and the table keeps the first `limit` rows.
-    #[tokio::test]
-    async fn downloaded_files_are_cut_to_the_row_cap() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| no_tempdir(&e.to_string()));
-        let mut config = Config::default();
-        config.general.data_dir = dir.path().to_path_buf();
-        let db = open_writer(&config);
-        let url = serve_once(
-            "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nn,s\n1,a\n2,b\n3,c\n",
-        )
-        .await;
-        let request = ImportRequest {
-            url: url.into(),
-            table: String::from("rows"),
-            query: None,
-            source_table: None,
-            limit: Some(2),
-        };
-        let summary = Importing {
-            config: &config,
-            db: &db,
-            workspace_id: "ws",
-            request: &request,
-            policy: ImportPolicy::owner(),
-            embedder: None::<&Embeddings>,
-            control: RunControl::unobserved(),
-        }
-        .run()
-        .await
-        .unwrap_or_else(|e| no_import(&e.to_string()));
-        assert_eq!(summary.table, "rows");
-        assert_eq!(summary.rows, 2);
-        assert_eq!(summary.columns, vec![String::from("n"), String::from("s")]);
-        let kept = db
-            .run(|db| db.execute_query("SELECT n FROM rows ORDER BY n"))
-            .await
-            .map(|r| r.rows.len())
-            .unwrap_or_default();
-        assert_eq!(kept, 2);
-    }
-
-    /// A raw `@` in an HTTP import's password is masked out of the summary
-    /// source — the same value that becomes the document title and the
-    /// tracing-log field — while the download still reaches the host the
-    /// parser identifies (the owner may reach loopback), so the `ss@`
-    /// suffix the old first-`@` split leaked no longer lands anywhere.
-    #[tokio::test]
-    async fn an_http_import_with_a_raw_at_in_the_password_masks_the_source() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| no_tempdir(&e.to_string()));
-        let mut config = Config::default();
-        config.general.data_dir = dir.path().to_path_buf();
-        let db = open_writer(&config);
-        let served = serve_once(
-            "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nn,s\n1,a\n2,b\n3,c\n",
-        )
-        .await;
-        // `serve_once` returns `http://127.0.0.1:<port>/data.csv`; inject
-        // `user:p@ss@` userinfo so the password carries a raw `@`.
-        let tail = match served.strip_prefix("http://") {
-            Some(rest) => rest,
-            None => served.as_str(),
-        };
-        let url = format!("http://user:p@ss@{tail}");
-        let request = ImportRequest {
-            url: url.into(),
-            table: String::from("rows"),
-            query: None,
-            source_table: None,
-            limit: None,
-        };
-        let summary = Importing {
-            config: &config,
-            db: &db,
-            workspace_id: "ws",
-            request: &request,
-            policy: ImportPolicy::owner(),
-            embedder: None::<&Embeddings>,
-            control: RunControl::unobserved(),
-        }
-        .run()
-        .await
-        .unwrap_or_else(|e| no_import(&e.to_string()));
-        assert_eq!(summary.source, format!("http://user:***@{tail}"));
-        assert!(!summary.source.contains("ss@"), "{}", summary.source);
-        assert!(!summary.source.contains("p@ss"), "{}", summary.source);
-    }
-
-    #[expect(clippy::panic, reason = "test helper: a temp dir must exist")]
-    fn no_tempdir(msg: &str) -> tempfile::TempDir {
-        panic!("cannot create a temp dir: {msg}")
-    }
-
-    #[expect(clippy::panic, reason = "test helper: the fixture files must exist")]
-    fn no_file(msg: &str) {
-        panic!("cannot write a fixture file: {msg}")
-    }
-
-    #[expect(clippy::panic, reason = "test helper: the workspace must open")]
-    fn open_writer(config: &Config) -> Writer {
-        WorkspaceDb::open(config, "ws")
-            .and_then(Writer::spawn)
-            .unwrap_or_else(|e| panic!("cannot open the workspace: {e}"))
-    }
-
-    #[expect(clippy::panic, reason = "test asserts Ok")]
-    fn no_import(msg: &str) -> ImportSummary {
-        panic!("import failed: {msg}")
-    }
-
-    /// The control database and workspace files stay out of workspaces
-    /// even for the owner (issue #69), through every spelling of the URL;
-    /// a symlink into the data directory does not slip past.
-    #[tokio::test]
-    async fn sqlite_imports_refuse_quacks_own_data_directory() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| no_tempdir(&e.to_string()));
-        let mut config = Config::default();
-        config.general.data_dir = dir.path().join("data");
-        std::fs::create_dir_all(&config.general.data_dir)
-            .unwrap_or_else(|e| no_file(&e.to_string()));
-        let control = config.general.data_dir.join("control.db");
-        std::fs::write(&control, b"").unwrap_or_else(|e| no_file(&e.to_string()));
-        let link = dir.path().join("elsewhere.db");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&control, &link).unwrap_or_else(|e| no_file(&e.to_string()));
-        let db = open_writer(&config);
-        let control = control.display();
-        let mut urls = vec![
-            format!("sqlite:{control}"),
-            format!("sqlite://{control}"),
-            format!("SQLite:{control}?mode=ro"),
-        ];
-        if cfg!(unix) {
-            urls.push(format!("sqlite:{}", link.display()));
-        }
-        for url in urls {
-            let request = ImportRequest {
-                url: url.clone().into(),
-                table: String::from("x"),
-                query: None,
-                source_table: Some(String::from("users")),
-                limit: None,
-            };
-            let err = Importing {
-                config: &config,
-                db: &db,
-                workspace_id: "ws",
-                request: &request,
-                policy: ImportPolicy::owner(),
-                embedder: None::<&Embeddings>,
-                control: RunControl::unobserved(),
-            }
-            .run()
-            .await
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-            assert!(err.contains("own data directory"), "{url}: {err}");
-        }
-        assert!(!SourceUrl::from("sqlite:/tmp/other.db").is_under(&config.general.data_dir));
-        assert_eq!(
-            SourceUrl::from("sqlite://a/b.db?x=1").sqlite_path(),
-            Path::new("a/b.db")
-        );
-    }
-}
+mod tests;

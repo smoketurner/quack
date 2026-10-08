@@ -20,20 +20,31 @@ WORKSPACE ?= storms
 # The crate whose templates Tailwind scans; its built CSS is committed.
 SERVER_CRATE ?= quack
 
-.PHONY: all build check clean fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates image hooks css-dev css-build editor-build run run-server demo-data help
+.PHONY: all build check clean setup doc changelog fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates image hooks css-dev css-build editor-build run run-server demo-data help
 
 all: build
 
 ##@ Build
 
 build: ## Build the workspace (release)
-	$(CARGO) build --release
+	$(CARGO) build
 
 check: ## Type-check the workspace
 	$(CARGO) check --workspace --all-targets --all-features
 
 clean: ## Remove the cargo target/ build artifacts
 	$(CARGO) clean
+
+setup: ## Install the toolchain and tools a contributor needs (idempotent), then the git hooks
+	./scripts/setup.sh
+	prek install
+
+doc: ## Build the API documentation with broken links denied (what the CI docs job runs)
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps
+
+changelog: ## Render CHANGELOG.md from the commits with git-cliff (cliff.toml); commit the result
+	git cliff -o CHANGELOG.md
+	@printf '%s\n' "$$(cat CHANGELOG.md)" > CHANGELOG.md
 
 ##@ Quality
 
@@ -93,7 +104,7 @@ editor-build: ## Bundle the web console's SQL editor (CodeMirror) with pnpm (com
 ##@ Run
 
 run: build ## Build and run a binary: make run [BIN=quack] [ARGS="..."]
-	$(CARGO) run --release --bin $(BIN) -- $(ARGS)
+	$(CARGO) run --bin $(BIN) -- $(ARGS)
 
 run-server: ## Serve the web UI and API locally without login: make run-server [BIND=127.0.0.1:8080]
 	$(CARGO) run --bin quack -- serve --local --bind $(BIND)

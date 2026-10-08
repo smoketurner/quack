@@ -37,6 +37,8 @@ struct IssuerState {
     id_claims: Option<Value>,
     /// The `error` a refresh is refused with; a new token when unset.
     refresh_error: Option<&'static str>,
+    /// Claims of an ID token a refresh returns too; none when unset.
+    refresh_id_claims: Option<Value>,
     token_bodies: Vec<String>,
     /// The JWK set `/jwks` serves.
     jwks: Vec<Value>,
@@ -104,6 +106,7 @@ impl MockIssuer {
 
     fn sign_in(&self) -> SignIn {
         let config = OidcConfig {
+            groups_claim: None,
             issuer_url: self.url.clone(),
             client_id: Some(String::from("quack")),
             client_secret_env: None,
@@ -221,13 +224,17 @@ fn answer(
                     }
                     ("200 OK", token)
                 }
-                Some("refresh_token") => match state.refresh_error {
-                    Some(error) => ("400 Bad Request", json!({ "error": error })),
-                    None => (
-                        "200 OK",
-                        json!({ "access_token": "renewed-access", "token_type": "Bearer", "expires_in": 3600 }),
-                    ),
-                },
+                Some("refresh_token") => {
+                    if let Some(error) = state.refresh_error {
+                        ("400 Bad Request", json!({ "error": error }))
+                    } else {
+                        let mut token = json!({ "access_token": "renewed-access", "token_type": "Bearer", "expires_in": 3600 });
+                        if let Some(claims) = &state.refresh_id_claims {
+                            token["id_token"] = json!(jwt(claims));
+                        }
+                        ("200 OK", token)
+                    }
+                }
                 _ => (
                     "400 Bad Request",
                     json!({ "error": "unsupported_grant_type" }),
@@ -374,12 +381,31 @@ async fn renewal_tells_a_revoked_grant_from_a_broken_client() {
     assert!(
         matches!(
             &renewed,
-            Ok(Renewal::Renewed(token))
+            Ok(Renewal::Renewed { token, reissued: None })
                 if token.access_token.expose_secret() == "renewed-access"
                     && token.refresh_token.as_ref().map(ExposeSecret::expose_secret) == Some("user-refresh")
         ),
         "{renewed:?}"
     );
+
+    // A renewal's ID token passes a sign-in's checks but the nonce.
+    issuer.with(|s| {
+        s.refresh_id_claims = Some(json!({
+            "iss": issuer.url, "sub": "subject-1", "aud": "quack", "exp": in_an_hour(),
+        }));
+    });
+    let renewed = sign_in.renew(&refresh).await;
+    assert!(
+        matches!(&renewed, Ok(Renewal::Renewed { reissued: Some(r), .. }) if r.subject == OidcSubject::from("subject-1")),
+        "{renewed:?}"
+    );
+    issuer.with(|s| {
+        s.refresh_id_claims = Some(json!({
+            "iss": issuer.url, "sub": "subject-1", "aud": "someone-else", "exp": in_an_hour(),
+        }));
+    });
+    assert!(sign_in.renew(&refresh).await.is_err());
+    issuer.with(|s| s.refresh_id_claims = None);
 
     issuer.with(|s| s.refresh_error = Some("invalid_grant"));
     assert!(matches!(
@@ -823,7 +849,10 @@ async fn an_advertised_par_endpoint_takes_the_request_and_the_browser_only_a_ref
     let renewed = sign_in
         .renew(&SecretString::from(String::from("user-refresh")))
         .await;
-    assert!(matches!(renewed, Ok(Renewal::Renewed(_))), "{renewed:?}");
+    assert!(
+        matches!(renewed, Ok(Renewal::Renewed { .. })),
+        "{renewed:?}"
+    );
     // Three requests, three assertions, none refused and none reused.
     let (spent, refused) = issuer.spent_and_refused();
     assert_eq!(spent, 3);

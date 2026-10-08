@@ -8,7 +8,7 @@ use axum_extra::extract::cookie::{Cookie, SameSite};
 use quack_core::config::OidcConfig;
 use quack_core::error::Error as CoreError;
 use quack_core::oidc::SignedIn;
-use quack_core::storage::control::{AuditAction, AuditEntry, Channel, Outcome};
+use quack_core::storage::control::{AuditAction, AuditEntry, Channel, Origin, Outcome};
 use serde::Deserialize;
 
 use super::WebResult;
@@ -127,9 +127,12 @@ pub(super) async fn finish(
     let oidc = configured(&app)?;
     let started_here = jar.get(STATE_COOKIE).map(|c| c.value().to_owned());
     let jar = jar.remove(cleared_state());
-    let mut entry = AuditEntry::new(AuditAction::Login, Outcome::Denied, Channel::Web);
-    entry.client_addr = peer.ip();
-    entry.request_id = request_id;
+    let origin = Origin {
+        channel: Channel::Web,
+        client_addr: peer.ip(),
+        request_id,
+    };
+    let mut entry = AuditEntry::new(AuditAction::Login, Outcome::Denied, origin);
 
     let signed_in = match callback.complete(oidc, started_here.as_deref()).await {
         Ok(signed_in) => signed_in,
@@ -148,11 +151,21 @@ pub(super) async fn finish(
         .control
         .oidc_user(&signed_in.subject, &signed_in.username)
         .await?;
+    if user.is_disabled() {
+        entry.user_id = Some(user.id.clone());
+        app.control.record_audit(&entry).await?;
+        return Ok(Flash::error("/login", "this account is disabled").into_response());
+    }
     entry.outcome = Outcome::Allowed;
     entry.user_id = Some(user.id.clone());
     // Audited before the token and session commit, so a failed audit write
     // leaves no credential.
     app.control.record_audit(&entry).await?;
+    if let Some(groups) = signed_in.groups.listed() {
+        app.control
+            .reconcile_idp_memberships(&user, groups, &entry.origin)
+            .await?;
+    }
     // The token and the session it serves appear together.
     let token = oidc.keep_and_open(&user.id, &signed_in.token).await?;
     Ok((

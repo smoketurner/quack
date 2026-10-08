@@ -3,7 +3,11 @@
 ## Continuous integration
 
 - **`.github/workflows/ci.yml`**: `fmt`, `clippy` (`--locked -D warnings`), `test`
-  (`cargo test --locked`, Linux + macOS), `dependency-review` (PRs), and `license-check`
+  (`cargo test --locked` on Linux and macOS), `test-windows` (the same on Windows, cached,
+  built without debuginfo, and skipped in the merge queue since it is not a required check),
+  `prune-caches` (on `main`, deletes all but the newest entry of each cache), `docs` (`cargo doc --no-deps` with
+  `RUSTDOCFLAGS=-D warnings`, the same as `make doc`; `[workspace.lints.rustdoc]` denies
+  broken and private intra-doc links), `dependency-review` (PRs), and `license-check`
   (`cargo-deny check`). The toolchain comes from `rust-toolchain.toml` via `rustup show`;
   `Swatinem/rust-cache` caches builds (see [Build caching](#build-caching)). Actions are
   SHA-pinned. `permissions: {}` is set at the top, with `contents: read` per job.
@@ -11,6 +15,15 @@
   full commit-SHA pin (`zgosalvez/github-actions-ensure-sha-pinned-actions`).
 - **`.github/dependabot.yml`**: `cargo`, `github-actions`, and `docker` (the base-image
   tags), weekly, grouped, 7-day cooldown.
+- **`.github/workflows/advisories.yml`**: `cargo deny check` every Monday (and on
+  dispatch), since `ci.yml` runs it only when code changes and Dependabot's alerts do not
+  cover RustSec's `unmaintained` and `unsound` classes or license and source drift. On a
+  failure it opens one issue titled "cargo deny check fails on the weekly advisory scan",
+  or comments on the open one, with the run's link.
+- **`.github/workflows/fuzz.yml`**: every night (and on dispatch), one job per fuzz target
+  in `fuzz/` (`pdf`, `markdown`, `text`, `html`, `docx`, `pptx`, `xlsx`, `chunker`) on the
+  nightly toolchain, seeded from the evaluation fixtures by `fuzz/seed.sh`, ten minutes
+  each; a crash uploads `fuzz/artifacts/` as the run's artifact.
 
 CI runs on pushes to main. The release workflow runs on tags alone, so ordinary pushes
 spend no release minutes.
@@ -82,7 +95,8 @@ The caching layout exists to keep one build script's output: DuckDB's C++ amalga
 - **The repository gets 10 GB of Actions cache in total.** Past that, GitHub evicts
   least-recently-used entries, even mid-run: a job saving a fresh entry can evict the one a
   parallel job is about to restore. Every `Cargo.lock` change starts a new generation of
-  entries, so the steady state must leave room for two.
+  entries, and the old one lingers until eviction catches up, so `prune-caches` deletes it
+  on the next push to `main`.
 - **Only an exact key hit keeps the build-script output.** `rust-cache`'s restore-key
   fallback recovers the registry and some artifacts, but `libduckdb-sys` re-runs, so a
   near-miss costs nine minutes. A surviving entry beats a better-shaped evicted one.
@@ -93,6 +107,9 @@ The resulting rules:
   `target/`, which fits the total inside the budget. Test backtraces keep file and line
   numbers. `rust-cache` hashes every `CARGO_*` variable into the key, so `release.yml` sets
   it identically; otherwise its gates job cannot restore what CI saved.
+- **Windows tests build without debuginfo** (`CARGO_PROFILE_DEV_DEBUG: "0"` on that job), so
+  its `v1-debug-Windows` entry fits beside the other three. A failed assertion still names
+  its file and line: those come from the panic location, not from debuginfo.
 - **One entry per compiling job**: `v1-clippy-<os>` and `v1-debug-<os>`. Folding clippy
   into the test job would halve the entries but serialize the work: measured cold, 11m36s
   of clippy plus 13m08s of tests, against about 13 minutes in parallel. Line-tables-only
@@ -111,7 +128,7 @@ total and `gh cache list` the entries. Remove stale generations with `gh cache d
 
 ## Releases (`release.yml` + `reusable-build.yml`)
 
-Trigger: an annotated `v*` tag pushed to the repository (for example `v0.2.0`), or
+Trigger: an annotated `v*` tag pushed to the repository (for example `v2026.10.3`; the scheme is `vYYYY.M.N`, the Nth release of that month), or
 `workflow_dispatch` for a dry run that builds everything and publishes nothing.
 
 Separate build and publish workflows make the provenance SLSA Build Level 3. Everything
@@ -124,7 +141,11 @@ attestation names `reusable-build.yml`, so a consumer can require that identity.
 `release.yml`:
 
 1. **gates**: `cargo fmt --check`, clippy, the test suite, `make crypto-gates`, and
-   `cargo deny check` through the pinned action.
+   `cargo deny check` through the pinned action. On a tag it then renders the release
+   notes: this tag's section of `docs/upgrading.md` (`scripts/upgrading-section.sh`; a
+   missing section fails the release) above the commits since the previous tag, grouped by
+   Conventional Commit type by git-cliff (`cliff.toml`, the same output `CHANGELOG.md`
+   holds), uploaded as the `release-notes` artifact.
    - The tests restore CI's `v1-check-Linux` cache read-only, which is why the job's
      `CARGO_*` environment must match `ci.yml`.
    - `make crypto-gates` requires `cargo tree -i ring -e normal` and
@@ -244,7 +265,9 @@ by: `reusable-build.yml` uses no Actions cache, and `release.yml`'s gates job ru
   cargo-chef caches the dependency build, and the musl binary lands in
   `gcr.io/distroless/static-debian13:nonroot`. Environment: `QUACK_DATA_DIR=/data`,
   `QUACK_CONFIG_DIR=/config`, `QUACK_BIND=0.0.0.0:8080`. Entrypoint `/quack`, default
-  command `serve`, so `docker run ... quack user add alice --admin` also works.
+  command `serve`, so `docker run ... quack user add alice --admin` also works. The
+  `HEALTHCHECK` is `/quack ready`, which calls `GET /readyz` (the image has no shell or
+  curl); the compose file declares the same check.
 - **`Dockerfile.release`**: the same runtime from prebuilt `dist/linux-<arch>/quack`
   binaries; no compilation, so multi-arch builds need no emulation.
 - **`.dockerignore`**: a deny-by-default allowlist that keeps the context small and
@@ -255,7 +278,9 @@ by: `reusable-build.yml` uses no Actions cache, and `release.yml`'s gates job ru
 
 `docker-compose.yml` runs `quack serve` beside `ollama/ollama`. It mounts
 `deploy/config.toml` at `/config` (chat and embedding models on the `ollama` service) and
-uses named volumes for `/data` and the models. First run:
+uses named volumes for `/data` and the models. `stop_grace_period` is 30 seconds, above
+`[server].shutdown_grace_seconds` (20), so `docker compose stop` lets quack cancel its jobs
+and checkpoint each workspace before Docker sends SIGKILL. First run:
 
 ```bash
 docker compose up -d
@@ -275,15 +300,30 @@ and `docker compose up -d`.
   actionlint 1.7 does not know the `$/` self-repository `uses:` form that zizmor asks for.
 - `docker buildx build --check -f Dockerfile .` (and `Dockerfile.release`,
   `Dockerfile.build`) validates the Dockerfiles without building.
-- CI builds on Linux and macOS only, so only a `workflow_dispatch` release run exercises
-  the macOS and Windows release builds. Run one before tagging after any build change.
+- CI tests on Linux, macOS, and Windows (Windows runs on pull requests and `main`, not in
+  the merge queue, so a pull request should show it green before it merges), but only a `workflow_dispatch` release run exercises the release builds
+  themselves. Run one before tagging after any build change.
 - Pin every new action to a SHA (`secure_workflows.yml` enforces it). Resolve current SHAs
   with `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`.
 
-Two patterns to add when the code calls for them:
+## Fuzzing
 
-- **Fuzzing**: once a parser takes untrusted input at scale, add a detached `fuzz/` crate
-  (`cargo-fuzz` + `libfuzzer-sys`, its own empty `[workspace]`) and gitignore
-  `fuzz/corpus/` and `fuzz/artifacts/`.
+`fuzz/` is a detached crate (its own `[workspace]`, so the main workspace's lints, profiles,
+and lock file stay as they are) with one libFuzzer target per parser entry point:
+`TextFormat::extract` for each format, `xlsx::sheets`, and `Chunker::document` over the
+Markdown and text parsers. Locally:
+
+```bash
+cargo install cargo-fuzz --locked
+./fuzz/seed.sh                        # copies the evaluation fixtures into fuzz/corpus/<target>/
+cd fuzz && cargo +nightly fuzz run docx -- -max_total_time=120
+```
+
+`fuzz/corpus/`, `fuzz/artifacts/`, and `fuzz/target/` are gitignored. A crash leaves its
+input under `fuzz/artifacts/<target>/`; `cargo +nightly fuzz run <target> <that file>`
+replays it.
+
+One pattern to add when the code calls for it:
+
 - **Docs site**: when `docs/` outgrows flat files, migrate to mdBook (`docs/book.toml` +
   `src/SUMMARY.md`), deploy via a GitHub Pages workflow, and gitignore `docs/book/`.

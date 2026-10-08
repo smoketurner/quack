@@ -8,17 +8,19 @@ use std::time::Instant;
 
 use crate::embedding::EmbeddingModel;
 
-use super::{GraphOptions, Node, store};
+use super::{Node, store};
+use crate::config::GraphConfig;
 use crate::embedding::{Embedder, Input};
-use crate::error::{Error, Record, Result};
+use crate::error::{Error, Result};
 use crate::ids::{MergeId, NodeId};
 use crate::prefix::PrefixMatch;
 use crate::progress::{ChunkDone, RunControl};
-use crate::storage::workspace::{WorkspaceDb, tokenize};
+use crate::storage::control::ResourceKind;
+use crate::storage::workspace::{Analyzer, Unspaced, WorkspaceDb};
 use crate::storage::writer::Writer;
 
 /// A proposed merge: `drop` folds into `keep`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct MergeProposal {
     pub id: MergeId,
     pub keep: Node,
@@ -28,7 +30,9 @@ pub struct MergeProposal {
 }
 
 /// Where a merge proposal stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum MergeStatus {
     /// Waiting for review.
@@ -51,7 +55,9 @@ text_enum_sql!(MergeStatus);
 
 /// A reviewer's answer to a merge proposal, from the CLI, the API, or the
 /// graph page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum MergeDecision {
     Accept,
@@ -75,7 +81,7 @@ impl MergeDecision {
 }
 
 /// What a resolution pass did.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct ResolutionSummary {
     pub embedded: u32,
     pub auto_merged: u32,
@@ -92,7 +98,7 @@ pub struct ResolutionSummary {
 pub async fn resolve<M: EmbeddingModel>(
     db: &Writer,
     embedder: Option<&Embedder<M>>,
-    options: &GraphOptions,
+    options: &GraphConfig,
 ) -> Result<ResolutionSummary> {
     let mut summary = ResolutionSummary::default();
     let Some(embedder) = embedder else {
@@ -249,7 +255,7 @@ struct MergeCounts {
 /// alike their labels (issue #41: WEST VIRGINIA is not VIRGINIA). A pair
 /// with one keyed side is only ever proposed; auto-merge is reserved for
 /// two model-extracted nodes.
-fn propose_merges(db: &WorkspaceDb, options: &GraphOptions) -> Result<MergeCounts> {
+fn propose_merges(db: &WorkspaceDb, options: &GraphConfig) -> Result<MergeCounts> {
     // The keyed flag is computed per node before the join: a correlated
     // EXISTS per pair row, or a window over the pairs, made DuckDB run
     // out of its 256 MiB on 3,667 nodes, while this streams in seconds.
@@ -378,13 +384,17 @@ fn provenance_count(db: &WorkspaceDb, id: &NodeId) -> Result<i64> {
     )?)
 }
 
-/// Whether two labels share a word of at least three characters.
+/// Whether two labels share a word of at least three characters, or a
+/// character bigram of an unspaced script (a Chinese, Japanese, or Korean
+/// label has no words to share).
 #[must_use]
 pub fn share_token(a: &str, b: &str) -> bool {
+    let analyzer = Analyzer::default();
     let tokens = |s: &str| -> BTreeSet<String> {
-        tokenize(s)
+        analyzer
+            .terms(s)
             .into_iter()
-            .filter(|t| t.chars().count() >= 3)
+            .filter(|t| t.chars().count() >= 3 || Unspaced::is_term(t))
             .collect()
     };
     !tokens(a).is_disjoint(&tokens(b))
@@ -423,7 +433,7 @@ fn merge_nodes_in(db: &WorkspaceDb, keep: &NodeId, drop: &NodeId) -> Result<()> 
     properties.set_aliases(&aliases);
     conn.execute(
         "UPDATE _quack_graph_nodes SET properties = ?, provisional = provisional AND ? WHERE id = ?",
-        duckdb::params![properties.to_json(), drop_node.provisional, keep],
+        duckdb::params![properties.to_json(), drop_node.standing, keep],
     )?;
     // Repoint edges, dropping any that would duplicate an existing triple
     // or become a self-loop.
@@ -459,8 +469,10 @@ fn merge_nodes_in(db: &WorkspaceDb, keep: &NodeId, drop: &NodeId) -> Result<()> 
         [],
     )?;
     conn.execute(
-        "INSERT OR IGNORE INTO _quack_provenance (subject_id, document_id, chunk_id, table_name, row_key, confidence) \
-         SELECT ?, document_id, chunk_id, table_name, row_key, confidence FROM _quack_provenance WHERE subject_id = ?",
+        "INSERT OR IGNORE INTO _quack_provenance \
+         (subject_id, document_id, chunk_id, table_name, row_key, confidence, author, note, asserted_at) \
+         SELECT ?, document_id, chunk_id, table_name, row_key, confidence, author, note, asserted_at \
+         FROM _quack_provenance WHERE subject_id = ?",
         duckdb::params![keep, drop],
     )?;
     conn.execute(
@@ -524,7 +536,7 @@ pub fn pending(db: &WorkspaceDb) -> Result<Vec<MergeProposal>> {
 ///
 /// Returns an error when nothing or more than one proposal matches.
 pub fn find(db: &WorkspaceDb, prefix: &str) -> Result<MergeProposal> {
-    PrefixMatch::of(pending(db)?, prefix, |m| m.id.as_str()).one(Record::MergeProposal, prefix)
+    PrefixMatch::of(pending(db)?, prefix, |m| m.id.as_str()).one(ResourceKind::GraphMerge, prefix)
 }
 
 /// Record a reviewer's answer to a pending proposal (full id or unique
@@ -560,5 +572,8 @@ mod tests {
         assert!(share_token("Acme Corp", "ACME Corporation"));
         assert!(!share_token("Acme", "Apex"));
         assert!(!share_token("A B", "A C"));
+        // An unspaced label shares character bigrams, not words.
+        assert!(share_token("東京海上保険", "東京海上"));
+        assert!(!share_token("東京海上", "大阪銀行"));
     }
 }

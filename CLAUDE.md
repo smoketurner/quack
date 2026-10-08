@@ -18,7 +18,9 @@ section 17 for where the code still lags. The chosen stack:
 - **Workspace** of crates under `crates/` (edition 2024, resolver 3, MSRV 1.99.0)
 - **DuckDB** (via `duckdb-rs`), one file per workspace, holding everything classified
   about that workspace: user tables, chunks, graph, ontology, context, sessions, audit
-  detail (all internal tables prefixed `_quack_`)
+  detail (all internal tables prefixed `_quack_`); the file records its schema version and
+  the quack and DuckDB versions that wrote it, and a quack older than the file refuses it
+  untouched (`Error::WorkspaceTooNew`, `docs/migrations.md`)
 - **SQLite** (via `sqlx`) for `control.db` in server mode: users, workspaces, membership,
   tokens, and the mandatory append-only access audit log; nothing workspace-revealing
 - **sea-query** for type-safe SQL generation against `control.db`; bound parameters for
@@ -88,25 +90,57 @@ data-layer, crypto, or dependency change:
 ```bash
 cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # SQL, no agent
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
-cargo run --bin quack -- ingest sales.csv -w ws                                # file -> table(s) or chunks
-#   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX
-cargo run --bin quack -- -p "question" -w ws [-f text|json]                    # one agent turn; steps on stderr
+cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use
+cargo run --bin quack -- workspace rename OLD NEW | delete NAME [-y] | snapshot NAME [--to FILE|-] | restore FILE|- [--name N]   # storage::backup: one tar (manifest.json, data.duckdb, files/); delete is at once, the audit rows stay
+cargo run --bin quack -- ingest sales.csv -w ws [--replace [ID]] [--types amount=DOUBLE]   # file -> table(s) or chunks; --replace supersedes the document with the same name (or ID) once the new one is ready; --types retypes columns strictly after the load; an image needs [ingestion].vision_model
+cargo run --bin quack -- ingest DIR -w ws [--prune]                            # every supported file under DIR (not a bundle), root and path recorded; re-run skips unchanged, replaces changed, reports gone files of that root (--prune deletes them)
+#   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet); chunks: PDF, Markdown, text, HTML, DOCX, PPTX, EPUB, ODT, EML/MBOX, VTT/SRT, source code, RTF
+#   --author/--authored/--tag set what the file says about itself; a table inside a document with >= [ingestion].table_rows_as_table rows also loads as <stem>_tableN
+cargo run --bin quack -- tables [TABLE [--note TEXT] [--retype COL=TYPE]] [--format json]   # row counts, owner notes, profile warnings; a note or a strict retype (PUT .../tables/note, POST .../tables/retype, the Tables page)
+cargo run --bin quack -- docs [--tag ID TAG | --untag ID TAG | --author ID NAME | --authored ID DATE]   # a document's own fields; PATCH .../documents/{doc} over REST
+cargo run --bin quack -- -p "question" -w ws [-f text|json] [--documents DOC,..]   # one agent turn; steps on stderr; --documents limits it to those documents
+cargo run --bin quack -- search QUERY -w ws [--in DOC..] [--keyword|--vector] [--explain] [-f text|json]   # analysis::search::DocumentSearch without the model: each hit's vector, keyword, and rerank rank
 cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY)
-cargo run --bin quack -- sessions | export ID [--sql]                          # sessions live in the workspace file
+cargo run --bin quack -- sessions [--search TEXT] | export ID [--sql]          # sessions live in the workspace file; /rename, /sessions TEXT, and /resume TITLE in the terminal; [analysis].title_sessions has the model title them
+cargo run --bin quack -- saved list | add NAME --from-session ID | run NAME [--refresh] [--exit-code] | show NAME | remove NAME   # an answer's SQL re-run without the model; exit 5 when changed; cron schedules it
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
+cargo run --bin quack -- ontology rename class|relation OLD NEW                   # a new id as a new version; the graph's nodes and edges move with it
+cargo run --bin quack -- ontology schema                                          # the interchange form's JSON Schema (docs/ontology.schema.json, kept equal by a test)
 cargo run --bin quack -- ontology propose [--documents] [--auto-accept] [--from FILE] | review | accept ID.. | reject ID..
-cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] | revalidate | review | merges | merge ID..
+cargo run --bin quack -- graph search ENTITY [--hops N] | search --class C | path A B | status | extract [-y] [--reset [--all]] | revalidate [-y] | review | merges | merge ID..
+cargo run --bin quack -- graph add node LABEL --class C [--property K=V] | add edge FROM REL TO | set NODE [--label L] [--to-class C] [--property K=V] [--unset K] | delete node NODE | delete edge ID   # a person's assertions, recorded with author and note
+cargo run --bin quack -- graph export DIR|- [--format csv|graphml|jsonld] [--include-provisional]   # the whole graph (graph::export); csv to stdout is a tar
 cargo run --bin quack -- okf export DIR|-                                        # the workspace as an Open Knowledge Format bundle; `ingest DIR` imports one
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
-cargo run --bin quack -- import postgres://u:p@h/db --table t --from orders      # snapshot a Postgres/SQLite query or an http(s) data file as a table
+cargo run --bin quack -- import sqlite:/path/src.db --table t --from orders [--types col=TYPE]   # snapshot a SQLite query, an http(s) data file (-H 'Name: value', --bearer-env VAR, --json-pointer /data), or s3://bucket/key as a table
+cargo run --bin quack -- import ... --save NAME [--store-credential] | import list | refresh NAME | remove NAME   # import::SavedImport in _quack_imports; a refresh replaces the table only when the source changed; cron schedules it
 cargo run --bin quack -- auth login|status|logout PROVIDER ; auth jwks [PROVIDER] [--rotate [--activate]]  # OAuth tokens; a client's public key
 cargo run --bin quack -- auth register [--issuer URL] [--device-code|--token-env VAR|--open] [--replace] [--print] | unregister   # RFC 7591/7592 client registration
 cargo run --bin quack -- config [--changed] [--format json]                      # every recognized setting, its value and origin, the file's unknown keys, the env vars read
-cargo run --bin quack -- doctor [--offline] [--format json]                      # every check with its fix: config, data dir mode, workspace, model providers (probed), bind; exit 1 on a failure
-cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit   # server admin
-cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1, MCP under /mcp/v1/{workspace}
+cargo run --bin quack -- doctor [--offline] [--format json]                      # every check with its fix: config, data dir mode, workspace, model providers (probed), bind, vault key; exit 1 on a failure
+cargo run --bin quack -- ready [--url URL] ; vault export-key [--to FILE|-] [-y]          # GET /readyz (the image's HEALTHCHECK); the vault key to a 0600 file or stdout
+cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit [-w ws --detail --format ocsf [--with-prompt]]   # server admin; --detail joins the workspace's own audit (OCSF ai_operation on queries)
+cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1 (its OpenAPI 3.1 document at /api/v1/openapi.json, rendered at /api/v1/docs), MCP under /mcp/v1/{workspace}; /readyz and /metrics (quack_core::telemetry) outside the limiter; [server].log_format = "json" for a collector; every provider request retried under [providers.NAME].max_retries / retry_backoff_ms (llm::limit::Attempts)
 cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors
 ```
+
+A saved question (`quack_core::saved`, design doc 8.1) is an answered turn's `run_sql`
+read statements pinned under a name in `_quack_saved_questions`, visible to everyone who may
+read the workspace; `quack saved run` runs them again without the model, each classified
+again and under the agent's row cap and timeout, records in `_quack_saved_runs` a digest of
+every result set and the row counts (never the rows; the run that produced them returns them
+once), and says `changed` when any digest differs from the newest completed run that ran the
+same statements. The digest (`WorkspaceDb::execute_query_digested`) is order-insensitive, the
+sum of every row's SHA-256, since parallel DuckDB returns unordered rows in varying order
+(`--refresh` asks the model again as a `PrintTurn`, writes denied, and pins the new answer's
+statements). There is no scheduler: cron runs it, and `--exit-code` exits 5 on a change;
+`-f` takes `-q`'s `QueryFormat` and default. The terminal's `/saved` verbs run as jobs
+through `saved_cli` (`add` pins the session's last answer; `--refresh` and `--exit-code` are
+parse errors there), and the REST routes under `.../saved` (`server/api/saved.rs`) list, save,
+show, run, and remove, audited as `save`, `saved_run`, `open`, `list`, and `delete`; a run
+answers directly, no job. The web Saved page (`server/web/saved.rs`) and the chat page's Save
+form go through the same `Access` methods (`list_saved`, `save_answer`, `run_saved`,
+`remove_saved`).
 
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
 file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model through
@@ -114,30 +148,68 @@ rig's conversation memory (`llm::memory::History`: `SessionMemory` under `Transc
 rig's token window over `[analysis].history_token_budget`), and with
 `[analysis].compact_history` the turns it leaves out become a chat-model summary kept in
 `_quack_session_summaries`. Retrieval is hybrid (exact cosine scan plus quack's own
-BM25 over `_quack_terms` with Snowball-stemmed tokens, reciprocal rank fusion in
-`WorkspaceDb::search_hybrid_chunks`;
+BM25 over `_quack_terms`, each document's chunks stemmed under the language
+`WorkspaceDb::chunk_writer` detects once for it, reciprocal rank fusion in `WorkspaceDb::explain_search`;
 no DuckDB extension is ever loaded, see design doc section 14), then an optional reranker
 (`analysis::rerank`, `[retrieval].rerank = "none" | "model" | "reranker"`; `model` over-fetches
 `rerank_candidates` and has the chat model order them, `reranker` has the dedicated rerank
-model `rerank_model` score them through rig's `Rerank` at an OpenAI-compatible `/rerank`); citations are registered per turn
+model `rerank_model` score them through rig's `Rerank` at an OpenAI-compatible `/rerank`).
+Each document's text is stemmed under the language `whatlang` detects at ingest
+(`storage::workspace::{Language, Stemming, Analyzer}`, `_quack_documents.language`,
+`[retrieval].languages = ["auto"]` or Snowball names), Chinese, Japanese, and Korean runs
+become character bigrams, and a query is tokenized under every stemming in
+`_quack_meta.languages`. Every hit carries its rank and score in each leg and the reranker
+(`ChunkSearchResult::ranks`). One type, `analysis::search::DocumentSearch` (query, `top_k`,
+documents, graph entity, `DocumentFilter`, mode `hybrid|keyword|vector`), is the search of
+`search_documents`, REST and MCP `search`, `quack search`, `/search`, and the web Search
+page (`/w/{id}/search`); a person can limit a question to documents (`document_ids` on REST
+and MCP `query`, `-p --documents`, the chat's document picker): `DocumentScope` is resolved
+when the turn starts, noted in the system prompt, recorded on the user message
+(`UserMeta`), and intersected with the model's `document_ids`; the terminal's `/scope DOC..`
+holds one for its next questions until `/scope` alone lifts it. Citations are registered per turn
 (`analysis::citations`) and validated before the answer is returned. Sessions have a mode,
 `chat` or `query`; `--mode` / `/mode` set it. The workspace context (owner-written
 instructions, `quack_core::storage::context`, versioned in `_quack_context`) is injected
 into the system prompt after the schema and documents, capped at `[context].max_tokens`;
-the agent never writes it. Charts are `analysis::chart::ChartSpec` (bar, line, scatter,
-pie; 200 points max), not ECharts.
+the agent never writes it. The prompt states today's date (`PromptOptions::today`, the
+system's local zone from jiff) right after the mode paragraph; tests pin it. Charts are `analysis::chart::ChartSpec` (bar, line, scatter,
+pie; several series from several `y` columns or a `series_by` pivot, `stacked`; 200 distinct x
+values and 8 series max), not ECharts. A `run_sql` or `create_chart` step keeps its first
+`[analysis].step_result_rows` rows (`ToolStep::result`); `POST .../sql/export` and the SQL page's
+download stream every row of a read statement (`WorkspaceDb::stream_query`).
 
 Background work is asynchronous everywhere (design doc 4.1): `quack_core::jobs::JobQueue`
 runs submitted jobs with optional lanes that keep submission order (a chat session is a
 serial lane, so a follow-up waits for the answer before it; a workspace's uploads, graph
 extraction, and document pass have their own), cancel tokens, per-chunk progress, and a
-broadcast of `JobInfo` snapshots every interface reports from. There is no job pool:
+broadcast of `JobInfo` snapshots every interface reports from. `JobQueue::shutdown(grace)` is
+the one way a process stops its jobs: a later `submit` is recorded as cancelled and never runs,
+queued and running jobs are cancelled, and it waits up to the grace for them and for what
+`when_ended` records. The terminal's quit calls it; `quack serve` calls it on SIGTERM or Ctrl-C
+beside the HTTP drain under `[server].shutdown_grace_seconds` (20), after cancelling
+`AppState::stopping` (which ends `jobs/stream` and the MCP event streams, and cancels an MCP
+`query` turn, which runs under a child of it), and then
+`AppState::close` drops the workspace handles so each writer checkpoints. There is no job pool:
 resources are limited where they are used. Every rig HTTP client sends through
 `llm::LimitedHttp` (rig's reqwest transport, plus the provider's `headers`), which holds
 one permit of the process-wide gate for the provider and the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
 for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
 requests (`TurnRequest::run`, `Embedder::embed_interactive`, via the `quack_core::priority` task-local) before
-background ones. Bedrock is two provider types, one per endpoint
+background ones. The same gate enforces a workspace's `allowed_providers`: `llm::egress::Egress`
+is a task-local scope (`Workspace(AllowedProviders)`, or `NoWorkspace` for `quack doctor`'s probes),
+entered by `Access::resolve` in the server, `OpenedWorkspace` on the command line, and
+`McpServer::as_caller` per tool call, and carried into every job by `JobQueue::submit`.
+`Egress::permit` is the one check, called when a model client is built from a `ModelRef` (a typed
+`Error::ProviderRefused` holding the `egress::Refusal`, and `Error::is_provider_refusal` is what
+the audit outcome and a turn's failure kind ask: 403 and a `denied` audit row through
+`Access::model`, exit 1 from the CLI) and again by `ProviderGates::permit` for every request,
+Bedrock's SDK requests included. A request with no scope is `Error::ModelRequestUnscoped`, never an
+allow, so a test that makes a model request enters a scope first. Under a restricted list an Ollama
+model whose id ends in `-cloud` or `:cloud` is refused. Every outbound HTTP client takes its proxy from `quack_core::proxy::Proxies`
+(`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, read once; loopback and `169.254.0.0/16`
+are never proxied): reqwest clients start from `Proxies::client` (`.clippy.toml` disallows
+`reqwest::Client::builder` and `new`), and the AWS SDK connector takes `Proxies::aws`
+(`docs/providers.md`). Bedrock is two provider types, one per endpoint
 (`bedrock` for bedrock-runtime, `bedrock-mantle`; they host different models; `llm::bedrock`,
 settings in `config::bedrock`), each with an `api` (`converse`, `bedrock` only,
 through rig-bedrock and the AWS SDK, whose HTTPS client is wrapped to take the same gates for
@@ -150,7 +222,10 @@ The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`,
 `AppMsg` channel, the job broadcast, a spinner tick) and submits every question,
 statement, file, import, and ontology or graph verb as a job, so it never blocks its input:
 a strip above the prompt shows active jobs, `/jobs` lists them, `/cancel N` stops one, and
-write prompts from concurrent work queue up. Its commands' database steps run in the order
+write prompts from concurrent work queue up. A left-button drag over the transcript
+selects text in transcript lines (`terminal::selection`), and releasing copies it without row
+markers or wrap breaks to the system clipboard (`arboard`) and the terminal's (OSC 52;
+`terminal::clipboard`). Its commands' database steps run in the order
 typed on one worker task (`App::on_db`: reads on the reader pool, writes in the writer's
 interactive line), never on the loop's thread; input typed during `/new`, `/resume`, or
 `/mode` waits for the switch. `SharedDb` is `Arc<storage::writer::Writer>`, an actor: one
@@ -173,7 +248,39 @@ retried with the real names (twice at most), and an empty reply is asked for onc
 workspace and its settings; a turn's recorder, write policy, refusal flag, and chart and graph
 results are one `analysis::tools::Turn`, handed to every call as a runtime scope of rig's
 `ToolContext` (`.tool_context(turn.context())` on the run). `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
-prompts y/n/a and `-p` refuses and exits 3. Provider construction lives in `quack_core::llm`; interfaces never build rig
+prompts y/n/a (`a` covers the rest of that turn) and `-p` refuses and exits 3. Every
+interface offers the answers in `analysis::events::Decision`'s words (`label`, `reply`,
+`HEADING`; the SSE event carries them as `choices`). SQL a person types (the terminal's
+direct SQL and `/sql`, the web SQL page) runs as typed; only the agent's writes ask. Once a turn has retrieved document or graph text
+(`search_documents`, `search_graph`, `find_path`, `always_retrieve`, a `describe_class` that names
+example entities; `Turn::read_documents`),
+no write of that turn runs unasked, whatever was allowed: `WritePolicy::decide` asks where the
+interface answers permission events (`Allow(Approver::Person)`: the terminal, a streamed turn)
+and refuses where it cannot (`Allow(Approver::Nobody)`: print mode, non-streamed REST, MCP), and
+the reason (`policy::Hold`) goes on the prompt, the `permission_required` event's `reason` (with
+`Hold::notice`, the sentence the card shows, as `notice`), and
+the refused step. Pinned documents, the workspace context, table rows, and the listing tools do
+not count, so a pinned document or a table cell can still dictate a write under allow-write.
+Every parser yields `parser::Section`s with a `kind` (`body`, `table`, `note`, `code`) and an
+optional `locator` beside the page (`line 40`, `12:04`, `chapter 3`, `message 2`), stored on
+`_quack_chunks` and rendered by every citation label (`analysis::citations::ChunkLocation`);
+tables are `ingestion::table::Table` rendered as pipe Markdown, chunked by rows with the header
+repeated, and loaded as document-owned workspace tables past `[ingestion].table_rows_as_table`.
+`parser::DocumentMeta` (author, dates, tags, other named values) comes from each format and
+lands on `_quack_documents`; `NewFile::fields` (the uploader's `DocumentFields`) wins over it.
+Images (PNG, JPEG, WebP, GIF; `FileType::Image`) are read once at ingest by
+`[ingestion].vision_model` (`llm::vision::ImageReader`, a tool-less `llm::PlainCall` at
+`background_effort`), whose transcription and description are chunked as Markdown; the image is
+kept as `files/<document id>.<ext>` (`ingestion::StoredImage`, `WorkspaceDb::stored_image`) and
+served by `GET .../documents/{doc}/image`. With no vision model an image is refused at
+registration (`Error::NoVisionModel`). A chat model marked `images = true` gets `view_image` (the
+stored image and a question back to the chat model) in a workspace that holds an image.
+Chunk bodies, graph source excerpts, and pinned text reach the model inside `text::Fenced`
+markers, whose code is a digest of the enclosed text (so the text cannot close its own block),
+after a fixed sentence that it is data; an `always_retrieve` chunk is fenced too, as the `content`
+string of the JSON object rig prints, with no sentence before it; the system prompt's trust
+paragraph precedes the permission rules; filenames, titles, headings, labels, and graph property
+values render through `text::OneLine`. Provider construction lives in `quack_core::llm`; interfaces never build rig
 clients themselves. Every chat model is wrapped in `llm::sampling::Sampled`: only Ollama's API
 gets a `temperature`, Claude gets `max_tokens` 64,000, and `[analysis].effort` /
 `background_effort` go out as each API's field (an unrecognized model id gets it on Chat
@@ -208,8 +315,8 @@ temporary client stays recorded (sealed) until deleted, so an interrupted run le
 `--token-env` or `--open`. RFC 7592 carries
 each rotation step's key set (`Registrar::publish_keys`, a full-metadata `PUT`) and deletes the
 client (`unregister`).
-Every interface returns one response object, `AgentResponse::to_json` (answer, citations with
-labels, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `duration_ms`, `session_id`); a write refused
+Every interface returns one response object, `AgentResponseBody` from `AgentResponse::body` (answer, citations with
+labels and the document's `ingested_at`, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `duration_ms`, `session_id`); a write refused
 inside a turn is `write_refused: true` (REST 200, MCP structured content, print exit 3). A streamed
 web or REST turn from someone who may write asks instead: a `permission_required` SSE event, answered
 by `POST .../sessions/{sid}/permissions/{request}` (`server::permissions`, held in memory, refused after
@@ -217,14 +324,22 @@ by `POST .../sessions/{sid}/permissions/{request}` (`server::permissions`, held 
 `input_tokens`/`output_tokens`/`total_tokens` for the turn taken off rig's final response
 (the per-request counts summed when a turn derails first), `null` when the provider
 reported none, and copied onto the assistant message's metadata in `_quack_messages`. It is
-a record: the history trim still uses the four-characters-per-token
-estimate (`text::Tokens`), since it runs before the call.
+a record: the history trim and `OllamaWindow` still use the four-characters-per-token
+estimate (`text::Tokens`), since both run before the call.
 The ontology (`quack_core::ontology`, design doc 6.3) is classes with single inheritance
 from `entity`, relations with a domain and a range, typed properties, and table mappings.
 It lives in the `_quack_ontology_*` tables; `ontology::store::save` validates, checks
 mapped tables and columns against the workspace, and writes a new version with a JSON
 snapshot, `since_version` carried over for items that already existed. JSON is the only
 interchange form (export, import, `PUT /ontology`); a file is never the source of truth.
+The ontology page's forms edit a property's meaning and the measures (`ontology::edit::Edit`,
+applied to the current version and saved through `store::save`).
+A class or relation id changes only through `ontology::store::rename` (`quack ontology rename`,
+`POST .../ontology/rename`, the ontology page's Rename form): `IdRenames` on the save's
+`Revision` moves, in the save's transaction, the ontology's own references, `since_version`,
+undecided candidates, and the graph's `class_id` and `relation_id`; an id that already exists
+is refused, and earlier snapshots keep the old id. An import that swaps one id for another is
+a removal plus an addition; `Ontology::diff` does not guess renames.
 The system prompt carries a compact rendering when an ontology exists
 (`Ontology::render_capped`, 30 items per section with the rest counted; extraction still
 gets `render_for_prompt` in full, since the model may only answer with ids it was shown),
@@ -262,7 +377,24 @@ trims and defaults the caller's fields, `run` checks class and relation ids agai
 ontology and resolves the entry points, and an unresolved path end is an `UnknownEntity`
 naming the closest labels. `graph::store::status` reports size, `provisional` (the newest ontology version
 was auto-accepted), `stale` (`graph_built_with_ontology_version` lags), pending merges,
-and drift; `revalidate` drops what the current ontology no longer allows. The agent
+drift, `pending_chunks` (chunks no extraction read), and `pending_tables` (mapped tables
+whose fingerprint in `_quack_graph_tables_built`, written by each mapping's last batch,
+no longer matches: owning document, keyed row count, hash over the mapped columns);
+`[graph].follow_ingest` (`off`, `tables`, `all`) has `graph::follow_up::after_documents`
+extract a document into the graph as it becomes ready (the server queues it as an audited
+graph run after an upload or import; the CLI and terminal run it after their ingest). A
+person's writes go through `store::{create_node, update_node, delete_node, create_edge,
+delete_edge}` (`quack graph add|set|delete`, the `.../graph/nodes` and `.../graph/edges`
+routes audited as `graph_edit`, the graph page's forms), each checked against the ontology
+and recorded as `Origin::Manual` provenance (`author`, `note`, `asserted_at`), rendered
+everywhere as `asserted by {author}: {note}`; `graph extract --reset` keeps them unless
+`--all`; `revalidate` drops what the current ontology no longer allows, and
+`Revalidation::preview` counts that first (totals, per class id, per relation id) so
+`quack graph revalidate` asks before dropping (`-y` skips; with nobody to ask it fails,
+`Confirm::ask_to_drop`), and the graph page and `POST .../graph/revalidate` send back the
+preview's totals (`api::graph::DropApproval`; 409 with the current totals when they are absent or
+stale). `GET .../graph/revalidate` serves the preview, and the run deletes what the preview
+counted, since both start from `Revalidation::find`. The agent
 registers `search_graph` and `find_path` only when the graph has nodes, query mode drops
 provisional results, and every response shape carries the turn's `graph` results. Their
 rendering (`Display for GraphResult` in `graph::traverse`, shared with `quack graph` and the terminal)
@@ -271,10 +403,38 @@ ontology does not define is refused with the ids that do exist, a name that matc
 entity comes back with the closest labels (`traverse::suggest_entities`), and a result
 query mode emptied by dropping provisional nodes says so rather than claiming the graph
 is empty. A result cut short by `max_nodes` says so too, and a class listing carries the
-total it was capped from (`GraphResult::total_nodes`, `truncated`). Provenance to a mapped
+total it was capped from (`GraphResult::total_nodes`, `truncated`). Every result carries
+`status` (`GraphStatusSummary`: versions, `stale`, `provisional_nodes`, `drift_total`,
+`dropped_provisional`), filled by `GraphQuery::run` and `PathQuery::run` (`store::summary`)
+and counted by `without_provisional`, so every interface's `graph` says how current it is;
+the prompt's graph line names the drift count. `graph::export::GraphExport` writes the whole
+graph as a CSV bundle (to a directory, or a tar whose parts are staged in
+`WorkspaceDb::spool_file`), GraphML (`quick-xml`), or JSON-LD, each part streamed from one
+ordered statement; `GET .../graph/export?format=` streams it through `api::okf::Download`
+(shared with the OKF export) and audits `export` with the counts when the stream ends. Provenance to a mapped
 table renders as a predicate `run_sql` can run, since the mapping knows the key column. The
 tool guidance in the system prompt gains a numbered graph procedure whenever those tools
 are registered.
+
+What the agent knows of a table (issue #403): `storage::profile::TableProfile` (per column
+present and distinct counts, three common values, the share of a text column that casts to a
+number or a date) is stored in `_quack_table_profiles` at load, import, and after any write that
+changed the row count (`TableProfile::after_write`, called by every interface that runs a write),
+and shown only while its row count matches; `profile::ColumnWarning` (all empty, half empty,
+numbers or dates stored as text, a repeating key) is worked out when read, with the
+`ColumnType` that fixes it when every value converts (`profile::Retype`, a strict `CAST`;
+`--types` at ingest and import). Owners' notes are `profile::TableNote` (`_quack_table_notes`).
+The ontology's `Property` carries `description`, `unit`, `synonyms`, and `Ontology::measures`
+(a SQL expression over one table, checked as a read at save); `WorkspaceDb::describe_table`
+returns all of it on `TableDescription` (`TableDescription::body`, a `TableDescriptionBody`, is the one REST, MCP, and CLI shape). Past
+`table_search::DETAILED_TABLES` (25) user tables, `find_tables` registers and the prompt ranks
+tables against the question after the workspace context (`analysis::table_search`: a card per
+table, BM25 with `tokenize`, plus cosine over card vectors in `_quack_table_cards` refreshed at
+turn start, fused by RRF). The graph is readable in SQL through `graph::views` (issue #406):
+`graph_<class>` with one typed column per property and `graph_edges`, made by `views::ensure` at
+every ontology save and open, marked by a comment; `table_search::user_tables` is
+`list_tables` without them. A write naming `graph_` is refused (`views::write_names_reserved`),
+and ingest and import refuse `graph_` and `_quack_` table names (`TableName::check_unreserved`).
 
 Every embedding goes through `quack_core::embedding::Embedder` as an `Input`, which names
 its role: `Query` (search), `Document { title, text }` (a chunk under its heading), or
@@ -300,8 +460,23 @@ to the chunks that entity was extracted from (`graph::store::chunks_of_nodes` in
 hit names the entities the graph took from it (`graph::store::entities_of_chunks`). An
 entity that exists only in mapped table rows says so instead of returning nothing. The
 `entity` argument is offered only while the graph has nodes (`SearchDocumentsTool::with_model`, `text_to_sql::Modeled`),
-like the graph tools themselves. Ollama embedding requests go through `llm::OllamaEmbedder`,
+like the graph tools themselves. `read_document(document, from, limit)` (`tools::ReadDocumentTool`,
+registered in every workspace beside `search_documents`) returns a document's chunks in order
+from a position, numbered through the turn's citation registry so `[n]` markers on them
+validate, within `[retrieval].pinned_token_budget` (at most 50 chunks a call), and counts as
+reading document text for the write rule. Every `Citation` carries `excerpt`, the chunk's
+first 500 characters; the web chat links each citation to the passage page
+`/w/{id}/documents/{doc}/chunks/{n}` (`templates/passage.html`, previous and next chunk linked),
+and `GET .../documents/{doc}/chunks?from=&limit=` pages a document's chunks over REST, both
+through `api::documents::read_chunks` (`WorkspaceDb::document_chunks`), audited as opening the
+document. Ollama embedding requests go through `llm::OllamaEmbedder`,
 not rig's client, so they carry `keep_alive` and a chunk-sized `num_ctx`.
+
+Every command resolves its workspace through `ControlPlane::workspace_or_default`: `-w NAME`
+must name a workspace that exists (`Error::NoWorkspaceNamed`, exit 2, nothing created), and
+with no `-w` the `[general].default_workspace` is created, audited, on first use. A new
+workspace's name is a `storage::control::WorkspaceName` (trimmed, non-empty, no `/`, `\`, or
+`.`), the one rule `quack workspace create`, the API, the web console, and the config key share.
 
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with
@@ -312,9 +487,19 @@ half of each audit row is `storage::audit` (`_quack_audit`) inside the workspace
 same UUID v7. Ingestion is `register_document` (status `queued`, or `Registration::Duplicate` when the
 bytes' SHA-256 already belong to a non-failed document whose table or chunks still exist;
 `Error::TableTaken` when the file's table belongs to another live document) plus `Processing::run`
-(`processing` to `ready` or `error`, recording `chunk_count` and the parsed title);
+(`processing` to `ready` or `error`, recording `chunk_count`, the parsed title, and a PDF's
+`parser::PageCounts`: pages in the file, pages whose extraction failed, pages without text;
+`PageCounts::note` is the one wording every interface shows, as `3 of 40 pages unreadable`);
 `ingest_file` does both and takes a `NewFile` (name, bytes, `DocumentSource`, optional
-title and uploader, and its `RunControl`).
+title and uploader, its `RunControl`, and `replaces`, the ready document this file takes
+the place of: `quack ingest --replace [ID]`, `POST .../documents?replace={doc}`, the
+Documents row's Replace control). The old document keeps serving, marked `superseded_by`,
+until the new one is `ready`; then it becomes `DocumentStatus::Superseded` and its pin moves
+over (`WorkspaceDb::finish_replacement`); a failure clears the mark (`mark_document_error`).
+A table file loads over its predecessor's table. A superseded document leaves search, the
+prompt, `list_documents`, and `read_document` (`WorkspaceDb::list_documents` is live rows;
+`list_all_documents` has them all for `quack docs --all` and the page's `?all=true`), but keeps
+its chunks so stored citations still open.
 
 The MCP server (`crates/quack/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `sql`,
 `list_tables`, `describe_table`, `list_documents` and the `quack://workspace/...` resources;
@@ -326,11 +511,15 @@ accept the issuer's access tokens (`SignIn::verify_bearer`, `jsonwebtoken` on aw
 Bearer resource_metadata=...` on 401, so MCP clients can sign users in themselves.
 
 External data comes in through `quack_core::import` (`quack import`, `POST .../import`, the
-Tables page form, `/import` in the terminal): a Postgres or SQLite query runs on the source
-with every column cast to text through sqlx (`tls-rustls-aws-lc-rs`), or a CSV, Parquet,
-JSON, or workbook file is fetched over HTTP(S), and the rows load through the normal
-ingestion path as a document with source `import` and the redacted URL as title. No
-`ATTACH`: the workspace never reaches out at query time.
+Tables page form, `/import` in the terminal): a query runs on a SQLite file, opened read-only
+by path, with every column cast to text through sqlx, or a CSV, Parquet, JSON, or workbook
+file is fetched over HTTP(S) (with `import::SourceHeader`s: given ones, or a bearer token read
+from `--bearer-env` at fetch time; `JsonPointer` picks the rows of an enveloped JSON) or from S3
+(`import::s3`, a GET signed by `llm::bedrock::Signer::s3` with the AWS SDK's credentials), and
+the rows load through the normal ingestion path as a document with source `import` and the
+redacted URL as title. S3 and `--bearer-env` use the server's own credentials, so `quack serve`
+with logins refuses them (`Error::ServerCredentials`, 403) unless
+`[import].allow_server_credentials`. No `ATTACH`: the workspace never reaches out at query time.
 
 `quack serve` (`crates/quack/src/server/`) is a thin axum client of core: `auth.rs` turns a
 bearer (login session or API token), the session cookie, or `--local` into an `Identity`
@@ -364,11 +553,27 @@ write in progress just to record itself. `query/stream` forwards the agent event
 and run on the work queue in a lane of `[server].workers_per_workspace` per workspace
 (`queue.rs`), which locks the workspace only around each database step and keeps each queued upload's bytes on disk in the workspace's `uploads/` until its job ends; `api/jobs.rs`
 serves `GET .../jobs`, `.../jobs/stream` (SSE), `.../jobs/{job}`, and `POST .../cancel`,
-and `/w/{id}/jobs` is the web console's Jobs page. The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
+and `/w/{id}/jobs` is the web console's Jobs page; every workspace page carries a job strip
+(`/w/{id}/jobs/strip`) over one `jobs/stream`, with a toast when a background job finishes, and
+`[server.webhooks]` POSTs finished jobs, content-free and HMAC-signed (`jobs::webhook`). The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
 the same `Access::resolve` checks and the API's `Access` operations; `WebUser` redirects to `/login` instead
 of a 401; the built Tailwind CSS is committed (`make css-build` after template edits),
-htmx and ECharts are vendored, and the SQL page's CodeMirror editor is bundled from
-`crates/quack/editor/` (`make editor-build`, bundle committed; `docs/web-ui.md`). Tests drive the router with
+htmx, ECharts, and Redoc are vendored, and the SQL page's CodeMirror editor is bundled from
+`crates/quack/editor/` (`make editor-build`, bundle committed; `docs/web-ui.md`). The API's
+contract is `server/api/openapi.rs`: an OpenAPI 3.1 document generated with `utoipa` from a
+`#[utoipa::path]` on every handler and `ToSchema` on every request and response type (core
+types included), served at `/api/v1/openapi.json` and rendered by Redoc at `/api/v1/docs`,
+both beside `/healthz` (no sign-in, no audit, no limiter). A new route goes through
+`api::ApiRoutes::route` and needs its annotation in `ApiDoc`'s `paths`; the tests in
+`api/openapi/tests.rs` fail otherwise, and also when a method the router answers is not
+documented. Parameters come from the handler's signature through utoipa's `axum_extras`:
+a tuple `Path<(..)>` is named from the route template, a lone `Path<WorkspaceId>` or
+`Path<UserId>` and every query struct go in `params(...)` (the ids implement `IntoParams`
+for their segment), and `Query<T>` supplies the location, so no `parameter_in` is written;
+a test fails when a path segment or a query field is missing. Every API error is `{"error", "code"}` with a stable `server::error::ErrorCode`
+(`ErrorCode::of` maps each core error, `of_turn` each `FailureKind`); the SSE `error` event
+carries the same JSON, and `error::coded_errors` gives the framework's own errors under
+`/api/` (rejections, 405, 429, 504) the same body. Tests drive the router with
 `tower::ServiceExt::oneshot` and no model. The full CLI (`quack -p`, `quack serve`, `quack mcp`,
 `quack ontology propose`, ...) is specified in design doc section 11.
 
@@ -411,7 +616,7 @@ with a warning when they do not), and the multi-arch `quack serve` image on GHCR
 prebuilt binaries (`Dockerfile.release`) plus image tarballs for air-gapped hosts. The
 `publish` job only downloads those artifacts, writes `SHA256SUMS`, and creates the release.
 `docker-compose.yml` with `deploy/config.toml` runs the image beside Ollama. Cut a release
-by pushing an annotated `vX.Y.Z` tag after the branch is pushed; `workflow_dispatch` builds
+by pushing an annotated `vYYYY.M.N` tag (`v2026.10.3`) after the branch is pushed and `docs/upgrading.md` has the tag's section (the release notes lead with it, then git-cliff's grouped commits); `workflow_dispatch` builds
 everything and publishes nothing.
 
 ## Where to read more
@@ -419,4 +624,9 @@ everything and publishes nothing.
 `docs/architecture.md` maps the design to the modules; `docs/migrations.md`,
 `docs/crypto.md`, `docs/web-ui.md`, and `docs/ci-cd.md` cover the schema, TLS, web UI, and
 release layers, `docs/authentication.md` covers signing in to quack, and `docs/providers.md`
-covers connecting to and authenticating with model providers. Read the relevant one before changing that layer.
+covers connecting to and authenticating with model providers. `docs/audit.md` lists every
+logged event type (a test keeps it in step with `AuditAction`), `docs/operations.md` the
+erase procedure and hardware sizing, `docs/upgrading.md` each release's upgrade steps (the
+version-bump PR adds the section; the release notes lead with it), `docs/compliance/` the
+control matrix, and `docs/contributing/` the recipes for a new parser, agent tool, or provider
+type. Read the relevant one before changing that layer.

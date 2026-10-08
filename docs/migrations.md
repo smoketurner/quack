@@ -26,9 +26,14 @@ version with a SHA-384 checksum of its file.
   label), membership, tokens (API token hashes; signed-in users' and model providers' OAuth
   tokens in `user_tokens` and `provider_tokens`), each OAuth client's `private_key_jwt`
   signing key in `client_keys` (version 7), the clients quack registered itself (RFC 7591)
-  with their registration access tokens in `client_registrations` (version 8), and the
-  access `audit_log`. The vault seals every token and key. The audit log is append-only; no
-  code path may `UPDATE` or `DELETE` it.
+  with their registration access tokens in `client_registrations` (version 8), each user's
+  lifecycle columns (`disabled_at`, `password_changed_at`, `failed_logins`, `locked_until`;
+  version 9), the roles an identity provider's groups carry in `group_roles` and which
+  memberships that provider granted (`members.granted_by`; version 10), the secret a saved
+  import refreshes with, sealed, keyed by the import's id, and deleted with its workspace
+  (`import_credentials`; version 11), and the access
+  `audit_log`. The vault seals every token and key. The audit log is append-only; no code
+  path may `UPDATE` or `DELETE` it.
 
 ### Databases created before the switch
 
@@ -44,7 +49,7 @@ on the same file.
 
 Each workspace's `data.duckdb` holds the `_quack_` tables beside the user's tables and
 views: documents, chunks, terms, ontology, graph, provenance, merges, sessions, messages,
-context, and audit detail (design doc section 5.4). `WorkspaceDb::open()` creates what is
+saved questions and their runs, context, and audit detail (design doc section 5.4). `WorkspaceDb::open()` creates what is
 missing and records `_quack_meta.schema_version`. A version bump can trigger a rebuild on
 open:
 
@@ -63,6 +68,28 @@ open:
   matched a node pair in either orientation, a pair whose provenance flipped between
   resolution passes could land twice (`(keep, drop)` and `(drop, keep)`). Each pair keeps
   one row, the more-decided one, so a reviewer's rejection survives.
+- **12**: Profiles every user table (`_quack_table_profiles`, issue #403), so the prompt, the
+  Tables page, and the agent's tools carry column warnings for tables loaded before profiles.
+  The same release adds `_quack_table_notes`, `_quack_table_cards`, `_quack_ontology_measures`,
+  and `description`, `unit`, and `synonyms` on `_quack_ontology_properties`, which need no
+  backfill, and the graph's `graph_` views (issue #406), which every open makes to match the
+  ontology.
+- **13**: Detects each document's language (`_quack_documents.language`, an ISO 639-3
+  code) from its first chunks under `[retrieval].languages`, records the workspace's
+  stemmings in `_quack_meta.languages`, and rebuilds the term index: each chunk stemmed
+  under its document's language, runs of Chinese, Japanese, and Korean as character
+  bigrams (issue #395).
+- **14**: Adds `_quack_imports`, the imports saved under a name for `quack import refresh`
+  (issue #402). The table starts empty and needs no backfill.
+
+A column that needs no backfill needs no bump: `ADD COLUMN IF NOT EXISTS` on open adds it,
+and rows written earlier read as `NULL`. `_quack_documents.page_count`, `pages_unreadable`,
+`pages_empty`, `superseded_by` (the id of the document replacing this one; the status
+`superseded` joined the four above with it), and `source_root` with `source_path` (the
+canonical path of the folder `quack ingest DIR` read the file from, and the file's path
+under it) arrived this way, as did `author`, `authored_at`, `modified_at`, `tags`, and
+`metadata` (what a file says about itself) and `_quack_chunks.kind` and `locator` (a chunk
+stored before them reads as body text with no locator).
 
 Phrase search (`"..."` in a keyword query) needed no bump: it post-filters candidates by
 substring instead of adding term positions to `_quack_terms`.
@@ -85,4 +112,64 @@ every open replays `CREATE TABLE IF NOT EXISTS` plus `ADD COLUMN IF NOT EXISTS`.
 - The ontology and the workspace context are versioned as data
   (`_quack_ontology_versions`, `_quack_context`), not by schema versions.
 - A workspace directory is portable: every version must open a file an older binary created
-  on another machine. User tables and views are never touched.
+  on another machine. User tables and views are never touched; the one exception is the
+  `graph_` views quack itself makes and marks with a comment (`graph::views`), which it
+  replaces and drops to match the ontology.
+
+### Upgrading and rolling back
+
+Upgrades run on open. A newer quack opens an older workspace file, runs the steps above,
+and records three values in `_quack_meta`: `schema_version`, `written_by_quack` (its own
+version), and `written_by_duckdb` (the DuckDB library it was built with). `quack doctor`
+prints all three for the workspace it checks.
+
+Rolling back is refused. An older quack that opens a file whose `schema_version` is above
+its own stops with `Error::WorkspaceTooNew` before it runs any statement that changes the
+file: no table definition, no rebuild, no version write. The message names the file, both
+schema versions, and the quack that wrote it:
+
+```
+workspace file .../data.duckdb has schema version 13, written by quack 2026.11.0; this quack
+(2026.10.3) reads up to version 12: run quack 2026.11.0 or newer, or restore the copy of the
+workspace made before the upgrade
+```
+
+The CLI prints it and exits 1, the server answers 503, and `quack doctor` fails the
+workspace check with that advice as its fix. Two ways out:
+
+1. Run the quack version the message names, or a newer one.
+2. Restore the copy of the workspace directory made before the upgrade.
+
+So copy the data directory before upgrading quack if rolling back must stay possible. A
+file last written before `written_by_quack` existed names no version; the message then
+asks for "a newer quack". A `schema_version` that is not a number is refused the same way,
+before any statement runs (`Error::WorkspaceSchemaUnreadable`): quack does not guess which
+schema such a file holds.
+
+`control.db` has the same guard from sqlx: the migrator refuses a database that holds a
+migration the binary lacks.
+
+### DuckDB's storage format
+
+DuckDB versions its file format separately from quack's schema. Two facts, checked against
+the bundled DuckDB 1.5.6:
+
+- DuckDB picks the format when it creates a file, from `storage_compatibility_version`.
+  The default is `v0.10.2`; `duckdb_databases()` reports such a file as storage version
+  `v1.0.0+`.
+- An existing file keeps its format. Files created as `v1.0.0+`, `v1.2.0+`, `v1.4.0+`, and
+  `v1.5.0+` each reported the same storage version after a `SET` to `v1.5.0` or `latest`,
+  a write, and a checkpoint. A `v1.0.0+` file kept its version when opened with the setting
+  at `v0.10.2`, `v1.5.0`, or `latest`, and a `v1.5.0+` file keeps it when quack opens it
+  (the test below).
+
+`WorkspaceDb::open` passes `storage_compatibility_version = 'v0.10.2'` when it opens the
+file (`STORAGE_COMPATIBILITY_VERSION`). The setting has to go in at open: a `SET` after the
+file exists changes nothing, and after `lock_configuration` it is an error. Naming the
+default changes no file today. It means a `duckdb` upgrade whose default differs cannot
+change the format of new workspace files: the test
+`naming_the_storage_compatibility_version_changes_no_file` fails until someone decides.
+
+Raising the constant is a deliberate step. New files then need at least that DuckDB, so no
+quack built on an older one can open them. Existing files keep their format. Record the
+change here when it happens.

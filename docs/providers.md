@@ -45,10 +45,58 @@ Three settings apply to every type:
   bills on one. quack refuses `Authorization` and `x-api-key`, since the credential comes
   from `auth`. `quack config` shows header names, never values. Bedrock's `api = "converse"`
   takes no headers, because the AWS SDK sends those requests.
+- `max_retries` (3) and `retry_backoff_ms` (500) say how a failed request is sent again: a
+  429, a 5xx, or a connection that dropped before the response head is retried after the
+  wait, which doubles each time with up to 25% jitter and never exceeds 60 seconds; a
+  `Retry-After` header sets the wait when the provider sends one. A stream that fails after
+  its head is not retried, since part of it was delivered. `max_retries = 0` sends once.
+  Bedrock's `converse` API hands the same numbers to the AWS SDK's standard retry mode.
+  Each retry counts in `quack_provider_retries_total` on `/metrics`.
 
 `type = "openai"` also takes `api`: `"responses"` (the default for OpenAI itself) or
 `"chat-completions"` (the default with a `base_url`, since many compatible servers offer
 nothing else).
+
+## Restricting a workspace to some providers
+
+A workspace's owner can limit which configured providers receive its content: the
+**Allowed providers** setting on the workspace's settings page, or `allowed_providers` in
+`PATCH /api/v1/workspaces/{id}`. An empty list allows every provider. The list names
+`[providers.NAME]` entries, so it applies to the chat model, the embedding model, and the
+rerank model alike.
+
+quack enforces the list on every model request from every interface: questions, search,
+uploads, imports, graph extraction, the ontology's document pass, embeddings refresh, MCP, the
+command line, and the terminal. It checks twice, with one function
+(`quack_core::llm::egress::Egress::permit`):
+
+1. When it builds a model's client, so the work is refused before it starts.
+2. When each request passes the provider's concurrency gate
+   (`llm::limit::ProviderGates::permit`). Every HTTP request quack sends to a provider goes
+   through that gate, Bedrock's AWS SDK requests included, so no request goes around it.
+
+A refused request is never sent. The error names the provider and the list:
+
+```
+provider 'hosted' is not allowed in this workspace, which allows only: local
+```
+
+The server answers `403` and writes a `denied` row to the audit log for the action that was
+refused. An MCP tool returns the same text as a tool error. The command line prints it and
+exits 1.
+
+The models are set once for the whole installation, so restrict a workspace only to providers
+that serve every model it needs. If `[embedding].model` is on a provider the list leaves out,
+that workspace refuses uploads, search, and questions until the list or the configuration
+changes.
+
+Ollama serves some models from its own hosts through the local API; their ids carry a `cloud`
+tag (`NAME:cloud` or `NAME:SIZE-cloud`). In a workspace with a restricted list, quack refuses
+those models on a `type = "ollama"` provider, so a list of local providers keeps content on
+the machine. A workspace that allows every provider is not affected.
+
+`quack doctor` and the model listings carry no workspace content. `quack doctor` probes every
+configured provider whatever any workspace allows.
 
 ## Temperature and reasoning effort
 
@@ -57,7 +105,7 @@ and OpenAI reasoning models reject it with a 400, and every API accepts a reques
 
 `[analysis].effort` and `background_effort` go out as the field each API takes:
 `output_config.effort` for Claude, `reasoning.effort` on Responses, `reasoning_effort` on Chat
-Completions and on Ollama. quack knows which levels Claude, OpenAI's reasoning models, and
+Completions, `think` on Ollama. quack knows which levels Claude, OpenAI's reasoning models, and
 gpt-oss take, and refuses any other level before sending a request. A model it does not
 recognize, such as a gateway alias or an open-weight model on vLLM, gets the effort on Chat
 Completions and Responses, and the server decides whether it accepts that level.
@@ -84,7 +132,33 @@ temperature = false                      # use the model's own sampling defaults
 `temperature = true` sends quack's temperature (0.1 for chat turns, 0.0 for extraction). If only
 some of a gateway's models reason, set `effort` on those models rather than in `[analysis]`,
 because a model that does not reason rejects the field. `quack config` lists every key, and
-`quack doctor` shows what the chat model is sent.
+`quack doctor` shows what the chat model is sent. It checks `background_effort` too when that differs from
+`effort`. A level the model refuses fails graph extraction and the ontology's document pass;
+a chat turn still answers, without model reranking and history summaries, and logs a warning.
+
+## Images
+
+Two settings let quack read images. Neither sends an image anywhere until it is set.
+
+- `[ingestion].vision_model` names the model that reads an uploaded PNG, JPEG, WebP, or GIF
+  once at ingest. Without it, an image upload is refused. It runs at the model's
+  `background_effort`.
+- `images = true` on `[providers.NAME]` or `[providers.NAME.models."ID"]` says the chat
+  model reads images, which gives the agent the `view_image` tool in a workspace that holds
+  an image: the stored image and the agent's question go to the chat model again.
+
+```toml
+[ingestion]
+vision_model = "ollama/gemma4:e4b"
+
+[providers.ollama.models."gemma4:e4b"]
+images = true                            # only when gemma4:e4b is also the chat model
+```
+
+Any provider type works if the model accepts images: Ollama's vision models, OpenAI's
+and Claude's current models, and Bedrock's Claude models. A model that does not read
+images either rejects the request or answers without seeing the image, so set these
+only for one that does. `quack doctor` checks that the provider lists `vision_model`.
 
 ## Credentials
 
@@ -213,6 +287,51 @@ issuer at each rotation step. [`authentication.md`](authentication.md#letting-qu
 lists its options. When `[server.oidc]` names the same issuer, one registration and one key
 serve both.
 
+## Proxies
+
+quack sends every outbound HTTP request through the forward proxy the environment names:
+model providers, Amazon Bedrock and its AWS credential calls, OAuth and OpenID Connect
+issuers, and `quack import` of an HTTP(S) file.
+
+| Variable | Used for |
+|---|---|
+| `HTTPS_PROXY` | `https://` requests |
+| `HTTP_PROXY` | `http://` requests |
+| `ALL_PROXY` | a scheme whose own variable is unset |
+| `NO_PROXY` | hosts to reach directly, comma-separated |
+
+The upper-case name wins over the lower-case one. A value without a scheme is an `http://`
+proxy. Credentials go in the URL (`http://user:password@proxy.corp:8080`); quack never
+prints them.
+
+**Always direct.** `localhost`, `127.0.0.0/8`, `::1`, and `169.254.0.0/16` never go through
+the proxy, whatever `NO_PROXY` holds. A local Ollama and the EC2 and ECS credential
+endpoints therefore need no entry. A model server on another host does: under Docker
+Compose, add the `ollama` service name to `NO_PROXY`.
+
+**`NO_PROXY` forms.** A domain matches itself and its subdomains (`corp.example` and
+`.corp.example` are the same). An address (`10.1.2.3`) and a range (`10.0.0.0/8`) match
+addresses written in the URL. A lone `*` matches every hostname, but no address. Globs
+(`*.corp.example`) and entries with a port (`host:8443`) match nothing; `quack doctor` names
+them.
+
+**Limits.**
+
+- SOCKS proxies are not supported. Requests through one fail, and `quack doctor` fails the
+  check.
+- Amazon Bedrock's `converse` API and AWS credential calls (Bedrock's, and an S3
+  import's) take one proxy. When `HTTP_PROXY` and `HTTPS_PROXY` differ they use
+  `HTTPS_PROXY`, and an `http://` Bedrock `base_url` is reached directly. An S3 import's
+  download itself goes through the same client as any HTTP(S) import.
+- A proxy that inspects TLS presents its own certificate. Add its certificate authority
+  to the operating system's trust store.
+- With `[import].allow_private_hosts` off, an import through a proxy checks only an
+  address written in the URL. The proxy resolves names, so the proxy decides which hosts
+  a name may reach.
+
+`quack doctor` prints the proxy in effect, and `quack config` lists which of the four
+variables are set.
+
 ## Recipe: Amazon Bedrock
 
 Bedrock has two endpoints that host different models, so quack has one provider type for
@@ -281,6 +400,32 @@ The bearer is sent only when the provider has a key, since `llama-server` refuse
 was not started with. Ollama, Anthropic, and Bedrock serve no rerank endpoint, so quack
 refuses them for `rerank_model` when it loads the config. `quack doctor` checks that the
 server lists the model and answers one small rerank call.
+
+**Offline or air-gapped: Qwen3-Reranker-0.6B on llama.cpp.** Of the rerankers small enough
+to run beside Ollama on one machine, Qwen3-Reranker-0.6B scores highest on the MTEB-R
+reranking benchmark (65.80, against 57.03 for bge-reranker-v2-m3; the model card has the
+table). llama.cpp's server serves it at `/v1/rerank` with no network at runtime:
+
+```bash
+llama-server --reranking -m Qwen3-Reranker-0.6B-Q8_0.gguf --port 8000
+```
+
+```toml
+[retrieval]
+rerank = "reranker"
+rerank_model = "rerank/Qwen3-Reranker-0.6B"
+# rerank_candidates = 24
+
+[providers.rerank]
+type = "openai"
+base_url = "http://localhost:8000/v1"
+```
+
+`rerank_candidates` (24) is how many fused hits the reranker scores before `top_k` are
+kept. Raise it, to 50 or so, when the workspace holds many near-duplicate passages (versions
+of one policy, templated reports): the right passage is then often below rank 24 in the fused
+list, and a reranker scores a pair in a few milliseconds, so the cost is small. Leave it
+when the search already returns the right document in its first page.
 
 ## Recipe: LiteLLM
 
@@ -539,6 +684,11 @@ advertised grants when `actor = false`. `--offline` skips network checks.
 - **`invalid_client` with `private_key_jwt`**: the issuer does not hold quack's current key.
   Register the output of `quack auth jwks NAME`, and restart `quack serve` after
   `--activate`.
+- **"provider 'X' is not allowed in this workspace"** (`403` from the server, exit code 1):
+  the workspace's allowed providers leave out the provider of a configured model. Add the
+  provider on the workspace's settings page, or move the model to an allowed provider.
+- **"model 'M' of provider 'X' runs in Ollama's cloud"**: the workspace restricts its
+  providers and the model has a `cloud` tag. Configure a local model, or allow every provider.
 - **A Bedrock credential error at the first request**: the AWS SDK found no valid
   credentials. Run `aws sso login` for the profile, or check `aws_profile` and `AWS_PROFILE`.
 

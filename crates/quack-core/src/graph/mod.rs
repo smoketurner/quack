@@ -9,15 +9,20 @@
 //! Everything lives in `_quack_graph_*` and `_quack_provenance` inside the
 //! workspace file.
 
+pub mod export;
 pub mod extract;
+pub mod follow_up;
 pub mod query;
 pub mod resolve;
 pub mod store;
 pub mod tables;
 pub mod traverse;
+pub mod views;
 
 use std::collections::BTreeMap;
 use std::fmt;
+
+use crate::error::{Error, Result as CoreResult};
 
 use duckdb::types::ToSqlOutput;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -26,11 +31,13 @@ use crate::embedding::{Dimension, Input};
 use crate::extraction::Tally;
 use crate::ids::{ChunkId, ClassId, DocumentId, EdgeId, NodeId, RelationId};
 use crate::ontology::OntologyVersion;
+use crate::text::OneLine;
 
 /// Whether a graph write rests on a reviewed ontology, or on one that was
 /// auto-accepted and so is provisional until someone reviews it. Binds
-/// as the `provisional` column's boolean.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// as the `provisional` column's boolean, and serializes as it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "bool", into = "bool")]
 pub enum Standing {
     #[default]
     Reviewed,
@@ -40,20 +47,21 @@ pub enum Standing {
 flag_enum!(Standing, false => Reviewed, true => Provisional);
 
 /// A stored node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Node {
     pub id: NodeId,
     pub label: String,
     pub class_id: ClassId,
     #[serde(default)]
     pub properties: Properties,
-    pub provisional: bool,
+    #[serde(rename = "provisional")]
+    pub standing: Standing,
 }
 
 /// `label (class)`, how every listing names a node.
 impl fmt::Display for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({})", self.label, self.class_id)
+        write!(f, "{} ({})", OneLine(&self.label), self.class_id)
     }
 }
 
@@ -71,7 +79,7 @@ impl Node {
 }
 
 /// A stored edge.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Edge {
     pub id: EdgeId,
     pub source_node_id: NodeId,
@@ -80,7 +88,8 @@ pub struct Edge {
     pub weight: f64,
     #[serde(default)]
     pub properties: Properties,
-    pub provisional: bool,
+    #[serde(rename = "provisional")]
+    pub standing: Standing,
 }
 
 /// Properties past this many are counted rather than rendered: a node
@@ -98,7 +107,7 @@ const ALIASES: &str = "aliases";
 /// answered or a column held reads as no properties, so no caller checks
 /// the shape again. Sorted by name, so rendering and the stored form do not
 /// depend on the order a model or a row gave them in.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct Properties(BTreeMap<String, serde_json::Value>);
 
@@ -131,6 +140,63 @@ impl Properties {
     pub fn fill_from(&mut self, other: &Self) {
         for (key, value) in &other.0 {
             self.0.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    /// `KEY=VALUE` pairs as properties, as `quack graph add` and `set`
+    /// take them: a value that reads as a JSON number or boolean is stored
+    /// as one, anything else as text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] naming a pair without `=` or a key.
+    pub fn parse_pairs<S: AsRef<str>>(
+        pairs: impl IntoIterator<Item = S>,
+    ) -> CoreResult<serde_json::Map<String, serde_json::Value>> {
+        let mut out = serde_json::Map::new();
+        for pair in pairs {
+            let pair = pair.as_ref();
+            let Some((key, value)) = pair.split_once('=') else {
+                return Err(Error::Config(format!("'{pair}' is not KEY=VALUE")));
+            };
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(Error::Config(format!("'{pair}' has no key")));
+            }
+            let value = serde_json::from_str::<serde_json::Value>(value.trim())
+                .ok()
+                .filter(|v| v.is_number() || v.is_boolean())
+                .unwrap_or_else(|| serde_json::Value::String(value.trim().to_owned()));
+            out.insert(key.to_owned(), value);
+        }
+        Ok(out)
+    }
+
+    /// The graph page's `KEY=VALUE` lines as an edit for [`Self::patch`]:
+    /// blank lines skipped, and an empty value is `null`, which removes
+    /// the key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] naming a line without `=` or a key.
+    pub fn parse_patch_lines(text: &str) -> CoreResult<serde_json::Map<String, serde_json::Value>> {
+        let mut patch = Self::parse_pairs(text.lines().map(str::trim).filter(|l| !l.is_empty()))?;
+        for value in patch.values_mut() {
+            if value.as_str().is_some_and(str::is_empty) {
+                *value = serde_json::Value::Null;
+            }
+        }
+        Ok(patch)
+    }
+
+    /// Apply a person's edit: each value sets its key, `null` removes it.
+    pub fn patch(&mut self, edit: &serde_json::Map<String, serde_json::Value>) {
+        for (key, value) in edit {
+            if value.is_null() {
+                self.0.remove(key);
+            } else {
+                self.0.insert(key.clone(), value.clone());
+            }
         }
     }
 
@@ -229,7 +295,7 @@ impl fmt::Display for Properties {
                 dropped = dropped.saturating_add(1);
                 continue;
             }
-            parts.push(format!("{key}: {value}"));
+            parts.push(format!("{}: {}", OneLine(key), OneLine(&value)));
         }
         if parts.is_empty() {
             return Ok(());
@@ -242,10 +308,22 @@ impl fmt::Display for Properties {
 }
 
 /// Where a node or edge came from. Serialized flat into [`Provenance`],
-/// as `document_id` and `chunk_id` or `table_name` and `row_key`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// as `document_id` and `chunk_id`, `table_name` and `row_key`, or the
+/// person who asserted it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(untagged)]
+#[schema(as = ProvenanceOrigin)]
 pub enum Origin {
+    /// A person stated it (`quack graph add`, the API, the graph page).
+    /// First, so a row with `asserted_at` never reads as a chunk.
+    Manual {
+        /// The server user; `None` from the command line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        asserted_at: String,
+    },
     /// A chunk of a document.
     Chunk {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,16 +334,55 @@ pub enum Origin {
     Row { table_name: String, row_key: String },
 }
 
+/// The `_quack_provenance` columns of one row, as the store reads them.
+#[derive(Debug, Clone)]
+pub struct ProvenanceColumns {
+    pub document_id: Option<DocumentId>,
+    /// Empty when the row is not a chunk's.
+    pub chunk_id: ChunkId,
+    pub table_name: String,
+    pub row_key: String,
+    pub author: Option<String>,
+    pub note: Option<String>,
+    pub asserted_at: Option<String>,
+}
+
+impl Default for ProvenanceColumns {
+    fn default() -> Self {
+        Self {
+            document_id: None,
+            chunk_id: ChunkId::from(String::new()),
+            table_name: String::new(),
+            row_key: String::new(),
+            author: None,
+            note: None,
+            asserted_at: None,
+        }
+    }
+}
+
 impl Origin {
-    /// From the `_quack_provenance` columns, where the unused pair is
-    /// stored as empty text: a row when the table is named, else a chunk.
+    /// From the `_quack_provenance` columns, where an unused text column
+    /// is empty: an assertion when it has a time, a row when the table is
+    /// named, else a chunk.
     #[must_use]
-    pub fn from_columns(
-        document_id: Option<DocumentId>,
-        chunk_id: ChunkId,
-        table_name: String,
-        row_key: String,
-    ) -> Self {
+    pub fn from_columns(columns: ProvenanceColumns) -> Self {
+        let ProvenanceColumns {
+            document_id,
+            chunk_id,
+            table_name,
+            row_key,
+            author,
+            note,
+            asserted_at,
+        } = columns;
+        if let Some(asserted_at) = asserted_at {
+            return Self::Manual {
+                author,
+                note,
+                asserted_at,
+            };
+        }
         if table_name.is_empty() {
             Self::Chunk {
                 document_id,
@@ -284,13 +401,31 @@ impl Origin {
     pub fn chunk_id(&self) -> Option<&ChunkId> {
         match self {
             Self::Chunk { chunk_id, .. } => Some(chunk_id),
-            Self::Row { .. } => None,
+            Self::Row { .. } | Self::Manual { .. } => None,
         }
+    }
+
+    /// "asserted by {author}: {note}" for a manual origin, as every
+    /// rendering shows it; `None` for the others.
+    #[must_use]
+    pub fn assertion(&self) -> Option<String> {
+        let Self::Manual { author, note, .. } = self else {
+            return None;
+        };
+        let mut text = match author {
+            Some(author) => format!("asserted by {}", OneLine(author)),
+            None => String::from("asserted by hand"),
+        };
+        if let Some(note) = note.as_deref().filter(|n| !n.trim().is_empty()) {
+            text.push_str(": ");
+            text.push_str(&OneLine(note).to_string());
+        }
+        Some(text)
     }
 }
 
 /// A node's or edge's source, with how sure the extraction was.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Provenance {
     pub subject_id: String,
     #[serde(flatten)]
@@ -300,7 +435,7 @@ pub struct Provenance {
 
 /// A traversal or listing: the nodes and edges found, each with its
 /// provenance, and the nodes the query started from.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GraphResult {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -317,6 +452,28 @@ pub struct GraphResult {
     /// check it reads a capped listing as the whole population.
     #[serde(default)]
     pub truncated: bool,
+    /// The graph this result came from, so a reader can judge the answer
+    /// without asking for the status separately.
+    #[serde(default)]
+    pub status: GraphStatusSummary,
+}
+
+/// What a reader of one graph result needs to know about the whole graph:
+/// which ontology built it, whether it lags the current one, how much of
+/// it is provisional, how much the corpus expressed that the ontology
+/// lacks, and how many provisional nodes this result left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct GraphStatusSummary {
+    pub built_with_version: Option<OntologyVersion>,
+    pub ontology_version: Option<OntologyVersion>,
+    pub stale: bool,
+    pub provisional_nodes: u64,
+    /// Distinct classes and relations the corpus expressed that the
+    /// ontology lacks ([`Drift::total`]).
+    pub drift_total: u64,
+    /// Provisional nodes query mode dropped from this result.
+    #[serde(default)]
+    pub dropped_provisional: u64,
 }
 
 impl GraphResult {
@@ -326,14 +483,20 @@ impl GraphResult {
     }
 
     /// Drop provisional nodes and edges (query mode never answers from an
-    /// unreviewed graph).
+    /// unreviewed graph), counting the nodes dropped in the status.
     #[must_use]
     pub fn without_provisional(mut self) -> Self {
-        self.nodes.retain(|n| !n.provisional);
+        let before = self.nodes.len();
+        self.nodes.retain(|n| n.standing == Standing::Reviewed);
+        let dropped = before.saturating_sub(self.nodes.len());
+        self.status.dropped_provisional = self
+            .status
+            .dropped_provisional
+            .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
         let kept: std::collections::BTreeSet<&str> =
             self.nodes.iter().map(|n| n.id.as_str()).collect();
         self.edges.retain(|e| {
-            !e.provisional
+            e.standing == Standing::Reviewed
                 && kept.contains(e.source_node_id.as_str())
                 && kept.contains(e.target_node_id.as_str())
         });
@@ -351,7 +514,7 @@ impl GraphResult {
 
 /// Counts of what the corpus tried to express that the ontology has no
 /// place for, accumulated across extraction runs (design doc 6.5, drift).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Drift {
     #[serde(default)]
     pub classes: Tally,
@@ -375,7 +538,7 @@ impl Drift {
 /// What the interfaces show about the graph: size, whether it is
 /// provisional (built from an auto-accepted ontology) or stale (the
 /// ontology moved on), and the drift the corpus expressed.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GraphStatus {
     pub nodes: u64,
     pub edges: u64,
@@ -393,6 +556,14 @@ pub struct GraphStatus {
     /// mapping is removed or the data comes back.
     #[serde(default)]
     pub missing_tables: Vec<String>,
+    /// Chunks of ready documents no extraction has read yet.
+    #[serde(default)]
+    pub pending_chunks: u64,
+    /// Mapped tables whose rows changed since table extraction last read
+    /// them (re-ingested, re-imported, or updated by SQL), or that it
+    /// never read.
+    #[serde(default)]
+    pub pending_tables: Vec<String>,
 }
 
 impl GraphStatus {
@@ -446,6 +617,20 @@ impl fmt::Display for GraphStatus {
                 f,
                 "Mapped tables no longer in the workspace (extraction skips them): {}",
                 self.missing_tables.join(", ")
+            )?;
+        }
+        if self.pending_chunks > 0 {
+            writeln!(
+                f,
+                "{} chunks not yet extracted: `quack graph extract --source documents`",
+                self.pending_chunks
+            )?;
+        }
+        if !self.pending_tables.is_empty() {
+            writeln!(
+                f,
+                "Mapped tables changed since the graph read them: {} (`quack graph extract --source tables`)",
+                self.pending_tables.join(", ")
             )?;
         }
         if self.drift.total() > 0 {
@@ -515,7 +700,7 @@ impl duckdb::ToSql for NormalizedLabel {
 }
 
 /// What a graph extraction reads.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ExtractSource {
     /// Mapped tables, then document chunks.
@@ -547,29 +732,6 @@ impl ExtractSource {
         match self {
             Self::All | Self::Documents => true,
             Self::Tables => false,
-        }
-    }
-}
-
-/// Tuning for traversal and resolution, from `[graph]`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct GraphOptions {
-    pub max_traversal_depth: u32,
-    pub max_nodes: u32,
-    /// Cosine distance under which two labels of one class are proposed
-    /// as a merge.
-    pub merge_threshold: f64,
-    /// Cosine distance under which the merge happens without review.
-    pub auto_merge_threshold: f64,
-}
-
-impl Default for GraphOptions {
-    fn default() -> Self {
-        Self {
-            max_traversal_depth: 3,
-            max_nodes: 200,
-            merge_threshold: 0.08,
-            auto_merge_threshold: 0.02,
         }
     }
 }
@@ -609,6 +771,17 @@ pub fn ddl(dimension: Dimension) -> String {
             confidence DOUBLE,
             PRIMARY KEY (subject_id, chunk_id, table_name, row_key)
         );
+        ALTER TABLE _quack_provenance ADD COLUMN IF NOT EXISTS author TEXT;
+        ALTER TABLE _quack_provenance ADD COLUMN IF NOT EXISTS note TEXT;
+        ALTER TABLE _quack_provenance ADD COLUMN IF NOT EXISTS asserted_at TIMESTAMP;
+        CREATE TABLE IF NOT EXISTS _quack_graph_tables_built (
+            table_name TEXT PRIMARY KEY,
+            document_id TEXT,
+            ontology_version INTEGER NOT NULL,
+            row_count BIGINT NOT NULL,
+            row_hash TEXT NOT NULL,
+            built_at TIMESTAMP DEFAULT now()
+        );
         CREATE TABLE IF NOT EXISTS _quack_graph_extracted (
             chunk_id TEXT PRIMARY KEY,
             ontology_version INTEGER NOT NULL,
@@ -630,207 +803,4 @@ pub fn ddl(dimension: Dimension) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn labels_normalize_case_and_whitespace() {
-        assert_eq!(
-            NormalizedLabel::new("  Acme   Corp \n").as_str(),
-            "acme corp"
-        );
-        assert_eq!(NormalizedLabel::new("USAID").as_str(), "usaid");
-        assert!(NormalizedLabel::new(" \t ").is_empty());
-    }
-
-    #[test]
-    fn properties_render_sorted_and_flattened() {
-        let text = Properties::from(serde_json::json!({
-            "status": "open",
-            "amount": 1200.5,
-            "aliases": ["Acme Ltd", "Acme"],
-            "closed": null,
-            "note": "  padded  ",
-        }))
-        .to_string();
-        assert_eq!(
-            text,
-            "{aliases: Acme Ltd, Acme, amount: 1200.5, note: padded, status: open}"
-        );
-    }
-
-    #[test]
-    fn properties_without_values_render_as_nothing() {
-        for value in [
-            serde_json::json!({}),
-            serde_json::json!(null),
-            serde_json::json!("not an object"),
-            serde_json::json!({ "empty": "", "unset": null }),
-        ] {
-            assert_eq!(Properties::from(value).to_string(), "");
-        }
-    }
-
-    #[test]
-    fn a_long_value_is_cut_and_extra_properties_are_counted() {
-        let long = "x".repeat(PROPERTY_VALUE_CHARS + 10);
-        let text = Properties::from(serde_json::json!({ "note": long })).to_string();
-        assert!(text.ends_with("\u{2026}}"), "{text}");
-        // "{note: " + the cut value + the ellipsis + "}"
-        assert_eq!(text.chars().count(), PROPERTY_VALUE_CHARS + 9);
-
-        let mut wide = serde_json::Map::new();
-        for i in 0..(RENDERED_PROPERTIES + 3) {
-            wide.insert(format!("p{i:02}"), serde_json::json!("v"));
-        }
-        let text = Properties::from(wide).to_string();
-        assert!(text.contains("p00: v") && text.contains("p07: v"), "{text}");
-        assert!(!text.contains("p08"), "{text}");
-        assert!(text.ends_with("... 3 more}"), "{text}");
-    }
-
-    #[test]
-    fn properties_read_anything_and_keep_only_objects() {
-        let parsed: Properties = serde_json::from_str("\"a string\"").unwrap_or_default();
-        assert!(parsed.is_empty());
-        let parsed: Properties = serde_json::from_str(r#"{"a": 1}"#).unwrap_or_default();
-        assert_eq!(parsed.get("a"), Some(&serde_json::json!(1)));
-        assert!(Properties::from_column(None).is_empty());
-        assert!(Properties::from_column(Some("not json")).is_empty());
-        assert_eq!(Properties::from_column(Some(r#"{"a": 1}"#)), parsed);
-        assert_eq!(parsed.to_json(), r#"{"a":1}"#);
-    }
-
-    #[test]
-    fn filling_keeps_existing_values() {
-        let mut kept = Properties::from(serde_json::json!({ "a": 1 }));
-        kept.fill_from(&Properties::from(serde_json::json!({ "a": 2, "b": 3 })));
-        assert_eq!(
-            kept,
-            Properties::from(serde_json::json!({ "a": 1, "b": 3 }))
-        );
-    }
-
-    #[test]
-    fn origins_serialize_flat_and_round_trip() {
-        let chunk = Provenance {
-            subject_id: String::from("n"),
-            origin: Origin::from_columns(
-                Some(DocumentId::from("d")),
-                ChunkId::from("c"),
-                String::new(),
-                String::new(),
-            ),
-            confidence: 0.5,
-        };
-        let row = Provenance {
-            subject_id: String::from("n"),
-            origin: Origin::from_columns(
-                None,
-                ChunkId::from(String::new()),
-                String::from("t"),
-                String::from("k"),
-            ),
-            confidence: 1.0,
-        };
-        assert_eq!(chunk.origin.chunk_id(), Some(&ChunkId::from("c")));
-        assert_eq!(row.origin.chunk_id(), None);
-        assert_eq!(
-            serde_json::to_value(&chunk).ok(),
-            Some(serde_json::json!({
-                "subject_id": "n", "document_id": "d", "chunk_id": "c", "confidence": 0.5
-            }))
-        );
-        assert_eq!(
-            serde_json::to_value(&row).ok(),
-            Some(serde_json::json!({
-                "subject_id": "n", "table_name": "t", "row_key": "k", "confidence": 1.0
-            }))
-        );
-        for p in [chunk, row] {
-            let back: Option<Provenance> = serde_json::to_string(&p)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok());
-            assert_eq!(back, Some(p));
-        }
-    }
-
-    #[test]
-    fn provisional_results_are_dropped_with_their_edges_and_provenance() {
-        let node = |id: &str, provisional: bool| Node {
-            id: NodeId::from(id.to_owned()),
-            label: id.to_owned(),
-            class_id: ClassId::from("entity"),
-            properties: Properties::default(),
-            provisional,
-        };
-        let result = GraphResult {
-            nodes: vec![node("a", false), node("b", true), node("c", false)],
-            edges: vec![
-                Edge {
-                    id: EdgeId::from("ab"),
-                    source_node_id: NodeId::from("a"),
-                    target_node_id: NodeId::from("b"),
-                    relation_id: RelationId::from("mentions"),
-                    weight: 1.0,
-                    properties: Properties::default(),
-                    provisional: false,
-                },
-                Edge {
-                    id: EdgeId::from("ac"),
-                    source_node_id: NodeId::from("a"),
-                    target_node_id: NodeId::from("c"),
-                    relation_id: RelationId::from("mentions"),
-                    weight: 1.0,
-                    properties: Properties::default(),
-                    provisional: false,
-                },
-            ],
-            provenance: vec![
-                Provenance {
-                    subject_id: String::from("b"),
-                    origin: Origin::from_columns(
-                        None,
-                        ChunkId::from(String::new()),
-                        String::new(),
-                        String::new(),
-                    ),
-                    confidence: 1.0,
-                },
-                Provenance {
-                    subject_id: String::from("ac"),
-                    origin: Origin::from_columns(
-                        None,
-                        ChunkId::from(String::new()),
-                        String::new(),
-                        String::new(),
-                    ),
-                    confidence: 1.0,
-                },
-            ],
-            roots: vec![NodeId::from("a"), NodeId::from("b")],
-            ..GraphResult::default()
-        };
-        let kept = result.without_provisional();
-        assert_eq!(kept.nodes.len(), 2);
-        assert_eq!(
-            kept.edges.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
-            ["ac"]
-        );
-        assert_eq!(kept.provenance.len(), 1);
-        assert_eq!(kept.roots, [NodeId::from("a")]);
-    }
-
-    #[test]
-    fn drift_accumulates_and_counts_distinct_names() {
-        let mut drift = Drift::default();
-        drift.classes.bump("vessel");
-        drift.classes.bump("vessel");
-        drift.relations.bump("docked_at");
-        let mut total = Drift::default();
-        total.absorb(&drift);
-        total.absorb(&drift);
-        assert_eq!(total.classes.get("vessel"), 4);
-        assert_eq!(total.total(), 2);
-    }
-}
+mod tests;

@@ -5,20 +5,24 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use quack_core::error::Record;
+use quack_core::analysis::events::Decision;
 use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
-use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Sharing, Transcript};
-use serde::Deserialize;
+use quack_core::storage::sessions::{
+    self, ChatMode, ExportFormat, MessageHit, MessageRow, SessionRow, Sharing, Transcript,
+};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
-use crate::server::permissions::Answer;
 use crate::server::state::{App, with_db};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 pub(crate) struct ListQuery {
+    /// Sessions at most, newest first.
     #[serde(default = "default_limit")]
+    #[param(default = 50)]
     pub limit: u32,
 }
 
@@ -26,12 +30,89 @@ fn default_limit() -> u32 {
     50
 }
 
+#[derive(Deserialize, utoipa::IntoParams)]
+pub(crate) struct SearchQuery {
+    /// The text to find in questions and answers, case-insensitive.
+    pub q: String,
+    /// Hits at most, newest first.
+    #[serde(default = "default_limit")]
+    #[param(default = 50)]
+    pub limit: u32,
+}
+
+/// Questions and answers that matched, in sessions the caller may read.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct MessageHits {
+    pub hits: Vec<MessageHit>,
+}
+
+/// Find text in the questions and answers of the sessions the caller may
+/// read; a session they may not read never counts. Audited as `search`,
+/// the text in the detail row.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/sessions/search",
+    tag = "sessions",
+    params(WorkspaceId, SearchQuery),
+    responses((status = 200, description = "The matches", body = MessageHits)),
+)]
+pub(crate) async fn search(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+    Query(q): Query<SearchQuery>,
+) -> ApiResult<Json<MessageHits>> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let hits = access.search_sessions(&app, &q.q, q.limit.min(200)).await?;
+    Ok(Json(MessageHits { hits }))
+}
+
+impl Access {
+    /// The caller's matches for `query`, audited as a `search`.
+    pub(crate) async fn search_sessions(
+        &self,
+        app: &App,
+        query: &str,
+        limit: u32,
+    ) -> ApiResult<Vec<MessageHit>> {
+        let (viewer, text) = (self.session_viewer(), query.to_owned());
+        let hits = app
+            .read(&self.membership.workspace.id, move |db| {
+                sessions::search_messages(db, &text, &viewer, limit)
+            })
+            .await?;
+        self.audit(
+            app,
+            AuditAction::Search,
+            None,
+            Outcome::Allowed,
+            Some(serde_json::json!({ "sessions": query, "hits": hits.len() })),
+        )
+        .await?;
+        Ok(hits)
+    }
+}
+
+/// The sessions the caller may read.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SessionList {
+    pub sessions: Vec<SessionRow>,
+}
+
+/// The caller's sessions and the shared ones; an owner's sees every one.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/sessions",
+    tag = "sessions",
+    params(WorkspaceId, ListQuery),
+    responses((status = 200, description = "The sessions", body = SessionList)),
+)]
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Query(q): Query<ListQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SessionList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "sessions")
@@ -43,33 +124,47 @@ pub(crate) async fn list(
             sessions::list_sessions_for(db, limit, &viewer)
         })
         .await?;
-    Ok(Json(serde_json::json!({ "sessions": rows })))
+    Ok(Json(SessionList { sessions: rows }))
 }
 
 impl Access {
     /// The session, if the caller may see it; one they may not reads as
     /// missing.
-    async fn visible_session(
+    pub(crate) async fn visible_session(
         &self,
         app: &App,
         session_id: &SessionId,
-    ) -> ApiResult<sessions::SessionRow> {
+    ) -> ApiResult<SessionRow> {
         let sid = session_id.to_owned();
         let viewer = self.session_viewer();
         let found = app
-            .read(&self.workspace.id, move |db| {
+            .read(&self.membership.workspace.id, move |db| {
                 Ok(sessions::get_session(db, &sid)?.filter(|s| s.visible_to(&viewer)))
             })
             .await?;
-        found.ok_or_else(|| Record::Session.missing(session_id.as_str()).into())
+        found.ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()).into())
     }
 }
 
+/// A session and every message in it.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SessionDetail {
+    pub session: SessionRow,
+    pub messages: Vec<MessageRow>,
+}
+
+/// A session and every message in it.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/sessions/{sid}",
+    tag = "sessions",
+    responses((status = 200, description = "The session", body = SessionDetail)),
+)]
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
     Path((id, sid)): Path<(WorkspaceId, SessionId)>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SessionDetail>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     let session = access.visible_session(&app, &sid).await?;
     let session_id = session.id.clone();
@@ -85,43 +180,63 @@ pub(crate) async fn show(
             None,
         )
         .await?;
-    Ok(Json(
-        serde_json::json!({ "session": session, "messages": messages }),
-    ))
+    Ok(Json(SessionDetail { session, messages }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct UpdateSession {
     pub shared: Option<Sharing>,
     /// `chat` or `query`: the explicit way to change a session's mode.
     pub mode: Option<ChatMode>,
+    /// A new title; an empty one gives back the title the first question
+    /// derives.
+    pub title: Option<String>,
 }
 
-/// Share a session with every member or take it back, or change its
-/// mode. Its creator, or an owner, may. Audited as `share` and `mode`.
+/// Share a session with every member or take it back, change its mode, or
+/// rename it. Its creator, or an owner, may. Audited as `share`, `mode`,
+/// and `rename`.
+#[utoipa::path(
+    patch,
+    path = "/workspaces/{id}/sessions/{sid}",
+    tag = "sessions",
+    request_body = UpdateSession,
+    responses((status = 200, description = "The session as it now is", body = SessionRow)),
+)]
 pub(crate) async fn update(
     State(app): State<App>,
     identity: Identity,
     Path((id, sid)): Path<(WorkspaceId, SessionId)>,
     Json(body): Json<UpdateSession>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<SessionRow>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    if body.shared.is_none() && body.mode.is_none() {
-        return Err(ApiError::bad_request("give shared or mode"));
+    if body.shared.is_none() && body.mode.is_none() && body.title.is_none() {
+        return Err(ApiError::bad_request("give shared, mode, or title"));
     }
     let shared = match body.shared {
         Some(sharing) => Some(access.set_session_sharing(&app, &sid, sharing).await?),
         None => None,
     };
-    let session = match body.mode {
+    let moded = match body.mode {
         Some(mode) => Some(access.set_session_mode(&app, &sid, mode).await?),
         None => shared,
     };
-    let session = session.ok_or_else(|| ApiError::from(Record::Session.missing(sid.as_str())))?;
-    Ok(Json(serde_json::to_value(session)?))
+    let session = match body.title {
+        Some(title) => Some(access.rename_session(&app, &sid, &title).await?),
+        None => moded,
+    };
+    let session =
+        session.ok_or_else(|| ApiError::from(ResourceKind::Session.missing(sid.as_str())))?;
+    Ok(Json(session))
 }
 
 /// Delete a session: its creator, or an owner, may. Audited as `delete`.
+#[utoipa::path(
+    delete,
+    path = "/workspaces/{id}/sessions/{sid}",
+    tag = "sessions",
+    responses((status = 204, description = "Deleted")),
+)]
 pub(crate) async fn remove(
     State(app): State<App>,
     identity: Identity,
@@ -143,7 +258,7 @@ impl Access {
         sid: &SessionId,
         action: AuditAction,
         refusal: &'static str,
-    ) -> ApiResult<sessions::SessionRow> {
+    ) -> ApiResult<SessionRow> {
         let session = self.visible_session(app, sid).await?;
         if !self.owns(session.created_by.as_ref()) {
             self.audit(
@@ -165,7 +280,7 @@ impl Access {
         app: &App,
         sid: &SessionId,
         mode: ChatMode,
-    ) -> ApiResult<sessions::SessionRow> {
+    ) -> ApiResult<SessionRow> {
         let session = self
             .own_session(
                 app,
@@ -174,12 +289,12 @@ impl Access {
                 "only the session's creator or an owner may change its mode",
             )
             .await?;
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let session_id = session.id;
         let updated = with_db(db, move |db| {
             sessions::set_session_mode(db, &session_id, mode)?;
             sessions::get_session(db, &session_id)?
-                .ok_or_else(|| Record::Session.missing(session_id.as_str()))
+                .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))
         })
         .await?;
         self.audit(
@@ -199,7 +314,7 @@ impl Access {
         app: &App,
         sid: &SessionId,
         sharing: Sharing,
-    ) -> ApiResult<sessions::SessionRow> {
+    ) -> ApiResult<SessionRow> {
         let session = self
             .own_session(
                 app,
@@ -208,12 +323,12 @@ impl Access {
                 "only the session's creator or an owner may share it",
             )
             .await?;
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let session_id = session.id;
         let updated = with_db(db, move |db| {
             sessions::set_session_sharing(db, &session_id, sharing)?;
             sessions::get_session(db, &session_id)?
-                .ok_or_else(|| Record::Session.missing(session_id.as_str()))
+                .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))
         })
         .await?;
         self.audit(
@@ -222,6 +337,39 @@ impl Access {
             Some(ResourceKind::Session.id(sid)),
             Outcome::Allowed,
             Some(serde_json::json!({ "shared": bool::from(sharing) })),
+        )
+        .await?;
+        Ok(updated)
+    }
+
+    /// Rename a session; a blank title gives back the derived one. The
+    /// title is workspace content, so it goes in the detail row only.
+    pub(crate) async fn rename_session(
+        &self,
+        app: &App,
+        sid: &SessionId,
+        title: &str,
+    ) -> ApiResult<SessionRow> {
+        let session = self
+            .own_session(
+                app,
+                sid,
+                AuditAction::Rename,
+                "only the session's creator or an owner may rename it",
+            )
+            .await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let (session_id, title) = (session.id, title.to_owned());
+        let updated = with_db(db, move |db| {
+            sessions::set_session_title(db, &session_id, &title)
+        })
+        .await?;
+        self.audit(
+            app,
+            AuditAction::Rename,
+            Some(ResourceKind::Session.id(sid)),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "title": updated.title, "title_by": updated.title_by })),
         )
         .await?;
         Ok(updated)
@@ -237,7 +385,7 @@ impl Access {
                 "only the session's creator or an owner may delete it",
             )
             .await?;
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let session_id = session.id;
         with_db(db, move |db| sessions::delete_session(db, &session_id)).await?;
         self.audit(
@@ -251,12 +399,24 @@ impl Access {
         Ok(())
     }
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 pub(crate) struct ExportQuery {
     #[serde(default)]
     pub format: ExportFormat,
 }
 
+/// The session as Markdown (questions, steps, answers) or as a runnable
+/// `.sql` file of its statements.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/sessions/{sid}/export",
+    tag = "sessions",
+    params(ExportQuery),
+    responses((status = 200, description = "The transcript", content(
+        (String = "text/markdown"),
+        (String = "application/sql"),
+    ))),
+)]
 pub(crate) async fn export(
     State(app): State<App>,
     identity: Identity,
@@ -286,19 +446,26 @@ pub(crate) async fn export(
 }
 
 /// A person's answer to a write their streamed turn is waiting on.
-#[derive(Deserialize)]
-pub(crate) struct Decision {
-    pub decision: Answer,
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct PermissionAnswer {
+    pub decision: Decision,
 }
 
 /// Answer the write `request` that the caller's turn in session `sid` is
 /// waiting on. Only the person whose question asked may answer, and only
 /// with write access; every answer is audited with the statement.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/sessions/{sid}/permissions/{request}",
+    tag = "sessions",
+    request_body = PermissionAnswer,
+    responses((status = 204, description = "The turn has the answer")),
+)]
 pub(crate) async fn decide(
     State(app): State<App>,
     identity: Identity,
     Path((id, sid, request)): Path<(WorkspaceId, SessionId, PermissionId)>,
-    Json(body): Json<Decision>,
+    Json(body): Json<PermissionAnswer>,
 ) -> ApiResult<axum::http::StatusCode> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let answer = body.decision;
@@ -311,7 +478,9 @@ pub(crate) async fn decide(
                     AuditAction::Permission,
                     resource,
                     answer.outcome(),
-                    Some(answer.detail(&request, &sql)),
+                    Some(serde_json::json!({
+                        "request": request, "sql": sql, "decision": answer.as_str(),
+                    })),
                 )
                 .await?;
             Ok(axum::http::StatusCode::NO_CONTENT)

@@ -7,12 +7,19 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use std::time::Duration;
+
+use quack_core::analysis::tools::SharedDb;
 use quack_core::embedding::refresh;
 use quack_core::graph::extract;
+use quack_core::graph::follow_up::{FollowUp, FollowUpSummary};
 use quack_core::graph::resolve::ResolutionSummary;
-use quack_core::ids::{RunId, WorkspaceId};
+use quack_core::ids::{DocumentId, RunId};
+use quack_core::import::{ImportSummary, LoadStatus};
 use quack_core::jobs::{JobContext, JobId, JobKind, JobSpec, Lane, LaneKey};
-use quack_core::ontology::documents;
+use quack_core::llm::Embeddings;
+use quack_core::ontology::{documents, store as ontology_store};
+use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde_json::Value;
 
@@ -20,56 +27,49 @@ use crate::server::auth::Access;
 use crate::server::error::ApiResult;
 use crate::server::state::App;
 
-/// What a background run is: how it is audited, which queue it takes, and
-/// what the job list calls it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RunKind {
-    Embeddings,
-    Graph,
-    Ontology,
+/// What a background run is: the job kind whose workspace lane it takes,
+/// how it is audited, and what the job list calls it. One row per run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunKind {
+    job: JobKind,
+    action: AuditAction,
+    resource: ResourceKind,
+    label: &'static str,
 }
 
 impl RunKind {
-    fn action(self) -> AuditAction {
-        match self {
-            Self::Embeddings => AuditAction::EmbeddingsRefresh,
-            Self::Graph => AuditAction::GraphExtract,
-            Self::Ontology => AuditAction::Propose,
-        }
-    }
-
-    fn resource(self) -> ResourceKind {
-        match self {
-            Self::Embeddings => ResourceKind::EmbeddingsRun,
-            Self::Graph => ResourceKind::GraphRun,
-            Self::Ontology => ResourceKind::InductionRun,
-        }
-    }
-
-    fn job(self) -> JobKind {
-        match self {
-            Self::Embeddings => JobKind::Embeddings,
-            Self::Graph => JobKind::Graph,
-            Self::Ontology => JobKind::Ontology,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Embeddings => "embeddings refresh",
-            Self::Graph => "graph extraction",
-            Self::Ontology => "ontology document pass",
-        }
-    }
-
-    fn lane(self, workspace_id: &WorkspaceId) -> LaneKey {
-        let workspace = workspace_id.clone();
-        match self {
-            Self::Embeddings => LaneKey::Embeddings(workspace),
-            Self::Graph => LaneKey::Graph(workspace),
-            Self::Ontology => LaneKey::Ontology(workspace),
-        }
-    }
+    pub(crate) const EMBEDDINGS: Self = Self {
+        job: JobKind::Embeddings,
+        action: AuditAction::EmbeddingsRefresh,
+        resource: ResourceKind::EmbeddingsRun,
+        label: "embeddings refresh",
+    };
+    pub(crate) const GRAPH: Self = Self {
+        job: JobKind::Graph,
+        action: AuditAction::GraphExtract,
+        resource: ResourceKind::GraphRun,
+        label: "graph extraction",
+    };
+    /// The extraction that follows an ingest under `[graph].follow_ingest`.
+    pub(crate) const FOLLOW_UP: Self = Self {
+        job: JobKind::Graph,
+        action: AuditAction::GraphExtract,
+        resource: ResourceKind::GraphRun,
+        label: "graph follow-up",
+    };
+    /// A saved import run again (`POST .../imports/{id}/refresh`).
+    pub(crate) const IMPORT_REFRESH: Self = Self {
+        job: JobKind::Import,
+        action: AuditAction::Import,
+        resource: ResourceKind::SavedImport,
+        label: "import refresh",
+    };
+    pub(crate) const ONTOLOGY: Self = Self {
+        job: JobKind::Ontology,
+        action: AuditAction::Propose,
+        resource: ResourceKind::InductionRun,
+        label: "ontology document pass",
+    };
 }
 
 /// What a finished run reports: the closing audit row's detail (beside
@@ -92,6 +92,19 @@ impl RunReport for refresh::Summary {
     }
 }
 
+impl RunReport for ImportSummary {
+    fn detail(&self) -> Value {
+        serde_json::json!({ "summary": self })
+    }
+
+    fn message(&self) -> String {
+        match self.status {
+            LoadStatus::Unchanged => format!("{}: source unchanged", self.table),
+            LoadStatus::Loaded => format!("{}: {} rows, replaced", self.table, self.rows),
+        }
+    }
+}
+
 /// A graph document pass: the extraction, then the resolution after it.
 pub(crate) struct GraphReport {
     pub summary: extract::RunSummary,
@@ -108,6 +121,16 @@ impl RunReport for GraphReport {
             "{} nodes, {} edges from {} chunks",
             self.summary.nodes, self.summary.edges, self.summary.chunks
         )
+    }
+}
+
+impl RunReport for FollowUpSummary {
+    fn detail(&self) -> Value {
+        serde_json::json!({ "summary": self })
+    }
+
+    fn message(&self) -> String {
+        self.to_string()
     }
 }
 
@@ -146,8 +169,8 @@ impl BackgroundRun {
         access
             .audit(
                 app,
-                kind.action(),
-                Some(kind.resource().id(&id)),
+                kind.action.clone(),
+                Some(kind.resource.clone().id(&id)),
                 Outcome::Allowed,
                 Some(detail),
             )
@@ -173,11 +196,14 @@ impl BackgroundRun {
         Fut: Future<Output = Result<R, String>> + Send + 'static,
         R: RunReport,
     {
-        let workspace_id = self.access.workspace.id.clone();
-        let spec = JobSpec::new(self.kind.job(), self.kind.label())
+        let workspace_id = self.access.membership.workspace.id.clone();
+        let spec = JobSpec::new(self.kind.job, self.kind.label)
             .workspace(workspace_id.clone())
             .owner(Some(self.access.identity.user_id.clone()))
-            .lane(Lane::serial(&self.kind.lane(&workspace_id)));
+            .lane(Lane::serial(&LaneKey::Workspace(
+                self.kind.job,
+                workspace_id,
+            )));
         let jobs = self.app.jobs.clone();
         let unstarted = self.clone();
         let id = jobs.submit(spec, move |ctx| async move {
@@ -192,7 +218,7 @@ impl BackgroundRun {
                     Ok(report.message())
                 }
                 Err(e) => {
-                    tracing::warn!(run = %self.id, kind = ?self.kind, error = %e, "background run failed");
+                    tracing::warn!(run = %self.id, kind = self.kind.label, error = %e, "background run failed");
                     self.finish(
                         Outcome::Error,
                         serde_json::json!({ "finished": true, "error": e }),
@@ -222,14 +248,89 @@ impl BackgroundRun {
             .access
             .audit(
                 &self.app,
-                self.kind.action(),
-                Some(self.kind.resource().id(&self.id)),
+                self.kind.action.clone(),
+                Some(self.kind.resource.clone().id(&self.id)),
                 outcome,
                 Some(detail),
             )
             .await
         {
-            tracing::error!(run = %self.id, kind = ?self.kind, error = %e.message, "audit write failed at the end of a background run");
+            tracing::error!(run = %self.id, kind = self.kind.label, error = %e.message, "audit write failed at the end of a background run");
         }
     }
+}
+
+/// How many seconds a follow-up waits for the workspace's extraction slot
+/// before giving up: a request-time table extraction holds it briefly.
+const SLOT_WAIT_SECONDS: u32 = 60;
+
+/// Queue the graph extraction that follows `documents` becoming ready,
+/// when `[graph].follow_ingest` asks for one: an audited background run
+/// in the workspace's graph lane, so it waits behind an extraction in
+/// progress. `None` when nothing follows.
+pub(crate) async fn follow_ingest(
+    app: &App,
+    access: &Access,
+    db: SharedDb,
+    embedder: Option<Embeddings>,
+    documents: Vec<DocumentId>,
+) -> ApiResult<Option<JobId>> {
+    if app.config.graph.follow_ingest.is_off() || documents.is_empty() {
+        return Ok(None);
+    }
+    // Nothing to extract into without an ontology: no run, no audit rows.
+    let workspace_id = access.membership.workspace.id.clone();
+    if app
+        .read(&workspace_id, ontology_store::latest_version)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let run = BackgroundRun::start(
+        app,
+        access,
+        RunKind::FOLLOW_UP,
+        serde_json::json!({
+            "documents": documents,
+            "follow_ingest": app.config.graph.follow_ingest.as_str(),
+        }),
+    )
+    .await?;
+    let app = Arc::clone(app);
+    let job = run.submit(move |ctx| async move {
+        let mut slot = None;
+        for _ in 0..SLOT_WAIT_SECONDS {
+            slot = app.begin_extraction(&workspace_id);
+            if slot.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let Some(slot) = slot else {
+            return Err(String::from(
+                "a graph extraction is still running for this workspace; run `graph extract` later",
+            ));
+        };
+        let progress = |done: ChunkDone| ctx.progress(done.done, done.total);
+        let cancel = ctx.cancel_token();
+        let control = RunControl {
+            progress: &progress,
+            cancel: Some(&cancel),
+        };
+        let outcome = FollowUp {
+            db: &db,
+            config: &app.config,
+            embeddings: embedder.as_ref(),
+        }
+        .run(&documents, control)
+        .await;
+        drop(slot);
+        match outcome {
+            Ok(Some(summary)) => Ok(summary),
+            Ok(None) => Ok(FollowUpSummary::default()),
+            Err(e) => Err(e.to_string()),
+        }
+    });
+    Ok(Some(job))
 }

@@ -8,9 +8,13 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Class, Mapping, MappingRelation, Ontology, Property, PropertyType, Relation, SnakeId};
+use super::{
+    Class, IdRenames, Mapping, MappingRelation, Ontology, Property, PropertyType, Relation, SnakeId,
+};
 use crate::error::{Error, Result};
+use crate::graph;
 use crate::ids::{ClassId, RelationId};
+use crate::storage::profile::{ColumnKind, ColumnProfile, TableProfile};
 use crate::storage::workspace::{WorkspaceDb, quote_ident};
 
 /// Tuning for table evidence.
@@ -36,7 +40,7 @@ impl Default for TableEvidenceOptions {
 }
 
 /// What one candidate proposes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Proposal {
     Class(Class),
@@ -66,10 +70,20 @@ impl Proposal {
             Self::Mapping(_) => ItemKind::Mapping,
         }
     }
+
+    /// Follow renamed class and relation ids wherever the proposal names one.
+    pub(crate) fn rename_ids(&mut self, renames: &IdRenames) {
+        match self {
+            Self::Class(class) => renames.rename_class(class),
+            Self::Property { class, .. } => renames.rename_owner(class),
+            Self::Relation(relation) => renames.rename_relation(relation),
+            Self::Mapping(mapping) => renames.rename_mapping(mapping),
+        }
+    }
 }
 
 /// The kinds of item an ontology holds and a proposal adds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ItemKind {
     Class,
@@ -98,148 +112,28 @@ pub struct Candidate {
     pub low_support: bool,
 }
 
-/// What a column's `DuckDB` type says about the property it becomes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColumnKind {
-    Boolean,
-    /// A date or timestamp.
-    Temporal,
-    /// An integer, float, or decimal type.
-    Numeric,
-    /// Text or anything else: the values decide.
-    Other,
-}
-
-impl ColumnKind {
-    fn of(duckdb_type: &str) -> Self {
-        const NUMERIC: [&str; 11] = [
-            "TINYINT",
-            "SMALLINT",
-            "INTEGER",
-            "BIGINT",
-            "HUGEINT",
-            "UTINYINT",
-            "USMALLINT",
-            "UINTEGER",
-            "UBIGINT",
-            "FLOAT",
-            "DOUBLE",
-        ];
-        let t = duckdb_type.to_ascii_uppercase();
-        if t == "BOOLEAN" {
-            Self::Boolean
-        } else if t.starts_with("DATE") || t.starts_with("TIMESTAMP") {
-            Self::Temporal
-        } else if NUMERIC.contains(&t.as_str()) || t.starts_with("DECIMAL") {
-            Self::Numeric
-        } else {
-            Self::Other
-        }
-    }
-}
-
-struct ColumnProfile {
-    name: String,
-    duckdb_type: String,
-    kind: ColumnKind,
+/// The property type a column's type and values suggest.
+fn property_type(
+    column: &ColumnProfile,
     rows: u64,
-    non_null: u64,
-    distinct: u64,
-    samples: Vec<String>,
-    /// Share of non-null values that cast to a date.
-    date_share: f64,
-}
-
-impl ColumnProfile {
-    /// The property type the column's type and values suggest.
-    fn property_type(&self, options: &TableEvidenceOptions) -> PropertyType {
-        match self.kind {
-            ColumnKind::Boolean => return PropertyType::Boolean,
-            ColumnKind::Temporal => return PropertyType::Date,
-            ColumnKind::Numeric => return PropertyType::Number,
-            ColumnKind::Other => {}
-        }
-        if self.non_null > 0 && self.date_share >= 0.9 {
-            return PropertyType::Date;
-        }
-        if self.rows >= options.enum_min_rows
-            && self.distinct > 1
-            && self.distinct <= u64::from(options.enum_max_values)
-        {
-            return PropertyType::Enum;
-        }
-        PropertyType::String
+    options: &TableEvidenceOptions,
+) -> PropertyType {
+    match column.kind() {
+        ColumnKind::Boolean => return PropertyType::Boolean,
+        ColumnKind::Temporal => return PropertyType::Date,
+        ColumnKind::Numeric => return PropertyType::Number,
+        ColumnKind::Text | ColumnKind::Other => {}
     }
-}
-
-struct TableProfile {
-    name: String,
-    rows: u64,
-    columns: Vec<ColumnProfile>,
-    key: Option<String>,
-}
-
-impl TableProfile {
-    /// Profile a table: its row count, each column's counts and samples,
-    /// and the column that looks like its key.
-    fn read(db: &WorkspaceDb, table: &str) -> Result<Self> {
-        let described = db.describe_table(table)?;
-        let conn = db.connection();
-        let quoted = quote_ident(table);
-        let rows: i64 =
-            conn.query_row(&format!("SELECT count(*) FROM {quoted}"), [], |r| r.get(0))?;
-        let rows = u64::try_from(rows).unwrap_or(0);
-        let mut columns = Vec::new();
-        for column in &described.columns {
-            let q = quote_ident(&column.name);
-            let (non_null, distinct, date_share): (i64, i64, Option<f64>) = conn.query_row(
-                &format!(
-                    "SELECT count({q}), count(DISTINCT {q}), \
-                     avg(CASE WHEN {q} IS NULL THEN NULL WHEN TRY_CAST({q} AS DATE) IS NOT NULL THEN 1.0 ELSE 0.0 END) \
-                     FROM {quoted}"
-                ),
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-            let mut stmt = conn.prepare(&format!(
-                "SELECT DISTINCT CAST({q} AS VARCHAR) FROM {quoted} WHERE {q} IS NOT NULL ORDER BY 1 LIMIT 3"
-            ))?;
-            let samples: Vec<String> = stmt
-                .query_map([], |r| r.get::<_, String>(0))?
-                .flatten()
-                .collect();
-            columns.push(ColumnProfile {
-                name: column.name.clone(),
-                duckdb_type: column.column_type.to_ascii_uppercase(),
-                kind: ColumnKind::of(&column.column_type),
-                rows,
-                non_null: u64::try_from(non_null).unwrap_or(0),
-                distinct: u64::try_from(distinct).unwrap_or(0),
-                samples,
-                date_share: date_share.unwrap_or(0.0),
-            });
-        }
-        let key = columns
-            .iter()
-            .filter(|c| rows > 0 && c.non_null == rows && c.distinct == rows)
-            .min_by_key(|c| {
-                let lower = c.name.to_ascii_lowercase();
-                if lower == "id" {
-                    0
-                } else if lower.ends_with("_id") || lower.ends_with("id") {
-                    1
-                } else {
-                    2
-                }
-            })
-            .map(|c| c.name.clone());
-        Ok(Self {
-            name: table.to_owned(),
-            rows,
-            columns,
-            key,
-        })
+    if column.non_null > 0 && column.date_share >= 0.9 {
+        return PropertyType::Date;
     }
+    if rows >= options.enum_min_rows
+        && column.distinct > 1
+        && column.distinct <= u64::from(options.enum_max_values)
+    {
+        return PropertyType::Enum;
+    }
+    PropertyType::String
 }
 
 /// A relation name from a foreign-key-like column: `policy_id` becomes
@@ -298,9 +192,10 @@ pub fn propose_from_tables(
     current: Option<&Ontology>,
     options: &TableEvidenceOptions,
 ) -> Result<Vec<Candidate>> {
+    let views = graph::views::names(db)?;
     let mut profiles = Vec::new();
-    for table in &db.list_tables()? {
-        profiles.push(TableProfile::read(db, table)?);
+    for table in db.list_tables()?.iter().filter(|t| !views.contains(*t)) {
+        profiles.push(TableProfile::compute(db, table)?);
     }
     let mut pass = InductionPass {
         db,
@@ -373,38 +268,33 @@ impl InductionPass<'_> {
     /// Propose a table's class, its properties, the relations its columns
     /// imply, and its mapping.
     fn table(&mut self, profile: &TableProfile) -> Result<()> {
-        let class_id = self.known.class_for_table(&profile.name);
+        let class_id = self.known.class_for_table(&profile.table);
         let mut property_ids = Vec::new();
         let mut property_map = BTreeMap::new();
         let mut relations = Vec::new();
 
         for column in &profile.columns {
             let property_id = SnakeId::from_name(&column.name).into_string();
-            let kind = column.property_type(self.options);
+            let kind = property_type(column, profile.row_count, self.options);
             let values = if kind == PropertyType::Enum {
-                enum_values(self.db, &profile.name, &column.name)?
+                enum_values(self.db, &profile.table, &column.name)?
             } else {
                 Vec::new()
             };
             property_ids.push(property_id.clone());
             property_map.insert(column.name.clone(), property_id.clone());
-            let is_key = profile.key.as_deref() == Some(column.name.as_str());
+            let is_key = profile.key_column() == Some(column.name.as_str());
             if !self.known.property(&class_id, &property_id) {
                 self.candidates.push(Candidate {
                     proposal: Proposal::Property {
                         class: class_id.clone(),
-                        property: Property {
-                            id: property_id.clone(),
-                            label: None,
-                            kind,
-                            values,
-                        },
+                        property: Property::new(property_id.clone(), kind, values),
                     },
                     evidence: serde_json::json!({
-                        "table": profile.name,
+                        "table": profile.table,
                         "column": column.name,
                         "duckdb_type": column.duckdb_type,
-                        "rows": column.rows,
+                        "rows": profile.row_count,
                         "non_null": column.non_null,
                         "distinct": column.distinct,
                         "samples": column.samples,
@@ -420,7 +310,7 @@ impl InductionPass<'_> {
                     low_support: false,
                 });
             }
-            if !is_key && !self.known.mapped_relation(&profile.name, &column.name) {
+            if !is_key && !self.known.mapped_relation(&profile.table, &column.name) {
                 self.relations(profile, column, &mut relations)?;
             }
         }
@@ -431,35 +321,34 @@ impl InductionPass<'_> {
                     id: ClassId::from(class_id.clone()),
                     parent: ClassId::from(super::ROOT_CLASS),
                     label: None,
-                    description: Some(format!("Rows of table {}", profile.name)),
+                    description: Some(format!("Rows of table {}", profile.table)),
                     key: profile
-                        .key
-                        .as_deref()
+                        .key_column()
                         .map(|key| SnakeId::from_name(key).into_string()),
                     properties: property_ids,
                 }),
                 evidence: serde_json::json!({
-                    "table": profile.name,
-                    "rows": profile.rows,
+                    "table": profile.table,
+                    "rows": profile.row_count,
                     "columns": profile.columns.len(),
-                    "key_column": profile.key,
+                    "key_column": profile.key_column(),
                 }),
                 confidence: 1.0,
                 low_support: false,
             });
         }
-        if let Some(key) = &profile.key
-            && !self.known.mapping(&profile.name)
+        if let Some(key) = profile.key_column()
+            && !self.known.mapping(&profile.table)
         {
             self.candidates.push(Candidate {
                 proposal: Proposal::Mapping(Mapping {
-                    table: profile.name.clone(),
+                    table: profile.table.clone(),
                     class: ClassId::from(class_id),
-                    key: key.clone(),
+                    key: key.to_owned(),
                     properties: property_map,
                     relations,
                 }),
-                evidence: serde_json::json!({ "table": profile.name, "rows": profile.rows }),
+                evidence: serde_json::json!({ "table": profile.table, "rows": profile.row_count }),
                 confidence: 1.0,
                 low_support: false,
             });
@@ -475,16 +364,22 @@ impl InductionPass<'_> {
         column: &ColumnProfile,
         relations: &mut Vec<MappingRelation>,
     ) -> Result<()> {
-        let class_id = self.known.class_for_table(&profile.name);
-        for other in self.profiles.iter().filter(|p| p.name != profile.name) {
-            let Some(other_key) = other.key.as_deref() else {
+        let class_id = self.known.class_for_table(&profile.table);
+        for other in self.profiles.iter().filter(|p| p.table != profile.table) {
+            let Some(other_key) = other.key_column() else {
                 continue;
             };
-            let share = overlap(self.db, &profile.name, &column.name, &other.name, other_key)?;
+            let share = overlap(
+                self.db,
+                &profile.table,
+                &column.name,
+                &other.table,
+                other_key,
+            )?;
             if share < self.options.key_overlap_threshold || column.distinct == 0 {
                 continue;
             }
-            let target_class = self.known.class_for_table(&other.name);
+            let target_class = self.known.class_for_table(&other.table);
             let (relation_id, new) =
                 match self.relation_name(&column.name, &class_id, &target_class) {
                     RelationName::New(id) => (id, true),
@@ -506,9 +401,9 @@ impl InductionPass<'_> {
                         range: ClassId::from(target_class),
                     }),
                     evidence: serde_json::json!({
-                        "table": profile.name,
+                        "table": profile.table,
                         "column": column.name,
-                        "target_table": other.name,
+                        "target_table": other.table,
                         "target_key": other_key,
                         "overlap": share,
                         "distinct": column.distinct,
@@ -556,7 +451,8 @@ impl InductionPass<'_> {
     }
 }
 
-/// Old id to new for one kind of item.
+/// Old property id to new. Not part of [`IdRenames`], which is what a save
+/// moves the graph by, and the graph is keyed by class and relation ids only.
 #[derive(Default)]
 struct RenameMap(BTreeMap<String, String>);
 
@@ -567,12 +463,12 @@ impl RenameMap {
     }
 }
 
-/// Id renames from rename and merge decisions, by kind, so later proposals
-/// that reference a renamed or merged item follow it.
+/// Id renames from rename and merge decisions, so later proposals that
+/// reference a renamed or merged item follow it.
 #[derive(Default)]
 struct Renames {
-    classes: RenameMap,
-    relations: RenameMap,
+    /// Classes and relations.
+    ids: IdRenames,
     properties: RenameMap,
 }
 
@@ -585,10 +481,14 @@ impl From<&[(Proposal, Decision)]> for Renames {
             };
             match proposal {
                 Proposal::Class(c) => {
-                    out.classes.0.insert(c.id.to_string(), target.clone());
+                    out.ids
+                        .classes
+                        .insert(c.id.clone(), ClassId::from(target.as_str()));
                 }
                 Proposal::Relation(r) => {
-                    out.relations.0.insert(r.id.to_string(), target.clone());
+                    out.ids
+                        .relations
+                        .insert(r.id.clone(), RelationId::from(target.as_str()));
                 }
                 Proposal::Property { property, .. } => {
                     out.properties.0.insert(property.id.clone(), target.clone());
@@ -605,8 +505,7 @@ impl Renames {
     /// class already there with its properties and key.
     fn apply_class(&self, ontology: &mut Ontology, class: &Class, decision: &Decision) {
         let mut class = class.clone();
-        class.id = ClassId::from(self.classes.follow(class.id.as_str()));
-        class.parent = ClassId::from(self.classes.follow(class.parent.as_str()));
+        self.ids.rename_class(&mut class);
         if let Decision::Reparent(parent) = decision {
             class.parent = ClassId::from(parent.as_str());
         }
@@ -667,7 +566,8 @@ pub fn apply(base: Option<&Ontology>, accepted: &[(Proposal, Decision)]) -> Resu
         if let Proposal::Property { class, property } = proposal
             && !merged(decision)
         {
-            let class_id = names.classes.follow(class);
+            let mut class_id = class.clone();
+            names.ids.rename_owner(&mut class_id);
             let property_id = names.properties.follow(&property.id);
             if let Some(class) = ontology
                 .classes
@@ -684,9 +584,7 @@ pub fn apply(base: Option<&Ontology>, accepted: &[(Proposal, Decision)]) -> Resu
             && !merged(decision)
         {
             let mut relation = relation.clone();
-            relation.id = RelationId::from(names.relations.follow(relation.id.as_str()));
-            relation.domain = ClassId::from(names.classes.follow(relation.domain.as_str()));
-            relation.range = ClassId::from(names.classes.follow(relation.range.as_str()));
+            names.ids.rename_relation(&mut relation);
             if ontology.relation(relation.id.as_str()).is_none() {
                 ontology.relations.push(relation);
             }
@@ -695,15 +593,13 @@ pub fn apply(base: Option<&Ontology>, accepted: &[(Proposal, Decision)]) -> Resu
     for (proposal, _) in accepted {
         if let Proposal::Mapping(mapping) = proposal {
             let mut mapping = mapping.clone();
-            mapping.class = ClassId::from(names.classes.follow(mapping.class.as_str()));
+            names.ids.rename_mapping(&mut mapping);
             mapping.properties = mapping
                 .properties
                 .iter()
                 .map(|(column, p)| (column.clone(), names.properties.follow(p)))
                 .collect();
             for link in &mut mapping.relations {
-                link.relation = RelationId::from(names.relations.follow(link.relation.as_str()));
-                link.target_class = ClassId::from(names.classes.follow(link.target_class.as_str()));
                 link.target_key = names.properties.follow(&link.target_key);
             }
             ontology.mappings.retain(|m| m.table != mapping.table);
@@ -747,272 +643,4 @@ pub enum Decision {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::embedding::Dimension;
-    use crate::ontology::OntologyVersion;
-
-    #[expect(clippy::panic, reason = "test failure path")]
-    fn fail(msg: &str) -> ! {
-        panic!("{msg}")
-    }
-
-    fn db() -> WorkspaceDb {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        for sql in [
-            "CREATE TABLE policies (policy_number TEXT, holder TEXT, effective DATE, premium DOUBLE)",
-            "CREATE TABLE claims (claim_id INTEGER, policy_number TEXT, amount DOUBLE, status TEXT, filed TEXT, active BOOLEAN)",
-        ] {
-            assert!(db.execute_statement(sql).is_ok());
-        }
-        for i in 0..30 {
-            assert!(
-                db.execute_statement(&format!(
-                    "INSERT INTO policies VALUES ('P{i}', 'Holder {i}', DATE '2024-01-01', {i}.5)"
-                ))
-                .is_ok()
-            );
-            let status = ["filed", "paid", "denied"]
-                .get(i % 3)
-                .copied()
-                .unwrap_or("filed");
-            assert!(db.execute_statement(&format!("INSERT INTO claims VALUES ({i}, 'P{}', {i}.0, '{status}', '2024-02-{:02}', {})", i % 25, (i % 28).saturating_add(1), i % 2 == 0)).is_ok());
-        }
-        db
-    }
-
-    #[test]
-    fn column_types_sort_into_kinds() {
-        for (duckdb_type, kind) in [
-            ("BOOLEAN", ColumnKind::Boolean),
-            ("date", ColumnKind::Temporal),
-            ("TIMESTAMP WITH TIME ZONE", ColumnKind::Temporal),
-            ("BIGINT", ColumnKind::Numeric),
-            ("DECIMAL(18,3)", ColumnKind::Numeric),
-            ("double", ColumnKind::Numeric),
-            ("VARCHAR", ColumnKind::Other),
-            ("INTEGER[]", ColumnKind::Other),
-        ] {
-            assert_eq!(ColumnKind::of(duckdb_type), kind, "{duckdb_type}");
-        }
-    }
-
-    #[test]
-    fn names_are_snake_case_singular_and_prefixed() {
-        assert_eq!(SnakeId::from_name("Ship Mode").as_str(), "ship_mode");
-        assert_eq!(SnakeId::from_name("po / so #").as_str(), "po_so");
-        assert_eq!(SnakeId::from_name("2024").as_str(), "t_2024");
-        assert_eq!(SnakeId::singular_from("shipments").as_str(), "shipment");
-        assert_eq!(SnakeId::singular_from("policies").as_str(), "policy");
-        assert_eq!(SnakeId::singular_from("address").as_str(), "address");
-        assert_eq!(SnakeId::singular_from("bus").as_str(), "bus");
-        assert_eq!(relation_id_for_column("policy_id"), "has_policy");
-        assert_eq!(relation_id_for_column("policy_number"), "has_policy_number");
-    }
-
-    #[test]
-    fn shared_foreign_key_column_names_get_distinct_relations() {
-        let db = db();
-        assert!(
-            db.execute_statement(
-                "CREATE TABLE notes (note_id INTEGER, policy_number VARCHAR, body VARCHAR)"
-            )
-            .is_ok()
-        );
-        for i in 0..40_u32 {
-            assert!(
-                db.execute_statement(&format!(
-                    "INSERT INTO notes VALUES ({i}, 'P{}', 'note {i}')",
-                    i % 25
-                ))
-                .is_ok()
-            );
-        }
-        let candidates = propose_from_tables(&db, None, &TableEvidenceOptions::default())
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let relations: Vec<&Relation> = candidates
-            .iter()
-            .filter_map(|c| match &c.proposal {
-                Proposal::Relation(r) => Some(r),
-                Proposal::Class(_) | Proposal::Property { .. } | Proposal::Mapping(_) => None,
-            })
-            .collect();
-        assert_eq!(relations.len(), 2, "one relation per source table");
-        assert!(
-            relations
-                .iter()
-                .any(|r| r.id == "has_policy_number" && r.domain == "claim")
-        );
-        assert!(
-            relations
-                .iter()
-                .any(|r| r.id == "note_has_policy_number" && r.domain == "note")
-        );
-        let accepted: Vec<(Proposal, Decision)> = candidates
-            .iter()
-            .map(|c| (c.proposal.clone(), Decision::Accept))
-            .collect();
-        let ontology = apply(None, &accepted).unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(ontology.validate().is_ok());
-    }
-
-    #[test]
-    fn tables_propose_classes_keys_typed_properties_relations_and_mappings() {
-        let db = db();
-        let candidates = propose_from_tables(&db, None, &TableEvidenceOptions::default())
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let find = |kind: &str, id: &str| {
-            candidates
-                .iter()
-                .find(|c| c.proposal.kind().as_str() == kind && c.proposal.id() == id)
-        };
-        let claim = find("class", "claim").unwrap_or_else(|| fail("no claim class"));
-        assert!(
-            matches!(&claim.proposal, Proposal::Class(c) if c.key.as_deref() == Some("claim_id") && c.properties.len() == 6)
-        );
-        let policy = find("class", "policy").unwrap_or_else(|| fail("no policy class"));
-        assert!(
-            matches!(&policy.proposal, Proposal::Class(c) if c.key.as_deref() == Some("policy_number"))
-        );
-        let status = find("property", "status").unwrap_or_else(|| fail("no status"));
-        assert!(
-            matches!(&status.proposal, Proposal::Property { property, .. } if property.kind == PropertyType::Enum && property.values == ["denied", "filed", "paid"])
-        );
-        let filed = find("property", "filed").unwrap_or_else(|| fail("no filed"));
-        assert!(
-            matches!(&filed.proposal, Proposal::Property { property, .. } if property.kind == PropertyType::Date),
-            "text dates are dates"
-        );
-        assert!(
-            matches!(&find("property", "amount").map(|c| &c.proposal), Some(Proposal::Property { property, .. }) if property.kind == PropertyType::Number)
-        );
-        assert!(
-            matches!(&find("property", "active").map(|c| &c.proposal), Some(Proposal::Property { property, .. }) if property.kind == PropertyType::Boolean)
-        );
-        let relation = find("relation", "has_policy_number").unwrap_or_else(|| fail("no relation"));
-        assert!(
-            matches!(&relation.proposal, Proposal::Relation(r) if r.domain == "claim" && r.range == "policy")
-        );
-        assert!(relation.confidence >= 0.8);
-        let mapping = find("mapping", "claims").unwrap_or_else(|| fail("no mapping"));
-        assert!(
-            matches!(&mapping.proposal, Proposal::Mapping(m) if m.key == "claim_id" && m.relations.len() == 1 && m.properties.len() == 6)
-        );
-
-        // Accepting everything yields a valid ontology with the mappings.
-        let accepted: Vec<(Proposal, Decision)> = candidates
-            .iter()
-            .map(|c| (c.proposal.clone(), Decision::Accept))
-            .collect();
-        let ontology = apply(None, &accepted).unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(ontology.classes.len(), 2);
-        assert_eq!(ontology.mappings.len(), 2);
-        assert!(ontology.class_properties("claim").contains("status"));
-        // Extend mode proposes nothing new once everything is in.
-        let again = propose_from_tables(&db, Some(&ontology), &TableEvidenceOptions::default())
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(again.is_empty(), "{}", again.len());
-        // A table mapped to a class named differently from the table is
-        // covered too: nothing is proposed for it (issue #55).
-        let mut renamed = ontology;
-        for class in &mut renamed.classes {
-            if class.id == "claim" {
-                class.id = ClassId::from("insurance_claim");
-            }
-        }
-        for mapping in &mut renamed.mappings {
-            if mapping.class == "claim" {
-                mapping.class = ClassId::from("insurance_claim");
-            }
-        }
-        for relation in &mut renamed.relations {
-            if relation.domain == "claim" {
-                relation.domain = ClassId::from("insurance_claim");
-            }
-            if relation.range == "claim" {
-                relation.range = ClassId::from("insurance_claim");
-            }
-        }
-        let again = propose_from_tables(&db, Some(&renamed), &TableEvidenceOptions::default())
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(again.is_empty(), "{again:?}");
-    }
-
-    #[test]
-    fn rename_merge_and_reparent_follow_through_references() {
-        let db = db();
-        let candidates = propose_from_tables(&db, None, &TableEvidenceOptions::default())
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let mut base = Ontology::builtin_default();
-        base.version = Some(OntologyVersion::FIRST);
-        let decisions: Vec<(Proposal, Decision)> = candidates
-            .iter()
-            .map(|c| {
-                let decision = match (&c.proposal, c.proposal.id()) {
-                    (Proposal::Class(_), "claim") => Decision::Reparent(String::from("event")),
-                    (Proposal::Class(_), "policy") => {
-                        Decision::Rename(String::from("insurance_policy"))
-                    }
-                    (Proposal::Relation(_), _) => Decision::Rename(String::from("filed_against")),
-                    (Proposal::Property { .. }, "holder") => {
-                        Decision::MergeInto(String::from("title"))
-                    }
-                    _ => Decision::Accept,
-                };
-                (c.proposal.clone(), decision)
-            })
-            .collect();
-        let ontology = apply(Some(&base), &decisions).unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(ontology.class("insurance_policy").is_some() && ontology.class("policy").is_none());
-        assert!(ontology.class("claim").is_some_and(|c| c.parent == "event"));
-        let relation = ontology
-            .relation("filed_against")
-            .unwrap_or_else(|| fail("no relation"));
-        assert_eq!(
-            (relation.domain.as_str(), relation.range.as_str()),
-            ("claim", "insurance_policy")
-        );
-        let mapping = ontology
-            .mappings
-            .iter()
-            .find(|m| m.table == "claims")
-            .unwrap_or_else(|| fail("no mapping"));
-        assert_eq!(
-            mapping
-                .relations
-                .first()
-                .map(|r| (r.relation.as_str(), r.target_class.as_str())),
-            Some(("filed_against", "insurance_policy"))
-        );
-        let policies = ontology
-            .mappings
-            .iter()
-            .find(|m| m.table == "policies")
-            .unwrap_or_else(|| fail("no mapping"));
-        assert_eq!(
-            policies.properties.get("holder").map(String::as_str),
-            Some("title")
-        );
-        assert!(ontology.property("holder").is_none());
-        assert!(
-            ontology
-                .class_properties("insurance_policy")
-                .contains("title")
-        );
-        assert_eq!(ontology.classes.len(), 9);
-
-        let bad = vec![(
-            Proposal::Class(Class {
-                id: ClassId::from("x"),
-                parent: ClassId::from("ghost"),
-                label: None,
-                description: None,
-                key: None,
-                properties: Vec::new(),
-            }),
-            Decision::Accept,
-        )];
-        assert!(apply(None, &bad).is_err());
-    }
-}
+mod tests;

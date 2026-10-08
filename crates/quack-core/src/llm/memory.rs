@@ -48,8 +48,8 @@ pub struct History {
 
 impl History {
     /// The history under `[analysis]`: the window always, and the
-    /// summarizing compactor when `compact_history` is on and a chat model
-    /// is configured.
+    /// summarizing compactor when `compact_history` is on and the chat
+    /// model takes its summary call.
     ///
     /// # Errors
     ///
@@ -58,21 +58,23 @@ impl History {
         let budget = config.analysis.history_token_budget;
         let compactor = if config.analysis.compact_history {
             let chat = config.chat_model_ref()?;
-            let summarizer = ChatClient::build(config, &chat).await?.schema_call(
-                chat.model,
-                config.model_settings(chat),
-                Task {
-                    preamble: SUMMARY_PROMPT,
-                    timeout: SUMMARY_TIMEOUT,
-                    label: "history summary",
-                },
-                schema_for!(SummaryAnswer),
-            )?;
-            Some(SessionCompactor {
-                db: Arc::clone(&db),
-                summarizer: Arc::new(summarizer),
-                max_tokens: SessionCompactor::cap(budget),
-            })
+            ChatClient::build(config, &chat)
+                .await?
+                .optional_schema_call(
+                    chat.model,
+                    config.model_settings(chat),
+                    Task {
+                        preamble: SUMMARY_PROMPT,
+                        timeout: SUMMARY_TIMEOUT,
+                        label: "history summary",
+                    },
+                    schema_for!(SummaryAnswer),
+                )
+                .map(|summarizer| SessionCompactor {
+                    db: Arc::clone(&db),
+                    summarizer: Arc::new(summarizer),
+                    max_tokens: SessionCompactor::cap(budget),
+                })
         } else {
             None
         };
@@ -229,6 +231,7 @@ mod tests {
     use super::*;
     use crate::analysis::agent::AgentResponse;
     use crate::embedding::Dimension;
+    use crate::llm::egress::Egress;
     use crate::storage::sessions::ChatMode;
     use crate::storage::workspace::WorkspaceDb;
     use jiff::Timestamp;
@@ -470,5 +473,30 @@ mod tests {
         .unwrap_or_else(|e| fail(&e.to_string()));
         let shown: Vec<String> = history.iter().map(SpokenText::spoken_text).collect();
         assert_eq!(shown, ["question 4", "answer 4", "question 5", "answer 5"]);
+    }
+
+    /// A `background_effort` the model refuses leaves the window alone to
+    /// replay; the turn is not refused for its summary call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_summary_call_the_model_refuses_leaves_the_window_alone() {
+        Egress::scope(Some(Egress::NoWorkspace), async {
+            let (db, _id) = session().await;
+            for (background_effort, compacts) in [("none", true), ("max", false)] {
+                let config = Config::parse(&format!(
+                    "[general]\nchat_model = \"p/gpt-5.6-sol\"\n\
+                 [analysis]\ncompact_history = true\neffort = \"none\"\n\
+                 background_effort = \"{background_effort}\"\n\
+                 [providers.p]\ntype = \"openai\"\napi = \"chat-completions\"\n\
+                 auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n\
+                 base_url = \"http://127.0.0.1:9\"\n"
+                ))
+                .unwrap_or_else(|e| fail(&e.to_string()));
+                let history = History::from_config(&config, Arc::clone(&db))
+                    .await
+                    .unwrap_or_else(|e| fail(&e.to_string()));
+                assert_eq!(history.compactor.is_some(), compacts, "{background_effort}");
+            }
+        })
+        .await;
     }
 }

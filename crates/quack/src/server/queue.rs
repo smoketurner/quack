@@ -11,13 +11,16 @@ use std::sync::Arc;
 
 use quack_core::analysis::tools::SharedDb;
 use quack_core::config::Config;
-use quack_core::ids::{DocumentId, UserId, WorkspaceId};
+use quack_core::ids::{DocumentId, WorkspaceId};
+use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::{NewFile, Processing};
 use quack_core::jobs::{JobId, JobKind, JobResult, JobSpec, JobState, Lane, LaneKey};
 use quack_core::llm::Embeddings;
 use quack_core::progress::{ChunkDone, RunControl};
 
+use super::auth::Access;
 use super::error::{ApiError, ApiResult};
+use super::run;
 use super::state::App;
 
 /// A queued upload's bytes, kept in its workspace's `uploads/` directory
@@ -106,19 +109,22 @@ impl UploadJob {
 
     /// Queue the upload for processing and return its job id. The document
     /// is already registered as `queued`; whatever happens to the job, it
-    /// ends `ready` or `error`, never stuck.
+    /// ends `ready` or `error`, never stuck. A document that becomes ready
+    /// queues the graph follow-up `[graph].follow_ingest` asks for, as
+    /// `access`'s run.
     pub(crate) fn submit(
         self,
         app: &App,
-        workspace_id: &WorkspaceId,
-        owner: Option<UserId>,
+        access: &Access,
         db: SharedDb,
+        embedder: Option<Embeddings>,
     ) -> JobId {
+        let workspace_id = &access.membership.workspace.id;
         let spec = JobSpec::new(JobKind::Ingest, self.filename.clone())
             .workspace(workspace_id.clone())
-            .owner(owner)
+            .owner(Some(access.identity.user_id.clone()))
             .lane(Lane::new(
-                &LaneKey::Ingest(workspace_id.clone()),
+                &LaneKey::Workspace(JobKind::Ingest, workspace_id.clone()),
                 app.config.server.workers_per_workspace,
             ));
         let config = app.config.clone();
@@ -126,6 +132,7 @@ impl UploadJob {
         let document_id = self.document_id.clone();
         let spool = self.spool.clone();
         let worker_db = Arc::clone(&db);
+        let (follow_app, follow_access) = (Arc::clone(app), access.clone());
         let id = app
             .jobs
             .submit(spec, move |ctx| async move {
@@ -135,7 +142,28 @@ impl UploadJob {
                     progress: &progress,
                     cancel: Some(&cancel),
                 };
-                self.process(&config, &workspace, &worker_db, control).await
+                let ready = self.document_id.clone();
+                let mut message = self
+                    .process(&config, &workspace, &worker_db, embedder.as_ref(), control)
+                    .await?;
+                let followed = run::follow_ingest(
+                    &follow_app,
+                    &follow_access,
+                    Arc::clone(&worker_db),
+                    embedder,
+                    vec![ready],
+                )
+                .await;
+                let note = match followed {
+                    Ok(Some(job)) => format!("; graph follow-up queued as job {job}"),
+                    Ok(None) => String::new(),
+                    Err(e) => {
+                        tracing::warn!(error = %e.message, "the graph follow-up could not be queued");
+                        format!("; graph follow-up not queued: {}", e.message)
+                    }
+                };
+                message.push_str(&note);
+                Ok(message)
             })
             .id;
         // The work records its own outcome; a job that ends without running
@@ -164,16 +192,9 @@ impl UploadJob {
         config: &Config,
         workspace_id: &str,
         db: &SharedDb,
+        embedder: Option<&Embeddings>,
         control: RunControl<'_>,
     ) -> JobResult {
-        let model = match Embeddings::from_config(config).await {
-            Ok(model) => model,
-            Err(e) => {
-                tracing::warn!(error = %e, document = %self.document_id, "upload fails: no embedding model");
-                Self::mark_error(db, &self.document_id, &e.to_string()).await;
-                return Err(e.to_string());
-            }
-        };
         let data = match self.spool.read().await {
             Ok(data) => data,
             Err(e) => {
@@ -190,15 +211,16 @@ impl UploadJob {
             workspace_id,
             document_id: &self.document_id,
             file: &file,
-            embedder: model.as_ref(),
+            embedder,
         }
         .run()
         .await;
         match result {
             Ok(r) => {
                 tracing::info!(document = %r.document_id, file = %r.filename, chunks = r.chunks_stored, "upload processed");
+                let pages = PageCounts::suffix(r.pages);
                 Ok(match r.tables.as_slice() {
-                    [] => format!("{} chunks", r.chunks_stored),
+                    [] => format!("{} chunks{pages}", r.chunks_stored),
                     tables => format!("tables {}", tables.join(", ")),
                 })
             }

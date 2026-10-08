@@ -301,6 +301,7 @@ fn effort_fields(
         (Family::Claude, _) => {
             fields.insert(String::from("output_config"), json!({ "effort": level }))
         }
+        (_, Wire::Ollama) => fields.insert(String::from("think"), json!(level)),
         (_, Wire::Responses) => {
             fields.insert(String::from("reasoning"), json!({ "effort": level }))
         }
@@ -367,6 +368,7 @@ impl<W: rig::wire::Wire<Op = Completion>> rig::wire::Wire for Sampled<W> {
     type Payload = W::Payload;
     type Frame = W::Frame;
     type Decoder<'id> = W::Decoder<'id>;
+    type Reassembler = W::Reassembler;
 
     fn describe(&self) -> rig::wire::Descriptor<'_> {
         self.inner.describe()
@@ -382,6 +384,10 @@ impl<W: rig::wire::Wire<Op = Completion>> rig::wire::Wire for Sampled<W> {
 
     fn decoder<'id>(&self) -> Self::Decoder<'id> {
         self.inner.decoder()
+    }
+
+    fn reassembler(&self) -> Self::Reassembler {
+        self.inner.reassembler()
     }
 }
 
@@ -411,18 +417,8 @@ mod tests {
     }
 
     fn request() -> rig::completion::CompletionRequest {
-        rig::completion::CompletionRequest {
-            model: None,
-            chat_history: Vec::new(),
-            documents: Vec::new(),
-            tools: Vec::new(),
-            temperature: Some(0.1),
-            max_tokens: None,
-            tool_choice: None,
-            additional_params: None,
-            output_schema: None,
-            record_telemetry_content: false,
-        }
+        rig::completion::CompletionRequest::new(rig::completion::Message::user("q"))
+            .temperature(0.1)
     }
 
     fn sampling(model: &str, wire: Wire, effort: Option<Effort>) -> Sampling {
@@ -520,7 +516,7 @@ mod tests {
                 "gpt-oss:20b",
                 Wire::Ollama,
                 Effort::High,
-                json!({ "reasoning_effort": "high" }),
+                json!({ "think": "high" }),
             ),
             (
                 "openai.gpt-oss-120b",
@@ -550,12 +546,12 @@ mod tests {
             Some(json!({ "store": false, "reasoning": { "summary": "auto", "effort": "high" } }))
         );
         let mut asked = request();
-        asked.additional_params = Some(json!({ "keep_alive": "30m" }));
+        asked.additional_params = Some(json!({ "num_ctx": 8192, "keep_alive": "30m" }));
         assert_eq!(
             sampling("gpt-oss:20b", Wire::Ollama, Some(Effort::Low))
                 .apply(asked)
                 .additional_params,
-            Some(json!({ "keep_alive": "30m", "reasoning_effort": "low" }))
+            Some(json!({ "num_ctx": 8192, "keep_alive": "30m", "think": "low" }))
         );
     }
 

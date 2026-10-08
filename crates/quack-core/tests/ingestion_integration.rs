@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{MAIN_SEPARATOR, Path};
 
+use quack_core::analysis::citations::Citation;
 use quack_core::config::{
     AnalysisConfig, BaseUrl, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
     ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig, ProviderType,
@@ -14,13 +15,17 @@ use quack_core::error::Error;
 use quack_core::graph::{Properties, Standing, store as graph_store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId};
 use quack_core::import::{HostReach, ImportPolicy, ImportRequest};
-use quack_core::ingestion::parser::FileType;
+use quack_core::ingestion::parser::SectionKind;
+use quack_core::ingestion::parser::{FileType, PageCounts};
+use quack_core::ingestion::tree::{Folder, FolderReport, Outcome, Prune};
 use quack_core::llm::CancellationToken;
+use quack_core::llm::egress::Egress;
 use quack_core::progress::{ChunkDone, RunControl};
-use quack_core::storage::control::ControlPlane;
+use quack_core::storage::control::{ControlPlane, WorkspaceName};
+use quack_core::storage::profile::TableProfile;
 use quack_core::storage::workspace::{
-    ChunkScope, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk, NewDocument,
-    Pinning, StatementKind, WorkspaceDb,
+    ChunkScope, DocumentFields, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk,
+    NewDocument, Pinning, StatementKind, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use quack_core::{import, ingestion};
@@ -124,17 +129,20 @@ fn test_config(data_dir: &Path) -> Config {
     Config {
         general: GeneralConfig {
             data_dir: data_dir.to_path_buf(),
-            default_workspace: "test".into(),
+            default_workspace: WorkspaceName::default(),
             chat_model: None,
         },
         providers,
         ingestion: IngestionConfig {
+            table_rows_as_table: 20,
             chunk_size_tokens: 50,
             chunk_overlap_tokens: 10,
             embedding_batch_size: 64,
             embedding_concurrency: 2,
             tokenizer_encoding: String::from("cl100k_base"),
             upload_max_mb: 512,
+            max_decompressed_mb: 1024,
+            vision_model: None,
         },
         embedding: EmbeddingConfig {
             model: Some("mock/mock-model".parse().unwrap()),
@@ -156,7 +164,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
     Config {
         general: GeneralConfig {
             data_dir: data_dir.to_path_buf(),
-            default_workspace: "test".into(),
+            default_workspace: WorkspaceName::default(),
             chat_model: None,
         },
         providers: BTreeMap::new(),
@@ -404,10 +412,12 @@ async fn embedding_batch_size_bounds_every_embed_request() {
     .ingested()
     .unwrap();
 
-    // One report per stored batch, counting chunks, ending at all of them.
+    // The total with nothing done, then one report per stored batch,
+    // counting chunks, ending at all of them.
     let reported = reported.into_inner().unwrap();
     let batch_count = model.model().batches.lock().unwrap().len();
-    assert_eq!(reported.len(), batch_count, "{reported:?}");
+    assert_eq!(reported.len(), batch_count + 1, "{reported:?}");
+    assert_eq!(reported.first().copied(), Some((0, result.chunks_stored)));
     assert!(reported.is_sorted_by(|a, b| a.0 < b.0), "{reported:?}");
     assert_eq!(
         reported.last().copied(),
@@ -836,7 +846,7 @@ async fn ingest_unknown_file_type_returns_error() {
         &config,
         &writer,
         workspace_id,
-        &ingestion::NewFile::new("image.png", b"fake image data"),
+        &ingestion::NewFile::new("scan.tiff", b"fake image data"),
         None,
     )
     .await;
@@ -950,16 +960,20 @@ fn workspace_db_chunk_without_embedding() {
     )
     .unwrap();
 
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 0,
-        content: "hello world",
-        heading: None,
-        page: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "hello world")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c1"),
+                chunk_index: 0,
+                content: "hello world",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
 
     let qr = db
         .execute_query("SELECT id, content FROM _quack_chunks WHERE id = 'c1'")
@@ -983,16 +997,20 @@ fn workspace_db_chunk_with_embedding() {
     .unwrap();
 
     let embedding = Vector::from(vec![0.5_f32, 0.3, -0.2, 0.8]);
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 0,
-        content: "embedded chunk",
-        heading: None,
-        page: None,
-        embedding: Some(&embedding),
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "embedded chunk")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c1"),
+                chunk_index: 0,
+                content: "embedded chunk",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&embedding),
+            })
+        })
+        .unwrap();
 
     let qr = db
         .execute_query("SELECT content FROM _quack_chunks WHERE embedding IS NOT NULL")
@@ -1013,16 +1031,20 @@ fn workspace_db_set_chunk_embedding() {
     )
     .unwrap();
 
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 0,
-        content: "hello world",
-        heading: None,
-        page: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "hello world")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c1"),
+                chunk_index: 0,
+                content: "hello world",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
 
     // Embedding should be NULL initially
     let qr = db
@@ -1086,26 +1108,34 @@ fn workspace_db_search_returns_filename_and_honors_document_filter() {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("a0"),
-        document_id: &DocumentId::from("doc-a"),
-        chunk_index: 0,
-        content: "flood exclusion",
-        heading: None,
-        page: None,
-        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
-    })
-    .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("b0"),
-        document_id: &DocumentId::from("doc-b"),
-        chunk_index: 0,
-        content: "claims timeline",
-        heading: None,
-        page: None,
-        embedding: Some(&Vector::from(vec![0.9, 0.1, 0.0, 0.0])),
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-a"), "flood exclusion")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("a0"),
+                chunk_index: 0,
+                content: "flood exclusion",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-b"), "claims timeline")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("b0"),
+                chunk_index: 0,
+                content: "claims timeline",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![0.9, 0.1, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
 
     let query = Vector::from(vec![1.0_f32, 0.0, 0.0, 0.0]);
 
@@ -1153,36 +1183,48 @@ fn workspace_db_search_similar_chunks() {
     )
     .unwrap();
 
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 0,
-        content: "first chunk",
-        heading: None,
-        page: None,
-        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
-    })
-    .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c2"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 1,
-        content: "second chunk",
-        heading: None,
-        page: None,
-        embedding: Some(&Vector::from(vec![0.0, 1.0, 0.0, 0.0])),
-    })
-    .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c3"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 2,
-        content: "third chunk",
-        heading: None,
-        page: None,
-        embedding: Some(&Vector::from(vec![0.7, 0.7, 0.0, 0.0])),
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "first chunk")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c1"),
+                chunk_index: 0,
+                content: "first chunk",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "second chunk")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c2"),
+                chunk_index: 1,
+                content: "second chunk",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![0.0, 1.0, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "third chunk")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c3"),
+                chunk_index: 2,
+                content: "third chunk",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![0.7, 0.7, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
 
     let query = Vector::from(vec![1.0_f32, 0.0, 0.0, 0.0]);
     let results = db
@@ -1385,7 +1427,7 @@ fn open_records_schema_version_and_embedding_meta() {
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
     assert_eq!(
         db.meta(MetaKey::SchemaVersion).unwrap().as_deref(),
-        Some("11")
+        Some("14")
     );
     assert_eq!(
         db.meta(MetaKey::EmbeddingDimension).unwrap().as_deref(),
@@ -1434,16 +1476,20 @@ fn dimension_change_with_stored_embeddings_keeps_them_until_refresh() {
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c"),
-            document_id: &DocumentId::from("d"),
-            chunk_index: 0,
-            content: "x",
-            heading: None,
-            page: None,
-            embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
-        })
-        .unwrap();
+        db.chunk_writer(&DocumentId::from("d"), "x")
+            .and_then(|writer| {
+                writer.insert(&NewChunk {
+                    id: &ChunkId::from("c"),
+                    chunk_index: 0,
+                    content: "x",
+                    heading: None,
+                    page: None,
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+                })
+            })
+            .unwrap();
     }
     let mut changed = test_config(dir.path());
     changed.embedding.dimension = Some(Dimension::new(8));
@@ -1508,16 +1554,20 @@ fn dimension_change_without_embeddings_adopts_new_width() {
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c"),
-            document_id: &DocumentId::from("d"),
-            chunk_index: 0,
-            content: "x",
-            heading: None,
-            page: None,
-            embedding: None,
-        })
-        .unwrap();
+        db.chunk_writer(&DocumentId::from("d"), "x")
+            .and_then(|writer| {
+                writer.insert(&NewChunk {
+                    id: &ChunkId::from("c"),
+                    chunk_index: 0,
+                    content: "x",
+                    heading: None,
+                    page: None,
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: None,
+                })
+            })
+            .unwrap();
     }
     {
         // A node label embedding of the old width: cleared on reopen and
@@ -1562,26 +1612,34 @@ fn dimension_change_without_embeddings_adopts_new_width() {
             .unwrap()
             .is_empty()
     );
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c8"),
-        document_id: &DocumentId::from("d"),
-        chunk_index: 1,
-        content: "y",
-        heading: None,
-        page: None,
-        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
-    })
-    .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c2"),
-        document_id: &DocumentId::from("d"),
-        chunk_index: 1,
-        content: "y",
-        heading: None,
-        page: None,
-        embedding: Some(&Vector::from(vec![0.5; 8])),
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("d"), "y")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c8"),
+                chunk_index: 1,
+                content: "y",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
+    db.chunk_writer(&DocumentId::from("d"), "y")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c2"),
+                chunk_index: 1,
+                content: "y",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![0.5; 8])),
+            })
+        })
+        .unwrap();
 }
 
 #[test]
@@ -1614,6 +1672,8 @@ fn legacy_unprefixed_tables_are_renamed_on_open() {
             .as_deref()
             .is_some_and(|m| m.contains("upload it again"))
     );
+    // A row from before page counts were recorded carries none.
+    assert_eq!(old.pages, None);
     assert!(db.list_tables().unwrap().is_empty());
 }
 
@@ -1704,34 +1764,55 @@ fn seeded_for_search(config: &Config, ws: &str) -> WorkspaceDb {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("a0"),
-        document_id: &DocumentId::from("doc-a"),
-        chunk_index: 0,
-        content: "Flood damage is excluded from coverage.",
-        heading: Some("Exclusions"),
-        page: Some(12),
-        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+    db.chunk_writer(
+        &DocumentId::from("doc-a"),
+        "Flood damage is excluded from coverage.",
+    )
+    .and_then(|writer| {
+        writer.insert(&NewChunk {
+            id: &ChunkId::from("a0"),
+            chunk_index: 0,
+            content: "Flood damage is excluded from coverage.",
+            heading: Some("Exclusions"),
+            page: Some(12),
+            kind: SectionKind::Body,
+            locator: None,
+            embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+        })
     })
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("b0"),
-        document_id: &DocumentId::from("doc-b"),
-        chunk_index: 0,
-        content: "Policy POL-8841 renews every March.",
-        heading: None,
-        page: None,
-        embedding: Some(&Vector::from(vec![0.0, 1.0, 0.0, 0.0])),
+    db.chunk_writer(
+        &DocumentId::from("doc-b"),
+        "Policy POL-8841 renews every March.",
+    )
+    .and_then(|writer| {
+        writer.insert(&NewChunk {
+            id: &ChunkId::from("b0"),
+            chunk_index: 0,
+            content: "Policy POL-8841 renews every March.",
+            heading: None,
+            page: None,
+            kind: SectionKind::Body,
+            locator: None,
+            embedding: Some(&Vector::from(vec![0.0, 1.0, 0.0, 0.0])),
+        })
     })
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("b1"),
-        document_id: &DocumentId::from("doc-b"),
-        chunk_index: 1,
-        content: "Claims close within thirty days of filing.",
-        heading: Some("Claims"),
-        page: None,
-        embedding: Some(&Vector::from(vec![0.0, 0.0, 1.0, 0.0])),
+    db.chunk_writer(
+        &DocumentId::from("doc-b"),
+        "Claims close within thirty days of filing.",
+    )
+    .and_then(|writer| {
+        writer.insert(&NewChunk {
+            id: &ChunkId::from("b1"),
+            chunk_index: 1,
+            content: "Claims close within thirty days of filing.",
+            heading: Some("Claims"),
+            page: None,
+            kind: SectionKind::Body,
+            locator: None,
+            embedding: Some(&Vector::from(vec![0.0, 0.0, 1.0, 0.0])),
+        })
     })
     .unwrap();
     db
@@ -1900,16 +1981,20 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
                 .with_status(DocumentStatus::Ready),
         )
         .unwrap();
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c0"),
-            document_id: &DocumentId::from("d"),
-            chunk_index: 0,
-            content: "renewal POL-8841 notice",
-            heading: None,
-            page: None,
-            embedding: None,
-        })
-        .unwrap();
+        db.chunk_writer(&DocumentId::from("d"), "renewal POL-8841 notice")
+            .and_then(|writer| {
+                writer.insert(&NewChunk {
+                    id: &ChunkId::from("c0"),
+                    chunk_index: 0,
+                    content: "renewal POL-8841 notice",
+                    heading: None,
+                    page: None,
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: None,
+                })
+            })
+            .unwrap();
         // Simulate a v5 workspace: unstemmed term rows, old version recorded.
         db.execute_statement("DELETE FROM _quack_terms").unwrap();
         db.execute_statement("INSERT INTO _quack_terms VALUES ('c0', 'renewal', 1)")
@@ -1925,7 +2010,7 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
     let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
     assert_eq!(
         db.meta(MetaKey::SchemaVersion).unwrap().as_deref(),
-        Some("11")
+        Some("14")
     );
     let hits = db
         .search_keyword_chunks("8841", 3, &ChunkScope::all())
@@ -2021,7 +2106,7 @@ async fn ingest_markdown_stores_headings_and_pinned_flag() {
     );
 
     let doc = db.list_documents().unwrap().into_iter().next().unwrap();
-    assert!(!doc.pinned);
+    assert_eq!(doc.pinning, Pinning::Unpinned);
     db.set_document_pinning(&doc.id, Pinning::Pinned).unwrap();
     let pinned = db.pinned_documents().unwrap();
     assert_eq!(pinned.len(), 1);
@@ -2106,7 +2191,8 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
         .unwrap();
     assert_eq!(errored.status, DocumentStatus::Error);
     let retry =
-        ingestion::register_document(&db, &ingestion::NewFile::new("scan.pdf", bad)).unwrap();
+        ingestion::register_document(&db, &config, &ingestion::NewFile::new("scan.pdf", bad))
+            .unwrap();
     assert!(matches!(retry, ingestion::Registration::New(_)));
 }
 
@@ -2137,7 +2223,7 @@ async fn a_long_pdf_ingests_every_page_in_order() {
     .unwrap()
     .ingested()
     .unwrap();
-    assert_eq!(result.pages_skipped, 0);
+    assert_eq!(result.pages.and_then(PageCounts::note), None);
     assert!(result.chunks_stored > 0);
 
     let doc = db.document(&result.document_id).unwrap().unwrap();
@@ -2201,6 +2287,8 @@ fn piped_bytes_load_as_a_temporary_stdin_table() {
         Some(&serde_json::json!(2))
     );
 
+    // Closed first: Windows lets no second handle open the file (#448).
+    drop(db);
     let reopened = WorkspaceDb::open(&config, "ws-stdin").unwrap();
     assert!(
         !reopened
@@ -2585,6 +2673,312 @@ async fn office_and_html_documents_are_chunked_with_titles() {
 }
 
 #[tokio::test]
+async fn a_pdf_page_without_text_is_counted_on_the_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-pages").unwrap();
+    let writer = writer_of(&db);
+    // Three pages; the second carries no text, as a scanned image would.
+    let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Mixed");
+    pdf.letter_page().at(72.0, 720.0).text("First page").done();
+    pdf.letter_page().done();
+    pdf.letter_page().at(72.0, 720.0).text("Third page").done();
+    let bytes = pdf.build().unwrap();
+
+    let result = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-pages",
+        &ingestion::NewFile::new("mixed.pdf", &bytes),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    let counts = PageCounts {
+        total: 3,
+        unreadable: 0,
+        empty: 1,
+    };
+    assert_eq!(result.pages, Some(counts));
+    assert_eq!(
+        result.pages.and_then(PageCounts::note).as_deref(),
+        Some("1 of 3 pages without text")
+    );
+
+    let doc = db.document(&result.document_id).unwrap().unwrap();
+    assert_eq!(doc.status, DocumentStatus::Ready);
+    assert_eq!(doc.pages, Some(counts));
+    assert_eq!(
+        doc.pages.and_then(PageCounts::note).as_deref(),
+        Some("1 of 3 pages without text")
+    );
+
+    // A source without pages records none.
+    let text = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-pages",
+        &ingestion::NewFile::new("notes.md", b"# Notes\n\nNo pages here.\n"),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(text.pages, None);
+    let doc = db.document(&text.document_id).unwrap().unwrap();
+    assert_eq!(doc.pages, None);
+}
+
+/// An image is refused before it is registered when no vision model is
+/// set.
+#[tokio::test]
+async fn an_image_without_a_vision_model_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-images").unwrap();
+    let refused = ingestion::register_document(
+        &db,
+        &config,
+        &ingestion::NewFile::new("chart.png", b"\x89PNG\r\n\x1a\n"),
+    );
+    assert!(
+        matches!(refused, Err(Error::NoVisionModel(ref name)) if name == "chart.png"),
+        "{refused:?}"
+    );
+    assert!(
+        !db.list_all_documents()
+            .unwrap()
+            .iter()
+            .any(|d| d.filename == "chart.png")
+    );
+}
+
+/// An image the vision model could not read fails as a document and
+/// leaves no stored copy behind.
+#[tokio::test]
+async fn an_image_the_model_cannot_read_leaves_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config: Config = toml::from_str(
+        "[ingestion]\nvision_model = \"down/vision\"\n\
+         [providers.down]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\nmax_retries = 0\n",
+    )
+    .unwrap();
+    config.general.data_dir = dir.path().to_path_buf();
+    let db = WorkspaceDb::open(&config, "ws-unread").unwrap();
+    let writer = writer_of(&db);
+    let failed = Egress::scope(
+        Some(Egress::NoWorkspace),
+        ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-unread",
+            &ingestion::NewFile::new("chart.png", b"\x89PNG\r\n\x1a\n"),
+            None::<&Embedder<MockEmbeddingModel>>,
+        ),
+    )
+    .await;
+    assert!(failed.is_err());
+    let document = db
+        .list_all_documents()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.filename == "chart.png")
+        .unwrap();
+    assert_eq!(document.status, DocumentStatus::Error);
+    let files: Vec<String> = std::fs::read_dir(config.workspace_files_dir("ws-unread"))
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !files.iter().any(|f| f.starts_with(document.id.as_str())),
+        "{files:?}"
+    );
+}
+
+/// Deleting an image document removes the image it keeps.
+#[tokio::test]
+async fn deleting_an_image_document_removes_its_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-image").unwrap();
+    let id = DocumentId::from("img");
+    db.insert_document(
+        &NewDocument::new(&id, "chart.png", "image/png", 8).with_status(DocumentStatus::Ready),
+    )
+    .unwrap();
+    let document = db.document(&id).unwrap().unwrap();
+    let image = db.stored_image(&document).unwrap();
+    assert_eq!(
+        image.path(),
+        config.workspace_files_dir("ws-image").join("img.png")
+    );
+    std::fs::create_dir_all(image.path().parent().unwrap()).unwrap();
+    std::fs::write(image.path(), b"png").unwrap();
+    assert!(db.has_images().unwrap());
+
+    assert!(db.delete_document(&id).unwrap());
+    assert!(!image.path().exists());
+    assert!(!db.has_images().unwrap());
+}
+
+/// `tiny_xlsx` with one more sheet part of `megabytes` of spaces: a few
+/// kilobytes more on disk.
+fn padded_xlsx(megabytes: usize) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new_append(std::io::Cursor::new(tiny_xlsx())).unwrap();
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    writer
+        .start_file("xl/worksheets/sheet3.xml", options)
+        .unwrap();
+    writer
+        .write_all(" ".repeat(megabytes.saturating_mul(1024 * 1024)).as_bytes())
+        .unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+/// A Word or `PowerPoint` package of one part: a word, then `megabytes` of
+/// spaces.
+/// A DOCX or PPTX package (by `part`, its main content part) whose text is
+/// padded with `megabytes` of spaces, so it inflates far past its size.
+fn padded_package(part: &str, megabytes: usize) -> Vec<u8> {
+    use std::io::Write as _;
+    let padding = " ".repeat(megabytes.saturating_mul(1024 * 1024));
+    let docx = part.starts_with("word/");
+    let main = if docx {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">Padded{padding}</w:t></w:r></w:p></w:body></w:document>"#
+        )
+    } else {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Body"/><p:cNvSpPr/><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Padded{padding}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+        )
+    };
+    let (types, rels): (String, &str) = if docx {
+        (
+            String::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+            ),
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        )
+    } else {
+        (
+            String::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#,
+            ),
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#,
+        )
+    };
+    let mut parts: Vec<(&str, &str)> = vec![("[Content_Types].xml", &types), ("_rels/.rels", rels)];
+    if !docx {
+        parts.push((
+            "ppt/presentation.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst></p:presentation>"#,
+        ));
+        parts.push((
+            "ppt/_rels/presentation.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#,
+        ));
+    }
+    parts.push((part, &main));
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, content) in parts {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(content.as_bytes()).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+#[tokio::test]
+async fn a_file_that_inflates_past_the_limit_ends_in_error_and_a_normal_one_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config_no_provider(dir.path());
+    config.ingestion.max_decompressed_mb = 1;
+    let db = WorkspaceDb::open(&config, "ws-bomb").unwrap();
+    let writer = writer_of(&db);
+
+    let bombs = [
+        ("bomb.docx", padded_package("word/document.xml", 2)),
+        ("bomb.pptx", padded_package("ppt/slides/slide1.xml", 2)),
+        ("bomb.xlsx", padded_xlsx(2)),
+    ];
+    for (filename, bytes) in &bombs {
+        assert!(bytes.len() < 64 * 1024, "{filename}: {} bytes", bytes.len());
+        let err = ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-bomb",
+            &ingestion::NewFile::new(filename, bytes),
+            None::<&Embedder<MockEmbeddingModel>>,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(matches!(&err, Error::Ingestion(_)), "{filename}: {err}");
+        let doc = db
+            .list_documents()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.filename == *filename)
+            .unwrap();
+        assert_eq!(doc.status, DocumentStatus::Error, "{filename}");
+        let message = doc.error_message.unwrap();
+        assert!(
+            message.contains("more than [ingestion].max_decompressed_mb (1 MB)"),
+            "{filename}: {message}"
+        );
+    }
+    assert!(db.list_tables().unwrap().is_empty());
+
+    // Under the same limit, files that fit still load.
+    let normal = [
+        ("fits.docx", padded_package("word/document.xml", 0)),
+        ("fits.pptx", padded_package("ppt/slides/slide1.xml", 0)),
+        ("fits.xlsx", tiny_xlsx()),
+    ];
+    for (filename, bytes) in &normal {
+        let loaded = ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-bomb",
+            &ingestion::NewFile::new(filename, bytes),
+            None::<&Embedder<MockEmbeddingModel>>,
+        )
+        .await
+        .unwrap()
+        .ingested()
+        .unwrap();
+        assert!(
+            loaded.chunks_stored > 0 || !loaded.tables.is_empty(),
+            "{filename}"
+        );
+    }
+
+    // The padded workbook is a workbook: a limit above its size loads it.
+    config.ingestion.max_decompressed_mb = 4;
+    let loaded = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-bomb",
+        &ingestion::NewFile::new("padded.xlsx", &padded_xlsx(2)),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(loaded.tables.len(), 2);
+}
+
+#[tokio::test]
 async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config_no_provider(dir.path());
@@ -2609,11 +3003,8 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     }
     let url = format!("sqlite://{}", source_path.display());
     let request = ImportRequest {
-        url: url.clone().into(),
-        table: String::from("Orders Import"),
-        query: None,
         source_table: Some(String::from("orders")),
-        limit: None,
+        ..ImportRequest::new(url.clone(), String::from("Orders Import"))
     };
     let summary = import::Importing {
         config: &config,
@@ -2664,13 +3055,11 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
 
     // A query with a limit, into another table.
     let request = ImportRequest {
-        url: url.clone().into(),
-        table: String::from("big"),
         query: Some(String::from(
             "SELECT region, total * 2 AS doubled FROM orders ORDER BY id",
         )),
-        source_table: None,
         limit: Some(2),
+        ..ImportRequest::new(url.clone(), String::from("big"))
     };
     let summary = import::Importing {
         config: &config,
@@ -2698,16 +3087,20 @@ fn keyword_search_treats_null_as_a_word() {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c"),
-        document_id: &DocumentId::from("d"),
-        chunk_index: 0,
-        content: "The null hypothesis was rejected.",
-        heading: None,
-        page: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("d"), "The null hypothesis was rejected.")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c"),
+                chunk_index: 0,
+                content: "The null hypothesis was rejected.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
     assert_eq!(
         db.search_keyword_chunks("null", 5, &ChunkScope::all())
             .unwrap()
@@ -2735,16 +3128,20 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
             .with_status(DocumentStatus::Error),
     )
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c"),
-        document_id: &DocumentId::from("d"),
-        chunk_index: 0,
-        content: "zebra crossing",
-        heading: None,
-        page: None,
-        embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("d"), "zebra crossing")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c"),
+                chunk_index: 0,
+                content: "zebra crossing",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
+            })
+        })
+        .unwrap();
     assert!(
         db.search_keyword_chunks("zebra", 5, &ChunkScope::all())
             .unwrap()
@@ -2893,9 +3290,12 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
 
     // A queued row from a process that died is failed when the server
     // opens the workspace.
-    let registration =
-        ingestion::register_document(&db, &ingestion::NewFile::new("later.csv", b"a\n1\n"))
-            .unwrap();
+    let registration = ingestion::register_document(
+        &db,
+        &config,
+        &ingestion::NewFile::new("later.csv", b"a\n1\n"),
+    )
+    .unwrap();
     let ingestion::Registration::New(queued) = registration else {
         return assert!(matches!(registration, ingestion::Registration::New(_)));
     };
@@ -2922,11 +3322,11 @@ async fn server_policy_refuses_local_sqlite_files() {
         db: &writer,
         workspace_id: "ws-import-policy",
         request: &ImportRequest {
-            url: format!("sqlite://{}", dir.path().join("control.db").display()).into(),
-            table: String::from("x"),
-            query: None,
             source_table: Some(String::from("users")),
-            limit: None,
+            ..ImportRequest::new(
+                format!("sqlite://{}", dir.path().join("control.db").display()),
+                String::from("x"),
+            )
         },
         policy: server_policy,
         embedder: None::<&Embedder<MockEmbeddingModel>>,
@@ -2959,11 +3359,8 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
     }
     let url = format!("sqlite://{}", source_path.display());
     let first = ImportRequest {
-        url: url.clone().into(),
-        table: String::from("Orders Import"),
-        query: None,
         source_table: Some(String::from("orders")),
-        limit: None,
+        ..ImportRequest::new(url.clone(), String::from("Orders Import"))
     };
     let summary = import::Importing {
         config: &config,
@@ -2983,13 +3380,7 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         config: &config,
         db: &writer,
         workspace_id: "ws-import-errors",
-        request: &ImportRequest {
-            url: url.clone().into(),
-            table: String::from("Orders Import"),
-            query: None,
-            source_table: Some(String::from("orders")),
-            limit: None,
-        },
+        request: &first,
         policy: ImportPolicy::owner(),
         embedder: None::<&Embedder<MockEmbeddingModel>>,
         control: RunControl::unobserved(),
@@ -3002,11 +3393,8 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         db: &writer,
         workspace_id: "ws-import-errors",
         request: &ImportRequest {
-            url: url.into(),
-            table: String::from("x"),
             query: Some(String::from("SELECT * FROM nope")),
-            source_table: None,
-            limit: None,
+            ..ImportRequest::new(url, String::from("x"))
         },
         policy: ImportPolicy::owner(),
         embedder: None::<&Embedder<MockEmbeddingModel>>,
@@ -3020,11 +3408,8 @@ async fn sqlite_import_errors_are_specific_and_duplicates_are_refused() {
         db: &writer,
         workspace_id: "ws-import-errors",
         request: &ImportRequest {
-            url: String::from("mysql://h/db").into(),
-            table: String::from("x"),
-            query: None,
             source_table: Some(String::from("t")),
-            limit: None,
+            ..ImportRequest::new(String::from("mysql://h/db"), String::from("x"))
         },
         policy: ImportPolicy::owner(),
         embedder: None::<&Embedder<MockEmbeddingModel>>,
@@ -3127,4 +3512,866 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
     )
     .await;
     assert!(matches!(outcome, Err(Error::Cancelled)));
+}
+
+/// Write `text` at `path` under `root`, making the directories.
+fn write_under(root: &Path, path: &str, text: &str) {
+    let path = root.join(path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// A folder run over `root` into `ws-folder` without an embedding model.
+async fn folder_run(config: &Config, writer: &Writer, root: &Path, prune: Prune) -> FolderReport {
+    Folder {
+        config,
+        db: writer,
+        workspace_id: "ws-folder",
+        root,
+        embedder: None::<&Embedder<MockEmbeddingModel>>,
+        control: RunControl::unobserved(),
+        prune,
+    }
+    .run()
+    .await
+    .unwrap()
+}
+
+/// Each result as its path and the kind of its outcome.
+fn outcome_kinds(report: &FolderReport) -> Vec<(String, &'static str)> {
+    report
+        .results
+        .iter()
+        .map(|r| {
+            let kind = match r.outcome {
+                Outcome::Ingested(_) => "ingested",
+                Outcome::Replaced { .. } => "replaced",
+                Outcome::Skipped(_) => "skipped",
+                Outcome::Moved { .. } => "moved",
+                Outcome::Failed(_) => "failed",
+            };
+            (r.relative.clone(), kind)
+        })
+        .collect()
+}
+
+/// A file moved within the folder is followed to its new path, so
+/// `--prune` never deletes the only document of content that is still
+/// there; content that moved into a new path while its old path changed is
+/// ingested, not skipped; and symbolic links are not followed.
+#[tokio::test]
+async fn a_moved_file_is_followed_and_never_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-folder").unwrap();
+    let writer = writer_of(&db);
+    let root = dir.path().join("notes");
+    write_under(&root, "a.md", "Alpha content.");
+    write_under(&root, "b.md", "Bravo content.");
+    folder_run(&config, &writer, &root, Prune::Keep).await;
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let root_text = canonical.to_string_lossy();
+    let alpha = db
+        .newest_document_at_path(&root_text, "a.md")
+        .unwrap()
+        .unwrap();
+
+    // a.md moves to sub/c.md.
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::rename(root.join("a.md"), root.join("sub/c.md")).unwrap();
+    let moved = folder_run(&config, &writer, &root, Prune::Delete).await;
+    assert_eq!(
+        outcome_kinds(&moved),
+        [
+            (String::from("b.md"), "skipped"),
+            (String::from("sub/c.md"), "moved"),
+        ]
+    );
+    assert!(moved.gone.is_empty(), "{:?}", moved.gone);
+    let at_new = db
+        .newest_document_at_path(&root_text, "sub/c.md")
+        .unwrap()
+        .unwrap();
+    assert_eq!(at_new.id, alpha.id);
+    assert!(
+        db.newest_document_at_path(&root_text, "a.md")
+            .unwrap()
+            .is_none()
+    );
+
+    // b.md's old content moves to a.md, which sorts first, while b.md
+    // changes: b.md replaces its document first, so a.md is new content.
+    write_under(&root, "a.md", "Bravo content.");
+    write_under(&root, "b.md", "Bravo, revised.");
+    let swapped = folder_run(&config, &writer, &root, Prune::Delete).await;
+    assert_eq!(
+        outcome_kinds(&swapped),
+        [
+            (String::from("a.md"), "ingested"),
+            (String::from("b.md"), "replaced"),
+            (String::from("sub/c.md"), "skipped"),
+        ]
+    );
+    let live: Vec<String> = db
+        .list_documents()
+        .unwrap()
+        .into_iter()
+        .filter_map(|d| d.source_path)
+        .collect();
+    assert_eq!(live.len(), 3, "{live:?}");
+
+    // A link to a directory above the folder is not walked.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.path(), root.join("up")).unwrap();
+        let linked = folder_run(&config, &writer, &root, Prune::Keep).await;
+        assert!(
+            linked
+                .results
+                .iter()
+                .all(|r| !r.relative.starts_with("up/")),
+            "{:?}",
+            outcome_kinds(&linked)
+        );
+    }
+}
+
+/// A folder run ingests every supported file with its path, lists the
+/// rest, counts a file that fails as one outcome among the others, and
+/// skips every unchanged file on the next run.
+#[tokio::test]
+async fn a_folder_run_ingests_supported_files_and_skips_them_next_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-folder").unwrap();
+    let writer = writer_of(&db);
+    let root = dir.path().join("contracts");
+    write_under(&root, "policy.md", "Flood is excluded.");
+    write_under(&root, "rates/sales.csv", "region,total\nnorth,1\n");
+    write_under(&root, "notes.xyz", "?");
+    write_under(&root, "broken.csv", "a,b\n1,2,3,4\n\"unterminated,5\n6\n");
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let root_text = canonical.to_string_lossy();
+
+    let first = folder_run(&config, &writer, &root, Prune::Keep).await;
+    assert_eq!(
+        outcome_kinds(&first),
+        [
+            (String::from("broken.csv"), "failed"),
+            (String::from("policy.md"), "ingested"),
+            (String::from("rates/sales.csv"), "ingested"),
+        ]
+    );
+    assert_eq!(first.unsupported, ["notes.xyz"]);
+    assert!(first.gone.is_empty());
+    assert_eq!(first.failed(), 1);
+    let policy = db
+        .newest_document_at_path(&root_text, "policy.md")
+        .unwrap()
+        .unwrap();
+    assert_eq!(policy.source_path.as_deref(), Some("policy.md"));
+    assert_eq!(policy.source_root.as_deref(), Some(root_text.as_ref()));
+    assert_eq!(policy.filename, "policy.md");
+    assert_eq!(
+        db.newest_document_at_path(&root_text, "rates/sales.csv")
+            .unwrap()
+            .unwrap()
+            .tables,
+        Some(vec![String::from("sales")])
+    );
+    assert!(
+        db.newest_document_at_path(&root_text, "broken.csv")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.newest_document_at_path("/elsewhere", "policy.md")
+            .unwrap()
+            .is_none()
+    );
+
+    let again = folder_run(&config, &writer, &root, Prune::Keep).await;
+    assert_eq!(
+        outcome_kinds(&again),
+        [
+            (String::from("broken.csv"), "failed"),
+            (String::from("policy.md"), "skipped"),
+            (String::from("rates/sales.csv"), "skipped"),
+        ]
+    );
+}
+
+/// On a later run a changed file replaces the document at its path, and
+/// a document whose file is gone is reported and kept, or deleted with
+/// its table when pruning.
+#[tokio::test]
+async fn a_folder_rerun_replaces_changed_files_and_reports_or_prunes_gone_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-folder").unwrap();
+    let writer = writer_of(&db);
+    let root = dir.path().join("contracts");
+    write_under(&root, "policy.md", "Flood is excluded.");
+    write_under(&root, "rates/sales.csv", "region,total\nnorth,1\n");
+    folder_run(&config, &writer, &root, Prune::Keep).await;
+    let canonical = std::fs::canonicalize(&root).unwrap();
+    let root_text = canonical.to_string_lossy();
+    let policy = db
+        .newest_document_at_path(&root_text, "policy.md")
+        .unwrap()
+        .unwrap();
+
+    write_under(&root, "policy.md", "Flood is covered.");
+    std::fs::remove_file(root.join("rates/sales.csv")).unwrap();
+    let changed = folder_run(&config, &writer, &root, Prune::Keep).await;
+    let replaced = changed
+        .results
+        .iter()
+        .find(|r| r.relative == "policy.md")
+        .unwrap();
+    assert!(
+        matches!(&replaced.outcome, Outcome::Replaced { old, .. } if *old == policy.id),
+        "{replaced:?}"
+    );
+    assert_eq!(
+        db.document(&policy.id).unwrap().unwrap().status,
+        DocumentStatus::Superseded
+    );
+    let successor = db
+        .newest_document_at_path(&root_text, "policy.md")
+        .unwrap()
+        .unwrap();
+    assert_ne!(successor.id, policy.id);
+    assert_eq!(
+        changed
+            .gone
+            .iter()
+            .map(|d| d.source_path.clone())
+            .collect::<Vec<_>>(),
+        [Some(String::from("rates/sales.csv"))]
+    );
+    assert_eq!(changed.pruned, Prune::Keep);
+    assert!(db.list_tables().unwrap().contains(&String::from("sales")));
+
+    let pruned = folder_run(&config, &writer, &root, Prune::Delete).await;
+    assert_eq!(pruned.gone.len(), 1);
+    assert_eq!(pruned.pruned, Prune::Delete);
+    assert!(
+        db.newest_document_at_path(&root_text, "rates/sales.csv")
+            .unwrap()
+            .is_none()
+    );
+    assert!(!db.list_tables().unwrap().contains(&String::from("sales")));
+    assert!(
+        folder_run(&config, &writer, &root, Prune::Keep)
+            .await
+            .gone
+            .is_empty()
+    );
+}
+
+/// Two folders fed into one workspace keep to themselves: the same
+/// relative path under each is its own document, a run of one folder
+/// never reports or prunes the other's documents, and a change replaces
+/// only within its root.
+#[tokio::test]
+async fn folders_sharing_a_relative_path_are_separate_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-folder").unwrap();
+    let writer = writer_of(&db);
+    let (east, west) = (dir.path().join("east"), dir.path().join("west"));
+    write_under(&east, "policy.md", "East: flood is excluded.");
+    write_under(&east, "only-east.md", "East only.");
+    write_under(&west, "policy.md", "West: flood is covered.");
+    let east_run = folder_run(&config, &writer, &east, Prune::Keep).await;
+    let west_run = folder_run(&config, &writer, &west, Prune::Keep).await;
+    assert_eq!(
+        outcome_kinds(&east_run),
+        [
+            (String::from("only-east.md"), "ingested"),
+            (String::from("policy.md"), "ingested"),
+        ]
+    );
+    assert_eq!(
+        outcome_kinds(&west_run),
+        [(String::from("policy.md"), "ingested")]
+    );
+    assert!(east_run.gone.is_empty() && west_run.gone.is_empty());
+    let root_of = |path: &Path| -> String {
+        std::fs::canonicalize(path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let (east_root, west_root) = (root_of(&east), root_of(&west));
+    let east_policy = db
+        .newest_document_at_path(&east_root, "policy.md")
+        .unwrap()
+        .unwrap();
+    let west_policy = db
+        .newest_document_at_path(&west_root, "policy.md")
+        .unwrap()
+        .unwrap();
+    assert_ne!(east_policy.id, west_policy.id);
+    assert_eq!(db.documents_under(&east_root).unwrap().len(), 2);
+    assert_eq!(db.documents_under(&west_root).unwrap().len(), 1);
+
+    // A change in west replaces west's copy only, and a pruning run of
+    // west touches nothing of east's.
+    write_under(&west, "policy.md", "West: flood is now excluded.");
+    let west_again = folder_run(&config, &writer, &west, Prune::Delete).await;
+    assert!(
+        matches!(
+            west_again.results.first().map(|r| &r.outcome),
+            Some(Outcome::Replaced { old, .. }) if *old == west_policy.id
+        ),
+        "{west_again:?}"
+    );
+    assert!(west_again.gone.is_empty());
+    assert_eq!(
+        db.document(&east_policy.id).unwrap().unwrap().status,
+        DocumentStatus::Ready
+    );
+    assert_eq!(db.documents_under(&east_root).unwrap().len(), 2);
+
+    // Removing east's extra file and pruning east deletes that one alone.
+    std::fs::remove_file(east.join("only-east.md")).unwrap();
+    let east_pruned = folder_run(&config, &writer, &east, Prune::Delete).await;
+    assert_eq!(
+        east_pruned
+            .gone
+            .iter()
+            .map(|d| d.source_path.clone())
+            .collect::<Vec<_>>(),
+        [Some(String::from("only-east.md"))]
+    );
+    assert_eq!(db.documents_under(&east_root).unwrap().len(), 1);
+    assert_eq!(db.documents_under(&west_root).unwrap().len(), 1);
+    assert_eq!(db.list_documents().unwrap().len(), 2);
+}
+
+/// `ingest_file` into `ws-replace` without an embedding model, for the
+/// replacement tests.
+async fn ingest(
+    config: &Config,
+    writer: &Writer,
+    file: ingestion::NewFile<'_>,
+) -> Result<ingestion::IngestOutcome, Error> {
+    ingestion::ingest_file(
+        config,
+        writer,
+        "ws-replace",
+        &file,
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+}
+
+/// A changed file replaces its predecessor: the old document is
+/// `superseded` once the new one is ready, leaves search, the listing,
+/// and the prompt, keeps its chunks for earlier citations, and hands its
+/// pin on. Identical bytes are still a duplicate, and a document that is
+/// not ready, or missing, is refused.
+#[tokio::test]
+async fn a_changed_file_replaces_its_predecessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let ingested = |outcome: ingestion::IngestOutcome| outcome.ingested().unwrap();
+
+    let first = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("policy.md", b"Flood is excluded."),
+        )
+        .await
+        .unwrap(),
+    );
+    db.set_document_pinning(&first.document_id, Pinning::Pinned)
+        .unwrap();
+    let second = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("policy.md", b"Flood is covered.")
+                .replaces(Some(&first.document_id)),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(second.replaced.as_ref(), Some(&first.document_id));
+    let old = db.document(&first.document_id).unwrap().unwrap();
+    assert_eq!(old.status, DocumentStatus::Superseded);
+    assert_eq!(old.superseded_by.as_ref(), Some(&second.document_id));
+    let new = db.document(&second.document_id).unwrap().unwrap();
+    assert_eq!(
+        (new.status, new.pinning),
+        (DocumentStatus::Ready, Pinning::Pinned)
+    );
+    assert_eq!(
+        db.list_documents()
+            .unwrap()
+            .iter()
+            .map(|d| &d.id)
+            .collect::<Vec<_>>(),
+        [&second.document_id]
+    );
+    assert_eq!(db.list_all_documents().unwrap().len(), 2);
+    assert_eq!(db.recent_documents(10).unwrap().1, 1);
+    assert_eq!(
+        db.document_chunks(&first.document_id, 0, 10).unwrap().len(),
+        1
+    );
+    let hits = db
+        .search_keyword_chunks("flood", 5, &ChunkScope::all())
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| &h.document_id).collect::<Vec<_>>(),
+        [&second.document_id]
+    );
+    assert_eq!(db.pinned_documents().unwrap().len(), 1);
+
+    // Identical bytes are a duplicate even as a replacement; a replaced
+    // document, or a missing one, cannot be replaced.
+    let same = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("policy.md", b"Flood is covered.")
+            .replaces(Some(&first.document_id)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(same, ingestion::IngestOutcome::Duplicate(d) if d.id == second.document_id));
+    let stale = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("policy.md", b"Flood is excluded again.")
+            .replaces(Some(&first.document_id)),
+    )
+    .await;
+    assert!(
+        matches!(&stale, Err(Error::Ingestion(m)) if m.contains("it is superseded, not ready")),
+        "{stale:?}"
+    );
+    let missing = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("policy.md", b"Flood is excluded again.")
+            .replaces(Some(&DocumentId::from("nope"))),
+    )
+    .await;
+    assert!(
+        matches!(missing, Err(Error::NotFound { .. })),
+        "{missing:?}"
+    );
+    assert_eq!(
+        db.list_all_documents().unwrap().len(),
+        2,
+        "nothing registered"
+    );
+}
+
+/// A table file takes over its predecessor's table; a failed replacement
+/// leaves the document and its table as they were; a second replacement
+/// of a document whose first is on its way is refused; deleting a
+/// replaced table document leaves the table to its successor.
+#[tokio::test]
+async fn a_table_replacement_swaps_the_table_and_a_failed_one_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let ingested = |outcome: ingestion::IngestOutcome| outcome.ingested().unwrap();
+
+    let sales = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("sales.csv", b"region,total\nnorth,1\n"),
+        )
+        .await
+        .unwrap(),
+    );
+    let sales2 = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("sales.csv", b"region,total\nnorth,1\nsouth,2\n")
+                .replaces(Some(&sales.document_id)),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(sales2.tables, vec![String::from("sales")]);
+    let rows = || -> i64 {
+        db.connection()
+            .query_row("SELECT count(*) FROM sales", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(rows(), 2);
+    assert_eq!(
+        db.table_owner("sales").unwrap().map(|d| d.id),
+        Some(sales2.document_id.clone())
+    );
+    assert_eq!(
+        db.document(&sales.document_id).unwrap().unwrap().status,
+        DocumentStatus::Superseded
+    );
+
+    // A failed replacement leaves the document and its table as they were.
+    let broken = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("sales.csv", b"a,b\n1,2,3,4\n\"unterminated,5\n6\n")
+            .replaces(Some(&sales2.document_id)),
+    )
+    .await;
+    assert!(matches!(broken, Err(Error::Ingestion(_))), "{broken:?}");
+    let kept = db.document(&sales2.document_id).unwrap().unwrap();
+    assert_eq!(
+        (kept.status, kept.superseded_by),
+        (DocumentStatus::Ready, None)
+    );
+    assert_eq!(rows(), 2);
+    let failed = db
+        .list_all_documents()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.status == DocumentStatus::Error)
+        .unwrap();
+    assert_eq!(failed.superseded_by, None);
+
+    // While one replacement is on its way, a second is refused.
+    let pending = ingestion::register_document(
+        &db,
+        &config,
+        &ingestion::NewFile::new("sales.csv", b"region,total\nnorth,3\n")
+            .replaces(Some(&sales2.document_id)),
+    )
+    .unwrap();
+    assert!(matches!(pending, ingestion::Registration::New(_)));
+    let twice = ingestion::register_document(
+        &db,
+        &config,
+        &ingestion::NewFile::new("sales.csv", b"region,total\nnorth,4\n")
+            .replaces(Some(&sales2.document_id)),
+    );
+    assert!(
+        matches!(&twice, Err(Error::Ingestion(m)) if m.contains("already being processed")),
+        "{twice:?}"
+    );
+
+    // Deleting a replaced table document leaves the table to its successor.
+    assert!(db.delete_document(&sales.document_id).unwrap());
+    assert_eq!(rows(), 2);
+    assert!(db.list_tables().unwrap().contains(&String::from("sales")));
+}
+
+/// Captions and source code are chunked with locators that reach the
+/// stored chunk, the search hit, and the citation label.
+#[tokio::test]
+async fn captions_and_code_cite_their_locators() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-locators").unwrap();
+    let writer = writer_of(&db);
+    let vtt = "WEBVTT\n\n00:12:04.000 --> 00:12:06.000\nThe renewal grace period is thirty days.\n\n00:30:00.000 --> 00:30:02.000\nUnrelated closing remarks.\n";
+    let code: String = (1..=80)
+        .map(|i| format!("fn step_{i}() {{ let renewal_period = {i}; }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (name, data) in [
+        ("meeting.vtt", vtt.as_bytes()),
+        ("main.rs", code.as_bytes()),
+    ] {
+        ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-locators",
+            &ingestion::NewFile::new(name, data),
+            None::<&Embedder<MockEmbeddingModel>>,
+        )
+        .await
+        .unwrap()
+        .ingested()
+        .unwrap();
+    }
+    let rows = db
+        .execute_query(
+            "SELECT d.filename, c.kind, c.locator FROM _quack_chunks c \
+             JOIN _quack_documents d ON d.id = c.document_id ORDER BY d.filename, c.chunk_index",
+        )
+        .unwrap();
+    let placed: Vec<(String, String, String)> = rows
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r.first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                r.get(1)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                r.get(2)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        placed
+            .iter()
+            .any(|(f, k, l)| f == "meeting.vtt" && k == "body" && l == "12:04"),
+        "{placed:?}"
+    );
+    assert!(
+        placed
+            .iter()
+            .any(|(f, _, l)| f == "meeting.vtt" && l == "30:00"),
+        "{placed:?}"
+    );
+    let code_chunks: Vec<&(String, String, String)> =
+        placed.iter().filter(|(f, _, _)| f == "main.rs").collect();
+    assert!(code_chunks.len() > 1, "{placed:?}");
+    assert!(code_chunks.iter().all(|(_, k, _)| k == "code"));
+    assert_eq!(
+        code_chunks.first().map(|(_, _, l)| l.as_str()),
+        Some("line 1")
+    );
+    assert!(
+        code_chunks
+            .iter()
+            .skip(1)
+            .all(|(_, _, l)| l.starts_with("line ") && l != "line 1")
+    );
+
+    let hits = db
+        .search_keyword_chunks("grace period", 5, &ChunkScope::all())
+        .unwrap();
+    let hit = hits.first().unwrap();
+    assert_eq!(hit.locator.as_deref(), Some("12:04"));
+    let label = Citation::new(1, hit).label();
+    assert!(
+        label.starts_with("meeting.vtt, 12:04, ingested "),
+        "{label}"
+    );
+}
+
+/// A Markdown file's front matter lands on the document row, a table big
+/// enough becomes a table of the workspace owned by the document, the
+/// uploader's own fields win, and a person's edits replace them.
+#[tokio::test]
+async fn front_matter_tables_and_edits_land_on_the_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config_no_provider(dir.path());
+    config.ingestion.table_rows_as_table = 2;
+    let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
+    let writer = writer_of(&db);
+    let md = "---\ntitle: Limits\nauthor: Ada\ndate: 2026-01-05\ntags: [policy, limits]\nowner: claims\n---\n\n# Limits\n\n| Peril | Limit |\n|---|---|\n| Fire | 1000 |\n| Flood | 0 |\n| Wind | 250 |\n\nAfter the table.\n";
+    let result = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-meta",
+        &ingestion::NewFile::new("notes.md", md.as_bytes()),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(result.tables, ["notes_table1"]);
+    let count = db
+        .execute_query("SELECT count(*) FROM notes_table1 WHERE \"Limit\" > 0")
+        .unwrap();
+    assert_eq!(
+        count
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(serde_json::Value::as_i64),
+        Some(2)
+    );
+    let doc = db.document(&result.document_id).unwrap().unwrap();
+    assert_eq!(doc.title.as_deref(), Some("Limits"));
+    assert_eq!(doc.author.as_deref(), Some("Ada"));
+    assert_eq!(doc.authored_at.as_deref(), Some("2026-01-05 00:00:00"));
+    assert_eq!(doc.tags, ["policy", "limits"]);
+    assert_eq!(
+        doc.metadata.get("owner").map(String::as_str),
+        Some("claims")
+    );
+    assert_eq!(
+        doc.tables.as_deref(),
+        Some(&[String::from("notes_table1")][..])
+    );
+    let kinds = db
+        .execute_query("SELECT kind FROM _quack_chunks ORDER BY chunk_index")
+        .unwrap();
+    let kinds: Vec<&str> = kinds
+        .rows
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(kinds, ["table", "body"]);
+}
+
+/// The uploader's fields win over the file's own, and a person's edits
+/// replace them: an empty text clears, a bad date is refused, a missing
+/// document is not found.
+#[tokio::test]
+async fn the_uploaders_fields_win_and_a_person_edits_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-meta-edits").unwrap();
+    let writer = writer_of(&db);
+    let second = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-meta-edits",
+        &ingestion::NewFile::new("again.md", b"---\nauthor: Ada\n---\n\ntext\n").fields(
+            DocumentFields {
+                author: Some(String::from("Grace")),
+                tags: Some(vec![String::from("given")]),
+                ..DocumentFields::default()
+            },
+        ),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    let doc = db.document(&second.document_id).unwrap().unwrap();
+    assert_eq!(doc.author.as_deref(), Some("Grace"));
+    assert_eq!(doc.tags, ["given"]);
+    db.set_document_fields(
+        &second.document_id,
+        &DocumentFields {
+            title: Some(String::from("Edited")),
+            author: Some(String::new()),
+            authored_at: Some(String::from("2026-02-01")),
+            tags: Some(vec![String::from(" one "), String::new()]),
+        },
+    )
+    .unwrap();
+    let doc = db.document(&second.document_id).unwrap().unwrap();
+    assert_eq!(doc.title.as_deref(), Some("Edited"));
+    assert_eq!(doc.author, None);
+    assert_eq!(doc.authored_at.as_deref(), Some("2026-02-01 00:00:00"));
+    assert_eq!(doc.tags, ["one"]);
+    let bad = db
+        .set_document_fields(
+            &second.document_id,
+            &DocumentFields {
+                authored_at: Some(String::from("yesterday")),
+                ..DocumentFields::default()
+            },
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(bad.contains("is not a date"), "{bad}");
+    assert!(
+        db.set_document_fields(&DocumentId::from("absent"), &DocumentFields::default())
+            .is_err()
+    );
+}
+
+/// A loaded table is profiled at once; `--types` retypes its columns
+/// strictly, and a reserved name is refused before anything loads.
+#[tokio::test]
+async fn a_loaded_table_is_profiled_retyped_and_reserved_names_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let csv = b"id,amount,placed\n1,100,2026-01-02\n2,250,2026-01-03\n";
+
+    ingest(&config, &writer, ingestion::NewFile::new("orders.csv", csv))
+        .await
+        .unwrap();
+    let profile = TableProfile::current(&db, "orders", 2).unwrap().unwrap();
+    assert_eq!(profile.column("amount").unwrap().distinct, 2);
+
+    let typed = b"code,amount,placed\nA,100,2026-01-02\nB,250,2026-01-03\n";
+    ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("typed.csv", typed)
+            .types("amount=DOUBLE,placed=VARCHAR".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+    let columns = db.describe_columns("typed").unwrap();
+    let kind = |name: &str| {
+        columns
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.column_type.clone())
+    };
+    assert_eq!(kind("amount").as_deref(), Some("DOUBLE"));
+    assert_eq!(kind("placed").as_deref(), Some("VARCHAR"));
+    assert_eq!(
+        TableProfile::current(&db, "typed", 2)
+            .unwrap()
+            .unwrap()
+            .column("amount")
+            .unwrap()
+            .duckdb_type,
+        "DOUBLE"
+    );
+
+    let wrong = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("wrong.csv", b"code\nA\n").types("code=BIGINT".parse().unwrap()),
+    )
+    .await;
+    assert!(wrong.is_err_and(|e| e.to_string().contains("does not convert")));
+    let missing = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::new("missing.csv", b"code\nA\n").types("ghost=BIGINT".parse().unwrap()),
+    )
+    .await;
+    assert!(missing.is_err_and(|e| e.to_string().contains("'ghost'")));
+
+    for name in ["graph_vendors.csv", "_quack_meta.csv"] {
+        let refused = ingest(&config, &writer, ingestion::NewFile::new(name, b"a\n1\n")).await;
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("reserves")),
+            "{name}"
+        );
+    }
+    assert!(
+        !db.list_tables()
+            .unwrap()
+            .iter()
+            .any(|t| t.starts_with("graph_v"))
+    );
+}
+
+/// A workspace from before profiles gets every table profiled on open.
+#[test]
+fn an_older_workspace_is_profiled_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    {
+        let db = WorkspaceDb::open(&config, "ws-old").unwrap();
+        db.execute_statement("CREATE TABLE t AS SELECT range AS n FROM range(4)")
+            .unwrap();
+        db.execute_statement("DELETE FROM _quack_table_profiles")
+            .unwrap();
+        db.execute_statement("UPDATE _quack_meta SET value = '11' WHERE key = 'schema_version'")
+            .unwrap();
+    }
+    let db = WorkspaceDb::open(&config, "ws-old").unwrap();
+    assert!(TableProfile::current(&db, "t", 4).unwrap().is_some());
 }

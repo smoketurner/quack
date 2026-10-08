@@ -7,19 +7,28 @@
   <tbody>
   {% for d in documents %}
   <tr id="doc-{{ d.id }}" class="border-b border-slate-800">
-    <td class="font-medium wrap-anywhere">{{ d.filename }}{% if let Some(title) = d.title %} <span class="font-normal text-slate-400">{{ title }}</span>{% endif %}{% if d.pinned %} <span class="rounded bg-amber-900 px-1.5 py-0.5 text-xs text-amber-200">pinned</span>{% endif %}</td>
+    <td class="font-medium wrap-anywhere">{{ d.filename }}{% if let Some(title) = d.title %} <span class="font-normal text-slate-400">{{ title }}</span>{% endif %}{% if d.pinning == Pinning::Pinned %} <span class="rounded bg-amber-900 px-1.5 py-0.5 text-xs text-amber-200">pinned</span>{% endif %}
+      {% if d.author.is_some() || d.authored_at.is_some() || !d.tags.is_empty() %}<div class="mt-0.5 text-xs font-normal text-slate-400">{% if let Some(author) = d.author %}{{ author }}{% endif %}{% if let Some(at) = d.authored_at %}{% if d.author.is_some() %}, {% endif %}{{ at }}{% endif %}{% for tag in d.tags %} <span class="rounded bg-slate-800 px-1.5 py-0.5">{{ tag }}</span>{% endfor %}</div>{% endif %}</td>
     <td class="whitespace-nowrap text-slate-400">{{ d.source }}</td>
-    <td class="wrap-anywhere"><span id="status-{{ d.id }}">{% include "document_status.html" %}</span></td>
+    <td class="wrap-anywhere"><span id="status-{{ d.id }}">{% include "document_status.html" %}</span>{% if let Some(by) = d.superseded_by %} <a class="text-slate-400 hover:underline" href="#doc-{{ by }}">{% if d.status == DocumentStatus::Superseded %}replaced by{% else %}being replaced by{% endif %} {{ by }}</a>{% endif %}</td>
     <td class="whitespace-nowrap text-right tabular-nums">{{ d.size_bytes.unwrap_or(0) }}</td>
     <td class="whitespace-nowrap text-slate-400">{{ When::Relative.html(d.ingested_at.as_str())|safe }}</td>
     <td class="whitespace-nowrap text-right">
       {% if can_write %}
-      {% if d.pinned %}
+      {% if d.pinning == Pinning::Pinned %}
       <button class="text-blue-400 hover:underline" hx-post="/w/{{ ws_id }}/documents/{{ d.id }}/unpin" hx-target="#rows" hx-swap="innerHTML">Unpin</button>
       {% else %}
       <button class="text-blue-400 hover:underline" hx-post="/w/{{ ws_id }}/documents/{{ d.id }}/pin" hx-target="#rows" hx-swap="innerHTML">Pin</button>
       {% endif %}
       <button class="ml-3 text-red-400 hover:underline" hx-post="/w/{{ ws_id }}/documents/{{ d.id }}/delete" hx-confirm="Delete {{ d.filename }}?" hx-target="#rows" hx-swap="innerHTML">Delete</button>
+      {% if d.status == DocumentStatus::Ready && d.superseded_by.is_none() %}
+      <details class="mt-1 text-left"><summary class="cursor-pointer text-blue-400 hover:underline">Replace</summary>
+        <form method="post" action="/w/{{ ws_id }}/documents/{{ d.id }}/replace" enctype="multipart/form-data" class="mt-1 flex flex-wrap items-center gap-2">
+          <input type="file" name="file" required aria-label="Replacement for {{ d.filename }}" class="block max-w-full cursor-pointer text-xs text-slate-400 file:mr-2 file:cursor-pointer file:rounded file:border file:border-slate-600 file:bg-slate-800 file:px-2 file:py-1 file:text-xs file:text-slate-100 hover:file:bg-slate-700">
+          <button type="submit" class="rounded bg-blue-600 px-2 py-1 text-xs text-white hover:bg-blue-500">Upload replacement</button>
+        </form>
+      </details>
+      {% endif %}
       {% endif %}
     </td>
   </tr>

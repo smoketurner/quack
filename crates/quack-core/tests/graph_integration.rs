@@ -6,20 +6,28 @@
 
 use std::collections::BTreeMap;
 
+use quack_core::analysis::table_search;
+use quack_core::config::{Config, FollowIngest, GraphConfig};
 use quack_core::embedding::{Dimension, Embedder, EmbeddingModel, Input, Profile, Prompts, Vector};
 use quack_core::error::Error;
 use quack_core::extraction::{Extract, ExtractFuture, ExtractionRun};
 use quack_core::graph::extract::{ChunkPlan, Extraction};
+use quack_core::graph::follow_up::FollowUp;
 use quack_core::graph::resolve::MergeDecision;
-use quack_core::graph::store::NewNode;
+use quack_core::graph::store::{Assertion, NewEdge, NewNode, NodeEdit, Revalidation};
 use quack_core::graph::traverse::Hops;
 use quack_core::graph::{
-    GraphOptions, GraphResult, Node, Origin, Properties, Standing, extract, resolve,
-    store as graph_store, tables, traverse,
+    GraphResult, Node, Origin, Properties, Standing, extract, resolve, store as graph_store,
+    tables, traverse,
 };
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
+use quack_core::ingestion::parser::SectionKind;
+use quack_core::ontology::candidates::{self, Queue};
+use quack_core::ontology::induction::{Candidate, ItemKind, Proposal};
 use quack_core::ontology::store::Revision;
-use quack_core::ontology::{self, Class, Mapping, MappingRelation, Ontology, Relation, store};
+use quack_core::ontology::{
+    self, Class, IdRenames, Mapping, MappingRelation, Ontology, OntologyVersion, Relation, store,
+};
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::{
     DocumentStatus, NewChunk, NewDocument, SamplePool, WorkspaceDb,
@@ -113,24 +121,21 @@ fn ontology() -> Ontology {
             relation("delivered_to", "shipment", "country"),
         ],
         properties: vec![
-            ontology::Property {
-                id: String::from("name"),
-                label: None,
-                kind: ontology::PropertyType::String,
-                values: Vec::new(),
-            },
-            ontology::Property {
-                id: String::from("po"),
-                label: None,
-                kind: ontology::PropertyType::String,
-                values: Vec::new(),
-            },
-            ontology::Property {
-                id: String::from("mode"),
-                label: None,
-                kind: ontology::PropertyType::String,
-                values: Vec::new(),
-            },
+            ontology::Property::new(
+                String::from("name"),
+                ontology::PropertyType::String,
+                Vec::new(),
+            ),
+            ontology::Property::new(
+                String::from("po"),
+                ontology::PropertyType::String,
+                Vec::new(),
+            ),
+            ontology::Property::new(
+                String::from("mode"),
+                ontology::PropertyType::String,
+                Vec::new(),
+            ),
         ],
         mappings: vec![Mapping {
             table: String::from("shipments"),
@@ -152,6 +157,7 @@ fn ontology() -> Ontology {
                 },
             ],
         }],
+        measures: Vec::new(),
     }
 }
 
@@ -170,26 +176,37 @@ fn workspace() -> WorkspaceDb {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c1"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 0,
-        content: "Orgenics ships to Kenya from its plant.",
-        heading: Some("Vendors"),
-        page: None,
-        embedding: None,
+    db.chunk_writer(
+        &DocumentId::from("doc-1"),
+        "Orgenics ships to Kenya from its plant.",
+    )
+    .and_then(|writer| {
+        writer.insert(&NewChunk {
+            id: &ChunkId::from("c1"),
+            chunk_index: 0,
+            content: "Orgenics ships to Kenya from its plant.",
+            heading: Some("Vendors"),
+            page: None,
+            kind: SectionKind::Body,
+            locator: None,
+            embedding: None,
+        })
     })
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c2"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 1,
-        content: "FAIL this one",
-        heading: None,
-        page: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "FAIL this one")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c2"),
+                chunk_index: 1,
+                content: "FAIL this one",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
     store::save(
         &db,
         &ontology(),
@@ -260,9 +277,9 @@ fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
 
     // Vendor V0 is a hub with about a third of the shipments: a bounded
     // walk out of it returns at most max_nodes.
-    let options = GraphOptions {
+    let options = GraphConfig {
         max_nodes: 7,
-        ..GraphOptions::default()
+        ..GraphConfig::default()
     };
     let hub = traverse::resolve_entry(&db, "V0", Some("vendor"), None).unwrap();
     let found = traverse::neighborhood(&db, &hub, Hops::new(3), None, &options).unwrap();
@@ -280,14 +297,21 @@ fn extraction_samples_evenly_across_documents() {
     )
     .unwrap();
     for i in 0..4 {
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from(format!("l{i}")),
-            document_id: &DocumentId::from("doc-2"),
-            chunk_index: i,
-            content: "Filler text about nothing in particular.",
-            heading: None,
-            page: None,
-            embedding: None,
+        db.chunk_writer(
+            &DocumentId::from("doc-2"),
+            "Filler text about nothing in particular.",
+        )
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from(format!("l{i}")),
+                chunk_index: i,
+                content: "Filler text about nothing in particular.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
         })
         .unwrap();
     }
@@ -344,10 +368,10 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
     graph_store::add_provenance(&db, &uganda_south, &doc("c2")).unwrap();
     let before = graph_store::status(&db).unwrap().nodes;
 
-    let options = GraphOptions {
+    let options = GraphConfig {
         merge_threshold: 0.5,
         auto_merge_threshold: 0.05,
-        ..GraphOptions::default()
+        ..GraphConfig::default()
     };
     let resolved = resolve::resolve(&writer, Some(&letters()), &options)
         .await
@@ -398,26 +422,30 @@ async fn rejected_merge_is_not_reproposed_when_provenance_flips_orientation() {
     };
     let chunk =
         |c: &str| graph_store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from(c), 0.9);
-    let options = GraphOptions {
+    let options = GraphConfig {
         merge_threshold: 0.5,
         auto_merge_threshold: -1.0,
-        ..GraphOptions::default()
+        ..GraphConfig::default()
     };
     let acme = graph_store::upsert_node(&db, &node("Acme")).unwrap();
     graph_store::add_provenance(&db, &acme, &chunk("c1")).unwrap();
     graph_store::add_provenance(&db, &acme, &chunk("c2")).unwrap();
     let acme_corp = graph_store::upsert_node(&db, &node("Acme Corp")).unwrap();
     graph_store::add_provenance(&db, &acme_corp, &chunk("c1")).unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c3"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 2,
-        content: "Acme Corp is an acme.",
-        heading: None,
-        page: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "Acme Corp is an acme.")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c3"),
+                chunk_index: 2,
+                content: "Acme Corp is an acme.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
     // First pass: Acme (2 provenance) keeps; Acme Corp (1) drops.
     resolve::resolve(&writer, Some(&letters()), &options)
         .await
@@ -464,26 +492,30 @@ async fn pending_pair_is_not_duplicated_when_provenance_flips_orientation() {
     };
     let chunk =
         |c: &str| graph_store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from(c), 0.9);
-    let options = GraphOptions {
+    let options = GraphConfig {
         merge_threshold: 0.5,
         auto_merge_threshold: -1.0,
-        ..GraphOptions::default()
+        ..GraphConfig::default()
     };
     let acme = graph_store::upsert_node(&db, &node("Acme")).unwrap();
     graph_store::add_provenance(&db, &acme, &chunk("c1")).unwrap();
     graph_store::add_provenance(&db, &acme, &chunk("c2")).unwrap();
     let acme_corp = graph_store::upsert_node(&db, &node("Acme Corp")).unwrap();
     graph_store::add_provenance(&db, &acme_corp, &chunk("c1")).unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c3"),
-        document_id: &DocumentId::from("doc-1"),
-        chunk_index: 2,
-        content: "Acme Corp is an acme.",
-        heading: None,
-        page: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-1"), "Acme Corp is an acme.")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c3"),
+                chunk_index: 2,
+                content: "Acme Corp is an acme.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
     resolve::resolve(&writer, Some(&letters()), &options)
         .await
         .unwrap();
@@ -522,16 +554,20 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    db.insert_chunk(&NewChunk {
-        id: &ChunkId::from("c3"),
-        document_id: &DocumentId::from("doc-2"),
-        chunk_index: 0,
-        content: "Orgenics ships to Nowhere.",
-        heading: None,
-        page: None,
-        embedding: None,
-    })
-    .unwrap();
+    db.chunk_writer(&DocumentId::from("doc-2"), "Orgenics ships to Nowhere.")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c3"),
+                chunk_index: 0,
+                content: "Orgenics ships to Nowhere.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
     let node = |label: &str, class: &str| NewNode {
         label: label.to_owned(),
         class_id: ClassId::from(class.to_owned()),
@@ -583,7 +619,7 @@ fn deleting_a_document_removes_the_graph_rows_only_it_supported() {
     db.set_document_tables(&DocumentId::from("doc-t"), &[String::from("shipments")])
         .unwrap();
     assert!(db.delete_document(&DocumentId::from("doc-t")).unwrap());
-    assert!(db.list_tables().unwrap().is_empty());
+    assert!(table_search::user_tables(&db).unwrap().is_empty());
     let status = graph_store::status(&db).unwrap();
     assert_eq!((status.nodes, status.edges), (0, 0));
     assert_eq!(status.missing_tables, vec![String::from("shipments")]);
@@ -668,10 +704,10 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
 
     // Resolution: Orgenics and Orgenics Ltd share a token and embed close,
     // so a merge is proposed; Aurobindo stays apart.
-    let options = GraphOptions {
+    let options = GraphConfig {
         merge_threshold: 0.5,
         auto_merge_threshold: 0.0,
-        ..GraphOptions::default()
+        ..GraphConfig::default()
     };
     let resolved = resolve::resolve(&writer, Some(&letters()), &options)
         .await
@@ -729,7 +765,7 @@ async fn tables_documents_resolution_and_traversal_end_to_end() {
 
 fn paths_merges_and_listing(
     db: &WorkspaceDb,
-    options: &GraphOptions,
+    options: &GraphConfig,
     hood: &GraphResult,
     roots: &[Node],
     current: &Ontology,
@@ -878,7 +914,7 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
     // Query mode drops provisional results entirely.
     let roots = traverse::resolve_entry(&db, "Kenya", None, None).unwrap();
     let hood =
-        traverse::neighborhood(&db, &roots, Hops::new(1), None, &GraphOptions::default()).unwrap();
+        traverse::neighborhood(&db, &roots, Hops::new(1), None, &GraphConfig::default()).unwrap();
     assert!(!hood.is_empty());
     assert!(hood.without_provisional().is_empty());
     graph_store::mark_reviewed(&db).unwrap();
@@ -908,16 +944,41 @@ async fn stale_graphs_revalidate_and_provisional_results_are_excluded() {
             .contains("stale: run `quack graph revalidate` or `quack graph extract`"),
         "a genuinely stale graph keeps the stale suffix: {status}"
     );
+    let preview = Revalidation::preview(&db).unwrap();
+    assert_eq!(
+        preview.classes,
+        BTreeMap::from([(String::from("country"), 2)])
+    );
+    assert_eq!(
+        preview.relations,
+        BTreeMap::from([(String::from("delivered_to"), 3)])
+    );
+    assert_eq!(preview.misfit_edges(), 0);
+    let shown = preview.to_string();
+    assert!(
+        shown.contains("drops 2 nodes and 3 edges")
+            && shown.contains("class country, which the ontology no longer defines: 2 nodes")
+            && shown
+                .contains("relation delivered_to, which the ontology no longer defines: 3 edges"),
+        "{shown}"
+    );
+    assert_eq!(
+        graph_store::status(&db).unwrap().nodes,
+        7,
+        "a preview drops nothing"
+    );
     let outcome = graph_store::revalidate(&db).unwrap();
     assert_eq!(outcome.dropped_nodes, 2, "Kenya and Uganda");
-    assert_eq!(outcome.dropped_edges, 0, "their edges went with them");
+    assert_eq!(outcome.dropped_edges, 3, "their edges went with them");
+    assert_eq!(preview, outcome, "the preview counted what the run dropped");
+    assert!(Revalidation::preview(&db).unwrap().is_empty());
     assert_eq!(Some(outcome.version), saved.version);
     let status = graph_store::status(&db).unwrap();
     assert_eq!(status.nodes, 5);
     assert_eq!(status.edges, 3);
     assert!(!status.stale);
 
-    graph_store::clear(&db).unwrap();
+    graph_store::clear(&db, graph_store::Keep::Nothing).unwrap();
     let status = graph_store::status(&db).unwrap();
     assert!(!status.enabled());
     assert_eq!(status.built_with_version, None);
@@ -964,12 +1025,22 @@ fn revalidation_drops_edges_that_no_longer_fit_and_dangling_ones() {
     )
     .unwrap();
 
+    let preview = Revalidation::preview(&db).unwrap();
+    assert!(preview.classes.is_empty() && preview.relations.is_empty());
+    assert_eq!(preview.misfit_edges(), 4);
+    assert!(
+        preview.to_string().contains(
+            "4 edges that lose an end or no longer fit their relation's domain and range"
+        ),
+        "{preview}"
+    );
     let outcome = graph_store::revalidate(&db).unwrap();
     assert_eq!(outcome.dropped_nodes, 0);
     assert_eq!(
         outcome.dropped_edges, 4,
         "three supplied_by edges and the dangling one"
     );
+    assert_eq!(preview, outcome, "the preview counted what the run dropped");
     let after = graph_store::status(&db).unwrap();
     assert_eq!(after.nodes, before.nodes);
     assert_eq!(after.edges, before.edges - 3);
@@ -1020,9 +1091,9 @@ fn class_listings_report_the_total_they_were_capped_from() {
         .unwrap();
     }
     let current = ontology();
-    let options = GraphOptions {
+    let options = GraphConfig {
         max_nodes: 5,
-        ..GraphOptions::default()
+        ..GraphConfig::default()
     };
 
     let capped = traverse::by_class(&db, Some(&current), "country", 5, &options).unwrap();
@@ -1034,7 +1105,7 @@ fn class_listings_report_the_total_they_were_capped_from() {
     assert!(tree.contains("cut off at the node limit"), "{tree}");
 
     let whole =
-        traverse::by_class(&db, Some(&current), "country", 50, &GraphOptions::default()).unwrap();
+        traverse::by_class(&db, Some(&current), "country", 50, &GraphConfig::default()).unwrap();
     assert_eq!(whole.nodes.len(), 12);
     assert!(!whole.truncated);
     assert!(!whole.to_string().contains("cut off"), "{tree}");
@@ -1058,14 +1129,21 @@ async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
     )
     .unwrap();
     for i in 0..150 {
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from(format!("l{i:03}")),
-            document_id: &DocumentId::from("doc-2"),
-            chunk_index: i,
-            content: "Filler text about nothing in particular.",
-            heading: None,
-            page: None,
-            embedding: None,
+        db.chunk_writer(
+            &DocumentId::from("doc-2"),
+            "Filler text about nothing in particular.",
+        )
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from(format!("l{i:03}")),
+                chunk_index: i,
+                content: "Filler text about nothing in particular.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
         })
         .unwrap();
     }
@@ -1100,7 +1178,7 @@ async fn an_extraction_run_reads_its_chunks_a_page_at_a_time() {
 
     // A sample reads only its chunks, across the same pages. Each document
     // gets a quota of 50, which the two-chunk one cannot fill.
-    graph_store::clear(&db).unwrap();
+    graph_store::clear(&db, graph_store::Keep::Nothing).unwrap();
     let plan = ChunkPlan::new(&db, Some(100)).unwrap();
     assert_eq!(plan.len(), 52);
     let summary = extract::run(
@@ -1397,4 +1475,845 @@ fn aliases_resolve_case_and_whitespace_insensitively_like_primary_labels() {
         traverse::suggest_entities(&db, "Ibm", None, None).unwrap(),
         ["IBM (vendor)"]
     );
+}
+
+/// `since_version` of one live ontology row.
+fn since_version(db: &WorkspaceDb, table: &str, id: &str) -> Option<i64> {
+    db.connection()
+        .query_row(
+            &format!("SELECT since_version FROM {table} WHERE id = ?"),
+            [id],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+/// How many edges carry each relation id.
+fn edges_by_relation(db: &WorkspaceDb) -> BTreeMap<String, u64> {
+    let mut stmt = db
+        .connection()
+        .prepare("SELECT relation_id, count(*) FROM _quack_graph_edges GROUP BY relation_id")
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// A workspace whose `shipment` class has a subclass, a mapping, two
+/// relations it is the domain of, undecided candidates that name it, and
+/// nodes from table rows and from a document chunk; the graph matches the
+/// auto-accepted version 2.
+fn shipments_with_a_subclass_and_candidates() -> WorkspaceDb {
+    let db = workspace();
+    let mut with_subclass = store::current(&db).unwrap().unwrap();
+    with_subclass.classes.push(Class {
+        id: ClassId::from("air_shipment"),
+        parent: ClassId::from("shipment"),
+        label: None,
+        description: None,
+        key: None,
+        properties: Vec::new(),
+    });
+    let current = store::save(&db, &with_subclass, Revision::auto(None, Some("subclass"))).unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    // One node from a document chunk, beside the three from table rows.
+    let from_chunk = graph_store::upsert_node(
+        &db,
+        &NewNode {
+            label: String::from("PO-9"),
+            class_id: ClassId::from("shipment"),
+            properties: Properties::default(),
+            standing: Standing::Reviewed,
+        },
+    )
+    .unwrap();
+    graph_store::add_provenance(
+        &db,
+        &from_chunk,
+        &graph_store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from("c1"), 0.9),
+    )
+    .unwrap();
+    graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
+    candidates::store_run(
+        &db,
+        &[
+            Candidate {
+                proposal: Proposal::Property {
+                    class: String::from("shipment"),
+                    property: ontology::Property::new(
+                        String::from("weight"),
+                        ontology::PropertyType::Number,
+                        Vec::new(),
+                    ),
+                },
+                evidence: serde_json::Value::Null,
+                confidence: 0.9,
+                low_support: false,
+            },
+            Candidate {
+                proposal: Proposal::Relation(Relation {
+                    id: RelationId::from("routed_via"),
+                    label: None,
+                    description: None,
+                    domain: ClassId::from("shipment"),
+                    range: ClassId::from("country"),
+                }),
+                evidence: serde_json::Value::Null,
+                confidence: 0.4,
+                low_support: true,
+            },
+        ],
+    )
+    .unwrap();
+    db
+}
+
+/// Renaming a class moves everything in the ontology that names it: its
+/// subclass, the relations it is the domain of, its mapping, its own and
+/// its property memberships' `since_version`, and undecided candidates.
+/// Earlier snapshots keep the old id.
+#[test]
+fn renaming_a_class_moves_everything_in_the_ontology_that_names_it() {
+    let db = shipments_with_a_subclass_and_candidates();
+    let renames = IdRenames::one(ItemKind::Class, "shipment", "consignment").unwrap();
+    let renamed = store::rename(&db, &renames, Some("alice")).unwrap();
+
+    assert_eq!(renamed.version, OntologyVersion::new(3));
+    assert!(renamed.class("shipment").is_none());
+    assert_eq!(
+        renamed.class("air_shipment").map(|c| c.parent.as_str()),
+        Some("consignment"),
+        "the subclass follows"
+    );
+    for relation in ["supplied_by", "delivered_to"] {
+        assert_eq!(
+            renamed.relation(relation).map(|r| r.domain.as_str()),
+            Some("consignment"),
+            "{relation}'s domain follows"
+        );
+    }
+    assert_eq!(
+        renamed
+            .mapping_for_table("shipments")
+            .map(|m| m.class.as_str()),
+        Some("consignment"),
+        "the mapping follows"
+    );
+    assert_eq!(store::current(&db).unwrap().unwrap(), renamed);
+    assert_eq!(
+        since_version(&db, "_quack_ontology_classes", "consignment"),
+        Some(1),
+        "the class keeps the version its old id first appeared in"
+    );
+    let membership: i64 = db
+        .connection()
+        .query_row(
+            "SELECT since_version FROM _quack_ontology_properties \
+             WHERE id = 'po' AND class_id = 'consignment'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(membership, 1, "and so does each of its properties");
+    let header = store::versions(&db, 1).unwrap().remove(0);
+    assert_eq!(
+        header.note.as_deref(),
+        Some("renamed class shipment to consignment")
+    );
+    assert_eq!(header.author.as_deref(), Some("alice"));
+    assert_eq!(
+        store::current_standing(&db).unwrap(),
+        Standing::Provisional,
+        "a rename reviews nothing: the version keeps the acceptance before it"
+    );
+    let history = store::version(&db, OntologyVersion::new(2).unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(
+        history.class("shipment").is_some() && history.class("consignment").is_none(),
+        "earlier snapshots are history and keep the old id"
+    );
+
+    // Undecided candidates name the class by its new id.
+    let pending = candidates::queue(&db, Queue::Pending).unwrap();
+    assert!(
+        matches!(
+            pending.first().map(|c| &c.proposal),
+            Some(Proposal::Property { class, .. }) if class == "consignment"
+        ),
+        "{pending:?}"
+    );
+    let aside = candidates::queue(&db, Queue::LowSupport).unwrap();
+    assert!(
+        matches!(
+            aside.first().map(|c| &c.proposal),
+            Some(Proposal::Relation(r)) if r.domain == "consignment" && r.range == "country"
+        ),
+        "{aside:?}"
+    );
+}
+
+/// Renaming a class moves its nodes with their edges and provenance, and
+/// the graph still matches the ontology: a revalidation afterwards has
+/// nothing to drop.
+#[test]
+fn renaming_a_class_moves_its_nodes_and_a_revalidation_drops_nothing() {
+    let db = shipments_with_a_subclass_and_candidates();
+    let before = graph_store::status(&db).unwrap();
+    let shipments = graph_store::class_count(&db, &[ClassId::from("shipment")]).unwrap();
+    assert_eq!(shipments, 4);
+    let mut node_ids = graph_store::all_node_ids(&db).unwrap();
+    node_ids.sort();
+    let provenance = graph_store::provenance_of(&db, &node_ids).unwrap().len();
+
+    let renames = IdRenames::one(ItemKind::Class, "shipment", "consignment").unwrap();
+    let renamed = store::rename(&db, &renames, None).unwrap();
+
+    // Same size, every shipment node now a consignment.
+    assert_eq!(
+        graph_store::class_count(&db, &[ClassId::from("consignment")]).unwrap(),
+        shipments
+    );
+    assert_eq!(
+        graph_store::class_count(&db, &[ClassId::from("shipment")]).unwrap(),
+        0
+    );
+    let after = graph_store::status(&db).unwrap();
+    assert_eq!((after.nodes, after.edges), (before.nodes, before.edges));
+    let mut kept = graph_store::all_node_ids(&db).unwrap();
+    kept.sort();
+    assert_eq!(kept, node_ids, "no node was replaced");
+    assert_eq!(
+        graph_store::provenance_of(&db, &node_ids).unwrap().len(),
+        provenance
+    );
+    assert!(
+        !after.stale && after.built_with_version == renamed.version,
+        "a graph that matched the version before matches the renamed one: {after}"
+    );
+    assert!(Revalidation::preview(&db).unwrap().is_empty());
+    let outcome = graph_store::revalidate(&db).unwrap();
+    assert_eq!((outcome.dropped_nodes, outcome.dropped_edges), (0, 0));
+    let unchanged = graph_store::status(&db).unwrap();
+    assert_eq!(
+        (unchanged.nodes, unchanged.edges),
+        (before.nodes, before.edges)
+    );
+}
+
+/// Renaming a relation moves its mapping, its `since_version`, and every
+/// edge that carries it; a revalidation afterwards has nothing to drop.
+#[test]
+fn renaming_a_relation_moves_its_mapping_and_its_edges() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    store::save(&db, &current, Revision::reviewed(None, Some("again"))).unwrap();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
+    let before = graph_store::status(&db).unwrap();
+    let edges = edges_by_relation(&db);
+    assert_eq!(edges.get("supplied_by"), Some(&3));
+    let node_ids = graph_store::all_node_ids(&db).unwrap();
+    let edge_ids: Vec<_> = graph_store::edges(&db, &node_ids, graph_store::EdgeScope::Touching)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    let provenance = graph_store::provenance_of(&db, &edge_ids).unwrap().len();
+    assert!(provenance > 0);
+
+    let renames = IdRenames::one(ItemKind::Relation, "supplied_by", "sourced_from").unwrap();
+    let renamed = store::rename(&db, &renames, None).unwrap();
+
+    assert!(renamed.relation("supplied_by").is_none());
+    assert_eq!(
+        renamed
+            .relation("sourced_from")
+            .map(|r| (r.domain.as_str(), r.range.as_str())),
+        Some(("shipment", "vendor"))
+    );
+    let mapped: Vec<&str> = renamed
+        .mapping_for_table("shipments")
+        .map(|m| m.relations.iter().map(|r| r.relation.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(mapped, ["sourced_from", "delivered_to"]);
+    assert_eq!(
+        since_version(&db, "_quack_ontology_relations", "sourced_from"),
+        Some(1)
+    );
+    assert_eq!(
+        store::versions(&db, 1).unwrap().remove(0).note.as_deref(),
+        Some("renamed relation supplied_by to sourced_from")
+    );
+
+    let moved = edges_by_relation(&db);
+    assert_eq!(moved.get("sourced_from"), Some(&3));
+    assert_eq!(moved.get("supplied_by"), None);
+    assert_eq!(moved.get("delivered_to"), edges.get("delivered_to"));
+    assert_eq!(
+        graph_store::provenance_of(&db, &edge_ids).unwrap().len(),
+        provenance
+    );
+    let after = graph_store::status(&db).unwrap();
+    assert!(!after.stale, "{after}");
+    assert!(Revalidation::preview(&db).unwrap().is_empty());
+    let outcome = graph_store::revalidate(&db).unwrap();
+    assert_eq!((outcome.dropped_nodes, outcome.dropped_edges), (0, 0));
+    let unchanged = graph_store::status(&db).unwrap();
+    assert_eq!(
+        (unchanged.nodes, unchanged.edges),
+        (before.nodes, before.edges)
+    );
+    // The mapped table extracts onto the renamed relation's edges.
+    tables::extract(&db, &renamed, Standing::Reviewed).unwrap();
+    assert_eq!(graph_store::status(&db).unwrap().edges, before.edges);
+}
+
+/// A rename is refused, and writes nothing, when the old id is not
+/// defined, the new id already is, or the new id is not a valid id.
+#[test]
+fn a_rename_onto_an_existing_id_is_refused_and_writes_nothing() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
+    let refused = |kind: ItemKind, old: &str, new: &str| {
+        store::rename(&db, &IdRenames::one(kind, old, new).unwrap(), None)
+            .unwrap_err()
+            .to_string()
+    };
+    for (kind, old, new, why) in [
+        (
+            ItemKind::Class,
+            "vendor",
+            "country",
+            "class 'country' is declared twice",
+        ),
+        (
+            ItemKind::Class,
+            "vendor",
+            "vendor",
+            "class 'vendor' already has that id",
+        ),
+        (
+            ItemKind::Class,
+            "supplier",
+            "partner",
+            "no class 'supplier' to rename",
+        ),
+        (
+            ItemKind::Class,
+            "entity",
+            "thing",
+            "no class 'entity' to rename",
+        ),
+        (ItemKind::Class, "vendor", "entity", "implicit root"),
+        (ItemKind::Class, "vendor", "Not An Id", "snake_case"),
+        (
+            ItemKind::Relation,
+            "supplied_by",
+            "ships_to",
+            "relation 'ships_to' is declared twice",
+        ),
+        (
+            ItemKind::Relation,
+            "sold_by",
+            "sourced_from",
+            "no relation 'sold_by' to rename",
+        ),
+        (ItemKind::Relation, "supplied_by", "mentions", "implicit"),
+    ] {
+        let error = refused(kind, old, new);
+        assert!(error.contains(why), "{kind} {old} -> {new}: {error}");
+    }
+    assert_eq!(store::latest_version(&db).unwrap(), OntologyVersion::new(1));
+}
+
+/// Graph rows left from an earlier ontology keep their id taken: a rename
+/// onto it is refused and its version rolled back. A rename elsewhere goes
+/// through and leaves the graph as stale as it was.
+#[test]
+fn a_rename_onto_an_id_left_in_the_graph_is_refused_and_rolled_back() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    graph_store::set_built_with(&db, current.saved_version().unwrap()).unwrap();
+    let refused = |kind: ItemKind, old: &str, new: &str| {
+        store::rename(&db, &IdRenames::one(kind, old, new).unwrap(), None)
+            .unwrap_err()
+            .to_string()
+    };
+
+    // The ontology drops `country` and nobody revalidates: its two nodes
+    // stay in the graph, so `vendor` cannot take that id.
+    let mut edited = current;
+    edited.classes.retain(|c| c.id != "country");
+    edited
+        .relations
+        .retain(|r| r.id != "delivered_to" && r.id != "ships_to");
+    if let Some(mapping) = edited.mappings.first_mut() {
+        mapping.relations.retain(|r| r.target_class != "country");
+    }
+    store::save(
+        &db,
+        &edited,
+        Revision::reviewed(None, Some("drop countries")),
+    )
+    .unwrap();
+    let error = refused(ItemKind::Class, "vendor", "country");
+    assert!(
+        error.contains("the graph still holds 2 nodes of a class 'country'"),
+        "{error}"
+    );
+    let error = refused(ItemKind::Relation, "supplied_by", "delivered_to");
+    assert!(
+        error.contains("the graph still holds 3 edges of a relation 'delivered_to'"),
+        "{error}"
+    );
+    assert_eq!(
+        store::latest_version(&db).unwrap(),
+        OntologyVersion::new(2),
+        "a refused rename rolls its version back"
+    );
+    assert!(
+        store::current(&db)
+            .unwrap()
+            .unwrap()
+            .class("vendor")
+            .is_some()
+    );
+    assert_eq!(
+        graph_store::class_count(&db, &[ClassId::from("vendor")]).unwrap(),
+        2
+    );
+
+    // A graph that was already stale stays stale after a rename: the
+    // rename moved ids, it did not revalidate.
+    store::rename(
+        &db,
+        &IdRenames::one(ItemKind::Class, "vendor", "supplier").unwrap(),
+        None,
+    )
+    .unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert!(status.stale, "{status}");
+    assert_eq!(status.built_with_version, OntologyVersion::new(1));
+    let preview = Revalidation::preview(&db).unwrap();
+    assert_eq!(
+        preview.classes,
+        BTreeMap::from([(String::from("country"), 2)])
+    );
+}
+
+/// `save` applies the renames its revision carries to the ontology it is
+/// given, and only class and relation ids rename.
+#[test]
+fn a_save_applies_its_renames_and_refuses_ids_its_ontology_lacks() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    let renames = IdRenames::one(ItemKind::Class, "vendor", "supplier").unwrap();
+    let saved = store::save(
+        &db,
+        &current,
+        Revision::reviewed(None, None).renaming(&renames),
+    )
+    .unwrap();
+    assert!(saved.class("supplier").is_some() && saved.class("vendor").is_none());
+    let error = store::save(
+        &db,
+        &saved,
+        Revision::reviewed(None, None).renaming(&renames),
+    )
+    .map(|_| ())
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("no class 'vendor' to rename"), "{error}");
+    assert_eq!(store::latest_version(&db).unwrap(), OntologyVersion::new(2));
+
+    let empty = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
+    let error = store::rename(&empty, &renames, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no ontology to rename in"), "{error}");
+    for kind in [ItemKind::Property, ItemKind::Mapping] {
+        let error = IdRenames::one(kind, "name", "title")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot be renamed: only a class or a relation id can"),
+            "{error}"
+        );
+    }
+}
+
+/// A table-built graph with "ada"'s assertion ready to use.
+fn asserting() -> (WorkspaceDb, Ontology, Assertion) {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    let ada = Assertion {
+        author: Some(String::from("ada")),
+        note: Some(String::from("from the vendor list")),
+    };
+    (db, current, ada)
+}
+
+fn vendor(label: &str, name: &str) -> NewNode {
+    NewNode {
+        label: String::from(label),
+        class_id: ClassId::from("vendor"),
+        properties: Properties::from(serde_json::json!({ "name": name })),
+        standing: Standing::Reviewed,
+    }
+}
+
+fn supplied_by(source: &NodeId, target: &NodeId) -> NewEdge {
+    NewEdge {
+        source: source.clone(),
+        target: target.clone(),
+        relation: RelationId::from("supplied_by"),
+        properties: Properties::default(),
+    }
+}
+
+/// A person's node and edge: each checked against the ontology, written
+/// with one manual provenance row that every rendering shows, and found
+/// again by label.
+#[test]
+fn a_person_asserts_nodes_and_edges_under_the_ontology() {
+    let (db, _, ada) = asserting();
+    let bad = graph_store::create_node(
+        &db,
+        &NewNode {
+            class_id: ClassId::from("vessel"),
+            ..vendor("Acme", "Acme")
+        },
+        &ada,
+    )
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(bad.contains("no class 'vessel'"), "{bad}");
+    let added = graph_store::create_node(&db, &vendor("Acme Pharma", "Acme Pharma"), &ada).unwrap();
+    assert!(added.created);
+    assert_eq!(added.subject.standing, Standing::Reviewed);
+    let sources = graph_store::provenance_of(&db, std::slice::from_ref(&added.subject.id)).unwrap();
+    assert_eq!(
+        sources
+            .first()
+            .and_then(|s| s.origin.assertion())
+            .as_deref(),
+        Some("asserted by ada: from the vendor list")
+    );
+    assert_eq!(sources.len(), 1);
+    // Asserting it again finds it, takes the new properties, and keeps one
+    // manual row.
+    let again =
+        graph_store::create_node(&db, &vendor("acme   pharma", "ACME"), &Assertion::default())
+            .unwrap();
+    assert!(!again.created);
+    assert_eq!(again.subject.id, added.subject.id);
+    assert_eq!(
+        again.subject.properties.get("name"),
+        Some(&serde_json::json!("ACME"))
+    );
+    assert_eq!(
+        graph_store::provenance_of(&db, std::slice::from_ref(&added.subject.id))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let po1 = graph_store::find_node(&db, "PO-1", Some("shipment")).unwrap();
+    let kenya = graph_store::find_node(&db, "Kenya", None).unwrap();
+    let edge =
+        graph_store::create_edge(&db, &supplied_by(&po1.id, &added.subject.id), &ada).unwrap();
+    assert!(edge.created);
+    let refused = graph_store::create_edge(&db, &supplied_by(&kenya.id, &po1.id), &ada)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        refused.contains("does not allow supplied_by from a country to a shipment"),
+        "{refused}"
+    );
+    let walk = traverse::neighborhood(
+        &db,
+        std::slice::from_ref(&po1),
+        Hops::new(1),
+        None,
+        &GraphConfig::default(),
+    )
+    .unwrap();
+    assert!(
+        walk.provenance
+            .iter()
+            .any(|p| p.subject_id == edge.subject.id.as_str() && p.origin.assertion().is_some())
+    );
+    let ambiguous = graph_store::find_node(&db, "Kenya", Some("vendor"))
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(ambiguous.contains("graph node"), "{ambiguous}");
+}
+
+/// A correction changes the label and the properties; a label another
+/// node of the class holds, and a class the node's edges no longer fit,
+/// are refused.
+#[test]
+fn a_person_corrects_a_node_under_the_ontology() {
+    let (db, _, ada) = asserting();
+    let added = graph_store::create_node(&db, &vendor("Acme Pharma", "Acme Pharma"), &ada).unwrap();
+    let po1 = graph_store::find_node(&db, "PO-1", None).unwrap();
+    graph_store::create_edge(&db, &supplied_by(&po1.id, &added.subject.id), &ada).unwrap();
+    let vector = Vector::new(vec![0.5; 4], Dimension::new(4)).unwrap();
+    db.set_node_embedding(&added.subject.id, &vector).unwrap();
+    let needing = |db: &WorkspaceDb| -> bool {
+        graph_store::nodes_needing_embedding(db, 1_000)
+            .unwrap()
+            .iter()
+            .any(|n| n.id == added.subject.id)
+    };
+    assert!(!needing(&db), "embedded under the current profile");
+    let edited = graph_store::update_node(
+        &db,
+        &added.subject.id,
+        &NodeEdit {
+            label: Some(String::from("Acme Pharmaceuticals")),
+            class: None,
+            properties: serde_json::json!({ "country": "Kenya", "name": null })
+                .as_object()
+                .cloned(),
+        },
+        &Assertion::default(),
+    )
+    .unwrap();
+    assert_eq!(edited.label, "Acme Pharmaceuticals");
+    // A new label clears the old label's vector, so it is embedded again.
+    assert!(needing(&db), "the renamed node needs a new vector");
+    assert_eq!(
+        edited.properties.get("country"),
+        Some(&serde_json::json!("Kenya"))
+    );
+    assert_eq!(edited.properties.get("name"), None);
+    let taken = graph_store::update_node(
+        &db,
+        &added.subject.id,
+        &NodeEdit {
+            label: Some(String::from("Orgenics")),
+            ..NodeEdit::default()
+        },
+        &Assertion::default(),
+    )
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(
+        taken.contains("already has the label 'Orgenics'"),
+        "{taken}"
+    );
+    let misfit = graph_store::update_node(
+        &db,
+        &added.subject.id,
+        &NodeEdit {
+            class: Some(ClassId::from("country")),
+            ..NodeEdit::default()
+        },
+        &Assertion::default(),
+    )
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(
+        misfit.contains("could not take its edge supplied_by"),
+        "{misfit}"
+    );
+    assert_eq!(
+        graph_store::find_node(&db, "acme pharmaceuticals", None)
+            .unwrap()
+            .id,
+        added.subject.id
+    );
+}
+
+/// A reset keeps what people asserted (an edge only with both ends)
+/// unless asked to drop everything; deleting a node takes its edges and
+/// every provenance row of theirs.
+#[test]
+fn a_reset_keeps_assertions_and_deletes_cascade() {
+    let (db, current, ada) = asserting();
+    let added = graph_store::create_node(&db, &vendor("Acme Pharma", "Acme Pharma"), &ada).unwrap();
+    let po1 = graph_store::find_node(&db, "PO-1", None).unwrap();
+    graph_store::create_edge(&db, &supplied_by(&po1.id, &added.subject.id), &ada).unwrap();
+    graph_store::clear(&db, graph_store::Keep::Asserted).unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!((status.nodes, status.edges), (1, 0), "{status}");
+    assert!(graph_store::node(&db, &added.subject.id).unwrap().is_some());
+    graph_store::clear(&db, graph_store::Keep::Nothing).unwrap();
+    assert_eq!(graph_store::status(&db).unwrap().nodes, 0);
+
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    let orgenics = graph_store::find_node(&db, "Orgenics", None).unwrap();
+    let before = graph_store::status(&db).unwrap();
+    let deleted = graph_store::delete_node(&db, &orgenics.id).unwrap();
+    assert_eq!(deleted.id, orgenics.id);
+    let after = graph_store::status(&db).unwrap();
+    assert_eq!(after.nodes, before.nodes - 1);
+    assert_eq!(after.edges, before.edges - 2, "{after}");
+    let orphans: i64 = db
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM _quack_provenance p \
+             WHERE NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = p.subject_id) \
+               AND NOT EXISTS (SELECT 1 FROM _quack_graph_edges e WHERE e.id = p.subject_id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphans, 0);
+    let missing = graph_store::delete_node(&db, &orgenics.id)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(missing.contains("graph node"), "{missing}");
+    let po3 = graph_store::find_node(&db, "PO-3", None).unwrap();
+    let edges = graph_store::edges(
+        &db,
+        std::slice::from_ref(&po3.id),
+        graph_store::EdgeScope::Touching,
+    )
+    .unwrap();
+    let dropped = graph_store::delete_edge(&db, &edges.first().unwrap().id).unwrap();
+    assert!(graph_store::edge(&db, &dropped.id).unwrap().is_none());
+}
+
+/// The status counts the chunks no extraction read and names the mapped
+/// tables whose rows changed since table extraction read them: a row
+/// updated by SQL, and a table never read.
+#[test]
+fn status_reports_unextracted_chunks_and_changed_tables() {
+    let db = workspace();
+    let current = store::current(&db).unwrap().unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!(status.pending_chunks, 2, "{status}");
+    assert_eq!(status.pending_tables, ["shipments"], "{status}");
+    assert!(
+        status
+            .to_string()
+            .contains("2 chunks not yet extracted: `quack graph extract --source documents`"),
+        "{status}"
+    );
+    assert!(
+        status
+            .to_string()
+            .contains("Mapped tables changed since the graph read them: shipments"),
+        "{status}"
+    );
+
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert!(status.pending_tables.is_empty(), "{status}");
+
+    // A changed cell makes the table pending, and extracting again takes
+    // the new value onto the existing node.
+    db.execute_statement("UPDATE shipments SET mode = 'Rail' WHERE po = 'PO-1'")
+        .unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!(status.pending_tables, ["shipments"], "{status}");
+    tables::extract(&db, &current, Standing::Reviewed).unwrap();
+    let po1 = graph_store::find_node(&db, "PO-1", None).unwrap();
+    assert_eq!(po1.properties.get("mode"), Some(&serde_json::json!("Rail")));
+    assert!(graph_store::status(&db).unwrap().pending_tables.is_empty());
+
+    // A table that is gone is missing, not pending.
+    db.execute_statement("DROP TABLE shipments").unwrap();
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!(status.missing_tables, ["shipments"]);
+    assert!(status.pending_tables.is_empty(), "{status}");
+}
+
+/// The follow-up after an ingest: off, nothing; `tables`, the new
+/// document's mapped table and no model calls; `all`, its unextracted
+/// chunks too, each once.
+#[tokio::test]
+async fn an_ingest_follow_up_extracts_what_the_setting_names() {
+    let db = workspace();
+    db.execute_statement(
+        "UPDATE _quack_documents SET tables = '[\"shipments\"]'::JSON WHERE id = 'doc-1'",
+    )
+    .unwrap();
+    let writer = writer_of(&db);
+    let doc = DocumentId::from("doc-1");
+    let mut config = Config::default();
+
+    let off = FollowUp {
+        db: &writer,
+        config: &config,
+        embeddings: None,
+    }
+    .run(std::slice::from_ref(&doc), RunControl::unobserved())
+    .await
+    .unwrap();
+    assert!(off.is_none());
+    assert_eq!(graph_store::status(&db).unwrap().nodes, 0);
+
+    config.graph.follow_ingest = FollowIngest::Tables;
+    let followed = FollowUp {
+        db: &writer,
+        config: &config,
+        embeddings: None,
+    }
+    .run(std::slice::from_ref(&doc), RunControl::unobserved())
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(followed.tables.len(), 1);
+    assert_eq!(followed.tables.first().map(|t| t.nodes), Some(3));
+    assert!(followed.chunks.is_none());
+    assert_eq!(
+        followed.to_string(),
+        "graph: table shipments: 3 nodes, 6 edges"
+    );
+    let status = graph_store::status(&db).unwrap();
+    assert_eq!(status.nodes, 7, "{status}");
+    assert_eq!(status.pending_chunks, 2);
+    assert!(status.pending_tables.is_empty());
+    assert_eq!(
+        status.built_with_version,
+        store::latest_version(&db).unwrap()
+    );
+
+    // A document with no table and no chunks of its own leaves nothing to do.
+    let nothing = FollowUp {
+        db: &writer,
+        config: &config,
+        embeddings: None,
+    }
+    .run(&[DocumentId::from("absent")], RunControl::unobserved())
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(nothing.to_string(), "graph: nothing new to extract");
+
+    // A newer ontology makes the graph stale; a follow-up that extracts
+    // only new documents does not make it current again.
+    let current = store::current(&db).unwrap().unwrap();
+    store::save(
+        &db,
+        &current,
+        Revision::reviewed(Some("test"), Some("v next")),
+    )
+    .unwrap();
+    assert!(graph_store::status(&db).unwrap().stale);
+    FollowUp {
+        db: &writer,
+        config: &config,
+        embeddings: None,
+    }
+    .run(std::slice::from_ref(&doc), RunControl::unobserved())
+    .await
+    .unwrap();
+    assert!(graph_store::status(&db).unwrap().stale, "still stale");
 }

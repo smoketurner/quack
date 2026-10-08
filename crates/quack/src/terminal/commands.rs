@@ -8,6 +8,7 @@ use std::sync::LazyLock;
 use clap::error::ErrorKind;
 use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
 use quack_core::graph::traverse::Hops;
+use quack_core::import::{JsonPointer, SourceHeader};
 use quack_core::ingestion::parser::FileType;
 use quack_core::jobs::JobNumber;
 use quack_core::storage::workspace::{SqlName, looks_like_direct_sql};
@@ -15,7 +16,9 @@ use quack_core::storage::workspace::{SqlName, looks_like_direct_sql};
 use crate::embeddings_cli::EmbeddingsAction;
 use crate::graph_cli::GraphAction;
 use crate::ontology_cli::OntologyAction;
-use crate::{ExportFlags, ModeArg};
+use crate::saved_cli::SavedAction;
+use crate::tables_cli::TablesArgs;
+use crate::{ExportFlags, ImportAction, ModeArg};
 
 /// The argument id of a command that takes the rest of the line as typed
 /// (a statement, a path, an entity name), so quotes and spacing survive.
@@ -41,34 +44,61 @@ pub(crate) enum SlashCommand {
         #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "STATEMENT")]
         statement: Option<String>,
     },
-    /// List tables in the workspace
+    /// List tables; with TABLE, its columns, warnings, and sample rows, and
+    /// set its note or retype a column (as `quack tables`)
     #[command(name = "/tables")]
-    Tables,
-    /// Columns, types, and sample rows of a table
-    #[command(name = "/schema", disable_help_flag = true)]
-    Schema {
-        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "TABLE")]
-        table: String,
-    },
-    /// Load a file (a bare path typed at the prompt does the same)
+    Tables(TablesArgs),
+    /// Load a file (a path typed at the prompt or a file dropped on the terminal does the same)
     #[command(name = "/ingest", visible_alias = "/attach", disable_help_flag = true)]
     Ingest {
         #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "PATH")]
         path: String,
     },
-    /// Pull rows from Postgres, SQLite, or a URL
-    #[command(name = "/import", disable_help_flag = true)]
+    /// Pull rows from a SQLite file, a URL, or S3; or list, refresh, or
+    /// remove an import saved with `quack import --save`
+    #[command(
+        name = "/import",
+        disable_help_flag = true,
+        args_conflicts_with_subcommands = true,
+        subcommand_negates_reqs = true
+    )]
     Import {
-        url: String,
-        table: String,
+        #[command(subcommand)]
+        action: Option<ImportAction>,
+        #[arg(required = true)]
+        url: Option<String>,
+        #[arg(required = true)]
+        table: Option<String>,
         source_table: Option<String>,
         /// Run this query on the source instead of reading a table
         #[arg(long, value_name = "SQL")]
         query: Option<String>,
+        /// Send a header with an http(s) download, as `NAME: VALUE`
+        #[arg(long = "header", short = 'H', value_name = "NAME: VALUE")]
+        headers: Vec<SourceHeader>,
+        /// Send `Authorization: Bearer` with the token in this variable
+        #[arg(long, value_name = "VAR")]
+        bearer_env: Option<String>,
+        /// Load the array of rows at this pointer inside a JSON download
+        #[arg(long, value_name = "POINTER")]
+        json_pointer: Option<JsonPointer>,
     },
     /// List ingested documents
     #[command(name = "/docs")]
     Docs,
+    /// Search the documents without the model: each hit's vector, keyword, and rerank rank
+    #[command(name = "/search", disable_help_flag = true)]
+    Search {
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "QUERY")]
+        query: String,
+    },
+    /// Limit the next questions to these documents (id, file name, or
+    /// title); with none, every document again (the web chat's picker)
+    #[command(name = "/scope")]
+    Scope {
+        #[arg(value_name = "DOCUMENT")]
+        documents: Vec<String>,
+    },
     /// Pin a document's full text into every prompt
     #[command(name = "/pin", disable_help_flag = true)]
     Pin { id: String },
@@ -78,7 +108,7 @@ pub(crate) enum SlashCommand {
     /// Delete a document with its chunks, table, and graph rows
     #[command(name = "/delete", disable_help_flag = true)]
     Delete { id: String },
-    /// The ontology: show, init, propose, review, accept, reject, and versions
+    /// The ontology: every `quack ontology` verb (show, init, import, export, propose, review, rename, versions, ...)
     #[command(name = "/ontology")]
     Ontology {
         #[command(subcommand)]
@@ -125,12 +155,31 @@ pub(crate) enum SlashCommand {
         #[command(subcommand)]
         action: EmbeddingsAction,
     },
-    /// List recent sessions
-    #[command(name = "/sessions")]
-    Sessions,
-    /// Switch to a session (id prefix accepted) and replay it
+    /// Saved questions: list them, or add NAME (this session's last answer), run NAME, show NAME, remove NAME
+    #[command(name = "/saved")]
+    Saved {
+        #[command(subcommand)]
+        action: Option<SavedAction>,
+    },
+    /// Pick a recent session to resume
+    #[command(name = "/sessions", disable_help_flag = true)]
+    Sessions {
+        /// Only the sessions whose questions or answers contain this text
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "TEXT")]
+        query: Option<String>,
+    },
+    /// Rename this session; with no title, its first question names it again
+    #[command(name = "/rename", disable_help_flag = true)]
+    Rename {
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "TITLE")]
+        title: Option<String>,
+    },
+    /// Switch to a session (an id prefix, or a title's start) and replay it
     #[command(name = "/resume", disable_help_flag = true)]
-    Resume { id: String },
+    Resume {
+        #[arg(id = VERBATIM, allow_hyphen_values = true, value_name = "ID | TITLE")]
+        id: String,
+    },
     /// Start a fresh session
     #[command(name = "/new")]
     New,
@@ -150,7 +199,7 @@ pub(crate) enum SlashCommand {
         flags: ExportFlags,
         file: Option<String>,
     },
-    /// List running, queued, and recent jobs
+    /// Show running, queued, and recent jobs; c cancels one
     #[command(name = "/jobs")]
     Jobs,
     /// Cancel job N from /jobs (queued or running)
@@ -161,19 +210,13 @@ pub(crate) enum SlashCommand {
         #[arg(id = VERBATIM, value_name = "N")]
         job: JobNumber,
     },
-    /// Show the chart of the Nth chart-bearing answer (default: the last)
-    #[command(name = "/chart", disable_help_flag = true)]
-    Chart {
-        #[arg(value_name = "N")]
-        n: Option<usize>,
-    },
     /// Expand or collapse the tool call details
     #[command(name = "/steps")]
     Steps,
     /// Show the chat and embedding models in use
     #[command(name = "/model")]
     Model,
-    /// Clear messages and chart
+    /// Clear messages
     #[command(name = "/clear")]
     Clear,
     /// Show current workspace and session
@@ -279,7 +322,22 @@ impl SlashCommand {
             })?;
             words.extend(split);
         }
-        SlashLine::try_parse_from(words).map(|line| line.command)
+        let command = SlashLine::try_parse_from(words)?.command;
+        if let Self::Saved {
+            action: Some(SavedAction::Run {
+                refresh, exit_code, ..
+            }),
+        } = &command
+            && let Some(flag) = [("--refresh", *refresh), ("--exit-code", *exit_code)]
+                .into_iter()
+                .find_map(|(flag, given)| given.then_some(flag))
+        {
+            return Err(SlashLine::command().error(
+                ErrorKind::UnknownArgument,
+                format!("{flag} is a command-line flag: quack saved run NAME {flag}"),
+            ));
+        }
+        Ok(command)
     }
 }
 
@@ -304,8 +362,8 @@ fn takes_verbatim(command: &Command) -> bool {
 pub(crate) enum Input {
     /// A `/` command.
     Command(String),
-    /// A path to a file quack can load.
-    File(PathBuf),
+    /// A line of names of files quack can load.
+    Files(FileLine),
     /// A statement to run as typed.
     Sql(String),
     /// A question for the agent.
@@ -314,29 +372,81 @@ pub(crate) enum Input {
 
 impl Input {
     pub(crate) fn classify(line: String) -> Self {
-        if line.starts_with('/') {
+        // Files first: an absolute path starts with `/` like a command.
+        if let Some(files) = FileLine::of(&line) {
+            Self::Files(files)
+        } else if line.starts_with('/') {
             Self::Command(line)
-        } else if let Some(path) = Self::file(&line) {
-            Self::File(path)
         } else if looks_like_direct_sql(&line) {
             Self::Sql(line)
         } else {
             Self::Question(line)
         }
     }
+}
 
-    /// The file `text` names, when it is one quack can load: quoted or
-    /// not, `~/` for the home directory, relative to the working directory
-    /// otherwise.
-    pub(crate) fn file(text: &str) -> Option<PathBuf> {
-        let cleaned = text.trim().trim_matches('\'').trim_matches('"');
-        if cleaned.is_empty() || cleaned.contains('\n') {
+/// A line that names only files quack can load.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FileLine {
+    /// Every name on it, as paths.
+    Files(Vec<PathBuf>),
+    /// Its names end at a word starting with `#`, which the shell split
+    /// reads as a comment: loading the names before it would leave files
+    /// out without saying so.
+    Comment,
+}
+
+impl FileLine {
+    pub(crate) const COMMENT: &str = "a name starting with # reads as a comment, so it and the                                       names after it would be left out; nothing was loaded.                                       Write it as ./#name or in quotes";
+
+    /// `text` as files, when all of it is files quack can load: one path
+    /// as typed, quoted or not, or the shell-quoted paths a terminal
+    /// writes for files dropped on it.
+    pub(crate) fn of(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if let Some(path) = Self::file(text.trim_matches('\'').trim_matches('"')) {
+            return Some(Self::Files(vec![path]));
+        }
+        let words = Self::words(text)?;
+        let paths: Vec<PathBuf> = words
+            .iter()
+            .map(|word| Self::file(word))
+            .collect::<Option<_>>()?;
+        if paths.is_empty() {
             return None;
         }
-        FileType::of(cleaned)?;
-        let path = match cleaned.strip_prefix("~/") {
+        // `#` opens a comment only where a word starts, so the line with
+        // every `#` made an ordinary character splits into more words
+        // exactly when a comment was dropped from it.
+        let whole = Self::words(&text.replace('#', "x"));
+        Some(if whole.is_some_and(|all| all.len() == words.len()) {
+            Self::Files(paths)
+        } else {
+            Self::Comment
+        })
+    }
+
+    /// The words of a pasted line as the terminal quoted them: POSIX shell
+    /// rules (backslash escapes, `#` comments) where terminals write them,
+    /// Windows command-line rules on Windows, where a dropped path is
+    /// double-quoted and its backslashes are separators.
+    #[cfg(not(windows))]
+    fn words(text: &str) -> Option<Vec<String>> {
+        shlex::split(text)
+    }
+
+    #[cfg(windows)]
+    fn words(text: &str) -> Option<Vec<String>> {
+        Some(winsplit::split(text))
+    }
+
+    /// `name` as a path, when it is a file quack can load: `~/` for the
+    /// home directory, relative to the working directory otherwise.
+    fn file(name: &str) -> Option<PathBuf> {
+        FileType::of(name)?;
+        let path = match name.strip_prefix("~/") {
             Some(under_home) => dirs::home_dir()?.join(under_home),
-            None => PathBuf::from(cleaned),
+            None => PathBuf::from(name),
         };
         path.is_file().then_some(path)
     }
@@ -353,9 +463,11 @@ in one session are answered in order; other work runs alongside, up to
 
 Shortcuts:
   /                 List commands; Up/Down pick, Tab fills in, Enter runs, Esc hides
+  /jobs, /sessions  Open a list; Up/Down move, Enter picks, Esc closes
   Enter             Send message
   Up/Down           Browse input history (kept across sessions)
   PageUp/PageDown, mouse wheel   Scroll messages; Home/End jump
+  Drag the mouse    Select messages; letting go copies them to the clipboard
   Ctrl+U            Clear input line
   Ctrl+L            Clear screen
   Esc or Ctrl+C     Cancel this session's newest question (running or queued)
@@ -368,9 +480,10 @@ const HELP_COLUMN: usize = 18;
 /// more read as `VERB ...` and the popup lists them.
 const INLINE_VERBS: usize = 3;
 
-/// Arguments the terminal supplies itself (`--yes`: it never asks), or
-/// clap's own, so offering them would mislead.
-const IMPLIED_ARGS: &[&str] = &["yes", "help"];
+/// Arguments the terminal supplies itself (`--yes`: it never asks), refuses
+/// (`/saved run`'s `--exit-code` and `--refresh` are command-line flags),
+/// or clap's own, so offering them would mislead.
+const IMPLIED_ARGS: &[&str] = &["yes", "help", "exit_code", "refresh"];
 
 impl SlashCommand {
     /// The `/help` text: every command with its aliases and arguments,
@@ -686,290 +799,4 @@ impl Completion {
 }
 
 #[cfg(test)]
-mod tests {
-    use quack_core::storage::sessions::ExportFormat;
-
-    use super::*;
-
-    #[expect(clippy::panic, reason = "test failure path")]
-    fn fail(msg: &str) -> ! {
-        panic!("{msg}")
-    }
-
-    fn words(line: &str) -> Vec<String> {
-        Completion::for_line(line)
-            .map(|c| c.items.into_iter().map(|s| s.word).collect())
-            .unwrap_or_default()
-    }
-
-    fn parses(line: &str) -> bool {
-        SlashCommand::parse(line).is_ok()
-    }
-
-    #[test]
-    fn the_parser_definition_is_valid() {
-        SlashLine::command().debug_assert();
-    }
-
-    #[test]
-    fn command_names_complete_by_prefix() {
-        assert_eq!(words("/").len(), visible_subcommands(&TREE).count());
-        assert_eq!(words("/sch"), ["/schema"]);
-        assert_eq!(
-            words("/s"),
-            ["/sql", "/schema", "/sessions", "/share", "/steps"]
-        );
-        assert!(words("/nothing").is_empty());
-        assert!(words("hello").is_empty());
-        assert!(words("").is_empty());
-        assert!(words("/sql SELECT 1").is_empty(), "free text gets nothing");
-        assert!(words("/exit ").is_empty());
-    }
-
-    #[test]
-    fn verbs_and_their_flags_come_from_the_cli() {
-        assert_eq!(words("/ontology pr"), ["propose"]);
-        assert_eq!(words("/graph st"), ["status"]);
-        assert_eq!(words("/embeddings "), ["refresh"]);
-        assert_eq!(
-            words("/ontology propose --"),
-            ["--auto-accept", "--documents", "--sample", "--from"],
-            "--yes is implied in the terminal"
-        );
-        assert!(words("/ontology propose --documents --d").is_empty());
-        assert_eq!(words("/graph extract --source documents --s"), ["--sample"]);
-        assert!(
-            words("/graph Alice").is_empty(),
-            "an entity name gets nothing"
-        );
-        assert!(words("/graph Alice ").is_empty());
-        assert!(
-            words("/graph Alice status").is_empty(),
-            "a verb only comes first"
-        );
-        assert!(
-            words("/ontology propose ").is_empty(),
-            "flags need a dash first"
-        );
-        assert!(words("/unknown ").is_empty());
-    }
-
-    #[test]
-    fn choices_and_nested_verbs_follow_their_command() {
-        assert_eq!(words("/mode "), ["chat", "query"]);
-        assert_eq!(words("/mode q"), ["query"]);
-        assert!(words("/mode chat ").is_empty());
-        assert_eq!(words("/export --"), ["--sql", "--markdown"]);
-        assert!(
-            words("/export --sql --s").is_empty(),
-            "a typed flag is not offered again"
-        );
-        assert_eq!(words("/context e"), ["export"]);
-        assert!(words("/context import ").is_empty());
-    }
-
-    #[test]
-    fn accepting_replaces_the_word_and_spaces_when_more_may_follow() {
-        let apply = |line: &str| {
-            let completion = Completion::for_line(line)?;
-            let item = completion.get(0)?;
-            Some((completion.apply(line, item).0, item.finishes()))
-        };
-        assert_eq!(apply("/sch"), Some((String::from("/schema "), false)));
-        assert_eq!(apply("/he"), Some((String::from("/help"), true)));
-        assert_eq!(
-            apply("/graph sta"),
-            Some((String::from("/graph status "), false))
-        );
-        assert_eq!(
-            apply("/graph rev"),
-            Some((String::from("/graph revalidate"), true))
-        );
-        assert_eq!(
-            apply("/ontology propose --fr"),
-            Some((String::from("/ontology propose --from "), false))
-        );
-        assert_eq!(apply("/mode c"), Some((String::from("/mode chat"), true)));
-    }
-
-    #[test]
-    fn selection_past_the_end_clamps_to_the_last() {
-        let completion = Completion::for_line("/mode ");
-        let last = completion
-            .as_ref()
-            .and_then(|c| c.get(9))
-            .map(|s| s.word.as_str());
-        assert_eq!(last, Some("query"));
-    }
-
-    #[test]
-    fn help_lists_every_command_alias_and_usage() {
-        let help = SlashCommand::help();
-        for command in visible_subcommands(&TREE) {
-            assert!(
-                help.contains(command.get_name()),
-                "{} missing",
-                command.get_name()
-            );
-            for alias in command.get_visible_aliases() {
-                assert!(help.contains(alias), "{alias} missing");
-            }
-        }
-        for line in [
-            "/help, /?",
-            "/quit, /exit, /q",
-            "/schema TABLE",
-            "/mode [chat|query]",
-            "/export [--sql] [--markdown] [FILE]",
-            "/import URL TABLE [SOURCE_TABLE] [--query SQL]",
-            "/ontology VERB ...",
-            "/context [import FILE | export FILE]",
-            "/embeddings refresh  ",
-            "/ingest, /attach PATH  Load",
-        ] {
-            assert!(help.contains(line), "{line} missing from\n{help}");
-        }
-        assert!(help.contains("Shortcuts:"));
-    }
-
-    #[test]
-    fn free_text_parses_and_missing_arguments_are_refused() {
-        assert!(parses("/sql"));
-        assert!(parses("/sql SELECT -1 AS x"));
-        assert!(parses("/path Alice -> Bob"));
-        assert!(parses("/graph --class Person"));
-        assert!(parses("/graph Alice 2"));
-        assert!(parses("/graph status --format json"));
-        assert!(parses("/q"));
-        assert!(parses("/? "));
-        assert!(parses("/sql SELECT '-h' --help"), "free text keeps -h");
-        assert!(matches!(
-            SlashCommand::parse("/ontology --help").map_err(|e| e.kind()),
-            Err(ErrorKind::DisplayHelp)
-        ));
-        assert!(!parses("/schema"));
-        assert!(!parses("/graph"));
-        assert!(!parses("/mode fast"));
-        assert!(!parses("/nothing"));
-        assert!(parses("/ontology propose --documents"));
-        assert!(
-            !parses("/ontology propose --extend"),
-            "propose has one behavior: what the ontology lacks"
-        );
-        assert!(matches!(
-            SlashCommand::parse("/graph merges"),
-            Ok(SlashCommand::Graph {
-                action: Some(GraphAction::Merges),
-                walk: None,
-            })
-        ));
-    }
-
-    #[test]
-    fn free_text_arrives_as_typed_and_the_rest_splits_like_a_shell_line() {
-        assert!(matches!(
-            SlashCommand::parse("/sql SELECT 'a  b' AS \"x\""),
-            Ok(SlashCommand::Sql { statement: Some(s) }) if s == "SELECT 'a  b' AS \"x\""
-        ));
-        assert!(matches!(
-            SlashCommand::parse("/sql"),
-            Ok(SlashCommand::Sql { statement: None })
-        ));
-        assert!(matches!(
-            SlashCommand::parse("/context import my notes.md"),
-            Ok(SlashCommand::Context { action: Some(ContextAction::Import { file }) })
-                if file == "my notes.md"
-        ));
-        assert!(matches!(
-            SlashCommand::parse("/import sqlite:/tmp/a.db t --query \"SELECT * FROM x WHERE y = 'z'\""),
-            Ok(SlashCommand::Import { url, table, source_table: None, query: Some(q) })
-                if url == "sqlite:/tmp/a.db" && table == "t" && q == "SELECT * FROM x WHERE y = 'z'"
-        ));
-        assert!(matches!(
-            SlashCommand::parse("/export --sql 'the session.sql'"),
-            Ok(SlashCommand::Export { flags, file: Some(f) })
-                if flags.format() == ExportFormat::Sql && f == "the session.sql"
-        ));
-        let unclosed = SlashCommand::parse("/export 'open");
-        assert!(
-            unclosed
-                .as_ref()
-                .is_err_and(|e| e.to_string().contains("quote is not closed")),
-            "{:?}",
-            unclosed.map(|_| ())
-        );
-        assert!(matches!(
-            SlashCommand::parse("/cancel #3"),
-            Ok(SlashCommand::Cancel { job }) if job.to_string() == "3"
-        ));
-        assert!(!parses("/cancel x"));
-        assert!(matches!(
-            SlashCommand::parse("/chart 2"),
-            Ok(SlashCommand::Chart { n: Some(2) })
-        ));
-        assert!(matches!(
-            SlashCommand::parse("/unknown 'quote"),
-            Err(e) if e.kind() == ErrorKind::InvalidSubcommand
-        ));
-    }
-
-    #[test]
-    fn a_graph_walk_is_an_entity_with_optional_hops_or_a_class() {
-        let walk = |text: &str| text.parse::<GraphWalk>();
-        assert_eq!(
-            walk("O'Brien Ltd 3"),
-            Ok(GraphWalk::Entity {
-                name: String::from("O'Brien Ltd"),
-                hops: Hops::new(3)
-            })
-        );
-        assert_eq!(
-            walk("Alice"),
-            Ok(GraphWalk::Entity {
-                name: String::from("Alice"),
-                hops: Hops::NEIGHBORHOOD
-            })
-        );
-        assert_eq!(
-            walk("--class  Person"),
-            Ok(GraphWalk::Class(String::from("Person")))
-        );
-        assert!(walk("--class").is_err());
-        assert!(matches!(
-            SlashCommand::parse("/graph O'Brien 2"),
-            Ok(SlashCommand::Graph { action: None, walk: Some(GraphWalk::Entity { name, .. }) })
-                if name == "O'Brien"
-        ));
-        assert_eq!(
-            "Alice -> Bob Jones".parse::<Route>(),
-            Ok(Route {
-                from: String::from("Alice"),
-                to: String::from("Bob Jones")
-            })
-        );
-        assert!("Alice ->".parse::<Route>().is_err());
-        assert!("Alice".parse::<Route>().is_err());
-    }
-
-    #[test]
-    fn a_line_is_a_command_a_file_sql_or_a_question() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let file = dir.path().join("notes.md");
-        std::fs::write(&file, "# hi").unwrap_or_else(|e| fail(&e.to_string()));
-        let path = file.display().to_string();
-        assert_eq!(
-            Input::classify(String::from("/tables")),
-            Input::Command(String::from("/tables"))
-        );
-        assert_eq!(Input::classify(format!("'{path}'")), Input::File(file));
-        assert_eq!(
-            Input::classify(String::from("SELECT 1")),
-            Input::Sql(String::from("SELECT 1"))
-        );
-        assert_eq!(
-            Input::classify(String::from("what is in notes.md")),
-            Input::Question(String::from("what is in notes.md"))
-        );
-        assert!(Input::file("/nowhere/notes.md").is_none());
-    }
-}
+mod tests;

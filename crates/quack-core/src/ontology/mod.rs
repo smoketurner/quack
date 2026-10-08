@@ -9,6 +9,7 @@
 
 pub mod candidates;
 pub mod documents;
+pub mod edit;
 pub mod induction;
 pub mod store;
 
@@ -16,10 +17,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
 use duckdb::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef};
+use schemars::{JsonSchema, Schema, schema_for};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{Error, Result};
+use crate::graph::views;
 use crate::ids::{ClassId, RelationId};
+use crate::storage::workspace::quote_ident;
+use crate::text::OneLine;
 use induction::ItemKind;
 
 /// The implicit root class every class descends from.
@@ -116,7 +121,7 @@ pub struct NotSnakeCase(String);
 impl NotSnakeCase {
     /// The refusal as the ontology error for an id of `kind`.
     #[must_use]
-    pub fn for_item(self, kind: ItemKind) -> Error {
+    pub fn for_item(self, kind: impl std::fmt::Display) -> Error {
         Error::Ontology(format!(
             "{kind} id '{}' must be snake_case: a lowercase letter, then lowercase letters, digits, or underscores",
             self.0
@@ -129,8 +134,21 @@ pub const MENTIONS_RELATION: &str = "mentions";
 
 /// A saved ontology version: the first save is 1 and each save counts up.
 /// An ontology not yet saved, and a graph never built, have none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(transparent)]
+#[schema(value_type = u32, minimum = 1)]
 pub struct OntologyVersion(NonZeroU32);
 
 impl OntologyVersion {
@@ -207,10 +225,13 @@ impl FromSql for OntologyVersion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A kind of entity: graph nodes are typed by one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Class {
+    /// `snake_case`, unique among classes.
     pub id: ClassId,
+    /// The class this one specializes; the implicit root `entity` when absent.
     #[serde(default = "root_class")]
     pub parent: ClassId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,6 +241,7 @@ pub struct Class {
     /// The property that identifies an instance (a policy number).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Ids of the properties an instance carries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub properties: Vec<String>,
 }
@@ -233,19 +255,26 @@ fn hidden(total: usize, limit: usize) -> Option<usize> {
     total.checked_sub(limit).filter(|rest| *rest > 0)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A kind of edge, from an entity of `domain` to one of `range`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Relation {
+    /// `snake_case`, unique among relations.
     pub id: RelationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The class of the edge's source (or one of its subclasses).
     pub domain: ClassId,
+    /// The class of the edge's target (or one of its subclasses).
     pub range: ClassId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The type of a property's values.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum PropertyType {
     String,
@@ -263,9 +292,11 @@ text_enum!(PropertyType, "property type", {
     Boolean => "boolean",
 });
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A typed attribute that classes carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Property {
+    /// Unique among properties.
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -274,23 +305,92 @@ pub struct Property {
     /// Allowed values for `enum`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
+    /// What a value means, shown beside every column mapped to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The unit a number is in (`cents`, `USD`, `kg`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Other words people use for it, which the table search matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
+}
+
+impl Property {
+    /// A property with no label, description, unit, or synonyms.
+    #[must_use]
+    pub fn new(id: impl Into<String>, kind: PropertyType, values: Vec<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: None,
+            kind,
+            values,
+            description: None,
+            unit: None,
+            synonyms: Vec::new(),
+        }
+    }
+}
+
+/// A named calculation over one table: a SQL expression such as
+/// `sum(amount) / 100.0`, checked as a read of that table when the
+/// ontology is saved, so the agent and people compute it one way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Measure {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The table the expression reads.
+    pub table: String,
+    /// What goes after `SELECT` and before `FROM table`.
+    pub expression: String,
+}
+
+impl Measure {
+    /// The statement that checks the expression: it must parse as one read
+    /// of its table, and plan.
+    #[must_use]
+    pub fn check_statement(&self) -> String {
+        format!(
+            "SELECT {} AS measure FROM {}",
+            self.expression,
+            quote_ident(&self.table)
+        )
+    }
+}
+
+/// `- revenue = sum(amount) / 100.0: net revenue in dollars`.
+impl std::fmt::Display for Measure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} = {}", self.id, OneLine(&self.expression))?;
+        if let Some(description) = &self.description {
+            write!(f, ": {}", OneLine(description))?;
+        }
+        Ok(())
+    }
 }
 
 /// One foreign-key-like column of a mapped table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MappingRelation {
+    /// The relation each row's edge takes.
     pub relation: RelationId,
+    /// The column holding the target's key.
     pub column: String,
     pub target_class: ClassId,
+    /// The target class's key property the column's values match.
     pub target_key: String,
 }
 
 /// How a table's rows become nodes and edges (design doc 6.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Mapping {
+    /// The workspace table whose rows become nodes.
     pub table: String,
+    /// The class each row's node takes.
     pub class: ClassId,
     /// The column holding the class key.
     pub key: String,
@@ -310,7 +410,9 @@ impl Mapping {
 }
 
 /// The whole ontology in interchange form.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema, utoipa::ToSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Ontology {
     /// The stored version this was read from; `None` for one not yet saved.
@@ -319,6 +421,7 @@ pub struct Ontology {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "OntologyVersion::zero_as_none"
     )]
+    #[schemars(with = "Option<u32>")]
     pub version: Option<OntologyVersion>,
     #[serde(default)]
     pub classes: Vec<Class>,
@@ -326,8 +429,12 @@ pub struct Ontology {
     pub relations: Vec<Relation>,
     #[serde(default)]
     pub properties: Vec<Property>,
+    /// How tables' rows become nodes and edges.
     #[serde(default)]
     pub mappings: Vec<Mapping>,
+    /// Named calculations over one table each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub measures: Vec<Measure>,
 }
 
 /// The relations one class takes part in.
@@ -339,7 +446,158 @@ pub struct ClassRelations<'a> {
     pub to: Vec<&'a Relation>,
 }
 
+/// Class and relation ids to rename, each old id to its new one: what an
+/// accepted candidate's rename or merge decision gives the proposals after
+/// it, and what a save carries to move the graph's nodes and edges with
+/// the ids (design doc 6.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdRenames {
+    pub classes: BTreeMap<ClassId, ClassId>,
+    pub relations: BTreeMap<RelationId, RelationId>,
+}
+
+impl IdRenames {
+    /// One id of `kind`, from `old` to `new`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Ontology` error for a property or a mapping: the graph
+    /// is keyed by class and relation ids only.
+    pub fn one(kind: ItemKind, old: &str, new: &str) -> Result<Self> {
+        let mut renames = Self::default();
+        match kind {
+            ItemKind::Class => {
+                renames
+                    .classes
+                    .insert(ClassId::from(old), ClassId::from(new));
+            }
+            ItemKind::Relation => {
+                renames
+                    .relations
+                    .insert(RelationId::from(old), RelationId::from(new));
+            }
+            ItemKind::Property | ItemKind::Mapping => {
+                return Err(Error::Ontology(format!(
+                    "a {kind} cannot be renamed: only a {} or a {} id can",
+                    ItemKind::Class,
+                    ItemKind::Relation
+                )));
+            }
+        }
+        Ok(renames)
+    }
+
+    /// The id a class had before these renames: its own unless it is the
+    /// new id of one.
+    pub(crate) fn class_before<'a>(&'a self, id: &'a str) -> &'a str {
+        self.classes
+            .iter()
+            .find(|(_, new)| new.as_str() == id)
+            .map_or(id, |(old, _)| old.as_str())
+    }
+
+    /// The id a relation had before these renames.
+    pub(crate) fn relation_before<'a>(&'a self, id: &'a str) -> &'a str {
+        self.relations
+            .iter()
+            .find(|(_, new)| new.as_str() == id)
+            .map_or(id, |(old, _)| old.as_str())
+    }
+
+    fn move_class(&self, id: &mut ClassId) {
+        if let Some(new) = self.classes.get(id.as_str()) {
+            id.clone_from(new);
+        }
+    }
+
+    fn move_relation(&self, id: &mut RelationId) {
+        if let Some(new) = self.relations.get(id.as_str()) {
+            id.clone_from(new);
+        }
+    }
+
+    pub(crate) fn rename_class(&self, class: &mut Class) {
+        self.move_class(&mut class.id);
+        self.move_class(&mut class.parent);
+    }
+
+    pub(crate) fn rename_relation(&self, relation: &mut Relation) {
+        self.move_relation(&mut relation.id);
+        self.move_class(&mut relation.domain);
+        self.move_class(&mut relation.range);
+    }
+
+    pub(crate) fn rename_mapping(&self, mapping: &mut Mapping) {
+        self.move_class(&mut mapping.class);
+        for link in &mut mapping.relations {
+            self.move_relation(&mut link.relation);
+            self.move_class(&mut link.target_class);
+        }
+    }
+
+    /// The new id of the class named `owner`, for the places that hold a
+    /// class id as plain text.
+    pub(crate) fn rename_owner(&self, owner: &mut String) {
+        if let Some(new) = self.classes.get(owner.as_str()) {
+            new.as_str().clone_into(owner);
+        }
+    }
+
+    /// Every old id must be one `ontology` defines, renamed to another
+    /// id. A new id the ontology already has is left to
+    /// [`Ontology::validate`], which refuses the renamed ontology for
+    /// declaring it twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Ontology` error naming the first id that breaks this.
+    pub(crate) fn check(&self, ontology: &Ontology) -> Result<()> {
+        let classes = self.classes.iter().map(|(old, new)| {
+            let defined = ontology.class(old.as_str()).is_some();
+            (ItemKind::Class, old.as_str(), new.as_str(), defined)
+        });
+        let relations = self.relations.iter().map(|(old, new)| {
+            let defined = ontology.relation(old.as_str()).is_some();
+            (ItemKind::Relation, old.as_str(), new.as_str(), defined)
+        });
+        for (kind, old, new, defined) in classes.chain(relations) {
+            if !defined {
+                return Err(Error::Ontology(format!("no {kind} '{old}' to rename")));
+            }
+            if old == new {
+                return Err(Error::Ontology(format!(
+                    "{kind} '{old}' already has that id"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `class vendor to supplier, relation ships_to to delivers_to`.
+impl std::fmt::Display for IdRenames {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let classes = self
+            .classes
+            .iter()
+            .map(|(old, new)| format!("{} {old} to {new}", ItemKind::Class));
+        let relations = self
+            .relations
+            .iter()
+            .map(|(old, new)| format!("{} {old} to {new}", ItemKind::Relation));
+        f.write_str(&classes.chain(relations).collect::<Vec<_>>().join(", "))
+    }
+}
+
 impl Ontology {
+    /// The JSON Schema of the interchange form, as `docs/ontology.schema.json`
+    /// publishes it: what import, `PUT .../ontology`, and the ontology page
+    /// accept.
+    #[must_use]
+    pub fn json_schema() -> Schema {
+        schema_for!(Self)
+    }
+
     /// Parse the JSON interchange form and validate it.
     ///
     /// # Errors
@@ -468,6 +726,12 @@ impl Ontology {
         self.mappings.iter().find(|m| m.table == table)
     }
 
+    /// The measures defined over `table`.
+    #[must_use]
+    pub fn measures_on(&self, table: &str) -> Vec<&Measure> {
+        self.measures.iter().filter(|m| m.table == table).collect()
+    }
+
     /// Whether `id` names a class: the root, or one defined here.
     #[must_use]
     pub fn defines_class(&self, id: &str) -> bool {
@@ -528,7 +792,28 @@ impl Ontology {
         self.validate_properties()?;
         self.validate_classes()?;
         self.validate_relations()?;
-        self.validate_mappings()
+        self.validate_mappings()?;
+        self.validate_measures()
+    }
+
+    fn validate_measures(&self) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        for measure in &self.measures {
+            SnakeId::try_from(measure.id.as_str()).map_err(|e| e.for_item("measure"))?;
+            if !seen.insert(measure.id.as_str()) {
+                return Err(Error::Ontology(format!(
+                    "measure '{}' is declared twice",
+                    measure.id
+                )));
+            }
+            if measure.table.trim().is_empty() || measure.expression.trim().is_empty() {
+                return Err(Error::Ontology(format!(
+                    "measure '{}' needs a table and an expression",
+                    measure.id
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn validate_properties(&self) -> Result<()> {
@@ -568,6 +853,15 @@ impl Ontology {
             if class.id == ROOT_CLASS {
                 return Err(Error::Ontology(format!(
                     "'{ROOT_CLASS}' is the implicit root and cannot be declared"
+                )));
+            }
+            // Each class's view is `graph_<id>`, and `graph_edges` is the
+            // edge view: a class by that id would have no view of its own.
+            if Some(class.id.as_str()) == views::EDGES_VIEW.strip_prefix(views::PREFIX) {
+                return Err(Error::Ontology(format!(
+                    "class id '{}' is taken by the graph's edge view ({}); choose another",
+                    class.id,
+                    views::EDGES_VIEW
                 )));
             }
             if !seen.insert(class.id.as_str()) {
@@ -796,6 +1090,7 @@ impl Ontology {
         out.relations.sort_by(|a, b| a.id.cmp(&b.id));
         out.properties.sort_by(|a, b| a.id.cmp(&b.id));
         out.mappings.sort_by(|a, b| a.table.cmp(&b.table));
+        out.measures.sort_by(|a, b| a.id.cmp(&b.id));
         for class in &mut out.classes {
             class.properties.sort();
             class.properties.dedup();
@@ -812,8 +1107,34 @@ impl Ontology {
             if property.label.as_deref() == Some(property.id.as_str()) {
                 property.label = None;
             }
+            property.synonyms.sort();
+            property.synonyms.dedup();
         }
         out
+    }
+
+    /// This ontology, unsaved and not yet validated, with `renames`
+    /// applied to every place it names a class or a relation: ids,
+    /// parents, domains and ranges, and table mappings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Ontology` error when an old id is not defined or is
+    /// renamed to itself.
+    pub(crate) fn renamed(&self, renames: &IdRenames) -> Result<Self> {
+        renames.check(self)?;
+        let mut out = self.clone();
+        out.version = None;
+        for class in &mut out.classes {
+            renames.rename_class(class);
+        }
+        for relation in &mut out.relations {
+            renames.rename_relation(relation);
+        }
+        for mapping in &mut out.mappings {
+            renames.rename_mapping(mapping);
+        }
+        Ok(out)
     }
 
     /// What changed from `older` to `self`, by id, comparing canonical forms.
@@ -828,6 +1149,7 @@ impl Ontology {
             relations: Changes::between(&older.relations, &this.relations, |r| r.id.as_str()),
             properties: Changes::between(&older.properties, &this.properties, |p| p.id.as_str()),
             mappings: Changes::between(&older.mappings, &this.mappings, Mapping::id),
+            measures: Changes::between(&older.measures, &this.measures, |m| m.id.as_str()),
         }
     }
 
@@ -849,12 +1171,7 @@ impl Ontology {
             domain: ClassId::from(domain.to_owned()),
             range: ClassId::from(range.to_owned()),
         };
-        let property = |id: &str, kind: PropertyType| Property {
-            id: id.to_owned(),
-            label: None,
-            kind,
-            values: Vec::new(),
-        };
+        let property = |id: &str, kind: PropertyType| Property::new(id, kind, Vec::new());
         Self {
             version: None,
             classes: vec![
@@ -881,12 +1198,13 @@ impl Ontology {
                 property("date", PropertyType::Date),
             ],
             mappings: Vec::new(),
+            measures: Vec::new(),
         }
     }
 }
 
 /// Ids added, removed, or changed for one kind.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct Changes {
     pub added: Vec<String>,
     pub removed: Vec<String>,
@@ -920,7 +1238,7 @@ impl Changes {
 }
 
 /// The difference between two versions.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct OntologyDiff {
     pub from: Option<OntologyVersion>,
     pub to: Option<OntologyVersion>,
@@ -928,6 +1246,8 @@ pub struct OntologyDiff {
     pub relations: Changes,
     pub properties: Changes,
     pub mappings: Changes,
+    #[serde(default)]
+    pub measures: Changes,
 }
 
 impl Ontology {
@@ -973,7 +1293,19 @@ impl Ontology {
             } else {
                 format!(" [{}]", p.values.join(", "))
             };
-            lines.push(format!("  - {}: {}{values}", p.id, p.kind.as_str()));
+            let unit = p
+                .unit
+                .as_deref()
+                .map_or(String::new(), |u| format!(" [{u}]"));
+            let description = p
+                .description
+                .as_deref()
+                .map_or(String::new(), |d| format!(": {d}"));
+            lines.push(format!(
+                "  - {}: {}{values}{unit}{description}",
+                p.id,
+                p.kind.as_str()
+            ));
         }
         if !self.mappings.is_empty() {
             lines.push(String::from("mappings:"));
@@ -986,6 +1318,12 @@ impl Ontology {
                     m.properties.len(),
                     m.relations.len()
                 ));
+            }
+        }
+        if !self.measures.is_empty() {
+            lines.push(String::from("measures:"));
+            for m in &self.measures {
+                lines.push(format!("  - {m} (on {})", m.table));
             }
         }
         let mut text = lines.join("\n");
@@ -1001,6 +1339,7 @@ impl OntologyDiff {
             && self.relations.is_empty()
             && self.properties.is_empty()
             && self.mappings.is_empty()
+            && self.measures.is_empty()
     }
 }
 
@@ -1018,6 +1357,7 @@ impl std::fmt::Display for OntologyDiff {
             ("relations", &self.relations),
             ("properties", &self.properties),
             ("mappings", &self.mappings),
+            ("measures", &self.measures),
         ] {
             if changes.is_empty() {
                 continue;
@@ -1038,257 +1378,4 @@ impl std::fmt::Display for OntologyDiff {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn summary_nests_subclasses_under_parents() {
-        let mut ontology = Ontology::builtin_default();
-        ontology.classes.push(Class {
-            id: ClassId::from("vendor"),
-            parent: ClassId::from("organization"),
-            label: None,
-            description: None,
-            key: None,
-            properties: Vec::new(),
-        });
-        let text = ontology.render_summary();
-        assert!(
-            text.contains("  - organization {industry, country}\n    - vendor\n"),
-            "{text}"
-        );
-        assert!(text.contains("  - works_at: person -> organization"));
-        assert!(text.contains("  - date: date"));
-    }
-
-    #[test]
-    fn versions_count_from_one() {
-        assert_eq!(OntologyVersion::new(0), None);
-        assert_eq!(OntologyVersion::after(None), OntologyVersion::FIRST);
-        let second = OntologyVersion::after(Some(OntologyVersion::FIRST));
-        assert_eq!(second.get(), 2);
-        assert_eq!(second.previous(), Some(OntologyVersion::FIRST));
-        assert_eq!(OntologyVersion::FIRST.previous(), None);
-        assert_eq!(
-            " 7 "
-                .parse::<OntologyVersion>()
-                .map(OntologyVersion::get)
-                .ok(),
-            Some(7)
-        );
-        for bad in ["0", "-1", "v2", ""] {
-            assert!(bad.parse::<OntologyVersion>().is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn an_unsaved_version_is_absent_in_json_and_read_from_zero_or_null() {
-        let json = Ontology::builtin_default().to_json().unwrap_or_default();
-        assert!(!json.contains("\"version\""), "{json}");
-        for version in ["0", "null"] {
-            let text = format!(r#"{{"version": {version}}}"#);
-            assert_eq!(
-                Ontology::from_json(&text).map(|o| o.version).ok(),
-                Some(None),
-                "{text}"
-            );
-        }
-        let saved = Ontology::from_json(r#"{"version": 3}"#)
-            .map(|o| o.version)
-            .ok();
-        assert_eq!(saved, Some(OntologyVersion::new(3)));
-        assert!(Ontology::from_json(r#"{"version": -1}"#).is_err());
-    }
-
-    #[test]
-    fn snake_ids_are_checked_not_repaired() {
-        assert_eq!(
-            SnakeId::try_from("ship_mode_2").map(SnakeId::into_string),
-            Ok(String::from("ship_mode_2"))
-        );
-        for bad in ["", "Ship", "2024", "_x", "ship mode", "ship-mode"] {
-            let refused =
-                SnakeId::try_from(bad).map_err(|e| e.for_item(ItemKind::Class).to_string());
-            assert_eq!(
-                refused,
-                Err(format!(
-                    "ontology error: class id '{bad}' must be snake_case: a lowercase letter, then \
-                     lowercase letters, digits, or underscores"
-                )),
-                "{bad}"
-            );
-        }
-    }
-
-    fn err_of(json: &str) -> String {
-        match Ontology::from_json(json) {
-            Ok(_) => String::from("<ok>"),
-            Err(e) => e.to_string(),
-        }
-    }
-
-    const INSURANCE: &str = r#"{
-  "classes": [
-    { "id": "organization", "properties": ["country"] },
-    { "id": "vendor", "parent": "organization" },
-    { "id": "policy", "key": "policy_number", "properties": ["policy_number", "effective_date"] },
-    { "id": "claim", "key": "claim_id", "properties": ["claim_id", "amount", "status"] }
-  ],
-  "relations": [
-    { "id": "issued_by", "domain": "policy", "range": "organization" },
-    { "id": "filed_against", "domain": "claim", "range": "policy" }
-  ],
-  "properties": [
-    { "id": "country", "type": "string" },
-    { "id": "policy_number", "type": "string" },
-    { "id": "effective_date", "type": "date" },
-    { "id": "claim_id", "type": "string" },
-    { "id": "amount", "type": "number" },
-    { "id": "status", "type": "enum", "values": ["filed", "paid", "denied"] }
-  ],
-  "mappings": [
-    {
-      "table": "claims", "class": "claim", "key": "claim_id",
-      "properties": { "amount": "amount", "status": "status" },
-      "relations": [
-        { "relation": "filed_against", "column": "policy_id", "target_class": "policy", "target_key": "policy_number" }
-      ]
-    }
-  ]
-}"#;
-
-    #[test]
-    fn the_design_example_parses_and_round_trips_through_json() {
-        let ontology = Ontology::from_json(INSURANCE).unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(ontology.classes.len(), 4);
-        assert!(ontology.is_subclass_of("vendor", "organization"));
-        assert!(ontology.is_subclass_of("vendor", ROOT_CLASS));
-        assert!(!ontology.is_subclass_of("policy", "organization"));
-        assert!(ontology.class_properties("vendor").contains("country"));
-        let json = ontology.to_json().unwrap_or_else(|e| fail(&e.to_string()));
-        let again = Ontology::from_json(&json).unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(again, ontology);
-    }
-
-    #[expect(clippy::panic, reason = "test failure path")]
-    fn fail(msg: &str) -> ! {
-        panic!("{msg}")
-    }
-
-    #[test]
-    fn validation_names_each_violation() {
-        let c = |body: &str| format!("{{\"classes\": [{body}]}}");
-        assert!(err_of(&c(r#"{"id": "Bad-Id"}"#)).contains("snake_case"));
-        assert!(err_of(&c(r#"{"id": "entity"}"#)).contains("implicit root"));
-        assert!(err_of(&c(r#"{"id": "a"}, {"id": "a"}"#)).contains("declared twice"));
-        assert!(err_of(&c(r#"{"id": "a", "parent": "ghost"}"#)).contains("unknown parent"));
-        assert!(
-            err_of(&c(
-                r#"{"id": "a", "parent": "b"}, {"id": "b", "parent": "a"}"#
-            ))
-            .contains("cycle")
-        );
-        assert!(err_of(&c(r#"{"id": "a", "properties": ["nope"]}"#)).contains("unknown property"));
-        assert!(err_of(r#"{"classes": [{"id": "a", "key": "k"}], "properties": [{"id": "k", "type": "string"}]}"#).contains("not one of its properties"));
-        assert!(
-            err_of(r#"{"properties": [{"id": "s", "type": "enum"}]}"#).contains("needs values")
-        );
-        assert!(
-            err_of(r#"{"properties": [{"id": "s", "type": "string", "values": ["x"]}]}"#)
-                .contains("cannot list values")
-        );
-        assert!(
-            err_of(r#"{"relations": [{"id": "mentions", "domain": "entity", "range": "entity"}]}"#)
-                .contains("implicit")
-        );
-        assert!(
-            err_of(r#"{"relations": [{"id": "r", "domain": "nope", "range": "entity"}]}"#)
-                .contains("unknown domain")
-        );
-        assert!(err_of(r#"{"classes": [{"id": "a"}], "mappings": [{"table": "t", "class": "a", "key": ""}]}"#).contains("needs a table and a key"));
-        assert!(err_of(r#"{"classes": [{"id": "a"}], "mappings": [{"table": "t", "class": "ghost", "key": "id"}]}"#).contains("unknown class"));
-        assert!(err_of(r#"{"classes": [{"id": "a"}], "mappings": [{"table": "t", "class": "a", "key": "id", "properties": {"c": "p"}}]}"#).contains("does not carry"));
-        let wrong_direction = r#"{"classes": [{"id": "a"}, {"id": "b", "key": "k", "properties": ["k"]}], "properties": [{"id": "k", "type": "string"}], "relations": [{"id": "r", "domain": "b", "range": "a"}], "mappings": [{"table": "t", "class": "a", "key": "id", "relations": [{"relation": "r", "column": "c", "target_class": "b", "target_key": "k"}]}]}"#;
-        assert!(err_of(wrong_direction).contains("goes b -> a"));
-        assert!(err_of("{\"classes\": [").contains("does not parse"));
-        assert!(err_of(&c(r#"{"id": "a", "colour": "red"}"#)).contains("does not parse"));
-    }
-
-    #[test]
-    fn the_builtin_default_is_valid_and_renders_for_the_prompt() {
-        let default = Ontology::builtin_default();
-        assert!(default.validate().is_ok());
-        let text = default.render_for_prompt();
-        assert!(text.contains("person: entity {email, title}"), "{text}");
-        assert!(text.contains("works_at: person -> organization"));
-        assert!(text.contains("mentions: entity -> entity"));
-        assert!(!text.contains("mapped tables"));
-    }
-
-    #[test]
-    fn the_capped_rendering_counts_what_it_leaves_out() {
-        let default = Ontology::builtin_default();
-        let capped = default.render_capped(2);
-        assert!(capped.contains("person: entity"), "{capped}");
-        assert!(!capped.contains("concept: entity"), "{capped}");
-        assert!(
-            capped.contains("and 5 more classes; describe_class shows any class by id"),
-            "{capped}"
-        );
-        assert!(capped.contains("and 3 more relations"), "{capped}");
-        // `mentions` is implicit and always named, cap or no cap.
-        assert!(capped.contains("mentions: entity -> entity"), "{capped}");
-        // Uncapped, nothing is counted away.
-        let full = default.render_capped(usize::MAX);
-        assert_eq!(full, default.render_for_prompt());
-        assert!(!full.contains("more classes"), "{full}");
-    }
-
-    #[test]
-    fn relations_and_subclasses_follow_inheritance() {
-        let ontology = Ontology::builtin_default();
-        let ClassRelations { from, to } = ontology.relations_of("person");
-        let from: Vec<&str> = from.iter().map(|r| r.id.as_str()).collect();
-        let to: Vec<&str> = to.iter().map(|r| r.id.as_str()).collect();
-        // `works_at` is the class's own; the `entity`-domain ones are inherited.
-        assert!(
-            from.contains(&"works_at") && from.contains(&"located_in"),
-            "{from:?}"
-        );
-        assert!(!from.contains(&"produced_by"), "{from:?}");
-        assert!(to.contains(&"part_of"), "{to:?}");
-        assert_eq!(ontology.subclasses("entity").len(), ontology.classes.len());
-        assert!(ontology.subclasses("person").is_empty());
-        assert!(ontology.mapping_for("person").is_none());
-    }
-
-    #[test]
-    fn diff_reports_added_removed_and_changed_ids() {
-        let base = Ontology::from_json(INSURANCE).unwrap_or_else(|e| fail(&e.to_string()));
-        let mut next = base.clone();
-        next.version = OntologyVersion::new(2);
-        next.classes.retain(|c| c.id != "vendor");
-        next.classes.push(Class {
-            id: ClassId::from("adjuster"),
-            parent: ClassId::from("organization"),
-            label: None,
-            description: None,
-            key: None,
-            properties: Vec::new(),
-        });
-        if let Some(status) = next.properties.iter_mut().find(|p| p.id == "status") {
-            status.values.push(String::from("under_review"));
-        }
-        let diff = next.diff(&base);
-        assert_eq!(diff.classes.added, ["adjuster"]);
-        assert_eq!(diff.classes.removed, ["vendor"]);
-        assert_eq!(diff.properties.changed, ["status"]);
-        assert!(diff.relations.is_empty() && diff.mappings.is_empty());
-        let text = diff.to_string();
-        assert!(
-            text.contains("+ adjuster") && text.contains("- vendor") && text.contains("~ status"),
-            "{text}"
-        );
-        assert!(base.diff(&base).is_empty());
-    }
-}
+mod tests;

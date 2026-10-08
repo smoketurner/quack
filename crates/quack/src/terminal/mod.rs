@@ -2,7 +2,11 @@
 
 mod app;
 mod chart;
+mod clipboard;
 mod commands;
+mod markdown;
+mod picker;
+mod selection;
 mod sql;
 mod ui;
 
@@ -41,11 +45,20 @@ pub(crate) async fn run(setup: SessionSetup) -> Result<()> {
     tui_app.load_sql_schema().await?;
 
     let mut terminal = ratatui::try_init().context("failed to initialize terminal")?;
-    // Mouse capture for wheel scrolling; ratatui's restore does not undo
-    // it, so it is released by hand either way.
+    // Mouse capture for wheel scrolling, bracketed paste so a dropped
+    // file's path arrives as one event; ratatui's restore undoes neither,
+    // so both are released by hand either way.
     let mouse =
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).is_ok();
+    let paste =
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste).is_ok();
     let result = tui_app.run(&mut terminal).await;
+    if paste {
+        drop(crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableBracketedPaste
+        ));
+    }
     if mouse {
         drop(crossterm::execute!(
             std::io::stdout(),

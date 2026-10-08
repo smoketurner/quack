@@ -6,14 +6,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use duckdb::OptionalExt as _;
+
 use super::{NormalizedLabel, Standing};
 use crate::error::{Error, Result};
-use crate::ids::{EdgeId, NodeId};
-use crate::ontology::{Mapping, Ontology};
+use crate::ids::{DocumentId, EdgeId, NodeId};
+use crate::ontology::{Mapping, Ontology, store as ontology_store};
 use crate::storage::workspace::{WorkspaceDb, quote_ident};
 
 /// What table extraction did for one mapping.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct MappingSummary {
     pub table: String,
     pub rows: u32,
@@ -109,9 +111,117 @@ pub fn extract_batch(
     db.under_timeout(|db| {
         let tx = db.connection().unchecked_transaction()?;
         let outcome = extract_rows(db, mapping, standing, offset)?;
+        if outcome.next_offset.is_none() {
+            Fingerprint::of(db, mapping)?.record(db, &mapping.table)?;
+        }
         tx.commit()?;
         Ok(outcome)
     })
+}
+
+/// What a mapped table's rows were when extraction last read them: the
+/// document that owns the table, the keyed row count, and an
+/// order-insensitive hash over every mapped column. Any of the three
+/// changing (a re-ingest, a re-import, an `UPDATE`) makes the table
+/// pending in the graph's status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fingerprint {
+    pub document_id: Option<DocumentId>,
+    pub row_count: u64,
+    pub row_hash: String,
+}
+
+impl Fingerprint {
+    /// The table's current fingerprint, computed in SQL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a query fails.
+    pub fn of(db: &WorkspaceDb, mapping: &Mapping) -> Result<Self> {
+        let mut columns: Vec<&str> = vec![mapping.key.as_str()];
+        columns.extend(mapping.properties.keys().map(String::as_str));
+        columns.extend(mapping.relations.iter().map(|r| r.column.as_str()));
+        columns.sort_unstable();
+        columns.dedup();
+        let fields = columns
+            .iter()
+            .map(|c| format!("{q} := {q}", q = quote_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT count(*), CAST(coalesce(sum(hash(struct_pack({fields}))), 0) AS VARCHAR) \
+             FROM {} WHERE {key} IS NOT NULL",
+            quote_ident(&mapping.table),
+            key = quote_ident(&mapping.key),
+        );
+        let (row_count, row_hash): (i64, String) = db
+            .connection()
+            .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(Self {
+            document_id: db.table_owner(&mapping.table)?.map(|d| d.id),
+            row_count: u64::try_from(row_count).unwrap_or(0),
+            row_hash,
+        })
+    }
+
+    /// The fingerprint recorded when `table` was last extracted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn recorded(db: &WorkspaceDb, table: &str) -> Result<Option<Self>> {
+        Ok(db
+            .connection()
+            .query_row(
+                "SELECT document_id, row_count, row_hash FROM _quack_graph_tables_built WHERE table_name = ?",
+                duckdb::params![table],
+                |r| {
+                    Ok(Self {
+                        document_id: r.get(0)?,
+                        row_count: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
+                        row_hash: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    fn record(&self, db: &WorkspaceDb, table: &str) -> Result<()> {
+        let version = ontology_store::latest_version(db)?
+            .ok_or_else(|| Error::Ontology(String::from("no ontology version to record")))?;
+        db.connection().execute(
+            "INSERT OR REPLACE INTO _quack_graph_tables_built \
+             (table_name, document_id, ontology_version, row_count, row_hash, built_at) \
+             VALUES (?, ?, ?, ?, ?, now())",
+            duckdb::params![
+                table,
+                self.document_id.as_ref(),
+                version,
+                i64::try_from(self.row_count).unwrap_or(i64::MAX),
+                self.row_hash
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+/// The mapped tables, among `present`, whose rows extraction never read
+/// or that changed since it did.
+///
+/// # Errors
+///
+/// Returns an error if a query fails.
+pub fn pending(db: &WorkspaceDb, ontology: &Ontology, present: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for mapping in &ontology.mappings {
+        if !present.contains(&mapping.table) {
+            continue;
+        }
+        if Fingerprint::recorded(db, &mapping.table)? != Some(Fingerprint::of(db, mapping)?) {
+            out.push(mapping.table.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// What identifies a node inside a batch: the exact-merge key of the
@@ -371,15 +481,16 @@ impl Staged {
 
 fn merge_scratch_tables(db: &WorkspaceDb, table: &str, standing: Standing) -> Result<()> {
     let conn = db.connection();
-    // Nodes: fill in missing property keys and clear the provisional flag
-    // on the ones that exist, insert the rest.
+    // Nodes: the row's values take their mapped keys on the ones that
+    // exist (the table is the keyed source of truth; other keys stay) and
+    // clear the provisional flag; the rest are inserted.
     conn.execute(
         "UPDATE _quack_graph_nodes SET \
-            properties = json_merge_patch(t.properties::JSON, coalesce(_quack_graph_nodes.properties, '{}'::JSON)), \
+            properties = json_merge_patch(coalesce(_quack_graph_nodes.properties, '{}'::JSON), t.properties::JSON), \
             provisional = _quack_graph_nodes.provisional AND ? \
          FROM _quack_tmp_graph_nodes t \
          WHERE t.normalized_label = _quack_graph_nodes.normalized_label AND t.class_id = _quack_graph_nodes.class_id \
-           AND (json_merge_patch(t.properties::JSON, coalesce(_quack_graph_nodes.properties, '{}'::JSON))::VARCHAR \
+           AND (json_merge_patch(coalesce(_quack_graph_nodes.properties, '{}'::JSON), t.properties::JSON)::VARCHAR \
                   <> coalesce(_quack_graph_nodes.properties, '{}'::JSON)::VARCHAR \
                 OR (_quack_graph_nodes.provisional AND NOT ?))",
         duckdb::params![standing, standing],

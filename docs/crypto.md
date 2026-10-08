@@ -30,7 +30,6 @@ to cross-compile for the static musl build, and one certain rustls backend at ru
 - Features:
   - `reqwest` with `rustls`; `rig` sends through it (its `reqwest` transport, which
     takes TLS from those features).
-  - `sqlx` with `tls-rustls-aws-lc-rs` (the Postgres import).
   - The AWS SDK behind the Bedrock provider (`aws-config` and `aws-sdk-bedrockruntime`
     with `default-https-client`) on `aws-smithy-http-client`'s `rustls-aws-lc`. Linux adds
     `rustls-aws-lc-fips`, and there `llm::bedrock` selects `CryptoMode::AwsLcFips`.
@@ -71,6 +70,31 @@ to cross-compile for the static musl build, and one certain rustls backend at ru
   It survives the FIPS build: the hybrid sends the ML-KEM share first
   (`post_quantum_first: true`), and rustls's `fips()` for a hybrid defers to that half,
   which FIPS mode approves.
+
+## TLS versions and post-quantum readiness
+
+What quack negotiates, from the resolved features (`rustls` with `aws_lc_rs`,
+`prefer-post-quantum`, and `std`; `reqwest` with `rustls`):
+
+- **Outbound only.** Every TLS connection quack makes is outbound: model providers, an
+  OpenID Connect issuer, an `https://` import. `quack serve` speaks plain
+  HTTP. Inbound TLS belongs to the proxy in front of it (`[server].trusted_proxies` names
+  it), which is also where the inbound cipher policy lives.
+- **TLS 1.3 and TLS 1.2**, rustls's default protocol versions, with aws-lc-rs's default
+  cipher suites (AES-GCM and ChaCha20-Poly1305 AEADs; on the FIPS build, the module's
+  approved subset). Nothing older is offered.
+- **Key exchange:** `X25519MLKEM768`, the hybrid of X25519 and ML-KEM-768, is offered
+  first (`prefer-post-quantum`), so a server that supports it gets a post-quantum key
+  exchange; otherwise X25519 or a NIST curve. The hybrid survives the FIPS build.
+- **Signatures stay classical.** Certificate verification accepts ECDSA (P-256, P-384),
+  RSA (PKCS#1 v1.5 and PSS), and Ed25519 through rustls-webpki; no post-quantum signature
+  scheme is offered or accepted yet, since none is deployed in the web PKI. quack's own
+  signatures are classical too: ES256 (P-256) client assertions for `private_key_jwt`, and
+  the identity-provider access tokens it verifies carry whatever asymmetric algorithm the
+  issuer uses.
+- **Data at rest:** the vault seals tokens and keys with HPKE (DHKEM P-256 with HKDF-SHA256
+  and AES-256-GCM), classical key agreement under a key the OS keychain holds. A
+  post-quantum KEM there is a format change for a later release.
 
 ## FIPS on Linux
 

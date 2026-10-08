@@ -8,13 +8,15 @@ use std::fmt;
 use crate::embedding::EmbeddingModel;
 use serde::Serialize;
 
+use super::GraphResult;
+use super::store;
 use super::traverse::{self, Hops};
-use super::{GraphOptions, GraphResult};
+use crate::config::GraphConfig;
 use crate::embedding::{Embedder, Vector};
 use crate::error::{Error, Result};
 use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::workspace::WorkspaceDb;
-use crate::text::NonBlankText;
+use crate::text::{NonBlankText, OneLine};
 
 /// Text a caller gave, trimmed, and absent when blank.
 fn given(text: Option<&str>) -> Option<String> {
@@ -88,7 +90,7 @@ impl GraphQuery {
         &self,
         db: &WorkspaceDb,
         embedding: Option<&Vector>,
-        options: &GraphOptions,
+        options: &GraphConfig,
     ) -> Result<GraphResult> {
         let ontology = ontology_store::current(db)?;
         if let Some(class) = self.class.as_deref() {
@@ -97,10 +99,10 @@ impl GraphQuery {
         if let Some(relation) = self.relation.as_deref() {
             OntologyId::Relation(relation).check(ontology.as_ref())?;
         }
-        match self.entity.as_deref() {
+        let mut result = match self.entity.as_deref() {
             Some(entity) => {
                 let roots = traverse::resolve_entry(db, entity, self.class.as_deref(), embedding)?;
-                traverse::neighborhood(db, &roots, self.hops, self.relation.as_deref(), options)
+                traverse::neighborhood(db, &roots, self.hops, self.relation.as_deref(), options)?
             }
             None => traverse::by_class(
                 db,
@@ -108,8 +110,10 @@ impl GraphQuery {
                 self.class.as_deref().unwrap_or_default(),
                 options.max_nodes,
                 options,
-            ),
-        }
+            )?,
+        };
+        result.status = store::summary(db)?;
+        Ok(result)
     }
 
     /// Labels close to the entity, to offer when the search found nothing.
@@ -190,15 +194,17 @@ impl PathQuery {
         &self,
         db: &WorkspaceDb,
         ends: &PathEnds,
-        options: &GraphOptions,
+        options: &GraphConfig,
     ) -> Result<GraphResult> {
         let from = traverse::resolve_entry(db, &self.from, None, ends.from.as_ref())?;
         let to = traverse::resolve_entry(db, &self.to, None, ends.to.as_ref())?;
-        match (from.first(), to.first()) {
-            (Some(a), Some(b)) => traverse::path(db, a, b, self.max_hops, options),
-            (None, _) => Err(UnknownEntity::find(db, &self.from, ends.from.as_ref()).into()),
-            (_, None) => Err(UnknownEntity::find(db, &self.to, ends.to.as_ref()).into()),
-        }
+        let mut result = match (from.first(), to.first()) {
+            (Some(a), Some(b)) => traverse::path(db, a, b, self.max_hops, options)?,
+            (None, _) => return Err(UnknownEntity::find(db, &self.from, ends.from.as_ref()).into()),
+            (_, None) => return Err(UnknownEntity::find(db, &self.to, ends.to.as_ref()).into()),
+        };
+        result.status = store::summary(db)?;
+        Ok(result)
     }
 }
 
@@ -226,7 +232,13 @@ impl fmt::Display for UnknownEntity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "no entity '{}' in the knowledge graph", self.name)?;
         if !self.closest.is_empty() {
-            write!(f, "; the closest labels are: {}", self.closest.join(", "))?;
+            f.write_str("; the closest labels are: ")?;
+            for (i, label) in self.closest.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", OneLine(label))?;
+            }
         }
         Ok(())
     }

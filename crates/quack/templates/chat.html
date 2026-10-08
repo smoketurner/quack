@@ -5,48 +5,68 @@
   <aside aria-label="Sessions">
     <div class="flex items-center justify-between">
       <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-400">Sessions</h2>
-      <a class="text-sm text-blue-400 hover:underline" href="/w/{{ ws.id }}/chat">New</a>
+      <a class="text-sm text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/chat">New</a>
     </div>
+    <form role="search" method="get" action="/w/{{ ws.membership.workspace.id }}/chat/search" hx-get="/w/{{ ws.membership.workspace.id }}/chat/search" hx-target="#session-hits" class="mt-2">
+      <input type="search" name="q" aria-label="Search the sessions" placeholder="Search questions and answers" hx-get="/w/{{ ws.membership.workspace.id }}/chat/search" hx-target="#session-hits" hx-trigger="input changed delay:300ms, search" class="w-full rounded border border-slate-700 px-2 py-1 text-sm">
+    </form>
+    <div id="session-hits" class="mt-1" aria-live="polite"></div>
     <ul id="sessions" class="mt-2 space-y-1 text-sm">
       {% for s in sessions %}
       <li class="group flex items-start gap-1">
-        <a class="block min-w-0 flex-1 truncate rounded px-2 py-1 hover:bg-slate-800{% if let Some(c) = current %}{% if c.id == s.id %} bg-slate-800{% endif %}{% endif %}" href="/w/{{ ws.id }}/chat?session={{ s.id }}"{% if let Some(c) = current %}{% if c.id == s.id %} aria-current="page"{% endif %}{% endif %} title="{{ s.title.as_deref().unwrap_or("(untitled)") }}">{{ s.title.as_deref().unwrap_or("(untitled)") }}<span class="block text-xs text-slate-400">{{ When::Relative.html(s.updated_at.as_str())|safe }} · {{ s.mode.as_str() }}{% if s.shared %} · shared{% endif %}{% if s.created_by.is_none() %} · cli{% endif %}</span></a>
-        {% if s.shared %}
-        <form method="post" action="/w/{{ ws.id }}/chat/{{ s.id }}/unshare"><button type="submit" class="rounded px-2 py-1 text-slate-500 hover:bg-slate-800 hover:text-slate-300" title="Stop sharing" aria-label="Stop sharing">●</button></form>
+        <a class="block min-w-0 flex-1 truncate rounded px-2 py-1 hover:bg-slate-800{% if let Some(c) = current %}{% if c.id == s.id %} bg-slate-800{% endif %}{% endif %}" href="/w/{{ ws.membership.workspace.id }}/chat?session={{ s.id }}"{% if let Some(c) = current %}{% if c.id == s.id %} aria-current="page"{% endif %}{% endif %} title="{{ s.title.as_deref().unwrap_or("(untitled)") }}">{{ s.title.as_deref().unwrap_or("(untitled)") }}<span class="block text-xs text-slate-400">{{ When::Relative.html(s.updated_at.as_str())|safe }} · {{ s.mode.as_str() }}{% if s.sharing == Sharing::Shared %} · shared{% endif %}{% if s.created_by.is_none() %} · cli{% endif %}</span></a>
+        {% if s.sharing == Sharing::Shared %}
+        <form method="post" action="/w/{{ ws.membership.workspace.id }}/chat/{{ s.id }}/unshare"><button type="submit" class="rounded px-2 py-1 text-slate-500 hover:bg-slate-800 hover:text-slate-300" title="Stop sharing" aria-label="Stop sharing">●</button></form>
         {% else %}
-        <form method="post" action="/w/{{ ws.id }}/chat/{{ s.id }}/share"><button type="submit" class="rounded px-2 py-1 text-slate-500 hover:bg-slate-800 hover:text-slate-300" title="Share with members" aria-label="Share with members">○</button></form>
+        <form method="post" action="/w/{{ ws.membership.workspace.id }}/chat/{{ s.id }}/share"><button type="submit" class="rounded px-2 py-1 text-slate-500 hover:bg-slate-800 hover:text-slate-300" title="Share with members" aria-label="Share with members">○</button></form>
         {% endif %}
-        <form method="post" action="/w/{{ ws.id }}/chat/{{ s.id }}/delete" onsubmit="return confirm('Delete this session?')"><button type="submit" class="rounded px-2 py-1 text-slate-500 hover:bg-red-950 hover:text-red-400" title="Delete session" aria-label="Delete session">×</button></form>
+        <form method="post" action="/w/{{ ws.membership.workspace.id }}/chat/{{ s.id }}/delete" data-confirm="Delete this session?"><button type="submit" class="rounded px-2 py-1 text-slate-500 hover:bg-red-950 hover:text-red-400" title="Delete session" aria-label="Delete session">×</button></form>
       </li>
       {% endfor %}
     </ul>
   </aside>
-  <section id="chat" class="min-w-0" data-workspace="{{ ws.id }}" {% if let Some(current) = current %}data-session="{{ current.id }}" data-mode="{{ current.mode.as_str() }}"{% endif %}>
+  <section id="chat" class="min-w-0" data-workspace="{{ ws.membership.workspace.id }}" {% if let Some(current) = current %}data-session="{{ current.id }}" data-mode="{{ current.mode.as_str() }}"{% endif %}>
+    {% if let Some(current) = current %}
+    <form method="post" action="/w/{{ ws.membership.workspace.id }}/chat/{{ current.id }}/rename" class="mb-3 flex flex-wrap items-center gap-2 text-sm">
+      <label class="sr-only" for="session-title">Session title</label>
+      <input id="session-title" name="title" value="{{ current.title.as_deref().unwrap_or("") }}" placeholder="untitled; a blank title names it after its first question" class="min-w-0 flex-1 rounded border border-slate-700 px-2 py-1">
+      <button type="submit" class="rounded border border-slate-700 px-2 py-1 text-xs hover:bg-slate-800">Rename</button>
+    </form>
+    {% endif %}
     {% if messages.is_empty() %}
     <div id="empty" class="rounded border border-slate-800 bg-slate-900 p-4 text-sm text-slate-400 wrap-anywhere">
       <p>{% if let Some(current) = current %}This session has no messages yet.{% else %}Ask about what this workspace holds.{% endif %}</p>
       {% if !tables.is_empty() %}<p class="mt-2"><span class="font-medium text-slate-200">{{ tables.len() }} tables:</span> {{ tables.join(", ") }}</p>{% endif %}
       {% if !documents.is_empty() %}<p class="mt-2"><span class="font-medium text-slate-200">{{ documents.len() }} documents:</span> {% for d in documents %}{% if !loop.first %}, {% endif %}{{ d.display_name() }}{% endfor %}</p>{% endif %}
-      {% if tables.is_empty() && documents.is_empty() %}<p class="mt-2">Nothing yet: <a class="text-blue-400 hover:underline" href="/w/{{ ws.id }}/documents">upload documents or tables</a> first.</p>{% endif %}
+      {% if tables.is_empty() && documents.is_empty() %}<p class="mt-2">Nothing yet: <a class="text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/documents">upload documents or tables</a> first.</p>{% endif %}
       <p class="mt-2 text-slate-400">Enter sends; Shift+Enter adds a line.</p>
     </div>
     {% endif %}
     <div id="messages" class="space-y-4" role="log" aria-label="Conversation" aria-live="polite">
       {% for m in messages %}
-      <article class="rounded border border-slate-800 bg-slate-900 p-4 msg-{{ m.role }}">
+      <article id="m-{{ m.seq }}" class="rounded border border-slate-800 bg-slate-900 p-4 msg-{{ m.role }}">
         <div class="flex flex-wrap items-baseline gap-x-2 text-xs text-slate-400"><span class="font-semibold uppercase">{{ m.role }}</span>{% if let Some(at) = m.at %}{{ When::Clock.element(at)|safe }}{% endif %}{% if let Some(ms) = m.duration_ms %}<span>· answered in {{ ms }} ms</span>{% endif %}</div>
         {% if !m.steps.is_empty() %}
         <details class="mt-2 text-sm"><summary class="cursor-pointer text-slate-400">{{ m.steps.len() }} steps</summary>
           <ol class="mt-1 space-y-1 font-mono text-xs wrap-anywhere">
-            {% for st in m.steps %}<li><span class="font-semibold">{{ st.tool }}</span> {{ st.detail }} <span class="text-slate-400">→ {{ st.summary }}, {{ st.duration_ms }} ms</span></li>{% endfor %}
+            {% for st in m.steps %}<li><span class="font-semibold">{{ st.tool }}</span> {{ st.detail }} <span class="text-slate-400">→ {{ st.summary }}, {{ st.duration_ms }} ms</span>
+              {% if !st.columns.is_empty() %}
+              <details class="step-result mt-1"><summary class="cursor-pointer text-slate-500">rows</summary>
+                <div class="mt-1 max-h-72 overflow-auto rounded border border-slate-800"><table class="min-w-full text-xs"><thead><tr class="border-b border-slate-700 text-left">{% for c in st.columns %}<th scope="col" class="px-2 py-1 font-mono whitespace-nowrap">{{ c }}</th>{% endfor %}</tr></thead><tbody>
+                  {% for row in st.cells %}<tr class="border-b border-slate-800">{% for v in row %}<td class="px-2 py-1 whitespace-nowrap">{{ v }}</td>{% endfor %}</tr>{% endfor %}
+                </tbody></table></div>
+                {% if let Some(rows) = st.rows %}{% if *rows > st.cells.len() as u64 %}<p class="mt-1 text-slate-500">first {{ st.cells.len() }} of {{ rows }} rows</p>{% endif %}{% endif %}
+                <form method="post" action="/w/{{ ws.membership.workspace.id }}/sql.csv" class="mt-1"><input type="hidden" name="sql" value="{{ st.detail }}"><button type="submit" class="text-blue-400 hover:underline">Export full result</button></form>
+              </details>
+              {% endif %}</li>{% endfor %}
           </ol></details>
         {% endif %}
         <div class="answer mt-2{% if m.role == "user" %} whitespace-pre-wrap{% endif %}">{{ m.content_html|safe }}</div>
         {% if let Some(chart) = m.chart_json %}<div class="chart mt-3 h-72" data-chart="{{ chart }}"></div>{% endif %}
-        {% for g in m.graphs %}<div class="graph mt-3 h-72 rounded border border-slate-800" data-graph="{{ g }}"></div>{% endfor %}
+        {% for g in m.graphs %}<div class="graph mt-3 h-72 rounded border border-slate-800" data-graph="{{ g.json }}"></div><p class="mt-1 text-xs text-slate-400">{{ g.summary }}</p>{% endfor %}
         {% if !m.citations.is_empty() %}
         <ol class="mt-3 space-y-1 text-sm text-slate-400">
-          {% for c in m.citations %}<li>[{{ c.n }}] <a class="text-blue-400 hover:underline" href="/w/{{ ws.id }}/documents#doc-{{ c.document_id }}">{{ c.label }}</a></li>{% endfor %}
+          {% for c in m.citations %}<li>[{{ c.n }}] <a class="text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/documents/{{ c.document_id }}/chunks/{{ c.chunk_index }}">{{ c.label }}</a></li>{% endfor %}
         </ol>
         {% endif %}
       </article>
@@ -59,6 +79,12 @@
           <select name="mode" class="rounded border border-slate-700 px-2 py-1">
             <option value="chat">chat</option><option value="query">query (sources only)</option>
           </select></label>
+        {% if !pickable.is_empty() %}
+        <label class="flex items-center gap-1"><span>Documents</span>
+          <select name="documents" multiple size="1" title="Limit the question to these documents; none picked asks about all" class="max-w-64 rounded border border-slate-700 px-2 py-1">
+            {% for d in pickable %}<option value="{{ d.id }}">{{ d.name }}</option>{% endfor %}
+          </select></label>
+        {% endif %}
         {% if ws.can_write %}
         <label class="flex items-center gap-1"><input type="checkbox" name="allow_write"> Run changes without asking</label>
         {% endif %}
@@ -67,6 +93,20 @@
       </div>
       <p id="status" role="status" class="mt-2 text-sm text-slate-400"></p>
     </form>
+    {% if let Some(error) = error %}<p role="alert" class="mt-3 rounded border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}
+    {% if let Some(c) = current %}
+    <div class="mt-3 flex flex-wrap items-center gap-4 text-sm">
+      <form method="post" action="/w/{{ ws.membership.workspace.id }}/saved" class="flex flex-wrap items-center gap-2">
+        <input type="hidden" name="session" value="{{ c.id }}">
+        <label class="flex items-center gap-1"><span class="text-slate-400">Save the last answer's SQL as</span>
+          <input name="name" required class="w-40 rounded border border-slate-700 px-2 py-1"></label>
+        <button type="submit" class="rounded border border-slate-700 px-3 py-1 hover:bg-slate-800">Save</button>
+      </form>
+      <span class="text-slate-400">Export this session:
+        <a class="text-blue-400 hover:underline" href="/api/v1/workspaces/{{ ws.membership.workspace.id }}/sessions/{{ c.id }}/export?format=markdown" download="session-{{ c.id }}.md">Markdown</a> ·
+        <a class="text-blue-400 hover:underline" href="/api/v1/workspaces/{{ ws.membership.workspace.id }}/sessions/{{ c.id }}/export?format=sql" download="session-{{ c.id }}.sql">SQL</a></span>
+    </div>
+    {% endif %}
   </section>
 </div>
 {% endif %}

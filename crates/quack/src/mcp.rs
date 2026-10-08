@@ -7,7 +7,8 @@
 //! `sql` (classified, writes need permission), `list_tables`,
 //! `describe_table`, `list_documents`. Resources: `quack://workspace/tables`,
 //! `quack://workspace/tables/{name}/schema`, `quack://workspace/documents`,
-//! `quack://workspace/ontology`, `quack://workspace/context`.
+//! `quack://workspace/ontology`, `quack://workspace/ontology/schema`,
+//! `quack://workspace/context`.
 //!
 //! Over HTTP every call is audited through the request's `Access`, like
 //! the REST API; over stdio nothing is audited, like the CLI.
@@ -19,20 +20,22 @@ use axum::http::request::Parts;
 use quack_core::analysis::citations::Sources;
 use quack_core::analysis::events;
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::{ReaderDb, SharedDb};
+use quack_core::analysis::search::{DocumentSearch, SearchDetail};
+use quack_core::analysis::tools::{FindPathArgs, ReaderDb, Rerank, SearchGraphArgs, SharedDb};
 use quack_core::config::Config;
-use quack_core::embedding::Input;
 use quack_core::ids::{SessionId, UserId};
 use quack_core::llm::acting::Acting;
+use quack_core::llm::egress::Egress;
 use quack_core::llm::{self, Embeddings};
-use quack_core::ontology::store as ontology_store;
+use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditAction, AuditResource, Outcome, ResourceKind, WorkspaceRow,
 };
+use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{self, ChatMode, SessionViewer};
 use quack_core::storage::workspace::{
-    ChunkScope, HybridLimits, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
+    DocumentFilter, SearchMode, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -48,8 +51,8 @@ use serde::Deserialize;
 
 use crate::server::auth::Access;
 use crate::server::state::{App, with_db};
-use quack_core::error::Result as CoreResult;
-use quack_core::graph::query::{GraphQuery, PathQuery};
+use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::graph::query::PathQuery;
 
 /// Where audit rows go: nowhere for stdio (the CLI is unaudited), or the
 /// server's access log and the workspace detail table for HTTP.
@@ -94,7 +97,7 @@ impl Caller {
         };
         caller
             .access
-            .audit(app, action, resource, outcome, detail)
+            .audit(app, action.clone(), resource, outcome, detail)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e.message, %action, "audit write failed");
@@ -112,6 +115,16 @@ impl Caller {
         }
     }
 
+    /// What cuts a `query` turn short: over HTTP, the server stopping.
+    /// `quack mcp` on stdio has no stop signal (it ends with its input),
+    /// so its token is never cancelled.
+    fn cancel(&self) -> llm::CancellationToken {
+        match self {
+            Self::Unaudited => llm::CancellationToken::new(),
+            Self::Audited { app, .. } => app.stopping.child_token(),
+        }
+    }
+
     /// Whom model requests are made for (over HTTP, the request's user at
     /// an on-behalf-of provider; over stdio, nobody).
     fn acting(&self) -> Option<Acting> {
@@ -119,6 +132,20 @@ impl Caller {
             Self::Unaudited => None,
             Self::Audited { caller, .. } => caller.acting.clone(),
         }
+    }
+
+    /// The tool result when `error` kept a model from being built, recorded
+    /// as denied when the workspace's provider allow-list refused it and as
+    /// an error otherwise.
+    async fn unbuilt(
+        &self,
+        action: AuditAction,
+        detail: serde_json::Value,
+        error: &CoreError,
+    ) -> Result<CallToolResult, McpError> {
+        self.record(action, None, Outcome::of_failure(error), Some(detail))
+            .await?;
+        Ok(failure(error.to_string()))
     }
 }
 
@@ -156,40 +183,43 @@ pub(crate) struct QueryArgs {
     /// keeps the mode it was created with.
     #[schemars(with = "Option<ChatMode>")]
     pub mode: Option<String>,
+    /// Limit the question to these documents: ids from `list_documents`
+    /// (prefixes accepted), exact file names, or exact titles; omit for
+    /// every document.
+    #[serde(default)]
+    pub document_ids: Vec<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Default, Deserialize, JsonSchema)]
 pub(crate) struct SearchArgs {
-    /// Words or a phrase to find in the documents.
+    /// Words or a phrase to find in the documents; a "quoted phrase" must
+    /// appear exactly.
     pub query: String,
     /// Chunks to return (default from the workspace configuration).
     pub top_k: Option<u32>,
+    /// Search only these documents: ids from `list_documents` (prefixes
+    /// accepted), exact file names, or exact titles.
+    #[serde(default)]
+    pub document_ids: Vec<String>,
+    /// Search only the passages this knowledge-graph entity was extracted
+    /// from.
+    pub entity: Option<String>,
+    /// Search only documents of these types, sources, or tags, written in a
+    /// date range, or by an author.
+    #[serde(default)]
+    pub filters: DocumentFilter,
+    /// `hybrid` (the default), `keyword`, or `vector`.
+    pub mode: Option<SearchMode>,
+    /// Also return each leg's candidates with their ranks and scores, the
+    /// quoted-phrase filter, and the rerank outcome.
+    #[serde(default)]
+    pub explain: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct SqlArgs {
     /// One `DuckDB` statement over the workspace tables.
     pub sql: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub(crate) struct SearchGraphArgs {
-    /// The entity to start from; omit to list every entity of `class`.
-    pub entity: Option<String>,
-    /// An ontology class id: the entry point's class, or the class to list.
-    pub class: Option<String>,
-    /// Follow only this relation id.
-    pub relation: Option<String>,
-    /// Hops out from the entity (default 2).
-    pub hops: Option<u32>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub(crate) struct FindPathArgs {
-    pub from: String,
-    pub to: String,
-    /// Longest path to consider (default 4).
-    pub max_hops: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -217,12 +247,13 @@ fn failure(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
 
-/// A `quack://workspace/...` resource: four fixed ones and one schema per table.
+/// A `quack://workspace/...` resource: five fixed ones and one schema per table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceResource<'a> {
     Tables,
     Documents,
     Ontology,
+    OntologySchema,
     Context,
     Schema(&'a str),
 }
@@ -230,10 +261,11 @@ enum WorkspaceResource<'a> {
 impl<'a> WorkspaceResource<'a> {
     const PREFIX: &'static str = "quack://workspace/";
     const SCHEMA_TEMPLATE: &'static str = "quack://workspace/tables/{name}/schema";
-    const FIXED: [WorkspaceResource<'static>; 4] = [
+    const FIXED: [WorkspaceResource<'static>; 5] = [
         WorkspaceResource::Tables,
         WorkspaceResource::Documents,
         WorkspaceResource::Ontology,
+        WorkspaceResource::OntologySchema,
         WorkspaceResource::Context,
     ];
 
@@ -243,6 +275,7 @@ impl<'a> WorkspaceResource<'a> {
             "tables" => Some(Self::Tables),
             "documents" => Some(Self::Documents),
             "ontology" => Some(Self::Ontology),
+            "ontology/schema" => Some(Self::OntologySchema),
             "context" => Some(Self::Context),
             _ => path
                 .strip_prefix("tables/")?
@@ -256,13 +289,18 @@ impl<'a> WorkspaceResource<'a> {
     fn audit_id(self) -> String {
         match self {
             Self::Schema(_) => String::from(Self::SCHEMA_TEMPLATE),
-            Self::Tables | Self::Documents | Self::Ontology | Self::Context => self.uri(),
+            Self::Tables
+            | Self::Documents
+            | Self::Ontology
+            | Self::OntologySchema
+            | Self::Context => self.uri(),
         }
     }
 
     fn uri(self) -> String {
         match self {
             Self::Schema(table) => format!("{}tables/{table}/schema", Self::PREFIX),
+            Self::OntologySchema => format!("{}ontology/schema", Self::PREFIX),
             Self::Tables | Self::Documents | Self::Ontology | Self::Context => {
                 format!("{}{}", Self::PREFIX, self.name())
             }
@@ -274,6 +312,7 @@ impl<'a> WorkspaceResource<'a> {
             Self::Tables => String::from("tables"),
             Self::Documents => String::from("documents"),
             Self::Ontology => String::from("ontology"),
+            Self::OntologySchema => String::from("ontology schema"),
             Self::Context => String::from("context"),
             Self::Schema(table) => format!("{table} schema"),
         }
@@ -288,6 +327,9 @@ impl<'a> WorkspaceResource<'a> {
             Self::Ontology => {
                 String::from("The ontology (classes, relations, properties, mappings) as JSON")
             }
+            Self::OntologySchema => String::from(
+                "The JSON Schema of the ontology's interchange form, for writing one to import",
+            ),
             Self::Context => {
                 String::from("The owner's instructions and definitions for the agent, as Markdown")
             }
@@ -298,7 +340,11 @@ impl<'a> WorkspaceResource<'a> {
     fn mime_type(self) -> &'static str {
         match self {
             Self::Context => "text/markdown",
-            Self::Tables | Self::Documents | Self::Ontology | Self::Schema(_) => "application/json",
+            Self::Tables
+            | Self::Documents
+            | Self::Ontology
+            | Self::OntologySchema
+            | Self::Schema(_) => "application/json",
         }
     }
 
@@ -368,11 +414,12 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
         // Boxed: an agent turn's future is large (clippy::large_futures).
-        Box::pin(Acting::scope(caller.acting(), self.ask(args, &caller))).await
+        Box::pin(self.as_caller(&caller, self.ask(args, &caller))).await
     }
 
-    /// `query`, acting for the request's user: its model requests reach an
-    /// on-behalf-of provider as them.
+    /// `query`, as its caller: its model requests reach an on-behalf-of
+    /// provider as the request's user, and only providers the workspace
+    /// allows.
     async fn ask(&self, args: QueryArgs, caller: &Caller) -> Result<CallToolResult, McpError> {
         let question = args.question.trim().to_owned();
         if question.is_empty() {
@@ -401,13 +448,18 @@ impl McpServer {
             session_id: &session_id,
             policy: self.inner.policy,
             message: &question,
+            documents: &args.document_ids,
             sink,
-            cancel: llm::CancellationToken::new(),
+            cancel: caller.cancel(),
         }
         .run(&self.inner.config)
         .await;
         drop(drain);
-        let detail = serde_json::json!({ "prompt": question, "session_id": session_id });
+        let detail = serde_json::json!({
+            "prompt": question,
+            "session_id": session_id,
+            "documents": args.document_ids,
+        });
         match outcome {
             Ok(response) => {
                 caller
@@ -424,12 +476,17 @@ impl McpServer {
                     text.push_str(&sources);
                 }
                 if response.write_refused {
-                    text.push_str(
-                        "\n(A mutating statement was refused: this connection cannot write.)",
-                    );
+                    // With write access the refusal has another cause (the
+                    // turn read document text first, say), which its step
+                    // carries.
+                    text.push_str(if self.inner.policy.allows_unasked() {
+                        "\n(A mutating statement was refused; its step says why.)"
+                    } else {
+                        "\n(A mutating statement was refused: this connection cannot write.)"
+                    });
                 }
                 let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-                result.structured_content = Some(response.to_json(&session_id));
+                result.structured_content = Some(serde_json::json!(response.body(&session_id)));
                 Ok(result)
             }
             Err(e) => {
@@ -437,7 +494,7 @@ impl McpServer {
                     .record(
                         AuditAction::Query,
                         Some(ResourceKind::Session.id(&session_id)),
-                        Outcome::Error,
+                        Outcome::of_failure(&e),
                         Some(detail),
                     )
                     .await?;
@@ -455,7 +512,7 @@ impl McpServer {
     /// Hybrid retrieval over the documents, no model in the loop.
     #[tool(
         name = "search",
-        description = "Find the most relevant document chunks for a query by meaning and by keyword. Returns chunks with their file, page, heading, and score; no model is called."
+        description = "Find the most relevant document chunks for a query by meaning and by keyword, optionally within named documents, a graph entity's passages, or documents matching a filter. Returns chunks with their file, page, heading, fused score, and rank in each leg; `explain` adds both legs' candidates and the rerank outcome. No chat model is called unless the workspace reranks with it."
     )]
     async fn search(
         &self,
@@ -463,75 +520,61 @@ impl McpServer {
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
-        Acting::scope(caller.acting(), self.retrieve(args, &caller)).await
+        // Boxed: building the model makes the future large.
+        Box::pin(self.as_caller(&caller, self.retrieve(args, &caller))).await
     }
 
-    /// `search`, acting for the request's user: embedding the query is a
-    /// model request too.
+    /// `search`, as its caller: embedding the query is a model request too.
     async fn retrieve(
         &self,
         args: SearchArgs,
         caller: &Caller,
     ) -> Result<CallToolResult, McpError> {
-        let query = args.query.trim().to_owned();
-        if query.is_empty() {
-            return Ok(failure("query must not be empty"));
-        }
-        let top_k = args
-            .top_k
-            .unwrap_or(self.inner.config.retrieval.top_k)
-            .clamp(1, 100);
-        let rrf_k = self.inner.config.retrieval.rrf_k;
+        let config = &self.inner.config;
+        let search =
+            match DocumentSearch::new(&args.query, args.top_k.unwrap_or(config.retrieval.top_k)) {
+                Ok(search) => DocumentSearch {
+                    documents: args.document_ids,
+                    entity: args.entity.filter(|e| !e.trim().is_empty()),
+                    filter: args.filters,
+                    mode: args.mode.unwrap_or_default(),
+                    ..search
+                },
+                Err(e) => return Ok(failure(e.to_string())),
+            };
+        let detail = serde_json::json!({ "q": search.query, "search": search.describe() });
+        let model = match Embeddings::from_config(config).await {
+            Ok(model) => model,
+            Err(e) => return caller.unbuilt(AuditAction::Search, detail, &e).await,
+        };
+        let rerank = match Rerank::from_config(config).await {
+            Ok(rerank) => rerank,
+            Err(e) => return caller.unbuilt(AuditAction::Search, detail, &e).await,
+        };
         // Run the search, audit its outcome, then answer — the way the `sql`
         // tool does, so a post-authorization failure is recorded instead of
         // dropped, while tool failures stay normal tool results.
-        let result: Result<Vec<_>, McpError> = async {
-            let embedding = match Embeddings::from_config(&self.inner.config).await {
-                Ok(Some(model)) => {
-                    match model.embed_interactive(&Input::Query(query.clone())).await {
-                        Ok(vector) => Some(vector),
-                        Err(e) => return Err(internal(format!("embedding failed: {e}"))),
-                    }
-                }
-                Ok(None) => None,
-                Err(e) => return Err(internal(format!("embedding provider unavailable: {e}"))),
-            };
-            let text = query.clone();
-            self.reader_db(move |db| {
-                let scope = ChunkScope::all();
-                match embedding.as_ref() {
-                    Some(vector) => db.search_hybrid_chunks(
-                        &text,
-                        vector,
-                        HybridLimits { top_k, rrf_k },
-                        &scope,
-                    ),
-                    None => db.search_keyword_chunks(&text, top_k, &scope),
-                }
-            })
-            .await
-        }
-        .await;
-        let outcome = if result.is_ok() {
-            Outcome::Allowed
-        } else {
-            Outcome::Error
+        let result = search
+            .run(
+                &self.inner.reader,
+                model.as_ref(),
+                rerank.as_ref(),
+                config.retrieval.rrf_k,
+            )
+            .await;
+        let outcome = match &result {
+            Ok(_) => Outcome::Allowed,
+            Err(e) => Outcome::of_failure(e),
         };
         caller
-            .record(
-                AuditAction::Search,
-                None,
-                outcome,
-                Some(serde_json::json!({ "q": query })),
-            )
+            .record(AuditAction::Search, None, outcome, Some(detail))
             .await?;
-        let hits = match result {
-            Ok(hits) => hits,
-            Err(e) => return Ok(failure(e.message)),
-        };
-        Ok(CallToolResult::structured(
-            serde_json::json!({ "chunks": hits }),
-        ))
+        match result {
+            Ok(found) => Ok(CallToolResult::structured(serde_json::json!(
+                found.body(SearchDetail::explained(args.explain))
+            ))),
+            Err(e) => Ok(failure(e.to_string())),
+        }
     }
 
     /// Run one SQL statement. Reads always run; writes need this
@@ -566,7 +609,7 @@ impl McpServer {
                 .await?;
             return Ok(failure(TEMP_OBJECT_REFUSED));
         }
-        if is_write && self.inner.policy != WritePolicy::Allow {
+        if is_write && !self.inner.policy.allows_unasked() {
             caller
                 .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
                 .await?;
@@ -586,6 +629,7 @@ impl McpServer {
             // the statement itself errored, since an earlier statement in
             // a batch can have already run.
             self.inner.reader.observe_write().await;
+            TableProfile::after_write(&self.inner.db).await;
             result
         } else {
             // A read never queues behind a write: run it on the reader
@@ -636,7 +680,7 @@ impl McpServer {
 
     #[tool(
         name = "describe_table",
-        description = "Columns, types, row count, and three sample rows of a table."
+        description = "A table's columns with their types and, when the owner gave them, their meaning, unit, and synonyms; its row count; the owner's note; its profile (per column: values present, distinct values, common values) with warnings such as numbers stored as text or a key that repeats; the measures defined over it; and three sample rows."
     )]
     async fn describe_table(
         &self,
@@ -671,24 +715,30 @@ impl McpServer {
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
-        let query = match GraphQuery::new(
-            args.entity.as_deref(),
-            args.class.as_deref(),
-            args.relation.as_deref(),
-            args.hops,
-        ) {
+        Box::pin(self.as_caller(&caller, self.neighborhood(args, &caller))).await
+    }
+
+    /// `search_graph`, as its caller: embedding the entity's name is a
+    /// model request.
+    async fn neighborhood(
+        &self,
+        args: SearchGraphArgs,
+        caller: &Caller,
+    ) -> Result<CallToolResult, McpError> {
+        let query = match args.query() {
             Ok(query) => query,
             Err(e) => return Ok(failure(e.to_string())),
         };
-        let options = self.inner.config.graph.options();
+        let options = self.inner.config.graph;
         let detail = serde_json::to_value(&query).map_err(internal)?;
+        let model = match Embeddings::from_config(&self.inner.config).await {
+            Ok(model) => model,
+            Err(e) => return caller.unbuilt(AuditAction::Graph, detail, &e).await,
+        };
         // Run, audit the outcome, then answer, the way `sql` does, so a
         // failure after authorization is recorded rather than dropped.
         let result = async {
-            let embedding = query
-                .embedding(self.embedder().await?.as_ref())
-                .await
-                .map_err(internal)?;
+            let embedding = query.embedding(model.as_ref()).await.map_err(internal)?;
             // An unknown class or relation id names the real ones.
             self.reader_db(move |db| query.run(db, embedding.as_ref(), &options))
                 .await
@@ -716,19 +766,26 @@ impl McpServer {
         extensions: Extensions,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
-        let query = match PathQuery::new(&args.from, &args.to, args.max_hops) {
+        Box::pin(self.as_caller(&caller, self.path(args, &caller))).await
+    }
+
+    /// `find_path`, as its caller: embedding each end's name is a model
+    /// request.
+    async fn path(&self, args: FindPathArgs, caller: &Caller) -> Result<CallToolResult, McpError> {
+        let query = match args.query() {
             Ok(query) => query,
             Err(e) => return Ok(failure(e.to_string())),
         };
-        let options = self.inner.config.graph.options();
+        let options = self.inner.config.graph;
         let detail = serde_json::to_value(&query).map_err(internal)?;
         let PathQuery { from, to, max_hops } = query.clone();
+        let model = match Embeddings::from_config(&self.inner.config).await {
+            Ok(model) => model,
+            Err(e) => return caller.unbuilt(AuditAction::Graph, detail, &e).await,
+        };
         // Run, audit the outcome, then answer (see `search_graph`).
         let result = async {
-            let ends = query
-                .embeddings(self.embedder().await?.as_ref())
-                .await
-                .map_err(internal)?;
+            let ends = query.embeddings(model.as_ref()).await.map_err(internal)?;
             // An end that names no entity comes back with the closest labels.
             self.reader_db(move |db| query.run(db, &ends, &options))
                 .await
@@ -774,11 +831,18 @@ impl McpServer {
 }
 
 impl McpServer {
-    /// The embedding model, for fuzzy entity resolution; `None` without one.
-    async fn embedder(&self) -> Result<Option<Embeddings>, McpError> {
-        Embeddings::from_config(&self.inner.config)
-            .await
-            .map_err(internal)
+    /// Run a tool's `work` as its caller: acting for the request's user,
+    /// and sending only to the model providers the workspace allows (over
+    /// HTTP, as the request found the workspace; over stdio, as the command
+    /// opened it). rmcp runs each call on a task of its own, so neither
+    /// scope reaches it from the request.
+    async fn as_caller<F: Future>(&self, caller: &Caller, work: F) -> F::Output {
+        let workspace = match caller {
+            Caller::Unaudited => &self.inner.workspace,
+            Caller::Audited { caller, .. } => &caller.access.membership.workspace,
+        };
+        let egress = Egress::Workspace(workspace.allowed_providers.clone());
+        Acting::scope(caller.acting(), Egress::scope(Some(egress), work)).await
     }
 
     /// The session a `query` call appends to: the requested one when it
@@ -840,19 +904,7 @@ impl McpServer {
                 db.describe_table(&table).map(Some)
             })
             .await?;
-        Ok(described.map(|d| {
-            let columns: Vec<serde_json::Value> = d
-                .columns
-                .iter()
-                .map(|c| serde_json::json!({ "name": c.name, "type": c.column_type }))
-                .collect();
-            serde_json::json!({
-                "table": d.table_name,
-                "columns": columns,
-                "row_count": d.row_count,
-                "sample": { "columns": d.sample_rows.columns, "rows": d.sample_rows.rows },
-            })
-        }))
+        Ok(described.map(|d| serde_json::json!(d.body())))
     }
 
     async fn resource_text(
@@ -872,6 +924,9 @@ impl McpServer {
                 Some(ontology) => ontology.to_json().map_err(internal)?,
                 None => String::from("{}"),
             },
+            WorkspaceResource::OntologySchema => {
+                serde_json::to_string(&Ontology::json_schema()).map_err(internal)?
+            }
             WorkspaceResource::Context => {
                 let current = self.reader_db(context::current).await?;
                 current.map(|c| c.content).unwrap_or_default()
@@ -1000,307 +1055,4 @@ pub(crate) async fn serve_stdio(
 }
 
 #[cfg(test)]
-mod tests {
-    use quack_core::storage::writer::Writer;
-
-    use quack_core::config::Config;
-
-    use super::*;
-    use quack_core::ids::WorkspaceId;
-    use quack_core::storage::control::AllowedProviders;
-
-    #[expect(clippy::panic, reason = "test failure path")]
-    fn fail(msg: &str) -> ! {
-        panic!("{msg}")
-    }
-
-    fn server(dir: &std::path::Path, policy: WritePolicy) -> McpServer {
-        let mut config = Config::default();
-        config.general.data_dir = dir.to_path_buf();
-        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
-        let reader = ReaderDb::new(Arc::clone(&db));
-        McpServer::new(McpSetup {
-            config,
-            db,
-            reader,
-            workspace: WorkspaceRow {
-                id: WorkspaceId::from("ws"),
-                name: String::from("stdio"),
-                classification: String::from("internal"),
-                allowed_providers: AllowedProviders::All,
-            },
-            policy,
-            user_id: None,
-            auditor: Auditor::None,
-        })
-    }
-
-    fn field(result: &CallToolResult, key: &str) -> serde_json::Value {
-        result
-            .structured_content
-            .as_ref()
-            .and_then(|v| v.get(key))
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn error_text(result: &CallToolResult) -> String {
-        assert_eq!(result.is_error, Some(true));
-        result
-            .content
-            .iter()
-            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-            .collect()
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn stdio_tools_gate_writes_and_serve_resources() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let read_only = server(dir.path(), WritePolicy::Deny);
-        let denied = read_only
-            .sql(
-                Parameters(SqlArgs {
-                    sql: String::from("CREATE TABLE t AS SELECT 1 AS n"),
-                }),
-                Extensions::default(),
-            )
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert!(error_text(&denied).contains("cannot write"));
-        let internal = read_only
-            .sql(
-                Parameters(SqlArgs {
-                    sql: String::from("SELECT * FROM _quack_documents"),
-                }),
-                Extensions::default(),
-            )
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert!(error_text(&internal).contains("internal tables"));
-        let bad = read_only
-            .sql(
-                Parameters(SqlArgs {
-                    sql: String::from("SELEC 1"),
-                }),
-                Extensions::default(),
-            )
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert_eq!(bad.is_error, Some(true));
-
-        let writer = server(dir.path(), WritePolicy::Allow);
-        let created = writer
-            .sql(
-                Parameters(SqlArgs {
-                    sql: String::from("CREATE TABLE t AS SELECT 1 AS n UNION ALL SELECT 2"),
-                }),
-                Extensions::default(),
-            )
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert_eq!(created.is_error, Some(false));
-        let tables = writer
-            .list_tables(Extensions::default())
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert_eq!(field(&tables, "tables"), serde_json::json!(["t"]));
-        let described = writer
-            .describe_table(
-                Parameters(DescribeTableArgs {
-                    table: String::from("t"),
-                }),
-                Extensions::default(),
-            )
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert_eq!(field(&described, "row_count"), 2);
-        assert_eq!(
-            field(&described, "columns")
-                .get(0)
-                .and_then(|c| c.get("name")),
-            Some(&serde_json::json!("n"))
-        );
-        let missing = writer
-            .describe_table(
-                Parameters(DescribeTableArgs {
-                    table: String::from("zz"),
-                }),
-                Extensions::default(),
-            )
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert!(error_text(&missing).contains("no table"));
-        let documents = writer
-            .list_documents(Extensions::default())
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert_eq!(field(&documents, "documents"), serde_json::json!([]));
-        let empty = writer
-            .search(
-                Parameters(SearchArgs {
-                    query: String::from("  "),
-                    top_k: None,
-                }),
-                Extensions::default(),
-            )
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert_eq!(empty.is_error, Some(true));
-    }
-
-    /// `query` with a model that cannot answer: the failure is reported,
-    /// the session it made is gone, and the next call is not stuck on a
-    /// deleted session id. A session the caller named survives the
-    /// failure, and a session nobody made is refused.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut config = Config::parse(
-            "[general]\nchat_model = \"o/m\"\n[providers.o]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
-        )
-        .unwrap_or_else(|e| fail(&e.to_string()));
-        config.general.data_dir = dir.path().to_path_buf();
-        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
-        let reader = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
-        let server = McpServer::new(McpSetup {
-            config,
-            db: Arc::clone(&db),
-            reader,
-            workspace: WorkspaceRow {
-                id: WorkspaceId::from("ws"),
-                name: String::from("stdio"),
-                classification: String::from("internal"),
-                allowed_providers: AllowedProviders::All,
-            },
-            policy: WritePolicy::Deny,
-            user_id: None,
-            auditor: Auditor::None,
-        });
-        let ask = |session_id: Option<&str>, mode: Option<&str>| {
-            Parameters(QueryArgs {
-                question: String::from("how many?"),
-                session_id: session_id.map(str::to_owned),
-                mode: mode.map(str::to_owned),
-            })
-        };
-        let session_count = || async {
-            db.run(|db| sessions::list_sessions(db, 10))
-                .await
-                .unwrap_or_else(|e| fail(&e.to_string()))
-                .len()
-        };
-
-        for _ in 0..2 {
-            let failed = server
-                .query(ask(None, None), Extensions::default())
-                .await
-                .unwrap_or_else(|e| fail(&e.message));
-            let text = error_text(&failed);
-            assert!(text.contains("the agent turn failed"), "{text}");
-            assert!(!text.contains("does not exist"), "{text}");
-            assert_eq!(session_count().await, 0);
-        }
-
-        let bad_mode = server
-            .query(ask(None, Some("loud")), Extensions::default())
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert!(
-            error_text(&bad_mode).contains("unknown mode 'loud'; use one of: chat, query"),
-            "{}",
-            error_text(&bad_mode)
-        );
-
-        let unknown = server
-            .query(ask(Some("nope"), None), Extensions::default())
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert!(error_text(&unknown).contains("does not exist"));
-
-        let existing = db
-            .run(|db| sessions::create_session(db, "o/m", ChatMode::Chat, None))
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()))
-            .id;
-        let failed = server
-            .query(
-                ask(Some(existing.as_str()), Some("query")),
-                Extensions::default(),
-            )
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert!(error_text(&failed).contains("the agent turn failed"));
-        let kept = db
-            .run(move |db| sessions::get_session(db, &existing))
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        // The mode given with an existing session id does not change it.
-        assert_eq!(kept.map(|s| s.mode), Some(ChatMode::Chat));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn stdio_resources_render_tables_context_and_schemas() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let writer = server(dir.path(), WritePolicy::Allow);
-        let created = writer
-            .sql(
-                Parameters(SqlArgs {
-                    sql: String::from("CREATE TABLE t AS SELECT 1 AS n UNION ALL SELECT 2"),
-                }),
-                Extensions::default(),
-            )
-            .await
-            .unwrap_or_else(|e| fail(&e.message));
-        assert_eq!(created.is_error, Some(false));
-        assert_eq!(
-            writer
-                .resource_text(WorkspaceResource::Tables)
-                .await
-                .unwrap_or_else(|e| fail(&e.message))
-                .as_deref(),
-            Some("{\"tables\":[\"t\"]}")
-        );
-        assert_eq!(
-            writer
-                .resource_text(WorkspaceResource::Context)
-                .await
-                .unwrap_or_else(|e| fail(&e.message))
-                .as_deref(),
-            Some("")
-        );
-        assert!(
-            writer
-                .resource_text(WorkspaceResource::Schema("t"))
-                .await
-                .unwrap_or_else(|e| fail(&e.message))
-                .is_some_and(|t| t.contains("\"row_count\":2"))
-        );
-        assert_eq!(
-            writer
-                .resource_text(WorkspaceResource::Schema("zz"))
-                .await
-                .unwrap_or_else(|e| fail(&e.message)),
-            None
-        );
-        let info = writer.get_info();
-        assert!(info.instructions.is_some_and(|i| i.contains("'stdio'")));
-    }
-
-    #[test]
-    fn resource_uris_round_trip() {
-        let schema = WorkspaceResource::Schema("orders");
-        for resource in WorkspaceResource::FIXED.into_iter().chain([schema]) {
-            assert_eq!(WorkspaceResource::parse(&resource.uri()), Some(resource));
-        }
-        assert_eq!(
-            schema.uri(),
-            "quack://workspace/tables/orders/schema",
-            "the template's shape"
-        );
-        assert_eq!(WorkspaceResource::parse("quack://elsewhere"), None);
-        assert_eq!(WorkspaceResource::parse("quack://workspace/tables/t"), None);
-        assert_eq!(WorkspaceResource::parse("quack://workspace/sessions"), None);
-    }
-}
+mod tests;

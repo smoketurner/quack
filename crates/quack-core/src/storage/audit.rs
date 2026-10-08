@@ -8,7 +8,7 @@
 use crate::error::Result;
 use crate::ids::{AuditId, UserId};
 use crate::storage::workspace::WorkspaceDb;
-use crate::storage::writer::Writer;
+use crate::storage::writer::{Lease, Writer};
 
 /// The workspace's insert-only audit connection (design doc 4.1): a clone
 /// of the writer's connection on a thread of its own that only ever
@@ -37,6 +37,15 @@ impl AuditLog {
     /// Returns an error if the insert fails.
     pub async fn record(&self, detail: AuditDetail) -> Result<()> {
         self.0.run(move |db| detail.write(db)).await
+    }
+
+    /// The audit connection, lent as [`Writer::lend`] lends the writer's.
+    ///
+    /// # Errors
+    ///
+    /// When the audit connection's thread has stopped.
+    pub async fn lend(&self) -> Result<Lease> {
+        self.0.lend().await
     }
 }
 
@@ -73,7 +82,7 @@ impl AuditDetail {
 }
 
 /// A stored detail row.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AuditDetailRow {
     pub id: AuditId,
     pub timestamp: String,

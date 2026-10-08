@@ -25,9 +25,12 @@ use anyhow::Context;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, MatchedPath};
 use axum::http::{HeaderValue, Request, StatusCode, header};
+use axum::response::IntoResponse;
 use axum::routing::get;
 use quack_core::DUCK;
 use quack_core::config::Config;
+use quack_core::jobs::webhook::Webhook;
+use quack_core::telemetry;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::KeyExtractor;
 use tower_governor::{GovernorError, GovernorLayer};
@@ -39,6 +42,7 @@ use tower_http::trace::TraceLayer;
 
 use oidc::Oidc;
 use quack_core::llm::acting::Acting;
+use quack_core::llm::egress::Egress;
 use quack_core::llm::oauth::KeySource;
 use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::llm::oauth::registration::{ClientSection, registered_sections};
@@ -50,14 +54,15 @@ use state::{App, AppState, ServeMode};
 /// How long one request may take. Agent turns can be slow.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Rate limit per peer address ([`CallerKey`]): sustained rate and burst.
-const RATE_PER_SECOND: u64 = 1;
+/// Rate limit per peer address ([`CallerKey`]): one request back every
+/// period, up to the burst.
+const RATE_PERIOD: Duration = Duration::from_secs(1);
 const RATE_BURST: u32 = 120;
 
 /// The same, for the two endpoints that check a password. The general limit
 /// is sized for a browsing session and is far too loose to make password
 /// guessing expensive, so the login routes carry their own (issue #73).
-const LOGIN_RATE_PER_SECOND: u64 = 2;
+const LOGIN_RATE_PERIOD: Duration = Duration::from_secs(2);
 const LOGIN_RATE_BURST: u32 = 10;
 
 /// How often a limiter drops the per-key state that has fallen back to a
@@ -107,8 +112,12 @@ impl MakeRequestId for RequestIdV7 {
 /// one alike (issue #237). The peer address is the one thing a caller cannot
 /// choose per request. The price is that everyone behind one address (a NAT,
 /// or a reverse proxy in front of quack) shares one budget.
+///
+/// Behind a proxy in `[server].trusted_proxies`, the key is the client the
+/// proxy's forwarded headers name (`TrustedProxies::client_ip`), so an organization
+/// behind one proxy is not one bucket.
 #[derive(Clone)]
-struct CallerKey;
+struct CallerKey(App);
 
 impl KeyExtractor for CallerKey {
     type Key = std::net::IpAddr;
@@ -120,7 +129,11 @@ impl KeyExtractor for CallerKey {
             .extensions()
             .get::<axum::extract::ConnectInfo<SocketAddr>>()
             .map_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |c| {
-                c.0.ip()
+                self.0
+                    .config
+                    .server
+                    .trusted_proxies
+                    .client_ip(c.0.ip(), req.headers())
             }))
     }
 }
@@ -129,12 +142,13 @@ impl KeyExtractor for CallerKey {
 /// bucket, so a browser hammering the form cannot spend the budget the API
 /// login would have had, or the other way round.
 pub(crate) fn throttled_login(
+    app: &App,
     route: axum::routing::MethodRouter<App>,
 ) -> axum::routing::MethodRouter<App> {
     let config = GovernorConfigBuilder::default()
-        .per_second(LOGIN_RATE_PER_SECOND)
+        .period(LOGIN_RATE_PERIOD)
         .burst_size(LOGIN_RATE_BURST)
-        .key_extractor(CallerKey)
+        .key_extractor(CallerKey(Arc::clone(app)))
         .finish()
         .map(Arc::new);
     let Some(config) = config else {
@@ -153,9 +167,9 @@ pub(crate) fn router(app: App) -> Router {
         .unwrap_or(usize::MAX)
         .saturating_mul(1024 * 1024);
     let governor = GovernorConfigBuilder::default()
-        .per_second(RATE_PER_SECOND)
+        .period(RATE_PERIOD)
         .burst_size(RATE_BURST)
-        .key_extractor(CallerKey)
+        .key_extractor(CallerKey(Arc::clone(&app)))
         .finish()
         .map(Arc::new);
     // Everything a caller can reach is rate limited, not just the API: the
@@ -170,8 +184,8 @@ pub(crate) fn router(app: App) -> Router {
             &format!("{}/{{*path}}", resource::METADATA_PATH),
             get(resource::metadata_for),
         )
-        .nest("/api/v1", api::router())
-        .merge(web::router());
+        .nest("/api/v1", api::router(&app).into_router())
+        .merge(web::router(&app));
     if let Some(config) = governor {
         let limiter = Arc::clone(config.limiter());
         spawn_cleanup(RATE_CLEANUP_INTERVAL, move || limiter.retain_recent());
@@ -183,14 +197,27 @@ pub(crate) fn router(app: App) -> Router {
             web::flash::keep,
         ))
         .layer(axum::middleware::map_response(no_store))
+        .layer(axum::middleware::from_fn(same_origin))
         // Every request gets an empty acting slot, which the identity
-        // extractor fills once it knows the caller.
-        .layer(axum::middleware::from_fn(acting_slot));
+        // extractor fills once it knows the caller, and an empty egress
+        // slot, which `Access::resolve` fills with the workspace's
+        // provider allow-list.
+        .layer(axum::middleware::from_fn(request_slots));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        // Readiness and metrics stay outside the limiter too: a watcher
+        // that is throttled reads a live server as dead.
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
+        // The API's description reveals no workspace content: no sign-in,
+        // no audit row, and no limiter, like the static assets.
+        .route(api::openapi::DOCUMENT_PATH, get(api::openapi::document))
+        .route(api::openapi::PAGE_PATH, get(api::openapi::page))
         .merge(web::assets())
         .merge(limited)
+        .layer(axum::middleware::map_response(security_headers))
         .layer(DefaultBodyLimit::max(upload_limit))
+        .layer(axum::middleware::from_fn(record_request))
         // One span per request, carrying the id the request-id layer set
         // (it is the outer layer, so the header exists here); the response
         // event carries status and latency.
@@ -221,7 +248,10 @@ pub(crate) fn router(app: App) -> Router {
                     |response: &axum::http::Response<_>,
                      latency: Duration,
                      _span: &tracing::Span| {
+                        // The access log, on its own target so it can be
+                        // turned on alone: `RUST_LOG=quack::access=debug`.
                         tracing::debug!(
+                            target: "quack::access",
                             latency_ms = latency.as_millis(),
                             status = response.status().as_u16(),
                             "finished processing request"
@@ -233,6 +263,8 @@ pub(crate) fn router(app: App) -> Router {
             StatusCode::GATEWAY_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
+        // Outside the timeout and the limiter, so their errors get a code too.
+        .layer(axum::middleware::from_fn(error::coded_errors))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(RequestIdV7))
         .with_state(app)
@@ -252,6 +284,31 @@ async fn no_store(mut response: axum::response::Response) -> axum::response::Res
         );
         headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
         headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    }
+    response
+}
+
+/// What the browser may load and run for any page: scripts and data only
+/// from this server, images only from it or inline, never framed. The web
+/// UI's scripts are all files under `/static`; styles may be inline, which
+/// `ECharts`, htmx's indicators, and Redoc write.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; \
+     style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; \
+     connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; \
+     frame-ancestors 'none'";
+
+/// The headers every response carries so a browser does not guess types,
+/// leak paths to other sites, or run what a page did not ship.
+async fn security_headers(mut response: axum::response::Response) -> axum::response::Response {
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "same-origin"),
+    ] {
+        if !headers.contains_key(&name) {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
     }
     response
 }
@@ -330,12 +387,138 @@ impl fmt::Display for Banner<'_> {
     }
 }
 
-/// Run the rest of the request with an acting slot of its own.
-async fn acting_slot(
+/// Count the request and its latency under the route's template, never
+/// its path (a path can name workspace content); an unmatched path counts
+/// as `-`.
+async fn record_request(
     request: Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    Acting::request(next.run(request)).await
+    let method = request.method().to_string();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| String::from("-"), |m| m.as_str().to_owned());
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    telemetry::http_request(
+        &method,
+        &route,
+        response.status().as_u16(),
+        started.elapsed(),
+    );
+    response
+}
+
+/// `GET /readyz`: whether this server can serve, component by component:
+/// `control.db` answers, the data directory takes a write, and the vault
+/// key opens. 200 with every check `ok`, else 503 naming the failed ones.
+async fn readyz(axum::extract::State(app): axum::extract::State<App>) -> axum::response::Response {
+    let readiness = app.readiness().await;
+    let status = if readiness.ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, axum::Json(readiness)).into_response()
+}
+
+/// `GET /metrics`: the Prometheus text, to loopback or to an admin's
+/// bearer; anyone else gets 403. The gauges are read as the page is made.
+async fn metrics(
+    axum::extract::State(app): axum::extract::State<App>,
+    peer: auth::Peer,
+    identity: Result<auth::Identity, error::ApiError>,
+) -> axum::response::Response {
+    let local = peer.0.is_some_and(|ip| ip.is_loopback());
+    if !local {
+        match identity {
+            Ok(identity) => {
+                if let Err(e) = identity.require_admin() {
+                    return e.into_response();
+                }
+            }
+            Err(e) => return e.into_response(),
+        }
+    }
+    app.refresh_gauges().await;
+    let Some(text) = telemetry::render() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "metrics are not recorded").into_response();
+    };
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        text,
+    )
+        .into_response()
+}
+
+/// Run the rest of the request with an acting slot and an egress slot of
+/// its own.
+/// Refuse a state-changing request a browser sent from another site: a
+/// form or script elsewhere can make the browser post with the session
+/// cookie, or, in local mode, with no credential at all. A request with a
+/// bearer token is the caller's own; one without an `Origin` or `Referer`
+/// header did not come from a page (curl, a script) and passes; otherwise
+/// the header's host must be the host the request was sent to.
+async fn same_origin(
+    request: Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if CrossSite::of(&request).is_some() {
+        return error::ApiError::forbidden(
+            "a request from another site may not change anything here",
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
+/// A state-changing request from a page on another host.
+struct CrossSite;
+
+impl CrossSite {
+    fn of(request: &Request<axum::body::Body>) -> Option<Self> {
+        let safe = matches!(
+            *request.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+        );
+        let headers = request.headers();
+        if safe || headers.contains_key(header::AUTHORIZATION) {
+            return None;
+        }
+        let page = headers
+            .get(header::ORIGIN)
+            .or_else(|| headers.get(header::REFERER))?
+            .to_str()
+            .ok()?;
+        let from = page.parse::<axum::http::Uri>().ok();
+        let from = from.as_ref().and_then(axum::http::Uri::authority);
+        let to = headers
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .or_else(|| {
+                request
+                    .uri()
+                    .authority()
+                    .map(axum::http::uri::Authority::as_str)
+            });
+        match (from, to) {
+            (Some(from), Some(to)) if from.as_str().eq_ignore_ascii_case(to) => None,
+            // An `Origin: null` (a sandboxed frame, a redirect) or an
+            // unreadable header is a page this server cannot vouch for.
+            _ => Some(Self),
+        }
+    }
+}
+
+async fn request_slots(
+    request: Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    Acting::request(Egress::request(next.run(request))).await
 }
 
 /// Bind and serve until Ctrl-C.
@@ -412,23 +595,37 @@ pub(crate) async fn serve(
         out.flush()?;
     }
     let app = Arc::new(AppState::new(config, control, mode, sessions, oidc));
+    // Finished jobs go to the operator's endpoint, when one is configured;
+    // a webhook that cannot sign stops the server before it listens.
+    if let Some(hook) =
+        Webhook::from_config(app.config.server.webhooks.as_ref()).context("[server.webhooks]")?
+    {
+        drop(hook.spawn(app.jobs.subscribe()));
+    }
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot listen on {addr}"))?;
     tracing::info!(%addr, ?mode, "quack serve listening");
-    axum::serve(
-        listener,
-        router(app).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("server error")?;
+    let mut server = Box::pin(
+        axum::serve(
+            listener,
+            router(Arc::clone(&app)).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(app.stopping.clone().cancelled_owned())
+        .into_future(),
+    );
+    tokio::select! {
+        served = &mut server => return served.context("server error"),
+        () = shutdown_signal() => {}
+    }
+    let served = app.stop(server).await;
     tracing::info!("stopped");
-    Ok(())
+    served.context("server error")
 }
 
 /// Resolve on Ctrl-C or, on Unix, SIGTERM (what containers and systemd
-/// send). In-flight requests finish; new connections are refused.
+/// send). The server then stops: new connections are refused, jobs are
+/// cancelled, and in-flight requests get `[server].shutdown_grace_seconds`.
 async fn shutdown_signal() {
     let ctrl_c = async {
         drop(tokio::signal::ctrl_c().await);
@@ -448,7 +645,7 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! {
-        () = ctrl_c => tracing::info!("received Ctrl-C; finishing in-flight requests"),
-        () = terminate => tracing::info!("received SIGTERM; finishing in-flight requests"),
+        () = ctrl_c => tracing::info!("received Ctrl-C; cancelling jobs and finishing in-flight requests"),
+        () = terminate => tracing::info!("received SIGTERM; cancelling jobs and finishing in-flight requests"),
     }
 }

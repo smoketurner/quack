@@ -24,6 +24,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::Stream;
@@ -34,10 +35,15 @@ use rig::http_client::{
 use tokio::sync::oneshot;
 
 use super::bedrock::Signer;
-use crate::config::{BaseUrl, ProviderConfig, ProviderName, RequestLimit};
+use super::egress::Egress;
+use crate::config::{
+    BaseUrl, ProviderConfig, ProviderName, ProviderType, RequestLimit, RetryPolicy,
+};
 use crate::error::{self, Error};
 
 use crate::priority::Priority;
+use crate::proxy::Proxies;
+use crate::telemetry;
 
 /// Permits of one provider and model, handed to interactive waiters first.
 struct Gate {
@@ -175,17 +181,97 @@ impl GateKey {
 }
 
 /// A provider's gates, one per model, shared process-wide by every client
-/// built for it. `Default` is unlimited.
+/// built for it. Every model request quack sends passes [`Self::permit`],
+/// so it is also where the workspace's provider allow-list is enforced.
+/// `Default` names no provider: unlimited and unchecked.
 #[derive(Clone, Default)]
 pub(crate) struct ProviderGates {
-    /// The provider and its limit, or `None` for the unlimited default.
-    provider: Option<(ProviderKey, RequestLimit)>,
+    /// The provider, or `None` for the default.
+    provider: Option<Gated>,
+}
+
+/// The provider a set of gates belongs to.
+#[derive(Clone)]
+struct Gated {
+    key: ProviderKey,
+    kind: ProviderType,
+    limit: RequestLimit,
+}
+
+/// How a request's attempts are counted and waited out: the provider's
+/// `RetryPolicy`, and its name for the log and the metrics.
+#[derive(Clone, Debug)]
+pub(crate) struct Attempts {
+    provider: String,
+    policy: RetryPolicy,
+}
+
+impl Attempts {
+    pub(crate) fn new(name: &ProviderName, policy: RetryPolicy) -> Self {
+        Self {
+            provider: name.to_string(),
+            policy,
+        }
+    }
+
+    /// Whether `status` is worth another attempt, and how long to wait
+    /// first: `Retry-After` in seconds when the response names it, else
+    /// the policy's backoff for retry `attempt`. `None` when the response
+    /// stands (a success, a client error) or the attempts are used up.
+    fn wait_for_status(
+        &self,
+        attempt: u32,
+        status: http::StatusCode,
+        headers: &http::HeaderMap,
+    ) -> Option<Duration> {
+        if attempt >= self.policy.max_retries
+            || !rig::error::retryable_status(Some(status.as_u16()))
+        {
+            return None;
+        }
+        let named = headers
+            .get(http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .filter(|d| *d <= RetryPolicy::MAX_WAIT);
+        Some(named.unwrap_or_else(|| self.policy.next_wait(attempt.saturating_add(1))))
+    }
+
+    /// Whether a failure is worth another attempt, and the wait: a failing
+    /// status (rig's client turns one into an error, headers kept) as for
+    /// a response, a dropped transport by the backoff.
+    fn wait_for_error(&self, attempt: u32, error: &http_client::Error) -> Option<Duration> {
+        if let http_client::Error::InvalidStatusCodeWithDetails {
+            status, headers, ..
+        } = error
+        {
+            return self.wait_for_status(attempt, *status, headers);
+        }
+        if attempt >= self.policy.max_retries || !rig::error::transient_transport(error) {
+            return None;
+        }
+        Some(self.policy.next_wait(attempt.saturating_add(1)))
+    }
+
+    /// Note a retry: one `warn!` per attempt, and the counter.
+    fn note(&self, model: Option<&str>, attempt: u32, wait: Duration, why: &str) {
+        tracing::warn!(
+            provider = %self.provider,
+            model = model.unwrap_or("-"),
+            attempt = attempt.saturating_add(1),
+            of = self.policy.max_retries,
+            wait_ms = wait.as_millis(),
+            "{why}; retrying the model request"
+        );
+        telemetry::provider_retry(&self.provider, model);
+    }
 }
 
 impl std::fmt::Debug for ProviderGates {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderGates")
-            .field("limit", &self.provider.as_ref().map(|(_, limit)| *limit))
+            .field("limit", &self.provider.as_ref().map(|gated| gated.limit))
             .finish_non_exhaustive()
     }
 }
@@ -194,28 +280,40 @@ impl ProviderGates {
     /// The gates of provider `name`.
     pub(crate) fn for_provider(name: &ProviderName, provider: &ProviderConfig) -> Self {
         Self {
-            provider: Some((
-                ProviderKey {
+            provider: Some(Gated {
+                key: ProviderKey {
                     name: name.clone(),
                     base_url: provider.base_url.clone(),
                 },
-                provider.request_limit(),
-            )),
+                kind: provider.provider_type,
+                limit: provider.request_limit(),
+            }),
         }
     }
 
-    /// Wait for a permit of `model`'s gate at the calling task's priority
-    /// (read now, not when the future first runs); `None` when unlimited.
+    /// Check the request against the calling task's [`Egress`], then wait
+    /// for a permit of `model`'s gate at its priority (both read now, not
+    /// when the future first runs); `None` when unlimited.
+    ///
+    /// # Errors
+    ///
+    /// The future returns [`Egress::permit`]'s refusal, and the request must
+    /// not be sent.
     pub(crate) fn permit(
         &self,
         model: Option<String>,
-    ) -> impl Future<Output = Option<GatePermit>> + Send + 'static {
+    ) -> impl Future<Output = error::Result<Option<GatePermit>>> + Send + 'static {
+        let permitted = match &self.provider {
+            Some(gated) => Egress::permit(&gated.key.name, gated.kind, model.as_deref()),
+            None => Ok(()),
+        };
         let gate = self.gate(model);
         let priority = Priority::current();
         async move {
+            permitted?;
             match gate {
-                Some(gate) => Some(gate.acquire(priority).await),
-                None => None,
+                Some(gate) => Ok(Some(gate.acquire(priority).await)),
+                None => Ok(None),
             }
         }
     }
@@ -223,11 +321,12 @@ impl ProviderGates {
     /// The gate for `model`, created with this client's limit on first use;
     /// a later config for the same provider in one process keeps the first.
     fn gate(&self, model: Option<String>) -> Option<Arc<Gate>> {
-        let (provider, limit) = self.provider.as_ref()?;
+        let gated = self.provider.as_ref()?;
         let key = GateKey {
-            provider: provider.clone(),
+            provider: gated.key.clone(),
             model,
         };
+        let limit = gated.limit;
         let mut map = GateKey::registry()
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -248,6 +347,8 @@ pub struct LimitedHttp {
     headers: http::HeaderMap,
     /// Replaces the credential rig set, once the request has its permit.
     authorize: Option<Authorize>,
+    /// How a throttled or failed request is tried again; `None` sends once.
+    attempts: Option<Attempts>,
 }
 
 /// How a client authorizes each request in place of rig's own header.
@@ -283,11 +384,21 @@ impl LimitedHttp {
     #[must_use]
     pub fn for_provider(name: &ProviderName, provider: &ProviderConfig) -> Self {
         Self {
-            inner: ReqwestClient::from(reqwest::Client::default()),
+            // A client that cannot be built is a TLS setup failure, which
+            // reqwest's default client meets the same way.
+            inner: ReqwestClient::from(Proxies::from_env().client().build().unwrap_or_default()),
             gates: ProviderGates::for_provider(name, provider),
             headers: http::HeaderMap::new(),
             authorize: None,
+            attempts: Some(Attempts::new(name, provider.retry)),
         }
+    }
+
+    /// The provider's name for the metrics, `-` for the default client.
+    fn provider_name(&self) -> String {
+        self.attempts
+            .as_ref()
+            .map_or_else(|| String::from("-"), |a| a.provider.clone())
     }
 
     /// This client, sending `headers` (a provider's `headers`) on every
@@ -381,6 +492,32 @@ impl Stream for Holding {
     }
 }
 
+/// The parts of a request that every attempt is rebuilt from: the
+/// headers and body as rig gave them, before the provider's headers and
+/// credential go on (a signature is time-bound, so each attempt signs
+/// anew).
+struct Blueprint {
+    parts: http::request::Parts,
+    body: Bytes,
+}
+
+impl Blueprint {
+    /// A fresh request: `Parts` is not `Clone`, so one is rebuilt from the
+    /// method, URI, version, and headers.
+    fn request(&self) -> Request<Bytes> {
+        let mut builder = Request::builder()
+            .method(self.parts.method.clone())
+            .uri(self.parts.uri.clone())
+            .version(self.parts.version);
+        for (name, value) in &self.parts.headers {
+            builder = builder.header(name, value);
+        }
+        builder
+            .body(self.body.clone())
+            .unwrap_or_else(|_| Request::new(self.body.clone()))
+    }
+}
+
 impl HttpClientExt for LimitedHttp {
     fn send<T, U>(
         &self,
@@ -395,15 +532,78 @@ impl HttpClientExt for LimitedHttp {
         // is chosen by the model it names.
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
-        let permit = self.gates.permit(GateKey::model_of(&body));
+        let model = GateKey::model_of(&body);
+        let permit = self.gates.permit(model.clone());
+        let gates = self.gates.clone();
         let authorize = self.authorize.clone();
         let headers = self.headers.clone();
+        let attempts = self.attempts.clone();
+        let provider = self.provider_name();
         async move {
-            let permit = permit.await;
-            let request =
-                Self::prepare(authorize, &headers, Request::from_parts(parts, body)).await?;
-            let response = inner.send(request).await?;
-            Ok(body_holding(response, permit))
+            let waited = Instant::now();
+            let mut permit = permit.await.map_err(http_client::Error::instance)?;
+            telemetry::provider_permit_wait(&provider, model.as_deref(), waited.elapsed());
+            let blueprint = Blueprint { parts, body };
+            let mut attempt = 0_u32;
+            loop {
+                let request =
+                    Self::prepare(authorize.clone(), &headers, blueprint.request()).await?;
+                let started = Instant::now();
+                match inner.send(request).await {
+                    Ok(response) => {
+                        let status = response.status();
+                        telemetry::provider_request(
+                            &provider,
+                            model.as_deref(),
+                            status.as_str(),
+                            started.elapsed(),
+                        );
+                        let again = attempts
+                            .as_ref()
+                            .and_then(|a| a.wait_for_status(attempt, status, response.headers()));
+                        let Some(wait) = again else {
+                            return Ok(body_holding(response, permit));
+                        };
+                        if let Some(a) = &attempts {
+                            a.note(model.as_deref(), attempt, wait, &format!("HTTP {status}"));
+                        }
+                        // The backoff waits without the permit: an interactive
+                        // request should not queue behind a throttled one.
+                        drop(permit);
+                        tokio::time::sleep(wait).await;
+                        permit = gates
+                            .permit(model.clone())
+                            .await
+                            .map_err(http_client::Error::instance)?;
+                    }
+                    Err(error) => {
+                        telemetry::provider_request(
+                            &provider,
+                            model.as_deref(),
+                            "error",
+                            started.elapsed(),
+                        );
+                        let again = attempts
+                            .as_ref()
+                            .and_then(|a| a.wait_for_error(attempt, &error));
+                        let Some(wait) = again else {
+                            return Err(error);
+                        };
+                        if let Some(a) = &attempts {
+                            a.note(model.as_deref(), attempt, wait, &error.to_string());
+                        }
+                        // The backoff waits without the permit: an interactive
+                        // request should not queue behind a throttled one.
+                        drop(permit);
+                        tokio::time::sleep(wait).await;
+                        permit = gates
+                            .permit(model.clone())
+                            .await
+                            .map_err(http_client::Error::instance)?;
+                    }
+                }
+                attempt = attempt.saturating_add(1);
+            }
         }
     }
 
@@ -431,12 +631,15 @@ impl HttpClientExt for LimitedHttp {
                 }
                 None => {}
             }
-            let permit = permit.await;
+            let permit = permit.await.map_err(http_client::Error::instance)?;
             let response = inner.send_multipart(req).await?;
             Ok(body_holding(response, permit))
         }
     }
 
+    /// A streamed request is tried again only until its head arrives:
+    /// once the response status is good, the stream is the model's answer
+    /// and a break in it ends the turn rather than restarting it.
     fn send_streaming<T>(
         &self,
         req: Request<T>,
@@ -447,259 +650,86 @@ impl HttpClientExt for LimitedHttp {
         let inner = self.inner.clone();
         let (parts, body) = req.into_parts();
         let body: Bytes = body.into();
-        let permit = self.gates.permit(GateKey::model_of(&body));
+        let model = GateKey::model_of(&body);
+        let permit = self.gates.permit(model.clone());
+        let gates = self.gates.clone();
         let authorize = self.authorize.clone();
         let headers = self.headers.clone();
+        let attempts = self.attempts.clone();
+        let provider = self.provider_name();
         async move {
-            let permit = permit.await;
-            let request =
-                Self::prepare(authorize, &headers, Request::from_parts(parts, body)).await?;
-            let response = inner.send_streaming(request).await?;
-            Ok(response.map(|stream| -> BoxedStream {
-                Box::pin(Holding {
-                    inner: stream,
-                    permit,
-                })
-            }))
+            let waited = Instant::now();
+            let mut permit = permit.await.map_err(http_client::Error::instance)?;
+            telemetry::provider_permit_wait(&provider, model.as_deref(), waited.elapsed());
+            let blueprint = Blueprint { parts, body };
+            let mut attempt = 0_u32;
+            loop {
+                let request =
+                    Self::prepare(authorize.clone(), &headers, blueprint.request()).await?;
+                let started = Instant::now();
+                match inner.send_streaming(request).await {
+                    Ok(response) => {
+                        let status = response.status();
+                        telemetry::provider_request(
+                            &provider,
+                            model.as_deref(),
+                            status.as_str(),
+                            started.elapsed(),
+                        );
+                        let again = attempts
+                            .as_ref()
+                            .and_then(|a| a.wait_for_status(attempt, status, response.headers()));
+                        let Some(wait) = again else {
+                            return Ok(response.map(|stream| -> BoxedStream {
+                                Box::pin(Holding {
+                                    inner: stream,
+                                    permit,
+                                })
+                            }));
+                        };
+                        if let Some(a) = &attempts {
+                            a.note(model.as_deref(), attempt, wait, &format!("HTTP {status}"));
+                        }
+                        // The backoff waits without the permit: an interactive
+                        // request should not queue behind a throttled one.
+                        drop(permit);
+                        tokio::time::sleep(wait).await;
+                        permit = gates
+                            .permit(model.clone())
+                            .await
+                            .map_err(http_client::Error::instance)?;
+                    }
+                    Err(error) => {
+                        telemetry::provider_request(
+                            &provider,
+                            model.as_deref(),
+                            "error",
+                            started.elapsed(),
+                        );
+                        let again = attempts
+                            .as_ref()
+                            .and_then(|a| a.wait_for_error(attempt, &error));
+                        let Some(wait) = again else {
+                            return Err(error);
+                        };
+                        if let Some(a) = &attempts {
+                            a.note(model.as_deref(), attempt, wait, &error.to_string());
+                        }
+                        // The backoff waits without the permit: an interactive
+                        // request should not queue behind a throttled one.
+                        drop(permit);
+                        tokio::time::sleep(wait).await;
+                        permit = gates
+                            .permit(model.clone())
+                            .await
+                            .map_err(http_client::Error::instance)?;
+                    }
+                }
+                attempt = attempt.saturating_add(1);
+            }
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use super::*;
-    use crate::config::{BaseUrl, ProviderType, RequestLimit};
-    use crate::error::Error;
-
-    fn name(text: &str) -> ProviderName {
-        text.parse().unwrap_or_else(|e: Error| fail(&e.to_string()))
-    }
-
-    #[expect(clippy::panic, reason = "test failure path")]
-    fn fail(msg: &str) -> ! {
-        panic!("{msg}")
-    }
-
-    fn provider(kind: ProviderType, limit: Option<u32>, url: &str) -> ProviderConfig {
-        ProviderConfig {
-            base_url: Some(
-                BaseUrl::try_from(url.to_owned()).unwrap_or_else(|e| fail(&e.to_string())),
-            ),
-            max_concurrent_requests: limit.and_then(RequestLimit::new),
-            ..ProviderConfig::new(kind)
-        }
-    }
-
-    /// One HTTP server on loopback answering every request after `delay`,
-    /// counting how many it serves at once.
-    async fn slow_server(delay: Duration) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let addr = listener
-            .local_addr()
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let now = Arc::new(AtomicUsize::new(0));
-        let seen = Arc::clone(&peak);
-        tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
-                let (now, peak) = (Arc::clone(&now), Arc::clone(&peak));
-                tokio::spawn(async move {
-                    let mut buf = [0_u8; 1024];
-                    drop(socket.read(&mut buf).await);
-                    let current = now.fetch_add(1, Ordering::SeqCst).saturating_add(1);
-                    peak.fetch_max(current, Ordering::SeqCst);
-                    tokio::time::sleep(delay).await;
-                    now.fetch_sub(1, Ordering::SeqCst);
-                    drop(
-                        socket
-                            .write_all(
-                                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
-                            )
-                            .await,
-                    );
-                });
-            }
-        });
-        (format!("http://{addr}/"), seen)
-    }
-
-    /// Send `body` (JSON naming a model, or empty) and read the answer.
-    async fn call(client: LimitedHttp, url: String, body: &'static str) -> Bytes {
-        let request = Request::post(url)
-            .body(Bytes::from_static(body.as_bytes()))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let response = client
-            .send::<_, Bytes>(request)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        response
-            .into_body()
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()))
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn requests_to_one_model_never_exceed_its_limit() {
-        use std::sync::atomic::Ordering;
-
-        let (url, peak) = slow_server(Duration::from_millis(150)).await;
-        let limited = LimitedHttp::for_provider(
-            &name("limit-test"),
-            &provider(ProviderType::Openai, Some(2), &url),
-        );
-        // Another client for the same provider shares the gate.
-        let again = LimitedHttp::for_provider(
-            &name("limit-test"),
-            &provider(ProviderType::Openai, Some(2), &url),
-        );
-        let mut calls = Vec::new();
-        for n in 0..6 {
-            let client = if n % 2 == 0 {
-                limited.clone()
-            } else {
-                again.clone()
-            };
-            calls.push(tokio::spawn(call(client, url.clone(), r#"{"model":"m"}"#)));
-        }
-        for call in calls {
-            let body = call.await.unwrap_or_else(|e| fail(&e.to_string()));
-            assert_eq!(&*body, b"ok");
-        }
-        assert_eq!(peak.load(Ordering::SeqCst), 2);
-        let gate = limited
-            .gates
-            .gate(Some(String::from("m")))
-            .unwrap_or_else(|| fail("no gate"));
-        assert_eq!(gate.available(), 2, "every permit came back");
-
-        // Ollama defaults to one at a time, hosted APIs to eight.
-        assert_eq!(
-            provider(ProviderType::Ollama, None, &url)
-                .request_limit()
-                .get(),
-            1
-        );
-        assert_eq!(
-            provider(ProviderType::Anthropic, None, &url)
-                .request_limit()
-                .get(),
-            8
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn each_model_on_a_provider_has_its_own_limit() {
-        use std::sync::atomic::Ordering;
-
-        let (url, peak) = slow_server(Duration::from_millis(200)).await;
-        let client = LimitedHttp::for_provider(
-            &name("per-model"),
-            &provider(ProviderType::Ollama, None, &url),
-        );
-        // A chat model and an embedding model: one each at a time, both at
-        // once.
-        let chat = tokio::spawn(call(client.clone(), url.clone(), r#"{"model":"chat"}"#));
-        let embed = tokio::spawn(call(client.clone(), url.clone(), r#"{"model":"embed"}"#));
-        for handle in [chat, embed] {
-            assert_eq!(
-                &*handle.await.unwrap_or_else(|e| fail(&e.to_string())),
-                b"ok"
-            );
-        }
-        assert_eq!(peak.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            GateKey::model_of(br#"{"model":"x","input":["a"]}"#).as_deref(),
-            Some("x")
-        );
-        assert_eq!(GateKey::model_of(b""), None);
-    }
-
-    #[tokio::test]
-    async fn a_freed_permit_goes_to_interactive_waiters_first() {
-        let gate = Gate::new(1);
-        let held = gate.acquire(Priority::Background).await;
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let mut waiters = Vec::new();
-        for (name, priority) in [
-            ("background 1", Priority::Background),
-            ("background 2", Priority::Background),
-            ("interactive", Priority::Interactive),
-        ] {
-            let (gate, order) = (Arc::clone(&gate), Arc::clone(&order));
-            waiters.push(tokio::spawn(async move {
-                let permit = gate.acquire(priority).await;
-                order
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(name);
-                drop(permit);
-            }));
-            // Queue them in this order.
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        drop(held);
-        for waiter in waiters {
-            assert!(waiter.await.is_ok());
-        }
-        assert_eq!(
-            *order.lock().unwrap_or_else(PoisonError::into_inner),
-            vec!["interactive", "background 1", "background 2"]
-        );
-        assert_eq!(gate.available(), 1);
-
-        // A waiter that gives up is skipped, not handed the permit forever.
-        let held = gate.acquire(Priority::Background).await;
-        let gave_up = tokio::spawn({
-            let gate = Arc::clone(&gate);
-            async move { gate.acquire(Priority::Interactive).await }
-        });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        gave_up.abort();
-        drop(gave_up.await);
-        drop(held);
-        assert_eq!(gate.available(), 1);
-    }
-
-    #[tokio::test]
-    async fn an_oauth_bearer_replaces_the_api_key_header() {
-        let client = LimitedHttp::for_provider(
-            &name("p"),
-            &provider(ProviderType::Anthropic, None, "http://127.0.0.1:9/"),
-        )
-        .with_oauth_bearer("tok-1")
-        .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(!format!("{client:?}").contains("tok-1"));
-        let request = Request::post("http://127.0.0.1:9/v1/messages")
-            .header("x-api-key", "tok-1")
-            .header("anthropic-version", "2023-06-01")
-            .body(Bytes::from_static(b"{}"))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let sent = LimitedHttp::prepare(client.authorize, &client.headers, request)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let headers = sent.headers();
-        assert_eq!(
-            headers
-                .get(http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok()),
-            Some("Bearer tok-1")
-        );
-        assert!(headers.get("x-api-key").is_none());
-        assert!(headers.get("anthropic-version").is_some());
-        assert_eq!(sent.body().as_ref(), b"{}");
-    }
-
-    #[test]
-    fn a_token_that_is_no_header_value_is_refused() {
-        let client = LimitedHttp::default().with_oauth_bearer("tok\n1");
-        assert!(client.is_err_and(|e| e.to_string().contains("not a header value")));
-    }
-}
+mod tests;

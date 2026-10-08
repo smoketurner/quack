@@ -15,14 +15,31 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::llm::{RerankModel, SchemaCall};
-use crate::storage::workspace::ChunkSearchResult;
+use crate::storage::workspace::{ChunkSearchResult, Ranks};
 
 /// Boxed future so implementations can be trait objects.
-pub type RankFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<usize>>> + Send + 'a>>;
+pub type RankFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Ranked>>> + Send + 'a>>;
+
+/// One candidate's place in a reranker's answer: its index among the
+/// candidates, and the score that put it there when the reranker gives one
+/// (a rerank model does; the chat model only orders).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ranked {
+    pub index: usize,
+    pub score: Option<f64>,
+}
+
+impl Ranked {
+    /// A place with no score.
+    #[must_use]
+    pub const fn at(index: usize) -> Self {
+        Self { index, score: None }
+    }
+}
 
 /// Orders retrieval candidates by relevance to a query.
 pub trait Reranker: Send + Sync {
-    /// The candidate indices in relevance order, best first. Indices left
+    /// The candidates in relevance order, best first. Candidates left
     /// out keep their fused order behind the ranked ones; indices out of
     /// range or repeated are ignored.
     fn rank<'a>(&'a self, query: &'a str, candidates: &'a [ChunkSearchResult]) -> RankFuture<'a>;
@@ -31,9 +48,10 @@ pub trait Reranker: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-/// Reorder `candidates` with `reranker` and keep the first `top_k`. A
-/// failure in the reranker keeps the fused order: retrieval must not fail
-/// because ranking did, so the error is logged and the summary says so.
+/// Reorder `candidates` with `reranker` and keep the first `top_k`, each
+/// carrying its rerank place and score. A failure in the reranker keeps the
+/// fused order: retrieval must not fail because ranking did, so the error
+/// is logged and the summary says so.
 pub async fn apply(
     reranker: &dyn Reranker,
     query: &str,
@@ -85,14 +103,39 @@ pub enum RerankOutcome {
     Failed(String),
 }
 
-/// `candidates` in `order`, then the rest in their original order.
-fn reorder(candidates: Vec<ChunkSearchResult>, order: &[usize]) -> Vec<ChunkSearchResult> {
+impl RerankOutcome {
+    /// The outcome as a tool step's summary ends: empty when skipped.
+    #[must_use]
+    pub fn suffix(&self) -> String {
+        match self {
+            Self::Skipped => String::new(),
+            Self::Reranked(name) => format!(", reranked by {name}"),
+            Self::Failed(_) => String::from(", reranking failed"),
+        }
+    }
+
+    /// The outcome for a person reading a search: what ordered the hits.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Skipped => String::from("not reranked"),
+            Self::Reranked(name) => format!("reranked by the {name}"),
+            Self::Failed(e) => format!("reranking failed ({e}); the fused order is kept"),
+        }
+    }
+}
+
+/// `candidates` in `order`, each marked with its place and score, then the
+/// rest in their original order.
+fn reorder(candidates: Vec<ChunkSearchResult>, order: &[Ranked]) -> Vec<ChunkSearchResult> {
     let mut slots: Vec<Option<ChunkSearchResult>> = candidates.into_iter().map(Some).collect();
     let mut out = Vec::with_capacity(slots.len());
-    for &i in order {
-        if let Some(slot) = slots.get_mut(i)
-            && let Some(chunk) = slot.take()
+    for ranked in order {
+        if let Some(slot) = slots.get_mut(ranked.index)
+            && let Some(mut chunk) = slot.take()
         {
+            chunk.ranks.rerank_rank = Some(Ranks::place(out.len()));
+            chunk.ranks.rerank_score = ranked.score;
             out.push(chunk);
         }
     }
@@ -115,12 +158,12 @@ pub struct RerankAnswer {
 impl RerankAnswer {
     /// The order as 0-based indices below `len`; numbers out of range are
     /// dropped.
-    fn indices(&self, len: usize) -> Vec<usize> {
+    fn indices(&self, len: usize) -> Vec<Ranked> {
         self.order
             .iter()
             .map(|&n| usize::from(n))
             .filter(|&n| n >= 1 && n <= len)
-            .map(|n| n.saturating_sub(1))
+            .map(|n| Ranked::at(n.saturating_sub(1)))
             .collect()
     }
 }
@@ -212,7 +255,14 @@ impl Reranker for ScoredReranker {
             response
                 .results
                 .sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
-            Ok(response.results.into_iter().map(|r| r.index).collect())
+            Ok(response
+                .results
+                .into_iter()
+                .map(|r| Ranked {
+                    index: r.index,
+                    score: Some(r.relevance_score),
+                })
+                .collect())
         })
     }
 
@@ -226,6 +276,8 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::ids::{ChunkId, DocumentId};
+    use crate::ingestion::parser::SectionKind;
+    use crate::llm::egress::Egress;
     use schemars::schema_for;
 
     fn hit(n: u32) -> ChunkSearchResult {
@@ -238,6 +290,10 @@ mod tests {
             heading: None,
             page: None,
             score: 1.0,
+            kind: SectionKind::Body,
+            locator: None,
+            ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
+            ranks: Ranks::default(),
         }
     }
 
@@ -248,7 +304,7 @@ mod tests {
             _query: &'a str,
             candidates: &'a [ChunkSearchResult],
         ) -> RankFuture<'a> {
-            Box::pin(async move { Ok((0..candidates.len()).rev().collect()) })
+            Box::pin(async move { Ok((0..candidates.len()).rev().map(Ranked::at).collect()) })
         }
         fn name(&self) -> &'static str {
             "reverse"
@@ -278,6 +334,9 @@ mod tests {
         assert_eq!(outcome, RerankOutcome::Reranked("reverse"));
         let ids: Vec<&str> = kept.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["c3", "c2"]);
+        let places: Vec<Option<u32>> = kept.iter().map(|c| c.ranks.rerank_rank).collect();
+        assert_eq!(places, [Some(1), Some(2)]);
+        assert!(kept.iter().all(|c| c.ranks.rerank_score.is_none()));
     }
 
     #[tokio::test]
@@ -289,6 +348,12 @@ mod tests {
         assert!(matches!(outcome, RerankOutcome::Failed(ref m) if m.contains("boom")));
         assert_eq!(kept.len(), 2);
         assert_eq!(kept.first().map(|c| c.id.as_str()), Some("c1"));
+        assert!(kept.iter().all(|c| c.ranks.rerank_rank.is_none()));
+        assert_eq!(
+            outcome.describe(),
+            "reranking failed (analysis error: boom); the fused order is kept"
+        );
+        assert_eq!(outcome.suffix(), ", reranking failed");
         let Reranked {
             results: kept,
             outcome,
@@ -334,6 +399,7 @@ mod tests {
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
     async fn a_rerank_model_scores_the_candidates_and_its_order_is_kept() {
+        Egress::scope(Some(Egress::NoWorkspace), async {
         let (base, seen) = answer_once(
             r#"{"results":[{"index":0,"relevance_score":0.2},{"index":2,"relevance_score":0.9},{"index":1,"relevance_score":-1.5}]}"#,
         )
@@ -351,6 +417,8 @@ mod tests {
         assert_eq!(outcome, RerankOutcome::Reranked("reranker"));
         let ids: Vec<&str> = results.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["c3", "c1"]);
+        let scores: Vec<Option<f64>> = results.iter().map(|c| c.ranks.rerank_score).collect();
+        assert_eq!(scores, [Some(0.9), Some(0.2)]);
 
         let request = seen.await.unwrap();
         assert!(request.starts_with("post /v1/rerank "), "{request}");
@@ -369,20 +437,25 @@ mod tests {
                 "documents": ["passage 1", "passage 2", "passage 3"],
             })
         );
+        })
+        .await;
     }
 
     #[test]
     fn reorder_appends_unranked_and_ignores_bad_indices() {
-        let out = reorder(vec![hit(1), hit(2), hit(3), hit(4)], &[2, 9, 2, 0]);
+        let order = [2, 9, 2, 0].map(Ranked::at);
+        let out = reorder(vec![hit(1), hit(2), hit(3), hit(4)], &order);
         let ids: Vec<&str> = out.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["c3", "c1", "c2", "c4"]);
+        let places: Vec<Option<u32>> = out.iter().map(|c| c.ranks.rerank_rank).collect();
+        assert_eq!(places, [Some(1), Some(2), None, None]);
     }
 
     #[test]
     fn the_ranking_is_one_based_and_drops_numbers_out_of_range() {
         let answer: RerankAnswer =
             serde_json::from_str(r#"{"order": [3, 1, 7, 0, 2]}"#).unwrap_or_default();
-        assert_eq!(answer.indices(3), [2, 0, 1]);
+        assert_eq!(answer.indices(3), [2, 0, 1].map(Ranked::at));
         assert!(RerankAnswer::default().indices(3).is_empty());
         assert!(serde_json::from_str::<RerankAnswer>("[1, 2]").is_err());
         let schema = serde_json::to_string(&schema_for!(RerankAnswer)).unwrap_or_default();

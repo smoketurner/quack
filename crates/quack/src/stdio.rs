@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
+use quack_core::storage::workspace::DocumentSource;
 
 /// A file to read or write, or `-` for standard input or output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +23,14 @@ pub(crate) struct NamedInput {
 }
 
 impl StdioPath {
+    /// How a document ingested from here records where it came from.
+    pub(crate) fn document_source(&self) -> DocumentSource {
+        match self {
+            Self::Stdio => DocumentSource::Stdin,
+            Self::Path(_) => DocumentSource::Path,
+        }
+    }
+
     /// The whole input under a file name: `name` when given, else the
     /// file's own name; standard input has none, so it needs `name`.
     ///

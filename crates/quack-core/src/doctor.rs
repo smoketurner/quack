@@ -24,15 +24,18 @@ use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::{Error, Result as CoreResult};
 use crate::llm::bedrock;
+use crate::llm::egress::Egress;
 use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
 use crate::llm::sampling::{Sampling, Wire, check_tool_calls};
-use crate::llm::{ChatClient, ProviderModels, RerankModel};
+use crate::llm::{ChatClient, Embeddings, ProviderModels, RerankModel};
 use crate::oidc::SignIn;
+use crate::proxy::Proxies;
 use crate::storage::control::ControlPlane;
-use crate::storage::workspace::WorkspaceDb;
+use crate::storage::workspace::{MetaKey, WorkspaceDb};
 use crate::text::Count;
+use crate::vault::Vault;
 use rig::ProviderError;
 use rig::error::ErrorKind;
 use rig::operation::RerankRequest;
@@ -65,6 +68,8 @@ text_enum!(Status, "check status", {
 pub enum Area {
     Config,
     Crypto,
+    /// The forward proxy outbound requests use.
+    Proxy,
     Data,
     #[serde(rename = "control db")]
     ControlDb,
@@ -74,22 +79,29 @@ pub enum Area {
     Embeddings,
     /// The dedicated rerank model, when `[retrieval].rerank = "reranker"`.
     Reranker,
+    /// The model that reads images at ingest, `[ingestion].vision_model`.
+    Vision,
     Server,
     /// The OAuth clients quack registered itself (`quack auth register`).
     Auth,
+    /// The key that seals every stored token (`quack vault export-key`).
+    Vault,
 }
 
 text_enum!(Area, "doctor area", {
     Config => "config",
     Crypto => "crypto",
+    Proxy => "proxy",
     Data => "data",
     ControlDb => "control db",
     Workspace => "workspace",
     ChatModel => "chat model",
     Embeddings => "embeddings",
     Reranker => "reranker",
+    Vision => "vision",
     Server => "server",
     Auth => "auth",
+    Vault => "vault",
 });
 
 /// One finding: what was checked, how it came out, and what to do.
@@ -102,6 +114,24 @@ pub struct Check {
     pub fix: Option<String>,
 }
 
+/// What a workspace file records about what wrote it; a file from before
+/// a value was recorded has none.
+struct FileVersions {
+    schema: Option<String>,
+    quack: Option<String>,
+    duckdb: Option<String>,
+}
+
+impl FileVersions {
+    fn read(db: &WorkspaceDb) -> Result<Self, Error> {
+        Ok(Self {
+            schema: db.meta(MetaKey::SchemaVersion)?,
+            quack: db.meta(MetaKey::WrittenByQuack)?,
+            duckdb: db.meta(MetaKey::WrittenByDuckDb)?,
+        })
+    }
+}
+
 impl Check {
     fn new(area: Area, status: Status, summary: impl Into<String>) -> Self {
         Self {
@@ -109,6 +139,74 @@ impl Check {
             status,
             summary: summary.into(),
             fix: None,
+        }
+    }
+
+    /// A workspace an older quack wrote, which the next open upgrades in
+    /// place; reported without opening it.
+    fn pending_upgrade(name: &str, recorded: u32) -> Self {
+        Self::new(
+            Area::Workspace,
+            Status::Info,
+            format!(
+                "'{name}' has schema version {recorded}; this quack upgrades it to version {} the \
+                 next time it opens it, and an older quack then refuses it",
+                WorkspaceDb::schema_version()
+            ),
+        )
+        .fix(
+            "to keep a way back, copy the data directory, or take a snapshot with the quack that \
+             wrote it, before the next command opens the workspace",
+        )
+    }
+
+    /// A workspace with no row: only the default one is created by using
+    /// it, so any other name is a failure.
+    fn missing_workspace(name: &str, default: &str) -> Self {
+        if name == default {
+            return Self::new(
+                Area::Workspace,
+                Status::Ok,
+                format!("'{name}' does not exist yet; the first command that uses it creates it"),
+            );
+        }
+        Self::new(
+            Area::Workspace,
+            Status::Fail,
+            Error::NoWorkspaceNamed(name.to_owned()).to_string(),
+        )
+        .fix(format!("quack workspace create {name}"))
+    }
+
+    /// A workspace that opens (`opens` says so), with the versions its file
+    /// records. Versions that cannot be read fail the check: an open file
+    /// that does not answer for itself is not a healthy one.
+    fn recorded_versions(opens: &str, versions: Result<FileVersions, Error>) -> Self {
+        match versions {
+            Ok(FileVersions {
+                schema,
+                quack,
+                duckdb,
+            }) => {
+                let or_unrecorded =
+                    |v: Option<String>| v.unwrap_or_else(|| String::from("unrecorded"));
+                Self::new(
+                    Area::Workspace,
+                    Status::Ok,
+                    format!(
+                        "{opens}; schema version {}, written by quack {} with DuckDB {}",
+                        or_unrecorded(schema),
+                        or_unrecorded(quack),
+                        or_unrecorded(duckdb)
+                    ),
+                )
+            }
+            Err(e) => Self::new(
+                Area::Workspace,
+                Status::Fail,
+                format!("{opens}, but the versions its file records cannot be read: {e}"),
+            )
+            .fix("check the file under the data directory, or restore a backup"),
         }
     }
 
@@ -219,49 +317,43 @@ impl Probing {
             Self::Online { timeout } => Some(timeout),
         }
     }
-
-    /// The client the probes share, or `None` offline.
-    fn client(self) -> Option<reqwest::Client> {
-        let Self::Online { timeout } = self else {
-            return None;
-        };
-        reqwest::Client::builder()
-            .timeout(timeout)
-            .connect_timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .inspect_err(|e| tracing::warn!(error = %e, "cannot build the probe client"))
-            .ok()
-    }
 }
 
 /// Run every check against the configuration `inspection` found.
 pub async fn run(inspection: &Inspection, options: &Options) -> Report {
-    let mut report = Report::default();
-    check_config(&mut report, inspection);
-    let config = &inspection.config;
-    check_crypto(&mut report);
-    let data_ready = check_data_dir(&mut report, config.data_dir());
-    let control = if data_ready {
-        check_control(&mut report, config).await
-    } else {
-        None
-    };
-    check_workspace(&mut report, config, control.as_ref(), options).await;
-    check_chat_model(&mut report, config, options.probing).await;
-    check_embedding_model(&mut report, config, options.probing).await;
-    check_reranker(&mut report, config, options.probing).await;
-    check_server(&mut report, config, control.as_ref()).await;
-    check_sign_in(&mut report, config, options.probing).await;
-    check_registrations(
-        &mut report,
-        config,
-        control.as_ref(),
-        options.probing,
-        KeySource::Keychain,
-    )
-    .await;
-    report
+    // The probes reach every configured provider and send no workspace's
+    // content, so no workspace's allow-list applies to them.
+    Egress::scope(Some(Egress::NoWorkspace), async {
+        let mut report = Report::default();
+        check_config(&mut report, inspection);
+        let config = &inspection.config;
+        check_crypto(&mut report);
+        check_proxy(&mut report, Proxies::from_env());
+        let data_ready = check_data_dir(&mut report, config.data_dir());
+        let control = if data_ready {
+            check_control(&mut report, config).await
+        } else {
+            None
+        };
+        check_workspace(&mut report, config, control.as_ref(), options).await;
+        check_chat_model(&mut report, config, options.probing).await;
+        check_embedding_model(&mut report, config, options.probing).await;
+        check_reranker(&mut report, config, options.probing).await;
+        check_vision_model(&mut report, config, options.probing).await;
+        check_server(&mut report, config, control.as_ref()).await;
+        check_sign_in(&mut report, config, options.probing).await;
+        check_registrations(
+            &mut report,
+            config,
+            control.as_ref(),
+            options.probing,
+            KeySource::Keychain,
+        )
+        .await;
+        check_vault(&mut report, config, KeySource::Keychain).await;
+        report
+    })
+    .await
 }
 
 fn check_config(report: &mut Report, inspection: &Inspection) {
@@ -319,6 +411,58 @@ fn check_crypto(report: &mut Report) {
     } else {
         report.push(Check::new(Area::Crypto, Status::Ok, module.to_string()));
     }
+}
+
+/// What the proxy variables amount to, and each one that does not do what
+/// it says. No request is made.
+fn check_proxy(report: &mut Report, proxies: &Proxies) {
+    for problem in proxies.problems() {
+        let status = if problem.is_failure() {
+            Status::Fail
+        } else {
+            Status::Warn
+        };
+        report.push(Check::new(Area::Proxy, status, problem.to_string()).fix(problem.fix()));
+    }
+    let mut through = Vec::new();
+    let mut status = Status::Ok;
+    for (scheme, proxy) in [("HTTPS", proxies.https()), ("HTTP", proxies.http())] {
+        let Some(proxy) = proxy else {
+            continue;
+        };
+        match proxy.unsupported_scheme() {
+            Some(unsupported) => {
+                status = Status::Fail;
+                through.push(format!(
+                    "{scheme} through {proxy} (unsupported {unsupported}: these requests fail)"
+                ));
+            }
+            None => through.push(format!("{scheme} through {proxy}")),
+        }
+    }
+    if through.is_empty() {
+        if proxies.problems().is_empty() {
+            report.push(Check::new(
+                Area::Proxy,
+                Status::Ok,
+                "none (no proxy variables set)",
+            ));
+        }
+        return;
+    }
+    let listed = match proxies.no_proxy_entries() {
+        0 => String::new(),
+        1 => String::from(", NO_PROXY (1 entry)"),
+        n => format!(", NO_PROXY ({n} entries)"),
+    };
+    report.push(Check::new(
+        Area::Proxy,
+        status,
+        format!(
+            "{}; direct: loopback, 169.254.0.0/16{listed}",
+            through.join(", ")
+        ),
+    ));
 }
 
 /// Returns whether the directory exists, so the checks that read what is
@@ -456,10 +600,8 @@ async fn check_workspace(
     control: Option<&ControlPlane>,
     options: &Options,
 ) {
-    let name = options
-        .workspace
-        .as_deref()
-        .unwrap_or(&config.general.default_workspace);
+    let default = config.general.default_workspace.as_str();
+    let name = options.workspace.as_deref().unwrap_or(default);
     let row = match control {
         Some(control) => match control.find_workspace_by_name(name).await {
             Ok(row) => row,
@@ -475,11 +617,7 @@ async fn check_workspace(
         None => None,
     };
     let Some(row) = row else {
-        report.push(Check::new(
-            Area::Workspace,
-            Status::Ok,
-            format!("'{name}' does not exist yet; the first command that uses it creates it"),
-        ));
+        report.push(Check::missing_workspace(name, default));
         return;
     };
     if !config.workspace_db_path(row.id.as_str()).exists() {
@@ -490,19 +628,25 @@ async fn check_workspace(
         ));
         return;
     }
+    // A file an older quack wrote is upgraded in place by any open: the
+    // doctor only reads its version, so running it before a backup leaves
+    // the way back intact.
+    if let Ok(recorded) = WorkspaceDb::recorded_schema(config, row.id.as_str())
+        && recorded < WorkspaceDb::schema_version()
+    {
+        report.push(Check::pending_upgrade(name, recorded));
+        return;
+    }
     match WorkspaceDb::open(config, row.id.as_str()) {
         Ok(db) => {
             let tables = db.list_tables().map_or(0, |t| t.len());
             let documents = db.list_documents().map_or(0, |d| d.len());
-            report.push(Check::new(
-                Area::Workspace,
-                Status::Ok,
-                format!(
-                    "'{name}' opens: {}, {}",
-                    Count(tables, "table"),
-                    Count(documents, "document")
-                ),
-            ));
+            let opens = format!(
+                "'{name}' opens: {}, {}",
+                Count(tables, "table"),
+                Count(documents, "document")
+            );
+            report.push(Check::recorded_versions(&opens, FileVersions::read(&db)));
             if let Some(note) = db.embedding_status().ok().and_then(|s| s.note()) {
                 report.push(
                     Check::new(Area::Workspace, Status::Warn, format!("'{name}': {note}"))
@@ -519,6 +663,26 @@ async fn check_workspace(
                      so it was not checked"
                 ),
             ));
+        }
+        // The error's own text ends with the same advice; the fix says it once.
+        Err(Error::WorkspaceTooNew {
+            recorded,
+            supported,
+            written_by,
+            ..
+        }) => {
+            report.push(
+                Check::new(
+                    Area::Workspace,
+                    Status::Fail,
+                    format!(
+                        "'{name}' does not open: its file has schema version {recorded}, written \
+                         by {written_by}, and this quack reads up to version {supported}; the \
+                         file was left as it was"
+                    ),
+                )
+                .fix(written_by.advice()),
+            );
         }
         Err(e) => {
             report.push(
@@ -552,6 +716,9 @@ async fn check_chat_model(report: &mut Report, config: &Config, probing: Probing
         Ok(model) => {
             check_model(report, Area::ChatModel, config, model, probing).await;
             report.push(sampling_check(config, model));
+            if let Some(check) = background_check(config, model) {
+                report.push(check);
+            }
         }
         Err(e) => report.push(Check::new(
             Area::ChatModel,
@@ -582,6 +749,48 @@ fn sampling_check(config: &Config, model: ModelRef<'_>) -> Check {
     }
 }
 
+/// What a background call (reranking, history summaries, graph extraction,
+/// the ontology's document pass) sends, when its effort is not the turn's.
+fn background_check(config: &Config, model: ModelRef<'_>) -> Option<Check> {
+    let settings = config.model_settings(model);
+    if settings.background_effort == settings.effort {
+        return None;
+    }
+    let sampling = Sampling::new(
+        model.model,
+        Wire::of(model.provider),
+        settings.background_effort,
+        settings.temperature,
+    );
+    Some(match sampling {
+        Ok(sampling) => match sampling.unsent_effort() {
+            Some(why) => Check::new(
+                Area::ChatModel,
+                Status::Warn,
+                format!("{model}, background calls: {why}"),
+            ),
+            None => Check::new(
+                Area::ChatModel,
+                Status::Ok,
+                format!("{model}, background calls: {sampling}"),
+            ),
+        },
+        Err(e) => Check::new(
+            Area::ChatModel,
+            Status::Fail,
+            format!(
+                "{model}, background calls: {e}; graph extraction and the ontology's document \
+                 pass fail, and chat turns run without model reranking and history summaries"
+            ),
+        )
+        .fix(format!(
+            "set background_effort to a level it takes under [providers.{}.models.\"{}\"], \
+             [providers.{}], or [analysis]",
+            model.provider_name, model.model, model.provider_name
+        )),
+    })
+}
+
 async fn check_embedding_model(report: &mut Report, config: &Config, probing: Probing) {
     match config.embedding_model_ref() {
         Ok(None) => report.push(
@@ -599,20 +808,22 @@ async fn check_embedding_model(report: &mut Report, config: &Config, probing: Pr
         Ok(Some(model)) => {
             check_model(report, Area::Embeddings, config, model, probing).await;
             report.push(prompts_check(config, model));
-            if let (Some(http), ProviderType::Ollama, Some(configured)) = (
-                probing.client(),
-                model.provider.provider_type,
-                config.embedding.dimension,
-            ) {
-                let base = model
-                    .provider
-                    .base_url
-                    .clone()
-                    .unwrap_or(ProviderType::OLLAMA_BASE_URL);
-                let show = OllamaShow::fetch(&http, &base, model.model).await;
-                if let Some(check) = width_check(model, configured, show) {
-                    report.push(check);
-                }
+            if let (Some(timeout), Some(configured)) =
+                (probing.timeout(), config.embedding.dimension)
+            {
+                let measured = match Embeddings::from_config(config).await {
+                    Ok(Some(embedder)) => {
+                        match tokio::time::timeout(timeout, embedder.measure_width()).await {
+                            Ok(measured) => measured.map_err(|e| e.to_string()),
+                            Err(_) => {
+                                Err(format!("no answer within {} seconds", timeout.as_secs()))
+                            }
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(e) => Err(e.to_string()),
+                };
+                report.push(width_check(model, configured, measured));
             }
         }
         Err(e) => report.push(Check::new(Area::Embeddings, Status::Fail, e.to_string())),
@@ -675,6 +886,17 @@ async fn check_reranker(report: &mut Report, config: &Config, probing: Probing) 
     });
 }
 
+/// The vision model, when `[ingestion].vision_model` is set: the setting
+/// resolves and the provider lists the model. Whether it reads images is
+/// the model's own; no image is sent.
+async fn check_vision_model(report: &mut Report, config: &Config, probing: Probing) {
+    match config.vision_model_ref() {
+        Ok(Some(model)) => check_model(report, Area::Vision, config, model, probing).await,
+        Ok(None) => {}
+        Err(e) => report.push(Check::new(Area::Vision, Status::Fail, e.to_string())),
+    }
+}
+
 /// Which input prefixes the embedding model gets, and where they come
 /// from.
 fn prompts_check(config: &Config, model: ModelRef<'_>) -> Check {
@@ -713,69 +935,34 @@ fn prompts_check(config: &Config, model: ModelRef<'_>) -> Check {
     }
 }
 
-/// What Ollama's `/api/show` says about a model, read from its metadata
-/// without loading it.
-#[derive(serde::Deserialize)]
-struct OllamaShow {
-    #[serde(default)]
-    model_info: serde_json::Map<String, serde_json::Value>,
-}
-
-impl OllamaShow {
-    async fn fetch(http: &reqwest::Client, base: &BaseUrl, model: &str) -> Result<Self, Probe> {
-        let url = format!("{}/api/show", base.root());
-        let response = http
-            .post(url)
-            .json(&serde_json::json!({ "model": model }))
-            .send()
-            .await
-            .map_err(Probe::from)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Probe::Unexpected(format!("HTTP {}", status.as_u16())));
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| Probe::Unexpected(ErrorChain(&e).to_string()))
-    }
-
-    /// The model's vector width: `<architecture>.embedding_length`.
-    fn embedding_length(&self) -> Option<u32> {
-        self.model_info
-            .iter()
-            .find(|(key, _)| key.ends_with(".embedding_length"))
-            .and_then(|(_, value)| value.as_u64())
-            .and_then(|n| u32::try_from(n).ok())
-    }
-}
-
-/// Whether the configured width is the one the model makes. `None` when
-/// the probe could not tell; `check_model` already reported an
-/// unreachable provider or a missing model.
+/// Whether the configured width is the one the model makes, from one
+/// embedding call's `measured` width or why the call failed.
 fn width_check(
     model: ModelRef<'_>,
     configured: Dimension,
-    show: Result<OllamaShow, Probe>,
-) -> Option<Check> {
-    let reported = show.ok()?.embedding_length()?;
-    Some(if reported == configured.get() {
-        Check::new(
+    measured: Result<usize, String>,
+) -> Check {
+    match measured {
+        Ok(width) if configured.fits(width) => Check::new(
             Area::Embeddings,
             Status::Ok,
-            format!("{model}: makes {reported}-dimensional vectors, as [embedding].dimension says"),
-        )
-    } else {
-        Check::new(
+            format!("{model}: makes {width}-dimensional vectors, as [embedding].dimension says"),
+        ),
+        Ok(width) => Check::new(
             Area::Embeddings,
             Status::Fail,
             format!(
-                "{model}: makes {reported}-dimensional vectors but [embedding].dimension is \
+                "{model}: makes {width}-dimensional vectors but [embedding].dimension is \
                  {configured}; every embedding call fails until they agree"
             ),
         )
-        .fix(format!("set dimension = {reported} under [embedding]"))
-    })
+        .fix(format!("set dimension = {width} under [embedding]")),
+        Err(e) => Check::new(
+            Area::Embeddings,
+            Status::Fail,
+            format!("{model}: an embedding call failed: {e}"),
+        ),
+    }
 }
 
 /// Credentials, transport, and whether the provider serves the model.
@@ -1288,6 +1475,52 @@ async fn check_sign_in(report: &mut Report, config: &Config, probing: Probing) {
         )
         .fix("check [server.oidc].issuer_url, and that this host can reach the issuer"),
     });
+    if let Some(claim) = &oidc.groups_claim
+        && matches!(sign_in.claim_supported(claim).await, Ok(Some(false)))
+    {
+        report.push(
+            Check::new(
+                Area::Server,
+                Status::Warn,
+                format!(
+                    "[server.oidc].groups_claim = \"{claim}\", but the issuer's claims_supported does not list it; sign-ins would revoke every provider-granted membership"
+                ),
+            )
+            .fix("check the claim's name, and that the issuer is configured to put groups in its tokens"),
+        );
+    }
+}
+
+/// Where the vault key is, since every sealed token in `control.db` is
+/// unreadable without it: a copy kept off this host restores them.
+pub(crate) async fn check_vault(report: &mut Report, config: &Config, key_source: KeySource) {
+    let vault = Vault::new(config.data_dir(), key_source);
+    let check = match vault.key_text().await {
+        Err(e) => Check::new(
+            Area::Vault,
+            Status::Fail,
+            format!("the vault key cannot be read: {e}"),
+        )
+        .fix("unlock the keychain, or check vault.key's permissions"),
+        Ok(None) => Check::new(
+            Area::Vault,
+            Status::Ok,
+            "no vault key yet; one is made when the first token is stored",
+        ),
+        Ok(Some(_)) => {
+            let location = vault
+                .key_location()
+                .await
+                .map_or_else(|e| e.to_string(), |l| l.to_string());
+            Check::new(
+                Area::Vault,
+                Status::Ok,
+                format!("the vault key is in the {location}; the sealed tokens in control.db open only with it"),
+            )
+            .fix("`quack vault export-key --to FILE` keeps a copy off this host; a restore of control.db elsewhere needs it as vault.key")
+        }
+    };
+    report.push(check);
 }
 
 /// Warn about the temporary sign-in clients an interrupted `quack auth
@@ -1500,639 +1733,4 @@ impl std::fmt::Display for ErrorChain<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[expect(clippy::unwrap_used, reason = "test")]
-    fn embedding_config(model: &str, extra: &str) -> Config {
-        let config: Config = toml::from_str(&format!(
-            "[providers.o]\ntype = \"ollama\"\n\
-             [embedding]\nmodel = \"o/{model}\"\ndimension = 1024\n{extra}"
-        ))
-        .unwrap();
-        config
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    fn the_width_probe_names_the_fix_when_the_model_disagrees() {
-        let config = embedding_config("embeddinggemma", "");
-        let model = config.embedding_model_ref().unwrap().unwrap();
-        let show =
-            |json: serde_json::Value| -> OllamaShow { serde_json::from_value(json).unwrap() };
-        let gemma = || {
-            show(serde_json::json!({
-                "model_info": { "general.architecture": "gemma3", "gemma3.embedding_length": 768 }
-            }))
-        };
-        assert_eq!(gemma().embedding_length(), Some(768));
-
-        let wrong = width_check(model, Dimension::new(1024), Ok(gemma())).unwrap();
-        assert_eq!(wrong.status, Status::Fail);
-        assert!(
-            wrong.summary.contains("768-dimensional"),
-            "{}",
-            wrong.summary
-        );
-        assert_eq!(
-            wrong.fix.as_deref(),
-            Some("set dimension = 768 under [embedding]")
-        );
-        assert_eq!(
-            width_check(model, Dimension::new(768), Ok(gemma()))
-                .unwrap()
-                .status,
-            Status::Ok
-        );
-        assert!(width_check(model, Dimension::new(768), Ok(show(serde_json::json!({})))).is_none());
-        assert!(width_check(model, Dimension::new(768), Err(Probe::Rejected(401))).is_none());
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    fn the_prompts_check_says_where_the_prefixes_come_from() {
-        for (model, extra, status, words) in [
-            (
-                "embeddinggemma",
-                "",
-                Status::Ok,
-                "EmbeddingGemma was trained with",
-            ),
-            ("all-minilm", "", Status::Ok, "takes no input prefixes"),
-            (
-                "embeddinggemma",
-                "query_prefix = \"q: \"\n",
-                Status::Ok,
-                "from [embedding]",
-            ),
-            ("my-embedder", "", Status::Info, "knows no input prefixes"),
-        ] {
-            let config = embedding_config(model, extra);
-            let check = prompts_check(&config, config.embedding_model_ref().unwrap().unwrap());
-            assert_eq!(check.status, status, "{model}");
-            assert!(check.summary.contains(words), "{}", check.summary);
-        }
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    fn the_chat_model_check_says_what_a_turn_sends() {
-        let gateway = "[providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n\
-                       api = \"responses\"\n";
-        for (chat, extra, status, words) in [
-            (
-                "gw/corp-reasoner",
-                "[analysis]\neffort = \"medium\"\n",
-                Status::Ok,
-                "sends no temperature, reasoning effort as {\"reasoning\":{\"effort\":\"medium\"}}",
-            ),
-            (
-                "gw/gpt-oss-120b",
-                "[analysis]\neffort = \"medium\"\n[providers.gw.models.\"gpt-oss-120b\"]\n\
-                 effort = \"xhigh\"\n",
-                Status::Fail,
-                "effort \"xhigh\" is not a level",
-            ),
-            (
-                "ol/llama3.1:8b",
-                "[analysis]\neffort = \"high\"\n[providers.ol]\ntype = \"ollama\"\n",
-                Status::Warn,
-                "is not sent",
-            ),
-        ] {
-            let toml = format!("[general]\nchat_model = \"{chat}\"\n{gateway}{extra}");
-            let config = Config::parse(&toml).unwrap();
-            let check = sampling_check(&config, config.chat_model_ref().unwrap());
-            assert_eq!(check.status, status, "{chat}: {}", check.summary);
-            assert!(check.summary.contains(words), "{}", check.summary);
-        }
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    fn the_chat_model_check_fails_what_every_turn_refuses() {
-        let gateway = "[providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n";
-        for (chat, extra, status) in [
-            ("gw/gpt-5.6-sol", "", Status::Fail),
-            ("gw/gpt-5.6-sol", "api = \"responses\"\n", Status::Ok),
-            (
-                "gw/gpt-5.6-sol",
-                "[analysis]\neffort = \"none\"\n",
-                Status::Ok,
-            ),
-            (
-                "gw/gpt-5.6-sol",
-                "effort = \"high\"\n[analysis]\neffort = \"none\"\n",
-                Status::Fail,
-            ),
-            ("gw/gpt-6-luna", "", Status::Ok),
-        ] {
-            let toml = format!("[general]\nchat_model = \"{chat}\"\n{gateway}{extra}");
-            let config = Config::parse(&toml).unwrap();
-            let check = sampling_check(&config, config.chat_model_ref().unwrap());
-            assert_eq!(check.status, status, "{toml}: {}", check.summary);
-        }
-    }
-
-    fn inspection(dir: &Path, toml: Option<&str>) -> Inspection {
-        let mut inspection = Inspection::of(dir.join("config.toml"), toml);
-        inspection.config.general.data_dir = dir.join("data");
-        inspection
-    }
-
-    fn offline() -> Options {
-        Options {
-            probing: Probing::Offline,
-            ..Options::default()
-        }
-    }
-
-    fn find(report: &Report, area: Area) -> Vec<&Check> {
-        report.checks.iter().filter(|c| c.area == area).collect()
-    }
-
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn sign_in_is_checked_for_its_secret_and_local_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let oidc = "[server.oidc]\nissuer_url = \"https://login.example.com\"\nclient_id = \"quack\"\nredirect_uri = \"https://q.example.com/auth/oidc/callback\"\n";
-        let mut found = Vec::new();
-        for extra in [
-            "",
-            "client_secret_env = \"QUACK_TEST_UNSET_OIDC_SECRET\"\n",
-            "[server]\nlocal = true\n",
-        ] {
-            let toml = format!("{oidc}{extra}");
-            let report = run(&inspection(dir.path(), Some(&toml)), &offline()).await;
-            let checks: Vec<(Status, String)> = find(&report, Area::Server)
-                .into_iter()
-                .filter(|c| c.summary.contains("login.example.com"))
-                .map(|c| (c.status, c.summary.clone()))
-                .collect();
-            found.push(checks);
-        }
-        let [plain, secret, local]: [Vec<(Status, String)>; 3] = found.try_into().unwrap();
-        assert!(
-            matches!(plain.as_slice(), [(Status::Ok, s)] if s.contains("not probed")),
-            "{plain:?}"
-        );
-        assert!(
-            matches!(secret.as_slice(), [(Status::Fail, s)] if s.contains("QUACK_TEST_UNSET_OIDC_SECRET")),
-            "{secret:?}"
-        );
-        assert!(
-            matches!(local.as_slice(), [(Status::Warn, s)] if s.contains("ignored")),
-            "{local:?}"
-        );
-    }
-
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn a_fresh_install_has_no_failures_and_says_what_needs_a_model() {
-        let dir = tempfile::tempdir().unwrap();
-        let report = run(&inspection(dir.path(), None), &offline()).await;
-        assert!(!report.has_failures(), "{report:#?}");
-        let chat = find(&report, Area::ChatModel);
-        assert_eq!(chat.len(), 1);
-        assert_eq!(chat.first().unwrap().status, Status::Warn);
-        assert!(chat.first().unwrap().summary.contains("SQL"));
-        assert!(
-            chat.first()
-                .unwrap()
-                .fix
-                .as_deref()
-                .unwrap()
-                .contains("chat_model")
-        );
-        assert_eq!(
-            find(&report, Area::Embeddings).first().unwrap().status,
-            Status::Info
-        );
-        // Nothing was created by looking.
-        assert!(!dir.path().join("data").exists());
-    }
-
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn a_rejected_file_and_its_unknown_key_are_failures() {
-        let dir = tempfile::tempdir().unwrap();
-        let report = run(
-            &inspection(dir.path(), Some("[general]\nchat_modle = \"x/y\"\n")),
-            &offline(),
-        )
-        .await;
-        let config = find(&report, Area::Config);
-        assert!(
-            config.iter().all(|c| c.status == Status::Fail),
-            "{config:#?}"
-        );
-        assert!(
-            config
-                .iter()
-                .any(|c| c.fix.as_deref().is_some_and(|f| f.contains("chat_model")))
-        );
-    }
-
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn a_missing_api_key_is_a_failure_naming_the_variable() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml = "[general]\nchat_model = \"a/claude\"\n[providers.a]\ntype = \"anthropic\"\n\
-                    auth = \"api-key\"\napi_key_env = \"QUACK_DOCTOR_TEST_KEY_UNSET\"\n";
-        let report = run(&inspection(dir.path(), Some(toml)), &offline()).await;
-        let chat = find(&report, Area::ChatModel);
-        let check = chat.first().unwrap();
-        assert_eq!(check.status, Status::Fail);
-        assert!(check.summary.contains("QUACK_DOCTOR_TEST_KEY_UNSET"));
-    }
-
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn an_unreachable_ollama_is_a_failure_with_the_cause() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml = "[general]\nchat_model = \"o/m\"\n[providers.o]\ntype = \"ollama\"\n\
-                    base_url = \"http://127.0.0.1:9\"\n";
-        let options = Options {
-            probing: Probing::Online {
-                timeout: Duration::from_secs(2),
-            },
-            ..Options::default()
-        };
-        let report = run(&inspection(dir.path(), Some(toml)), &options).await;
-        let check = *find(&report, Area::ChatModel).first().unwrap();
-        assert_eq!(check.status, Status::Fail, "{check:#?}");
-        assert!(check.summary.contains("cannot reach"));
-        assert!(check.fix.as_deref().unwrap().contains("ollama serve"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn a_data_dir_others_can_read_is_a_warning_and_a_fresh_one_is_private() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let inspection = inspection(dir.path(), None);
-        inspection.config.ensure_dirs().unwrap();
-        let data = inspection.config.data_dir();
-        let mode = std::fs::metadata(data).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
-        let report = run(&inspection, &offline()).await;
-        assert_eq!(
-            find(&report, Area::Data).first().unwrap().status,
-            Status::Ok
-        );
-
-        std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let report = run(&inspection, &offline()).await;
-        let check = *find(&report, Area::Data).first().unwrap();
-        assert_eq!(check.status, Status::Warn);
-        assert!(check.fix.as_deref().unwrap().starts_with("chmod 700"));
-    }
-
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn an_open_bind_and_local_off_loopback_are_flagged() {
-        let dir = tempfile::tempdir().unwrap();
-        let open = run(
-            &inspection(dir.path(), Some("[server]\nbind = \"0.0.0.0:8080\"\n")),
-            &offline(),
-        )
-        .await;
-        assert_eq!(
-            find(&open, Area::Server).first().unwrap().status,
-            Status::Warn
-        );
-        let local = run(
-            &inspection(
-                dir.path(),
-                Some("[server]\nbind = \"0.0.0.0:8080\"\nlocal = true\n"),
-            ),
-            &offline(),
-        )
-        .await;
-        assert_eq!(
-            find(&local, Area::Server).first().unwrap().status,
-            Status::Fail
-        );
-    }
-
-    /// A model list server that answers one request with the model `m` and
-    /// hands back that request, lowercased.
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn one_listing() -> (BaseUrl, tokio::task::JoinHandle<String>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let seen = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
-            let body = r#"{"data":[{"id":"m","display_name":"M"}]}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            drop(stream.write_all(response.as_bytes()).await);
-            String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).to_ascii_lowercase()
-        });
-        (BaseUrl::try_from(base).unwrap(), seen)
-    }
-
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn the_listing_probe_sends_provider_headers_beside_its_credential() {
-        let (base, seen) = one_listing().await;
-        let provider = ProviderConfig {
-            headers: Some(BTreeMap::from([(
-                String::from("X-Gateway-Team"),
-                String::from("quack"),
-            )])),
-            base_url: Some(base),
-            ..ProviderConfig::new(ProviderType::Openai)
-        };
-        let name: ProviderName = "gateway".parse().unwrap();
-        let client = ChatClient::connect(&name, &provider, Some("key"));
-        let listing = Probe::listing(client, Duration::from_secs(5)).await;
-        assert!(matches!(&listing, Ok(models) if models.get("m").is_some()));
-        let request = seen.await.unwrap();
-        assert!(request.starts_with("get /models "), "{request}");
-        assert!(request.contains("x-gateway-team: quack"), "{request}");
-        assert!(request.contains("authorization: bearer key"), "{request}");
-    }
-
-    /// An Anthropic provider's probe sends its credential where completions
-    /// do: an OAuth token as a bearer, an API key as `x-api-key`.
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn the_anthropic_probe_sends_an_oauth_token_as_a_bearer() {
-        let oauth = "auth = \"oauth\"\n[providers.p.oauth]\n\
-                     issuer_url = \"http://127.0.0.1:9\"\nclient_id = \"c\"\n";
-        let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
-        for (auth, bearer) in [(oauth, true), (keyed, false)] {
-            let (base, seen) = one_listing().await;
-            let config: Config = toml::from_str(&format!(
-                "[general]\nchat_model = \"p/m\"\n[providers.p]\n\
-                 type = \"anthropic\"\nbase_url = \"{base}\"\n{auth}"
-            ))
-            .unwrap();
-            let chat = config.chat_model_ref().unwrap();
-            let client = ChatClient::connect(chat.provider_name, chat.provider, Some("tok-1"));
-            let listing = Probe::listing(client, Duration::from_secs(5)).await;
-            assert!(matches!(&listing, Ok(models) if models.get("m").is_some()));
-            let request = seen.await.unwrap();
-            assert!(request.starts_with("get /v1/models "), "{request}");
-            assert!(request.contains("anthropic-version: "), "{request}");
-            assert_eq!(
-                request.contains("authorization: bearer tok-1\r\n"),
-                bearer,
-                "{request}"
-            );
-            assert_eq!(
-                request.contains("x-api-key: tok-1\r\n"),
-                !bearer,
-                "{request}"
-            );
-        }
-    }
-
-    fn listed(models: &[(&str, Option<u32>)]) -> ProviderModels {
-        ProviderModels::from(rig::model::ModelList::new(
-            models
-                .iter()
-                .map(|(id, window)| rig::model::ModelInfo {
-                    context_length: *window,
-                    ..rig::model::ModelInfo::from_id(*id)
-                })
-                .collect(),
-        ))
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    fn a_model_missing_from_the_listing_names_the_closest_ones() {
-        let base = BaseUrl::try_from(String::from("http://127.0.0.1:11434")).unwrap();
-        for (provider, status) in [("ollama", Status::Fail), ("openai", Status::Warn)] {
-            let config: Config = toml::from_str(&format!(
-                "[general]\nchat_model = \"p/gpt-oss:20\"\n[providers.p]\ntype = \"{provider}\"\n\
-                 auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n"
-            ))
-            .unwrap();
-            let model = config.chat_model_ref().unwrap();
-            let models = listed(&[
-                ("llama3.1:8b", None),
-                ("gpt-oss:20b", None),
-                ("gpt-oss:120b", None),
-                ("qwen3:4b", None),
-            ]);
-            let check = listing_check(Area::ChatModel, model, &base, &Ok(models));
-            assert_eq!(check.status, status, "{provider}");
-            assert!(
-                check
-                    .summary
-                    .ends_with("the closest it lists: gpt-oss:20b, gpt-oss:120b, qwen3:4b"),
-                "{}",
-                check.summary
-            );
-        }
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    fn a_context_window_smaller_than_the_budgets_is_a_warning() {
-        let config: Config = toml::from_str(
-            "[general]\nchat_model = \"p/small\"\n[providers.p]\ntype = \"openai\"\n\
-             auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n",
-        )
-        .unwrap();
-        let model = config.chat_model_ref().unwrap();
-        let budgets = config
-            .analysis
-            .history_token_budget
-            .get()
-            .saturating_add(config.retrieval.pinned_token_budget.get())
-            .saturating_add(config.context.max_tokens.get());
-        let small = listed(&[("small", Some(budgets.saturating_sub(1)))]);
-        let check = Check::context_window(&config, model, &small).unwrap();
-        assert_eq!(check.status, Status::Warn);
-        assert!(
-            check.summary.contains(&format!("{budgets} in all")),
-            "{}",
-            check.summary
-        );
-        let roomy = listed(&[("small", Some(budgets))]);
-        assert!(Check::context_window(&config, model, &roomy).is_none());
-        let unreported = listed(&[("small", None)]);
-        assert!(Check::context_window(&config, model, &unreported).is_none());
-    }
-
-    /// A rerank server: `GET /v1/models` lists `bge-reranker`, and `POST
-    /// /v1/rerank` scores the documents. Serves `requests` connections.
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn rerank_server(requests: usize) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}/v1", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            for _ in 0..requests {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut buf = [0_u8; 4096];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                let head = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).to_string();
-                let body = if head.starts_with("GET /v1/models") {
-                    r#"{"data":[{"id":"bge-reranker"}]}"#
-                } else {
-                    r#"{"results":[{"index":1,"relevance_score":0.7},{"index":0,"relevance_score":0.1}]}"#
-                };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                drop(stream.write_all(response.as_bytes()).await);
-            }
-        });
-        base
-    }
-
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn the_rerank_model_is_listed_and_answers_a_probe() {
-        let config = |base: &str, model: &str| -> Config {
-            toml::from_str(&format!(
-                "[retrieval]\nrerank = \"reranker\"\nrerank_model = \"tei/{model}\"\n\
-                 [providers.tei]\ntype = \"openai\"\nbase_url = \"{base}\"\n"
-            ))
-            .unwrap()
-        };
-        let probing = Probing::Online {
-            timeout: Duration::from_secs(5),
-        };
-        let base = rerank_server(2).await;
-        let mut report = Report::default();
-        check_reranker(&mut report, &config(&base, "bge-reranker"), probing).await;
-        let checks = find(&report, Area::Reranker);
-        let summaries: Vec<(Status, &str)> = checks
-            .iter()
-            .map(|c| (c.status, c.summary.as_str()))
-            .collect();
-        assert_eq!(
-            summaries,
-            [
-                (
-                    Status::Ok,
-                    "tei/bge-reranker: reachable, credential accepted, model listed"
-                ),
-                (Status::Ok, "tei/bge-reranker: a rerank call was answered"),
-            ]
-        );
-
-        // A model the server does not list is named with what it does.
-        let base = rerank_server(2).await;
-        let mut report = Report::default();
-        check_reranker(&mut report, &config(&base, "bge-rerank"), probing).await;
-        let listing = find(&report, Area::Reranker);
-        assert!(
-            listing.first().is_some_and(|c| c.status == Status::Warn
-                && c.summary.ends_with("the closest it lists: bge-reranker")),
-            "{listing:?}"
-        );
-
-        // Nothing to check in another mode.
-        let mut report = Report::default();
-        check_reranker(&mut report, &Config::default(), probing).await;
-        assert!(find(&report, Area::Reranker).is_empty());
-    }
-
-    /// A mock issuer for the doctor: its discovery document lists `grants`,
-    /// and it counts token requests.
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn grant_listing_issuer(
-        grants: &'static [&'static str],
-    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = listener
-            .local_addr()
-            .map(|a| format!("http://{a}"))
-            .unwrap_or_default();
-        let tokens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (served, counted) = (base.clone(), std::sync::Arc::clone(&tokens));
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                let head = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).to_string();
-                let target = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
-                let (status, body) = if target == "/.well-known/openid-configuration" {
-                    (
-                        "200 OK",
-                        serde_json::json!({
-                            "issuer": served,
-                            "authorization_endpoint": format!("{served}/authorize"),
-                            "token_endpoint": format!("{served}/token"),
-                            "grant_types_supported": grants,
-                        })
-                        .to_string(),
-                    )
-                } else {
-                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    (
-                        "400 Bad Request",
-                        String::from("{\"error\":\"invalid_client\"}"),
-                    )
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                drop(stream.write_all(response.as_bytes()).await);
-            }
-        });
-        (base, tokens)
-    }
-
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn on_behalf_of_without_an_actor_checks_the_grant_list_and_requests_no_token() {
-        let options = Options {
-            probing: Probing::Online {
-                timeout: Duration::from_secs(5),
-            },
-            ..Options::default()
-        };
-        let provider = |issuer: &str| {
-            format!(
-                "[general]\nchat_model = \"gw/m\"\n[providers.gw]\ntype = \"openai\"\n\
-                 base_url = \"https://gw.example.com/v1\"\nauth = \"oauth\"\n[providers.gw.oauth]\n\
-                 issuer_url = \"{issuer}\"\nclient_id = \"quack\"\nclient_auth = \"private_key_jwt\"\n\
-                 grant = \"on-behalf-of\"\nactor = false\n"
-            )
-        };
-
-        let (issuer, tokens) = grant_listing_issuer(&[
-            "authorization_code",
-            "urn:ietf:params:oauth:grant-type:token-exchange",
-        ])
-        .await;
-        let dir = tempfile::tempdir().unwrap();
-        let report = run(&inspection(dir.path(), Some(&provider(&issuer))), &options).await;
-        let chat = find(&report, Area::ChatModel);
-        let check = *chat.first().unwrap();
-        assert_eq!(check.status, Status::Ok, "{check:#?}");
-        assert!(check.summary.contains("on behalf of"), "{check:#?}");
-        assert!(check.summary.contains("token-exchange"), "{check:#?}");
-        assert!(!check.summary.contains("actor)"), "{check:#?}");
-        // No client-credentials token, nor any other, was asked for.
-        assert_eq!(tokens.load(std::sync::atomic::Ordering::SeqCst), 0);
-
-        let (issuer, tokens) = grant_listing_issuer(&["authorization_code"]).await;
-        let dir = tempfile::tempdir().unwrap();
-        let report = run(&inspection(dir.path(), Some(&provider(&issuer))), &options).await;
-        let check = *find(&report, Area::ChatModel).first().unwrap();
-        assert_eq!(check.status, Status::Fail, "{check:#?}");
-        assert!(
-            check.summary.contains("grant_types_supported"),
-            "{check:#?}"
-        );
-        assert_eq!(tokens.load(std::sync::atomic::Ordering::SeqCst), 0);
-    }
-}
+mod tests;

@@ -12,43 +12,65 @@ mod mcp;
 mod ontology_cli;
 mod print;
 mod progress_line;
+mod saved_cli;
+#[cfg(test)]
+mod scripted_ollama;
 mod server;
 mod stdio;
+mod tables_cli;
 mod terminal;
 mod text_or_json;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::{ReaderDb, SharedDb};
+use quack_core::analysis::search::{DocumentSearch, SearchDetail};
+use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
 use quack_core::config::inspect::SettingFilter;
-use quack_core::config::{Config, Grant};
+use quack_core::config::{Config, Grant, LogFormat};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
-use quack_core::error::{Error as CoreError, Record};
-use quack_core::ids::{DocumentId, SessionId};
-use quack_core::import::{self, ImportPolicy, ImportRequest};
-use quack_core::ingestion::{self, IngestOutcome, NewFile};
+use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::graph::export::Destination;
+use quack_core::graph::follow_up::FollowUp;
+use quack_core::ids::{DocumentId, SessionId, WorkspaceId};
+use quack_core::import::{
+    self, ImportPolicy, ImportRequest, ImportSecrets, JsonPointer, KeepSecret, LoadStatus,
+    RefreshWith, SavedImport, SourceHeader,
+};
+use quack_core::ingestion::parser::PageCounts;
+use quack_core::ingestion::tree::{FileResult, Folder, Outcome, Prune};
+use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile};
 use quack_core::llm::Embeddings;
+use quack_core::llm::egress::Egress;
 use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt, TokenManager, TokenStatus};
+use quack_core::llm::titles::SessionTitler;
 use quack_core::okf::{self, Bundle, DirSink, TarSink};
 use quack_core::ontology::store::Revision;
 use quack_core::prefix::PrefixMatch;
 use quack_core::progress::RunControl;
+use quack_core::proxy::Proxies;
 use quack_core::storage::context;
-use quack_core::storage::control::{ControlPlane, WorkspaceRow};
-use quack_core::storage::sessions::{self, ChatMode, ExportFormat, Transcript};
-use quack_core::storage::workspace::{DocumentSource, Pinning, WorkspaceDb};
+use quack_core::storage::control::{ControlPlane, ResourceKind, WorkspaceRow};
+use quack_core::storage::profile::{ColumnTypes, TableProfile};
+use quack_core::storage::sessions::{
+    self, ChatMode, ExportFormat, SessionViewer, Sharing, Transcript,
+};
+use quack_core::storage::workspace::{
+    DocumentFields, Pinning, QueryResults, SearchMode, StatementKind, WorkspaceDb,
+};
 use quack_core::storage::writer::Writer;
+use quack_core::vault::Vault;
 use quack_core::{config, doctor};
+use std::fmt;
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::confirm::Confirm;
-use crate::print::{PrintTurn, TurnOutcome};
+use crate::print::{AnswerTo, PrintTurn, TurnOutcome};
 use crate::server::state::ServeMode;
 use crate::stdio::{NamedInput, StdioPath};
 use crate::terminal::SessionSetup;
@@ -65,6 +87,28 @@ enum Exit {
     WriteRefused,
     /// An OAuth provider needs `quack auth login` first.
     AuthRequired,
+    /// `quack saved run --exit-code`: the result changed since the run
+    /// before.
+    Changed,
+}
+
+impl Exit {
+    /// The exit a failure asks for, found anywhere in the error's chain;
+    /// `None` is a plain runtime error. `main` applies this to every
+    /// command's error, so no command maps it itself. An OAuth provider
+    /// without a usable token is exit 4: no command but `quack auth login`
+    /// can run a login flow. A workspace that does not exist is a usage
+    /// error.
+    fn of(err: &anyhow::Error) -> Option<Self> {
+        err.chain()
+            .find_map(|cause| match cause.downcast_ref::<CoreError>()? {
+                CoreError::AuthRequired { .. } | CoreError::Delegation { .. } => {
+                    Some(Self::AuthRequired)
+                }
+                CoreError::NoWorkspaceNamed(_) => Some(Self::Usage),
+                _ => None,
+            })
+    }
 }
 
 impl From<Exit> for ExitCode {
@@ -73,6 +117,7 @@ impl From<Exit> for ExitCode {
             Exit::Usage => 2,
             Exit::WriteRefused => 3,
             Exit::AuthRequired => 4,
+            Exit::Changed => 5,
         })
     }
 }
@@ -142,6 +187,16 @@ struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
 
+    /// Limit the question to these documents (ids, id prefixes, or file
+    /// names; repeat the flag or separate with commas)
+    #[arg(
+        long,
+        value_name = "DOCUMENT",
+        value_delimiter = ',',
+        requires = "prompt"
+    )]
+    documents: Vec<String>,
+
     /// Wait for piped stdin to close before running (`-p` and `-q` load
     /// it as the `stdin` table). Without it, a pipe that has nothing to
     /// read within a second is skipped
@@ -179,6 +234,10 @@ enum Commands {
     /// Serve the REST API and web UI
     Serve(ServeArgs),
 
+    /// Ask a running `quack serve` whether it can serve (its /readyz), for
+    /// a container health check: exit 0 when ready, 1 otherwise
+    Ready(ReadyArgs),
+
     /// Serve the workspace as an MCP server over stdio (for Claude Code
     /// and editors); logs go to stderr
     Mcp(McpArgs),
@@ -191,9 +250,10 @@ enum Commands {
     #[command(subcommand)]
     Graph(graph_cli::GraphAction),
 
-    /// Pull rows from Postgres, SQLite, or a data file over HTTP(S) into
-    /// a workspace table (the Rust-side replacement for ATTACH)
-    Import(ImportArgs),
+    /// Pull rows from a SQLite file, a data file over HTTP(S), or S3 into a
+    /// workspace table (the Rust-side replacement for ATTACH); `list`,
+    /// `refresh`, and `remove` manage imports saved with `--save`
+    Import(ImportCommand),
 
     /// Move the workspace as an Open Knowledge Format bundle
     #[command(subcommand)]
@@ -212,10 +272,86 @@ enum Commands {
     /// List ingested documents, or pin and unpin one
     Docs(DocsArgs),
 
+    /// Search the documents without the model, showing each hit's rank in
+    /// the vector and keyword legs and after reranking
+    Search(SearchArgs),
+    /// List the tables with their row counts, notes, and warnings; show
+    /// one in full, set its note, or give a column a type
+    Tables(tables_cli::TablesArgs),
+
     /// The workspace's vectors: refresh the ones made with another
     /// embedding model, width, or input prefixes
     #[command(subcommand)]
     Embeddings(embeddings_cli::EmbeddingsAction),
+
+    /// Saved questions: an answer's SQL kept under a name and re-run
+    /// without the model, each run saying whether the data changed
+    #[command(subcommand)]
+    Saved(saved_cli::SavedAction),
+
+    /// The vault key that seals every stored token in control.db
+    #[command(subcommand)]
+    Vault(VaultAction),
+}
+
+#[derive(Subcommand)]
+enum VaultAction {
+    /// Print the vault key, or write it to a file only its owner can read;
+    /// a copy of control.db restored on another host needs it as vault.key
+    ExportKey {
+        /// Write the key here (mode 0600) instead of printing it (`-`
+        /// prints it)
+        #[arg(long, value_name = "FILE")]
+        to: Option<PathBuf>,
+        /// Print without asking
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}
+
+impl VaultAction {
+    /// `quack vault export-key`: the key as stored, to a 0600 file or, after
+    /// a yes, to stdout.
+    async fn run(self) -> Result<ExitCode> {
+        let Self::ExportKey { to, yes } = self;
+        init_logging();
+        let config = Config::load().context("failed to load configuration")?;
+        let vault = Vault::new(config.data_dir(), KeySource::Keychain);
+        let Some(key) = vault.key_text().await? else {
+            anyhow::bail!("no vault key exists yet; one is made when the first token is stored");
+        };
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        if let Some(path) = to.filter(|path| path.as_os_str() != "-") {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options
+                .open(&path)
+                .and_then(|mut file| {
+                    file.write_all(key.as_bytes())?;
+                    file.flush()
+                })
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            writeln!(out, "Wrote the vault key to {}", path.display())?;
+        } else {
+            // The question and a refusal go to stderr: stdout carries the
+            // key alone, so `quack vault export-key > vault.key` is the key.
+            let question = "The vault key unseals every token in control.db. Print it?";
+            let mut err = std::io::stderr().lock();
+            if !Confirm::Ask.ask_to_drop(yes, &mut err, question)? {
+                writeln!(err, "Not printed.")?;
+                return Ok(ExitCode::FAILURE);
+            }
+            writeln!(out, "{key}")?;
+        }
+        out.flush()?;
+        Ok(ExitCode::SUCCESS)
+    }
 }
 
 #[derive(clap::Args)]
@@ -227,6 +363,11 @@ struct SessionsArgs {
     /// Maximum number of sessions to show
     #[arg(long, default_value_t = 20)]
     limit: u32,
+
+    /// Show the questions and answers containing this text instead,
+    /// newest first, each with its session and message number
+    #[arg(long, value_name = "TEXT")]
+    search: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -236,6 +377,81 @@ struct ExportArgs {
 
     #[command(flatten)]
     flags: ExportFlags,
+}
+
+#[derive(clap::Args)]
+struct ReadyArgs {
+    /// The server's base URL; default: http://{[server].bind}, or
+    /// loopback when it binds every address
+    #[arg(long)]
+    url: Option<String>,
+}
+
+impl ReadyArgs {
+    /// The URL a server bound to `bind` answers on: an unspecified address
+    /// is reached on loopback of the same family, and an IPv6 host is
+    /// written in brackets.
+    fn url_for(bind: std::net::SocketAddr) -> String {
+        let host = match bind.ip() {
+            std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            }
+            std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            }
+            ip => ip,
+        };
+        format!("http://{}", std::net::SocketAddr::new(host, bind.port()))
+    }
+
+    /// `quack ready`: `GET /readyz` on the server and exit by its answer. The
+    /// container image's health check runs this, since the image has no shell.
+    async fn run(self) -> Result<ExitCode> {
+        let url = if let Some(url) = self.url {
+            url
+        } else {
+            let config = Config::load().context("failed to load configuration")?;
+            let bind: std::net::SocketAddr = config.server.bind.parse().with_context(|| {
+                format!(
+                    "[server].bind '{}' is not a socket address",
+                    config.server.bind
+                )
+            })?;
+            Self::url_for(bind)
+        };
+        let client = Proxies::from_env()
+            .client()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .context("could not build the HTTP client")?;
+        let readyz = format!("{}/readyz", url.trim_end_matches('/'));
+        let response = client.get(&readyz).send().await;
+        // The body is read before stdout is locked: no lock across an await.
+        let answer = match response {
+            Ok(response) if response.status().is_success() => Ok(None),
+            Ok(response) => {
+                let status = response.status();
+                Ok(Some((status, response.text().await.unwrap_or_default())))
+            }
+            Err(e) => Err(e),
+        };
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        match answer {
+            Ok(None) => {
+                writeln!(out, "ready")?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Ok(Some((status, body))) => {
+                writeln!(out, "not ready ({status}): {body}")?;
+                Ok(ExitCode::FAILURE)
+            }
+            Err(e) => {
+                writeln!(out, "not ready: {readyz} did not answer: {e}")?;
+                Ok(ExitCode::FAILURE)
+            }
+        }
+    }
 }
 
 #[derive(clap::Args)]
@@ -258,6 +474,77 @@ struct IngestArgs {
     /// Pin the document: its full text goes into every prompt
     #[arg(long)]
     pin: bool,
+
+    /// The author to record, over what the file says
+    #[arg(long)]
+    author: Option<String>,
+
+    /// The authored date to record (YYYY-MM-DD or ISO 8601), over what
+    /// the file says
+    #[arg(long, value_name = "DATE")]
+    authored: Option<String>,
+
+    /// A tag to record (repeatable), over the file's own
+    #[arg(long = "tag", value_name = "TAG")]
+    tags: Vec<String>,
+
+    /// Replace a ready document: the one with the same file name, or the
+    /// given id (prefixes accepted). It is superseded once this file is
+    /// ready and untouched if ingestion fails; a table file takes over its
+    /// table. Identical bytes are still skipped.
+    #[arg(long, value_name = "DOCUMENT_ID", num_args = 0..=1, default_missing_value = "")]
+    replace: Option<Replace>,
+
+    /// With a folder: delete the documents whose file is no longer in it
+    /// (without this they are only reported)
+    #[arg(long)]
+    prune: bool,
+
+    /// Give columns of the loaded table a type, as COLUMN=TYPE (VARCHAR,
+    /// BIGINT, DOUBLE, DATE, TIMESTAMP, BOOLEAN), comma-separated or
+    /// repeated; every value must convert
+    #[arg(long, value_name = "COLUMN=TYPE")]
+    types: Vec<ColumnTypes>,
+}
+
+/// What `quack ingest --replace [DOCUMENT_ID]` replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Replace {
+    /// The newest ready document with the ingested file's name.
+    SameName,
+    /// The document with this id or unique id prefix.
+    Document(String),
+}
+
+impl std::str::FromStr for Replace {
+    type Err = std::convert::Infallible;
+
+    /// `--replace` alone arrives as the empty default value.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(match value.trim() {
+            "" => Self::SameName,
+            id => Self::Document(id.to_owned()),
+        })
+    }
+}
+
+impl Replace {
+    /// The id of the ready document to replace, for a file named `filename`.
+    async fn resolve(self, db: &Writer, filename: &str) -> Result<DocumentId> {
+        match self {
+            Self::Document(prefix) => Ok(db.run(move |db| find_document(db, &prefix)).await?),
+            Self::SameName => {
+                let name = filename.to_owned();
+                let found = db.run(move |db| db.newest_document_named(&name)).await?;
+                let Some(found) = found else {
+                    anyhow::bail!(
+                        "no ready document named {filename} to replace; pass its id to --replace"
+                    );
+                };
+                Ok(found.id)
+            }
+        }
+    }
 }
 
 #[derive(clap::Args)]
@@ -284,13 +571,44 @@ struct McpArgs {
 }
 
 #[derive(clap::Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+struct ImportCommand {
+    #[command(subcommand)]
+    action: Option<ImportAction>,
+    #[command(flatten)]
+    run: ImportArgs,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ImportAction {
+    /// List the imports saved with `--save`, with how each last ran
+    List {
+        /// `json` prints one JSON object per saved import
+        #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+        format: TextOrJson,
+    },
+    /// Run a saved import again; its table is replaced only when the
+    /// source changed (cron schedules this)
+    Refresh {
+        /// The saved import's name or id
+        name: String,
+    },
+    /// Remove a saved import and any secret sealed for it; its table stays
+    Remove {
+        /// The saved import's name or id
+        name: String,
+    },
+}
+
+#[derive(clap::Args)]
 struct ImportArgs {
-    /// A Postgres URL (user, password, host, database), a SQLite path
-    /// as `sqlite:PATH`, or an http(s) URL of a data file
-    url: String,
+    /// A SQLite path as `sqlite:PATH`, an http(s) URL of a data file, or
+    /// `s3://BUCKET/KEY` (the AWS CLI's credentials and region)
+    #[arg(required = true)]
+    url: Option<String>,
     /// The workspace table to create (replaced when it exists)
-    #[arg(long)]
-    table: String,
+    #[arg(long, required = true)]
+    table: Option<String>,
     /// A query to run on the source
     #[arg(long, conflicts_with = "from")]
     query: Option<String>,
@@ -300,16 +618,44 @@ struct ImportArgs {
     /// Rows to pull at most (capped by `[import].max_rows`)
     #[arg(long)]
     limit: Option<u64>,
+    /// Give columns of the table a type, as COLUMN=TYPE, comma-separated
+    /// or repeated; every value must convert
+    #[arg(long, value_name = "COLUMN=TYPE")]
+    types: Vec<ColumnTypes>,
+    /// Send a header with an http(s) download, as `NAME: VALUE`; repeat
+    /// for more. Used once and never stored
+    #[arg(long = "header", short = 'H', value_name = "NAME: VALUE")]
+    headers: Vec<SourceHeader>,
+    /// Send `Authorization: Bearer` with the token in this environment
+    /// variable, read when the download starts
+    #[arg(long, value_name = "VAR")]
+    bearer_env: Option<String>,
+    /// Load the array of rows at this RFC 6901 pointer inside a JSON
+    /// download, as `/data/items`
+    #[arg(long, value_name = "POINTER")]
+    json_pointer: Option<JsonPointer>,
+    /// Save the import under this name, so `quack import refresh NAME`
+    /// runs it again
+    #[arg(long, value_name = "NAME")]
+    save: Option<String>,
+    /// Keep the URL's password and the header values with the saved
+    /// import, sealed under the vault key, so a refresh can send them
+    #[arg(long, requires = "save")]
+    store_credential: bool,
 }
 
 impl From<ImportArgs> for ImportRequest {
     fn from(args: ImportArgs) -> Self {
+        let mut headers = args.headers;
+        headers.extend(args.bearer_env.map(SourceHeader::BearerEnv));
         Self {
-            url: args.url.into(),
-            table: args.table,
             query: args.query,
             source_table: args.from,
             limit: args.limit,
+            types: ColumnTypes::joined(args.types),
+            headers,
+            json_pointer: args.json_pointer,
+            ..Self::new(args.url.unwrap_or_default(), args.table.unwrap_or_default())
         }
     }
 }
@@ -351,9 +697,113 @@ struct DocsArgs {
     #[arg(long, value_name = "DOCUMENT_ID")]
     delete: Option<String>,
 
+    /// Add a tag to a document: the id (prefixes accepted) and the tag
+    #[arg(long, num_args = 2, value_names = ["DOCUMENT_ID", "TAG"])]
+    tag: Vec<String>,
+
+    /// Remove a tag from a document: the id (prefixes accepted) and the tag
+    #[arg(long, num_args = 2, value_names = ["DOCUMENT_ID", "TAG"])]
+    untag: Vec<String>,
+
+    /// Set a document's author: the id (prefixes accepted) and the name
+    /// (empty to clear)
+    #[arg(long, num_args = 2, value_names = ["DOCUMENT_ID", "AUTHOR"])]
+    author: Vec<String>,
+
+    /// Set a document's authored date: the id (prefixes accepted) and the
+    /// date, as YYYY-MM-DD or an ISO 8601 timestamp (empty to clear)
+    #[arg(long, num_args = 2, value_names = ["DOCUMENT_ID", "DATE"])]
+    authored: Vec<String>,
+
     /// `json` prints one JSON object per document
     #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
     format: TextOrJson,
+
+    /// List replaced documents too, each with the id that took its place
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(clap::Args)]
+struct SearchArgs {
+    /// What to search for; a "quoted phrase" must appear exactly
+    query: String,
+
+    /// Search only these documents (ids, id prefixes, file names, or titles)
+    #[arg(long = "in", value_name = "DOCUMENT", num_args = 1..)]
+    documents: Vec<String>,
+
+    /// The keyword (BM25) leg alone
+    #[arg(long, conflicts_with = "vector")]
+    keyword: bool,
+
+    /// The vector leg alone
+    #[arg(long)]
+    vector: bool,
+
+    /// Also show each leg's candidates, the quoted-phrase filter, and the
+    /// rerank outcome
+    #[arg(long)]
+    explain: bool,
+
+    /// Hits to show (default `[retrieval].top_k`, at most 100)
+    #[arg(long, short = 'k')]
+    top_k: Option<u32>,
+
+    /// `json` prints the hits (and with --explain, the workings) as one
+    /// JSON document
+    #[arg(short = 'f', long, value_enum, default_value_t = TextOrJson::Text)]
+    format: TextOrJson,
+}
+
+impl SearchArgs {
+    const fn mode(&self) -> SearchMode {
+        match (self.keyword, self.vector) {
+            (true, _) => SearchMode::Keyword,
+            (false, true) => SearchMode::Vector,
+            (false, false) => SearchMode::Hybrid,
+        }
+    }
+
+    const fn detail(&self) -> SearchDetail {
+        SearchDetail::explained(self.explain)
+    }
+
+    /// `quack search`: one search, no model call unless reranking asks the
+    /// chat model; unaudited, like every command-line read.
+    async fn run(&self, cli: &Cli) -> Result<ExitCode> {
+        init_logging();
+        let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+        let config = &opened.config;
+        let search = DocumentSearch {
+            documents: self.documents.clone(),
+            mode: self.mode(),
+            ..DocumentSearch::new(&self.query, self.top_k.unwrap_or(config.retrieval.top_k))?
+        };
+        let embedder = Embeddings::from_config(config).await?;
+        let rerank = Rerank::from_config(config).await?;
+        let (_db, reader) = opened.shared(opened.open_db()?).await?;
+        let outcome = search
+            .run(
+                &reader,
+                embedder.as_ref(),
+                rerank.as_ref(),
+                config.retrieval.rrf_k,
+            )
+            .await?;
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        match self.format {
+            TextOrJson::Text => write!(out, "{}", outcome.render(self.detail()))?,
+            TextOrJson::Json => writeln!(
+                out,
+                "{}",
+                serde_json::to_string_pretty(&outcome.body(self.detail()))?
+            )?,
+        }
+        out.flush()?;
+        Ok(ExitCode::SUCCESS)
+    }
 }
 
 #[derive(Subcommand)]
@@ -508,14 +958,6 @@ pub(crate) enum OutputFormat {
 }
 
 impl OutputFormat {
-    fn default_for(stdout_is_tty: bool) -> Self {
-        if stdout_is_tty {
-            Self::Table
-        } else {
-            Self::Ndjson
-        }
-    }
-
     /// The format for `-p`, which prints an answer: text or JSON.
     const fn for_prompt(self) -> Option<TextOrJson> {
         match self {
@@ -538,14 +980,42 @@ impl OutputFormat {
     }
 }
 
-/// How `-q` prints a result set.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum QueryFormat {
+/// How `-q` and `saved run` print a result set: [`OutputFormat`] without
+/// `text`, which prints an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum QueryFormat {
+    /// Aligned text table
     Table,
+    /// One JSON document
     Json,
+    /// One JSON object per line
     Ndjson,
+    /// Comma-separated values with a header row
     Csv,
+    /// GitHub-flavored Markdown table
     Markdown,
+}
+
+impl QueryFormat {
+    /// Without `--format`: a table on a terminal, ndjson into a pipe.
+    pub(crate) fn default_for(stdout_is_tty: bool) -> Self {
+        if stdout_is_tty {
+            Self::Table
+        } else {
+            Self::Ndjson
+        }
+    }
+
+    /// Print `results` in this format.
+    pub(crate) fn write(self, results: &QueryResults, out: &mut impl Write) -> CoreResult<()> {
+        match self {
+            Self::Table => results.write_table(out),
+            Self::Json => results.write_json(out),
+            Self::Ndjson => results.write_ndjson(out),
+            Self::Csv => results.write_csv(out),
+            Self::Markdown => results.write_markdown(out),
+        }
+    }
 }
 
 #[tokio::main]
@@ -553,16 +1023,18 @@ async fn main() -> Result<ExitCode> {
     crypto::install_default_provider()
         .context("failed to install the aws-lc-rs crypto provider")?;
 
-    match run().await {
+    // One egress slot for the command, which opening its workspace fills
+    // with that workspace's provider allow-list.
+    match Box::pin(Egress::request(run())).await {
         // The reader closed the pipe (`quack ... | head -1`): the command
         // did its job, so stop quietly like `git` and `ls` do (issue #68).
         Err(e) if is_broken_pipe(&e) => Ok(ExitCode::SUCCESS),
-        // Any command that reached a provider without a usable token exits
-        // 4, so scripts can tell "run `quack auth login`" from a failure.
-        Err(e) => match auth_exit_code(&e) {
-            Some(code) => {
+        // A missing login exits 4 and a workspace that does not exist
+        // exits 2, so scripts can tell either from a failure.
+        Err(e) => match Exit::of(&e) {
+            Some(exit) => {
                 tracing::error!("{e:#}");
-                Ok(code)
+                Ok(ExitCode::from(exit))
             }
             None => Err(e),
         },
@@ -613,11 +1085,10 @@ async fn run() -> Result<ExitCode> {
 
     if let Some(sql) = cli.query.as_deref() {
         init_logging();
-        let Some(format) = cli
-            .format
-            .unwrap_or_else(|| OutputFormat::default_for(stdout_is_tty))
-            .for_query()
-        else {
+        let Some(format) = cli.format.map_or_else(
+            || Some(QueryFormat::default_for(stdout_is_tty)),
+            OutputFormat::for_query,
+        ) else {
             tracing::error!("-q accepts --format table, json, ndjson, csv, or markdown");
             return Ok(ExitCode::from(Exit::Usage));
         };
@@ -642,11 +1113,20 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             run_ingest(cli, args).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Ontology(ontology_cli::OntologyAction::Schema) => {
+            ontology_cli::write_schema(&mut std::io::stdout().lock())?;
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Ontology(action) => run_on_writer(cli, action).await,
+        Commands::Graph(graph_cli::GraphAction::Export(args)) if args.to_stdout() => {
+            run_graph_export(cli, &args).await
+        }
         Commands::Graph(action) => run_on_writer(cli, action).await,
         Commands::Embeddings(action) => run_on_writer(cli, action).await,
+        Commands::Saved(action) => run_saved(cli, action).await,
+        Commands::Vault(action) => action.run().await,
         Commands::Okf(OkfAction::Export { dir }) => run_okf_export(cli, &dir).await,
-        Commands::Import(args) => run_import(cli, args).await,
+        Commands::Import(command) => command.run(cli).await,
         Commands::Context(args) => {
             let ws_db = open_workspace(cli).await?;
             run_context(&ws_db, args.action.unwrap_or(ContextAction::Show))?;
@@ -660,9 +1140,14 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         }
         Commands::Mcp(args) => run_mcp(cli, args.allow_write).await,
         Commands::Serve(args) => {
-            // The server logs each request at info; other commands stay quiet.
-            init_logging_at("info,sqlx=warn,hyper=warn,h2=warn");
+            // The server logs at info in the file's format; other commands
+            // stay quiet. Each request's access line is `quack::access` at
+            // debug, so `RUST_LOG=quack::access=debug` turns it on alone.
             let config = Config::load().context("failed to load configuration")?;
+            init_logging_as(
+                "info,sqlx=warn,hyper=warn,h2=warn",
+                config.server.log_format,
+            );
             let mode = if args.local {
                 ServeMode::Local
             } else {
@@ -671,6 +1156,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             server::serve(config, args.bind, mode).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Ready(args) => args.run().await,
         Commands::Admin(command) => {
             init_logging();
             let config = Config::load().context("failed to load configuration")?;
@@ -682,6 +1168,15 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         Commands::Docs(args) => {
             let ws_db = open_workspace(cli).await?;
             run_docs(&ws_db, &args)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Search(args) => args.run(cli).await,
+        Commands::Tables(args) => {
+            let ws_db = open_workspace(cli).await?;
+            let stdout = std::io::stdout();
+            let mut out = std::io::BufWriter::new(stdout.lock());
+            args.run(&ws_db, &mut out)?;
+            out.flush()?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -776,8 +1271,10 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         session_id: &session_id,
         policy,
         prompt,
+        documents: &cli.documents,
         format,
         verbose: cli.verbose,
+        answer_to: AnswerTo::Stdout,
     }
     .run()
     .await;
@@ -785,6 +1282,8 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         let id = session_id.clone();
         drop(db.run(move |db| sessions::delete_if_empty(db, &id)).await);
     }
+    // The answer is out; a title the turn started finishes before exit.
+    SessionTitler::finish_pending(TITLE_GRACE).await;
     Ok(match outcome? {
         TurnOutcome::WriteRefused => ExitCode::from(Exit::WriteRefused),
         TurnOutcome::Answered => ExitCode::SUCCESS,
@@ -835,6 +1334,10 @@ async fn load_piped_stdin(
 /// How long a non-terminal stdin has to deliver a byte or close.
 const STDIN_GRACE: Duration = Duration::from_secs(1);
 
+/// How long a command that answers one question waits, after printing, for
+/// the session title its first turn started.
+pub(crate) const TITLE_GRACE: Duration = Duration::from_secs(30);
+
 /// Whether stdin is worth reading: a pipe or socket is when it becomes
 /// readable (data or end of file) within [`STDIN_GRACE`]; anything else
 /// (a regular file, `/dev/null`) answers a read at once.
@@ -875,7 +1378,10 @@ async fn open_workspace(cli: &Cli) -> Result<WorkspaceDb> {
 /// `quack sessions`: the session list.
 async fn run_sessions(cli: &Cli, args: &SessionsArgs) -> Result<ExitCode> {
     let ws_db = open_workspace(cli).await?;
-    list_sessions(&ws_db, args.format, args.limit)?;
+    match &args.search {
+        Some(text) => search_sessions(&ws_db, text, args.format, args.limit)?,
+        None => list_sessions(&ws_db, args.format, args.limit)?,
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -906,7 +1412,7 @@ impl WriterCommand for graph_cli::GraphAction {
         out: &mut impl Write,
         control: RunControl<'_>,
     ) -> Result<()> {
-        graph_cli::run(config, db, self, Confirm::Ask, out, control).await
+        self.run(config, db, Confirm::Ask, out, control).await
     }
 }
 
@@ -956,38 +1462,252 @@ async fn run_on_writer(cli: &Cli, command: impl WriterCommand) -> Result<ExitCod
     Ok(ExitCode::SUCCESS)
 }
 
+/// `quack saved ...`: the saved questions. A run that failed is the
+/// command's error, after the run was printed; one that changed exits 5
+/// with `--exit-code`.
+async fn run_saved(cli: &Cli, action: saved_cli::SavedAction) -> Result<ExitCode> {
+    init_logging();
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+    let (db, reader_db) = opened.shared(opened.open_db()?).await?;
+    let wants_exit_code = matches!(
+        action,
+        saved_cli::SavedAction::Run {
+            exit_code: true,
+            ..
+        }
+    );
+    let model = saved_cli::Model {
+        db: Arc::clone(&db),
+        reader_db,
+        verbose: cli.verbose,
+    };
+    // Not the lock: a refresh is a print-mode turn, which writes its own
+    // answer to stdout before the run is printed.
+    let mut out = std::io::BufWriter::new(std::io::stdout());
+    let ran = saved_cli::run(&opened.config, &db, action, None, Some(model), &mut out).await?;
+    out.flush()?;
+    let Some(run) = ran else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    if let Some(failure) = saved_cli::failure(&run) {
+        return Err(failure);
+    }
+    Ok(if wants_exit_code && run.changed {
+        ExitCode::from(Exit::Changed)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
 /// `quack import URL --table NAME`: rows from an external source as a
 /// workspace table.
-async fn run_import(cli: &Cli, args: ImportArgs) -> Result<ExitCode> {
-    init_logging();
-    let request = &ImportRequest::from(args);
-    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
-    let (config, ws_db) = (&opened.config, opened.writer()?);
-    let embedding_model = Embeddings::from_config(config).await?;
-    let summary = import::Importing {
-        config,
-        db: &ws_db,
-        workspace_id: opened.workspace.id.as_str(),
-        request,
-        policy: ImportPolicy::owner(),
-        embedder: embedding_model.as_ref(),
-        control: RunControl::unobserved(),
+impl ImportCommand {
+    /// Import (and with `--save`, keep the import for refreshing), or
+    /// list, refresh, or remove a saved one.
+    async fn run(self, cli: &Cli) -> Result<ExitCode> {
+        init_logging();
+        let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+        let control = ControlPlane::open(&opened.config)
+            .await
+            .context("failed to open control plane")?;
+        let vault = Vault::new(opened.config.data_dir(), KeySource::Keychain);
+        let db = opened.writer()?;
+        let context = ImportContext {
+            config: &opened.config,
+            workspace: &opened.workspace.id,
+            control: &control,
+            vault: &vault,
+            db: &db,
+        };
+        match self.action {
+            // Written to a buffer, then to stdout: the stdout lock is never
+            // held across the action's awaits, and what it reported before
+            // a failure still prints.
+            Some(action) => {
+                let mut report = Vec::new();
+                let ran = action.run(&context, &mut report).await;
+                std::io::stdout().lock().write_all(&report)?;
+                ran?;
+            }
+            None => self.run.run(&context).await?,
+        }
+        Ok(ExitCode::SUCCESS)
     }
-    .run()
-    .await
-    .context("import failed")?;
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    writeln!(
-        out,
-        "Imported {} rows from {} as table \"{}\" ({} columns: {}).",
-        summary.rows,
-        summary.source,
-        summary.table,
-        summary.columns.len(),
-        summary.columns.join(", ")
-    )?;
-    Ok(ExitCode::SUCCESS)
+}
+
+/// What every `quack import` form works with, in the CLI and the terminal:
+/// the workspace, its writer, and where saved imports keep their sealed
+/// secrets.
+pub(crate) struct ImportContext<'a> {
+    pub(crate) config: &'a Config,
+    pub(crate) workspace: &'a WorkspaceId,
+    pub(crate) control: &'a ControlPlane,
+    pub(crate) vault: &'a Vault,
+    pub(crate) db: &'a Writer,
+}
+
+impl ImportContext<'_> {
+    fn secrets(&self) -> ImportSecrets<'_> {
+        ImportSecrets {
+            control: self.control,
+            vault: self.vault,
+            workspace: self.workspace,
+        }
+    }
+}
+
+impl ImportAction {
+    /// What a job running it is called.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::List { .. } => String::from("import list"),
+            Self::Refresh { name } => format!("import refresh {name}"),
+            Self::Remove { name } => format!("import remove {name}"),
+        }
+    }
+
+    /// List, refresh, or remove a saved import, reporting to `out`.
+    pub(crate) async fn run(self, context: &ImportContext<'_>, out: &mut impl Write) -> Result<()> {
+        let db = context.db;
+        match self {
+            Self::List { format } => {
+                let saved = db.run(SavedImport::list).await?;
+                for import in &saved {
+                    match format {
+                        TextOrJson::Json => writeln!(out, "{}", serde_json::to_string(import)?)?,
+                        TextOrJson::Text => writeln!(out, "{}", SavedLine(import))?,
+                    }
+                }
+                if saved.is_empty() && format == TextOrJson::Text {
+                    writeln!(
+                        out,
+                        "No saved imports; save one with `quack import ... --save NAME`."
+                    )?;
+                }
+            }
+            Self::Refresh { name } => {
+                let saved = db.run(move |db| SavedImport::named(db, &name)).await?;
+                let config = context.config;
+                let embedder = Embeddings::from_config(config).await?;
+                let summary = context
+                    .secrets()
+                    .refresh(
+                        &saved,
+                        RefreshWith {
+                            config,
+                            db,
+                            policy: ImportPolicy::owner(),
+                            embedder: embedder.as_ref(),
+                            control: RunControl::unobserved(),
+                        },
+                    )
+                    .await
+                    .with_context(|| format!("refreshing '{}' failed", saved.name))?;
+                match (summary.status, saved.last_rows) {
+                    (LoadStatus::Unchanged, _) => {
+                        writeln!(out, "{}: source unchanged", saved.name)?;
+                    }
+                    (LoadStatus::Loaded, Some(before)) => writeln!(
+                        out,
+                        "{}: {} rows (was {before}), replaced",
+                        saved.name, summary.rows
+                    )?,
+                    (LoadStatus::Loaded, None) => {
+                        writeln!(out, "{}: {} rows, loaded", saved.name, summary.rows)?;
+                    }
+                }
+            }
+            Self::Remove { name } => {
+                let saved = db.run(move |db| SavedImport::named(db, &name)).await?;
+                context.secrets().remove(db, &saved).await?;
+                writeln!(
+                    out,
+                    "Removed saved import {}; table \"{}\" stays.",
+                    saved.name, saved.table
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ImportArgs {
+    /// Import once; with `--save`, keep it under a name for refreshing.
+    async fn run(self, context: &ImportContext<'_>) -> Result<()> {
+        let save = self.save.clone();
+        let keep = if self.store_credential {
+            KeepSecret::Sealed
+        } else {
+            KeepSecret::No
+        };
+        let request = ImportRequest::from(self);
+        if let Some(name) = &save {
+            request.check_saveable(keep)?;
+            let name = name.clone();
+            context
+                .db
+                .run(move |db| SavedImport::check_name(db, &name))
+                .await?;
+        }
+        let config = context.config;
+        let embedder = Embeddings::from_config(config).await?;
+        let summary = import::Importing {
+            config,
+            db: context.db,
+            workspace_id: context.workspace.as_str(),
+            request: &request,
+            policy: ImportPolicy::owner(),
+            embedder: embedder.as_ref(),
+            control: RunControl::unobserved(),
+        }
+        .run()
+        .await
+        .context("import failed")?;
+        let saved = match save {
+            Some(name) => Some(
+                context
+                    .secrets()
+                    .save(context.db, &name, &request, &summary, keep, None)
+                    .await?,
+            ),
+            None => None,
+        };
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        writeln!(
+            out,
+            "Imported {} rows from {} as table \"{}\" ({} columns: {}).",
+            summary.rows,
+            summary.source,
+            summary.table,
+            summary.columns.len(),
+            summary.columns.join(", ")
+        )?;
+        if let Some(saved) = saved {
+            writeln!(
+                out,
+                "Saved as \"{}\"; `quack import refresh {}` runs it again.",
+                saved.name, saved.name
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A saved import as `quack import list` prints it: name, table, source,
+/// and how it last ran.
+struct SavedLine<'a>(&'a SavedImport);
+
+impl fmt::Display for SavedLine<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let import = self.0;
+        write!(f, "{}  -> {}  {}", import.name, import.table, import.source)?;
+        match (&import.last_error, import.last_rows, &import.last_run_at) {
+            (Some(error), _, Some(at)) => write!(f, "  failed at {at}: {error}"),
+            (None, Some(rows), Some(at)) => write!(f, "  {rows} rows at {at}"),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// `quack okf export DIR`: the workspace as an Open Knowledge Format
@@ -1012,6 +1732,18 @@ async fn run_okf_export(cli: &Cli, dir: &StdioPath) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `quack graph export - --format F`: the graph on stdout, a tar of the
+/// CSV bundle or the document itself, in one read. A directory goes
+/// through the writer like the other graph verbs.
+async fn run_graph_export(cli: &Cli, args: &graph_cli::ExportArgs) -> Result<ExitCode> {
+    init_logging();
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
+    let db = opened.open_db()?;
+    let out = std::io::BufWriter::new(std::io::stdout().lock());
+    db.read_only(|db| args.export().write(db, Destination::Stream(out)))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `quack mcp`: the workspace as an MCP server on stdin and stdout.
 async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     init_logging();
@@ -1023,21 +1755,6 @@ async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     let policy = WritePolicy::Deny.allowed_if(allow_write);
     mcp::serve_stdio(config, db, reader_db, workspace, policy).await?;
     Ok(ExitCode::SUCCESS)
-}
-
-/// Exit 4 when the failure is an OAuth provider without a usable token,
-/// found anywhere in the error's chain: no command but `quack auth login`
-/// can run a login flow, so the message names it. `main` applies this to
-/// every command's error, so no command maps it itself.
-fn auth_exit_code(err: &anyhow::Error) -> Option<ExitCode> {
-    err.chain()
-        .any(|cause| {
-            matches!(
-                cause.downcast_ref::<CoreError>(),
-                Some(CoreError::AuthRequired { .. } | CoreError::Delegation { .. })
-            )
-        })
-        .then_some(ExitCode::from(Exit::AuthRequired))
 }
 
 /// `quack auth register`, signing the person in on this terminal when it
@@ -1442,32 +2159,121 @@ fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
         let id = find_document(db, prefix)?;
         db.delete_document(&id)?;
     }
+    if let [prefix, tag] = args.tag.as_slice() {
+        let id = find_document(db, prefix)?;
+        let mut tags = db.document(&id)?.map(|d| d.tags).unwrap_or_default();
+        if !tags.iter().any(|t| t == tag) {
+            tags.push(tag.clone());
+        }
+        db.set_document_fields(
+            &id,
+            &DocumentFields {
+                tags: Some(tags),
+                ..DocumentFields::default()
+            },
+        )?;
+    }
+    if let [prefix, tag] = args.untag.as_slice() {
+        let id = find_document(db, prefix)?;
+        let mut tags = db.document(&id)?.map(|d| d.tags).unwrap_or_default();
+        tags.retain(|t| t != tag);
+        db.set_document_fields(
+            &id,
+            &DocumentFields {
+                tags: Some(tags),
+                ..DocumentFields::default()
+            },
+        )?;
+    }
+    if let [prefix, author] = args.author.as_slice() {
+        let id = find_document(db, prefix)?;
+        db.set_document_fields(
+            &id,
+            &DocumentFields {
+                author: Some(author.clone()),
+                ..DocumentFields::default()
+            },
+        )?;
+    }
+    if let [prefix, date] = args.authored.as_slice() {
+        let id = find_document(db, prefix)?;
+        db.set_document_fields(
+            &id,
+            &DocumentFields {
+                authored_at: Some(date.clone()),
+                ..DocumentFields::default()
+            },
+        )?;
+    }
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    list_documents(db, args.format, &mut out)
+    let shown = if args.all { Shown::All } else { Shown::Live };
+    list_documents(db, args.format, shown, &mut out)
 }
 
 /// Resolve a full document id or a unique prefix.
-fn find_document(db: &WorkspaceDb, prefix: &str) -> Result<DocumentId> {
+fn find_document(db: &WorkspaceDb, prefix: &str) -> CoreResult<DocumentId> {
     let document = PrefixMatch::of(db.list_documents()?, prefix, |d| d.id.as_str())
-        .one(Record::Document, prefix)?;
+        .one(ResourceKind::Document, prefix)?;
     Ok(document.id)
 }
 
-fn list_documents(db: &WorkspaceDb, format: TextOrJson, out: &mut impl Write) -> Result<()> {
-    let docs = db.list_documents()?;
+/// Which documents `quack docs` lists.
+#[derive(Debug, Clone, Copy)]
+enum Shown {
+    /// What the workspace holds now.
+    Live,
+    /// Replaced documents too (`--all`).
+    All,
+}
+
+fn list_documents(
+    db: &WorkspaceDb,
+    format: TextOrJson,
+    shown: Shown,
+    out: &mut impl Write,
+) -> Result<()> {
+    let docs = match shown {
+        Shown::Live => db.list_documents()?,
+        Shown::All => db.list_all_documents()?,
+    };
     format.write_rows(out, &docs, "No documents yet.", |out, doc| {
         let title = doc
             .title
             .as_deref()
             .map_or(String::new(), |t| format!("  ({t})"));
+        let pages = doc
+            .pages
+            .and_then(PageCounts::note)
+            .map_or(String::new(), |note| format!("  [{note}]"));
+        let replaced = doc
+            .superseded_by
+            .as_ref()
+            .map_or(String::new(), |by| format!("  -> {by}"));
+        let about = match (&doc.author, &doc.authored_at, doc.tags.is_empty()) {
+            (None, None, true) => String::new(),
+            (author, authored, _) => format!(
+                "  [{}]",
+                author
+                    .iter()
+                    .map(String::as_str)
+                    .chain(authored.iter().filter_map(|d| d.get(..10)))
+                    .chain(doc.tags.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
         writeln!(
             out,
-            "{}  {:<10}  {:<6}  {}  {}{title}",
+            "{}  {:<10}  {:<6}  {}  {}{title}{about}{pages}{replaced}",
             doc.id,
             doc.status,
             doc.source,
-            if doc.pinned { "pinned  " } else { "        " },
+            if doc.pinning == Pinning::Pinned {
+                "pinned  "
+            } else {
+                "        "
+            },
             doc.filename
         )
     })?;
@@ -1476,16 +2282,14 @@ fn list_documents(db: &WorkspaceDb, format: TextOrJson, out: &mut impl Write) ->
 }
 
 /// Resolve a full id or a unique prefix to a session.
-fn find_session(db: &WorkspaceDb, prefix: &str) -> Result<sessions::SessionRow> {
+pub(crate) fn find_session(db: &WorkspaceDb, prefix: &str) -> CoreResult<sessions::SessionRow> {
     if let Some(exact) = sessions::get_session(db, &SessionId::from(prefix))? {
         return Ok(exact);
     }
-    Ok(
-        PrefixMatch::of(sessions::list_sessions(db, 1000)?, prefix, |s| {
-            s.id.as_str()
-        })
-        .one(Record::Session, prefix)?,
-    )
+    PrefixMatch::of(sessions::list_sessions(db, 1000)?, prefix, |s| {
+        s.id.as_str()
+    })
+    .one(ResourceKind::Session, prefix)
 }
 
 fn list_sessions(db: &WorkspaceDb, format: TextOrJson, limit: u32) -> Result<()> {
@@ -1501,7 +2305,30 @@ fn list_sessions(db: &WorkspaceDb, format: TextOrJson, limit: u32) -> Result<()>
             row.message_count,
             row.model,
             row.title.as_deref().unwrap_or("(untitled)"),
-            if row.shared { "  (shared)" } else { "" }
+            if row.sharing == Sharing::Shared {
+                "  (shared)"
+            } else {
+                ""
+            }
+        )
+    })?;
+    out.flush()?;
+    Ok(())
+}
+
+fn search_sessions(db: &WorkspaceDb, text: &str, format: TextOrJson, limit: u32) -> Result<()> {
+    let hits = sessions::search_messages(db, text, &SessionViewer::All, limit)?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    format.write_rows(&mut out, &hits, "Nothing matched.", |out, hit| {
+        writeln!(
+            out,
+            "{}#{}  {}  {}  ({})",
+            hit.session_id,
+            hit.seq,
+            hit.role.as_str(),
+            hit.snippet,
+            hit.session_title.as_deref().unwrap_or("untitled")
         )
     })?;
     out.flush()?;
@@ -1525,20 +2352,28 @@ fn init_logging() {
 
 /// Log to stderr at `default` unless `RUST_LOG` says otherwise.
 fn init_logging_at(default: &str) {
-    tracing_subscriber::fmt()
+    init_logging_as(default, LogFormat::Text);
+}
+
+/// Log to stderr at `default` unless `RUST_LOG` says otherwise, as text
+/// lines or as one JSON object per line.
+fn init_logging_as(default: &str, format: LogFormat) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
+    let builder = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default)),
-        )
-        .init();
+        .with_env_filter(filter);
+    match format {
+        LogFormat::Text => builder.init(),
+        LogFormat::Json => builder.json().init(),
+    }
     // The provider is installed at the top of `main`, before any subscriber
     // exists; this is the first point where saying so reaches a log.
     CryptoModule::linked().log();
 }
 
-/// The configuration and the workspace a command runs in: the named one,
-/// or the default, created on first use.
+/// The configuration and the workspace a command runs in: the one `-w`
+/// names, which must exist, or the default, created on first use.
 struct OpenedWorkspace {
     config: Config,
     workspace: WorkspaceRow,
@@ -1548,15 +2383,20 @@ struct OpenedWorkspace {
 impl OpenedWorkspace {
     async fn resolve(workspace_name: Option<&str>) -> Result<Self> {
         let config = Config::load().context("failed to load configuration")?;
+        Self::in_config(config, workspace_name).await
+    }
+
+    /// The workspace `workspace_name` selects under `config`.
+    async fn in_config(config: Config, workspace_name: Option<&str>) -> Result<Self> {
         let control = ControlPlane::open(&config)
             .await
             .context("failed to open control plane")?;
-        let name =
-            workspace_name.map_or_else(|| config.general.default_workspace.clone(), str::to_owned);
         let workspace = control
-            .find_or_create_workspace(&name)
-            .await
-            .context("failed to resolve workspace")?;
+            .workspace_or_default(workspace_name, &config.general.default_workspace)
+            .await?;
+        let name = workspace.name.clone();
+        // The command sends only to the model providers the workspace allows.
+        Egress::Workspace(workspace.allowed_providers.clone()).enter();
         Ok(Self {
             config,
             workspace,
@@ -1586,6 +2426,257 @@ impl OpenedWorkspace {
         let reader_db = ReaderDb::open(&db, self.config.analysis.reader_pool_size).await;
         Ok((db, reader_db))
     }
+
+    /// `quack ingest DIR`: an OKF bundle, or every supported file under the
+    /// folder. The per-file flags have no meaning for a folder.
+    async fn ingest_dir(
+        &self,
+        dir: &Path,
+        per_file: bool,
+        no_embed: bool,
+        prune: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !per_file,
+            "--replace, --pin, --title, --filename, --author, --authored, --tag, and --types take one file, not a directory"
+        );
+        if Bundle::is_dir(dir) {
+            return self
+                .ingest_bundle(&dir.display().to_string(), no_embed)
+                .await;
+        }
+        let prune = if prune { Prune::Delete } else { Prune::Keep };
+        self.ingest_folder(dir, no_embed, prune).await
+    }
+
+    /// `quack ingest DIR` on a folder of files: every file quack can load
+    /// becomes a document, one line each; a changed file replaces the document
+    /// at its path, an unchanged one is skipped, unsupported files are listed,
+    /// and documents whose file is gone are reported, or deleted with
+    /// `--prune`. A file that fails is reported and fails the command once
+    /// the rest have run.
+    async fn ingest_folder(&self, dir: &Path, no_embed: bool, prune: Prune) -> Result<()> {
+        let (config, workspace_id) = (&self.config, self.workspace.id.as_str());
+        let ws_db = self.writer()?;
+        let embedding_model = if no_embed {
+            None
+        } else {
+            Embeddings::from_config(config)
+                .await
+                .context("failed to build embedding model")?
+        };
+        let report = Folder {
+            config,
+            db: &ws_db,
+            workspace_id,
+            root: dir,
+            embedder: embedding_model.as_ref(),
+            control: RunControl {
+                progress: &progress_line::to_stderr,
+                cancel: None,
+            },
+            prune,
+        }
+        .run()
+        .await
+        .with_context(|| format!("ingesting {}", dir.display()))?;
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        for FileResult { relative, outcome } in &report.results {
+            match outcome {
+                Outcome::Ingested(id) => writeln!(out, "ingested  {relative} ({id})")?,
+                Outcome::Replaced { old, new } => {
+                    writeln!(out, "replaced  {relative} ({old} -> {new})")?;
+                }
+                Outcome::Skipped(id) => writeln!(out, "skipped   {relative} (identical to {id})")?,
+                Outcome::Moved { document, from } => {
+                    writeln!(out, "moved     {from} -> {relative} ({document})")?;
+                }
+                Outcome::Failed(error) => writeln!(out, "failed    {relative}: {error}")?,
+            }
+        }
+        if !report.unsupported.is_empty() {
+            writeln!(
+                out,
+                "Not ingested ({} unsupported): {}",
+                report.unsupported.len(),
+                report.unsupported.join(", ")
+            )?;
+        }
+        if !report.gone.is_empty() {
+            let names: Vec<String> = report
+                .gone
+                .iter()
+                .map(|d| {
+                    format!(
+                        "{} ({})",
+                        d.source_path.as_deref().unwrap_or(&d.filename),
+                        d.id
+                    )
+                })
+                .collect();
+            match report.pruned {
+                Prune::Delete => {
+                    writeln!(out, "Deleted ({} gone): {}", names.len(), names.join(", "))?;
+                }
+                Prune::Keep => writeln!(
+                    out,
+                    "Gone from {} ({}, still in the workspace; --prune deletes them): {}",
+                    dir.display(),
+                    names.len(),
+                    names.join(", ")
+                )?,
+            }
+        }
+        out.flush()?;
+        let stored: Vec<DocumentId> = report
+            .results
+            .iter()
+            .filter_map(|r| match &r.outcome {
+                Outcome::Ingested(id) | Outcome::Replaced { new: id, .. } => Some(id.clone()),
+                Outcome::Skipped(_) | Outcome::Moved { .. } | Outcome::Failed(_) => None,
+            })
+            .collect();
+        self.follow_ingest(&ws_db, embedding_model.as_ref(), &stored, &mut out)
+            .await?;
+        out.flush()?;
+        let failed = report.failed();
+        if failed > 0 {
+            anyhow::bail!("{failed} of {} files failed", report.results.len());
+        }
+        Ok(())
+    }
+
+    /// `quack ingest DIR` on an OKF bundle. Every concept file becomes a
+    /// Markdown document, its front matter and links feed the ontology review
+    /// queue, and `index.md` is offered as the workspace context.
+    async fn ingest_bundle(&self, dir: &str, no_embed: bool) -> Result<()> {
+        let (config, workspace_id) = (&self.config, self.workspace.id.as_str());
+        let bundle = Bundle::from_dir(&PathBuf::from(dir))?;
+        let ws_db = self.writer()?;
+        let embedding_model = if no_embed {
+            None
+        } else {
+            Embeddings::from_config(config)
+                .await
+                .context("failed to build embedding model")?
+        };
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        let mut stored = 0usize;
+        let mut skipped = 0usize;
+        for file in bundle.documents() {
+            let front = okf::parse_front_matter(&file.content).front;
+            let name = file.document_name();
+            let outcome = ingestion::ingest_file(
+                config,
+                &ws_db,
+                workspace_id,
+                &NewFile::new(&name, file.content.as_bytes()).title(front.get("title")),
+                embedding_model.as_ref(),
+            )
+            .await
+            .with_context(|| format!("ingesting {}", file.path))?;
+            match outcome {
+                IngestOutcome::Ingested(_) => stored = stored.saturating_add(1),
+                IngestOutcome::Duplicate(_) => skipped = skipped.saturating_add(1),
+            }
+        }
+        writeln!(
+            out,
+            "Ingested {stored} concept files from {dir}{}.",
+            if skipped > 0 {
+                format!(" ({skipped} already present)")
+            } else {
+                String::new()
+            }
+        )?;
+        let index_body = bundle
+            .index()
+            .map(|index| {
+                okf::parse_front_matter(&index.content)
+                    .body
+                    .trim()
+                    .to_owned()
+            })
+            .filter(|body| !body.is_empty());
+        // The ontology, the review queue, and the current context: one step on
+        // the writer.
+        let note = format!("restored from {dir}");
+        let (report, existing) = ws_db
+            .run(move |db| {
+                let report = bundle.restore_into(db, Revision::reviewed(None, Some(&note)))?;
+                Ok((report, context::current(db)?.map(|c| c.content)))
+            })
+            .await?;
+        if let Some(version) = report.restored {
+            writeln!(
+                out,
+                "Restored the bundle's ontology (version {version} in this workspace)."
+            )?;
+        }
+        if report.candidates > 0 {
+            writeln!(
+                out,
+                "{} ontology candidates from the bundle's types and links: `quack ontology review`.",
+                report.candidates
+            )?;
+        }
+        if let Some(body) = index_body {
+            if existing.as_deref() == Some(body.as_str()) {
+                writeln!(out, "index.md already is the workspace context.")?;
+            } else {
+                let question = format!(
+                    "index.md can become the workspace context{}. Apply it?",
+                    if existing.is_some() {
+                        " (replacing the current one)"
+                    } else {
+                        ""
+                    }
+                );
+                if Confirm::Ask.ask(&mut out, &question, None)? {
+                    let stored = ws_db.run(move |db| context::set(db, &body, None)).await?;
+                    writeln!(out, "context is now version {}", stored.version)?;
+                } else {
+                    writeln!(
+                        out,
+                        "Left the context alone; `quack context import {dir}/index.md` applies it later."
+                    )?;
+                }
+            }
+        }
+        out.flush()?;
+        Ok(())
+    }
+
+    /// The graph extraction `[graph].follow_ingest` asks for after an ingest
+    /// or import, run here and reported in one line; nothing when it is off.
+    async fn follow_ingest(
+        &self,
+        db: &Writer,
+        embedder: Option<&Embeddings>,
+        documents: &[DocumentId],
+        out: &mut impl Write,
+    ) -> Result<()> {
+        let followed = FollowUp {
+            db,
+            config: &self.config,
+            embeddings: embedder,
+        }
+        .run(
+            documents,
+            RunControl {
+                progress: &progress_line::to_stderr,
+                cancel: None,
+            },
+        )
+        .await
+        .context("graph follow-up failed")?;
+        if let Some(summary) = followed {
+            writeln!(out, "  Graph: {summary}")?;
+        }
+        Ok(())
+    }
 }
 
 async fn run_query(
@@ -1605,18 +2696,16 @@ async fn run_query(
     .await?;
 
     let results = ws_db.execute_query(sql).context("query execution failed")?;
+    if ws_db.classify_statement(sql)? != StatementKind::Read
+        && let Err(e) = TableProfile::refresh_stale(&ws_db)
+    {
+        tracing::warn!(error = %e, "could not refresh table profiles after a write");
+    }
 
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
-    match format {
-        QueryFormat::Table => results.write_table(&mut out)?,
-        QueryFormat::Json => results.write_json(&mut out)?,
-        QueryFormat::Ndjson => results.write_ndjson(&mut out)?,
-        QueryFormat::Csv => results.write_csv(&mut out)?,
-        QueryFormat::Markdown => results.write_markdown(&mut out)?,
-    }
-
+    format.write(&results, &mut out)?;
     out.flush()?;
     Ok(())
 }
@@ -1628,6 +2717,12 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         title,
         no_embed,
         pin,
+        replace,
+        prune,
+        author,
+        authored,
+        tags,
+        types,
     } = args;
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
     let config = &opened.config;
@@ -1635,7 +2730,18 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     if let StdioPath::Path(dir) = &file
         && dir.is_dir()
     {
-        return ingest_bundle(&opened, &dir.display().to_string(), no_embed).await;
+        let per_file = replace.is_some()
+            || pin
+            || title.is_some()
+            || filename.is_some()
+            || author.is_some()
+            || authored.is_some()
+            || !tags.is_empty()
+            || !types.is_empty();
+        return opened.ingest_dir(dir, per_file, no_embed, prune).await;
+    }
+    if prune {
+        anyhow::bail!("--prune goes with a folder");
     }
     let NamedInput {
         name: effective_filename,
@@ -1643,6 +2749,10 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     } = file.read_named(filename.as_deref())?;
 
     let ws_db = opened.writer()?;
+    let replaces = match replace {
+        None => None,
+        Some(replace) => Some(replace.resolve(&ws_db, &effective_filename).await?),
+    };
 
     let embedding_model = if no_embed {
         None
@@ -1652,17 +2762,21 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
             .context("failed to build embedding model")?
     };
 
-    let source = match file {
-        StdioPath::Stdio => DocumentSource::Stdin,
-        StdioPath::Path(_) => DocumentSource::Path,
-    };
     let outcome = ingestion::ingest_file(
         config,
         &ws_db,
         opened.workspace.id.as_str(),
         &NewFile::new(&effective_filename, &data)
-            .source(source)
-            .title(title.as_deref()),
+            .source(file.document_source())
+            .title(title.as_deref())
+            .replaces(replaces.as_ref())
+            .types(ColumnTypes::joined(types))
+            .fields(DocumentFields {
+                title: None,
+                author,
+                authored_at: authored,
+                tags: (!tags.is_empty()).then_some(tags),
+            }),
         embedding_model.as_ref(),
     )
     .await
@@ -1690,10 +2804,28 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
             .run(move |db| db.set_document_pinning(&id, Pinning::Pinned))
             .await?;
     }
+    report_ingested(&mut out, &result, pin)?;
+    out.flush()?;
+    opened
+        .follow_ingest(
+            &ws_db,
+            embedding_model.as_ref(),
+            &[result.document_id],
+            &mut out,
+        )
+        .await?;
+    out.flush()?;
+    Ok(())
+}
 
+/// The lines `quack ingest` prints for a stored file.
+fn report_ingested(out: &mut impl Write, result: &IngestResult, pin: bool) -> Result<()> {
     writeln!(out, "Ingested: {}", result.filename)?;
     writeln!(out, "  Type: {}", result.file_type)?;
     writeln!(out, "  Document ID: {}", result.document_id)?;
+    if let Some(old) = &result.replaced {
+        writeln!(out, "  Replaced: {old} (now superseded)")?;
+    }
     if pin {
         writeln!(out, "  Pinned: yes")?;
     }
@@ -1701,11 +2833,10 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     for table in &result.tables {
         writeln!(out, "  Table: {table}")?;
     }
-    if result.pages_skipped > 0 {
+    if let Some(note) = result.pages.and_then(PageCounts::note) {
         writeln!(
             out,
-            "  Pages skipped: {} (unreadable; the rest of the document was kept)",
-            result.pages_skipped
+            "  Pages skipped: {note} (the rest of the document was kept)"
         )?;
     }
     if result.chunks_stored > 0 {
@@ -1724,202 +2855,8 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
             )?;
         }
     }
-
-    out.flush()?;
-    Ok(())
-}
-
-/// `quack ingest DIR`: an OKF bundle. Every concept file becomes a
-/// Markdown document, its front matter and links feed the ontology review
-/// queue, and `index.md` is offered as the workspace context.
-async fn ingest_bundle(opened: &OpenedWorkspace, dir: &str, no_embed: bool) -> Result<()> {
-    let (config, workspace_id) = (&opened.config, opened.workspace.id.as_str());
-    let bundle = Bundle::from_dir(&PathBuf::from(dir))?;
-    let ws_db = opened.writer()?;
-    let embedding_model = if no_embed {
-        None
-    } else {
-        Embeddings::from_config(config)
-            .await
-            .context("failed to build embedding model")?
-    };
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-    let mut stored = 0usize;
-    let mut skipped = 0usize;
-    for file in bundle.documents() {
-        let front = okf::parse_front_matter(&file.content).front;
-        let name = file.document_name();
-        let outcome = ingestion::ingest_file(
-            config,
-            &ws_db,
-            workspace_id,
-            &NewFile::new(&name, file.content.as_bytes()).title(front.get("title")),
-            embedding_model.as_ref(),
-        )
-        .await
-        .with_context(|| format!("ingesting {}", file.path))?;
-        match outcome {
-            IngestOutcome::Ingested(_) => stored = stored.saturating_add(1),
-            IngestOutcome::Duplicate(_) => skipped = skipped.saturating_add(1),
-        }
-    }
-    writeln!(
-        out,
-        "Ingested {stored} concept files from {dir}{}.",
-        if skipped > 0 {
-            format!(" ({skipped} already present)")
-        } else {
-            String::new()
-        }
-    )?;
-    let index_body = bundle
-        .index()
-        .map(|index| {
-            okf::parse_front_matter(&index.content)
-                .body
-                .trim()
-                .to_owned()
-        })
-        .filter(|body| !body.is_empty());
-    // The ontology, the review queue, and the current context: one step on
-    // the writer.
-    let note = format!("restored from {dir}");
-    let (report, existing) = ws_db
-        .run(move |db| {
-            let report = bundle.restore_into(db, Revision::reviewed(None, Some(&note)))?;
-            Ok((report, context::current(db)?.map(|c| c.content)))
-        })
-        .await?;
-    if let Some(version) = report.restored {
-        writeln!(
-            out,
-            "Restored the bundle's ontology (version {version} in this workspace)."
-        )?;
-    }
-    if report.candidates > 0 {
-        writeln!(
-            out,
-            "{} ontology candidates from the bundle's types and links: `quack ontology review`.",
-            report.candidates
-        )?;
-    }
-    if let Some(body) = index_body {
-        if existing.as_deref() == Some(body.as_str()) {
-            writeln!(out, "index.md already is the workspace context.")?;
-        } else {
-            let question = format!(
-                "index.md can become the workspace context{}. Apply it?",
-                if existing.is_some() {
-                    " (replacing the current one)"
-                } else {
-                    ""
-                }
-            );
-            if Confirm::Ask.ask(&mut out, &question, None)? {
-                let stored = ws_db.run(move |db| context::set(db, &body, None)).await?;
-                writeln!(out, "context is now version {}", stored.version)?;
-            } else {
-                writeln!(
-                    out,
-                    "Left the context alone; `quack context import {dir}/index.md` applies it later."
-                )?;
-            }
-        }
-    }
-    out.flush()?;
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use quack_core::embedding::Dimension;
-    use quack_core::error::AuthReason;
-    use quack_core::llm::oauth::Renewal;
-    use quack_core::storage::workspace::NewDocument;
-
-    /// A closed reader surfaces as an `io::Error`, a `serde_json` or `csv`
-    /// error, or core's transparent `Io`, `Json`, and `Csv` variants; each one ends the
-    /// command quietly (issue #68). Anything else still reports.
-    #[test]
-    fn broken_pipe_is_recognised_through_every_wrapper() {
-        let pipe = || std::io::Error::from(std::io::ErrorKind::BrokenPipe);
-        assert!(is_broken_pipe(&anyhow::Error::from(pipe())));
-        assert!(is_broken_pipe(
-            &anyhow::Error::from(pipe()).context("failed to print")
-        ));
-        assert!(is_broken_pipe(&anyhow::Error::from(CoreError::Io(pipe()))));
-        assert!(is_broken_pipe(&anyhow::Error::from(CoreError::Json(
-            serde_json::Error::io(pipe())
-        ))));
-        assert!(is_broken_pipe(&anyhow::Error::from(csv::Error::from(
-            pipe()
-        ))));
-        assert!(is_broken_pipe(&anyhow::Error::from(CoreError::Csv(
-            csv::Error::from(pipe())
-        ))));
-        assert!(!is_broken_pipe(&anyhow::Error::from(std::io::Error::from(
-            std::io::ErrorKind::NotFound
-        ))));
-        assert!(!is_broken_pipe(&anyhow::anyhow!("something else")));
-    }
-
-    /// `docs --format json` prints every recorded field, so a script can tell why a
-    /// document failed.
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    fn docs_json_carries_every_document_field() {
-        let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
-        db.insert_document(&NewDocument::new(
-            &DocumentId::from("d1"),
-            "broken.pdf",
-            "application/pdf",
-            3,
-        ))
-        .unwrap();
-        db.mark_document_error(&DocumentId::from("d1"), "no text layer")
-            .unwrap();
-        let mut out = Vec::new();
-        list_documents(&db, TextOrJson::Json, &mut out).unwrap();
-        let row: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(row.get("status").unwrap(), "error", "{row}");
-        assert_eq!(row.get("error_message").unwrap(), "no text layer", "{row}");
-        for key in ["ingested_by", "tables", "filename", "sha256", "source"] {
-            assert!(row.get(key).is_some(), "{key} missing: {row}");
-        }
-    }
-
-    /// A missing login is recognised through the context a command adds
-    /// (`import failed`), but not once the error has been turned into text,
-    /// which is how `quack import` lost its exit 4.
-    #[test]
-    fn auth_required_is_recognised_through_context_only_while_typed() {
-        let auth = || CoreError::AuthRequired {
-            provider: String::from("corp"),
-            reason: AuthReason::NoToken,
-        };
-        assert!(auth_exit_code(&anyhow::Error::from(auth())).is_some());
-        assert!(auth_exit_code(&anyhow::Error::from(auth()).context("import failed")).is_some());
-        assert!(auth_exit_code(&anyhow::anyhow!(auth().to_string())).is_none());
-        assert!(auth_exit_code(&anyhow::anyhow!("something else")).is_none());
-    }
-
-    #[test]
-    fn auth_status_names_the_actor_only_when_one_is_sent() {
-        let token = TokenStatus {
-            expires_at: jiff::Timestamp::UNIX_EPOCH,
-            renewal: Renewal::Regrant,
-        };
-        let with_actor = token_state("gw", Some(token), Grant::OnBehalfOf, true);
-        assert!(with_actor.contains("(the actor)"), "{with_actor}");
-        for stored in [Some(token), None] {
-            let vouch = token_state("gw", stored, Grant::OnBehalfOf, false);
-            assert!(!vouch.contains("the actor"), "{vouch}");
-            assert!(vouch.contains("without an actor token"), "{vouch}");
-        }
-        assert!(
-            token_state("p", None, Grant::AuthorizationCode, false).contains("quack auth login p")
-        );
-    }
-}
+mod tests;

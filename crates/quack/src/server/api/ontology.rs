@@ -1,15 +1,21 @@
-//! The ontology: read, replace (a new version), versions, diff, restore.
+//! The ontology: read, replace (a new version), versions, diff, restore,
+//! and rename an id with the graph following.
 //! Members write; viewers read; every write is audited as `ontology`.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use quack_core::error::Error as CoreError;
 use quack_core::extraction::ExtractionRun;
 use quack_core::ids::{RunId, WorkspaceId};
-use quack_core::ontology::candidates::{CandidateAction, Queue};
-use quack_core::ontology::induction::{Decision, propose_from_tables};
+use quack_core::jobs::JobId;
+use quack_core::ontology::OntologyDiff;
+use quack_core::ontology::candidates::{CandidateAction, CandidateRow, Queue};
+use quack_core::ontology::induction::{Decision, ItemKind, propose_from_tables};
+use quack_core::ontology::store::VersionRow;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::server::auth::{Access, Identity, Need};
 use crate::server::error::{ApiError, ApiResult};
@@ -17,48 +23,92 @@ use crate::server::run::{BackgroundRun, RunKind};
 use crate::server::state::{App, with_db};
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::OntologyVersion;
-use quack_core::ontology::documents::{self, DocumentProposal};
+use quack_core::ontology::documents::{self, CostEstimate, DocumentProposal};
+use quack_core::ontology::edit::Edit;
 use quack_core::ontology::store::Revision;
-use quack_core::ontology::{Ontology, candidates, store};
+use quack_core::ontology::{IdRenames, Ontology, candidates, store};
 use quack_core::progress::{ChunkDone, RunControl};
 
+/// The current ontology; 404 before the first one is saved.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/ontology",
+    tag = "ontology",
+    params(WorkspaceId),
+    responses((status = 200, description = "The ontology", body = Ontology)),
+)]
 pub(crate) async fn show(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<Ontology>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "ontology")
         .await?;
     let current = app.read(&id, store::current).await?;
     let ontology = current.ok_or_else(|| ApiError::not_found("no ontology yet"))?;
-    Ok(Json(serde_json::to_value(ontology)?))
+    Ok(Json(ontology))
+}
+
+/// The JSON Schema of the interchange form `PUT .../ontology` accepts.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/ontology/schema",
+    tag = "ontology",
+    params(WorkspaceId),
+    responses((status = 200, description = "A JSON Schema (draft 2020-12)", body = Object)),
+)]
+pub(crate) async fn schema(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access
+        .audit_read(&app, AuditAction::Show, "ontology_schema")
+        .await?;
+    Ok(Json(serde_json::to_value(Ontology::json_schema())?))
 }
 
 /// Validate the body and store it as the next version.
+#[utoipa::path(
+    put,
+    path = "/workspaces/{id}/ontology",
+    tag = "ontology",
+    request_body(content = Ontology, description = "The interchange form `GET .../ontology/schema` describes"),
+    params(WorkspaceId),
+    responses((status = 200, description = "The stored version", body = Ontology)),
+)]
 pub(crate) async fn replace(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Json(body): Json<serde_json::Value>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<Ontology>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access
         .replace_ontology(&app, &body.to_string(), "imported")
         .await?;
-    Ok(Json(serde_json::to_value(stored)?))
+    Ok(Json(stored))
 }
 
 /// Install the built-in general ontology as version 1.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/ontology/init",
+    tag = "ontology",
+    params(WorkspaceId),
+    responses((status = 200, description = "The stored version", body = Ontology)),
+)]
 pub(crate) async fn init(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<Ontology>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.init_ontology(&app).await?;
-    Ok(Json(serde_json::to_value(stored)?))
+    Ok(Json(stored))
 }
 
 /// The ontology writes the API and the web console share: each stores a
@@ -73,7 +123,7 @@ impl Access {
         note: &'static str,
     ) -> ApiResult<Ontology> {
         let ontology = Ontology::from_json(json)?;
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let author = self.identity.username.clone();
         let stored = with_db(db, move |db| {
             store::save(db, &ontology, Revision::reviewed(Some(&author), Some(note)))
@@ -90,9 +140,38 @@ impl Access {
         Ok(stored)
     }
 
+    /// Apply one form edit to the current ontology and store the result as
+    /// the next version; the save validates it as it does any other.
+    pub(crate) async fn edit_ontology(&self, app: &App, edit: Edit) -> ApiResult<Ontology> {
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let note = format!("{edit} in the web UI");
+        let detail = serde_json::to_value(&edit)?;
+        let stored = with_db(db, move |db| {
+            let mut ontology = store::current(db)?
+                .ok_or_else(|| CoreError::Ontology(String::from("no ontology yet")))?;
+            edit.apply(&mut ontology)?;
+            store::save(
+                db,
+                &ontology,
+                Revision::reviewed(Some(&author), Some(&note)),
+            )
+        })
+        .await?;
+        self.audit(
+            app,
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "edited": detail, "version": stored.version })),
+        )
+        .await?;
+        Ok(stored)
+    }
+
     /// Install the built-in ontology as version 1; 409 once one exists.
     pub(crate) async fn init_ontology(&self, app: &App) -> ApiResult<Ontology> {
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let author = self.identity.username.clone();
         let stored = with_db(db, move |db| {
             if store::latest_version(db)?.is_some() {
@@ -118,13 +197,35 @@ impl Access {
         Ok(stored)
     }
 
+    /// Rename a class or relation id as the next version, moving the
+    /// graph's nodes and edges with it.
+    pub(crate) async fn rename_ontology_id(
+        &self,
+        app: &App,
+        rename: &RenameRequest,
+    ) -> ApiResult<Ontology> {
+        let renames = IdRenames::one(rename.kind, &rename.from, &rename.to)?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let author = self.identity.username.clone();
+        let stored = with_db(db, move |db| store::rename(db, &renames, Some(&author))).await?;
+        self.audit(
+            app,
+            AuditAction::Ontology,
+            Some(ResourceKind::OntologyVersion.id(&stored.saved_version()?.to_string())),
+            Outcome::Allowed,
+            Some(serde_json::json!({ "renamed": rename, "version": stored.version })),
+        )
+        .await?;
+        Ok(stored)
+    }
+
     /// Store version `version` again as the newest.
     pub(crate) async fn restore_ontology(
         &self,
         app: &App,
         version: OntologyVersion,
     ) -> ApiResult<Ontology> {
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let author = self.identity.username.clone();
         let stored = with_db(db, move |db| store::restore(db, version, Some(&author))).await?;
         self.audit(
@@ -139,9 +240,11 @@ impl Access {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 pub(crate) struct VersionsQuery {
+    /// Versions at most, newest first.
     #[serde(default = "default_limit")]
+    #[param(default = 20)]
     pub limit: u32,
 }
 
@@ -149,33 +252,63 @@ fn default_limit() -> u32 {
     20
 }
 
+/// The ontology's saved versions, newest first.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct VersionList {
+    pub versions: Vec<VersionRow>,
+}
+
+/// The ontology's saved versions, newest first.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/ontology/versions",
+    tag = "ontology",
+    params(WorkspaceId, VersionsQuery),
+    responses((status = 200, description = "The versions", body = VersionList)),
+)]
 pub(crate) async fn versions(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Query(q): Query<VersionsQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<VersionList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "ontology_versions")
         .await?;
     let limit = q.limit;
     let rows = app.read(&id, move |db| store::versions(db, limit)).await?;
-    Ok(Json(serde_json::json!({ "versions": rows })))
+    Ok(Json(VersionList { versions: rows }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 pub(crate) struct DiffQuery {
     /// The older version to compare against; default: the one before.
     pub against: Option<OntologyVersion>,
 }
 
+/// One saved version, and what changed since an older one.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct VersionDetail {
+    pub ontology: Ontology,
+    /// `null` for the first version.
+    pub diff: Option<OntologyDiff>,
+}
+
+/// One saved version, with its diff against an older one.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/ontology/versions/{v}",
+    tag = "ontology",
+    params(DiffQuery),
+    responses((status = 200, description = "The version", body = VersionDetail)),
+)]
 pub(crate) async fn version(
     State(app): State<App>,
     identity: Identity,
     Path((id, v)): Path<(WorkspaceId, OntologyVersion)>,
     Query(q): Query<DiffQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<VersionDetail>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit(
@@ -199,22 +332,61 @@ pub(crate) async fn version(
         .await?;
     let snapshot = snapshot.ok_or_else(|| ApiError::not_found("no such version"))?;
     let diff = older.map(|older| snapshot.diff(&older));
-    Ok(Json(
-        serde_json::json!({ "ontology": snapshot, "diff": diff }),
-    ))
+    Ok(Json(VersionDetail {
+        ontology: snapshot,
+        diff,
+    }))
 }
 
+/// Save an older version again as the newest.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/ontology/versions/{v}/restore",
+    tag = "ontology",
+    responses((status = 200, description = "The stored version", body = Ontology)),
+)]
 pub(crate) async fn restore(
     State(app): State<App>,
     identity: Identity,
     Path((id, v)): Path<(WorkspaceId, OntologyVersion)>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<Ontology>> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let stored = access.restore_ontology(&app, v).await?;
-    Ok(Json(serde_json::to_value(stored)?))
+    Ok(Json(stored))
 }
 
-#[derive(Deserialize, Default)]
+/// One id to rename, in the body or the ontology page's form.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub(crate) struct RenameRequest {
+    /// `class` or `relation`.
+    pub kind: ItemKind,
+    /// The id as the ontology has it now.
+    pub from: String,
+    /// The id to give it; one the ontology does not have yet.
+    pub to: String,
+}
+
+/// Rename a class or relation id; the stored ontology comes back.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/ontology/rename",
+    tag = "ontology",
+    request_body = RenameRequest,
+    params(WorkspaceId),
+    responses((status = 200, description = "The stored version", body = Ontology)),
+)]
+pub(crate) async fn rename(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+    Json(body): Json<RenameRequest>,
+) -> ApiResult<Json<Ontology>> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let stored = access.rename_ontology_id(&app, &body).await?;
+    Ok(Json(stored))
+}
+
+#[derive(Deserialize, Default, ToSchema)]
 pub(crate) struct ProposeRequest {
     /// Propose always adds only what the current ontology lacks (a full draft
     /// when there is none). `"extend"` names that and is accepted; any other
@@ -234,14 +406,34 @@ pub(crate) struct ProposeRequest {
     pub sample: Option<u32>,
 }
 
+/// What a proposal did: the table pass's count, or the document pass
+/// started.
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub(crate) enum Proposed {
+    Tables(TableProposal),
+    Documents(DocumentRunStarted),
+}
+
 /// Propose from table evidence into the review queue. Deterministic and
 /// fast, so it answers 200 with the count rather than 202.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/ontology/propose",
+    tag = "ontology",
+    request_body(content = Option<ProposeRequest>, description = "Optional; table evidence alone when absent"),
+    params(WorkspaceId),
+    responses(
+        (status = 200, description = "The table pass queued its candidates", body = TableProposal),
+        (status = 202, description = "The document pass runs in the background", body = DocumentRunStarted),
+    ),
+)]
 pub(crate) async fn propose(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     body: Option<Json<ProposeRequest>>,
-) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+) -> ApiResult<(StatusCode, Json<Proposed>)> {
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let request = body.map(|b| b.0).unwrap_or_default();
     if let Some(mode) = request.mode.as_deref()
@@ -253,16 +445,16 @@ pub(crate) async fn propose(
     }
     if request.documents {
         let started = access.start_document_run(&app, request.sample).await?;
-        return Ok((StatusCode::ACCEPTED, started));
+        return Ok((StatusCode::ACCEPTED, Json(Proposed::Documents(started))));
     }
     let proposed = access
         .propose_from_tables(&app, request.auto_accept)
         .await?;
-    Ok((StatusCode::OK, Json(serde_json::to_value(proposed)?)))
+    Ok((StatusCode::OK, Json(Proposed::Tables(proposed))))
 }
 
 /// What proposing from the tables queued.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct TableProposal {
     /// Candidates queued; zero when the ontology already covers the tables.
     pub candidates: usize,
@@ -272,7 +464,7 @@ pub(crate) struct TableProposal {
 }
 
 /// Candidates decided one at a time.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct CandidateDecided {
     pub candidate: String,
     pub action: CandidateAction,
@@ -280,7 +472,7 @@ pub(crate) struct CandidateDecided {
 }
 
 /// Candidates decided in bulk.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct CandidatesDecided {
     pub accepted: usize,
     pub rejected: usize,
@@ -297,7 +489,7 @@ impl Access {
         auto_accept: bool,
     ) -> ApiResult<TableProposal> {
         let options = app.config.ontology.table_evidence();
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let author = self.identity.username.clone();
         let proposed = with_db(db, move |db| {
             let current = store::current(db)?;
@@ -344,7 +536,7 @@ impl Access {
         target: Option<&str>,
     ) -> ApiResult<CandidateDecided> {
         let decision = action.decision(target)?;
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let author = self.identity.username.clone();
         let candidate_id = candidate.to_owned();
         let version = with_db(db, move |db| {
@@ -384,7 +576,7 @@ impl Access {
                 "choose at least one candidate to accept or reject",
             ));
         }
-        let db = app.workspace_db(&self.workspace.id).await?;
+        let db = app.workspace_db(&self.membership.workspace.id).await?;
         let author = self.identity.username.clone();
         let (accepting, rejecting) = (accept.clone(), reject.clone());
         let (version, rejected) = with_db(db, move |db| {
@@ -425,19 +617,33 @@ impl Access {
     }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::IntoParams)]
 pub(crate) struct CandidatesQuery {
     /// `pending` (default) or `low_support`.
     #[serde(default)]
     pub status: Queue,
 }
 
+/// Candidates waiting for review.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CandidateList {
+    pub candidates: Vec<CandidateRow>,
+}
+
+/// Candidates waiting for review.
+#[utoipa::path(
+    get,
+    path = "/workspaces/{id}/ontology/candidates",
+    tag = "ontology",
+    params(WorkspaceId, CandidatesQuery),
+    responses((status = 200, description = "The candidates", body = CandidateList)),
+)]
 pub(crate) async fn list_candidates(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Query(q): Query<CandidatesQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<CandidateList>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access
         .audit_read(&app, AuditAction::List, "ontology_candidates")
@@ -446,10 +652,10 @@ pub(crate) async fn list_candidates(
     let rows = app
         .read(&id, move |db| candidates::queue(db, queue))
         .await?;
-    Ok(Json(serde_json::json!({ "candidates": rows })))
+    Ok(Json(CandidateList { candidates: rows }))
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, ToSchema)]
 pub(crate) struct DecideManyRequest {
     /// Candidate ids to accept as proposed.
     #[serde(default)]
@@ -461,6 +667,14 @@ pub(crate) struct DecideManyRequest {
 
 /// Accept and reject candidates in bulk: one new version for every
 /// acceptance together (issue #55).
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/ontology/candidates",
+    tag = "ontology",
+    request_body = DecideManyRequest,
+    params(WorkspaceId),
+    responses((status = 200, description = "What was decided", body = CandidatesDecided)),
+)]
 pub(crate) async fn decide_many(
     State(app): State<App>,
     identity: Identity,
@@ -475,7 +689,7 @@ pub(crate) async fn decide_many(
     ))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub(crate) struct DecideRequest {
     /// `accept`, `rename`, `merge_into`, `reparent`, or `reject`.
     pub action: CandidateAction,
@@ -483,6 +697,14 @@ pub(crate) struct DecideRequest {
     pub target: Option<String>,
 }
 
+/// Decide one candidate.
+#[utoipa::path(
+    put,
+    path = "/workspaces/{id}/ontology/candidates/{cid}",
+    tag = "ontology",
+    request_body = DecideRequest,
+    responses((status = 200, description = "What was decided", body = CandidateDecided)),
+)]
 pub(crate) async fn decide(
     State(app): State<App>,
     identity: Identity,
@@ -508,15 +730,27 @@ impl Access {
         &self,
         app: &App,
         sample: Option<u32>,
-    ) -> ApiResult<Json<serde_json::Value>> {
-        let (access, id) = (self, &self.workspace.id);
+    ) -> ApiResult<DocumentRunStarted> {
+        let (access, id) = (self, &self.membership.workspace.id);
         let mut options = app.config.ontology.document_evidence();
         if let Some(n) = sample {
             options.sample_chunks = n;
         }
         // Fail now, not in the background, when no model can be built.
-        let extractor = llm::chat_extractor(&app.config).await?;
-        let embeddings = Embeddings::from_config(&app.config).await?;
+        let extractor = access
+            .model(
+                app,
+                AuditAction::Propose,
+                llm::chat_extractor(&app.config).await,
+            )
+            .await?;
+        let embeddings = access
+            .model(
+                app,
+                AuditAction::Propose,
+                Embeddings::from_config(&app.config).await,
+            )
+            .await?;
         let (cost, chunks, current) = app
             .read(id, move |db| {
                 let cost = documents::estimate(db, &options)?;
@@ -531,7 +765,7 @@ impl Access {
         let run = BackgroundRun::start(
             app,
             access,
-            RunKind::Ontology,
+            RunKind::ONTOLOGY,
             serde_json::json!({ "documents": true, "cost": cost }),
         )
         .await?;
@@ -580,8 +814,27 @@ impl Access {
                 Err(e) => Err(e.to_string()),
             }
         });
-        Ok(Json(
-            serde_json::json!({ "run": run_id, "cost": cost, "job": job, "status": "running" }),
-        ))
+        Ok(DocumentRunStarted {
+            run: run_id,
+            cost,
+            job,
+            status: RunState::Running,
+        })
     }
+}
+
+/// The document pass, started.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DocumentRunStarted {
+    pub run: RunId,
+    pub cost: CostEstimate,
+    pub job: JobId,
+    pub status: RunState,
+}
+
+/// Where a background run stands when it is answered.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RunState {
+    Running,
 }

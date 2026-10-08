@@ -1,0 +1,56 @@
+name: Fuzz
+
+# Every parser that takes an uploaded file runs under libFuzzer for a fixed
+# time each night (`fuzz/`, a detached crate). A crash leaves its input in
+# `fuzz/artifacts/`, uploaded here; a found crash is a bug to file with it.
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [pdf, markdown, text, html, docx, pptx, epub, odt, eml, mbox, vtt, srt, code, rtf, xlsx, chunker]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # libFuzzer needs nightly's `-Z sanitizer`; the pin is the toolchain
+      # action's `nightly` ref, not a dated channel, so it moves with it.
+      - uses: dtolnay/rust-toolchain@0e28dd9a7764e5f83064112bb1f24025a14c313c # nightly
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Seed the corpus from the evaluation fixtures
+        run: ./fuzz/seed.sh
+      - name: Fuzz for ten minutes
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cd fuzz && cargo +nightly fuzz run "${TARGET}" -- -max_total_time=600 -timeout=30
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore

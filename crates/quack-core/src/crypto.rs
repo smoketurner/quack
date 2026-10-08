@@ -13,6 +13,24 @@
 
 use crate::error::{Error, Result};
 
+/// Lowercase hex SHA-256: the form tokens are stored in, and what names
+/// a file's bytes, an embedding profile, and a fenced document block.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex_lower(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes).as_ref())
+}
+
+/// `bytes` as lowercase hex.
+#[must_use]
+pub fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for b in bytes {
+        out.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
+    }
+    out
+}
+
 /// Install aws-lc-rs as the process-wide rustls crypto provider.
 ///
 /// Call this first in `main`, before building any HTTP client or runtime.
@@ -111,6 +129,14 @@ impl std::fmt::Display for CryptoModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_hex_is_the_known_digest_of_abc() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn the_provider_is_fips_on_linux_and_not_elsewhere() {

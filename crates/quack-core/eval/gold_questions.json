@@ -2,104 +2,205 @@
   {
     "question": "What are the estimated wind speeds for an EF2 tornado?",
     "kind": "semantic",
-    "expected": [{ "filename": "ef-scale.md", "contains": "111 to 135" }]
+    "expected": [
+      {
+        "filename": "ef-scale.md",
+        "contains": "111 to 135"
+      }
+    ]
   },
   {
     "question": "What is the wind speed range of an EF5 tornado?",
     "kind": "semantic",
-    "expected": [{ "filename": "ef-scale.md", "contains": "over 200 miles per hour" }]
+    "expected": [
+      {
+        "filename": "ef-scale.md",
+        "contains": "over 200 miles per hour"
+      }
+    ]
   },
   {
     "question": "What is a Category 4 hurricane's sustained wind speed range?",
     "kind": "semantic",
-    "expected": [{ "filename": "saffir-simpson.md", "contains": "130 to 156" }]
+    "expected": [
+      {
+        "filename": "saffir-simpson.md",
+        "contains": "130 to 156"
+      }
+    ]
   },
   {
     "question": "What does a fatality code of I mean?",
     "kind": "semantic",
-    "expected": [{ "filename": "glossary.md", "contains": "indirect, meaning the death" }]
+    "expected": [
+      {
+        "filename": "glossary.md",
+        "contains": "indirect, meaning the death"
+      }
+    ]
   },
   {
     "question": "What does the property damage suffix M mean?",
     "kind": "semantic",
-    "expected": [{ "filename": "glossary.md", "contains": "M` for millions" }]
+    "expected": [
+      {
+        "filename": "glossary.md",
+        "contains": "M` for millions"
+      }
+    ]
   },
   {
     "question": "What should you do when a tornado warning is issued?",
     "kind": "semantic",
-    "expected": [{ "filename": "tornado-safety.md", "contains": "lowest floor of a sturdy" }]
+    "expected": [
+      {
+        "filename": "tornado-safety.md",
+        "contains": "lowest floor of a sturdy"
+      }
+    ]
   },
   {
     "question": "What is required for an entry to be recorded in the storm events database?",
     "kind": "semantic",
-    "expected": [{ "filename": "data-preparation.md", "contains": "recognized event type" }]
+    "expected": [
+      {
+        "filename": "data-preparation.md",
+        "contains": "recognized event type"
+      }
+    ]
   },
   {
     "question": "What distinguishes a direct death from an indirect death?",
     "kind": "semantic",
-    "expected": [{ "filename": "data-preparation.md", "contains": "physical force caused it" }]
+    "expected": [
+      {
+        "filename": "data-preparation.md",
+        "contains": "physical force caused it"
+      }
+    ]
   },
   {
     "question": "What happened in storm report SR-8841?",
     "kind": "identifier",
-    "expected": [{ "filename": "episode-01.md", "contains": "Rutherford County" }]
+    "expected": [
+      {
+        "filename": "episode-01.md",
+        "contains": "Rutherford County"
+      }
+    ]
   },
   {
     "question": "What happened in storm report SR-4437?",
     "kind": "identifier",
-    "expected": [{ "filename": "episode-08.md", "contains": "Grady County" }]
+    "expected": [
+      {
+        "filename": "episode-08.md",
+        "contains": "Grady County"
+      }
+    ]
   },
   {
     "question": "What happened in storm report SR-7765?",
     "kind": "identifier",
-    "expected": [{ "filename": "episode-09.md", "contains": "hurricane landfall" }]
+    "expected": [
+      {
+        "filename": "episode-09.md",
+        "contains": "hurricane landfall"
+      }
+    ]
   },
   {
     "question": "What happened in storm report SR-2214?",
     "kind": "identifier",
-    "expected": [{ "filename": "episode-06.md", "contains": "Cedar River" }]
+    "expected": [
+      {
+        "filename": "episode-06.md",
+        "contains": "Cedar River"
+      }
+    ]
   },
   {
     "question": "How much snow fell during storm report SR-6688?",
     "kind": "identifier",
-    "expected": [{ "filename": "episode-05.md", "contains": "fourteen inches" }]
+    "expected": [
+      {
+        "filename": "episode-05.md",
+        "contains": "fourteen inches"
+      }
+    ]
   },
   {
     "question": "What ignited the wildfire in storm report SR-9901?",
     "kind": "identifier",
-    "expected": [{ "filename": "episode-07.md", "contains": "ignited by lightning" }]
+    "expected": [
+      {
+        "filename": "episode-07.md",
+        "contains": "ignited by lightning"
+      }
+    ]
   },
   {
     "question": "Which forecast office covers Wakefield, Virginia?",
     "kind": "identifier",
-    "expected": [{ "filename": "office-akq.md", "contains": "AKQ" }]
+    "expected": [
+      {
+        "filename": "office-akq.md",
+        "contains": "AKQ"
+      }
+    ]
   },
   {
     "question": "Which forecast office covers Oxnard, California?",
     "kind": "identifier",
-    "expected": [{ "filename": "office-lox.md", "contains": "LOX" }]
+    "expected": [
+      {
+        "filename": "office-lox.md",
+        "contains": "LOX"
+      }
+    ]
   },
   {
     "question": "Which forecast office covers Glasgow, Montana?",
     "kind": "identifier",
-    "expected": [{ "filename": "office-ggw.md", "contains": "GGW" }]
+    "expected": [
+      {
+        "filename": "office-ggw.md",
+        "contains": "GGW"
+      }
+    ]
   },
   {
     "question": "\"flash flood emergency\"",
     "kind": "phrase",
-    "expected": [{ "filename": "episode-04.md", "contains": "flash flood emergency" }]
+    "expected": [
+      {
+        "filename": "episode-04.md",
+        "contains": "flash flood emergency"
+      }
+    ]
   },
   {
     "question": "\"wall of water\"",
     "kind": "phrase",
-    "expected": [{ "filename": "episode-06.md", "contains": "wall of water" }]
+    "expected": [
+      {
+        "filename": "episode-06.md",
+        "contains": "wall of water"
+      }
+    ]
   },
   {
     "question": "\"golf ball sized hail\"",
     "kind": "phrase",
     "expected": [
-      { "filename": "episode-01.md", "contains": "golf ball sized hail" },
-      { "filename": "episode-02.md", "contains": "golf ball sized hail" }
+      {
+        "filename": "episode-01.md",
+        "contains": "golf ball sized hail"
+      },
+      {
+        "filename": "episode-02.md",
+        "contains": "golf ball sized hail"
+      }
     ]
   },
   {
@@ -107,5 +208,115 @@
     "kind": "phrase",
     "expected": [],
     "expect_empty": true
+  },
+  {
+    "question": "How many generator hours did the Glasgow office record?",
+    "kind": "semantic",
+    "expected": [
+      {
+        "filename": "readiness-review.html",
+        "contains": "| Glasgow | Theo Brandt | 40 |"
+      }
+    ]
+  },
+  {
+    "question": "Who is the readiness lead for the Jackson office?",
+    "kind": "semantic",
+    "expected": [
+      {
+        "filename": "readiness-review.html",
+        "contains": "Priya Natarajan"
+      }
+    ]
+  },
+  {
+    "question": "What share of registered spotters must complete the annual refresher?",
+    "kind": "semantic",
+    "expected": [
+      {
+        "filename": "readiness-review.html",
+        "contains": "ninety percent of its registered spotters"
+      }
+    ]
+  },
+  {
+    "question": "How many cots does the fairgrounds pavilion hold?",
+    "kind": "semantic",
+    "expected": [
+      {
+        "filename": "shelter-supply.docx",
+        "contains": "| Fairgrounds pavilion | 400 |"
+      }
+    ]
+  },
+  {
+    "question": "When is a shelter restocked with water?",
+    "kind": "semantic",
+    "expected": [
+      {
+        "filename": "shelter-supply.docx",
+        "contains": "below one case per cot"
+      }
+    ]
+  },
+  {
+    "question": "Which dam's gate test was rated urgent?",
+    "kind": "semantic",
+    "expected": [
+      {
+        "filename": "dam-inspection.pdf",
+        "contains": "| Cedar Hollow | High | Seized | Urgent |"
+      }
+    ]
+  },
+  {
+    "question": "What happened to the Cedar Hollow spillway gate during the test lift?",
+    "kind": "phrase",
+    "expected": [
+      {
+        "filename": "dam-inspection.pdf",
+        "contains": "seized at forty percent open"
+      }
+    ]
+  },
+  {
+    "question": "Bis wann muss ein Hagelschaden gemeldet werden?",
+    "kind": "multilingual",
+    "expected": [
+      {
+        "filename": "sturmschaeden.md",
+        "contains": "innerhalb von sieben Tagen"
+      }
+    ]
+  },
+  {
+    "question": "Welche Versicherung deckt eine Überschwemmung durch Starkregen?",
+    "kind": "multilingual",
+    "expected": [
+      {
+        "filename": "sturmschaeden.md",
+        "contains": "Elementarschadenversicherung"
+      }
+    ]
+  },
+  {
+    "question": "台风过后多久报告损失？",
+    "kind": "multilingual",
+    "expected": [
+      {
+        "filename": "taifeng-lipei.md",
+        "contains": "七天内报告损失"
+      }
+    ]
+  },
+  {
+    "question": "洪水损失需要什么保险？",
+    "kind": "multilingual",
+    "expected": [
+      {
+        "filename": "taifeng-lipei.md",
+        "contains": "附加洪水保险"
+      }
+    ]
   }
 ]

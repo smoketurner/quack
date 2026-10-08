@@ -3,15 +3,16 @@
 
 use super::induction::{Candidate, Decision, ItemKind, Proposal, apply};
 use super::store::{self, Acceptance, Revision};
-use super::{Class, Ontology, ROOT_CLASS};
-use crate::error::{Error, Record, Result};
+use super::{Class, IdRenames, Ontology, ROOT_CLASS};
+use crate::error::{Error, Result};
 use crate::ids::{CandidateId, ClassId, RunId};
 use crate::prefix::PrefixMatch;
+use crate::storage::control::ResourceKind;
 use crate::storage::workspace::WorkspaceDb;
 use crate::text::NonBlankText;
 
 /// A stored candidate.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct CandidateRow {
     pub id: CandidateId,
     pub kind: ItemKind,
@@ -107,7 +108,9 @@ impl CandidateRow {
 }
 
 /// Where a candidate stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateStatus {
     /// In the main review queue.
@@ -141,7 +144,17 @@ impl CandidateStatus {
 }
 
 /// The two review queues a reader pages through.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Queue {
     /// The main proposal.
@@ -169,7 +182,9 @@ impl Queue {
 
 /// What a reviewer does with one candidate, from the API or the ontology
 /// page; [`Self::decision`] turns it and its target into a [`Decision`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateAction {
     Accept,
@@ -323,6 +338,24 @@ pub fn queue(db: &WorkspaceDb, queue: Queue) -> Result<Vec<CandidateRow>> {
     Ok(rows.flatten().collect())
 }
 
+/// Point every undecided candidate at renamed class and relation ids.
+/// Decided candidates are history and keep the ids they were decided with.
+pub(crate) fn rename_ids(db: &WorkspaceDb, renames: &IdRenames) -> Result<()> {
+    for status in [Queue::Pending, Queue::LowSupport] {
+        for row in queue(db, status)? {
+            let mut proposal = row.proposal.clone();
+            proposal.rename_ids(renames);
+            if proposal != row.proposal {
+                db.connection().execute(
+                    "UPDATE _quack_ontology_candidates SET proposal = ? WHERE id = ?",
+                    duckdb::params![serde_json::to_string(&proposal)?, row.id],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The pending candidates a single run queued: the rows [`store_run`]
 /// inserted for `run` that are still awaiting a decision. A per-run
 /// auto-accept ([`accept_run`]) reads this instead of the shared [`queue`]
@@ -353,7 +386,7 @@ pub fn find(db: &WorkspaceDb, prefix: &str) -> Result<CandidateRow> {
         .query_map(duckdb::params![prefix, prefix], row_from)?
         .flatten()
         .collect();
-    PrefixMatch::of(rows, prefix, |r| r.id.as_str()).one(Record::Candidate, prefix)
+    PrefixMatch::of(rows, prefix, |r| r.id.as_str()).one(ResourceKind::Candidate, prefix)
 }
 
 /// A new ontology version built by auto-accepting one run's candidates
@@ -443,6 +476,7 @@ fn accept_as(
             author: decided_by,
             note: Some(&note),
             acceptance,
+            renames: None,
         },
     )?;
     for (id, _, _) in &resolved {

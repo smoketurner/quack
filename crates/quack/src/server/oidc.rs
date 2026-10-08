@@ -8,20 +8,21 @@
 //! user has.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use jiff::{SignedDuration, Timestamp};
 use quack_core::config::OidcConfig;
+use quack_core::crypto::sha256_hex;
 use quack_core::error::Result as CoreResult;
 use quack_core::ids::UserId;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::CachedToken;
 use quack_core::llm::oauth::client_key::ClientKeys;
 use quack_core::oidc::{
-    Origin, Pending, RENEW_MARGIN, SignIn, SignedIn, Stored, SubjectTokens, UserTokens,
+    Pending, RENEW_MARGIN, SignIn, SignedIn, Stored, SubjectTokens, UserTokens,
 };
-use quack_core::storage::control::{ControlPlane, UserRow};
+use quack_core::storage::control::{ControlPlane, Origin, UserRow};
 use quack_core::vault::Vault;
 use quack_core::web_sessions::{SessionToken, WebSessions};
 
@@ -49,6 +50,9 @@ pub(crate) struct Oidc {
     /// Each signed-in user's own token (the on-behalf-of subject).
     subjects: Arc<SubjectTokens>,
     sessions: Arc<WebSessions>,
+    /// The digest of the last bearer each user's groups were reconciled
+    /// from: a token is reconciled once, not on every request.
+    reconciled: Mutex<HashMap<UserId, String>>,
 }
 
 impl Oidc {
@@ -73,6 +77,7 @@ impl Oidc {
             sign_in,
             pending: Mutex::new(HashMap::new()),
             sessions,
+            reconciled: Mutex::new(HashMap::new()),
         })
     }
 
@@ -201,11 +206,32 @@ impl Oidc {
         &self,
         control: &ControlPlane,
         token: &str,
+        origin: &Origin,
     ) -> CoreResult<UserRow> {
         let bearer = self.sign_in.verify_bearer(token).await?;
         let user = control.oidc_user(&bearer.subject, &bearer.username).await?;
         self.subjects
             .remember_presented(&user.id, token, bearer.expires_at);
+        if let Some(groups) = bearer.groups.listed() {
+            let digest = sha256_hex(token.as_bytes());
+            let seen = self
+                .reconciled
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&user.id)
+                .is_some_and(|seen| *seen == digest);
+            if !seen {
+                control
+                    .reconcile_idp_memberships(&user, groups, origin)
+                    .await?;
+                // Recorded only once it took: a failed reconcile is tried
+                // again on the token's next request.
+                self.reconciled
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(user.id.clone(), digest);
+            }
+        }
         Ok(user)
     }
 

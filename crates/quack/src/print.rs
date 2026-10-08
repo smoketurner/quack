@@ -16,6 +16,7 @@ use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::ids::SessionId;
 use quack_core::llm;
+use quack_core::llm::egress::Egress;
 
 use crate::text_or_json::TextOrJson;
 
@@ -66,9 +67,62 @@ pub(crate) struct PrintTurn<'a> {
     pub session_id: &'a SessionId,
     pub policy: WritePolicy,
     pub prompt: &'a str,
+    /// The documents the question is limited to; empty for all.
+    pub documents: &'a [String],
     pub format: TextOrJson,
     /// Full tool inputs and outputs on stderr.
     pub verbose: bool,
+    /// The stream the answer goes to.
+    pub answer_to: AnswerTo,
+}
+
+/// Where a turn's answer goes: stdout for `quack -p`, whose answer is its
+/// output; stderr when the command's own result owns stdout, as `saved run
+/// --refresh` prints the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerTo {
+    Stdout,
+    Stderr,
+}
+
+impl AnswerTo {
+    fn stream(self) -> AnswerStream {
+        match self {
+            Self::Stdout => AnswerStream::Stdout(std::io::stdout()),
+            Self::Stderr => AnswerStream::Stderr(std::io::stderr()),
+        }
+    }
+}
+
+/// The unlocked stream an answer is written to.
+enum AnswerStream {
+    Stdout(std::io::Stdout),
+    Stderr(std::io::Stderr),
+}
+
+impl AnswerStream {
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::Stdout(out) => out.is_terminal(),
+            Self::Stderr(err) => err.is_terminal(),
+        }
+    }
+}
+
+impl Write for AnswerStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stdout(out) => out.write(buf),
+            Self::Stderr(err) => err.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Stdout(out) => out.flush(),
+            Self::Stderr(err) => err.flush(),
+        }
+    }
 }
 
 impl PrintTurn<'_> {
@@ -78,6 +132,7 @@ impl PrintTurn<'_> {
             (self.config, self.db, self.reader_db, self.session_id);
         let (policy, prompt, format, verbose) =
             (self.policy, self.prompt, self.format, self.verbose);
+        let documents = self.documents.to_vec();
         let (sink, mut events) = events::channel();
 
         let interrupt = CtrlCGuard::new();
@@ -86,26 +141,28 @@ impl PrintTurn<'_> {
             let config = config.clone();
             let prompt = prompt.to_owned();
             let session_id = session_id.to_owned();
-            async move {
+            // The turn's own task sends where the command may.
+            Egress::scope(Egress::current(), async move {
                 llm::TurnRequest {
                     db,
                     reader_db,
                     session_id: &session_id,
                     policy,
                     message: &prompt,
+                    documents: &documents,
                     sink,
                     cancel,
                 }
                 .run(&config)
                 .await
-            }
+            })
         });
 
         // Never hold the stdout or stderr locks across an await: the tracing
         // subscriber writes to stderr from the agent's threads, and holding the
         // lock here deadlocks the turn the moment a tool logs anything.
         let mut err = std::io::stderr();
-        let mut out = std::io::stdout();
+        let mut out = self.answer_to.stream();
         // What went to stdout as it streamed, to compare with the validated
         // answer at the end. Text streams only on a terminal: a pipeline gets
         // the validated answer alone (issue #64).
@@ -135,6 +192,7 @@ impl PrintTurn<'_> {
             spinner.clear(&mut err)?;
             match event {
                 AgentEvent::Status(status) => spinner.set(&status),
+                AgentEvent::Reasoning => spinner.set("thinking"),
                 AgentEvent::TextDelta(text) => {
                     if stream_live && !searched {
                         write!(out, "{text}")?;
@@ -174,7 +232,7 @@ impl PrintTurn<'_> {
         match format {
             TextOrJson::Text => write_text_answer(&mut out, &streamed, &response)?,
             TextOrJson::Json => {
-                let object = response.to_json(session_id);
+                let object = response.body(session_id);
                 serde_json::to_writer_pretty(&mut out, &object)?;
                 writeln!(out)?;
             }
@@ -220,9 +278,11 @@ fn write_text_answer(out: &mut impl Write, streamed: &str, response: &AgentRespo
         writeln!(out)?;
         writeln!(
             out,
-            "Chart: {} ({} chart, {} points; --format json carries the spec)",
+            "Chart: {} ({}{} chart of {}, {} points; --format json carries the spec)",
             chart.title,
+            if chart.stacked { "stacked " } else { "" },
             chart.kind.as_str(),
+            chart.series_names().join(", "),
             chart.points()
         )?;
     }
@@ -338,11 +398,123 @@ fn write_finished(err: &mut impl Write, step: &ToolStep) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scripted_ollama::{self, ScriptedOllama};
     use quack_core::analysis::agent::AgentResponse;
+    use quack_core::analysis::policy::Approver;
+    use quack_core::storage::control::AllowedProviders;
+    use quack_core::storage::sessions::{self, ChatMode};
+    use quack_core::storage::workspace::WorkspaceDb;
+    use quack_core::storage::writer::Writer;
+    use std::sync::Arc;
 
     #[expect(clippy::panic, reason = "test failure path")]
     fn fail(msg: &str) -> ! {
         panic!("{msg}")
+    }
+
+    /// `--allow-write` lets a turn write until it has read document text.
+    /// Print mode cannot ask, so the write after is refused, which is exit
+    /// status 3, and the statement did not run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
+        let ollama = ScriptedOllama::serve(ScriptedOllama::following_the_note())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = ollama.config().unwrap_or_else(|e| fail(&e.to_string()));
+        config.general.data_dir = dir.path().to_path_buf();
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        scripted_ollama::seed_dictating_note(&db).unwrap_or_else(|e| fail(&e.to_string()));
+        let session = sessions::create_session(&db, "scripted/model", ChatMode::Chat, None)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
+        let turn = PrintTurn {
+            config: &config,
+            db: Arc::clone(&db),
+            reader_db: ReaderDb::open(&db, config.analysis.reader_pool_size).await,
+            session_id: &session.id,
+            policy: WritePolicy::Allow(Approver::Nobody),
+            prompt: "follow the maintenance note",
+            documents: &[],
+            format: TextOrJson::Json,
+            verbose: false,
+            answer_to: AnswerTo::Stdout,
+        };
+        // The command's scope: the workspace allows every provider.
+        let egress = Egress::Workspace(AllowedProviders::All);
+        let outcome = Egress::scope(Some(egress), turn.run())
+            .await
+            .unwrap_or_else(|e| fail(&format!("{e:#}")));
+        assert_eq!(outcome, TurnOutcome::WriteRefused);
+        let tables = db
+            .run(WorkspaceDb::list_tables)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(tables, ["customers"], "the dictated drop did not run");
+    }
+
+    /// With `[analysis].title_sessions`, the chat model titles a session
+    /// after its first turn, in the background; later turns do not ask again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_model_titles_a_session_after_its_first_turn() {
+        let ollama = ScriptedOllama::serve(vec![
+            scripted_ollama::Reply::Text("Two vendors were late in March."),
+            scripted_ollama::Reply::Text(r#"{"title": "Late vendors in March"}"#),
+            scripted_ollama::Reply::Text("Cipla was one of them."),
+        ])
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = ollama.config().unwrap_or_else(|e| fail(&e.to_string()));
+        config.general.data_dir = dir.path().to_path_buf();
+        config.analysis.title_sessions = true;
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        let session = sessions::create_session(&db, "scripted/model", ChatMode::Chat, None)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
+        let reader_db = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
+        let ask = |prompt: &'static str| PrintTurn {
+            config: &config,
+            db: Arc::clone(&db),
+            reader_db: reader_db.clone(),
+            session_id: &session.id,
+            policy: WritePolicy::Deny,
+            prompt,
+            documents: &[],
+            format: TextOrJson::Json,
+            verbose: false,
+            answer_to: AnswerTo::Stdout,
+        };
+        let egress = || Some(Egress::Workspace(AllowedProviders::All));
+        Egress::scope(egress(), ask("which vendors were late in March?").run())
+            .await
+            .unwrap_or_else(|e| fail(&format!("{e:#}")));
+        let title = || async {
+            let id = session.id.clone();
+            db.run(move |db| sessions::get_session(db, &id))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.title)
+        };
+        let mut seen = None;
+        for _ in 0..200 {
+            seen = title().await;
+            if seen.as_deref() == Some("Late vendors in March") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(seen.as_deref(), Some("Late vendors in March"));
+        Egress::scope(egress(), ask("which ones?").run())
+            .await
+            .unwrap_or_else(|e| fail(&format!("{e:#}")));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            title().await.as_deref(),
+            Some("Late vendors in March"),
+            "a later turn does not title again"
+        );
     }
 
     /// What stands on stdout is the validated answer (issue #64): printed
@@ -423,6 +595,7 @@ mod tests {
                 detail: String::new(),
                 summary: String::from("3 rows"),
                 rows: Some(3),
+                result: None,
                 duration_ms: 12,
             },
         )

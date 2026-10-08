@@ -16,6 +16,10 @@
 //! as an error and the writer carries on (a transaction it left open rolls
 //! back with it). Readers are separate connections
 //! ([`crate::analysis::tools::ReaderDb`]) and never wait here.
+//!
+//! [`Writer::lend`] hands the connection out as a [`Lease`] and parks the
+//! thread until it comes back, so work that needs the file closed (a
+//! snapshot's copy, a delete) can close it while every later closure waits.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -28,8 +32,16 @@ use crate::error::{Error, Result};
 use crate::priority::Priority;
 use crate::storage::workspace::WorkspaceDb;
 
-/// A closure on its way to the writer's thread.
-type Job = Box<dyn FnOnce(&WorkspaceDb) + Send>;
+/// A closure on its way to the writer's thread; it sees `None` once a
+/// lease closed the connection.
+type Closure = Box<dyn FnOnce(Option<&WorkspaceDb>) + Send>;
+
+/// Work on its way to the writer's thread.
+enum Job {
+    Run(Closure),
+    /// Hand the connection out until the lease comes back.
+    Lend(oneshot::Sender<Lease>),
+}
 
 /// The two lines, and whether the writer is shutting down.
 #[derive(Default)]
@@ -70,7 +82,7 @@ impl Shared {
     /// The writer's thread: run what arrives, interactive first, until
     /// closed and drained. The connection closes (and checkpoints) when
     /// this returns.
-    fn serve(&self, db: &WorkspaceDb) {
+    fn serve(&self, mut db: Option<WorkspaceDb>) {
         loop {
             let job = {
                 let mut lines = self.lines();
@@ -87,8 +99,68 @@ impl Shared {
                         .unwrap_or_else(PoisonError::into_inner);
                 }
             };
-            job(db);
+            match job {
+                Job::Run(run) => run(db.as_ref()),
+                Job::Lend(to) => db = Lease::lent(db, to),
+            }
         }
+    }
+}
+
+/// A writer's connection, lent out while its thread waits: whatever the
+/// lease holds when it drops goes back, the same connection, a reopened
+/// one, or none after [`Lease::close`], when every later closure fails
+/// with [`Error::WriterStopped`]. Dropping the writer's last handle waits
+/// for its lease.
+pub struct Lease {
+    db: Option<WorkspaceDb>,
+    back: std::sync::mpsc::Sender<Option<WorkspaceDb>>,
+}
+
+impl std::fmt::Debug for Lease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lease")
+            .field("open", &self.db.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Lease {
+    /// On the writer's thread: send `db` out and wait for what comes back.
+    fn lent(db: Option<WorkspaceDb>, to: oneshot::Sender<Self>) -> Option<WorkspaceDb> {
+        let (back, returned) = std::sync::mpsc::channel();
+        match to.send(Self { db, back }) {
+            Ok(()) => returned.recv().unwrap_or(None),
+            // The borrower stopped waiting: keep the connection.
+            Err(mut unsent) => unsent.db.take(),
+        }
+    }
+
+    /// The lent connection.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WriterStopped`] when it is closed.
+    pub fn db(&self) -> Result<&WorkspaceDb> {
+        self.db.as_ref().ok_or(Error::WriterStopped)
+    }
+
+    /// Close the lent connection.
+    pub fn close(&mut self) {
+        self.db = None;
+    }
+
+    /// Give the writer `db` in place of what it lent.
+    pub fn restore(&mut self, db: WorkspaceDb) {
+        self.db = Some(db);
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // The send fails only when the writer's thread is gone, and the
+        // connection with nowhere to go closes here.
+        drop(self.back.send(self.db.take()));
     }
 }
 
@@ -125,7 +197,7 @@ impl Writer {
         let serving = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name(String::from("quack-writer"))
-            .spawn(move || serving.serve(&db))?;
+            .spawn(move || serving.serve(Some(db)))?;
         Ok(Self {
             thread_id: thread.thread().id(),
             shared,
@@ -162,6 +234,19 @@ impl Writer {
         answered.await.unwrap_or_else(|_| Err(Error::WriterStopped))
     }
 
+    /// The connection itself, once every closure queued ahead of this call
+    /// at the calling task's priority has run; later closures wait until
+    /// the lease drops.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WriterStopped`] when the writer has stopped.
+    pub async fn lend(&self) -> Result<Lease> {
+        let (to, lent) = oneshot::channel();
+        self.push(Priority::current(), Job::Lend(to))?;
+        lent.await.map_err(|_| Error::WriterStopped)
+    }
+
     /// Queue `f`; `reply` gets its outcome on the writer's thread.
     fn submit<T: Send + 'static>(
         &self,
@@ -169,7 +254,11 @@ impl Writer {
         f: impl FnOnce(&WorkspaceDb) -> Result<T> + Send + 'static,
         reply: oneshot::Sender<Result<T>>,
     ) -> Result<()> {
-        let job: Job = Box::new(move |db| {
+        let job = Job::Run(Box::new(move |db| {
+            let Some(db) = db else {
+                drop(reply.send(Err(Error::WriterStopped)));
+                return;
+            };
             let outcome = catch_unwind(AssertUnwindSafe(|| f(db))).unwrap_or_else(|panic| {
                 // A closure that opened its transaction with a raw `BEGIN`
                 // (no RAII guard) leaves this one connection inside it when
@@ -189,7 +278,12 @@ impl Writer {
             });
             // A caller that stopped waiting (a dropped future) is fine.
             drop(reply.send(outcome));
-        });
+        }));
+        self.push(priority, job)
+    }
+
+    /// Queue `job` in `priority`'s line.
+    fn push(&self, priority: Priority, job: Job) -> Result<()> {
         let mut lines = self.shared.lines();
         if lines.closed {
             return Err(Error::WriterStopped);
@@ -200,9 +294,10 @@ impl Writer {
         Ok(())
     }
 
-    /// Closures waiting (interactive, background), for tests.
-    #[cfg(test)]
-    fn waiting(&self) -> (usize, usize) {
+    /// Closures waiting (interactive, background): the writer's queue
+    /// depth, which the server's metrics report.
+    #[must_use]
+    pub fn waiting(&self) -> (usize, usize) {
         let lines = self.shared.lines();
         (lines.interactive.len(), lines.background.len())
     }
@@ -228,6 +323,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::config::Config;
     use crate::embedding::Dimension;
 
     #[expect(clippy::panic, reason = "test failure path")]
@@ -360,6 +456,68 @@ mod tests {
                 .is_ok_and(|names| names == &vec![String::from("t2")]),
             "the wedging table should have rolled back: {tables:?}"
         );
+    }
+
+    /// A lease holds back every later closure; dropped unchanged it gives
+    /// the same connection back, closed it stops the writer, and restored
+    /// it hands over the new one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lease_holds_the_writer_until_it_returns_a_connection() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = Config::default();
+        config.general.data_dir = dir.path().to_path_buf();
+        let open = || WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        let writer = Arc::new(Writer::spawn(open()).unwrap_or_else(|e| fail(&e.to_string())));
+        let created = writer
+            .run(|db| db.execute_with_params("CREATE TABLE t (a INTEGER)", []))
+            .await;
+        assert!(created.is_ok(), "{created:?}");
+
+        let lease = writer.lend().await.unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(lease.db().is_ok());
+        let waiting = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move {
+                writer
+                    .run(|db| db.execute_with_params("INSERT INTO t VALUES (1)", []))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a closure ran while the connection was lent"
+        );
+        drop(lease);
+        assert!(waiting.await.is_ok_and(|r| r.is_ok()));
+
+        // Closed and reopened: the writer carries on with the new connection.
+        let mut lease = writer.lend().await.unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(lease.db().is_ok_and(|db| db.checkpoint().is_ok()));
+        lease.close();
+        assert!(lease.db().is_err());
+        lease.restore(open());
+        drop(lease);
+        let count = writer
+            .run(|db| db.execute_query("SELECT count(*) FROM t").map(|r| r.rows))
+            .await;
+        assert!(
+            count
+                .as_ref()
+                .is_ok_and(|rows| rows == &vec![vec![serde_json::json!(1)]]),
+            "{count:?}"
+        );
+
+        // Closed for good: every later closure and lease is refused.
+        let mut lease = writer.lend().await.unwrap_or_else(|e| fail(&e.to_string()));
+        lease.close();
+        drop(lease);
+        assert!(matches!(
+            writer.run(WorkspaceDb::list_tables).await,
+            Err(Error::WriterStopped)
+        ));
+        let lease = writer.lend().await.unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(matches!(lease.db(), Err(Error::WriterStopped)));
     }
 
     #[tokio::test]

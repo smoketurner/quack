@@ -34,12 +34,16 @@ use quack_core::graph::extract::{ChunkPlan, Extraction};
 use quack_core::graph::store::EdgeScope;
 use quack_core::graph::{self, Standing, store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
+use quack_core::ingestion::parser::{FileType, Load, SectionKind};
 use quack_core::ingestion::{self, NewFile};
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
 use quack_core::ontology::store::{self as ontology_store, Revision};
 use quack_core::progress::RunControl;
-use quack_core::storage::workspace::{ChunkScope, ChunkSearchResult, HybridLimits, WorkspaceDb};
+use quack_core::storage::control::WorkspaceName;
+use quack_core::storage::workspace::{
+    ChunkScope, ChunkSearchResult, HybridLimits, Ranks, WorkspaceDb,
+};
 use quack_core::storage::writer::Writer;
 use rig::ProviderError;
 use rig::embeddings::Embedding;
@@ -142,7 +146,7 @@ fn eval_config(data_dir: &Path) -> Result<Config> {
     Ok(Config {
         general: GeneralConfig {
             data_dir: data_dir.to_path_buf(),
-            default_workspace: String::from("eval"),
+            default_workspace: WorkspaceName::default(),
             chat_model: None,
         },
         providers,
@@ -250,7 +254,7 @@ async fn ingest_documents(
     embedder: &Embedder<HashEmbedder>,
 ) -> Result<()> {
     let writer = writer_of(db)?;
-    for path in list_files(dir, "md")? {
+    for path in list_chunked_files(dir)? {
         let data = std::fs::read(&path)?;
         let filename = file_name(&path)?;
         ingestion::ingest_file(
@@ -263,6 +267,23 @@ async fn ingest_documents(
         .await?;
     }
     Ok(())
+}
+
+/// Every file in `dir` that ingests as chunks (Markdown, HTML, DOCX, PDF,
+/// ...), in name order.
+fn list_chunked_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(FileType::of)
+                .is_some_and(|t| matches!(t.load(), Load::Chunks(_) | Load::Image(_)))
+        })
+        .collect();
+    entries.sort();
+    Ok(entries)
 }
 
 async fn ingest_tables(
@@ -858,6 +879,10 @@ fn evaluate_citations(path: &Path) -> Result<CitationReport> {
                 heading: None,
                 page: None,
                 score: 1.0,
+                kind: SectionKind::Body,
+                locator: None,
+                ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
+                ranks: Ranks::default(),
             })
             .collect();
         let _first_marker = registry.register(&registered);

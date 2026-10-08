@@ -8,24 +8,28 @@
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
-use sea_query::{Cond, DynIden, Expr, ExprTrait, IntoIden, OnConflict, Order, Query};
+use sea_query::{Cond, Condition, DynIden, Expr, ExprTrait, IntoIden, OnConflict, Order, Query};
 use serde::{Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{FromRow, Row, SqlitePool};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
 
 use jiff::{SignedDuration, Timestamp};
 
 use super::queries::{
-    ApiTokens, AuditLog, Bound, ClientKeys, ClientRegistrations, Members, ProviderTokens,
-    SealedColumns, UserTokens, Users, Workspaces,
+    ApiTokens, AuditLog, Bound, ClientKeys, ClientRegistrations, GroupRoles, ImportCredentials,
+    Members, ProviderTokens, SealedColumns, UserTokens, Users, Workspaces,
 };
-use crate::config::{Config, ProviderName};
+use crate::config::{Config, Lockout, ProviderName};
+use crate::crypto::sha256_hex;
 use crate::error::{Error, Result};
-use crate::ids::{AuditId, UserId, WorkspaceId};
+use crate::ids::{AuditId, ImportId, UserId, WorkspaceId};
+use crate::ocsf::PromptText;
 use crate::oidc::OidcSubject;
+use crate::storage::audit::AuditDetailRow;
+use crate::text::blank_as_none;
 use crate::vault::Sealed;
 
 /// The `control.db` schema, as plain SQL files embedded at compile time.
@@ -38,12 +42,60 @@ use crate::vault::Sealed;
 /// (`docs/migrations.md`).
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// A name a new workspace may take: trimmed, non-empty, and without `/`,
+/// `\`, or `.`. Lookups take plain text, since older rows predate the rule.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub struct WorkspaceName(String);
+
+impl WorkspaceName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for WorkspaceName {
+    type Err = Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        let name = name.trim();
+        if name.is_empty() || name.contains(['/', '\\', '.']) {
+            return Err(Error::InvalidWorkspaceName);
+        }
+        Ok(Self(name.to_owned()))
+    }
+}
+
+impl TryFrom<String> for WorkspaceName {
+    type Error = Error;
+
+    fn try_from(name: String) -> Result<Self> {
+        name.parse()
+    }
+}
+
+/// The name `[general].default_workspace` takes when unset.
+impl Default for WorkspaceName {
+    fn default() -> Self {
+        Self(String::from("default"))
+    }
+}
+
+impl fmt::Display for WorkspaceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A workspace row from the control plane.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct WorkspaceRow {
     pub id: WorkspaceId,
     pub name: String,
     pub classification: String,
+    /// Providers the workspace's questions may use; empty for every one.
+    #[schema(value_type = Vec<String>)]
     pub allowed_providers: AllowedProviders,
 }
 
@@ -118,6 +170,26 @@ impl AllowedProviders {
     }
 }
 
+/// As a refusal names it: `every provider`, `no provider`, or `only: a, b`.
+impl fmt::Display for AllowedProviders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::All => f.write_str("every provider"),
+            Self::Only(names) if names.is_empty() => f.write_str("no provider"),
+            Self::Only(names) => {
+                f.write_str("only: ")?;
+                for (i, name) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(name)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl Serialize for AllowedProviders {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         self.names().serialize(serializer)
@@ -143,9 +215,10 @@ pub enum ProviderAllowList {
     Only(BTreeSet<String>),
 }
 
-/// Whether a new server user administers the server.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(from = "bool")]
+/// Whether a server user administers the server. Serializes as the
+/// `is_admin` boolean.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "bool", into = "bool")]
 pub enum UserKind {
     #[default]
     Standard,
@@ -182,11 +255,53 @@ impl fmt::Debug for TokenSecret {
     }
 }
 
-/// A workspace a user belongs to, with their role in it.
-#[derive(Debug, Clone)]
+/// A workspace and where one person stands in it. Serializes as the
+/// workspace's fields plus `role`: the role, or `null` for an admin
+/// without membership.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct Membership {
+    #[serde(flatten)]
     pub workspace: WorkspaceRow,
-    pub role: Role,
+    #[serde(rename = "role")]
+    #[schema(value_type = Option<Role>)]
+    pub standing: Standing,
+}
+
+/// Where a person stands in a workspace: a member with a role, or a
+/// server admin without membership, who reaches settings and members but
+/// never content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(into = "Option<Role>")]
+pub enum Standing {
+    Member(Role),
+    Admin,
+}
+
+impl Standing {
+    /// A membership's role, or `Admin` where there is none.
+    #[must_use]
+    pub fn of(role: Option<Role>) -> Self {
+        role.map_or(Self::Admin, Self::Member)
+    }
+}
+
+/// The role, when there is a membership.
+impl From<Standing> for Option<Role> {
+    fn from(standing: Standing) -> Self {
+        match standing {
+            Standing::Member(role) => Some(role),
+            Standing::Admin => None,
+        }
+    }
+}
+
+impl fmt::Display for Standing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Member(role) => role.fmt(f),
+            Self::Admin => f.write_str("admin"),
+        }
+    }
 }
 
 /// When a workspace was created and last reached, as stored UTC text.
@@ -198,12 +313,34 @@ pub struct WorkspaceTimes {
 }
 
 /// A server user. The password hash never leaves this module.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct UserRow {
     pub id: UserId,
     pub username: String,
-    pub is_admin: bool,
+    #[serde(rename = "is_admin")]
+    pub kind: UserKind,
     pub created_at: String,
+    /// When an admin disabled the account; a disabled user cannot log in,
+    /// and every credential they hold is refused.
+    pub disabled_at: Option<String>,
+    /// While a lockout for wrong passwords lasts.
+    pub locked_until: Option<String>,
+}
+
+impl UserRow {
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.disabled_at.is_some()
+    }
+
+    /// Whether a lockout for wrong passwords holds now; a lock that has
+    /// run out stays recorded until the next attempt clears it.
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        self.locked_until
+            .as_deref()
+            .is_some_and(ControlPlane::still_locked)
+    }
 }
 
 impl FromRow<'_, SqliteRow> for UserRow {
@@ -211,15 +348,41 @@ impl FromRow<'_, SqliteRow> for UserRow {
         Ok(Self {
             id: row.try_get("id")?,
             username: row.try_get("username")?,
-            is_admin: row.try_get("is_admin")?,
+            kind: UserKind::from(row.try_get::<bool, _>("is_admin")?),
             created_at: row.try_get("created_at")?,
+            disabled_at: row.try_get("disabled_at")?,
+            locked_until: row.try_get("locked_until")?,
         })
     }
 }
 
+/// What checking a password found.
+#[derive(Debug)]
+pub enum PasswordCheck {
+    Verified(UserRow),
+    /// No such user, or a wrong password: the user when there is one, so
+    /// the denied row can name the account aimed at.
+    Wrong(Option<UserId>),
+    Disabled(UserId),
+    /// Too many wrong passwords in a row: refused until `until`.
+    Locked {
+        user_id: UserId,
+        until: String,
+    },
+}
+
 /// What a member may do in a workspace (design doc 12).
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -238,13 +401,14 @@ text_enum!(Role, "role", {
 });
 
 /// One membership, with the username for listings.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct MemberRow {
     pub workspace_id: WorkspaceId,
     pub user_id: UserId,
     pub username: String,
     pub role: Role,
     pub created_at: String,
+    pub granted_by: GrantedBy,
 }
 
 impl FromRow<'_, SqliteRow> for MemberRow {
@@ -255,8 +419,54 @@ impl FromRow<'_, SqliteRow> for MemberRow {
             username: row.try_get("username")?,
             role: parsed(row, "role")?,
             created_at: row.try_get("created_at")?,
+            granted_by: parsed(row, "granted_by")?,
         })
     }
+}
+
+/// Who gave a member their role: a person, or the identity provider's
+/// group claim at sign-in. Only the latter is revoked when the groups
+/// change.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum GrantedBy {
+    User,
+    Idp,
+}
+
+text_enum!(GrantedBy, "membership grant", {
+    User => "user",
+    Idp => "idp",
+});
+
+/// A role an identity provider's group carries in a workspace.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct GroupRoleRow {
+    pub workspace_id: WorkspaceId,
+    pub group_name: String,
+    pub role: Role,
+    pub created_at: String,
+}
+
+impl FromRow<'_, SqliteRow> for GroupRoleRow {
+    fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
+        Ok(Self {
+            workspace_id: row.try_get("workspace_id")?,
+            group_name: row.try_get("group_name")?,
+            role: parsed(row, "role")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+/// What reconciling a person's groups changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Reconciled {
+    pub granted: usize,
+    pub changed: usize,
+    pub revoked: usize,
 }
 
 /// What an API token may do (design doc 12).
@@ -361,8 +571,40 @@ impl FromStr for Expiry {
     }
 }
 
-/// One access-audit row to record: who, what, outcome, channel.
-#[derive(Debug, Clone)]
+/// Where a request came from: the channel it arrived over, and the
+/// client address and request id the server saw, when it recorded them.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = RequestOrigin)]
+pub struct Origin {
+    pub channel: Channel,
+    pub client_addr: Option<String>,
+    pub request_id: Option<String>,
+}
+
+/// A request over `channel` with no address or id: the CLI, or a row the
+/// server writes before it has read either.
+impl From<Channel> for Origin {
+    fn from(channel: Channel) -> Self {
+        Self {
+            channel,
+            client_addr: None,
+            request_id: None,
+        }
+    }
+}
+
+impl Origin {
+    /// The denied `session` row for `user`, when their sign-in has ended.
+    #[must_use]
+    pub fn denied_session(&self, user: &UserId) -> AuditEntry {
+        let mut entry = AuditEntry::new(AuditAction::Session, Outcome::Denied, self.clone());
+        entry.user_id = Some(user.clone());
+        entry
+    }
+}
+
+/// One access-audit row to record: who, what, outcome, origin.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AuditEntry {
     /// UUID v7; the same id keys `_quack_audit` inside the workspace.
     pub id: AuditId,
@@ -374,15 +616,14 @@ pub struct AuditEntry {
     /// An opaque id or a table name; never content.
     pub resource_id: Option<String>,
     pub outcome: Outcome,
-    pub channel: Channel,
-    pub client_addr: Option<String>,
-    pub request_id: Option<String>,
+    #[serde(flatten)]
+    pub origin: Origin,
 }
 
 impl AuditEntry {
     /// A fresh entry with a new UUID v7 and nothing else set.
     #[must_use]
-    pub fn new(action: AuditAction, outcome: Outcome, channel: Channel) -> Self {
+    pub fn new(action: AuditAction, outcome: Outcome, origin: impl Into<Origin>) -> Self {
         Self {
             id: AuditId::generate(),
             user_id: None,
@@ -392,9 +633,7 @@ impl AuditEntry {
             resource_type: None,
             resource_id: None,
             outcome,
-            channel,
-            client_addr: None,
-            request_id: None,
+            origin: origin.into(),
         }
     }
 
@@ -414,20 +653,25 @@ impl AuditEntry {
     }
 }
 
-/// What an access-audit row records was done. Rows are written with one of
-/// these; they are read back as text, since the log is history and keeps
-/// what older versions wrote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// What an access-audit row records was done. The log is history: a
+/// stored name this build does not define reads back as `Unknown`, which
+/// is never written.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(into = "String", from = "String")]
 pub enum AuditAction {
     Login,
     Logout,
+    /// A person changed their own password.
+    Password,
     /// A session that expired or no longer exists was presented.
     Session,
     /// Server administration: users.
     Admin,
     Workspace,
     Member,
+    /// An admin granted themself a role in a workspace they were not a
+    /// member of: membership taken by admin right, with a reason.
+    BreakGlass,
     Token,
     /// Opened one resource: a document, table, version, or session.
     Open,
@@ -452,23 +696,44 @@ pub enum AuditAction {
     GraphReview,
     GraphRevalidate,
     GraphMerge,
+    /// A workspace written out as a snapshot.
+    Snapshot,
+    /// A workspace restored from a snapshot.
+    Restore,
+    /// A person added, corrected, or deleted a graph node or edge.
+    GraphEdit,
     EmbeddingsRefresh,
     EmbeddingsStatus,
     SessionRead,
     Share,
+    /// A session was renamed, or given back its derived title.
+    Rename,
     Mode,
     Cancel,
     /// A person's decision on a write the agent wanted to run.
     Permission,
+    /// An answer's SQL saved as a question.
+    Save,
+    /// A saved question's SQL run again without the model.
+    SavedRun,
+    /// A table's note was set or removed.
+    TableNote,
+    /// A table column was given another type.
+    Retype,
+    /// A stored name this build does not define, as a newer build wrote
+    /// it. Read only: the one write path refuses it.
+    Unknown(String),
 }
 
-text_enum!(AuditAction, "audit action", {
+history_enum!(AuditAction, Unknown, {
     Login => "login",
     Logout => "logout",
+    Password => "password",
     Session => "session",
     Admin => "admin",
     Workspace => "workspace",
     Member => "member",
+    BreakGlass => "break_glass",
     Token => "token",
     Open => "open",
     List => "list",
@@ -490,21 +755,35 @@ text_enum!(AuditAction, "audit action", {
     GraphReview => "graph_review",
     GraphRevalidate => "graph_revalidate",
     GraphMerge => "graph_merge",
+    Snapshot => "snapshot",
+    Restore => "restore",
+    GraphEdit => "graph_edit",
     EmbeddingsRefresh => "embeddings_refresh",
     EmbeddingsStatus => "embeddings_status",
     SessionRead => "session_read",
     Share => "share",
+    Rename => "rename",
     Mode => "mode",
     Cancel => "cancel",
     Permission => "permission",
+    Save => "save",
+    SavedRun => "saved_run",
+    TableNote => "table_note",
+    Retype => "retype",
 });
 
-/// The kinds of resource an audit row names by opaque id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// The kinds of resource an audit row names by opaque id. Like
+/// [`AuditAction`], a stored kind this build does not define reads back as
+/// `Unknown` and is never written.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(into = "String", from = "String")]
 pub enum ResourceKind {
     Session,
+    /// A message in a session, named by its sequence number.
+    Message,
     Document,
+    /// A chunk of a document, named by the document and its position.
+    Chunk,
     User,
     Workspace,
     Token,
@@ -515,15 +794,27 @@ pub enum ResourceKind {
     InductionRun,
     GraphRun,
     GraphMerge,
+    GraphNode,
+    GraphEdge,
     EmbeddingsRun,
     /// An MCP resource URI.
     Resource,
     Audit,
+    SavedQuestion,
+    /// An import saved under a name for refreshing.
+    SavedImport,
+    /// An identity provider's group, named in a workspace's group roles.
+    Group,
+    /// A stored name this build does not define, as a newer build wrote
+    /// it. Read only: the one write path refuses it.
+    Unknown(String),
 }
 
-text_enum!(ResourceKind, "resource kind", {
+history_enum!(ResourceKind, Unknown, {
     Session => "session",
+    Message => "message",
     Document => "document",
+    Chunk => "chunk",
     User => "user",
     Workspace => "workspace",
     Token => "token",
@@ -534,12 +825,32 @@ text_enum!(ResourceKind, "resource kind", {
     InductionRun => "induction_run",
     GraphRun => "graph_run",
     GraphMerge => "graph_merge",
+    GraphNode => "graph_node",
+    GraphEdge => "graph_edge",
     EmbeddingsRun => "embeddings_run",
     Resource => "resource",
     Audit => "audit",
+    SavedQuestion => "saved_question",
+    SavedImport => "saved_import",
+    Group => "group",
 });
 
 impl ResourceKind {
+    /// The text form with spaces, for a sentence: "ontology version".
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.as_str().replace('_', " ")
+    }
+
+    /// The error for this kind of resource with `id` missing.
+    #[must_use]
+    pub fn missing(self, id: impl Into<String>) -> Error {
+        Error::NotFound {
+            kind: self,
+            id: id.into(),
+        }
+    }
+
     /// This kind of resource with `id`, as an audit row names it.
     #[must_use]
     pub fn id(self, id: &(impl AsRef<str> + ?Sized)) -> AuditResource<'_> {
@@ -551,13 +862,15 @@ impl ResourceKind {
 }
 
 /// The resource an audit row names: its kind and opaque id, never content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditResource<'a> {
     pub kind: ResourceKind,
     pub id: &'a str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {
     Allowed,
@@ -580,9 +893,21 @@ impl Outcome {
             Err(_) => Self::Error,
         }
     }
+
+    /// `Denied` for work that was refused, `Error` for any other failure.
+    #[must_use]
+    pub const fn of_failure(error: &Error) -> Self {
+        if error.is_provider_refusal() {
+            Self::Denied
+        } else {
+            Self::Error
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {
     Web,
@@ -602,55 +927,81 @@ text_enum!(Channel, "channel", {
     Cli => "cli",
 });
 
-/// A stored access-audit row.
-#[derive(Debug, Clone, serde::Serialize)]
+/// A stored access-audit row: the entry as it was recorded, and when.
+/// Serializes flat, the timestamp beside the entry's fields.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AuditRow {
-    pub id: AuditId,
     pub timestamp: String,
-    pub user_id: Option<UserId>,
-    pub token_hash: Option<String>,
-    pub workspace_id: Option<WorkspaceId>,
-    pub action: String,
-    pub resource_type: Option<String>,
-    pub resource_id: Option<String>,
-    pub outcome: Outcome,
-    pub channel: Channel,
-    pub client_addr: Option<String>,
-    pub request_id: Option<String>,
+    #[serde(flatten)]
+    pub entry: AuditEntry,
 }
 
 impl FromRow<'_, SqliteRow> for AuditRow {
     fn from_row(row: &SqliteRow) -> sqlx::Result<Self> {
         Ok(Self {
-            id: row.try_get("id")?,
             timestamp: row.try_get("timestamp")?,
-            user_id: row.try_get("user_id")?,
-            token_hash: row.try_get("token_hash")?,
-            workspace_id: row.try_get("workspace_id")?,
-            action: row.try_get("action")?,
-            resource_type: row.try_get("resource_type")?,
-            resource_id: row.try_get("resource_id")?,
-            outcome: parsed(row, "outcome")?,
-            channel: parsed(row, "channel")?,
-            client_addr: row.try_get("client_addr")?,
-            request_id: row.try_get("request_id")?,
+            entry: AuditEntry {
+                id: row.try_get("id")?,
+                user_id: row.try_get("user_id")?,
+                token_hash: row.try_get("token_hash")?,
+                workspace_id: row.try_get("workspace_id")?,
+                action: AuditAction::from(row.try_get::<String, _>("action")?),
+                resource_type: row
+                    .try_get::<Option<String>, _>("resource_type")?
+                    .map(ResourceKind::from),
+                resource_id: row.try_get("resource_id")?,
+                outcome: parsed(row, "outcome")?,
+                origin: Origin {
+                    channel: parsed(row, "channel")?,
+                    client_addr: row.try_get("client_addr")?,
+                    request_id: row.try_get("request_id")?,
+                },
+            },
         })
     }
 }
 
-/// Filters for reading the audit log; every field is optional.
-#[derive(Debug, Clone, Default)]
+/// Filters for reading the audit log, as a query string or a form sends
+/// them: every field is optional, a blank one is "any", and `limit`
+/// defaults to 100 rows a page.
+#[derive(Debug, Clone, serde::Deserialize, utoipa::IntoParams)]
+#[serde(default)]
 pub struct AuditFilter {
+    #[serde(deserialize_with = "blank_as_none")]
     pub user_id: Option<UserId>,
+    #[serde(deserialize_with = "blank_as_none")]
     pub workspace_id: Option<WorkspaceId>,
+    #[serde(deserialize_with = "blank_as_none")]
     pub action: Option<String>,
+    #[serde(deserialize_with = "blank_as_none")]
     pub outcome: Option<Outcome>,
     /// Inclusive lower bound on `timestamp` (SQLite text form).
+    #[serde(deserialize_with = "blank_as_none")]
     pub since: Option<String>,
     /// Exclusive upper bound on `timestamp`.
+    #[serde(deserialize_with = "blank_as_none")]
     pub until: Option<String>,
+    /// Rows a page.
+    #[param(default = 100)]
     pub limit: u32,
-    pub after: Option<AuditCursor>,
+    /// The previous page's `next_cursor`.
+    #[serde(deserialize_with = "blank_as_none")]
+    pub cursor: Option<AuditCursor>,
+}
+
+impl Default for AuditFilter {
+    fn default() -> Self {
+        Self {
+            user_id: None,
+            workspace_id: None,
+            action: None,
+            outcome: None,
+            since: None,
+            until: None,
+            limit: Self::DEFAULT_LIMIT,
+            cursor: None,
+        }
+    }
 }
 
 /// A page of the audit log, newest first; `next` is `None` on the last page.
@@ -720,24 +1071,21 @@ impl From<AuditCursor> for String {
     }
 }
 
+/// Serialized as its opaque text.
+impl utoipa::PartialSchema for AuditCursor {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        <String as utoipa::PartialSchema>::schema()
+    }
+}
+
+impl utoipa::ToSchema for AuditCursor {}
+
 impl TryFrom<String> for AuditCursor {
     type Error = Error;
 
     fn try_from(text: String) -> Result<Self> {
         text.parse()
     }
-}
-
-/// Lowercase hex SHA-256, the form tokens are stored in.
-#[must_use]
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
-    let mut out = String::with_capacity(64);
-    for b in digest.as_ref() {
-        out.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
-        out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
-    }
-    out
 }
 
 /// Fill `bytes` from the process's CSPRNG (aws-lc-rs).
@@ -799,12 +1147,68 @@ pub enum SealedOwner<'a> {
     /// `llm::oauth::client_key::ClientKeyName`; `client_keys`;
     /// `vault::Purpose::ClientKey`).
     ClientKey(&'a str),
+    /// A saved import's secret, kept with its workspace
+    /// (`import_credentials`; `vault::Purpose::ImportCredential`).
+    Import {
+        workspace: &'a WorkspaceId,
+        import: &'a ImportId,
+    },
+}
+
+/// Where an owner's sealed value lives: its table, key column and key, the
+/// column that records when it was written, and for a row that goes with
+/// its workspace, the workspace column, which is part of its key.
+struct SealedRow {
+    table: DynIden,
+    key: DynIden,
+    id: String,
+    stamp: DynIden,
+    workspace: Option<(DynIden, String)>,
+}
+
+impl SealedRow {
+    /// The condition that selects this owner's row: its key, and its
+    /// workspace when the row is kept per workspace.
+    fn matching(&self) -> Condition {
+        let mut condition = Condition::all().add(Expr::col(self.key.clone()).eq(self.id.as_str()));
+        if let Some((column, workspace)) = &self.workspace {
+            condition = condition.add(Expr::col(column.clone()).eq(workspace.as_str()));
+        }
+        condition
+    }
+
+    /// The columns an insert conflicts on: the key, with the workspace.
+    fn conflict_columns(&self) -> Vec<DynIden> {
+        self.workspace
+            .iter()
+            .map(|(column, _)| column.clone())
+            .chain(std::iter::once(self.key.clone()))
+            .collect()
+    }
 }
 
 impl SealedOwner<'_> {
+    fn row(self) -> SealedRow {
+        let (table, key, id, stamp) = self.unscoped();
+        let workspace = match self {
+            Self::Import { workspace, .. } => Some((
+                ImportCredentials::WorkspaceId.into_iden(),
+                workspace.to_string(),
+            )),
+            Self::User(_) | Self::Provider(_) | Self::ClientKey(_) => None,
+        };
+        SealedRow {
+            table,
+            key,
+            id,
+            stamp,
+            workspace,
+        }
+    }
+
     /// The table, its key column, this owner's key, and the column that
     /// records when the row was written.
-    fn row(self) -> (DynIden, DynIden, String, DynIden) {
+    fn unscoped(self) -> (DynIden, DynIden, String, DynIden) {
         match self {
             Self::User(user) => (
                 UserTokens::Table.into_iden(),
@@ -823,6 +1227,12 @@ impl SealedOwner<'_> {
                 ClientKeys::Name.into_iden(),
                 name.to_owned(),
                 ClientKeys::CreatedAt.into_iden(),
+            ),
+            Self::Import { import, .. } => (
+                ImportCredentials::Table.into_iden(),
+                ImportCredentials::ImportId.into_iden(),
+                import.to_string(),
+                SealedColumns::UpdatedAt.into_iden(),
             ),
         }
     }
@@ -1037,58 +1447,106 @@ impl ControlPlane {
     }
 
     /// Create a new workspace, with `owner` as its owner when given, and
-    /// record `audit` in the same transaction.
+    /// record `audit` in the same transaction. The name's unique index
+    /// decides whether it is taken, so two callers cannot both create it.
     ///
     /// # Errors
     ///
-    /// Returns an error if the insert fails (a duplicate name included);
-    /// nothing is then written.
+    /// Returns [`Error::WorkspaceExists`] when the name is taken, or an
+    /// error if the insert fails; nothing is then written.
     pub async fn create_workspace(
         &self,
-        name: &str,
+        name: &WorkspaceName,
         owner: Option<&UserId>,
         audit: AuditEntry,
     ) -> Result<WorkspaceRow> {
         let (ws, insert) = Self::new_workspace(name)?;
         let mut change = vec![insert];
         if let Some(owner) = owner {
-            change.push(Self::member_insert(&ws.id, owner, Role::Owner)?);
+            change.push(Self::member_insert(
+                &ws.id,
+                owner,
+                Role::Owner,
+                GrantedBy::User,
+            )?);
         }
         let audit = audit
             .in_workspace(&ws.id)
             .on(ResourceKind::Workspace.id(ws.id.as_str()));
-        self.commit_audited(change, audit).await?;
-        tracing::info!(workspace_name = name, workspace_id = %ws.id, "created workspace");
+        self.commit_audited(change, audit)
+            .await
+            .map_err(|e| match &e {
+                Error::Sqlite(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                    Error::WorkspaceExists(name.as_str().to_owned())
+                }
+                _ => e,
+            })?;
+        tracing::info!(workspace_name = %name, workspace_id = %ws.id, "created workspace");
         Ok(ws)
     }
 
-    /// Find a workspace by name, creating it if it does not exist. The CLI's
-    /// own workspaces, which it does not audit.
+    /// One round trip to `control.db`, for a readiness check.
     ///
     /// # Errors
     ///
-    /// Returns an error if the lookup or creation fails.
-    pub async fn find_or_create_workspace(&self, name: &str) -> Result<WorkspaceRow> {
+    /// Returns an error when the database does not answer.
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// The workspace called `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NoWorkspaceNamed`] when there is none, or an error
+    /// if the query fails.
+    pub async fn workspace_named(&self, name: &str) -> Result<WorkspaceRow> {
+        self.find_workspace_by_name(name)
+            .await?
+            .ok_or_else(|| Error::NoWorkspaceNamed(name.to_owned()))
+    }
+
+    /// The workspace a command line runs in: the one it `named`, which
+    /// must exist, or `default`. The default is created, audited on the
+    /// `cli` channel, the first time it is used, so a new install needs no
+    /// setup step. When two processes use it first at once, one creates it
+    /// and the other opens that row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NoWorkspaceNamed`] for a named workspace other than
+    /// the default that does not exist, or an error if a query fails.
+    pub async fn workspace_or_default(
+        &self,
+        named: Option<&str>,
+        default: &WorkspaceName,
+    ) -> Result<WorkspaceRow> {
+        let name = named.unwrap_or(default.as_str());
+        if name != default.as_str() {
+            return self.workspace_named(name).await;
+        }
         if let Some(ws) = self.find_workspace_by_name(name).await? {
             return Ok(ws);
         }
-        let (ws, insert) = Self::new_workspace(name)?;
-        insert.query().execute(&self.pool).await?;
-        tracing::info!(workspace_name = name, workspace_id = %ws.id, "created workspace");
-        Ok(ws)
+        let audit = AuditEntry::new(AuditAction::Workspace, Outcome::Allowed, Channel::Cli);
+        match self.create_workspace(default, None, audit).await {
+            Err(Error::WorkspaceExists(_)) => self.workspace_named(name).await,
+            created => created,
+        }
     }
 
-    fn new_workspace(name: &str) -> Result<(WorkspaceRow, Bound)> {
+    fn new_workspace(name: &WorkspaceName) -> Result<(WorkspaceRow, Bound)> {
         let id = WorkspaceId::generate();
         let insert = Bound::new(
             Query::insert()
                 .into_table(Workspaces::Table)
                 .columns([Workspaces::Id, Workspaces::Name, Workspaces::Classification])
-                .values([id.clone().into(), name.into(), "internal".into()])?,
+                .values([id.clone().into(), name.as_str().into(), "internal".into()])?,
         )?;
         let ws = WorkspaceRow {
             id,
-            name: name.to_owned(),
+            name: name.as_str().to_owned(),
             classification: String::from("internal"),
             allowed_providers: AllowedProviders::All,
         };
@@ -1130,7 +1588,69 @@ impl ControlPlane {
         bound.query().execute(&self.pool).await?;
         self.get_workspace(id)
             .await?
-            .ok_or_else(|| Error::WorkspaceNotFound(id.to_string()))
+            .ok_or_else(|| ResourceKind::Workspace.missing(id.to_string()))
+    }
+
+    /// Delete a workspace's row, which takes its members and API tokens
+    /// with it, and commit the audit row with it. The files are the
+    /// caller's to remove once nothing holds them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workspace is missing or the write fails.
+    pub async fn delete_workspace(&self, id: &WorkspaceId, audit: AuditEntry) -> Result<()> {
+        let delete = Bound::new(
+            Query::delete()
+                .from_table(Workspaces::Table)
+                .and_where(Expr::col(Workspaces::Id).eq(id)),
+        )?;
+        let audit = audit
+            .in_workspace(id)
+            .on(ResourceKind::Workspace.id(id.as_str()));
+        if !self.commit_audited(vec![delete], audit).await? {
+            return Err(ResourceKind::Workspace.missing(id.to_string()));
+        }
+        tracing::info!(workspace_id = %id, "deleted workspace");
+        Ok(())
+    }
+
+    /// Give a workspace a new name, audited in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::WorkspaceExists`] when the name is taken, an error
+    /// when the workspace is missing or the write fails.
+    pub async fn rename_workspace(
+        &self,
+        id: &WorkspaceId,
+        name: &WorkspaceName,
+        audit: AuditEntry,
+    ) -> Result<WorkspaceRow> {
+        let update = Bound::new(
+            Query::update()
+                .table(Workspaces::Table)
+                .value(Workspaces::Name, name.as_str())
+                .value(Workspaces::UpdatedAt, Expr::cust("CURRENT_TIMESTAMP"))
+                .and_where(Expr::col(Workspaces::Id).eq(id)),
+        )?;
+        let audit = audit
+            .in_workspace(id)
+            .on(ResourceKind::Workspace.id(id.as_str()));
+        let changed = self
+            .commit_audited(vec![update], audit)
+            .await
+            .map_err(|e| match &e {
+                Error::Sqlite(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                    Error::WorkspaceExists(name.as_str().to_owned())
+                }
+                _ => e,
+            })?;
+        if !changed {
+            return Err(ResourceKind::Workspace.missing(id.to_string()));
+        }
+        self.get_workspace(id)
+            .await?
+            .ok_or_else(|| ResourceKind::Workspace.missing(id.to_string()))
     }
 
     /// List all workspaces.
@@ -1172,7 +1692,7 @@ impl ControlPlane {
             .map(|r| {
                 Ok(Membership {
                     workspace: WorkspaceRow::from_row(r)?,
-                    role: parsed(r, "role")?,
+                    standing: Standing::Member(parsed(r, "role")?),
                 })
             })
             .collect()
@@ -1222,9 +1742,164 @@ impl ControlPlane {
 
     fn user_select() -> sea_query::SelectStatement {
         Query::select()
-            .columns([Users::Id, Users::Username, Users::IsAdmin, Users::CreatedAt])
+            .columns([
+                Users::Id,
+                Users::Username,
+                Users::IsAdmin,
+                Users::CreatedAt,
+                Users::DisabledAt,
+                Users::LockedUntil,
+            ])
             .from(Users::Table)
             .to_owned()
+    }
+
+    /// One change to a user's row, bound before any await so the future
+    /// stays `Send` (the builder is not).
+    fn user_change(id: &UserId, change: &mut sea_query::UpdateStatement) -> Result<Bound> {
+        Ok(Bound::new(
+            change
+                .table(Users::Table)
+                .and_where(Expr::col(Users::Id).eq(id)),
+        )?)
+    }
+
+    /// One change to a user's row, audited in the same transaction.
+    async fn update_user(&self, id: &UserId, change: Bound, audit: AuditEntry) -> Result<()> {
+        let audit = audit.on(ResourceKind::User.id(id.as_str()));
+        if !self.commit_audited(vec![change], audit).await? {
+            return Err(ResourceKind::User.missing(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// `user`, unless an admin disabled them: then a denied row under
+    /// `action` from `origin`, and [`Error::AccountDisabled`], whatever the
+    /// credential that named them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::AccountDisabled`] for a disabled user, or an error
+    /// when the denied row cannot be written.
+    pub async fn admit(
+        &self,
+        user: UserRow,
+        action: AuditAction,
+        origin: &Origin,
+    ) -> Result<UserRow> {
+        if !user.is_disabled() {
+            return Ok(user);
+        }
+        let mut entry = AuditEntry::new(action, Outcome::Denied, origin.clone());
+        entry.user_id = Some(user.id.clone());
+        self.record_audit(&entry).await?;
+        Err(Error::AccountDisabled)
+    }
+
+    /// Refuse the user's logins and credentials from now on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the user is missing or the write fails.
+    pub async fn disable_user(&self, id: &UserId, audit: AuditEntry) -> Result<()> {
+        let change = Self::user_change(
+            id,
+            Query::update().value(Users::DisabledAt, Expr::cust("CURRENT_TIMESTAMP")),
+        )?;
+        self.update_user(id, change, audit).await?;
+        tracing::info!(user_id = %id, "disabled user");
+        Ok(())
+    }
+
+    /// Let a disabled user log in again, and clear any lockout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the user is missing or the write fails.
+    pub async fn enable_user(&self, id: &UserId, audit: AuditEntry) -> Result<()> {
+        let change = Self::user_change(
+            id,
+            Query::update()
+                .value(Users::DisabledAt, Option::<String>::None)
+                .value(Users::LockedUntil, Option::<String>::None)
+                .value(Users::FailedLogins, 0_i64),
+        )?;
+        self.update_user(id, change, audit).await?;
+        tracing::info!(user_id = %id, "enabled user");
+        Ok(())
+    }
+
+    /// Give or take the server-wide admin flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the user is missing or the write fails.
+    pub async fn set_admin(&self, id: &UserId, kind: UserKind, audit: AuditEntry) -> Result<()> {
+        let change = Self::user_change(
+            id,
+            Query::update().value(Users::IsAdmin, i64::from(bool::from(kind))),
+        )?;
+        self.update_user(id, change, audit).await
+    }
+
+    /// Replace the user's password; the caller ends their sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty password, a missing user, or a failed
+    /// write.
+    pub async fn set_password(&self, id: &UserId, password: &str, audit: AuditEntry) -> Result<()> {
+        if password.is_empty() {
+            return Err(Error::Config(String::from("password must not be empty")));
+        }
+        let password = password.to_owned();
+        let hash = tokio::task::spawn_blocking(move || StoredPasswordHash::new(&password))
+            .await
+            .map_err(|e| Error::Config(format!("password hashing task failed: {e}")))??;
+        let change = Self::user_change(
+            id,
+            Query::update()
+                .value(Users::PasswordHash, hash.0.as_str())
+                .value(Users::PasswordChangedAt, Expr::cust("CURRENT_TIMESTAMP"))
+                .value(Users::FailedLogins, 0_i64)
+                .value(Users::LockedUntil, Option::<String>::None),
+        )?;
+        self.update_user(id, change, audit).await
+    }
+
+    /// Delete a user: their memberships and stored sign-in go with the row,
+    /// and their API tokens are deleted here, since that table carries no
+    /// foreign key to users. The audit log keeps every row that names them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the user is missing or the write fails.
+    pub async fn delete_user(&self, id: &UserId, audit: AuditEntry) -> Result<()> {
+        let tokens = Bound::new(
+            Query::delete()
+                .from_table(ApiTokens::Table)
+                .and_where(Expr::col(ApiTokens::UserId).eq(id)),
+        )?;
+        let user = Bound::new(
+            Query::delete()
+                .from_table(Users::Table)
+                .and_where(Expr::col(Users::Id).eq(id)),
+        )?;
+        let audit = audit.on(ResourceKind::User.id(id.as_str()));
+        // The token delete may touch no row; only the user's row decides.
+        let mut tx = self.pool.begin().await?;
+        tokens.query().execute(&mut *tx).await?;
+        let deleted = user.query().execute(&mut *tx).await?.rows_affected() > 0;
+        if !deleted {
+            return Err(ResourceKind::User.missing(id.to_string()));
+        }
+        Self::audit_insert(&audit)?
+            .query()
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!(user_id = %id, "deleted user");
+        Ok(())
     }
 
     /// Create a user with an argon2id password hash, and record `audit` in
@@ -1304,6 +1979,18 @@ impl ControlPlane {
             Self::user_select().and_where(Expr::col(Users::Username).eq(username.trim())),
         )?;
         Ok(bound.query_as().fetch_optional(&self.pool).await?)
+    }
+
+    /// The user with the given username, which must exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] when no user has that name, or an error
+    /// if the query fails.
+    pub async fn user_named(&self, username: &str) -> Result<UserRow> {
+        self.find_user_by_username(username)
+            .await?
+            .ok_or_else(|| ResourceKind::User.missing(username.trim()))
     }
 
     /// Every user, by name.
@@ -1400,7 +2087,7 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn sealed(&self, owner: SealedOwner<'_>) -> Result<Option<Sealed>> {
-        let (table, key, id, _) = owner.row();
+        let row = owner.row();
         let bound = Bound::new(
             Query::select()
                 .columns([
@@ -1408,8 +2095,8 @@ impl ControlPlane {
                     SealedColumns::Enc,
                     SealedColumns::Ciphertext,
                 ])
-                .from(table)
-                .and_where(Expr::col(key).eq(id)),
+                .from(row.table.clone())
+                .cond_where(row.matching()),
         )?;
         Ok(bound.query_as().fetch_optional(&self.pool).await?)
     }
@@ -1448,10 +2135,10 @@ impl ControlPlane {
         expected: &Sealed,
         sealed: &Sealed,
     ) -> Result<bool> {
-        let (table, key, id, stamp) = owner.row();
+        let row = owner.row();
         let bound = Bound::new(
             Query::update()
-                .table(table)
+                .table(row.table.clone())
                 .values([
                     (
                         SealedColumns::KeyId.into_iden(),
@@ -1462,9 +2149,9 @@ impl ControlPlane {
                         SealedColumns::Ciphertext.into_iden(),
                         sealed.ciphertext.clone().into(),
                     ),
-                    (stamp, Expr::current_timestamp()),
+                    (row.stamp.clone(), Expr::current_timestamp()),
                 ])
-                .and_where(Expr::col(key).eq(id))
+                .cond_where(row.matching())
                 .and_where(Expr::col(SealedColumns::KeyId).eq(expected.key_id.as_str()))
                 .and_where(Expr::col(SealedColumns::Enc).eq(expected.enc.clone())),
         )?;
@@ -1488,9 +2175,17 @@ impl ControlPlane {
     /// The insert that keeps `owner`'s sealed value: replacing the one
     /// before it, or only when there is none.
     fn sealed_insert(owner: SealedOwner<'_>, sealed: &Sealed, replace: bool) -> Result<Bound> {
-        let (table, key, id, stamp) = owner.row();
+        let row = owner.row();
+        let conflict_columns = row.conflict_columns();
+        let SealedRow {
+            table,
+            key,
+            id,
+            stamp,
+            workspace,
+        } = row;
         let conflict = if replace {
-            OnConflict::column(key.clone())
+            OnConflict::columns(conflict_columns)
                 .update_columns([
                     SealedColumns::KeyId.into_iden(),
                     SealedColumns::Enc.into_iden(),
@@ -1499,25 +2194,35 @@ impl ControlPlane {
                 ])
                 .to_owned()
         } else {
-            OnConflict::column(key.clone()).do_nothing().to_owned()
+            OnConflict::columns(conflict_columns)
+                .do_nothing()
+                .to_owned()
         };
         let bound = Bound::new(
             Query::insert()
                 .into_table(table)
-                .columns([
-                    key,
-                    SealedColumns::KeyId.into_iden(),
-                    SealedColumns::Enc.into_iden(),
-                    SealedColumns::Ciphertext.into_iden(),
-                    stamp,
-                ])
-                .values([
-                    id.into(),
-                    sealed.key_id.as_str().into(),
-                    sealed.enc.clone().into(),
-                    sealed.ciphertext.clone().into(),
-                    Expr::current_timestamp(),
-                ])?
+                .columns(
+                    [
+                        key,
+                        SealedColumns::KeyId.into_iden(),
+                        SealedColumns::Enc.into_iden(),
+                        SealedColumns::Ciphertext.into_iden(),
+                        stamp,
+                    ]
+                    .into_iter()
+                    .chain(workspace.as_ref().map(|(column, _)| column.clone())),
+                )
+                .values(
+                    [
+                        id.into(),
+                        sealed.key_id.as_str().into(),
+                        sealed.enc.clone().into(),
+                        sealed.ciphertext.clone().into(),
+                        Expr::current_timestamp(),
+                    ]
+                    .into_iter()
+                    .chain(workspace.map(|(_, value)| value.into())),
+                )?
                 .on_conflict(conflict),
         )?;
         Ok(bound)
@@ -1525,11 +2230,11 @@ impl ControlPlane {
 
     /// The delete that forgets `owner`'s sealed value.
     fn sealed_delete(owner: SealedOwner<'_>) -> Result<Bound> {
-        let (table, key, id, _) = owner.row();
+        let row = owner.row();
         Ok(Bound::new(
             Query::delete()
-                .from_table(table)
-                .and_where(Expr::col(key).eq(id)),
+                .from_table(row.table.clone())
+                .cond_where(row.matching()),
         )?)
     }
 
@@ -1761,26 +2466,146 @@ impl ControlPlane {
     ///
     /// Returns an error if the query fails.
     pub async fn verify_password(&self, username: &str, password: &str) -> Result<Option<UserRow>> {
+        match self
+            .check_password(username, password, Lockout::default())
+            .await?
+        {
+            PasswordCheck::Verified(user) => Ok(Some(user)),
+            PasswordCheck::Wrong(_) | PasswordCheck::Disabled(_) | PasswordCheck::Locked { .. } => {
+                Ok(None)
+            }
+        }
+    }
+
+    /// Check a password under `lockout`, and record the outcome on the
+    /// user's row: a wrong one counts toward the lock, a right one clears
+    /// the count. The hash is verified for every attempt, against a dummy
+    /// when there is no such user, before a disabled or locked account is
+    /// refused, so timing says nothing about who exists or is locked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a query fails.
+    pub async fn check_password(
+        &self,
+        username: &str,
+        password: &str,
+        lockout: Lockout,
+    ) -> Result<PasswordCheck> {
         let bound = Bound::new(
             Query::select()
-                .columns([Users::Id, Users::PasswordHash])
+                .columns([
+                    Users::Id,
+                    Users::PasswordHash,
+                    Users::DisabledAt,
+                    Users::LockedUntil,
+                    Users::FailedLogins,
+                ])
                 .from(Users::Table)
                 .and_where(Expr::col(Users::Username).eq(username.trim())),
         )?;
         let row = bound.query().fetch_optional(&self.pool).await?;
-        let (id, hash): (Option<UserId>, Option<String>) = match row {
-            Some(r) => (Some(r.try_get("id")?), r.try_get("password_hash")?),
-            None => (None, None),
-        };
+        let mut found = None;
+        let mut hash = None;
+        if let Some(r) = row {
+            let id: UserId = r.try_get("id")?;
+            let disabled: Option<String> = r.try_get("disabled_at")?;
+            let locked: Option<String> = r.try_get("locked_until")?;
+            let failed: i64 = r.try_get("failed_logins")?;
+            hash = r.try_get("password_hash")?;
+            found = Some((id, disabled.is_some(), locked, failed > 0));
+        }
         let password = password.to_owned();
         let hash = StoredPasswordHash::stored_or_dummy(hash);
         let ok = tokio::task::spawn_blocking(move || hash.verifies(&password))
             .await
             .map_err(|e| Error::Config(format!("password verification task failed: {e}")))?;
-        match (ok, id) {
-            (true, Some(id)) => self.get_user(&id).await,
-            _ => Ok(None),
+        let Some((id, disabled, locked, counted)) = found else {
+            return Ok(PasswordCheck::Wrong(None));
+        };
+        if disabled {
+            return Ok(PasswordCheck::Disabled(id));
         }
+        if let Some(until) = locked.clone().filter(|until| Self::still_locked(until)) {
+            return Ok(PasswordCheck::Locked { user_id: id, until });
+        }
+        if ok {
+            if counted || locked.is_some() {
+                self.set_failed_logins(&id, 0, None).await?;
+            }
+            return match self.get_user(&id).await? {
+                Some(user) => Ok(PasswordCheck::Verified(user)),
+                None => Ok(PasswordCheck::Wrong(None)),
+            };
+        }
+        match self.count_wrong_password(&id, lockout).await? {
+            Some(until) => {
+                tracing::warn!(user_id = %id, until, "account locked after repeated wrong passwords");
+                Ok(PasswordCheck::Locked { user_id: id, until })
+            }
+            None => Ok(PasswordCheck::Wrong(Some(id))),
+        }
+    }
+
+    /// Count one more wrong password for `id` and lock the account when
+    /// `lockout` says so, returning the lock's end. The count is read and
+    /// written in one immediate transaction, so wrong passwords sent at
+    /// once each count; a lock that has run out starts the count over.
+    async fn count_wrong_password(&self, id: &UserId, lockout: Lockout) -> Result<Option<String>> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let bound = Bound::new(
+            Query::select()
+                .columns([Users::FailedLogins, Users::LockedUntil])
+                .from(Users::Table)
+                .and_where(Expr::col(Users::Id).eq(id)),
+        )?;
+        let Some(row) = bound.query().fetch_optional(&mut *tx).await? else {
+            return Ok(None);
+        };
+        let failed: i64 = row.try_get("failed_logins")?;
+        let locked: Option<String> = row.try_get("locked_until")?;
+        let before = if locked.is_some() {
+            0
+        } else {
+            u32::try_from(failed).unwrap_or(u32::MAX)
+        };
+        let failed = before.saturating_add(1);
+        let until = lockout.locks_after(failed).then(|| {
+            Timestamp::now()
+                .checked_add(SignedDuration::from_mins(i64::from(lockout.minutes)))
+                .unwrap_or(Timestamp::MAX)
+                .to_string()
+        });
+        let bound = Bound::new(
+            Query::update()
+                .table(Users::Table)
+                .value(Users::FailedLogins, i64::from(failed))
+                .value(Users::LockedUntil, until.as_deref())
+                .and_where(Expr::col(Users::Id).eq(id)),
+        )?;
+        bound.query().execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(until)
+    }
+
+    /// Whether a stored `locked_until` is still in the future.
+    fn still_locked(until: &str) -> bool {
+        until
+            .parse::<Timestamp>()
+            .is_ok_and(|until| until > Timestamp::now())
+    }
+
+    /// The login counter and lock, not audited: the login itself is.
+    async fn set_failed_logins(&self, id: &UserId, failed: u32, until: Option<&str>) -> Result<()> {
+        let bound = Bound::new(
+            Query::update()
+                .table(Users::Table)
+                .value(Users::FailedLogins, i64::from(failed))
+                .value(Users::LockedUntil, until)
+                .and_where(Expr::col(Users::Id).eq(id)),
+        )?;
+        bound.query().execute(&self.pool).await?;
+        Ok(())
     }
 
     // --- members ------------------------------------------------------------
@@ -1805,11 +2630,12 @@ impl ControlPlane {
                 Query::update()
                     .table(Members::Table)
                     .value(Members::Role, role.as_str())
+                    .value(Members::GrantedBy, GrantedBy::User.as_str())
                     .and_where(Expr::col(Members::WorkspaceId).eq(workspace_id))
                     .and_where(Expr::col(Members::UserId).eq(user_id)),
             )?
         } else {
-            Self::member_insert(workspace_id, user_id, role)?
+            Self::member_insert(workspace_id, user_id, role, GrantedBy::User)?
         };
         let audit = audit
             .in_workspace(workspace_id)
@@ -1827,13 +2653,37 @@ impl ControlPlane {
         Ok(())
     }
 
-    fn member_insert(workspace_id: &WorkspaceId, user_id: &UserId, role: Role) -> Result<Bound> {
-        Ok(Bound::new(
-            Query::insert()
-                .into_table(Members::Table)
-                .columns([Members::WorkspaceId, Members::UserId, Members::Role])
-                .values([workspace_id.into(), user_id.into(), role.as_str().into()])?,
-        )?)
+    fn member_insert(
+        workspace_id: &WorkspaceId,
+        user_id: &UserId,
+        role: Role,
+        granted_by: GrantedBy,
+    ) -> Result<Bound> {
+        let mut insert = Query::insert()
+            .into_table(Members::Table)
+            .columns([
+                Members::WorkspaceId,
+                Members::UserId,
+                Members::Role,
+                Members::GrantedBy,
+            ])
+            .values([
+                workspace_id.into(),
+                user_id.into(),
+                role.as_str().into(),
+                granted_by.as_str().into(),
+            ])?
+            .to_owned();
+        // The provider never displaces a membership someone holds: one a
+        // person granted while the provider's groups were being read wins.
+        if granted_by == GrantedBy::Idp {
+            insert.on_conflict(
+                OnConflict::columns([Members::WorkspaceId, Members::UserId])
+                    .do_nothing()
+                    .to_owned(),
+            );
+        }
+        Ok(Bound::new(&insert)?)
     }
 
     /// Remove a membership, and record `audit` in the same transaction
@@ -1894,6 +2744,7 @@ impl ControlPlane {
                     (Members::Table, Members::UserId),
                     (Members::Table, Members::Role),
                     (Members::Table, Members::CreatedAt),
+                    (Members::Table, Members::GrantedBy),
                 ])
                 .column((Users::Table, Users::Username))
                 .from(Members::Table)
@@ -1905,6 +2756,244 @@ impl ControlPlane {
                 .order_by((Users::Table, Users::Username), Order::Asc),
         )?;
         Ok(bound.query_as().fetch_all(&self.pool).await?)
+    }
+
+    // --- group roles --------------------------------------------------------
+
+    /// Give an identity provider's group a role in the workspace, or change
+    /// it, audited in the same transaction. Members already signed in get
+    /// it at their next sign-in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty group name, a missing workspace, or a
+    /// failed write.
+    pub async fn set_group_role(
+        &self,
+        workspace_id: &WorkspaceId,
+        group: &str,
+        role: Role,
+        audit: AuditEntry,
+    ) -> Result<GroupRoleRow> {
+        let group = group.trim();
+        if group.is_empty() {
+            return Err(Error::Config(String::from("group name must not be empty")));
+        }
+        let bound = Bound::new(
+            Query::insert()
+                .into_table(GroupRoles::Table)
+                .columns([
+                    GroupRoles::WorkspaceId,
+                    GroupRoles::GroupName,
+                    GroupRoles::Role,
+                ])
+                .values([workspace_id.into(), group.into(), role.as_str().into()])?
+                .on_conflict(
+                    OnConflict::columns([GroupRoles::WorkspaceId, GroupRoles::GroupName])
+                        .update_column(GroupRoles::Role)
+                        .to_owned(),
+                ),
+        )?;
+        let audit = audit
+            .in_workspace(workspace_id)
+            .on(ResourceKind::Group.id(group));
+        self.commit_audited(vec![bound], audit)
+            .await
+            .map_err(|e| match &e {
+                Error::Sqlite(sqlx::Error::Database(db)) if db.is_foreign_key_violation() => {
+                    ResourceKind::Workspace.missing(workspace_id.to_string())
+                }
+                _ => e,
+            })?;
+        let bound = Bound::new(
+            Self::group_role_select()
+                .and_where(Expr::col(GroupRoles::WorkspaceId).eq(workspace_id))
+                .and_where(Expr::col(GroupRoles::GroupName).eq(group)),
+        )?;
+        bound
+            .query_as()
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| ResourceKind::Group.missing(group))
+    }
+
+    /// Take a group's role away; whether it had one. Memberships it granted
+    /// go at each member's next sign-in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn remove_group_role(
+        &self,
+        workspace_id: &WorkspaceId,
+        group: &str,
+        audit: AuditEntry,
+    ) -> Result<bool> {
+        let group = group.trim();
+        let bound = Bound::new(
+            Query::delete()
+                .from_table(GroupRoles::Table)
+                .and_where(Expr::col(GroupRoles::WorkspaceId).eq(workspace_id))
+                .and_where(Expr::col(GroupRoles::GroupName).eq(group)),
+        )?;
+        let audit = audit
+            .in_workspace(workspace_id)
+            .on(ResourceKind::Group.id(group));
+        self.commit_audited(vec![bound], audit).await
+    }
+
+    fn group_role_select() -> sea_query::SelectStatement {
+        Query::select()
+            .columns([
+                GroupRoles::WorkspaceId,
+                GroupRoles::GroupName,
+                GroupRoles::Role,
+                GroupRoles::CreatedAt,
+            ])
+            .from(GroupRoles::Table)
+            .to_owned()
+    }
+
+    /// The groups with a role in the workspace, by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn list_group_roles(&self, workspace_id: &WorkspaceId) -> Result<Vec<GroupRoleRow>> {
+        let bound = Bound::new(
+            Self::group_role_select()
+                .and_where(Expr::col(GroupRoles::WorkspaceId).eq(workspace_id))
+                .order_by(GroupRoles::GroupName, Order::Asc),
+        )?;
+        Ok(bound.query_as().fetch_all(&self.pool).await?)
+    }
+
+    /// Make the user's provider-granted memberships match `groups`, each
+    /// change a `member` row from `origin`: in
+    /// each workspace, the highest role among the groups with one, else
+    /// none. Only rows granted by the provider are added, re-roled, or
+    /// deleted; a row a person granted is never touched. Every change
+    /// commits with its own `member` audit row in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a query or the commit fails.
+    pub async fn reconcile_idp_memberships(
+        &self,
+        user: &UserRow,
+        groups: &[String],
+        origin: &Origin,
+    ) -> Result<Reconciled> {
+        let user_id = &user.id;
+        let audit = || {
+            let mut entry = AuditEntry::new(AuditAction::Member, Outcome::Allowed, origin.clone());
+            entry.user_id = Some(user_id.clone());
+            entry
+        };
+        let wanted = self.roles_for_groups(groups).await?;
+        let bound = Bound::new(
+            Query::select()
+                .columns([Members::WorkspaceId, Members::Role, Members::GrantedBy])
+                .from(Members::Table)
+                .and_where(Expr::col(Members::UserId).eq(user_id)),
+        )?;
+        let mut current: BTreeMap<WorkspaceId, (Role, GrantedBy)> = BTreeMap::new();
+        for row in bound.query().fetch_all(&self.pool).await? {
+            current.insert(
+                row.try_get("workspace_id")?,
+                (parsed(&row, "role")?, parsed(&row, "granted_by")?),
+            );
+        }
+        let mut changes: Vec<(Bound, AuditEntry)> = Vec::new();
+        let mut outcome = Reconciled::default();
+        let entry = |workspace: &WorkspaceId| {
+            audit()
+                .in_workspace(workspace)
+                .on(ResourceKind::User.id(user_id.as_str()))
+        };
+        for (workspace, role) in &wanted {
+            match current.get(workspace) {
+                Some((_, GrantedBy::User)) => {}
+                Some((have, GrantedBy::Idp)) if have == role => {}
+                Some((_, GrantedBy::Idp)) => {
+                    changes.push((
+                        Bound::new(
+                            Query::update()
+                                .table(Members::Table)
+                                .value(Members::Role, role.as_str())
+                                .and_where(Expr::col(Members::WorkspaceId).eq(workspace))
+                                .and_where(Expr::col(Members::UserId).eq(user_id))
+                                .and_where(
+                                    Expr::col(Members::GrantedBy).eq(GrantedBy::Idp.as_str()),
+                                ),
+                        )?,
+                        entry(workspace),
+                    ));
+                    outcome.changed = outcome.changed.saturating_add(1);
+                }
+                None => {
+                    changes.push((
+                        Self::member_insert(workspace, user_id, *role, GrantedBy::Idp)?,
+                        entry(workspace),
+                    ));
+                    outcome.granted = outcome.granted.saturating_add(1);
+                }
+            }
+        }
+        for (workspace, (_, granted_by)) in &current {
+            if *granted_by == GrantedBy::Idp && !wanted.contains_key(workspace) {
+                changes.push((
+                    Bound::new(
+                        Query::delete()
+                            .from_table(Members::Table)
+                            .and_where(Expr::col(Members::WorkspaceId).eq(workspace))
+                            .and_where(Expr::col(Members::UserId).eq(user_id))
+                            .and_where(Expr::col(Members::GrantedBy).eq(GrantedBy::Idp.as_str())),
+                    )?,
+                    entry(workspace),
+                ));
+                outcome.revoked = outcome.revoked.saturating_add(1);
+            }
+        }
+        if changes.is_empty() {
+            return Ok(outcome);
+        }
+        let mut tx = self.pool.begin().await?;
+        for (change, audit) in changes {
+            change.query().execute(&mut *tx).await?;
+            Self::audit_insert(&audit)?
+                .query()
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        tracing::info!(user = %user.username, ?outcome, "memberships follow the identity provider's groups");
+        Ok(outcome)
+    }
+
+    /// The highest role `groups` carry in each workspace.
+    async fn roles_for_groups(&self, groups: &[String]) -> Result<BTreeMap<WorkspaceId, Role>> {
+        let mut wanted = BTreeMap::new();
+        if groups.is_empty() {
+            return Ok(wanted);
+        }
+        let bound = Bound::new(
+            Query::select()
+                .columns([GroupRoles::WorkspaceId, GroupRoles::Role])
+                .from(GroupRoles::Table)
+                .and_where(
+                    Expr::col(GroupRoles::GroupName).is_in(groups.iter().map(String::as_str)),
+                ),
+        )?;
+        for row in bound.query().fetch_all(&self.pool).await? {
+            let workspace: WorkspaceId = row.try_get("workspace_id")?;
+            let role: Role = parsed(&row, "role")?;
+            wanted
+                .entry(workspace)
+                .and_modify(|have: &mut Role| *have = (*have).max(role))
+                .or_insert(role);
+        }
+        Ok(wanted)
     }
 
     // --- API tokens ---------------------------------------------------------
@@ -2089,6 +3178,30 @@ impl ControlPlane {
     }
 
     fn audit_insert(entry: &AuditEntry) -> Result<Bound> {
+        // Only what this build defines is written; a name read from history
+        // never goes back in under this build's name.
+        if !entry.action.is_defined() {
+            return Err(Error::UnknownValue {
+                what: "audit action",
+                value: entry.action.as_str().to_owned(),
+                allowed: AuditAction::ALL
+                    .iter()
+                    .map(AuditAction::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+        if let Some(kind) = entry.resource_type.as_ref().filter(|k| !k.is_defined()) {
+            return Err(Error::UnknownValue {
+                what: "resource kind",
+                value: kind.as_str().to_owned(),
+                allowed: ResourceKind::ALL
+                    .iter()
+                    .map(ResourceKind::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
         Ok(Bound::new(
             Query::insert()
                 .into_table(AuditLog::Table)
@@ -2111,24 +3224,72 @@ impl ControlPlane {
                     entry.token_hash.as_deref().into(),
                     entry.workspace_id.as_ref().map(WorkspaceId::as_str).into(),
                     entry.action.as_str().into(),
-                    entry.resource_type.map(ResourceKind::as_str).into(),
+                    entry
+                        .resource_type
+                        .as_ref()
+                        .map(ResourceKind::as_str)
+                        .into(),
                     entry.resource_id.as_deref().into(),
                     entry.outcome.as_str().into(),
-                    entry.channel.as_str().into(),
-                    entry.client_addr.as_deref().into(),
-                    entry.request_id.as_deref().into(),
+                    entry.origin.channel.as_str().into(),
+                    entry.origin.client_addr.as_deref().into(),
+                    entry.origin.request_id.as_deref().into(),
                 ])?,
         )?)
     }
 
-    /// Audit rows matching the filter, newest first.
+    /// The access rows with these ids, for joining a workspace's detail
+    /// rows to them; ids with no row are left out.
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
+    pub async fn audit_rows_by_ids(&self, ids: &[AuditId]) -> Result<Vec<AuditRow>> {
+        // In batches: SQLite caps the variables one statement binds, and an
+        // export of a whole workspace's audit names every row.
+        const BATCH: usize = 500;
+        let mut rows = Vec::with_capacity(ids.len());
+        for batch in ids.chunks(BATCH) {
+            let bound = AuditFilter::by_ids(batch)?;
+            rows.extend(bound.query_as::<AuditRow>().fetch_all(&self.pool).await?);
+        }
+        Ok(rows)
+    }
+
+    /// A workspace's detail rows joined to their access rows by the shared
+    /// id, as OCSF events in the details' order; a detail row whose access
+    /// row is gone is left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or a stored timestamp does not
+    /// parse.
+    pub async fn ocsf_events(
+        &self,
+        details: &[AuditDetailRow],
+        prompt: PromptText,
+    ) -> Result<Vec<serde_json::Value>> {
+        let ids: Vec<AuditId> = details.iter().map(|d| d.id.clone()).collect();
+        let rows = self.audit_rows_by_ids(&ids).await?;
+        let by_id: HashMap<&AuditId, &AuditRow> = rows.iter().map(|r| (&r.entry.id, r)).collect();
+        let mut events = Vec::with_capacity(details.len());
+        for detail in details {
+            if let Some(row) = by_id.get(&detail.id) {
+                events.push(row.to_ocsf_with_detail(Some(detail), prompt)?);
+            }
+        }
+        Ok(events)
+    }
+
+    /// One page of the access audit under `filter`, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cursor belongs to another filter or the
+    /// query fails.
     pub async fn query_audit(&self, filter: &AuditFilter) -> Result<AuditPage> {
         let digest = filter.digest();
-        if let Some(after) = &filter.after
+        if let Some(after) = &filter.cursor
             && after.filter != digest
         {
             return Err(Error::Config(String::from(
@@ -2141,7 +3302,7 @@ impl ControlPlane {
             rows.truncate(limit);
             rows.last().map(|last| AuditCursor {
                 timestamp: last.timestamp.clone(),
-                id: last.id.clone(),
+                id: last.entry.id.clone(),
                 filter: digest,
             })
         } else {
@@ -2152,8 +3313,12 @@ impl ControlPlane {
 }
 
 impl AuditFilter {
+    pub const DEFAULT_LIMIT: u32 = 100;
+    /// Rows a page holds at most, whatever `limit` asks.
+    pub const MAX_LIMIT: u32 = 1_000;
+
     fn page_size(&self) -> u32 {
-        Ord::max(self.limit, 1)
+        self.limit.clamp(1, Self::MAX_LIMIT)
     }
 
     /// Identifies the filter so a cursor only continues the same query.
@@ -2170,6 +3335,31 @@ impl AuditFilter {
         let mut hex = sha256_hex(canonical.as_bytes());
         hex.truncate(16);
         hex
+    }
+
+    /// The access rows with these ids, in no order: the half of a
+    /// workspace's audit that `control.db` holds, joined by the detail
+    /// rows' ids.
+    pub(crate) fn by_ids(ids: &[AuditId]) -> sqlx::Result<Bound> {
+        Bound::new(
+            Query::select()
+                .columns([
+                    AuditLog::Id,
+                    AuditLog::Timestamp,
+                    AuditLog::UserId,
+                    AuditLog::TokenHash,
+                    AuditLog::WorkspaceId,
+                    AuditLog::Action,
+                    AuditLog::ResourceType,
+                    AuditLog::ResourceId,
+                    AuditLog::Outcome,
+                    AuditLog::Channel,
+                    AuditLog::ClientAddr,
+                    AuditLog::RequestId,
+                ])
+                .from(AuditLog::Table)
+                .and_where(Expr::col(AuditLog::Id).is_in(ids.iter().map(AuditId::as_str))),
+        )
     }
 
     /// The filtered audit select, built and bound in one scope so no builder
@@ -2196,7 +3386,7 @@ impl AuditFilter {
             .order_by(AuditLog::Timestamp, Order::Desc)
             .order_by(AuditLog::Id, Order::Desc)
             .limit(u64::from(filter.page_size()).saturating_add(1));
-        if let Some(after) = &filter.after {
+        if let Some(after) = &filter.cursor {
             select.cond_where(
                 Cond::any()
                     .add(Expr::col(AuditLog::Timestamp).lt(after.timestamp.as_str()))
@@ -2230,1014 +3420,4 @@ impl AuditFilter {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use sqlx::AssertSqlSafe;
-
-    async fn open() -> (tempfile::TempDir, ControlPlane) {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut config = Config::default();
-        config.general.data_dir = dir.path().to_path_buf();
-        let cp = ControlPlane::open(&config)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        (dir, cp)
-    }
-
-    #[expect(clippy::panic, reason = "test failure path")]
-    fn fail(msg: &str) -> ! {
-        panic!("{msg}")
-    }
-
-    /// The audit row a test's own setup writes.
-    fn setup_audit() -> AuditEntry {
-        AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli)
-    }
-
-    /// A database from before sqlx migrations: the three sea-query versions
-    /// applied, progress recorded in `schema_version`, and rows in the tables
-    /// that replaying those versions would destroy.
-    async fn legacy_control_db(path: &std::path::Path) {
-        let url = format!("sqlite:{}?mode=rwc", path.display());
-        let options = SqliteConnectOptions::from_str(&url).unwrap_or_else(|e| fail(&e.to_string()));
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-
-        let mut sql = String::from(
-            "CREATE TABLE IF NOT EXISTS schema_version (\
-                 version INTEGER PRIMARY KEY, \
-                 applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);",
-        );
-        for file in [
-            "0001_access_control",
-            "0002_audit_log_access_record",
-            "0003_users_and_token_scopes",
-        ] {
-            sql.push_str(
-                &std::fs::read_to_string(
-                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("migrations")
-                        .join(format!("{file}.sql")),
-                )
-                .unwrap_or_else(|e| fail(&e.to_string())),
-            );
-        }
-        sql.push_str("INSERT INTO schema_version (version) VALUES (1), (2), (3);");
-        sql.push_str(
-            "INSERT INTO audit_log (id, action, outcome, channel) \
-             VALUES ('01890000-0000-7000-8000-000000000001', 'login', 'allowed', 'cli');",
-        );
-        sqlx::raw_sql(AssertSqlSafe(sql))
-            .execute(&pool)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        pool.close().await;
-    }
-
-    /// Values are bound, not written into the SQL: a name full of quotes
-    /// and statement separators is stored and found as the text it is.
-    #[tokio::test]
-    async fn values_are_bound_not_spliced_into_the_sql() {
-        let (_dir, cp) = open().await;
-        let name = "o'brien\"; DROP TABLE users; --";
-        let created = cp
-            .create_workspace(name, None, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let found = cp
-            .find_workspace_by_name(name)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(found.map(|w| w.id), Some(created.id));
-        assert!(cp.list_users().await.is_ok(), "users table still there");
-    }
-
-    #[test]
-    fn a_value_type_control_db_never_stores_is_refused() {
-        let insert = Query::insert()
-            .into_table(Users::Table)
-            .columns([Users::Id])
-            .values([1.5_f64.into()])
-            .map_or_else(|e| fail(&e.to_string()), |q| q.to_owned());
-        assert!(Bound::new(&insert).is_err());
-    }
-
-    #[tokio::test]
-    async fn legacy_schema_version_is_adopted_without_replaying_migrations() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut config = Config::default();
-        config.general.data_dir = dir.path().to_path_buf();
-        config
-            .ensure_dirs()
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        legacy_control_db(&config.control_db_path()).await;
-
-        let cp = ControlPlane::open(&config)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-
-        assert!(
-            cp.schema_version()
-                .await
-                .is_ok_and(|v| v == ControlPlane::latest_schema_version())
-        );
-        // Replaying v2 would have dropped and recreated audit_log.
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
-            .fetch_one(&cp.pool)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(rows, 1, "the access record must survive adoption");
-    }
-
-    #[tokio::test]
-    async fn a_shipped_migration_may_not_change_under_an_existing_database() {
-        let (dir, cp) = open().await;
-        drop(cp);
-
-        // Simulate an edit to a migration that has already been applied.
-        sqlx::raw_sql("UPDATE _sqlx_migrations SET checksum = x'00' WHERE version = 1")
-            .execute(
-                &SqlitePoolOptions::new()
-                    .max_connections(1)
-                    .connect_with(
-                        SqliteConnectOptions::from_str(&format!(
-                            "sqlite:{}",
-                            dir.path().join("control.db").display()
-                        ))
-                        .unwrap_or_else(|e| fail(&e.to_string())),
-                    )
-                    .await
-                    .unwrap_or_else(|e| fail(&e.to_string())),
-            )
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-
-        let mut config = Config::default();
-        config.general.data_dir = dir.path().to_path_buf();
-        assert!(
-            ControlPlane::open(&config).await.is_err(),
-            "a changed checksum must refuse the database, not migrate it"
-        );
-    }
-
-    #[test]
-    fn stored_allow_lists_decode_and_fail_closed() {
-        assert_eq!(AllowedProviders::from_column(None), AllowedProviders::All);
-        let only = AllowedProviders::from_column(Some("[\"ollama\"]"));
-        assert!(only.permits("ollama") && !only.permits("openai"));
-        let unreadable = AllowedProviders::from_column(Some("not json"));
-        assert!(!unreadable.permits("ollama"));
-        assert_eq!(
-            serde_json::to_value(&only).ok(),
-            Some(serde_json::json!(["ollama"]))
-        );
-        assert_eq!(
-            serde_json::to_value(AllowedProviders::All).ok(),
-            Some(serde_json::Value::Null)
-        );
-    }
-
-    #[tokio::test]
-    async fn migrations_reach_the_latest_version_and_rerun_idempotently() {
-        let (dir, cp) = open().await;
-        assert!(
-            cp.schema_version()
-                .await
-                .is_ok_and(|v| v == ControlPlane::latest_schema_version())
-        );
-        drop(cp);
-        let mut config = Config::default();
-        config.general.data_dir = dir.path().to_path_buf();
-        let again = ControlPlane::open(&config).await;
-        assert!(again.is_ok());
-    }
-
-    #[tokio::test]
-    async fn workspace_updates_keep_unset_fields() {
-        let (_dir, cp) = open().await;
-        let ws = cp
-            .create_workspace("w", None, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let changed = cp
-            .update_workspace(
-                &ws.id,
-                &WorkspaceChanges {
-                    classification: Some(String::from("secret")),
-                    allowed_providers: ProviderAllowList::Only(BTreeSet::from([String::from(
-                        "ollama",
-                    )])),
-                },
-            )
-            .await;
-        assert!(changed.is_ok_and(|w| {
-            w.classification == "secret"
-                && w.allowed_providers.permits("ollama")
-                && !w.allowed_providers.permits("openai")
-        }));
-        let kept = cp
-            .update_workspace(&ws.id, &WorkspaceChanges::default())
-            .await;
-        assert!(kept.is_ok_and(
-            |w| w.classification == "secret" && w.allowed_providers != AllowedProviders::All
-        ));
-        let cleared = cp
-            .update_workspace(
-                &ws.id,
-                &WorkspaceChanges {
-                    classification: None,
-                    allowed_providers: ProviderAllowList::All,
-                },
-            )
-            .await;
-        assert!(cleared.is_ok_and(|w| w.allowed_providers == AllowedProviders::All));
-        assert!(
-            cp.update_workspace(&WorkspaceId::from("missing"), &WorkspaceChanges::default())
-                .await
-                .is_err()
-        );
-        assert!(cp.get_workspace(&ws.id).await.is_ok_and(|w| w.is_some()));
-        assert!(cp.create_workspace("w", None, setup_audit()).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn users_hash_verify_and_reject_duplicates() {
-        let (_dir, cp) = open().await;
-        let alice = cp
-            .create_user("alice", "hunter42", UserKind::Admin, setup_audit())
-            .await;
-        assert!(
-            alice
-                .as_ref()
-                .is_ok_and(|u| u.is_admin && u.username == "alice")
-        );
-        assert!(
-            cp.verify_password("alice", "hunter42")
-                .await
-                .is_ok_and(|u| u.is_some())
-        );
-        assert!(
-            cp.verify_password("alice", "wrong")
-                .await
-                .is_ok_and(|u| u.is_none())
-        );
-        assert!(
-            cp.verify_password("nobody", "hunter42")
-                .await
-                .is_ok_and(|u| u.is_none())
-        );
-        let dup = cp
-            .create_user("alice", "x", UserKind::Standard, setup_audit())
-            .await
-            .err();
-        assert!(dup.is_some_and(|e| e.to_string().contains("already exists")));
-        assert!(
-            cp.create_user("", "x", UserKind::Standard, setup_audit())
-                .await
-                .is_err()
-        );
-        assert!(
-            cp.create_user("bob", "", UserKind::Standard, setup_audit())
-                .await
-                .is_err()
-        );
-        assert!(cp.list_users().await.is_ok_and(|u| u.len() == 1));
-        assert!(
-            cp.find_user_by_username(" alice ")
-                .await
-                .is_ok_and(|u| u.is_some())
-        );
-    }
-
-    #[tokio::test]
-    async fn a_first_sign_in_creates_a_plain_user_and_never_takes_a_name() {
-        let (_dir, cp) = open().await;
-        let existing = cp
-            .create_user("ada", "pw", UserKind::Admin, setup_audit())
-            .await;
-        assert!(existing.is_ok());
-        let ada = OidcSubject::from("sub-ada");
-
-        let first = cp.oidc_user(&ada, "ada").await;
-        let Ok(first) = first else {
-            fail(&format!("{:?}", first.err()));
-        };
-        assert!(
-            first.username.starts_with("ada-") && first.username.len() == 12,
-            "{}",
-            first.username
-        );
-        assert!(!first.is_admin);
-        assert!(
-            cp.workspaces_for_user(&first.id)
-                .await
-                .is_ok_and(|w| w.is_empty())
-        );
-        assert!(
-            cp.verify_password(&first.username, "")
-                .await
-                .is_ok_and(|u| u.is_none())
-        );
-
-        let again = cp.oidc_user(&ada, "renamed-at-the-issuer").await;
-        assert!(again.is_ok_and(|u| u.id == first.id && u.username == first.username));
-        assert!(
-            cp.find_user_by_oidc_subject(&ada)
-                .await
-                .is_ok_and(|u| u.is_some_and(|u| u.id == first.id))
-        );
-
-        let grace = cp
-            .oidc_user(&OidcSubject::from("sub-grace"), " grace ")
-            .await;
-        assert!(grace.is_ok_and(|u| u.username == "grace"));
-        assert!(
-            cp.oidc_user(&OidcSubject::from("sub-x"), "  ")
-                .await
-                .is_err()
-        );
-        assert!(
-            cp.find_user_by_oidc_subject(&OidcSubject::from("nobody"))
-                .await
-                .is_ok_and(|u| u.is_none())
-        );
-    }
-
-    #[tokio::test]
-    async fn a_sealed_token_is_replaced_in_place_and_goes_with_its_user() {
-        let (_dir, cp) = open().await;
-        let user = cp
-            .oidc_user(&OidcSubject::from("s"), "ada")
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let sealed = |id: &str| Sealed {
-            key_id: id.to_owned(),
-            enc: vec![4, 1, 2],
-            ciphertext: vec![9, 8, 7],
-        };
-        assert!(
-            cp.put_sealed(SealedOwner::User(&user.id), &sealed("k1"))
-                .await
-                .is_ok()
-        );
-        assert!(
-            cp.put_sealed(SealedOwner::User(&user.id), &sealed("k2"))
-                .await
-                .is_ok()
-        );
-        assert!(
-            cp.sealed(SealedOwner::User(&user.id))
-                .await
-                .is_ok_and(|t| t == Some(sealed("k2")))
-        );
-        assert!(
-            cp.put_sealed(SealedOwner::User(&UserId::from("nobody")), &sealed("k1"))
-                .await
-                .is_err()
-        );
-        sqlx::query("DELETE FROM users")
-            .execute(&cp.pool)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(
-            cp.sealed(SealedOwner::User(&user.id))
-                .await
-                .is_ok_and(|t| t.is_none())
-        );
-        assert!(cp.delete_sealed(SealedOwner::User(&user.id)).await.is_ok());
-    }
-
-    #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "one registration's life, end to end")]
-    async fn a_registration_is_kept_with_its_key_and_forgotten_with_it() {
-        let (_dir, cp) = open().await;
-        let sealed = |id: &str| Sealed {
-            key_id: id.to_owned(),
-            enc: vec![1],
-            ciphertext: vec![2, 3],
-        };
-        let key = sealed("key");
-        let mut row = RegistrationRow {
-            name: String::from("https://i"),
-            client_id: String::from("c1"),
-            registration_client_uri: Some(String::from("https://i/register/c1")),
-            token: Some(sealed("t1")),
-        };
-        assert!(
-            cp.registration("https://i")
-                .await
-                .is_ok_and(|r| r.is_none())
-        );
-        assert!(
-            cp.add_sealed(SealedOwner::ClientKey("https://i"), &sealed("pending"))
-                .await
-                .is_ok()
-        );
-        // The pending key moves to the client's name with the registration.
-        assert!(
-            cp.save_registration(
-                &row,
-                Previous::Nothing,
-                KeyChange {
-                    put: Some(("https://i c1", &key)),
-                    delete: &["https://i"],
-                },
-            )
-            .await
-            .is_ok_and(|saved| saved)
-        );
-        // A second new registration at the same name loses the race and
-        // changes nothing, keys included.
-        let rival = RegistrationRow {
-            client_id: String::from("c9"),
-            ..row.clone()
-        };
-        assert!(
-            cp.save_registration(
-                &rival,
-                Previous::Nothing,
-                KeyChange {
-                    put: Some(("https://i c9", &sealed("rival key"))),
-                    delete: &[],
-                },
-            )
-            .await
-            .is_ok_and(|saved| !saved)
-        );
-        assert!(
-            cp.sealed(SealedOwner::ClientKey("https://i c9"))
-                .await
-                .is_ok_and(|k| k.is_none())
-        );
-        // An update names the client it expects, and misses when another
-        // one is registered there.
-        assert!(
-            cp.save_registration(&rival, Previous::Client("c9"), KeyChange::default())
-                .await
-                .is_ok_and(|saved| !saved)
-        );
-        assert!(
-            cp.registration("https://i")
-                .await
-                .is_ok_and(|r| r.as_ref() == Some(&row))
-        );
-        assert!(
-            cp.sealed(SealedOwner::ClientKey("https://i c1"))
-                .await
-                .is_ok_and(|k| k == Some(key.clone()))
-        );
-        assert!(
-            cp.sealed(SealedOwner::ClientKey("https://i"))
-                .await
-                .is_ok_and(|k| k.is_none())
-        );
-        // An issuer without RFC 7592 leaves nothing to manage it with.
-        row.token = None;
-        row.registration_client_uri = None;
-        assert!(
-            cp.save_registration(&row, Previous::Client("c1"), KeyChange::default())
-                .await
-                .is_ok_and(|saved| saved)
-        );
-        assert!(
-            cp.registration("https://i")
-                .await
-                .is_ok_and(|r| r.as_ref() == Some(&row))
-        );
-        assert!(
-            cp.delete_registration(
-                "https://i",
-                KeyChange {
-                    put: None,
-                    delete: &["https://i c1"],
-                },
-            )
-            .await
-            .is_ok()
-        );
-        assert!(
-            cp.registration("https://i")
-                .await
-                .is_ok_and(|r| r.is_none())
-        );
-        assert!(
-            cp.sealed(SealedOwner::ClientKey("https://i c1"))
-                .await
-                .is_ok_and(|k| k.is_none())
-        );
-    }
-
-    #[tokio::test]
-    async fn a_client_key_row_is_added_once_replaced_in_place_and_deleted_by_name() {
-        let (_dir, cp) = open().await;
-        let sealed = |id: &str| Sealed {
-            key_id: id.to_owned(),
-            enc: vec![1],
-            ciphertext: vec![2, 3],
-        };
-        let owner = SealedOwner::ClientKey("https://i c");
-        assert!(
-            cp.add_sealed(owner, &sealed("k1"))
-                .await
-                .is_ok_and(|kept| kept)
-        );
-        // A second process's key loses to the first.
-        assert!(
-            cp.add_sealed(owner, &sealed("k2"))
-                .await
-                .is_ok_and(|kept| !kept)
-        );
-        assert!(
-            cp.sealed(owner)
-                .await
-                .is_ok_and(|t| t == Some(sealed("k1")))
-        );
-        assert!(cp.put_sealed(owner, &sealed("k3")).await.is_ok());
-        assert!(
-            cp.sealed(owner)
-                .await
-                .is_ok_and(|t| t == Some(sealed("k3")))
-        );
-        // Another client's key is another row.
-        assert!(
-            cp.sealed(SealedOwner::ClientKey("https://i other"))
-                .await
-                .is_ok_and(|t| t.is_none())
-        );
-        assert!(cp.delete_sealed(owner).await.is_ok());
-        assert!(cp.sealed(owner).await.is_ok_and(|t| t.is_none()));
-    }
-
-    #[tokio::test]
-    async fn a_client_key_moves_to_another_name_in_one_step() {
-        let (_dir, cp) = open().await;
-        let sealed = |id: &str| Sealed {
-            key_id: id.to_owned(),
-            enc: vec![1],
-            ciphertext: vec![2, 3],
-        };
-        let (current, next) = ("https://i c", "next https://i c");
-        assert!(
-            cp.add_sealed(SealedOwner::ClientKey(current), &sealed("old"))
-                .await
-                .is_ok()
-        );
-        assert!(
-            cp.add_sealed(SealedOwner::ClientKey(next), &sealed("new"))
-                .await
-                .is_ok()
-        );
-        // The replacement, resealed for the client's name, takes its place.
-        assert!(
-            cp.change_client_keys(KeyChange {
-                put: Some((current, &sealed("new for c"))),
-                delete: &[next],
-            })
-            .await
-            .is_ok()
-        );
-        assert!(
-            cp.sealed(SealedOwner::ClientKey(current))
-                .await
-                .is_ok_and(|t| t == Some(sealed("new for c")))
-        );
-        assert!(
-            cp.sealed(SealedOwner::ClientKey(next))
-                .await
-                .is_ok_and(|t| t.is_none())
-        );
-    }
-
-    #[tokio::test]
-    async fn members_need_a_user_and_a_workspace() {
-        let (_dir, cp) = open().await;
-        let ws = cp
-            .create_workspace("w", None, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let bob = cp
-            .create_user("bob", "pw", UserKind::Standard, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(
-            cp.set_member(&ws.id, &UserId::from("ghost"), Role::Member, setup_audit())
-                .await
-                .is_err()
-        );
-        assert!(
-            cp.set_member(&ws.id, &bob.id, Role::Viewer, setup_audit())
-                .await
-                .is_ok()
-        );
-        assert!(
-            cp.member_role(&ws.id, &bob.id)
-                .await
-                .is_ok_and(|r| r == Some(Role::Viewer))
-        );
-        assert!(
-            cp.set_member(&ws.id, &bob.id, Role::Owner, setup_audit())
-                .await
-                .is_ok()
-        );
-        assert!(
-            cp.member_role(&ws.id, &bob.id)
-                .await
-                .is_ok_and(|r| r == Some(Role::Owner))
-        );
-        let listed = cp.list_members(&ws.id).await;
-        assert!(
-            listed.is_ok_and(|m| m.len() == 1 && m.first().is_some_and(|m| m.username == "bob"))
-        );
-        let mine = cp.workspaces_for_user(&bob.id).await;
-        assert!(mine.is_ok_and(|w| {
-            w.len() == 1
-                && w.first()
-                    .is_some_and(|m| m.workspace.name == "w" && m.role == Role::Owner)
-        }));
-        assert!(
-            cp.remove_member(&ws.id, &bob.id, setup_audit())
-                .await
-                .is_ok_and(|removed| removed)
-        );
-        assert!(
-            cp.remove_member(&ws.id, &bob.id, setup_audit())
-                .await
-                .is_ok_and(|removed| !removed)
-        );
-        assert!(Role::Viewer < Role::Member && Role::Member < Role::Owner);
-        assert!("boss".parse::<Role>().is_err());
-    }
-
-    #[tokio::test]
-    async fn an_audited_change_names_what_it_changed_and_a_no_op_is_an_error() {
-        let (_dir, cp) = open().await;
-        let ws = cp
-            .create_workspace("w", None, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let bob = cp
-            .create_user("bob", "pw", UserKind::Standard, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let issued = cp
-            .create_token(&ws.id, &bob.id, "t", &[], None, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let removed = cp
-            .remove_member(&ws.id, &bob.id, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(!removed);
-        let rows = cp
-            .query_audit(&AuditFilter {
-                limit: 100,
-                ..AuditFilter::default()
-            })
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()))
-            .rows;
-        let named = |id: &str| rows.iter().find(|r| r.resource_id.as_deref() == Some(id));
-        assert!(
-            named(ws.id.as_str()).is_some_and(
-                |r| r.workspace_id.as_ref() == Some(&ws.id) && r.outcome == Outcome::Allowed
-            ),
-            "{rows:?}"
-        );
-        assert!(
-            named(&issued.row.token_hash).is_some_and(|r| r.workspace_id.as_ref() == Some(&ws.id)),
-            "{rows:?}"
-        );
-        let bob_rows: Vec<_> = rows
-            .iter()
-            .filter(|r| r.resource_id.as_deref() == Some(bob.id.as_str()))
-            .map(|r| r.outcome)
-            .collect();
-        assert_eq!(bob_rows, [Outcome::Error, Outcome::Allowed], "{rows:?}");
-    }
-
-    #[tokio::test]
-    async fn an_audited_change_does_not_stand_without_its_audit_row() {
-        let (_dir, cp) = open().await;
-        let ws = cp
-            .create_workspace("w", None, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let bob = cp
-            .create_user("bob", "pw", UserKind::Standard, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        cp.set_member(&ws.id, &bob.id, Role::Viewer, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let issued = cp
-            .create_token(&ws.id, &bob.id, "t", &[], None, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        sqlx::query("DROP TABLE audit_log")
-            .execute(&cp.pool)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-
-        assert!(
-            cp.create_workspace("w2", Some(&bob.id), setup_audit())
-                .await
-                .is_err()
-        );
-        assert!(
-            cp.find_workspace_by_name("w2")
-                .await
-                .is_ok_and(|w| w.is_none())
-        );
-        assert!(
-            cp.create_user("carol", "pw", UserKind::Standard, setup_audit())
-                .await
-                .is_err()
-        );
-        assert!(
-            cp.find_user_by_username("carol")
-                .await
-                .is_ok_and(|u| u.is_none())
-        );
-        assert!(
-            cp.set_member(&ws.id, &bob.id, Role::Owner, setup_audit())
-                .await
-                .is_err()
-        );
-        assert!(
-            cp.remove_member(&ws.id, &bob.id, setup_audit())
-                .await
-                .is_err()
-        );
-        assert!(
-            cp.member_role(&ws.id, &bob.id)
-                .await
-                .is_ok_and(|r| r == Some(Role::Viewer))
-        );
-        assert!(
-            cp.create_token(&ws.id, &bob.id, "t2", &[], None, setup_audit())
-                .await
-                .is_err()
-        );
-        assert!(
-            cp.delete_token(&issued.row.token_hash, setup_audit())
-                .await
-                .is_err()
-        );
-        assert!(
-            cp.list_tokens(&ws.id)
-                .await
-                .is_ok_and(|t| t.len() == 1 && t.first().is_some_and(|t| t.name == "t"))
-        );
-    }
-
-    #[tokio::test]
-    async fn tokens_are_stored_hashed_with_scopes_and_expiry() {
-        let (_dir, cp) = open().await;
-        let ws = cp
-            .create_workspace("w", None, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let bob = cp
-            .create_user("bob", "pw", UserKind::Standard, setup_audit())
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let minted = cp
-            .create_token(
-                &ws.id,
-                &bob.id,
-                "ci",
-                &[Scope::Read, Scope::Write],
-                "2000-01-01 00:00:00".parse().ok(),
-                setup_audit(),
-            )
-            .await;
-        let Ok(IssuedToken { secret, row }) = minted else {
-            fail("token creation failed");
-        };
-        assert!(secret.expose().starts_with("qk_"));
-        assert!(!format!("{secret:?}").contains("qk_"));
-        assert_eq!(row.token_hash, sha256_hex(secret.expose().as_bytes()));
-        assert!(row.has_scope(Scope::Write) && !row.has_scope(Scope::Admin));
-        let at = |text: &str| {
-            text.parse::<Expiry>()
-                .map_or_else(|e| fail(&e.to_string()), |at| at.0)
-        };
-        assert!(row.is_expired(at("2001-01-01 00:00:00")));
-        assert!(!row.is_expired(at("1999-01-01 00:00:00")));
-        assert_eq!(
-            at("2000-01-01 00:00:00").to_string(),
-            "2000-01-01T00:00:00Z",
-            "stored expiries are UTC"
-        );
-        let unreadable = TokenRow {
-            expires_at: Some(String::from("soon")),
-            ..row.clone()
-        };
-        assert!(unreadable.is_expired(at("1999-01-01 00:00:00")));
-        assert!(
-            cp.find_token(&row.token_hash)
-                .await
-                .is_ok_and(|t| t.is_some())
-        );
-        assert!(cp.touch_token(&row.token_hash).await.is_ok());
-        assert!(
-            cp.find_token(&row.token_hash)
-                .await
-                .is_ok_and(|t| t.is_some_and(|t| t.last_used_at.is_some()))
-        );
-        assert!(cp.list_tokens(&ws.id).await.is_ok_and(|t| t.len() == 1));
-        assert!(
-            cp.create_token(
-                &WorkspaceId::from("nope"),
-                &bob.id,
-                "x",
-                &[],
-                None,
-                setup_audit()
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            cp.delete_token(&row.token_hash, setup_audit())
-                .await
-                .is_ok_and(|d| d)
-        );
-        assert!(
-            cp.find_token(&row.token_hash)
-                .await
-                .is_ok_and(|t| t.is_none())
-        );
-        assert!("root".parse::<Scope>().is_err());
-    }
-
-    #[tokio::test]
-    async fn audit_rows_append_and_filter() {
-        let (_dir, cp) = open().await;
-        let mut allowed = AuditEntry::new(AuditAction::Open, Outcome::Allowed, Channel::Api)
-            .in_workspace(&WorkspaceId::from("w1"));
-        allowed.user_id = Some(UserId::from("u1"));
-        let mut denied = AuditEntry::new(AuditAction::Open, Outcome::Denied, Channel::Web)
-            .in_workspace(&WorkspaceId::from("w1"));
-        denied.user_id = Some(UserId::from("u2"));
-        let login = AuditEntry::new(AuditAction::Login, Outcome::Error, Channel::Web);
-        for e in [&allowed, &denied, &login] {
-            assert!(cp.record_audit(e).await.is_ok());
-        }
-        let all = cp
-            .query_audit(&AuditFilter {
-                limit: 10,
-                ..AuditFilter::default()
-            })
-            .await
-            .map(|page| page.rows);
-        assert!(all.is_ok_and(|r| r.len() == 3 && r.first().is_some_and(|r| r.action == "login")));
-        let denied_only = cp
-            .query_audit(&AuditFilter {
-                outcome: Some(Outcome::Denied),
-                limit: 10,
-                ..AuditFilter::default()
-            })
-            .await
-            .map(|page| page.rows);
-        assert!(denied_only.is_ok_and(|r| {
-            r.len() == 1
-                && r.first()
-                    .is_some_and(|r| r.user_id == Some(UserId::from("u2")))
-        }));
-        let for_ws = cp
-            .query_audit(&AuditFilter {
-                workspace_id: Some(WorkspaceId::from("w1")),
-                user_id: Some(UserId::from("u1")),
-                limit: 10,
-                ..AuditFilter::default()
-            })
-            .await
-            .map(|page| page.rows);
-        assert!(
-            for_ws.is_ok_and(|r| r.len() == 1 && r.first().is_some_and(|r| r.id == allowed.id))
-        );
-        let none = cp
-            .query_audit(&AuditFilter {
-                until: Some(String::from("1990-01-01")),
-                limit: 10,
-                ..AuditFilter::default()
-            })
-            .await
-            .map(|page| page.rows);
-        assert!(none.is_ok_and(|r| r.is_empty()));
-    }
-
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test setup")]
-    async fn workspace_times_carry_the_newest_access_of_each_workspace() {
-        let (_dir, cp) = open().await;
-        let used = cp
-            .create_workspace("used", None, setup_audit())
-            .await
-            .unwrap();
-        let idle = cp.find_or_create_workspace("idle").await.unwrap();
-        let denied = AuditEntry::new(AuditAction::Open, Outcome::Denied, Channel::Api)
-            .in_workspace(&used.id);
-        cp.record_audit(&denied).await.unwrap();
-        let mut times = cp.workspace_times().await.unwrap();
-        assert_eq!(times.len(), 2);
-        let newest = cp
-            .query_audit(&AuditFilter {
-                workspace_id: Some(used.id.clone()),
-                limit: 1,
-                ..AuditFilter::default()
-            })
-            .await
-            .unwrap()
-            .rows;
-        let used = times.remove(&used.id).unwrap();
-        assert_eq!(
-            used.last_accessed_at.as_deref(),
-            newest.first().map(|r| r.timestamp.as_str())
-        );
-        assert!(!used.created_at.is_empty());
-        let idle = times.remove(&idle.id).unwrap();
-        assert_eq!(idle.last_accessed_at, None);
-        assert!(!idle.created_at.is_empty());
-    }
-
-    #[tokio::test]
-    async fn audit_pages_walk_the_log_once_in_order() {
-        let (_dir, cp) = open().await;
-        let mut written = Vec::new();
-        for _ in 0..7 {
-            let entry = AuditEntry::new(AuditAction::Open, Outcome::Allowed, Channel::Api)
-                .in_workspace(&WorkspaceId::from("w1"));
-            assert!(cp.record_audit(&entry).await.is_ok());
-            written.push(entry.id);
-        }
-        let other = AuditEntry::new(AuditAction::Login, Outcome::Error, Channel::Web);
-        assert!(cp.record_audit(&other).await.is_ok());
-
-        let filter = AuditFilter {
-            workspace_id: Some(WorkspaceId::from("w1")),
-            limit: 3,
-            ..AuditFilter::default()
-        };
-        let mut seen = Vec::new();
-        let mut pages = 0;
-        let mut after = None;
-        loop {
-            let page = cp
-                .query_audit(&AuditFilter {
-                    after,
-                    ..filter.clone()
-                })
-                .await
-                .unwrap_or_else(|e| fail(&e.to_string()));
-            pages += 1;
-            seen.extend(page.rows.into_iter().map(|r| r.id));
-            match page.next {
-                Some(next) => after = Some(next),
-                None => break,
-            }
-        }
-        written.reverse();
-        assert_eq!(seen, written, "every row once, newest first");
-        assert_eq!(pages, 3, "3 + 3 + 1");
-
-        let first = cp
-            .query_audit(&filter)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let cursor = first.next.unwrap_or_else(|| fail("a second page"));
-        let round_trip: AuditCursor = cursor
-            .to_string()
-            .parse()
-            .unwrap_or_else(|e: Error| fail(&e.to_string()));
-        assert_eq!(round_trip, cursor);
-        let elsewhere = cp
-            .query_audit(&AuditFilter {
-                action: Some(String::from("open")),
-                after: Some(cursor),
-                ..filter.clone()
-            })
-            .await;
-        assert!(elsewhere.is_err_and(|e| e.to_string().contains("different filter")));
-        assert!("not a cursor".parse::<AuditCursor>().is_err());
-        assert!("bm90IGEgY3Vyc29y".parse::<AuditCursor>().is_err());
-    }
-
-    #[test]
-    fn sha256_hex_is_the_known_digest_of_abc() {
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn dummy_hash_parses_as_argon2id() {
-        assert!(PasswordHash::new(StoredPasswordHash::DUMMY).is_ok());
-        assert!(!StoredPasswordHash::stored_or_dummy(None).verifies("anything"));
-    }
-}
+mod tests;

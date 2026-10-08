@@ -38,6 +38,9 @@ pub enum Purpose {
     /// (RFC 7591 and 7592); the subject is the registration's name, the
     /// issuer.
     RegistrationToken,
+    /// A saved import's URL and header values, for its refresh; the subject
+    /// is the import's id.
+    ImportCredential,
 }
 
 text_enum!(Purpose, "vault purpose", {
@@ -45,6 +48,7 @@ text_enum!(Purpose, "vault purpose", {
     ProviderToken => "provider-token",
     ClientKey => "client-key",
     RegistrationToken => "registration-token",
+    ImportCredential => "import-credential",
 });
 
 impl Purpose {
@@ -169,6 +173,17 @@ impl Vault {
     /// key file cannot be read.
     pub async fn key_location(&self) -> Result<KeyLocation> {
         self.slot.location().await
+    }
+
+    /// The key as it is stored, for `quack vault export-key`; `None` when
+    /// nothing has been sealed yet and no key exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the keychain refuses or the key file cannot
+    /// be read.
+    pub async fn key_text(&self) -> Result<Option<String>> {
+        self.slot.read().await
     }
 
     /// The key, made and stored the first time something is sealed.

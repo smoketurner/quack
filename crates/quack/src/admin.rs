@@ -1,25 +1,37 @@
-//! Server administration from the command line: users, tokens, members,
-//! and the access audit log. Every mutation is itself audited on the `cli`
+//! Server administration from the command line: workspaces, users, tokens,
+//! members, and the access audit log. Every mutation is itself audited on the `cli`
 //! channel with no user, because the operator at the shell is implicit.
 
 use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use quack_core::config::Config;
-use quack_core::error::Record;
-use quack_core::ids::WorkspaceId;
-use quack_core::prefix::PrefixMatch;
-use quack_core::storage::control::{
-    AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, Expiry, IssuedToken,
-    Outcome, Role, Scope, UserKind, WorkspaceRow,
-};
+use quack_core::error::Error as CoreError;
 
+use quack_core::ids::{UserId, WorkspaceId};
+use quack_core::ocsf::PromptText;
+use quack_core::prefix::PrefixMatch;
+use quack_core::storage::audit;
+use quack_core::storage::backup::{Described, Manifest, RestoreRequest};
+use quack_core::storage::control::{
+    AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, Expiry, GrantedBy,
+    IssuedToken, Outcome, ResourceKind, Role, Scope, UserKind, WorkspaceName, WorkspaceRow,
+};
+use quack_core::storage::workspace::WorkspaceDb;
+
+use crate::confirm::Confirm;
 use crate::text_or_json::TextOrJson;
 
-/// Server administration: users, tokens, membership, and the audit log.
+/// Server administration: workspaces, users, tokens, membership, and the
+/// audit log.
 #[derive(Subcommand)]
 pub(crate) enum AdminCommand {
+    /// Workspaces: create, list, rename, delete, snapshot, or restore one
+    #[command(subcommand)]
+    Workspace(WorkspaceAction),
+
     /// Server users: create one or list them
     #[command(subcommand)]
     User(UserAction),
@@ -41,12 +53,60 @@ impl AdminCommand {
     /// act on `workspace`.
     pub(crate) async fn run(self, config: &Config, workspace: Option<&str>) -> Result<()> {
         match self {
-            Self::User(action) => run_user(config, action).await,
-            Self::Token(action) => run_token(config, workspace, action).await,
-            Self::Member(action) => run_member(config, workspace, action).await,
-            Self::Audit(args) => run_audit(config, args).await,
+            Self::Workspace(action) => action.run(config).await,
+            Self::User(action) => action.run(config).await,
+            Self::Token(action) => action.run(config, workspace).await,
+            Self::Member(action) => action.run(config, workspace).await,
+            Self::Audit(args) => args.run(config).await,
         }
     }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WorkspaceAction {
+    /// Create a workspace; `-w NAME` then names it on every command
+    Create {
+        /// Non-empty, with no slashes or dots
+        name: WorkspaceName,
+    },
+    /// List workspaces
+    List {
+        /// `json` prints one JSON object per row
+        #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+        format: TextOrJson,
+    },
+    /// Give a workspace a new name; `-w` and the URL bar then use it
+    Rename {
+        /// The workspace's current name
+        name: String,
+        /// Non-empty, with no slashes or dots
+        new_name: WorkspaceName,
+    },
+    /// Delete a workspace: its file, its members, and its API tokens;
+    /// the access audit log keeps its rows
+    Delete {
+        name: String,
+        /// Delete without asking
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Write a workspace as one tar: its file after a checkpoint, its
+    /// uploaded files, and a manifest naming its members and settings
+    Snapshot {
+        name: String,
+        /// Write the tar here instead of stdout (`-` is stdout)
+        #[arg(long, value_name = "FILE")]
+        to: Option<PathBuf>,
+    },
+    /// A snapshot's tar as a new workspace: members this server has users
+    /// for get their role again
+    Restore {
+        /// The tar, or `-` for stdin
+        file: PathBuf,
+        /// The new workspace's name; the snapshot's own when absent
+        #[arg(long)]
+        name: Option<WorkspaceName>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -64,6 +124,29 @@ pub(crate) enum UserAction {
         /// `json` prints one JSON object per row
         #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
         format: TextOrJson,
+    },
+    /// Refuse the user's logins and credentials from now on; `quack serve`
+    /// ends their sessions at their next request
+    Disable { username: String },
+    /// Let a disabled user log in again, and clear any lockout
+    Enable { username: String },
+    /// Set a new password, read from the terminal without echo, or from
+    /// stdin when stdin is not a terminal
+    Passwd { username: String },
+    /// Give the user the server-wide admin flag, or take it with `--off`
+    Admin {
+        username: String,
+        #[arg(long)]
+        off: bool,
+    },
+    /// Delete the user: their memberships, tokens, and stored sign-in go,
+    /// and each workspace file replaces their name with "removed"; the
+    /// access audit keeps its rows
+    Remove {
+        username: String,
+        /// Delete without asking
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -96,14 +179,27 @@ pub(crate) enum TokenAction {
 
 #[derive(Subcommand)]
 pub(crate) enum MemberAction {
-    /// Add a user to the workspace, or change their role
+    /// Add a user to the workspace, or change their role; with `--group`,
+    /// give an identity-provider group the role instead
     Add {
-        username: String,
+        /// The user; absent with `--group`
+        #[arg(required_unless_present = "group", conflicts_with = "group")]
+        username: Option<String>,
+        /// The identity provider's group (`[server.oidc].groups_claim`)
+        #[arg(long)]
+        group: Option<String>,
         #[arg(long, default_value = "member")]
         role: Role,
     },
-    /// Remove a user from the workspace
-    Remove { username: String },
+    /// Remove a user from the workspace, or with `--group` a group's role
+    Remove {
+        /// The user; absent with `--group`
+        #[arg(required_unless_present = "group", conflicts_with = "group")]
+        username: Option<String>,
+        /// The identity provider's group
+        #[arg(long)]
+        group: Option<String>,
+    },
     /// List members
     List {
         /// `json` prints one JSON object per row
@@ -137,6 +233,14 @@ pub(crate) struct AuditArgs {
     limit: u32,
     #[arg(long, value_enum, default_value_t = AuditFormat::Text)]
     format: AuditFormat,
+    /// With -w and --format ocsf: join each row to the workspace's own
+    /// audit detail, so query events carry the model, the tools, and the
+    /// documents cited (the OCSF `ai_operation` profile)
+    #[arg(long, requires = "workspace")]
+    detail: bool,
+    /// With --detail: carry each question's text on its event
+    #[arg(long, requires = "detail")]
+    with_prompt: bool,
 }
 
 /// How `quack audit` prints.
@@ -152,66 +256,399 @@ enum AuditFormat {
     Ocsf,
 }
 
-pub(crate) async fn run_user(config: &Config, action: UserAction) -> Result<()> {
-    let control = ControlPlane::open(config).await?;
-    let stdout = std::io::stdout();
-    match action {
-        UserAction::Add { username, admin } => {
-            let password = read_password(&format!("Password for {username}: "))?;
-            let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli);
-            let user = control
-                .create_user(&username, &password, UserKind::from(admin), entry)
-                .await?;
-            let mut out = stdout.lock();
+impl WorkspaceAction {
+    pub(crate) async fn run(self, config: &Config) -> Result<()> {
+        let control = ControlPlane::open(config).await?;
+        let stdout = std::io::stdout();
+        match self {
+            Self::Create { name } => {
+                let entry = AuditEntry::new(AuditAction::Workspace, Outcome::Allowed, Channel::Cli);
+                let ws = control.create_workspace(&name, None, entry).await?;
+                let mut out = stdout.lock();
+                writeln!(out, "Created workspace '{}' ({})", ws.name, ws.id)?;
+                out.flush()?;
+            }
+            Self::List { format } => {
+                let workspaces = control.list_workspaces().await?;
+                let mut out = std::io::BufWriter::new(stdout.lock());
+                format.write_rows(
+                    &mut out,
+                    &workspaces,
+                    "No workspaces yet. Run `quack workspace create NAME`.",
+                    |out, ws| writeln!(out, "{}  {:<24} {}", ws.id, ws.name, ws.classification),
+                )?;
+                out.flush()?;
+            }
+            Self::Rename { name, new_name } => {
+                let ws = control.workspace_named(&name).await?;
+                let entry = AuditEntry::new(AuditAction::Workspace, Outcome::Allowed, Channel::Cli);
+                let ws = control.rename_workspace(&ws.id, &new_name, entry).await?;
+                let mut out = stdout.lock();
+                writeln!(out, "Renamed '{name}' to '{}' ({})", ws.name, ws.id)?;
+                out.flush()?;
+            }
+            Self::Delete { name, yes } => {
+                let ws = control.workspace_named(&name).await?;
+                let mut out = stdout.lock();
+                let question = format!(
+                    "Delete workspace '{name}' ({}), its file, its members, and its tokens?",
+                    ws.id
+                );
+                if !Confirm::Ask.ask_to_drop(yes, &mut out, &question)? {
+                    writeln!(out, "Nothing deleted.")?;
+                    return Ok(());
+                }
+                let entry = AuditEntry::new(AuditAction::Delete, Outcome::Allowed, Channel::Cli);
+                control.delete_workspace(&ws.id, entry).await?;
+                let dir = config.workspace_dir(ws.id.as_str());
+                if dir.exists() {
+                    std::fs::remove_dir_all(&dir)
+                        .with_context(|| format!("failed to remove {}", dir.display()))?;
+                }
+                writeln!(out, "Deleted workspace '{name}' ({})", ws.id)?;
+                out.flush()?;
+            }
+            Self::Snapshot { name, to } => {
+                Self::snapshot(config, &control, &name, to).await?;
+            }
+            Self::Restore { file, name } => {
+                Self::restore(config, &control, file, name).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `quack workspace snapshot`: the tar to `to`, or to a piped stdout
+    /// when `to` is absent or `-`.
+    async fn snapshot(
+        config: &Config,
+        control: &ControlPlane,
+        name: &str,
+        to: Option<PathBuf>,
+    ) -> Result<()> {
+        let to = to.filter(|path| path.as_os_str() != "-");
+        let stdout = std::io::stdout();
+        let ws = control.workspace_named(name).await?;
+        let described = Described::of(control, &ws).await?;
+        let dir = config.workspace_dir(ws.id.as_str());
+        if to.is_none() && stdout.is_terminal() {
+            anyhow::bail!("stdout is a terminal; pipe the tar somewhere or use --to FILE");
+        }
+        let open_config = config.clone();
+        let out_path = to.clone();
+        // The file is copied closed: Windows lets no other handle open a
+        // `DuckDB` file in use (#448).
+        tokio::task::spawn_blocking(move || {
+            let db = WorkspaceDb::open(&open_config, ws.id.as_str())?;
+            let manifest = Manifest::of(&db, described)?;
+            db.checkpoint()?;
+            drop(db);
+            match out_path {
+                Some(path) => {
+                    let file = std::fs::File::create(&path)?;
+                    manifest.write(&dir, file)?.sync_all()?;
+                }
+                None => manifest.write(&dir, std::io::stdout().lock())?.flush()?,
+            }
+            Ok::<_, CoreError>(())
+        })
+        .await
+        .context("the snapshot task failed")??;
+        let Some(path) = to else {
+            return Ok(());
+        };
+        let mut out = stdout.lock();
+        writeln!(out, "Wrote '{name}' to {}", path.display())?;
+        out.flush()?;
+        Ok(())
+    }
+
+    /// `quack workspace restore`: a new workspace from `file` (`-` is stdin,
+    /// spooled to a 0600 file in the data directory, since a restore reads
+    /// its tar twice and a snapshot can be larger than memory).
+    async fn restore(
+        config: &Config,
+        control: &ControlPlane,
+        file: PathBuf,
+        name: Option<WorkspaceName>,
+    ) -> Result<()> {
+        let stdout = std::io::stdout();
+        let audit = |action| AuditEntry::new(action, Outcome::Allowed, Channel::Cli);
+        let spool = if file.as_os_str() == "-" {
+            let mut spool = tempfile::NamedTempFile::new_in(config.data_dir())?;
+            std::io::copy(&mut std::io::stdin().lock(), &mut spool)?;
+            Some(spool)
+        } else {
+            None
+        };
+        let path = spool.as_ref().map_or(file, |spool| spool.path().to_owned());
+        let restored = RestoreRequest {
+            name,
+            owner: None,
+            audit: &audit,
+        }
+        .run(control, config, move || std::fs::File::open(&path))
+        .await?;
+        let mut out = stdout.lock();
+        writeln!(
+            out,
+            "Restored '{}' ({}) from a snapshot taken {} by quack {}",
+            restored.workspace.name,
+            restored.workspace.id,
+            restored.manifest.taken_at,
+            restored.manifest.quack_version
+        )?;
+        writeln!(out, "{} member(s) kept their role", restored.members_kept)?;
+        if !restored.members_missing.is_empty() {
             writeln!(
                 out,
-                "Created user '{}' ({}){}",
-                user.username,
-                user.id,
-                if user.is_admin { ", admin" } else { "" }
+                "no user here for: {} (`quack user add` them, then `quack member add`)",
+                restored.members_missing.join(", ")
             )?;
-            out.flush()?;
         }
-        UserAction::List { format } => {
-            let users = control.list_users().await?;
-            let mut out = std::io::BufWriter::new(stdout.lock());
-            format.write_rows(
-                &mut out,
-                &users,
-                "No users yet. Run `quack user add NAME`.",
-                |out, user| {
-                    writeln!(
-                        out,
-                        "{}  {:<24} {}  {}",
-                        user.id,
-                        user.username,
-                        if user.is_admin { "admin " } else { "      " },
-                        user.created_at
-                    )
-                },
+        if !restored.providers_dropped.is_empty() {
+            writeln!(
+                out,
+                "allowed providers not configured here, dropped: {}",
+                restored.providers_dropped.join(", ")
             )?;
-            out.flush()?;
         }
+        out.flush()?;
+        Ok(())
     }
-    Ok(())
 }
 
-pub(crate) async fn run_token(
-    config: &Config,
-    workspace: Option<&str>,
-    action: TokenAction,
-) -> Result<()> {
-    let control = ControlPlane::open(config).await?;
-    let ws = existing_workspace(&control, config, workspace).await?;
-    match action {
-        TokenAction::Create {
-            user,
-            name,
-            scopes,
-            expires,
-        } => create_token(&control, &ws, &user, &name, &scopes, expires).await,
-        TokenAction::List { format } => list_tokens(&control, &ws, format).await,
-        TokenAction::Revoke { token_hash } => revoke_token(&control, &ws, &token_hash).await,
+impl UserAction {
+    pub(crate) async fn run(self, config: &Config) -> Result<()> {
+        let control = ControlPlane::open(config).await?;
+        let stdout = std::io::stdout();
+        match self {
+            Self::Add { username, admin } => {
+                let password = read_password(&format!("Password for {username}: "))?;
+                let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli);
+                let user = control
+                    .create_user(&username, &password, UserKind::from(admin), entry)
+                    .await?;
+                let mut out = stdout.lock();
+                writeln!(
+                    out,
+                    "Created user '{}' ({}){}",
+                    user.username,
+                    user.id,
+                    if user.kind == UserKind::Admin {
+                        ", admin"
+                    } else {
+                        ""
+                    }
+                )?;
+                out.flush()?;
+            }
+            Self::List { format } => {
+                let users = control.list_users().await?;
+                let mut out = std::io::BufWriter::new(stdout.lock());
+                format.write_rows(
+                    &mut out,
+                    &users,
+                    "No users yet. Run `quack user add NAME`.",
+                    |out, user| {
+                        writeln!(
+                            out,
+                            "{}  {:<24} {}  {}",
+                            user.id,
+                            user.username,
+                            if user.kind == UserKind::Admin {
+                                "admin "
+                            } else {
+                                "      "
+                            },
+                            user.created_at
+                        )
+                    },
+                )?;
+                out.flush()?;
+            }
+            Self::Disable { username } => {
+                let user = control.user_named(&username).await?;
+                let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli);
+                control.disable_user(&user.id, entry).await?;
+                let mut out = stdout.lock();
+                writeln!(out, "Disabled '{}' ({})", user.username, user.id)?;
+                out.flush()?;
+            }
+            Self::Enable { username } => {
+                let user = control.user_named(&username).await?;
+                let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli);
+                control.enable_user(&user.id, entry).await?;
+                let mut out = stdout.lock();
+                writeln!(out, "Enabled '{}' ({})", user.username, user.id)?;
+                out.flush()?;
+            }
+            Self::Passwd { username } => {
+                let user = control.user_named(&username).await?;
+                let password = read_password(&format!("New password for {username}: "))?;
+                let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli);
+                control.set_password(&user.id, &password, entry).await?;
+                let mut out = stdout.lock();
+                writeln!(out, "Changed the password of '{}'", user.username)?;
+                out.flush()?;
+            }
+            Self::Admin { username, off } => {
+                let user = control.user_named(&username).await?;
+                let kind = if off {
+                    UserKind::Standard
+                } else {
+                    UserKind::Admin
+                };
+                let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli);
+                control.set_admin(&user.id, kind, entry).await?;
+                let mut out = stdout.lock();
+                writeln!(
+                    out,
+                    "'{}' is {} an admin",
+                    user.username,
+                    if off { "no longer" } else { "now" }
+                )?;
+                out.flush()?;
+            }
+            Self::Remove { username, yes } => {
+                Self::remove(config, &control, &username, yes).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `quack user remove`: the row, then the user's name in every workspace
+    /// file. A workspace file another process holds (a running `quack serve`)
+    /// is reported; delete through the server's API or page while it runs.
+    async fn remove(
+        config: &Config,
+        control: &ControlPlane,
+        username: &str,
+        yes: bool,
+    ) -> Result<()> {
+        let user = control.user_named(username).await?;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let question = format!(
+            "Remove user '{}' ({}), their memberships, tokens, and stored sign-in?",
+            user.username, user.id
+        );
+        if !Confirm::Ask.ask_to_drop(yes, &mut out, &question)? {
+            writeln!(out, "Nothing removed.")?;
+            return Ok(());
+        }
+        // Every workspace forgets the user before the account goes: one that
+        // cannot be opened stops here with the user still there, and the
+        // command can be run again.
+        for ws in control.list_workspaces().await? {
+            let db = WorkspaceDb::open(config, ws.id.as_str()).with_context(|| {
+                format!(
+                    "workspace '{}' could not be opened, so user '{}' was not removed; \
+                     run the command again once it opens",
+                    ws.name, user.username
+                )
+            })?;
+            let changed = db.forget_user(&user.id, &user.username)?;
+            if changed > 0 {
+                writeln!(out, "'{}': {changed} row(s) now name \"removed\"", ws.name)?;
+            }
+        }
+        let entry = AuditEntry::new(AuditAction::Admin, Outcome::Allowed, Channel::Cli);
+        control.delete_user(&user.id, entry).await?;
+        writeln!(out, "Removed user '{}' ({})", user.username, user.id)?;
+        out.flush()?;
+        Ok(())
+    }
+}
+
+impl TokenAction {
+    pub(crate) async fn run(self, config: &Config, workspace: Option<&str>) -> Result<()> {
+        let control = ControlPlane::open(config).await?;
+        let ws = control
+            .workspace_or_default(workspace, &config.general.default_workspace)
+            .await?;
+        match self {
+            Self::Create {
+                user,
+                name,
+                scopes,
+                expires,
+            } => Self::create(&control, &ws, &user, &name, &scopes, expires).await,
+            Self::List { format } => Self::list(&control, &ws, format).await,
+            Self::Revoke { token_hash } => Self::revoke(&control, &ws, &token_hash).await,
+        }
+    }
+
+    async fn create(
+        control: &ControlPlane,
+        ws: &WorkspaceRow,
+        user: &str,
+        name: &str,
+        scopes: &[Scope],
+        expires: Option<u32>,
+    ) -> Result<()> {
+        let user_row = control.user_named(user).await?;
+        let expires_at = expires.map(Expiry::after_days).transpose()?;
+        let entry = AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli);
+        let IssuedToken { secret, row } = control
+            .create_token(&ws.id, &user_row.id, name, scopes, expires_at, entry)
+            .await?;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        writeln!(out, "{}", secret.expose())?;
+        writeln!(
+            out,
+            "Token '{}' for {} in workspace '{}' with scopes {}{}. It is shown only once.",
+            row.name,
+            user_row.username,
+            ws.name,
+            scope_list(&row.scopes),
+            row.expires_at
+                .as_deref()
+                .map_or(String::new(), |e| format!(", expires {e}"))
+        )?;
+        out.flush()?;
+        Ok(())
+    }
+
+    async fn list(control: &ControlPlane, ws: &WorkspaceRow, format: TextOrJson) -> Result<()> {
+        let tokens = control.list_tokens(&ws.id).await?;
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        format.write_rows(
+            &mut out,
+            &tokens,
+            &format!("No tokens in workspace '{}'.", ws.name),
+            |out, token| {
+                writeln!(
+                    out,
+                    "{}  {:<16} {:<16} {}  {}",
+                    token.token_hash,
+                    token.name,
+                    scope_list(&token.scopes),
+                    token.expires_at.as_deref().unwrap_or("no expiry"),
+                    token.last_used_at.as_deref().unwrap_or("never used")
+                )
+            },
+        )?;
+        out.flush()?;
+        Ok(())
+    }
+
+    async fn revoke(control: &ControlPlane, ws: &WorkspaceRow, prefix: &str) -> Result<()> {
+        let hash = PrefixMatch::of(control.list_tokens(&ws.id).await?, prefix, |t| {
+            t.token_hash.as_str()
+        })
+        .one(ResourceKind::Token, prefix)?
+        .token_hash;
+        let entry = AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli)
+            .in_workspace(&ws.id);
+        control.delete_token(&hash, entry).await?;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        writeln!(out, "Revoked token {hash}.")?;
+        out.flush()?;
+        Ok(())
     }
 }
 
@@ -223,198 +660,213 @@ fn scope_list(scopes: &[Scope]) -> String {
         .join(",")
 }
 
-async fn create_token(
-    control: &ControlPlane,
-    ws: &WorkspaceRow,
-    user: &str,
-    name: &str,
-    scopes: &[Scope],
-    expires: Option<u32>,
-) -> Result<()> {
-    let user_row = control
-        .find_user_by_username(user)
-        .await?
-        .with_context(|| format!("no user named '{user}'"))?;
-    let expires_at = expires.map(Expiry::after_days).transpose()?;
-    let entry = AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli);
-    let IssuedToken { secret, row } = control
-        .create_token(&ws.id, &user_row.id, name, scopes, expires_at, entry)
-        .await?;
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    writeln!(out, "{}", secret.expose())?;
-    writeln!(
-        out,
-        "Token '{}' for {} in workspace '{}' with scopes {}{}. It is shown only once.",
-        row.name,
-        user_row.username,
-        ws.name,
-        scope_list(&row.scopes),
-        row.expires_at
-            .as_deref()
-            .map_or(String::new(), |e| format!(", expires {e}"))
-    )?;
-    out.flush()?;
-    Ok(())
-}
-
-async fn list_tokens(control: &ControlPlane, ws: &WorkspaceRow, format: TextOrJson) -> Result<()> {
-    let tokens = control.list_tokens(&ws.id).await?;
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-    format.write_rows(
-        &mut out,
-        &tokens,
-        &format!("No tokens in workspace '{}'.", ws.name),
-        |out, token| {
-            writeln!(
-                out,
-                "{}  {:<16} {:<16} {}  {}",
-                token.token_hash,
-                token.name,
-                scope_list(&token.scopes),
-                token.expires_at.as_deref().unwrap_or("no expiry"),
-                token.last_used_at.as_deref().unwrap_or("never used")
-            )
-        },
-    )?;
-    out.flush()?;
-    Ok(())
-}
-
-async fn revoke_token(control: &ControlPlane, ws: &WorkspaceRow, prefix: &str) -> Result<()> {
-    let hash = PrefixMatch::of(control.list_tokens(&ws.id).await?, prefix, |t| {
-        t.token_hash.as_str()
-    })
-    .one(Record::Token, prefix)?
-    .token_hash;
-    let entry =
-        AuditEntry::new(AuditAction::Token, Outcome::Allowed, Channel::Cli).in_workspace(&ws.id);
-    control.delete_token(&hash, entry).await?;
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    writeln!(out, "Revoked token {hash}.")?;
-    out.flush()?;
-    Ok(())
-}
-
-pub(crate) async fn run_member(
-    config: &Config,
-    workspace: Option<&str>,
-    action: MemberAction,
-) -> Result<()> {
-    let control = ControlPlane::open(config).await?;
-    let ws = existing_workspace(&control, config, workspace).await?;
-    let stdout = std::io::stdout();
-    match action {
-        MemberAction::Add { username, role } => {
-            let user = control
-                .find_user_by_username(&username)
-                .await?
-                .with_context(|| format!("no user named '{username}'"))?;
-            control
-                .set_member(
-                    &ws.id,
-                    &user.id,
-                    role,
-                    AuditEntry::new(AuditAction::Member, Outcome::Allowed, Channel::Cli),
-                )
-                .await?;
-            let mut out = stdout.lock();
-            writeln!(out, "{} is now {role} of '{}'.", user.username, ws.name)?;
-            out.flush()?;
-        }
-        MemberAction::Remove { username } => {
-            let user = control
-                .find_user_by_username(&username)
-                .await?
-                .with_context(|| format!("no user named '{username}'"))?;
-            let removed = control
-                .remove_member(
-                    &ws.id,
-                    &user.id,
-                    AuditEntry::new(AuditAction::Member, Outcome::Allowed, Channel::Cli),
-                )
-                .await?;
-            let mut out = stdout.lock();
-            if removed {
-                writeln!(out, "Removed {} from '{}'.", user.username, ws.name)?;
-            } else {
-                writeln!(out, "{} was not a member of '{}'.", user.username, ws.name)?;
+impl MemberAction {
+    pub(crate) async fn run(self, config: &Config, workspace: Option<&str>) -> Result<()> {
+        let control = ControlPlane::open(config).await?;
+        let ws = control
+            .workspace_or_default(workspace, &config.general.default_workspace)
+            .await?;
+        let stdout = std::io::stdout();
+        match self {
+            Self::Add {
+                group: Some(group),
+                role,
+                ..
+            } => Self::group_role(&control, &ws, &group, Some(role)).await?,
+            Self::Add {
+                username,
+                group: None,
+                role,
+            } => {
+                let username = username.unwrap_or_default();
+                let user = control.user_named(&username).await?;
+                control
+                    .set_member(
+                        &ws.id,
+                        &user.id,
+                        role,
+                        AuditEntry::new(AuditAction::Member, Outcome::Allowed, Channel::Cli),
+                    )
+                    .await?;
+                let mut out = stdout.lock();
+                writeln!(out, "{} is now {role} of '{}'.", user.username, ws.name)?;
+                out.flush()?;
             }
-            out.flush()?;
+            Self::Remove {
+                group: Some(group), ..
+            } => Self::group_role(&control, &ws, &group, None).await?,
+            Self::Remove {
+                username,
+                group: None,
+            } => {
+                let username = username.unwrap_or_default();
+                let user = control.user_named(&username).await?;
+                let removed = control
+                    .remove_member(
+                        &ws.id,
+                        &user.id,
+                        AuditEntry::new(AuditAction::Member, Outcome::Allowed, Channel::Cli),
+                    )
+                    .await?;
+                let mut out = stdout.lock();
+                if removed {
+                    writeln!(out, "Removed {} from '{}'.", user.username, ws.name)?;
+                } else {
+                    writeln!(out, "{} was not a member of '{}'.", user.username, ws.name)?;
+                }
+                out.flush()?;
+            }
+            Self::List { format } => {
+                let members = control.list_members(&ws.id).await?;
+                let mut out = std::io::BufWriter::new(stdout.lock());
+                format.write_rows(
+                    &mut out,
+                    &members,
+                    &format!("No members in '{}'.", ws.name),
+                    |out, member| {
+                        writeln!(
+                            out,
+                            "{:<24} {:<8} {}{}",
+                            member.username,
+                            member.role,
+                            member.created_at,
+                            if member.granted_by == GrantedBy::Idp {
+                                "  (via group)"
+                            } else {
+                                ""
+                            }
+                        )
+                    },
+                )?;
+                let groups = control.list_group_roles(&ws.id).await?;
+                if !groups.is_empty() && format == TextOrJson::Text {
+                    writeln!(out, "\nGroups granting a role at sign-in:")?;
+                    for g in &groups {
+                        writeln!(out, "{:<24} {:<8} {}", g.group_name, g.role, g.created_at)?;
+                    }
+                }
+                out.flush()?;
+            }
         }
-        MemberAction::List { format } => {
-            let members = control.list_members(&ws.id).await?;
-            let mut out = std::io::BufWriter::new(stdout.lock());
-            format.write_rows(
-                &mut out,
-                &members,
-                &format!("No members in '{}'.", ws.name),
-                |out, member| {
+        Ok(())
+    }
+
+    /// `quack member add|remove --group`: give the group `role` here, or take
+    /// its role away.
+    async fn group_role(
+        control: &ControlPlane,
+        ws: &WorkspaceRow,
+        group: &str,
+        role: Option<Role>,
+    ) -> Result<()> {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let entry = AuditEntry::new(AuditAction::Member, Outcome::Allowed, Channel::Cli);
+        match role {
+            Some(role) => {
+                let row = control.set_group_role(&ws.id, group, role, entry).await?;
+                writeln!(
+                    out,
+                    "group '{}' now grants {} in '{}' at sign-in.",
+                    row.group_name, row.role, ws.name
+                )?;
+            }
+            None => {
+                if control.remove_group_role(&ws.id, group, entry).await? {
                     writeln!(
                         out,
-                        "{:<24} {:<8} {}",
-                        member.username, member.role, member.created_at
-                    )
-                },
-            )?;
-            out.flush()?;
+                        "group '{group}' no longer grants a role in '{}'.",
+                        ws.name
+                    )?;
+                } else {
+                    writeln!(out, "group '{group}' had no role in '{}'.", ws.name)?;
+                }
+            }
         }
+        out.flush()?;
+        Ok(())
     }
-    Ok(())
 }
 
-/// The audit row for a membership change to `user_id` in `ws`.
-pub(crate) async fn run_audit(config: &Config, args: AuditArgs) -> Result<()> {
-    let format = args.format;
-    let control = ControlPlane::open(config).await?;
-    let user_id = match args.user.as_deref() {
-        Some(name) => Some(
-            control
-                .find_user_by_username(name)
-                .await?
-                .with_context(|| format!("no user named '{name}'"))?
-                .id,
-        ),
-        None => None,
-    };
-    let workspace_id = match args.workspace.as_deref() {
-        Some(name) => Some(
-            control
-                .find_workspace_by_name(name)
-                .await?
-                .with_context(|| format!("no workspace named '{name}'"))?
-                .id,
-        ),
-        None => None,
-    };
-    let mut filter = AuditFilter {
-        user_id,
-        workspace_id,
-        action: args.action,
-        outcome: args.outcome,
-        since: args.since,
-        until: args.until,
-        limit: AUDIT_PAGE,
-        after: None,
-    };
-    let mut remaining = (args.limit != 0).then_some(args.limit);
-    let stdout = std::io::stdout();
-    let mut output = AuditOutput::start(format, std::io::BufWriter::new(stdout.lock()))?;
-    loop {
-        filter.limit = remaining.map_or(AUDIT_PAGE, |left| left.min(AUDIT_PAGE));
-        let page = control.query_audit(&filter).await?;
-        output.page(&page.rows)?;
-        remaining = remaining
-            .map(|left| left.saturating_sub(u32::try_from(page.rows.len()).unwrap_or(u32::MAX)));
-        match (page.next, remaining) {
-            (Some(next), None) => filter.after = Some(next),
-            (Some(next), Some(left)) if left > 0 => filter.after = Some(next),
-            (Some(_) | None, _) => break,
+impl AuditArgs {
+    /// The audit row for a membership change to `user_id` in `ws`.
+    pub(crate) async fn run(self, config: &Config) -> Result<()> {
+        let format = self.format;
+        let control = ControlPlane::open(config).await?;
+        let user_id = match self.user.as_deref() {
+            Some(name) => Some(control.user_named(name).await?.id),
+            None => None,
+        };
+        let workspace_id = match self.workspace.as_deref() {
+            Some(name) => Some(control.workspace_named(name).await?.id),
+            None => None,
+        };
+        if self.detail {
+            let Some(workspace_id) = workspace_id else {
+                anyhow::bail!("--detail needs -w WORKSPACE");
+            };
+            if format != AuditFormat::Ocsf {
+                anyhow::bail!("--detail prints OCSF events; add --format ocsf");
+            }
+            return self.with_detail(config, &control, &workspace_id).await;
         }
+        let mut filter = AuditFilter {
+            user_id,
+            workspace_id,
+            action: self.action,
+            outcome: self.outcome,
+            since: self.since,
+            until: self.until,
+            limit: AUDIT_PAGE,
+            cursor: None,
+        };
+        let mut remaining = (self.limit != 0).then_some(self.limit);
+        let stdout = std::io::stdout();
+        let mut output = AuditOutput::start(format, std::io::BufWriter::new(stdout.lock()))?;
+        loop {
+            filter.limit = remaining.map_or(AUDIT_PAGE, |left| left.min(AUDIT_PAGE));
+            let page = control.query_audit(&filter).await?;
+            output.page(&page.rows)?;
+            remaining = remaining.map(|left| {
+                left.saturating_sub(u32::try_from(page.rows.len()).unwrap_or(u32::MAX))
+            });
+            match (page.next, remaining) {
+                (Some(next), None) => filter.cursor = Some(next),
+                (Some(next), Some(left)) if left > 0 => filter.cursor = Some(next),
+                (Some(_) | None, _) => break,
+            }
+        }
+        output.finish()
     }
-    output.finish()
+
+    /// `quack audit -w ws --detail --format ocsf`: the workspace's detail rows
+    /// (its own file, opened here) joined to their access rows, one OCSF event
+    /// per line. `--limit 0` reads every detail row.
+    async fn with_detail(
+        &self,
+        config: &Config,
+        control: &ControlPlane,
+        workspace_id: &WorkspaceId,
+    ) -> Result<()> {
+        let db = WorkspaceDb::open(config, workspace_id.as_str())?;
+        let limit = if self.limit == 0 {
+            u32::MAX
+        } else {
+            self.limit
+        };
+        let details = audit::list(&db, limit)?;
+        drop(db);
+        let events = control
+            .ocsf_events(&details, PromptText::from(self.with_prompt))
+            .await?;
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        for event in &events {
+            writeln!(out, "{}", serde_json::to_string(event)?)?;
+        }
+        out.flush()?;
+        Ok(())
+    }
 }
 
 const AUDIT_PAGE: u32 = 1_000;
@@ -459,7 +911,21 @@ impl<W: Write> AuditOutput<W> {
         match self {
             Self::Csv(writer) => {
                 for r in rows {
-                    writer.serialize(r)?;
+                    let e = &r.entry;
+                    writer.write_record([
+                        e.id.as_str(),
+                        r.timestamp.as_str(),
+                        e.user_id.as_ref().map_or("", UserId::as_str),
+                        e.token_hash.as_deref().unwrap_or(""),
+                        e.workspace_id.as_ref().map_or("", WorkspaceId::as_str),
+                        e.action.as_str(),
+                        e.resource_type.as_ref().map_or("", ResourceKind::as_str),
+                        e.resource_id.as_deref().unwrap_or(""),
+                        e.outcome.as_str(),
+                        e.origin.channel.as_str(),
+                        e.origin.client_addr.as_deref().unwrap_or(""),
+                        e.origin.request_id.as_deref().unwrap_or(""),
+                    ])?;
                 }
             }
             Self::Ocsf(out) => {
@@ -474,14 +940,18 @@ impl<W: Write> AuditOutput<W> {
                         out,
                         "{}  {:<7} {:<5} {:<12} {:<10} {:<36} {}",
                         r.timestamp,
-                        r.outcome,
-                        r.channel,
-                        r.action,
-                        r.user_id
+                        r.entry.outcome,
+                        r.entry.origin.channel,
+                        r.entry.action,
+                        r.entry
+                            .user_id
                             .as_ref()
                             .map_or("-", |u| u.as_str().get(..8).unwrap_or(u.as_str())),
-                        r.workspace_id.as_ref().map_or("-", WorkspaceId::as_str),
-                        r.resource_id.as_deref().unwrap_or("")
+                        r.entry
+                            .workspace_id
+                            .as_ref()
+                            .map_or("-", WorkspaceId::as_str),
+                        r.entry.resource_id.as_deref().unwrap_or("")
                     )
                 })?;
             }
@@ -496,20 +966,6 @@ impl<W: Write> AuditOutput<W> {
         }
         Ok(())
     }
-}
-
-/// The named workspace, or the default one, which must already exist: an
-/// admin command never creates one by mistyping it.
-async fn existing_workspace(
-    control: &ControlPlane,
-    config: &Config,
-    name: Option<&str>,
-) -> Result<WorkspaceRow> {
-    let name = name.unwrap_or(&config.general.default_workspace);
-    control
-        .find_workspace_by_name(name)
-        .await?
-        .with_context(|| format!("no workspace named '{name}'; create it by opening it once"))
 }
 
 /// Read a password: without echo from a terminal, else one line from stdin.
@@ -580,231 +1036,4 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-
-    #[derive(clap::Parser)]
-    #[command(no_binary_name = true)]
-    enum Line {
-        #[command(subcommand)]
-        Token(TokenAction),
-        #[command(subcommand)]
-        Member(MemberAction),
-        Audit(AuditArgs),
-    }
-
-    /// Roles, scopes, and outcomes are checked by clap as they are typed,
-    /// with the values each accepts.
-    #[test]
-    fn roles_scopes_and_outcomes_parse_at_the_command_line() {
-        let parse = |args: &[&str]| <Line as clap::Parser>::try_parse_from(args);
-        assert!(matches!(
-            parse(&["member", "add", "ann", "--role", "Owner"]),
-            Ok(Line::Member(MemberAction::Add {
-                role: Role::Owner,
-                ..
-            }))
-        ));
-        assert!(matches!(
-            parse(&["token", "create", "--user", "u", "--name", "n", "--scopes", "read,write"]),
-            Ok(Line::Token(TokenAction::Create { scopes, .. }))
-                if scopes == [Scope::Read, Scope::Write]
-        ));
-        assert!(matches!(
-            parse(&["audit", "--outcome", "denied"]),
-            Ok(Line::Audit(AuditArgs {
-                outcome: Some(Outcome::Denied),
-                ..
-            }))
-        ));
-        let refused = parse(&["member", "add", "ann", "--role", "boss"])
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(
-            refused.contains("use one of: viewer, member, owner"),
-            "{refused}"
-        );
-        assert!(
-            parse(&[
-                "token", "create", "--user", "u", "--name", "n", "--scopes", "root"
-            ])
-            .is_err()
-        );
-        assert!(parse(&["audit", "--outcome", "maybe"]).is_err());
-    }
-
-    // --- read_hidden_line: control-key handling --------------------------------
-
-    #[expect(clippy::panic, reason = "test failure path")]
-    fn fail(msg: &str) -> ! {
-        panic!("{msg}");
-    }
-
-    /// A single key press with the given modifiers. `KeyEvent::new` defaults to
-    /// `KeyEventKind::Press`, which is what crossterm reports on Unix without
-    /// keyboard-enhancement flags — the regime `read_password` runs in.
-    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
-        Event::Key(KeyEvent::new(code, modifiers))
-    }
-
-    /// Plain typing: one `Char(c)` press with no modifiers per character.
-    fn typed(s: &str) -> Vec<Event> {
-        s.chars()
-            .map(|c| key(KeyCode::Char(c), KeyModifiers::NONE))
-            .collect()
-    }
-
-    /// Drive `read_hidden_line_from` with `events` in order, until Enter returns
-    /// or Ctrl-C bails. Exhausting the script without Enter returns an
-    /// `UnexpectedEof` error, so a forgotten terminator can never hang a test.
-    fn drive(events: &[Event]) -> Result<String> {
-        let mut idx = 0_usize;
-        let len = events.len();
-        let next = || {
-            let i = idx;
-            idx = i.saturating_add(1);
-            events.get(i).cloned().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!("scripted events exhausted at index {i} of {len}"),
-                )
-            })
-        };
-        read_hidden_line_from(next)
-    }
-
-    /// The happy path: a typed password is assembled verbatim and returned on
-    /// Enter.
-    #[test]
-    fn read_hidden_line_assembles_a_plain_password_verbatim() {
-        let mut events = typed("hunter2");
-        events.push(key(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(
-            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
-            "hunter2"
-        );
-    }
-
-    /// The reported bug: a Ctrl-D inserted while typing must not append `'d'`
-    /// to the password (crossterm 0.29 parses `0x04` as `Char('d')` + CONTROL).
-    #[test]
-    fn ctrl_d_inserted_while_typing_is_ignored() {
-        let mut events = typed("hunter2");
-        events.push(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
-        events.push(key(KeyCode::Enter, KeyModifiers::NONE));
-        // Before the fix this returned "hunter2d".
-        assert_eq!(
-            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
-            "hunter2"
-        );
-    }
-
-    /// Non-letter control bytes — Ctrl-Space (`0x00` -> `Char(' ')` + CONTROL)
-    /// and Ctrl-4 (`0x1C` -> `Char('4')` + CONTROL) — also arrive as `Char(_)`
-    /// with CONTROL and must be ignored.
-    #[test]
-    fn ctrl_space_and_ctrl_4_are_ignored() {
-        let mut events = typed("pw");
-        events.push(key(KeyCode::Char(' '), KeyModifiers::CONTROL));
-        events.push(key(KeyCode::Char('4'), KeyModifiers::CONTROL));
-        events.push(key(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(
-            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
-            "pw"
-        );
-    }
-
-    /// Ctrl-C still cancels the prompt, surfacing the `cancelled` error that
-    /// `read_password` propagates after restoring the cooked terminal mode.
-    #[test]
-    fn ctrl_c_cancels_with_the_cancelled_message() {
-        let events = vec![
-            key(KeyCode::Char('a'), KeyModifiers::NONE),
-            key(KeyCode::Char('c'), KeyModifiers::CONTROL),
-        ];
-        let err = drive(&events)
-            .err()
-            .unwrap_or_else(|| fail("expected Ctrl-C to cancel the read"));
-        assert!(err.to_string().contains("cancelled"), "{err}");
-    }
-
-    /// A literal lowercase `'c'` typed without Control is still appended; only
-    /// the Ctrl-C combo cancels, so the new guard must not swallow plain 'c'.
-    #[test]
-    fn a_plain_c_without_control_is_appended() {
-        let events = vec![
-            key(KeyCode::Char('a'), KeyModifiers::NONE),
-            key(KeyCode::Char('c'), KeyModifiers::NONE),
-            key(KeyCode::Char('c'), KeyModifiers::NONE),
-            key(KeyCode::Enter, KeyModifiers::NONE),
-        ];
-        assert_eq!(
-            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
-            "acc"
-        );
-    }
-
-    /// `AltGr` on Windows is CONTROL|ALT, and it types characters such as
-    /// `@` and `€` on many layouts: those are kept, not taken for Ctrl combos.
-    #[test]
-    fn altgr_characters_are_kept() {
-        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
-        let events = vec![
-            key(KeyCode::Char('a'), KeyModifiers::NONE),
-            key(KeyCode::Char('@'), altgr),
-            key(KeyCode::Char('€'), altgr),
-            key(KeyCode::Char('{'), altgr),
-            key(KeyCode::Enter, KeyModifiers::NONE),
-        ];
-        assert_eq!(
-            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
-            "a@€{"
-        );
-    }
-
-    /// Windows reports key releases too: only presses type, so a character
-    /// or a backspace does not happen twice.
-    #[test]
-    fn key_releases_are_ignored() {
-        let release = |code| {
-            Event::Key(KeyEvent::new_with_kind(
-                code,
-                KeyModifiers::NONE,
-                KeyEventKind::Release,
-            ))
-        };
-        let events = vec![
-            key(KeyCode::Char('a'), KeyModifiers::NONE),
-            release(KeyCode::Char('a')),
-            key(KeyCode::Char('b'), KeyModifiers::NONE),
-            release(KeyCode::Char('b')),
-            key(KeyCode::Backspace, KeyModifiers::NONE),
-            release(KeyCode::Backspace),
-            key(KeyCode::Char('c'), KeyModifiers::NONE),
-            release(KeyCode::Char('c')),
-            key(KeyCode::Enter, KeyModifiers::NONE),
-        ];
-        assert_eq!(
-            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
-            "ac"
-        );
-    }
-
-    /// Regression guard: filtering must not eat `Shift`. crossterm pairs an
-    /// uppercase `Char` with `KeyModifiers::SHIFT`, so capital letters typed
-    /// with `Shift` are still appended verbatim.
-    #[test]
-    fn uppercase_typed_with_shift_is_kept() {
-        let events = vec![
-            key(KeyCode::Char('H'), KeyModifiers::SHIFT),
-            key(KeyCode::Char('i'), KeyModifiers::NONE),
-            key(KeyCode::Enter, KeyModifiers::NONE),
-        ];
-        assert_eq!(
-            drive(&events).unwrap_or_else(|e| fail(&e.to_string())),
-            "Hi"
-        );
-    }
-}
+mod tests;

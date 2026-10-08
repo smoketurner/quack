@@ -7,6 +7,7 @@ use jiff::tz::TimeZone;
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
+use crate::storage::audit::AuditDetailRow;
 use crate::storage::control::{AuditAction, AuditRow, Outcome};
 
 /// The OCSF release the events conform to.
@@ -40,11 +41,8 @@ enum ApiActivity {
 impl EventClass {
     /// Where a row's action lands. A denied `token` is a rejected bearer,
     /// so it is a failed logon rather than token management.
-    fn of(action: Option<AuditAction>, outcome: Outcome) -> Self {
+    fn of(action: &AuditAction, outcome: Outcome) -> Self {
         use ApiActivity::{Create, Delete, Other, Read, Update};
-        let Some(action) = action else {
-            return Self::Api(Other);
-        };
         match action {
             AuditAction::Login | AuditAction::Session => Self::Authentication(AuthActivity::Logon),
             AuditAction::Logout => Self::Authentication(AuthActivity::Logoff),
@@ -63,24 +61,37 @@ impl EventClass {
             | AuditAction::Export
             | AuditAction::Graph
             | AuditAction::SessionRead
+            | AuditAction::SavedRun
             | AuditAction::EmbeddingsStatus => Self::Api(Read),
             AuditAction::Ingest
             | AuditAction::Import
             | AuditAction::Propose
             | AuditAction::GraphExtract
+            | AuditAction::Save
+            | AuditAction::BreakGlass
             | AuditAction::Admin => Self::Api(Create),
             AuditAction::Context
             | AuditAction::Member
             | AuditAction::Share
+            | AuditAction::Rename
             | AuditAction::Mode
             | AuditAction::Cancel
             | AuditAction::Permission
             | AuditAction::GraphReview
             | AuditAction::GraphRevalidate
             | AuditAction::GraphMerge
+            | AuditAction::Snapshot
+            | AuditAction::Restore
+            | AuditAction::GraphEdit
+            | AuditAction::Password
+            | AuditAction::TableNote
+            | AuditAction::Retype
             | AuditAction::EmbeddingsRefresh => Self::Api(Update),
             AuditAction::Delete => Self::Api(Delete),
-            AuditAction::Workspace | AuditAction::Ontology => Self::Api(Other),
+            // A name a newer build wrote is an API event under its own name.
+            AuditAction::Workspace | AuditAction::Ontology | AuditAction::Unknown(_) => {
+                Self::Api(Other)
+            }
         }
     }
 
@@ -112,15 +123,15 @@ impl AuditRow {
     ///
     /// Returns an error if the stored timestamp does not parse.
     pub fn to_ocsf(&self) -> Result<Value> {
-        let action = self.action.parse::<AuditAction>().ok();
-        let class = EventClass::of(action, self.outcome);
+        let entry = &self.entry;
+        let class = EventClass::of(&entry.action, entry.outcome);
         let (class_uid, class_name, category_uid, category_name) = class.class();
         let (activity_id, known_activity) = class.activity();
         let activity_name = match class {
-            EventClass::Api(ApiActivity::Other) => self.action.as_str(),
+            EventClass::Api(ApiActivity::Other) => entry.action.as_str(),
             EventClass::Authentication(_) | EventClass::Api(_) => known_activity,
         };
-        let (status_id, status) = match self.outcome {
+        let (status_id, status) = match entry.outcome {
             Outcome::Allowed => (1, "Success"),
             Outcome::Denied | Outcome::Error => (2, "Failure"),
         };
@@ -128,22 +139,23 @@ impl AuditRow {
             .and_then(|dt| dt.to_zoned(TimeZone::UTC))
             .map_err(|e| Error::Config(format!("audit timestamp {:?}: {e}", self.timestamp)))?
             .timestamp();
-        let user = self.user_id.as_ref().map(|id| json!({ "uid": id }));
+        let user = entry.user_id.as_ref().map(|id| json!({ "uid": id }));
         // An operator at the shell has no user row: the CLI is the actor.
         let actor = user.clone().map_or_else(
-            || json!({ "application": { "name": format!("quack {}", self.channel) } }),
+            || json!({ "application": { "name": format!("quack {}", entry.origin.channel) } }),
             |user| json!({ "user": user }),
         );
         // CLI and terminal rows have no client address: they ran on the host.
-        let src_endpoint = self
+        let src_endpoint = entry
+            .origin
             .client_addr
             .as_ref()
             .map_or_else(|| json!({ "name": "local" }), |ip| json!({ "ip": ip }));
         let mut resources = Vec::new();
-        if let Some(workspace) = &self.workspace_id {
+        if let Some(workspace) = &entry.workspace_id {
             resources.push(json!({ "type": "workspace", "uid": workspace }));
         }
-        if let (Some(kind), Some(uid)) = (&self.resource_type, &self.resource_id) {
+        if let (Some(kind), Some(uid)) = (&entry.resource_type, &entry.resource_id) {
             resources.push(json!({ "type": kind, "uid": uid }));
         }
         let mut event = json!({
@@ -158,13 +170,13 @@ impl AuditRow {
             "severity": "Informational",
             "status_id": status_id,
             "status": status,
-            "status_detail": self.outcome.as_str(),
+            "status_detail": entry.outcome.as_str(),
             "time": time.as_millisecond(),
             "time_dt": time.to_string(),
             "metadata": {
                 "version": OCSF_VERSION,
-                "uid": self.id,
-                "correlation_uid": self.request_id,
+                "uid": entry.id,
+                "correlation_uid": entry.origin.request_id,
                 "profiles": ["datetime"],
                 "product": {
                     "name": "quack",
@@ -174,8 +186,8 @@ impl AuditRow {
             },
             "src_endpoint": src_endpoint,
             "unmapped": {
-                "channel": self.channel.as_str(),
-                "token_hash": self.token_hash,
+                "channel": entry.origin.channel.as_str(),
+                "token_hash": entry.token_hash,
             },
         });
         let fields = match class {
@@ -186,13 +198,152 @@ impl AuditRow {
             }),
             EventClass::Api(_) => json!({
                 "actor": actor,
-                "api": { "operation": self.action },
+                "api": { "operation": entry.action },
                 "resources": resources,
             }),
         };
         if let (Some(event), Some(fields)) = (event.as_object_mut(), fields.as_object()) {
             event.extend(fields.clone());
         }
+        Ok(without_nulls(event))
+    }
+}
+
+/// Whether an exported event carries the question's text. An export with
+/// detail carries what the detail rows hold, statements and file names
+/// among them; the question is held back by default because it is what a
+/// person typed freely, and goes out only when asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptText {
+    Omit,
+    Include,
+}
+
+impl From<bool> for PromptText {
+    /// `true` when the caller asked for the prompt (`--with-prompt`,
+    /// `?prompt=true`).
+    fn from(include: bool) -> Self {
+        if include { Self::Include } else { Self::Omit }
+    }
+}
+
+impl AuditRow {
+    /// The row as an OCSF event joined to its `_quack_audit` detail, the
+    /// half that lives inside the workspace: for a query, the
+    /// `ai_operation` profile with the model that answered (`ai_model`),
+    /// the tool calls with their durations, and the documents and chunks
+    /// the answer cited as resources; for any other action, the detail
+    /// under `unmapped.detail`. A `break_glass` row is raised to Medium.
+    /// The prompt goes in only when asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored timestamp does not parse.
+    pub fn to_ocsf_with_detail(
+        &self,
+        detail: Option<&AuditDetailRow>,
+        prompt: PromptText,
+    ) -> Result<Value> {
+        let mut event = self.to_ocsf()?;
+        // The event's `unmapped` object with `key` set to `value`.
+        let unmapped_with = |event: &serde_json::Map<String, Value>, key: &str, value: Value| {
+            let mut unmapped = event
+                .get("unmapped")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            unmapped.insert(key.to_owned(), value);
+            Value::Object(unmapped)
+        };
+        if self.entry.action == AuditAction::BreakGlass
+            && let Some(object) = event.as_object_mut()
+        {
+            object.insert("severity_id".into(), json!(3));
+            object.insert("severity".into(), json!("Medium"));
+        }
+        let Some(detail) = detail.and_then(|d| d.detail.as_ref()) else {
+            return Ok(event);
+        };
+        let Some(object) = event.as_object_mut() else {
+            return Ok(event);
+        };
+        if self.entry.action != AuditAction::Query {
+            object.insert(
+                "unmapped".into(),
+                unmapped_with(object, "detail", detail.clone()),
+            );
+            return Ok(without_nulls(event));
+        }
+        if let Some(profiles) = object
+            .get_mut("metadata")
+            .and_then(|m| m.get_mut("profiles"))
+            .and_then(Value::as_array_mut)
+        {
+            profiles.push(json!("ai_operation"));
+        }
+        if let Some(model) = detail.get("model") {
+            object.insert(
+                "ai_model".into(),
+                json!({
+                    "name": model.get("name"),
+                    "vendor_name": model.get("provider"),
+                    "type": "Large Language Model",
+                }),
+            );
+        }
+        let tools: Vec<Value> = detail
+            .get("steps")
+            .and_then(Value::as_array)
+            .map(|steps| {
+                steps
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "name": s.get("tool"),
+                            "duration_ms": s.get("duration_ms"),
+                            "rows": s.get("rows"),
+                            "summary": s.get("summary"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut resources = object
+            .get("resources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for cited in detail
+            .get("citations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(document) = cited.get("document_id") {
+                resources.push(json!({ "type": "document", "uid": document }));
+            }
+            if let Some(chunk) = cited.get("chunk_id") {
+                resources.push(json!({ "type": "chunk", "uid": chunk }));
+            }
+        }
+        let mut seen = Vec::new();
+        resources.retain(|r| {
+            if seen.contains(r) {
+                false
+            } else {
+                seen.push(r.clone());
+                true
+            }
+        });
+        object.insert("resources".into(), Value::Array(resources));
+        let mut extra = json!({ "tools": tools, "session_id": self.entry.resource_id });
+        if prompt == PromptText::Include
+            && let Some(text) = detail.get("prompt")
+            && let Some(extra) = extra.as_object_mut()
+        {
+            extra.insert("prompt".into(), text.clone());
+        }
+        object.insert("unmapped".into(), unmapped_with(object, "ai", extra));
         Ok(without_nulls(event))
     }
 }
@@ -219,22 +370,26 @@ fn without_nulls(value: Value) -> Value {
 mod tests {
     use super::*;
     use crate::ids::{AuditId, UserId, WorkspaceId};
-    use crate::storage::control::Channel;
+    use crate::storage::control::{AuditEntry, Channel, Origin, ResourceKind};
 
-    fn row(action: &str, outcome: Outcome) -> AuditRow {
+    fn row(action: AuditAction, outcome: Outcome) -> AuditRow {
         AuditRow {
-            id: AuditId::from("0199aaaa-0000-7000-8000-000000000001"),
             timestamp: String::from("2026-09-24 12:34:56"),
-            user_id: Some(UserId::from("u1")),
-            token_hash: None,
-            workspace_id: Some(WorkspaceId::from("w1")),
-            action: action.to_owned(),
-            resource_type: Some(String::from("document")),
-            resource_id: Some(String::from("d1")),
-            outcome,
-            channel: Channel::Api,
-            client_addr: Some(String::from("10.0.0.7")),
-            request_id: Some(String::from("req-1")),
+            entry: AuditEntry {
+                id: AuditId::from("0199aaaa-0000-7000-8000-000000000001"),
+                user_id: Some(UserId::from("u1")),
+                token_hash: None,
+                workspace_id: Some(WorkspaceId::from("w1")),
+                action,
+                resource_type: Some(ResourceKind::Document),
+                resource_id: Some(String::from("d1")),
+                outcome,
+                origin: Origin {
+                    channel: Channel::Api,
+                    client_addr: Some(String::from("10.0.0.7")),
+                    request_id: Some(String::from("req-1")),
+                },
+            },
         }
     }
 
@@ -277,14 +432,14 @@ mod tests {
 
     #[test]
     fn logins_are_authentication_events() {
-        let event = render(&row("login", Outcome::Allowed));
+        let event = render(&row(AuditAction::Login, Outcome::Allowed));
         assert_required(&event);
         assert_eq!(event["type_uid"], 300_201);
         assert_eq!(event["status_id"], 1);
         assert_eq!(event["user"]["uid"], "u1");
 
-        let mut unknown = row("token", Outcome::Denied);
-        unknown.user_id = None;
+        let mut unknown = row(AuditAction::Token, Outcome::Denied);
+        unknown.entry.user_id = None;
         let event = render(&unknown);
         assert_required(&event);
         assert_eq!(
@@ -295,14 +450,96 @@ mod tests {
         assert_eq!(event["user"]["type_id"], 0);
 
         assert_eq!(
-            render(&row("logout", Outcome::Allowed))["type_uid"],
+            render(&row(AuditAction::Logout, Outcome::Allowed))["type_uid"],
             300_202
         );
     }
 
     #[test]
+    fn a_query_with_its_detail_carries_the_ai_operation_profile() {
+        let mut query = row(AuditAction::Query, Outcome::Allowed);
+        query.entry.resource_type = Some(ResourceKind::Session);
+        query.entry.resource_id = Some(String::from("s1"));
+        let detail = AuditDetailRow {
+            id: query.entry.id.clone(),
+            timestamp: String::from("2026-09-24 12:34:56"),
+            user_id: query.entry.user_id.clone(),
+            action: String::from("query"),
+            detail: Some(json!({
+                "prompt": "how many orders per region?",
+                "model": { "provider": "ollama", "name": "gpt-oss:20b" },
+                "steps": [
+                    { "tool": "run_sql", "duration_ms": 9, "rows": 4, "summary": "4 rows" },
+                    { "tool": "search_documents", "duration_ms": 41, "summary": "8 chunks" }
+                ],
+                "citations": [
+                    { "document_id": "d1", "chunk_id": "c1", "chunk_index": 3 },
+                    { "document_id": "d1", "chunk_id": "c2", "chunk_index": 4 }
+                ]
+            })),
+        };
+        let event = query
+            .to_ocsf_with_detail(Some(&detail), PromptText::Omit)
+            .unwrap_or_else(|e| panic_with(&e.to_string()));
+        assert_required(&event);
+        assert_eq!(
+            event["metadata"]["profiles"],
+            json!(["datetime", "ai_operation"])
+        );
+        assert_eq!(event["ai_model"]["name"], "gpt-oss:20b");
+        assert_eq!(event["ai_model"]["vendor_name"], "ollama");
+        assert_eq!(event["unmapped"]["ai"]["tools"][0]["name"], "run_sql");
+        assert_eq!(event["unmapped"]["ai"]["tools"][1]["duration_ms"], 41);
+        assert_eq!(event["unmapped"]["ai"]["session_id"], "s1");
+        assert!(event["unmapped"]["ai"].get("prompt").is_none(), "{event}");
+        let resources = event["resources"].as_array().cloned().unwrap_or_default();
+        assert!(resources.contains(&json!({ "type": "document", "uid": "d1" })));
+        assert!(resources.contains(&json!({ "type": "chunk", "uid": "c2" })));
+        assert_eq!(
+            resources.iter().filter(|r| r["type"] == "document").count(),
+            1,
+            "a document cited twice is one resource"
+        );
+        let with_prompt = query
+            .to_ocsf_with_detail(Some(&detail), PromptText::Include)
+            .unwrap_or_else(|e| panic_with(&e.to_string()));
+        assert_eq!(
+            with_prompt["unmapped"]["ai"]["prompt"],
+            "how many orders per region?"
+        );
+        // Without a detail row the event is the plain one; another action's
+        // detail rides along unmapped.
+        let plain = query
+            .to_ocsf_with_detail(None, PromptText::Include)
+            .unwrap_or_else(|e| panic_with(&e.to_string()));
+        assert!(plain.get("ai_model").is_none());
+        let sql = row(AuditAction::Sql, Outcome::Allowed);
+        let sql_detail = AuditDetailRow {
+            detail: Some(json!({ "sql": "SELECT 1" })),
+            action: String::from("sql"),
+            ..detail
+        };
+        let event = sql
+            .to_ocsf_with_detail(Some(&sql_detail), PromptText::Omit)
+            .unwrap_or_else(|e| panic_with(&e.to_string()));
+        assert_eq!(event["unmapped"]["detail"]["sql"], "SELECT 1");
+    }
+
+    #[test]
+    fn a_break_glass_grant_is_a_medium_create_event() {
+        let event = render(&row(AuditAction::BreakGlass, Outcome::Allowed));
+        assert_required(&event);
+        assert_eq!(event["type_uid"], 600_301);
+        assert_eq!(event["api"]["operation"], "break_glass");
+        let raised = row(AuditAction::BreakGlass, Outcome::Allowed)
+            .to_ocsf_with_detail(None, PromptText::Omit)
+            .unwrap_or_else(|e| panic_with(&e.to_string()));
+        assert_eq!(raised["severity_id"], 3);
+    }
+
+    #[test]
     fn workspace_actions_are_api_activity() {
-        let event = render(&row("sql", Outcome::Allowed));
+        let event = render(&row(AuditAction::Sql, Outcome::Allowed));
         assert_required(&event);
         assert_eq!(event["type_uid"], 600_302);
         assert_eq!(event["api"]["operation"], "sql");
@@ -319,22 +556,25 @@ mod tests {
         assert_eq!(event["time"], 1_790_253_296_000_i64);
         assert_eq!(event["time_dt"], "2026-09-24T12:34:56Z");
         assert_eq!(
-            render(&row("ingest", Outcome::Allowed))["type_uid"],
+            render(&row(AuditAction::Ingest, Outcome::Allowed))["type_uid"],
             600_301
         );
-        assert_eq!(render(&row("delete", Outcome::Error))["type_uid"], 600_304);
         assert_eq!(
-            render(&row("delete", Outcome::Error))["status_detail"],
+            render(&row(AuditAction::Delete, Outcome::Error))["type_uid"],
+            600_304
+        );
+        assert_eq!(
+            render(&row(AuditAction::Delete, Outcome::Error))["status_detail"],
             "error"
         );
         // A membership change is API activity/Update; a failed no-op removal
         // audited as `Error` is a `Failure` event, never a `Success` one.
-        let allowed = render(&row("member", Outcome::Allowed));
+        let allowed = render(&row(AuditAction::Member, Outcome::Allowed));
         assert_eq!(allowed["type_uid"], 600_303);
         assert_eq!(allowed["activity_name"], "Update");
         assert_eq!(allowed["status_id"], 1);
         assert_eq!(allowed["status"], "Success");
-        let failed = render(&row("member", Outcome::Error));
+        let failed = render(&row(AuditAction::Member, Outcome::Error));
         assert_eq!(failed["type_uid"], 600_303);
         assert_eq!(failed["status_id"], 2);
         assert_eq!(failed["status"], "Failure");
@@ -343,11 +583,11 @@ mod tests {
 
     #[test]
     fn unmapped_actions_and_local_rows_stay_valid() {
-        let mut cli = row("workspace", Outcome::Allowed);
-        cli.client_addr = None;
-        cli.channel = Channel::Cli;
-        cli.user_id = None;
-        cli.request_id = None;
+        let mut cli = row(AuditAction::Workspace, Outcome::Allowed);
+        cli.entry.origin.client_addr = None;
+        cli.entry.origin.channel = Channel::Cli;
+        cli.entry.user_id = None;
+        cli.entry.origin.request_id = None;
         let event = render(&cli);
         assert_required(&event);
         assert_eq!(event["type_uid"], 600_399);
@@ -361,11 +601,15 @@ mod tests {
         );
         assert!(event["unmapped"].get("token_hash").is_none(), "{event}");
 
-        let retired = render(&row("retired_action", Outcome::Allowed));
+        let retired = render(&row(
+            AuditAction::Unknown(String::from("retired_action")),
+            Outcome::Allowed,
+        ));
         assert_eq!(retired["type_uid"], 600_399);
         assert_eq!(retired["activity_name"], "retired_action");
+        assert_eq!(retired["api"]["operation"], "retired_action");
 
-        let mut broken = row("open", Outcome::Allowed);
+        let mut broken = row(AuditAction::Open, Outcome::Allowed);
         broken.timestamp = String::from("yesterday");
         assert!(broken.to_ocsf().is_err());
     }

@@ -30,9 +30,9 @@ pub use status::{EmbeddingStatus, StaleVectors};
 pub use vector::{Dimension, Fingerprint, Vector, WidthMismatch};
 
 use crate::config::Config;
+use crate::crypto::sha256_hex;
 use crate::error::{Error, Result};
 use crate::priority::Priority;
-use crate::storage::control::sha256_hex;
 use crate::text::NonBlankText;
 
 /// The placeholder a document prefix may carry for the chunk's title.
@@ -55,7 +55,7 @@ pub enum Input {
 }
 
 /// The prefix put before each role's input. Empty means none.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Prompts {
     pub query: String,
     /// May contain [`TITLE_PLACEHOLDER`].
@@ -141,7 +141,7 @@ impl ResolvedPrompts {
 
 /// Everything that decides what vector a text becomes. Two vectors are
 /// comparable only when their profiles are equal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Profile {
     /// The model as configured, with Ollama's implicit `:latest` removed.
     pub model: String,
@@ -273,6 +273,33 @@ impl<M: EmbeddingModel> Embedder<M> {
         vectors
             .pop()
             .ok_or_else(|| Error::Embedding("the model returned no embedding".into()))
+    }
+
+    /// How many numbers the model's vectors have, measured on one query
+    /// embedded without the width check. A model's metadata can name an
+    /// inner width that a final projection changes, so only a call tells.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model fails or answers with nothing.
+    pub async fn measure_width(&self) -> Result<usize> {
+        let text = self
+            .profile
+            .prompts
+            .render(&Input::Query(String::from("quack doctor")));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "measuring the width is the one call that must skip the width check"
+        )]
+        let answered = self.model.embed_texts(vec![text]).await;
+        match answered {
+            Ok(embeddings) => embeddings
+                .first()
+                .map(|embedding| embedding.vec.len())
+                .ok_or_else(|| Error::Embedding("the model returned no embedding".into())),
+            Err(ProviderError::MismatchedDimensions { returned, .. }) => Ok(returned),
+            Err(other) => Err(Error::Embedding(other.to_string())),
+        }
     }
 
     /// The inputs' vectors, in order.

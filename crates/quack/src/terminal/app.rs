@@ -3,58 +3,76 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use clap::error::ErrorKind;
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use futures::future::BoxFuture;
 use ratatui::style::{Color, Style};
 use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::{broadcast, mpsc};
 
+use jiff::Timestamp;
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::citations::{Citation, Sources};
 use quack_core::analysis::events::{
-    self, AgentEvent, Delivery, PermissionRequest, ToolName, ToolStep,
+    self, AgentEvent, Decision, Delivery, PermissionRequest, ToolName, ToolStep,
 };
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::{ReaderDb, SharedDb};
+use quack_core::analysis::search::{DocumentScope, DocumentSearch, SearchDetail};
+use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
 use quack_core::config::Config;
-use quack_core::error::{Error as CoreError, Record, Result as CoreResult};
+use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::graph::follow_up::FollowUp;
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery, UnknownEntity};
-use quack_core::ids::{SessionId, WorkspaceId};
-use quack_core::import::{self, ImportPolicy, ImportRequest};
+use quack_core::ids::{DocumentId, SessionId, WorkspaceId};
+use quack_core::import::{self, ImportPolicy, ImportRequest, SourceHeader};
+use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::{self, IngestOutcome, NewFile};
 use quack_core::jobs::{
     JobContext, JobCounts, JobId, JobInfo, JobKind, JobNumber, JobQueue, JobResult, JobSpec,
     JobState, Lane, LaneKey,
 };
+use quack_core::llm::oauth::KeySource;
 use quack_core::llm::{self, Embeddings};
 use quack_core::okf::{self, DirSink};
 use quack_core::prefix::PrefixMatch;
 use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
+use quack_core::storage::control::{ControlPlane, ResourceKind};
+use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{
-    self, ChatMode, ExportFormat, MessageRole, Sharing, Transcript,
+    self, ChatMode, ExportFormat, MessageRole, SessionRow, SessionViewer, Sharing, TitleSource,
+    Transcript,
 };
 use quack_core::storage::workspace::{
-    Pinning, QueryCanceller, SqlSchema, StatementKind, WorkspaceDb,
+    Pinning, QueryCanceller, QueryResults, SqlSchema, StatementKind, WorkspaceDb,
 };
+use quack_core::text::OneLine;
+use quack_core::vault::Vault;
 
-use crate::ModeArg;
 use crate::confirm::Confirm;
 use crate::embeddings_cli::{self, EmbeddingsAction};
-use crate::graph_cli::{self, GraphAction};
+use crate::graph_cli::GraphAction;
 use crate::ontology_cli::{self, OntologyAction};
+use crate::saved_cli::{self, SavedAction};
+use crate::tables_cli::TablesArgs;
 use crate::terminal::SessionSetup;
 use crate::terminal::chart::ChartData;
-use crate::terminal::commands::{Completion, ContextAction, GraphWalk, Input, Route, SlashCommand};
+use crate::terminal::clipboard::{Clipboard, CopyStatus};
+use crate::terminal::commands::{
+    Completion, ContextAction, FileLine, GraphWalk, Input, Route, SlashCommand,
+};
+use crate::terminal::picker::{Picked, Picker};
+use crate::terminal::selection::{Edge, Located, Selection, TranscriptView};
 use crate::terminal::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
+use crate::text_or_json::TextOrJson;
+use crate::{ImportAction, ImportContext, ModeArg};
 
 /// The spinner's frame interval; it ticks only while a job is active.
 const SPINNER_MS: u64 = 80;
@@ -64,6 +82,9 @@ const QUIT_GRACE: Duration = Duration::from_secs(3);
 
 /// Lines typed before, newest last; kept per data directory.
 const HISTORY_LINES: usize = 500;
+
+/// Sessions `/sessions` lists at most, newest first.
+const PICKER_SESSIONS: u32 = 200;
 
 const WELCOME_TEXT: &str = "\
 Welcome to quack!
@@ -80,13 +101,23 @@ No chat model is configured, so questions cannot be answered yet. SQL, file
 loading, and every /command work without one. Set [general].chat_model (or
 QUACK_MODEL) to PROVIDER/MODEL; `quack doctor` checks the setup and suggests one.";
 
-/// The choices every write prompt offers.
-const RUN_IT: &str = "Run it?  y = yes   n = no   a = yes, and allow writes for this session";
+/// The key that gives each answer at a write prompt.
+pub(crate) const fn answer_key(decision: Decision) -> char {
+    match decision {
+        Decision::Allow => 'y',
+        Decision::Deny => 'n',
+        Decision::AllowTurn => 'a',
+    }
+}
 
-/// The answer to `a` at a write prompt.
-const ALLOWED_FOR_SESSION: &str = "Allowed. Writes are permitted for the rest of this session.";
-/// An allow given after the question stopped waiting (cancelled) ran nothing.
-const TURN_GONE: &str = "That question had already ended; nothing ran.";
+/// Every answer with its key, as `[y] Run it   [n] Don't run it   ...`.
+pub(crate) fn answer_keys() -> String {
+    Decision::CHOICES
+        .into_iter()
+        .map(|decision| format!("[{}] {}", answer_key(decision), decision.label()))
+        .collect::<Vec<_>>()
+        .join("   ")
+}
 
 /// What a transcript message is, which decides how it is drawn.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -98,6 +129,8 @@ pub(crate) enum MessageKind {
     /// A direct SQL result table.
     Sql,
     System,
+    /// A file on its way in.
+    Upload,
     Error,
 }
 
@@ -106,10 +139,13 @@ pub(crate) struct Message {
     pub(crate) kind: MessageKind,
     pub(crate) content: String,
     /// The chart an assistant answer produced (design doc 9: charts belong
-    /// to messages); `/chart N` brings it into the chart pane.
+    /// to messages), drawn in the transcript under its text.
     pub(crate) chart: Option<ChartData>,
     /// A step's full tool detail, shown whole when steps are expanded.
     pub(crate) detail: Option<String>,
+    /// The rows a `run_sql` or `create_chart` step kept, shown as a
+    /// table when steps are expanded.
+    pub(crate) result: Option<QueryResults>,
 }
 
 impl Message {
@@ -119,6 +155,7 @@ impl Message {
             content: content.into(),
             chart: None,
             detail: None,
+            result: None,
         }
     }
 
@@ -143,6 +180,7 @@ impl From<&ToolStep> for Message {
     fn from(step: &ToolStep) -> Self {
         Self {
             detail: Some(step.detail.clone()),
+            result: step.result.clone(),
             ..Self::new(
                 MessageKind::Step,
                 format!(
@@ -256,56 +294,75 @@ impl From<&JobInfo> for Ticket {
     }
 }
 
-/// A decision the user owes. Prompts are modal, answered in order, while
-/// every job keeps running.
+/// A write the agent wants to make in the turn run by `job`: a decision
+/// the user owes. Prompts are modal, answered in order, while every job
+/// keeps running.
 enum Prompt {
     /// A write the agent wants to make in the turn run by `job`.
-    Agent {
+    Write {
         job: Ticket,
         request: PermissionRequest,
     },
-    /// A typed statement that modifies the workspace.
-    Sql(String),
+    /// A deletion the person asked for, held until they confirm it, as the
+    /// web asks before its delete buttons.
+    Delete(Deletion),
 }
 
 impl Prompt {
-    fn sql(&self) -> &str {
+    /// Whether it is a write the turn run by `job` asked for.
+    fn is_write_of(&self, job: JobId) -> bool {
         match self {
-            Self::Agent { request, .. } => &request.sql,
-            Self::Sql(sql) => sql,
+            Self::Write { job: owner, .. } => owner.id == job,
+            Self::Delete(_) => false,
+        }
+    }
+
+    /// Refuse a write, or drop a deletion: nobody will answer it now.
+    fn refuse(self) {
+        match self {
+            Self::Write { request, .. } => request.deny(),
+            Self::Delete(_) => {}
         }
     }
 }
 
-/// What the permission overlay asks about: the front prompt, described when
+/// What a confirmed `/delete` or the session list's `d` removes.
+pub(crate) enum Deletion {
+    Document { id: DocumentId, filename: String },
+    Session { id: SessionId, title: String },
+}
+
+impl Deletion {
+    /// The question the prompt asks.
+    fn question(&self) -> String {
+        match self {
+            Self::Document { filename, .. } => {
+                format!("Delete {filename} with its chunks, tables, and graph rows?")
+            }
+            Self::Session { title, .. } => {
+                format!("Delete the session '{title}' and its messages?")
+            }
+        }
+    }
+}
+
+/// The keys a deletion prompt takes.
+const CONFIRM_KEYS: &str = "[y] Delete   [n] Keep";
+
+/// What the prompt overlay asks about: the front prompt, described when
 /// drawn so it never depends on what the transcript still shows.
-pub(crate) struct PendingWrite<'a> {
-    /// Who asks, named from the session on screen now.
+pub(crate) struct PendingPrompt<'a> {
+    /// What is asked, and for a write who asks, named from the session on
+    /// screen now.
     pub(crate) heading: String,
-    pub(crate) sql: &'a str,
+    /// The statement a write would run; empty for a deletion.
+    pub(crate) body: &'a str,
+    /// Why the write is held, when there is more to say than "this writes".
+    pub(crate) notice: Option<&'static str>,
+    /// The answers and their keys.
+    pub(crate) keys: String,
     /// Prompts queued behind this one.
     pub(crate) waiting: usize,
-}
-
-/// An answer to a write prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Answer {
-    Yes,
-    No,
-    /// Yes, and allow writes for the rest of the session.
-    Always,
-}
-
-impl Answer {
-    /// The answer a key gives, if it is one: `y`, `n` (or Esc), `a`.
-    const fn of(code: KeyCode) -> Option<Self> {
-        match code {
-            KeyCode::Char('y' | 'Y') => Some(Self::Yes),
-            KeyCode::Char('a' | 'A') => Some(Self::Always),
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(Self::No),
-            _ => None,
-        }
-    }
 }
 
 /// An agent turn submitted as a job, and where its text goes. Its events
@@ -320,6 +377,58 @@ struct Turn {
     /// Index into `messages` of the step line being filled in.
     open_step: Option<usize>,
     progress: TurnProgress,
+    phase: Phase,
+}
+
+/// What a running turn is doing, for its row in the job strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// No output from the model yet: since the job started, or since
+    /// the tool before this model call finished.
+    Waiting {
+        since: Option<Timestamp>,
+    },
+    /// The model is reasoning, which the transcript does not show.
+    Thinking {
+        since: Timestamp,
+    },
+    Answering,
+    Tool(ToolName),
+}
+
+impl Phase {
+    /// The phase `event` leaves the turn in, at `now`.
+    fn after(self, event: &AgentEvent, now: Timestamp) -> Self {
+        match event {
+            AgentEvent::Reasoning => match self {
+                // More reasoning in one model call keeps its start.
+                Self::Thinking { .. } => self,
+                Self::Waiting { .. } | Self::Answering | Self::Tool(_) => {
+                    Self::Thinking { since: now }
+                }
+            },
+            AgentEvent::TextDelta(_) => Self::Answering,
+            AgentEvent::ToolStarted { tool, .. } => Self::Tool(*tool),
+            AgentEvent::ToolFinished(_) => Self::Waiting { since: Some(now) },
+            AgentEvent::Status(_)
+            | AgentEvent::PermissionRequired(_)
+            | AgentEvent::TurnComplete(_)
+            | AgentEvent::Failed(_) => self,
+        }
+    }
+
+    /// `thinking 41s`, as of `now`, for a job that started at `started`.
+    pub(crate) fn note(self, started: Option<Timestamp>, now: Timestamp) -> String {
+        let seconds = |since: Option<Timestamp>| {
+            since.map_or(0, |since| now.duration_since(since).as_secs().max(0))
+        };
+        match self {
+            Self::Waiting { since } => format!("waiting {}s", seconds(since.or(started))),
+            Self::Thinking { since } => format!("thinking {}s", seconds(Some(since))),
+            Self::Answering => String::from("answering"),
+            Self::Tool(tool) => format!("running {tool}"),
+        }
+    }
 }
 
 /// Where a turn is. Its end (`TurnComplete` or `Failed`) and the close of
@@ -368,6 +477,15 @@ impl Turn {
             self.whose()
         }
     }
+}
+
+/// Why a line is run as SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlIntent {
+    /// `/sql` said so.
+    Stated,
+    /// It starts with a SQL keyword, as a question can.
+    Guessed,
 }
 
 /// The command popup's state while a slash command is typed.
@@ -468,6 +586,8 @@ struct JobEnv {
     db: SharedDb,
     workspace_id: WorkspaceId,
     workspace_name: String,
+    /// The session `/saved add` takes its last answer from.
+    session_id: SessionId,
 }
 
 /// A command the terminal runs as a job, reporting what it printed.
@@ -475,11 +595,14 @@ enum CliJob {
     Ontology(OntologyAction),
     Graph(GraphAction),
     Embeddings(EmbeddingsAction),
+    Saved(SavedAction),
     Okf(String),
     ContextImport(String),
     ContextExport(String),
     Import(ImportRequest),
+    SavedImport(ImportAction),
     Ingest(PathBuf),
+    Search(String),
 }
 
 impl CliJob {
@@ -488,9 +611,11 @@ impl CliJob {
             Self::Ontology(_) => JobKind::Ontology,
             Self::Graph(_) => JobKind::Graph,
             Self::Embeddings(_) => JobKind::Embeddings,
+            Self::Saved(_) => JobKind::Sql,
             Self::Okf(_) | Self::ContextExport(_) => JobKind::Export,
-            Self::ContextImport(_) | Self::Import(_) => JobKind::Import,
+            Self::ContextImport(_) | Self::Import(_) | Self::SavedImport(_) => JobKind::Import,
             Self::Ingest(_) => JobKind::Ingest,
+            Self::Search(_) => JobKind::Search,
         }
     }
 
@@ -500,10 +625,13 @@ impl CliJob {
             Self::Ontology(_) => String::from("Running ontology command"),
             Self::Graph(_) => String::from("Running graph command"),
             Self::Embeddings(_) => String::from("Refreshing embeddings"),
+            Self::Saved(_) => String::from("Running saved question command"),
             Self::Okf(_) => String::from("Exporting the bundle"),
             Self::ContextImport(_) => String::from("Importing the context"),
             Self::ContextExport(_) => String::from("Exporting the context"),
             Self::Import(request) => format!("import {}", request.url),
+            Self::SavedImport(action) => action.label(),
+            Self::Search(query) => format!("search {}", one_line(query)),
             Self::Ingest(path) => path.file_name().map_or_else(
                 || path.display().to_string(),
                 |name| name.to_string_lossy().into_owned(),
@@ -512,16 +640,26 @@ impl CliJob {
     }
 
     /// What the transcript says when it starts.
-    fn announcement(&self) -> String {
+    fn announcement(&self) -> Message {
         match self {
-            Self::Import(request) => format!("Importing from {}", request.url),
-            Self::Ingest(path) => format!("Ingesting {}", path.display()),
+            Self::Import(request) => Message::new(
+                MessageKind::System,
+                format!("Importing from {}", request.url),
+            ),
+            Self::Ingest(path) => {
+                Message::new(MessageKind::Upload, format!("Loading {}", path.display()))
+            }
             Self::Ontology(_)
             | Self::Graph(_)
             | Self::Embeddings(_)
+            | Self::Saved(_)
             | Self::Okf(_)
             | Self::ContextImport(_)
-            | Self::ContextExport(_) => format!("{}\u{2026}", self.label()),
+            | Self::ContextExport(_)
+            | Self::SavedImport(_)
+            | Self::Search(_) => {
+                Message::new(MessageKind::System, format!("{}\u{2026}", self.label()))
+            }
         }
     }
 
@@ -549,15 +687,9 @@ impl CliJob {
                 .await?;
             }
             Self::Graph(action) => {
-                graph_cli::run(
-                    &env.config,
-                    &env.db,
-                    action,
-                    Confirm::Assume,
-                    &mut out,
-                    control,
-                )
-                .await?;
+                action
+                    .run(&env.config, &env.db, Confirm::Assume, &mut out, control)
+                    .await?;
             }
             Self::Embeddings(action) => {
                 embeddings_cli::run(
@@ -567,6 +699,17 @@ impl CliJob {
                     Confirm::Assume,
                     &mut out,
                     control,
+                )
+                .await?;
+            }
+            Self::Saved(action) => {
+                saved_cli::run(
+                    &env.config,
+                    &env.db,
+                    action,
+                    Some(&env.session_id),
+                    None,
+                    &mut out,
                 )
                 .await?;
             }
@@ -602,9 +745,45 @@ impl CliJob {
                 ));
             }
             Self::Import(request) => return Self::import(env, &request, control).await,
+            Self::SavedImport(action) => {
+                let control_plane = ControlPlane::open(&env.config).await?;
+                let vault = Vault::new(env.config.data_dir(), KeySource::Keychain);
+                action
+                    .run(
+                        &ImportContext {
+                            config: &env.config,
+                            workspace: &env.workspace_id,
+                            control: &control_plane,
+                            vault: &vault,
+                            db: &env.db,
+                        },
+                        &mut out,
+                    )
+                    .await?;
+            }
             Self::Ingest(path) => return Self::ingest(env, &path, control).await,
+            Self::Search(query) => return Self::search(env, &query).await,
         }
         Ok(String::from_utf8_lossy(&out).trim_end().to_owned())
+    }
+
+    /// `/search QUERY`: the hits with their rank in each leg, then each
+    /// leg's candidates and the rerank outcome.
+    async fn search(env: &JobEnv, query: &str) -> Result<String> {
+        let config = &env.config;
+        let search = DocumentSearch::new(query, config.retrieval.top_k)?;
+        let embedder = Embeddings::from_config(config).await?;
+        let rerank = Rerank::from_config(config).await?;
+        let reader = ReaderDb::new(Arc::clone(&env.db));
+        let outcome = search
+            .run(
+                &reader,
+                embedder.as_ref(),
+                rerank.as_ref(),
+                config.retrieval.rrf_k,
+            )
+            .await?;
+        Ok(outcome.render(SearchDetail::Workings).trim_end().to_owned())
     }
 
     /// Rows from an external source as a workspace table.
@@ -679,8 +858,23 @@ impl CliJob {
         } else {
             String::new()
         };
+        let pages = result
+            .pages
+            .and_then(PageCounts::note)
+            .map_or(String::new(), |note| {
+                format!("\n{note}; the rest was kept.")
+            });
+        let graph = FollowUp {
+            db: &env.db,
+            config: &env.config,
+            embeddings: embedding_model.as_ref(),
+        }
+        .run(std::slice::from_ref(&result.document_id), control)
+        .await
+        .map_err(|e| anyhow!("graph follow-up failed: {e}"))?
+        .map_or(String::new(), |summary| format!("\n{summary}"));
         Ok(format!(
-            "Loaded {} ({}){tables}{chunks}\nYou can now ask questions about this data.",
+            "Loaded {} ({}){tables}{chunks}{pages}{graph}\nYou can now ask questions about this data.",
             result.filename, result.file_type
         ))
     }
@@ -722,6 +916,7 @@ impl DirectSql {
                     })
                     .await;
                 reader.observe_write().await;
+                TableProfile::after_write(&db).await;
                 result
             }
             Side::Read => {
@@ -761,12 +956,17 @@ pub(crate) struct App {
     pub(crate) scroll: Scroll,
     /// How far back the transcript could scroll when last drawn.
     pub(crate) scroll_limit: Cell<usize>,
+    /// Where the transcript was when last drawn, to place the mouse on it.
+    pub(crate) view: Cell<TranscriptView>,
+    pub(crate) selection: Option<Selection>,
+    /// A finished selection's text, until the loop copies it.
+    to_copy: Option<String>,
+    pub(crate) copy_status: Option<CopyStatus>,
     pub(crate) quit: Quit,
     pub(crate) spinner: Spinner,
     pub(crate) workspace_name: String,
     pub(crate) provider_display: String,
     pub(crate) session_id: SessionId,
-    pub(crate) current_chart: Option<ChartData>,
     /// Decisions owed, oldest first; the front one is on screen.
     prompts: VecDeque<Prompt>,
     /// Agent turns queued or running, in submission order.
@@ -776,6 +976,8 @@ pub(crate) struct App {
     job_events: broadcast::Receiver<JobInfo>,
     /// Jobs still queued or running, for the strip above the input.
     pub(crate) active_jobs: Vec<JobInfo>,
+    /// The `/jobs` or `/sessions` box, while it is open (and takes the keys).
+    pub(crate) picker: Option<Picker>,
     /// The session's database worker: every command's database step runs
     /// there, in the order typed, never on the event loop's thread.
     db_steps: Option<mpsc::UnboundedSender<DbStep>>,
@@ -794,9 +996,11 @@ pub(crate) struct App {
     workspace_id: WorkspaceId,
     db: SharedDb,
     reader_db: ReaderDb,
-    /// Writes allowed for the session (`--allow-write`, or `a` at a
-    /// prompt). Shared with queued turns, which read it when they start.
-    allow_write: Arc<AtomicBool>,
+    /// `--allow-write`: the agent's writes run without asking.
+    allow_write: bool,
+    /// `/scope`: the documents questions are limited to; every document
+    /// when empty.
+    pub(crate) scope: DocumentScope,
     /// `/steps`: show tool details whole instead of a preview.
     pub(crate) expand_steps: bool,
     /// Each message's wrapped lines, by index, with the fingerprint they
@@ -836,17 +1040,21 @@ impl App {
             textarea: TextArea::default(),
             scroll: Scroll::Latest,
             scroll_limit: Cell::new(0),
+            view: Cell::new(TranscriptView::default()),
+            selection: None,
+            to_copy: None,
+            copy_status: None,
             quit: Quit::Stay,
             spinner: Spinner::default(),
             workspace_name,
             provider_display: config.chat_model_label(),
             session_id,
-            current_chart: None,
             prompts: VecDeque::new(),
             turns: Vec::new(),
             jobs,
             job_events,
             active_jobs: Vec::new(),
+            picker: None,
             db_steps: None,
             pending_db: 0,
             switching: None,
@@ -858,7 +1066,8 @@ impl App {
             workspace_id,
             db,
             reader_db,
-            allow_write: Arc::new(AtomicBool::new(writes == WritePolicy::Allow)),
+            allow_write: writes.allows_unasked(),
+            scope: DocumentScope::default(),
             expand_steps: false,
             wrap_cache: RefCell::new(Vec::new()),
             msg_rx,
@@ -902,6 +1111,14 @@ impl App {
     }
 
     /// Queued and running jobs, for the status line.
+    /// What the turn running as `job` is doing, if it is a turn.
+    pub(crate) fn phase_of(&self, job: &JobInfo) -> Option<Phase> {
+        self.turns
+            .iter()
+            .find(|turn| turn.job.id == job.id)
+            .map(|turn| turn.phase)
+    }
+
     pub(crate) fn job_counts(&self) -> JobCounts {
         self.jobs.counts(None)
     }
@@ -927,9 +1144,7 @@ impl App {
                     let meta = row.assistant().cloned().unwrap_or_default();
                     let mut message = Message::new(MessageKind::Assistant, row.content);
                     if let Some(spec) = &meta.chart {
-                        let chart = ChartData::from_spec(spec);
-                        self.current_chart = Some(chart.clone());
-                        message.chart = Some(chart);
+                        message.chart = Some(ChartData::from_spec(spec));
                     }
                     self.post(message);
                     if !meta.citations.is_empty() {
@@ -958,16 +1173,23 @@ impl App {
     /// waiting is applied before the next draw, so a burst of streamed text
     /// costs one redraw, not one per delta.
     pub(crate) async fn run(self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
-        self.run_with(terminal, EventStream::new()).await
+        let clipboard = Clipboard::new(std::io::stdout());
+        self.run_with(terminal, EventStream::new(), clipboard).await
     }
 
-    /// [`Self::run`] over any backend and input stream, so tests drive the
-    /// real loop with scripted keys and a `TestBackend`.
-    async fn run_with<B, S>(mut self, terminal: &mut ratatui::Terminal<B>, input: S) -> Result<()>
+    /// [`Self::run`] over any backend, input stream, and clipboard, so tests
+    /// drive the real loop with scripted keys and a `TestBackend`.
+    async fn run_with<B, S, W>(
+        mut self,
+        terminal: &mut ratatui::Terminal<B>,
+        input: S,
+        mut clipboard: Clipboard<W>,
+    ) -> Result<()>
     where
         B: ratatui::backend::Backend,
         B::Error: std::error::Error + Send + Sync + 'static,
         S: futures::Stream<Item = std::io::Result<Event>> + Unpin,
+        W: std::io::Write,
     {
         use futures::StreamExt as _;
 
@@ -1000,13 +1222,15 @@ impl App {
                     true
                 }
             };
+            if let Some(text) = self.to_copy.take() {
+                self.copy_status = Some(clipboard.copy(&text));
+            }
             if dirty {
                 self.pump();
             }
         }
 
-        self.cancel_all_jobs();
-        self.wait_for_jobs(QUIT_GRACE).await;
+        self.stop_jobs().await;
         if let Some((db, session)) = self.session_to_forget() {
             drop(
                 db.run(move |db| sessions::delete_if_empty(db, &session))
@@ -1020,22 +1244,135 @@ impl App {
     fn handle_terminal_event(&mut self, event: &Event) -> bool {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                self.clear_selection();
                 self.handle_key_event(key.code, key.modifiers);
                 true
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    self.scroll_up(3);
-                    true
-                }
-                MouseEventKind::ScrollDown => {
-                    self.scroll_down(3);
-                    true
-                }
-                _ => false,
-            },
-            Event::Resize(..) => true,
+            Event::Paste(text) => {
+                self.clear_selection();
+                self.handle_paste(text);
+                true
+            }
+            Event::Mouse(mouse) => self.handle_mouse(*mouse),
+            Event::Resize(..) => {
+                // The transcript wraps again, so its lines are other lines.
+                self.clear_selection();
+                true
+            }
             _ => false,
+        }
+    }
+
+    /// The wheel scrolls; a drag with the left button selects transcript
+    /// text, and letting go copies it. Returns whether to redraw.
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                match &mut self.picker {
+                    Some(picker) => picker.up(1),
+                    None => self.scroll_up(3),
+                }
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                match &mut self.picker {
+                    Some(picker) => picker.down(1),
+                    None => self.scroll_down(3),
+                }
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.clear_selection();
+                if self.picker.is_none()
+                    && !self.awaiting_permission()
+                    && let Some(Located {
+                        position,
+                        edge: Edge::Inside,
+                    }) = self.view.get().locate(mouse.column, mouse.row)
+                {
+                    self.selection = Some(Selection::at(position));
+                }
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(selection) = self.selection.as_mut().filter(|s| s.is_dragging()) else {
+                    return false;
+                };
+                let Some(located) = self.view.get().locate(mouse.column, mouse.row) else {
+                    return false;
+                };
+                selection.extend(located.position);
+                match located.edge {
+                    Edge::Above => self.scroll_up(1),
+                    Edge::Below => self.scroll_down(1),
+                    Edge::Inside => {}
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.finish_selection(),
+            MouseEventKind::Down(MouseButton::Right | MouseButton::Middle)
+            | MouseEventKind::Drag(MouseButton::Right | MouseButton::Middle)
+            | MouseEventKind::Up(MouseButton::Right | MouseButton::Middle)
+            | MouseEventKind::Moved
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => false,
+        }
+    }
+
+    /// The button came up: keep what was dragged over highlighted and
+    /// queue its text for the clipboard. Returns whether to redraw.
+    fn finish_selection(&mut self) -> bool {
+        let Some(mut selection) = self.selection.filter(Selection::is_dragging) else {
+            return false;
+        };
+        self.selection = None;
+        let width = usize::from(self.view.get().area.width);
+        let text = selection.text(&ui::format_messages(self, width));
+        if !text.is_empty() {
+            selection.finish();
+            self.selection = Some(selection);
+            self.to_copy = Some(text);
+        }
+        true
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.to_copy = None;
+        self.copy_status = None;
+    }
+
+    /// Pasted text. A terminal pastes the paths of files dropped on it, so
+    /// a paste into an empty input that names only loadable files loads
+    /// them at once; any other is typed in.
+    fn handle_paste(&mut self, text: &str) {
+        if self.awaiting_permission() || self.picker.is_some() {
+            return;
+        }
+        // Terminals paste a line break as a bare carriage return; normalize
+        // it once, up front, so the file-loading and typed-in branches see
+        // the same input (shlex split on '\n', not '\r').
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.textarea.is_empty()
+            && let Some(FileLine::Files(paths)) = FileLine::of(&text)
+        {
+            self.scroll = Scroll::Latest;
+            self.load_files(FileLine::Files(paths));
+            return;
+        }
+        self.textarea.insert_str(&text);
+        self.reset_completion();
+        self.history.leave();
+    }
+
+    fn load_files(&mut self, files: FileLine) {
+        match files {
+            FileLine::Files(paths) => {
+                for path in paths {
+                    self.run_job(CliJob::Ingest(path));
+                }
+            }
+            FileLine::Comment => self.note(MessageKind::Error, FileLine::COMMENT),
         }
     }
 
@@ -1045,22 +1382,6 @@ impl App {
 
     fn scroll_down(&mut self, lines: usize) {
         self.scroll = self.scroll.down(lines, self.scroll_limit.get());
-    }
-
-    /// After cancelling everything, give the jobs up to `grace` to stop:
-    /// a turn records its cancellation, a statement is interrupted, an
-    /// ingest drops its embedding requests. Whatever is still running
-    /// after that is dropped with the runtime at its next await.
-    async fn wait_for_jobs(&mut self, grace: Duration) {
-        let expiry = tokio::time::sleep(grace);
-        tokio::pin!(expiry);
-        while self.jobs.counts(None).active() > 0 {
-            tokio::select! {
-                () = &mut expiry => return,
-                Some(msg) = self.msg_rx.recv() => self.handle_msg(msg),
-                job = self.job_events.recv() => self.handle_job_event(&job),
-            }
-        }
     }
 
     /// Apply every message already waiting, without waiting for more.
@@ -1096,8 +1417,7 @@ impl App {
             }
             AppMsg::TurnClosed(job) => {
                 // Nothing will answer its prompts now.
-                self.prompts
-                    .retain(|p| !matches!(p, Prompt::Agent { job: owner, .. } if owner.id == job));
+                self.prompts.retain(|prompt| !prompt.is_write_of(job));
                 if let Some(turn) = self.turns.iter_mut().find(|t| t.job.id == job) {
                     turn.progress = turn.progress.closed();
                 }
@@ -1122,10 +1442,10 @@ impl App {
         !self.prompts.is_empty()
     }
 
-    pub(crate) fn pending_write(&self) -> Option<PendingWrite<'_>> {
-        let prompt = self.prompts.front()?;
-        let heading = match prompt {
-            Prompt::Agent { job, .. } => {
+    pub(crate) fn pending_prompt(&self) -> Option<PendingPrompt<'_>> {
+        let waiting = self.prompts.len().saturating_sub(1);
+        Some(match self.prompts.front()? {
+            Prompt::Write { job, request } => {
                 let speaker = self
                     .turns
                     .iter()
@@ -1134,14 +1454,21 @@ impl App {
                         || String::from("The agent"),
                         |turn| turn.speaker(&self.session_id),
                     );
-                format!("{speaker} wants to run:")
+                PendingPrompt {
+                    heading: format!("{speaker}: {}", Decision::HEADING),
+                    body: &request.sql,
+                    notice: request.hold.notice(),
+                    keys: answer_keys(),
+                    waiting,
+                }
             }
-            Prompt::Sql(_) => String::from("Your statement modifies the workspace:"),
-        };
-        Some(PendingWrite {
-            heading,
-            sql: prompt.sql(),
-            waiting: self.prompts.len().saturating_sub(1),
+            Prompt::Delete(deletion) => PendingPrompt {
+                heading: deletion.question(),
+                body: "",
+                notice: None,
+                keys: String::from(CONFIRM_KEYS),
+                waiting,
+            },
         })
     }
 
@@ -1152,12 +1479,15 @@ impl App {
         &mut self,
         _event: &std::result::Result<JobInfo, broadcast::error::RecvError>,
     ) {
-        self.active_jobs = self
-            .jobs
-            .list()
-            .into_iter()
+        let jobs = self.jobs.list();
+        self.active_jobs = jobs
+            .iter()
             .filter(|j| !j.state.is_finished())
+            .cloned()
             .collect();
+        if let Some(picker) = &mut self.picker {
+            picker.follow_jobs(jobs);
+        }
         self.settle_turns();
     }
 
@@ -1197,6 +1527,7 @@ impl App {
 
     fn handle_turn_event(&mut self, turn: &mut Turn, event: AgentEvent) {
         let visible = turn.session_id == self.session_id;
+        turn.phase = turn.phase.after(&event, Timestamp::now());
         match event {
             AgentEvent::Status(status) if visible => self.note(MessageKind::System, status),
             AgentEvent::TextDelta(text) if visible => {
@@ -1220,11 +1551,13 @@ impl App {
                 {
                     let line = format!("\n  {}, {} ms", step.summary, step.duration_ms);
                     msg.content.push_str(&line);
+                    msg.result = step.result;
                 } else {
                     self.post(Message::from(&step));
                 }
             }
             AgentEvent::Status(_)
+            | AgentEvent::Reasoning
             | AgentEvent::TextDelta(_)
             | AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolFinished(_) => {}
@@ -1268,17 +1601,24 @@ impl App {
     }
 
     /// Queue a turn's write request as a prompt; one from a session not on
-    /// screen says whose it is.
+    /// screen says whose it is, and one held for more than being a write
+    /// says why.
     fn ask_for_turn(&mut self, turn: &Turn, request: PermissionRequest) {
+        let notice = request
+            .hold
+            .notice()
+            .map_or(String::new(), |notice| format!("{notice}\n"));
         self.note(
             MessageKind::System,
             format!(
-                "{} wants to run a statement that modifies the workspace:\n{}\n{RUN_IT}",
+                "{}: {}\n{}\n{notice}{}",
                 turn.speaker(&self.session_id),
-                request.sql
+                Decision::HEADING,
+                request.sql,
+                answer_keys()
             ),
         );
-        self.prompts.push_back(Prompt::Agent {
+        self.prompts.push_back(Prompt::Write {
             job: turn.job,
             request,
         });
@@ -1298,22 +1638,19 @@ impl App {
         if !response.citations.is_empty() {
             self.post(Message::sources(&response.citations));
         }
-        if let Some(spec) = &response.chart {
-            let chart = ChartData::from_spec(spec);
-            self.current_chart = Some(chart.clone());
-            if let Some(last) = self
+        if let Some(spec) = &response.chart
+            && let Some(last) = self
                 .messages
                 .iter_mut()
                 .rev()
                 .find(|m| m.kind == MessageKind::Assistant)
-            {
-                last.chart = Some(chart);
-            }
+        {
+            last.chart = Some(ChartData::from_spec(spec));
         }
         for result in response.graph.iter().filter(|r| !r.is_empty()) {
             self.note(MessageKind::System, result.to_string());
         }
-        if response.write_refused && !self.writes_allowed() {
+        if response.write_refused && !self.allow_write {
             self.note(
                 MessageKind::System,
                 "A write was refused this turn. Answer y next time, or restart with --allow-write.",
@@ -1322,10 +1659,6 @@ impl App {
         turn.streaming = None;
         turn.open_step = None;
         self.scroll = Scroll::Latest;
-    }
-
-    fn writes_allowed(&self) -> bool {
-        self.allow_write.load(Ordering::Relaxed)
     }
 
     /// The newest turn of the session on screen, queued or running.
@@ -1344,12 +1677,10 @@ impl App {
     fn cancel_turn(&mut self, job: Ticket) {
         let mut kept = VecDeque::new();
         for prompt in self.prompts.drain(..) {
-            match prompt {
-                Prompt::Agent {
-                    job: owner,
-                    request,
-                } if owner.id == job.id => request.deny(),
-                other => kept.push_back(other),
+            if prompt.is_write_of(job.id) {
+                prompt.refuse();
+            } else {
+                kept.push_back(prompt);
             }
         }
         self.prompts = kept;
@@ -1390,42 +1721,89 @@ impl App {
         }
     }
 
-    /// `/jobs`: active jobs, then the most recent finished ones.
+    /// `/jobs`: every job on record in a box to move through, which
+    /// follows the queue while it is open.
     fn show_jobs(&mut self) {
         let jobs = self.jobs.list();
         if jobs.is_empty() {
             self.note(MessageKind::System, "No jobs yet.");
             return;
         }
-        let mut text = String::from("Jobs (newest last):");
-        let start = jobs.len().saturating_sub(20);
-        for job in jobs.iter().skip(start) {
-            text.push_str("\n  ");
-            text.push_str(&JobRow(job).listing());
-        }
-        text.push_str("\n/cancel N stops a queued or running job.");
-        self.note(MessageKind::System, text);
+        self.picker = Some(Picker::jobs(jobs));
     }
 
-    /// Stop every job when the session ends: a running turn is recorded as
-    /// cancelled rather than cut off mid-write.
-    fn cancel_all_jobs(&mut self) {
+    /// A key while the `/jobs` or `/sessions` box is open: move through
+    /// it, act on the highlighted row, or close it.
+    fn handle_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        match (code, modifiers) {
+            (KeyCode::Esc | KeyCode::Char('q'), _)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.picker = None;
+            }
+            (KeyCode::Up, _) => picker.up(1),
+            (KeyCode::Down, _) => picker.down(1),
+            (KeyCode::PageUp, _) => picker.up(10),
+            (KeyCode::PageDown, _) => picker.down(10),
+            (KeyCode::Home, _) => picker.first(),
+            (KeyCode::End, _) => picker.last(),
+            (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                if let Some(Picked::Job(job)) = picker.picked() {
+                    let number = job.number;
+                    self.cancel_job(number);
+                }
+            }
+            (KeyCode::Char('d'), KeyModifiers::NONE) => {
+                if let Some(Picked::Session(session)) = picker.picked() {
+                    let deletion = Deletion::Session {
+                        id: session.id.clone(),
+                        title: session
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| String::from("(untitled)")),
+                    };
+                    self.picker = None;
+                    self.prompts.push_back(Prompt::Delete(deletion));
+                }
+            }
+            (KeyCode::Enter, _) => match picker.picked() {
+                Some(Picked::Job(job)) => {
+                    let details = JobRow(job).details();
+                    self.picker = None;
+                    self.note(MessageKind::System, details);
+                }
+                Some(Picked::Session(session)) => {
+                    let id = session.id.to_string();
+                    self.picker = None;
+                    self.switch_session(id);
+                }
+                None => self.picker = None,
+            },
+            _ => {}
+        }
+    }
+
+    /// Stop every job when the session ends and give them `QUIT_GRACE` to
+    /// do it: a turn records its cancellation, a statement is interrupted,
+    /// an ingest drops its embedding requests. Whatever is still running
+    /// after that is dropped with the runtime at its next await.
+    async fn stop_jobs(&mut self) {
         for prompt in self.prompts.drain(..) {
-            if let Prompt::Agent { request, .. } = prompt {
-                request.deny();
-            }
+            prompt.refuse();
         }
-        for job in self.jobs.list() {
-            if !job.state.is_finished() {
-                self.jobs.cancel(job.id);
-            }
+        let left = self.jobs.shutdown(QUIT_GRACE).await;
+        if !left.is_empty() {
+            tracing::warn!(jobs = left.len(), "quit with jobs still running");
         }
+        self.pump();
     }
 
     /// Clear the transcript; streaming turns start a new message.
     fn clear_transcript(&mut self) {
         self.messages.clear();
-        self.current_chart = None;
+        self.wrap_cache.borrow_mut().clear();
         self.scroll = Scroll::Latest;
         for turn in &mut self.turns {
             turn.streaming = None;
@@ -1438,15 +1816,19 @@ impl App {
         if !ctrl_c && self.quit == Quit::Armed {
             self.quit = Quit::Stay;
         }
+        if self.picker.is_some() && !self.awaiting_permission() {
+            self.handle_picker_key(code, modifiers);
+            return;
+        }
         if ctrl_c {
             // The prompt on screen first, then this session's newest turn.
             match self.prompts.front() {
-                Some(Prompt::Agent { job, .. }) => {
+                Some(Prompt::Write { job, .. }) => {
                     let job = *job;
                     self.cancel_turn(job);
                     return;
                 }
-                Some(Prompt::Sql(_)) => {
+                Some(Prompt::Delete(_)) => {
                     self.handle_permission_key(KeyCode::Esc);
                     return;
                 }
@@ -1519,58 +1901,42 @@ impl App {
         }
     }
 
+    /// The answer a key gives to the front prompt, if it is one: `y`,
+    /// `n` (or Esc), and for a write `a`.
     fn handle_permission_key(&mut self, code: KeyCode) {
-        let Some(answer) = Answer::of(code) else {
-            return;
+        let answer = match code {
+            KeyCode::Esc => Decision::Deny,
+            KeyCode::Char(key) => {
+                let Some(answer) = Decision::CHOICES
+                    .into_iter()
+                    .find(|decision| answer_key(*decision) == key.to_ascii_lowercase())
+                else {
+                    return;
+                };
+                answer
+            }
+            _ => return,
         };
+        if answer == Decision::AllowTurn && matches!(self.prompts.front(), Some(Prompt::Delete(_)))
+        {
+            return;
+        }
         let Some(prompt) = self.prompts.pop_front() else {
             return;
         };
         match prompt {
-            Prompt::Sql(sql) => self.decide_pending_sql(sql, answer),
-            Prompt::Agent { request, .. } => self.decide_agent_write(request, answer),
-        }
-    }
-
-    /// The user's answer to a write the agent asked for.
-    fn decide_agent_write(&mut self, request: PermissionRequest, answer: Answer) {
-        match answer {
-            Answer::Yes => match request.allow() {
-                Delivery::Delivered => self.note(MessageKind::System, "Allowed."),
-                Delivery::TurnGone => self.note(MessageKind::System, TURN_GONE),
+            Prompt::Write { request, .. } => {
+                let reply = match request.answer(answer) {
+                    Delivery::Delivered => answer.reply(),
+                    Delivery::TurnGone => Delivery::TURN_GONE,
+                };
+                self.note(MessageKind::System, reply);
+            }
+            Prompt::Delete(deletion) => match answer {
+                Decision::Allow => self.delete(deletion),
+                Decision::Deny | Decision::AllowTurn => self.note(MessageKind::System, "Kept."),
             },
-            Answer::Always => {
-                // The rest of this turn through the request, the turns
-                // after (queued ones included) through the shared flag each
-                // reads when it starts.
-                let delivered = request.allow_for_turn();
-                self.allow_write.store(true, Ordering::Relaxed);
-                self.note(MessageKind::System, ALLOWED_FOR_SESSION);
-                if delivered == Delivery::TurnGone {
-                    self.note(MessageKind::System, TURN_GONE);
-                }
-            }
-            Answer::No => {
-                request.deny();
-                self.note(MessageKind::System, "Refused.");
-            }
         }
-    }
-
-    /// The user's answer to a typed statement's write prompt.
-    fn decide_pending_sql(&mut self, sql: String, answer: Answer) {
-        match answer {
-            Answer::No => {
-                self.note(MessageKind::System, "Refused.");
-                return;
-            }
-            Answer::Always => {
-                self.allow_write.store(true, Ordering::Relaxed);
-                self.note(MessageKind::System, ALLOWED_FOR_SESSION);
-            }
-            Answer::Yes => {}
-        }
-        self.execute_direct_sql(sql, Side::Write);
     }
 
     /// What the popup offers for the input, if it is showing: one line
@@ -1692,23 +2058,30 @@ impl App {
 
     /// Run a typed `/` line; a line the parser refuses is answered in the
     /// transcript (its help as a note, anything else as an error).
-    fn handle_slash_command(&mut self, input: &str) {
-        let command = match SlashCommand::parse(input) {
-            Ok(command) => command,
-            Err(e) => {
-                let (kind, text) = match e.kind() {
-                    ErrorKind::InvalidSubcommand => {
-                        let name = input.split_whitespace().next().unwrap_or(input);
-                        (MessageKind::Error, format!("unknown command: {name}"))
-                    }
-                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
-                        (MessageKind::System, e.to_string())
-                    }
-                    _ => (MessageKind::Error, e.to_string()),
-                };
-                self.note(kind, text.trim_end());
-                return;
+    /// `input` as a slash command, or `None` once the transcript says why
+    /// it is not one (or shows the help it asked for).
+    fn parse_slash_command(&mut self, input: &str) -> Option<SlashCommand> {
+        let e = match SlashCommand::parse(input) {
+            Ok(command) => return Some(command),
+            Err(e) => e,
+        };
+        let (kind, text) = match e.kind() {
+            ErrorKind::InvalidSubcommand => {
+                let name = input.split_whitespace().next().unwrap_or(input);
+                (MessageKind::Error, format!("unknown command: {name}"))
             }
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                (MessageKind::System, e.to_string())
+            }
+            _ => (MessageKind::Error, e.to_string()),
+        };
+        self.note(kind, text.trim_end());
+        None
+    }
+
+    fn handle_slash_command(&mut self, input: &str) {
+        let Some(command) = self.parse_slash_command(input) else {
+            return;
         };
         match command {
             SlashCommand::Quit => self.quit = Quit::Now,
@@ -1720,12 +2093,15 @@ impl App {
             SlashCommand::Cancel { job } => self.cancel_job(job),
             SlashCommand::Help => self.note(MessageKind::System, SlashCommand::help()),
             SlashCommand::Workspace => self.show_workspace(),
-            SlashCommand::Sessions => self.show_sessions(),
+            SlashCommand::Sessions { query: None } => self.show_sessions(),
+            SlashCommand::Sessions { query: Some(text) } => self.show_matching_sessions(text),
+            SlashCommand::Rename { title } => self.rename_session(title.unwrap_or_default()),
             SlashCommand::Resume { id } => self.switch_session(id),
             SlashCommand::New => self.new_session(),
             SlashCommand::Mode { mode: None } => self.show_mode(),
             SlashCommand::Mode { mode: Some(mode) } => self.set_mode(mode),
             SlashCommand::Docs => self.show_documents(),
+            SlashCommand::Search { query } => self.run_job(CliJob::Search(query)),
             SlashCommand::Context { action: None } => self.show_context(),
             SlashCommand::Context {
                 action: Some(ContextAction::Import { file }),
@@ -1735,10 +2111,10 @@ impl App {
             } => self.run_job(CliJob::ContextExport(file)),
             SlashCommand::Pin { id } => self.set_pinned(id, Pinning::Pinned),
             SlashCommand::Unpin { id } => self.set_pinned(id, Pinning::Unpinned),
-            SlashCommand::Tables => self.show_tables(),
-            SlashCommand::Schema { table } => self.show_schema(table),
-            SlashCommand::Ingest { path } => match Input::file(&path) {
-                Some(path) => self.run_job(CliJob::Ingest(path)),
+            SlashCommand::Tables(args) => self.tables(args),
+            SlashCommand::Scope { documents } => self.set_scope(documents),
+            SlashCommand::Ingest { path } => match FileLine::of(&path) {
+                Some(files) => self.load_files(files),
                 None => self.note(
                     MessageKind::Error,
                     format!("'{path}' is not a file quack can ingest"),
@@ -1762,28 +2138,44 @@ impl App {
             SlashCommand::Ontology { action } => self.run_job(CliJob::Ontology(action)),
             SlashCommand::Delete { id } => self.delete_document(id),
             SlashCommand::Import {
+                action: Some(action),
+                ..
+            } => self.run_job(CliJob::SavedImport(action)),
+            SlashCommand::Import {
+                action: None,
                 url,
                 table,
                 source_table,
                 query,
-            } => self.run_job(CliJob::Import(ImportRequest {
-                url: url.into(),
-                table,
-                query,
-                source_table,
-                limit: None,
-            })),
+                mut headers,
+                bearer_env,
+                json_pointer,
+            } => {
+                headers.extend(bearer_env.map(SourceHeader::BearerEnv));
+                self.run_job(CliJob::Import(ImportRequest {
+                    query,
+                    source_table,
+                    headers,
+                    json_pointer,
+                    ..ImportRequest::new(url.unwrap_or_default(), table.unwrap_or_default())
+                }));
+            }
             SlashCommand::Path { route } => self.show_path(&route),
             SlashCommand::Sql {
                 statement: Some(sql),
-            } => self.run_direct_sql(sql),
+            } => self.run_direct_sql(sql, SqlIntent::Stated),
             SlashCommand::Sql { statement: None } => self.edit_last_sql(),
             SlashCommand::Share => self.set_sharing(Sharing::Shared),
             SlashCommand::Unshare => self.set_sharing(Sharing::Private),
             SlashCommand::Export { flags, file } => self.export_session(flags.format(), file),
             SlashCommand::Okf { dir } => self.run_job(CliJob::Okf(dir)),
             SlashCommand::Embeddings { action } => self.run_job(CliJob::Embeddings(action)),
-            SlashCommand::Chart { n } => self.show_chart(n),
+            SlashCommand::Saved { action } => {
+                let list = SavedAction::List {
+                    format: TextOrJson::Text,
+                };
+                self.run_job(CliJob::Saved(action.unwrap_or(list)));
+            }
             SlashCommand::Steps => self.toggle_steps(),
             SlashCommand::Model => self.show_models(),
         }
@@ -1839,7 +2231,10 @@ impl App {
         self.submit_work(
             JobKind::Models,
             String::from("list models"),
-            Some(String::from("Listing each provider's models")),
+            Some(Message::new(
+                MessageKind::System,
+                "Listing each provider's models",
+            )),
             move |_ctx| async move {
                 BackgroundResult::Done {
                     kind: MessageKind::System,
@@ -1849,32 +2244,67 @@ impl App {
         );
     }
 
+    /// `/sessions`: the most recent sessions in a box to move through;
+    /// Enter resumes the highlighted one.
     fn show_sessions(&mut self) {
         self.on_db_ok(
             Side::Read,
-            |db| sessions::list_sessions(db, 20),
+            |db| sessions::list_sessions(db, PICKER_SESSIONS),
             |app, rows| {
                 if rows.is_empty() {
                     app.note(MessageKind::System, "No sessions yet.");
                     return;
                 }
-                let mut text = String::from("Sessions (most recent first):");
-                for row in rows {
-                    let marker = if row.id == app.session_id { "*" } else { " " };
-                    let line = format!(
-                        "\n{marker} {}  {}  {:>3} msgs  {}",
-                        row.id,
-                        row.updated_at,
-                        row.message_count,
-                        row.title.as_deref().unwrap_or("(untitled)")
-                    );
-                    text.push_str(&line);
+                app.picker = Some(Picker::sessions(rows, app.session_id.clone()));
+            },
+        );
+    }
+
+    /// `/sessions TEXT`: the picker, holding the sessions whose questions or
+    /// answers contain `text`, newest match first.
+    fn show_matching_sessions(&mut self, text: String) {
+        self.on_db_ok(
+            Side::Read,
+            move |db| {
+                let hits =
+                    sessions::search_messages(db, &text, &SessionViewer::All, PICKER_SESSIONS)?;
+                let mut rows: Vec<SessionRow> = Vec::new();
+                for hit in hits {
+                    if rows.iter().all(|row| row.id != hit.session_id)
+                        && let Some(row) = sessions::get_session(db, &hit.session_id)?
+                    {
+                        rows.push(row);
+                    }
                 }
-                text.push_str(
-                    "\nUse /resume ID to switch (any unique prefix works; ids created close \
-                     together differ only near the end).",
+                Ok(rows)
+            },
+            |app, rows| {
+                if rows.is_empty() {
+                    app.note(MessageKind::System, "No session mentions that.");
+                    return;
+                }
+                app.picker = Some(Picker::sessions(rows, app.session_id.clone()));
+            },
+        );
+    }
+
+    /// `/rename [TITLE]`: a new title, or with none the derived one again.
+    fn rename_session(&mut self, title: String) {
+        let session = self.session_id.clone();
+        self.on_db_ok(
+            Side::Write,
+            move |db| sessions::set_session_title(db, &session, &title),
+            |app, renamed| {
+                let title = renamed.title.unwrap_or_default();
+                app.note(
+                    MessageKind::System,
+                    match renamed.title_by {
+                        TitleSource::Person => format!("Renamed to \"{title}\"."),
+                        TitleSource::Derived | TitleSource::Model => {
+                            format!("Named after its first question again: \"{title}\".")
+                        }
+                    },
                 );
-                app.note(MessageKind::System, text);
             },
         );
     }
@@ -1888,7 +2318,31 @@ impl App {
             Side::Read,
             move |db| {
                 let sessions = sessions::list_sessions(db, 1000)?;
-                let found = match PrefixMatch::of(sessions, &prefix, |s| s.id.as_str()) {
+                let by_id = PrefixMatch::of(sessions.clone(), &prefix, |s| s.id.as_str());
+                let by_title = || {
+                    let wanted = prefix.to_lowercase();
+                    let titled: Vec<SessionRow> = sessions
+                        .into_iter()
+                        .filter(|s| {
+                            s.title
+                                .as_deref()
+                                .is_some_and(|t| t.to_lowercase().starts_with(&wanted))
+                        })
+                        .collect();
+                    match titled.len() {
+                        0 => PrefixMatch::None,
+                        1 => titled
+                            .into_iter()
+                            .next()
+                            .map_or(PrefixMatch::None, PrefixMatch::One),
+                        _ => PrefixMatch::Many(titled),
+                    }
+                };
+                let matched = match by_id {
+                    PrefixMatch::None => by_title(),
+                    found => found,
+                };
+                let found = match matched {
                     PrefixMatch::One(session) if session.id == current => Found::Current,
                     PrefixMatch::One(session) => Found::One(Replay::load(db, &session.id)?),
                     PrefixMatch::None => Found::None(prefix),
@@ -2001,6 +2455,7 @@ impl App {
             db: Arc::clone(&self.db),
             workspace_id: self.workspace_id.clone(),
             workspace_name: self.workspace_name.clone(),
+            session_id: self.session_id.clone(),
         };
         let announcement = job.announcement();
         self.submit_work(
@@ -2011,46 +2466,105 @@ impl App {
         );
     }
 
-    fn show_schema(&mut self, table: String) {
+    /// `/tables`: what `quack tables` prints, on the writer when it sets a
+    /// note or retypes a column, else on the reader.
+    fn tables(&mut self, args: TablesArgs) {
+        let writes = args.writes();
+        let side = if writes { Side::Write } else { Side::Read };
         self.on_db_ok(
-            Side::Read,
+            side,
             move |db| {
-                if db.list_tables()?.contains(&table) {
-                    db.describe_table(&table)
-                } else {
-                    Err(CoreError::Analysis(format!("no table named '{table}'")))
-                }
+                let mut out = Vec::new();
+                Ok(args
+                    .run(db, &mut out)
+                    .map(|()| String::from_utf8_lossy(&out).trim_end().to_owned()))
             },
-            |app, described| {
-                let mut text = format!("{} ({} rows)\n", described.table_name, described.row_count);
-                for column in &described.columns {
-                    let line = format!("  {} {}\n", column.name, column.column_type);
-                    text.push_str(&line);
+            move |app, printed| match printed {
+                Ok(text) => {
+                    app.note(MessageKind::Sql, text);
+                    if writes {
+                        app.refresh_sql_schema();
+                    }
                 }
-                let mut buf = Vec::new();
-                if described.sample_rows.write_table(&mut buf).is_ok() {
-                    text.push_str(&String::from_utf8_lossy(&buf));
-                }
-                app.note(MessageKind::Sql, text);
+                Err(e) => app.note(MessageKind::Error, format!("{e:#}")),
             },
         );
     }
 
-    fn delete_document(&mut self, prefix: String) {
+    /// `/scope`: resolve the names now, so a typo is reported here rather
+    /// than by the next question; no names is every document.
+    fn set_scope(&mut self, names: Vec<String>) {
         self.on_db_ok(
-            Side::Write,
-            move |db| {
-                let doc = PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
-                    .one(Record::Document, &prefix)?;
-                db.delete_document(&doc.id).map(|_| doc.filename)
-            },
-            |app, filename| {
-                app.note(
-                    MessageKind::System,
-                    format!("Deleted {filename} with its chunks, tables, and graph rows."),
-                );
+            Side::Read,
+            move |db| DocumentScope::resolve(db, &names),
+            |app, scope| {
+                let text = if scope.is_everything() {
+                    String::from("Questions ask about every document.")
+                } else {
+                    let names: Vec<String> = scope
+                        .documents()
+                        .iter()
+                        .map(|d| OneLine(&d.filename).to_string())
+                        .collect();
+                    format!(
+                        "Questions ask about {} only, until /scope with no names.",
+                        names.join(", ")
+                    )
+                };
+                app.scope = scope;
+                app.note(MessageKind::System, text);
             },
         );
+    }
+
+    /// `/delete`: find the document, then ask before deleting it.
+    fn delete_document(&mut self, prefix: String) {
+        self.on_db_ok(
+            Side::Read,
+            move |db| {
+                PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
+                    .one(ResourceKind::Document, &prefix)
+            },
+            |app, doc| {
+                app.prompts.push_back(Prompt::Delete(Deletion::Document {
+                    id: doc.id,
+                    filename: doc.filename,
+                }));
+            },
+        );
+    }
+
+    /// Delete what the person confirmed. Deleting the session on screen
+    /// starts a new one, as the web lands on a fresh chat.
+    fn delete(&mut self, deletion: Deletion) {
+        match deletion {
+            Deletion::Document { id, filename } => self.on_db_ok(
+                Side::Write,
+                move |db| db.delete_document(&id),
+                move |app, _| {
+                    app.note(
+                        MessageKind::System,
+                        format!("Deleted {filename} with its chunks, tables, and graph rows."),
+                    );
+                },
+            ),
+            Deletion::Session { id, title } => {
+                let current = id == self.session_id;
+                self.on_db_ok(
+                    Side::Write,
+                    move |db| sessions::delete_session(db, &id),
+                    move |app, _| {
+                        app.note(
+                            MessageKind::System,
+                            format!("Deleted the session '{title}'."),
+                        );
+                        if current {
+                            app.new_session();
+                        }
+                    },
+                );
+            }
+        }
     }
 
     fn set_sharing(&mut self, sharing: Sharing) {
@@ -2114,7 +2628,7 @@ impl App {
     /// `/graph ENTITY [HOPS]` or `/graph --class CLASS`: a tree of the
     /// neighbourhood or of the class's entities.
     fn show_graph(&mut self, walk: GraphWalk) {
-        let options = self.config.graph.options();
+        let options = self.config.graph;
         let query = match walk {
             GraphWalk::Class(class) => GraphQuery::new(None, Some(&class), None, None),
             GraphWalk::Entity { name, hops } => {
@@ -2144,7 +2658,7 @@ impl App {
 
     /// `/path FROM -> TO`: the shortest relation chain.
     fn show_path(&mut self, route: &Route) {
-        let options = self.config.graph.options();
+        let options = self.config.graph;
         let query = match PathQuery::new(&route.from, &route.to, None) {
             Ok(query) => query,
             Err(e) => return self.note(MessageKind::Error, e.to_string()),
@@ -2177,11 +2691,19 @@ impl App {
             }
             let mut text = String::from("Documents:");
             for doc in docs {
+                let pages = doc
+                    .pages
+                    .and_then(PageCounts::note)
+                    .map_or(String::new(), |note| format!("  [{note}]"));
                 let line = format!(
-                    "\n  {}  {:<10}  {}  {}",
+                    "\n  {}  {:<10}  {}  {}{pages}",
                     doc.id.short(),
                     doc.status,
-                    if doc.pinned { "pinned" } else { "      " },
+                    if doc.pinning == Pinning::Pinned {
+                        "pinned"
+                    } else {
+                        "      "
+                    },
                     doc.filename
                 );
                 text.push_str(&line);
@@ -2196,7 +2718,7 @@ impl App {
             Side::Write,
             move |db| {
                 let doc = PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
-                    .one(Record::Document, &prefix)?;
+                    .one(ResourceKind::Document, &prefix)?;
                 db.set_document_pinning(&doc.id, pinning).map(|()| doc.id)
             },
             move |app, id| {
@@ -2207,38 +2729,6 @@ impl App {
                 app.note(MessageKind::System, format!("{done} {}", id.short()));
             },
         );
-    }
-
-    /// `/chart [N]`: the Nth chart-bearing answer's chart into the pane
-    /// (the last one without N).
-    fn show_chart(&mut self, n: Option<usize>) {
-        let charts: Vec<ChartData> = self
-            .messages
-            .iter()
-            .filter_map(|m| m.chart.clone())
-            .collect();
-        if charts.is_empty() {
-            self.note(
-                MessageKind::System,
-                "No chart in this session yet; ask for one.",
-            );
-            return;
-        }
-        let wanted = n.unwrap_or(charts.len());
-        let Some(chart) = wanted.checked_sub(1).and_then(|at| charts.get(at)) else {
-            self.note(
-                MessageKind::Error,
-                format!("/chart takes a number from 1 to {}", charts.len()),
-            );
-            return;
-        };
-        let text = format!(
-            "Showing chart {wanted} of {}: {}",
-            charts.len(),
-            chart.title
-        );
-        self.current_chart = Some(chart.clone());
-        self.note(MessageKind::System, text);
     }
 
     /// Drop the session on screen if nothing was ever recorded in it,
@@ -2373,8 +2863,8 @@ impl App {
         }
         match Input::classify(line) {
             Input::Command(command) => self.handle_slash_command(&command),
-            Input::File(path) => self.run_job(CliJob::Ingest(path)),
-            Input::Sql(sql) => self.run_direct_sql(sql),
+            Input::Files(paths) => self.load_files(paths),
+            Input::Sql(sql) => self.run_direct_sql(sql, SqlIntent::Guessed),
             Input::Question(question) if self.config.general.chat_model.is_none() => {
                 self.note(MessageKind::User, question);
                 self.note(MessageKind::System, NO_CHAT_MODEL_TEXT);
@@ -2383,35 +2873,42 @@ impl App {
         }
     }
 
-    /// `/sql`: the same gate the agent's statements pass. Internal tables
-    /// are refused, an invalid statement is reported, and a write asks
-    /// y/n/a unless writes are already allowed for the session.
-    fn run_direct_sql(&mut self, sql: String) {
+    /// `/sql`, or a line that starts like a statement: the same gate the
+    /// agent's statements pass. Internal tables are refused, and an invalid
+    /// statement is reported (or asked as a question, when it was only
+    /// guessed to be SQL).
+    fn run_direct_sql(&mut self, sql: String, intent: SqlIntent) {
         self.note(MessageKind::User, sql.clone());
-        self.last_sql = Some(sql.clone());
         // Classifying is a parse: the reader pool does it, off the loop.
         let statement = sql.clone();
         self.on_db(
             Side::Read,
             move |db| db.classify_user_statement(&statement),
-            move |app, kind| app.gate_direct_sql(sql, kind),
+            move |app, kind| app.gate_direct_sql(sql, kind, intent),
         );
     }
 
-    /// Run a classified statement, or ask before a write.
-    fn gate_direct_sql(&mut self, sql: String, kind: CoreResult<StatementKind>) {
+    /// Run a classified statement.
+    fn gate_direct_sql(&mut self, sql: String, kind: CoreResult<StatementKind>, intent: SqlIntent) {
+        // DuckDB could not parse it, so a question that happens to start
+        // with a keyword goes to the model after all.
+        if let Ok(StatementKind::Invalid(message)) = &kind
+            && intent == SqlIntent::Guessed
+            && self.config.general.chat_model.is_some()
+        {
+            self.note(
+                MessageKind::System,
+                format!("Not SQL ({message}), so asked as a question. /sql runs a line as typed."),
+            );
+            self.submit_turn(sql);
+            return;
+        }
+        self.last_sql = Some(sql.clone());
         match kind {
             Ok(StatementKind::Read) => self.execute_direct_sql(sql, Side::Read),
-            Ok(StatementKind::Write) if self.writes_allowed() => {
-                self.execute_direct_sql(sql, Side::Write);
-            }
-            Ok(StatementKind::Write) => {
-                self.note(
-                    MessageKind::System,
-                    format!("This statement modifies the workspace.\n{RUN_IT}"),
-                );
-                self.prompts.push_back(Prompt::Sql(sql));
-            }
+            // A person's own statement runs as typed, as the web SQL page
+            // runs it; only the agent's writes ask.
+            Ok(StatementKind::Write) => self.execute_direct_sql(sql, Side::Write),
             Ok(StatementKind::Invalid(message)) => self.note(MessageKind::Error, message),
             Err(e) => self.note(MessageKind::Error, e.to_string()),
         }
@@ -2430,27 +2927,17 @@ impl App {
         });
     }
 
-    fn show_tables(&mut self) {
-        self.on_db_ok(Side::Read, WorkspaceDb::list_tables, |app, tables| {
-            if tables.is_empty() {
-                app.note(MessageKind::System, "No tables yet.");
-                return;
-            }
-            let mut text = String::from("Tables:");
-            for table in tables {
-                text.push_str("\n  ");
-                text.push_str(&table);
-            }
-            app.note(MessageKind::System, text);
-        });
-    }
-
     /// Submit a question as a job in its session's lane: it starts once
     /// the session's previous turn has finished (its history includes that
     /// answer) and a worker is free, and streams into the transcript while
     /// everything else stays usable.
     fn start_agent_turn(&mut self, message: String) {
         self.note(MessageKind::User, message.clone());
+        self.submit_turn(message);
+    }
+
+    /// [`Self::start_agent_turn`] for a message already in the transcript.
+    fn submit_turn(&mut self, message: String) {
         let behind = self.current_turn();
 
         let (sink, rx) = events::channel();
@@ -2458,14 +2945,18 @@ impl App {
         let db = Arc::clone(&self.db);
         let reader_db = self.reader_db.clone();
         let session_id = self.session_id.clone();
-        let allow_write = Arc::clone(&self.allow_write);
+        let policy = WritePolicy::Ask.allowed_if(self.allow_write);
+        // By id: the turn resolves them again when it starts.
+        let documents: Vec<String> = self
+            .scope
+            .documents()
+            .iter()
+            .map(|d| d.id.to_string())
+            .collect();
         let spec = JobSpec::new(JobKind::Chat, one_line(&message))
             .workspace(self.workspace_id.clone())
             .lane(Lane::serial(&LaneKey::Session(session_id.clone())));
         let job = Ticket::from(&self.jobs.submit(spec, move |ctx| async move {
-            // Read when the turn starts, so an `a` answered while it
-            // waited applies to it.
-            let policy = WritePolicy::Ask.allowed_if(allow_write.load(Ordering::Relaxed));
             // The turn emits TurnComplete or Failed itself; the returned
             // value is the same response, and the job keeps its outline.
             match (llm::TurnRequest {
@@ -2474,6 +2965,7 @@ impl App {
                 session_id: &session_id,
                 policy,
                 message: &message,
+                documents: &documents,
                 sink,
                 cancel: ctx.cancel_token(),
             })
@@ -2507,6 +2999,7 @@ impl App {
             streaming: None,
             open_step: None,
             progress: TurnProgress::Streaming,
+            phase: Phase::Waiting { since: None },
         });
         if let Some(previous) = behind {
             self.note(
@@ -2526,7 +3019,7 @@ impl App {
         &mut self,
         kind: JobKind,
         label: String,
-        announce: Option<String>,
+        announce: Option<Message>,
         work: F,
     ) where
         F: FnOnce(JobContext) -> Fut + Send + 'static,
@@ -2541,8 +3034,11 @@ impl App {
             drop(tx.send(AppMsg::Finished(id, result)));
             outcome
         });
-        if let Some(text) = announce {
-            self.note(MessageKind::System, format!("{text} (job #{})", job.number));
+        if let Some(message) = announce {
+            self.note(
+                message.kind,
+                format!("{} (job #{})", message.content, job.number),
+            );
         }
     }
 
@@ -2566,1251 +3062,4 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
-    use quack_core::storage::writer::Writer;
-
-    use quack_core::analysis::agent::AgentResponse;
-    use quack_core::analysis::chart::ChartSpec;
-    use quack_core::analysis::events::ToolStep;
-
-    use super::*;
-    use quack_core::ids::{ChunkId, DocumentId};
-
-    #[expect(clippy::panic, reason = "test failure path")]
-    fn fail(msg: &str) -> ! {
-        panic!("{msg}")
-    }
-
-    /// A turn's end and its stream's close arrive in either order, and only
-    /// both together finish it.
-    #[test]
-    fn a_turn_is_done_once_it_has_ended_and_closed() {
-        let start = TurnProgress::Streaming;
-        assert_eq!(start.ended(), TurnProgress::Ended);
-        assert_eq!(start.closed(), TurnProgress::Closed);
-        assert_eq!(start.ended().closed(), TurnProgress::Done);
-        assert_eq!(start.closed().ended(), TurnProgress::Done);
-        assert_eq!(start.ended().ended(), TurnProgress::Ended);
-    }
-
-    /// An app over a real workspace file (the background jobs open it
-    /// again by id), driven without a terminal.
-    fn app(dir: &Path) -> App {
-        app_with(dir, Config::default())
-    }
-
-    /// `app` under `config`, its data directory moved to `dir`.
-    fn app_with(dir: &Path, mut config: Config) -> App {
-        config.general.data_dir = dir.to_path_buf();
-        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        let session = sessions::create_session(&db, "m", ChatMode::Chat, None)
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
-        let reader_db = ReaderDb::new(Arc::clone(&db));
-        App::new(SessionSetup {
-            config,
-            workspace_name: String::from("ws"),
-            workspace_id: WorkspaceId::from("ws"),
-            db,
-            reader_db,
-            session_id: session.id,
-            writes: WritePolicy::Ask,
-        })
-    }
-
-    /// Wait for the background result a command posted and apply it.
-    async fn settle(app: &mut App) {
-        for _ in 0..400 {
-            while let Ok(msg) = app.msg_rx.try_recv() {
-                let finished = matches!(msg, AppMsg::Finished(..));
-                app.handle_msg(msg);
-                if finished {
-                    app.pump();
-                    return;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        fail("no background result arrived");
-    }
-
-    /// Wait until every database step sent so far has been applied.
-    async fn db_settle(app: &mut App) {
-        pump_until(app, |app| app.pending_db == 0).await;
-    }
-
-    /// Pump until `done` holds.
-    async fn pump_until(app: &mut App, done: impl Fn(&App) -> bool) {
-        for _ in 0..400 {
-            app.pump();
-            if done(app) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        fail("the condition never held");
-    }
-
-    /// A turn for a job that waits until it is cancelled.
-    fn waiting_turn(app: &App) -> Turn {
-        let job = app.jobs.submit(
-            JobSpec::new(JobKind::Chat, "question")
-                .lane(Lane::serial(&LaneKey::Session(SessionId::from("test")))),
-            |ctx| async move {
-                ctx.cancel_token().cancelled().await;
-                Err(String::from("cancelled"))
-            },
-        );
-        Turn {
-            job: Ticket::from(&job),
-            session_id: app.session_id.clone(),
-            streaming: None,
-            open_step: None,
-            progress: TurnProgress::Streaming,
-        }
-    }
-
-    fn last(app: &App) -> &Message {
-        app.messages.last().unwrap_or_else(|| fail("no messages"))
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn slash_commands_run_sql_schema_and_cli_verbs_without_a_terminal() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-
-        // A write asks first; `y` runs it as a job.
-        app.handle_slash_command("/sql CREATE TABLE t AS SELECT 1 AS a, 'x' AS b");
-        db_settle(&mut app).await;
-        assert!(app.awaiting_permission());
-        assert!(matches!(app.prompts.front(), Some(Prompt::Sql(_))));
-        app.handle_key_event(KeyCode::Char('y'), KeyModifiers::NONE);
-        assert!(!app.awaiting_permission());
-        settle(&mut app).await;
-        assert_eq!(last(&app).kind, MessageKind::Sql);
-
-        app.handle_slash_command("/tables");
-        db_settle(&mut app).await;
-        assert!(last(&app).content.contains('t'), "{}", last(&app).content);
-        app.handle_slash_command("/schema t");
-        db_settle(&mut app).await;
-        assert_eq!(last(&app).kind, MessageKind::Sql);
-        assert!(
-            last(&app).content.contains("a INTEGER"),
-            "{}",
-            last(&app).content
-        );
-        app.handle_slash_command("/schema nope");
-        db_settle(&mut app).await;
-        assert_eq!(last(&app).kind, MessageKind::Error);
-
-        // Internal tables stay refused, a read runs without asking.
-        app.handle_slash_command("/sql SELECT * FROM _quack_documents");
-        db_settle(&mut app).await;
-        assert_eq!(last(&app).kind, MessageKind::Error);
-        app.handle_slash_command("/sql SELECT a FROM t");
-        settle(&mut app).await;
-        assert!(last(&app).content.contains('1'), "{}", last(&app).content);
-
-        // The CLI verbs: clap parses them, background jobs answer.
-        app.handle_slash_command("/ontology --help");
-        assert!(
-            last(&app).content.contains("Usage"),
-            "{}",
-            last(&app).content
-        );
-        app.handle_slash_command("/graph status");
-        assert!(
-            last(&app).content.contains("(job #"),
-            "{}",
-            last(&app).content
-        );
-        settle(&mut app).await;
-        assert!(
-            last(&app).content.contains("Graph: 0 nodes"),
-            "{}",
-            last(&app).content
-        );
-        app.handle_slash_command("/ontology init");
-        settle(&mut app).await;
-        app.handle_slash_command("/ontology show");
-        settle(&mut app).await;
-        assert!(
-            last(&app).content.contains("entity"),
-            "{}",
-            last(&app).content
-        );
-
-        app.handle_slash_command("/export --markdown");
-        db_settle(&mut app).await;
-        assert_eq!(last(&app).kind, MessageKind::Sql);
-        app.handle_slash_command("/share");
-        db_settle(&mut app).await;
-        assert!(last(&app).content.contains("shared"));
-        app.handle_slash_command("/model");
-        let configured = app.messages.iter().rev().nth(1).map(|m| m.content.as_str());
-        assert!(
-            configured.is_some_and(|text| text.contains("keyword search only")),
-            "{configured:?}"
-        );
-        assert!(
-            last(&app)
-                .content
-                .contains("Listing each provider's models")
-        );
-        settle(&mut app).await;
-        assert_eq!(last(&app).content, "No providers are configured.");
-        app.handle_slash_command("/nope");
-        assert!(last(&app).content.contains("unknown command"));
-
-        // Every job so far is on record.
-        app.handle_slash_command("/jobs");
-        let listing = &last(&app).content;
-        assert!(listing.contains("succeeded sql"), "{listing}");
-        assert!(listing.contains("graph"), "{listing}");
-        app.handle_slash_command("/cancel 1");
-        assert!(last(&app).content.contains("already succeeded"));
-        app.handle_slash_command("/cancel x");
-        assert_eq!(last(&app).kind, MessageKind::Error);
-        assert!(
-            last(&app).content.contains("invalid value"),
-            "{}",
-            last(&app).content
-        );
-        app.handle_slash_command("/cancel 99");
-        assert!(last(&app).content.contains("no job #99"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn agent_events_attach_charts_and_steps_and_keys_cancel_the_turn() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        let mut turn = waiting_turn(&app);
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::ToolStarted {
-                tool: ToolName::RunSql,
-                detail: (1..=6)
-                    .map(|i| format!("line {i}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            },
-        );
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::ToolFinished(ToolStep {
-                tool: ToolName::RunSql,
-                detail: String::new(),
-                summary: String::from("3 rows"),
-                rows: Some(3),
-                duration_ms: 4,
-            }),
-        );
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::TextDelta(String::from("**Three** rows")),
-        );
-        let spec: ChartSpec = serde_json::from_value(serde_json::json!({
-            "title": "Rows by kind",
-            "kind": "bar",
-            "x": { "label": "kind", "values": ["a", "b"] },
-            "series": [{ "name": "n", "values": [1.0, 2.0] }]
-        }))
-        .unwrap_or_else(|e| fail(&e.to_string()));
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::TurnComplete(AgentResponse {
-                content: String::from("**Three** rows"),
-                chart: Some(spec),
-                ..AgentResponse::default()
-            }),
-        );
-        assert!(turn.streaming.is_none());
-        let assistant = app
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.kind == MessageKind::Assistant)
-            .unwrap_or_else(|| fail("no assistant message"));
-        assert!(assistant.chart.is_some(), "the chart belongs to the answer");
-        assert!(app.current_chart.is_some());
-        let step = app
-            .messages
-            .iter()
-            .find(|m| m.kind == MessageKind::Step)
-            .unwrap_or_else(|| fail("no step"));
-        assert!(
-            step.detail
-                .as_deref()
-                .is_some_and(|d| d.lines().count() == 6)
-        );
-
-        // Rendering folds the detail to a preview until /steps; the
-        // Markdown bold survives as a span; lines wrap to the width.
-        let lines = ui::format_messages(&app, 20);
-        let text: Vec<String> = lines
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
-            .collect();
-        assert!(text.iter().any(|l| l.contains("3 more lines")), "{text:?}");
-        assert!(text.iter().all(|l| l.chars().count() <= 20), "{text:?}");
-        app.handle_slash_command("/steps");
-        let expanded = ui::format_messages(&app, 80);
-        assert!(
-            expanded
-                .iter()
-                .any(|l| l.spans.iter().any(|s| s.content.contains("line 6")))
-        );
-        app.current_chart = None;
-        app.handle_slash_command("/chart 1");
-        assert!(app.current_chart.is_some());
-        app.handle_slash_command("/chart 9");
-        assert_eq!(last(&app).kind, MessageKind::Error);
-
-        // Esc while a turn runs cancels it; typing goes on meanwhile.
-        let job = turn.job.id;
-        app.turns.push(turn);
-        app.handle_key_event(KeyCode::Char('h'), KeyModifiers::NONE);
-        assert_eq!(app.textarea.lines().join(""), "h");
-        app.handle_key_event(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(last(&app).content.contains("Cancelling job #1"));
-        let finished = tokio::time::timeout(Duration::from_secs(5), app.jobs.wait(job))
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| fail("the turn did not end"));
-        assert_eq!(finished.state, JobState::Cancelled);
-        app.turns.clear();
-        app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(app.quit, Quit::Now, "Ctrl+C with nothing running quits");
-    }
-
-    /// Text streamed before a tool call, then more text after it, must end as
-    /// one assistant message holding the validated full answer: the
-    /// pre-tool preamble is not left behind as an orphaned partial.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_turn_with_text_then_a_tool_then_text_keeps_one_assistant_message() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        let mut turn = waiting_turn(&app);
-
-        // The common preamble before the first tool call.
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::TextDelta(String::from("Let me look up the data.")),
-        );
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::ToolStarted {
-                tool: ToolName::RunSql,
-                detail: String::from("SELECT 1"),
-            },
-        );
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::ToolFinished(ToolStep {
-                tool: ToolName::RunSql,
-                detail: String::new(),
-                summary: String::from("1 rows"),
-                rows: Some(1),
-                duration_ms: 1,
-            }),
-        );
-        // More text streams after the tool returns.
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::TextDelta(String::from(" The result is 1.")),
-        );
-        // The agent core returns the whole turn's accumulated, validated answer.
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::TurnComplete(AgentResponse {
-                content: String::from("Let me look up the data. The result is 1."),
-                ..AgentResponse::default()
-            }),
-        );
-
-        let assistants = app
-            .messages
-            .iter()
-            .filter(|m| m.kind == MessageKind::Assistant)
-            .count();
-        assert_eq!(
-            assistants, 1,
-            "one assistant message per turn, but the transcript was {:?}",
-            app.messages
-        );
-        let assistant = app
-            .messages
-            .iter()
-            .find(|m| m.kind == MessageKind::Assistant)
-            .unwrap_or_else(|| fail("no assistant message"));
-        assert_eq!(
-            assistant.content,
-            "Let me look up the data. The result is 1."
-        );
-        // The tool call is still its own neighboring step message.
-        assert_eq!(
-            app.messages
-                .iter()
-                .filter(|m| m.kind == MessageKind::Step)
-                .count(),
-            1
-        );
-        assert!(turn.streaming.is_none(), "the turn stopped streaming");
-        app.turns.clear();
-    }
-
-    /// A write tool pauses on `PermissionRequired` between its `ToolStarted`
-    /// and `ToolFinished`; the streaming target must survive both the tool
-    /// start and the permission prompt so the turn still ends with one
-    /// assistant message.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_turn_with_text_then_a_write_permission_then_text_keeps_one_assistant_message() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        let mut turn = waiting_turn(&app);
-
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::TextDelta(String::from("Let me update the table.")),
-        );
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::ToolStarted {
-                tool: ToolName::RunSql,
-                detail: String::from("DELETE FROM t"),
-            },
-        );
-        // A real `PermissionRequired` from a `TurnRecorder` so its answer
-        // oneshot is live and the terminal's `y` resolves it.
-        let (sink, mut rx) = events::channel();
-        let recorder = events::TurnRecorder::new(sink);
-        let pending = tokio::spawn(async move { recorder.ask_permission("DELETE FROM t").await });
-        let request = match rx
-            .recv()
-            .await
-            .unwrap_or_else(|| fail("no permission event"))
-        {
-            AgentEvent::PermissionRequired(request) => request,
-            other => fail(&format!("expected PermissionRequired, got {other:?}")),
-        };
-        app.handle_turn_event(&mut turn, AgentEvent::PermissionRequired(request));
-        assert!(app.awaiting_permission(), "the write prompt is on screen");
-        app.handle_permission_key(KeyCode::Char('y'));
-        assert!(!app.awaiting_permission());
-        let allowed = pending.await.unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(allowed, "the recorder saw the user's `yes`");
-
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::ToolFinished(ToolStep {
-                tool: ToolName::RunSql,
-                detail: String::new(),
-                summary: String::from("1 rows"),
-                rows: Some(1),
-                duration_ms: 1,
-            }),
-        );
-        app.handle_turn_event(&mut turn, AgentEvent::TextDelta(String::from(" Done.")));
-        app.handle_turn_event(
-            &mut turn,
-            AgentEvent::TurnComplete(AgentResponse {
-                content: String::from("Let me update the table. Done."),
-                ..AgentResponse::default()
-            }),
-        );
-
-        let assistants = app
-            .messages
-            .iter()
-            .filter(|m| m.kind == MessageKind::Assistant)
-            .count();
-        assert_eq!(
-            assistants, 1,
-            "one assistant message after a write tool, but the transcript was {:?}",
-            app.messages
-        );
-        let assistant = app
-            .messages
-            .iter()
-            .find(|m| m.kind == MessageKind::Assistant)
-            .unwrap_or_else(|| fail("no assistant message"));
-        assert_eq!(assistant.content, "Let me update the table. Done.");
-        assert!(turn.streaming.is_none());
-        app.turns.clear();
-    }
-
-    /// Have the turn run by `job` ask to run `sql`, as its forwarding task
-    /// does; the handle resolves to the answer.
-    async fn ask_to_write(
-        app: &mut App,
-        job: JobId,
-        sql: &'static str,
-    ) -> tokio::task::JoinHandle<bool> {
-        let (sink, mut rx) = events::channel();
-        let recorder = events::TurnRecorder::new(sink);
-        let pending = tokio::spawn(async move { recorder.ask_permission(sql).await });
-        let request = match rx.recv().await.unwrap_or_else(|| fail("no event")) {
-            AgentEvent::PermissionRequired(request) => request,
-            other => fail(&format!("expected PermissionRequired, got {other:?}")),
-        };
-        app.msg_tx
-            .send(AppMsg::Turn(
-                job,
-                Box::new(AgentEvent::PermissionRequired(request)),
-            ))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        app.pump();
-        pending
-    }
-
-    /// The input rows of a drawn frame: everything below the transcript's
-    /// last separator.
-    fn overlay(app: &App) -> String {
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        terminal
-            .draw(|frame| ui::draw(frame, app))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let buffer = terminal.backend().buffer();
-        let width = usize::from(buffer.area.width);
-        let rows: Vec<String> = buffer
-            .content()
-            .chunks(width)
-            .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
-            .collect();
-        let start = rows
-            .iter()
-            .rposition(|row| row.contains("Run this statement?"))
-            .and_then(|end| {
-                rows.iter()
-                    .take(end)
-                    .rposition(|row| row.trim_start().starts_with('\u{2500}'))
-            })
-            .unwrap_or_else(|| fail(&format!("no permission overlay:\n{}", rows.join("\n"))));
-        rows.get(start..).unwrap_or_default().join("\n")
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_overlay_shows_a_pending_agent_write_after_the_transcript_clears() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        let turn = waiting_turn(&app);
-        let job = turn.job.id;
-        app.turns.push(turn);
-        let pending = ask_to_write(&mut app, job, "DELETE FROM t").await;
-
-        app.clear_transcript();
-        assert!(app.messages.is_empty());
-        let drawn = overlay(&app);
-        assert!(drawn.contains("The agent wants to run:"), "{drawn}");
-        assert!(drawn.contains("DELETE FROM t"), "{drawn}");
-
-        app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
-        assert!(!app.awaiting_permission());
-        assert!(!pending.await.unwrap_or_else(|e| fail(&e.to_string())));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn an_agent_write_stays_on_screen_across_a_new_session() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        let turn = waiting_turn(&app);
-        let job = turn.job.id;
-        app.turns.push(turn);
-        let pending = ask_to_write(&mut app, job, "DELETE FROM t").await;
-
-        app.handle_slash_command("/new");
-        db_settle(&mut app).await;
-        assert!(
-            !app.messages
-                .iter()
-                .any(|m| m.content.contains("DELETE FROM t")),
-            "the switch cleared the transcript's note"
-        );
-        let drawn = overlay(&app);
-        assert!(drawn.contains("DELETE FROM t"), "{drawn}");
-
-        app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
-        assert!(!app.awaiting_permission());
-        assert!(!pending.await.unwrap_or_else(|e| fail(&e.to_string())));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn after_resume_the_overlay_names_the_writes_own_session() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        let other = app
-            .db
-            .run_at(Priority::Interactive, |db| {
-                sessions::create_session(db, "m", ChatMode::Chat, None)
-            })
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let turn = waiting_turn(&app);
-        let job = turn.job.id;
-        let whose = turn.whose();
-        app.turns.push(turn);
-        let pending = ask_to_write(&mut app, job, "DELETE FROM t").await;
-
-        app.handle_slash_command(&format!("/resume {}", other.id));
-        db_settle(&mut app).await;
-        assert_eq!(app.session_id, other.id);
-        let drawn = overlay(&app);
-        assert!(drawn.contains(&format!("{whose} wants to run:")), "{drawn}");
-        assert!(drawn.contains("DELETE FROM t"), "{drawn}");
-
-        app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
-        assert!(!pending.await.unwrap_or_else(|e| fail(&e.to_string())));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_typed_write_stays_on_screen_when_a_new_session_lands_after_it() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        // Classifying the write and switching sessions are applied in the
-        // order typed: the prompt first, then the clear.
-        app.handle_slash_command("/sql DELETE FROM t");
-        app.handle_slash_command("/new");
-        db_settle(&mut app).await;
-        assert!(matches!(app.prompts.front(), Some(Prompt::Sql(_))));
-        let drawn = overlay(&app);
-        assert!(
-            drawn.contains("Your statement modifies the workspace:"),
-            "{drawn}"
-        );
-        assert!(drawn.contains("DELETE FROM t"), "{drawn}");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_overlay_asks_about_the_front_prompt_and_counts_the_rest() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        let turn = waiting_turn(&app);
-        let job = turn.job.id;
-        app.turns.push(turn);
-        let first = ask_to_write(&mut app, job, "DELETE FROM first_table").await;
-        let second = ask_to_write(&mut app, job, "DELETE FROM second_table").await;
-
-        let drawn = overlay(&app);
-        assert!(drawn.contains("DELETE FROM first_table"), "{drawn}");
-        assert!(!drawn.contains("second_table"), "{drawn}");
-        assert!(drawn.contains("(+1 more waiting)"), "{drawn}");
-
-        app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
-        let drawn = overlay(&app);
-        assert!(drawn.contains("DELETE FROM second_table"), "{drawn}");
-        assert!(!drawn.contains("more waiting"), "{drawn}");
-        app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
-        assert!(!first.await.unwrap_or_else(|e| fail(&e.to_string())));
-        assert!(!second.await.unwrap_or_else(|e| fail(&e.to_string())));
-    }
-
-    #[test]
-    fn a_long_statement_is_capped_with_a_count_of_the_rest() {
-        let sql = (0..10)
-            .map(|n| format!("UPDATE t SET a = {n}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let pending = PendingWrite {
-            heading: String::from("The agent wants to run:"),
-            sql: &sql,
-            waiting: 0,
-        };
-        let lines: Vec<String> = pending
-            .lines(80, 4)
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        assert_eq!(lines.len(), 6, "{lines:?}");
-        assert!(
-            lines.get(3).is_some_and(|l| l.contains("SET a = 2")),
-            "{lines:?}"
-        );
-        assert!(
-            lines.get(4).is_some_and(|l| l.contains("7 more lines")),
-            "{lines:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_event_loop_answers_typed_sql_and_quits_on_ctrl_c() {
-        use crossterm::event::KeyEvent;
-        use ratatui::backend::TestBackend;
-
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let app = app(dir.path());
-        let (keys, input) = futures::channel::mpsc::unbounded::<std::io::Result<Event>>();
-        let press = |code| Ok(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
-        for ch in "SELECT 6 * 7 AS answer".chars() {
-            assert!(keys.unbounded_send(press(KeyCode::Char(ch))).is_ok());
-        }
-        assert!(keys.unbounded_send(press(KeyCode::Enter)).is_ok());
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 30))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let running = tokio::spawn(async move {
-            let result = app.run_with(&mut terminal, input).await;
-            (result, terminal)
-        });
-        // The answer arrives through the job queue and the loop draws it;
-        // then Ctrl+C with nothing running quits.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(
-            keys.unbounded_send(Ok(Event::Key(KeyEvent::new(
-                KeyCode::Char('c'),
-                KeyModifiers::CONTROL
-            ))))
-            .is_ok()
-        );
-        let (result, terminal) = tokio::time::timeout(Duration::from_secs(10), running)
-            .await
-            .unwrap_or_else(|_| fail("the loop did not quit"))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(result.is_ok(), "{result:?}");
-        let screen: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect();
-        // The result table, not a session id that happens to hold "42".
-        assert!(
-            screen.contains("answer") && screen.contains("(1 rows)"),
-            "{screen}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ctrl_c_with_jobs_running_asks_for_a_second_press() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        let (sql_sink, sql_rx) = tokio::sync::oneshot::channel::<()>();
-        app.jobs
-            .submit(JobSpec::new(JobKind::Sql, "slow"), |_| async move {
-                drop(sql_rx.await);
-                Ok(String::new())
-            });
-        pump_until(&mut app, |app| !app.active_jobs.is_empty()).await;
-        assert!(!ui::job_strip(&app).is_empty(), "the strip shows it");
-        app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(app.quit, Quit::Armed);
-        assert!(last(&app).content.contains("still running"));
-        app.handle_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(app.quit, Quit::Now);
-        assert!(sql_sink.send(()).is_ok());
-        pump_until(&mut app, |app| app.active_jobs.is_empty()).await;
-        assert!(ui::job_strip(&app).is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_command_popup_picks_fills_in_and_runs() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        let typed = |app: &mut App, text: &str| {
-            for ch in text.chars() {
-                app.handle_key_event(KeyCode::Char(ch), KeyModifiers::NONE);
-            }
-        };
-        let input = |app: &App| app.textarea.lines().join("\n");
-        let highlighted = |app: &App| {
-            app.completion()
-                .and_then(|c| c.get(app.completion_selected()).map(|s| s.word.clone()))
-        };
-
-        // Tab fills the highlighted command in; its verbs follow.
-        typed(&mut app, "/gr");
-        assert_eq!(highlighted(&app).as_deref(), Some("/graph"));
-        app.handle_key_event(KeyCode::Tab, KeyModifiers::NONE);
-        assert_eq!(input(&app), "/graph ");
-        typed(&mut app, "me");
-        assert_eq!(highlighted(&app).as_deref(), Some("merges"));
-
-        // Down and Up move the highlight and wrap; they leave history alone.
-        app.handle_key_event(KeyCode::Char('u'), KeyModifiers::CONTROL);
-        typed(&mut app, "/s");
-        assert_eq!(highlighted(&app).as_deref(), Some("/sql"));
-        app.handle_key_event(KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(highlighted(&app).as_deref(), Some("/schema"));
-        app.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
-        app.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(highlighted(&app).as_deref(), Some("/steps"));
-        assert_eq!(input(&app), "/s");
-
-        // Esc hides it without cancelling anything; typing brings it back.
-        app.handle_key_event(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(app.completion().is_none());
-        typed(&mut app, "c");
-        assert_eq!(highlighted(&app).as_deref(), Some("/schema"));
-
-        // Enter on a command that takes nothing fills it in and runs it.
-        app.handle_key_event(KeyCode::Char('u'), KeyModifiers::CONTROL);
-        typed(&mut app, "/he");
-        app.handle_key_event(KeyCode::Enter, KeyModifiers::NONE);
-        assert!(app.textarea.is_empty());
-        assert!(last(&app).content.contains("Commands:"));
-
-        // Enter on one that takes more only fills it in; with nothing left
-        // to fill, Enter sends the line as typed.
-        typed(&mut app, "/mo");
-        app.handle_key_event(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(input(&app), "/mode ");
-        typed(&mut app, "q");
-        app.handle_key_event(KeyCode::Tab, KeyModifiers::NONE);
-        assert_eq!(input(&app), "/mode query");
-        app.handle_key_event(KeyCode::Enter, KeyModifiers::NONE);
-        assert!(app.textarea.is_empty(), "sent as typed");
-        db_settle(&mut app).await;
-        assert!(
-            last(&app).content.contains("query"),
-            "{}",
-            last(&app).content
-        );
-
-        // Plain text, and the cursor moved off the end, show no popup.
-        app.handle_key_event(KeyCode::Char('u'), KeyModifiers::CONTROL);
-        typed(&mut app, "what is /s");
-        assert!(app.completion().is_none());
-        app.handle_key_event(KeyCode::Char('u'), KeyModifiers::CONTROL);
-        typed(&mut app, "/s");
-        app.handle_key_event(KeyCode::Left, KeyModifiers::NONE);
-        assert!(app.completion().is_none());
-
-        // The popup's rows: the highlighted one marked, labels aligned.
-        let items = Completion::for_line("/mode ")
-            .map(|c| c.items)
-            .unwrap_or_default();
-        let rows: Vec<String> = ui::completion_lines(&items, 1)
-            .iter()
-            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
-        assert!(
-            rows.first().is_some_and(|r| r.starts_with("  chat ")),
-            "{rows:?}"
-        );
-        assert!(
-            rows.get(1)
-                .is_some_and(|r| r.starts_with("\u{25B8} query ")),
-            "{rows:?}"
-        );
-    }
-
-    /// The words the popup offers for the input as it stands.
-    fn offered(app: &App) -> Vec<String> {
-        app.completion()
-            .map(|c| c.items.into_iter().map(|s| s.word).collect())
-            .unwrap_or_default()
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn sql_completion_follows_ingests_and_typed_statements() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        app.load_sql_schema()
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        app.set_input("SELECT * FROM sa");
-        assert!(offered(&app).is_empty(), "no tables yet");
-
-        let file = dir.path().join("sales.csv");
-        std::fs::write(&file, "region,revenue\nnorth,10\n")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        app.run_job(CliJob::Ingest(file));
-        settle(&mut app).await;
-        db_settle(&mut app).await;
-        app.set_input("SELECT * FROM sa");
-        assert_eq!(offered(&app), ["sales"]);
-        app.set_input("SELECT * FROM sales s WHERE s.re");
-        assert_eq!(offered(&app), ["region", "revenue"]);
-
-        app.allow_write.store(true, Ordering::Relaxed);
-        app.handle_slash_command("/sql CREATE TABLE stores (id INTEGER)");
-        settle(&mut app).await;
-        db_settle(&mut app).await;
-        app.set_input("SELECT * FROM st");
-        assert_eq!(offered(&app), ["stores"]);
-        assert!(
-            app.sql_schema
-                .tables
-                .iter()
-                .all(|t| !t.name.name.starts_with("_quack_")),
-            "{:?}",
-            app.sql_schema
-        );
-
-        // Tab fills the name in where the cursor is, and leaves the rest.
-        app.set_input("SELECT re FROM sales");
-        app.textarea.move_cursor(CursorMove::Jump(0, 9));
-        assert!(app.handle_completion_key(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.textarea.lines().concat(), "SELECT region FROM sales");
-        assert_eq!(app.textarea.cursor().1, 13);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn database_commands_run_in_order_off_the_loop_and_input_waits_for_a_switch() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        let file = dir.path().join("notes.md");
-        std::fs::write(&file, "# Notes\n\nSomething to pin.")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        app.run_job(CliJob::Ingest(file));
-        settle(&mut app).await;
-        // The ingest refreshed the completion schema on the worker.
-        db_settle(&mut app).await;
-
-        // A write then a read, sent back to back, answer in that order: the
-        // listing sees the pin.
-        let id = app
-            .db
-            .run(WorkspaceDb::list_documents)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()))
-            .first()
-            .map_or_else(|| fail("no document"), |d| d.id.clone());
-        app.handle_slash_command(&format!("/pin {id}"));
-        app.handle_slash_command("/docs");
-        // Neither has answered on the loop yet: nothing blocked here.
-        assert_eq!(app.pending_db, 2);
-        db_settle(&mut app).await;
-        assert!(
-            last(&app).content.contains("pinned"),
-            "{}",
-            last(&app).content
-        );
-
-        // Input typed during a switch waits for it, then lands in the new
-        // session.
-        let old = app.session_id.clone();
-        app.handle_slash_command("/new");
-        app.set_input("/workspace");
-        app.submit_message();
-        assert!(
-            last(&app)
-                .content
-                .contains("Waiting for the session switch"),
-            "{}",
-            last(&app).content
-        );
-        db_settle(&mut app).await;
-        assert_ne!(app.session_id, old);
-        assert!(
-            last(&app).content.contains(app.session_id.as_str()),
-            "the deferred /workspace ran in the new session: {}",
-            last(&app).content
-        );
-        assert!(app.switching.is_none());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn embeddings_refresh_is_a_job_and_stale_vectors_are_noted_at_startup() {
-        use quack_core::config::{BaseUrl, ProviderConfig, ProviderName, ProviderType};
-        use quack_core::embedding::{Dimension, Vector};
-        use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
-
-        // Without an embedding model the job says what is missing.
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        app.handle_slash_command("/embeddings refresh");
-        settle(&mut app).await;
-        assert_eq!(last(&app).kind, MessageKind::Error);
-        assert!(
-            last(&app).content.contains("no embedding model configured"),
-            "{}",
-            last(&app).content
-        );
-
-        // With one, a vector from another profile is noted when the
-        // session opens.
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut config = Config::default();
-        config.embedding.dimension = Some(Dimension::new(4));
-        config.embedding.model = Some(
-            "ollama/embeddinggemma"
-                .parse()
-                .unwrap_or_else(|e: CoreError| fail(&e.to_string())),
-        );
-        config.providers.insert(
-            "ollama"
-                .parse::<ProviderName>()
-                .unwrap_or_else(|e| fail(&e.to_string())),
-            ProviderConfig {
-                base_url: Some(
-                    BaseUrl::try_from(String::from("http://127.0.0.1:9"))
-                        .unwrap_or_else(|e| fail(&e.to_string())),
-                ),
-                ..ProviderConfig::new(ProviderType::Ollama)
-            },
-        );
-        let mut app = app_with(dir.path(), config);
-        app.note_embedding_status()
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let before = app.messages.len();
-        app.db
-            .run(|db| {
-                db.insert_document(
-                    &NewDocument::new(&DocumentId::from("d"), "a.md", "text/markdown", 1)
-                        .with_status(DocumentStatus::Ready),
-                )?;
-                db.insert_chunk(&NewChunk {
-                    id: &ChunkId::from("c"),
-                    document_id: &DocumentId::from("d"),
-                    chunk_index: 0,
-                    content: "levee report",
-                    heading: None,
-                    page: None,
-                    embedding: Some(&Vector::from(vec![1.0, 0.0, 0.0, 0.0])),
-                })?;
-                db.execute_statement("UPDATE _quack_chunks SET embedding_profile = 'older'")
-            })
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(app.messages.len(), before, "nothing to note while current");
-        app.note_embedding_status()
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let note = &last(&app).content;
-        assert!(
-            note.contains("keyword search only") && note.contains("/embeddings refresh"),
-            "{note}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_session_replays_at_startup_through_the_writer() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        let session = app.session_id.clone();
-        app.db
-            .run(move |db| {
-                sessions::record_turn(
-                    db,
-                    &session,
-                    "how many storms?",
-                    jiff::Timestamp::now(),
-                    &AgentResponse {
-                        content: String::from("Twelve storms."),
-                        ..AgentResponse::default()
-                    },
-                )
-            })
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        app.load_current_session()
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(
-            app.messages
-                .iter()
-                .any(|m| m.kind == MessageKind::Assistant && m.content == "Twelve storms."),
-            "the recorded answer is back in the transcript"
-        );
-        assert!(
-            app.messages
-                .iter()
-                .any(|m| m.content.contains("Resumed session"))
-        );
-    }
-
-    #[test]
-    fn the_transcript_rerenders_only_what_changed() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        let text = |lines: &[ratatui::text::Line<'_>]| -> String {
-            lines
-                .iter()
-                .map(|l| {
-                    l.spans
-                        .iter()
-                        .map(|s| s.content.as_ref())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        app.messages.push(Message::new(
-            MessageKind::Assistant,
-            String::from("Streaming"),
-        ));
-        let first = ui::format_messages(&app, 60);
-        let entries = app.wrap_cache.borrow().len();
-        assert_eq!(entries, app.messages.len());
-        let keys: Vec<Option<u64>> = app
-            .wrap_cache
-            .borrow()
-            .iter()
-            .map(|e| e.as_ref().map(|w| w.key))
-            .collect();
-
-        // A streamed delta changes the last message only.
-        if let Some(last) = app.messages.last_mut() {
-            last.content.push_str(" more text");
-        }
-        let second = ui::format_messages(&app, 60);
-        assert!(text(&second).contains("Streaming more text"));
-        assert_ne!(text(&first), text(&second));
-        let after: Vec<Option<u64>> = app
-            .wrap_cache
-            .borrow()
-            .iter()
-            .map(|e| e.as_ref().map(|w| w.key))
-            .collect();
-        let unchanged = keys.iter().zip(&after).filter(|(a, b)| a == b).count();
-        assert_eq!(unchanged, keys.len().saturating_sub(1));
-
-        // A new width, /steps, and /clear all show at once.
-        assert!(
-            ui::format_messages(&app, 20)
-                .iter()
-                .all(|l| l.width() <= 20)
-        );
-        app.clear_transcript();
-        assert!(ui::format_messages(&app, 60).is_empty());
-        assert!(app.wrap_cache.borrow().is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn questions_queue_per_session_while_other_work_runs() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        // No chat model: each turn fails fast, but it still goes through
-        // the session's lane in order and leaves the transcript usable.
-        app.start_agent_turn(String::from("first?"));
-        app.start_agent_turn(String::from("second?"));
-        assert_eq!(app.turns.len(), 2);
-        assert!(
-            last(&app).content.contains("Queued as job #2"),
-            "{}",
-            last(&app).content
-        );
-        // SQL runs alongside.
-        app.set_input("SELECT 6 * 7 AS answer");
-        app.submit_message();
-        // A job can finish between the result drain and the job-event drain
-        // of one pump, so wait for the result itself, not just an idle strip.
-        pump_until(&mut app, |app| {
-            app.turns.is_empty()
-                && app.active_jobs.is_empty()
-                && app
-                    .messages
-                    .iter()
-                    .any(|m| m.kind == MessageKind::Sql && m.content.contains("42"))
-        })
-        .await;
-        let jobs = app.jobs.list();
-        assert_eq!(jobs.len(), 3);
-        let chats: Vec<_> = jobs.iter().filter(|j| j.kind == JobKind::Chat).collect();
-        assert!(chats.iter().all(|j| j.state == JobState::Failed));
-        // The lane ran them in order.
-        assert!(
-            chats
-                .first()
-                .and_then(|a| a.finished_at)
-                .zip(chats.get(1).and_then(|b| b.started_at))
-                .is_some_and(|(a_end, b_start)| a_end <= b_start),
-            "{chats:#?}"
-        );
-        assert!(
-            app.messages.iter().any(|m| m.kind == MessageKind::Error),
-            "the failure is in the transcript"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn without_a_chat_model_questions_say_how_to_set_one_and_sql_still_runs() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        assert!(app.messages.iter().any(|m| m.content == NO_CHAT_MODEL_TEXT));
-
-        app.set_input("how many orders shipped late?");
-        app.submit_message();
-        assert!(app.turns.is_empty());
-        assert!(last(&app).content.contains("quack doctor"));
-
-        app.set_input("SELECT 41 + 1 AS answer");
-        app.submit_message();
-        settle(&mut app).await;
-        assert!(last(&app).content.contains("42"), "{}", last(&app).content);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn typed_input_is_kept_across_sessions_and_browsed_with_up_and_down() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        {
-            let mut app = app(dir.path());
-            app.set_input("/tables");
-            app.submit_message();
-            db_settle(&mut app).await;
-        }
-        let mut again = app(dir.path());
-        assert_eq!(again.history.lines, vec![String::from("/tables")]);
-
-        // Up recalls the newest, then older ones; Down comes back and past
-        // the newest to an empty input.
-        again.history.push(String::from("SELECT 1"));
-        let input = |app: &App| app.textarea.lines().join("\n");
-        again.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(input(&again), "SELECT 1");
-        again.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(input(&again), "/tables");
-        again.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(input(&again), "/tables", "the oldest stays");
-        assert!(
-            again.completion().is_none(),
-            "no popup over a recalled line"
-        );
-        again.handle_key_event(KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(input(&again), "SELECT 1");
-        again.handle_key_event(KeyCode::Down, KeyModifiers::NONE);
-        assert!(again.textarea.is_empty());
-        assert!(!again.history.browsing());
-
-        // A line with a newline is kept for the session, not the file.
-        again.history.push(String::from("a\nb"));
-        assert_eq!(again.history.lines.len(), 3);
-        let saved = app(dir.path());
-        assert_eq!(
-            saved.history.lines,
-            vec![String::from("/tables"), String::from("SELECT 1")]
-        );
-    }
-
-    #[test]
-    fn home_page_down_and_end_move_through_the_transcript() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let mut app = app(dir.path());
-        app.scroll_limit.set(40);
-        app.handle_key_event(KeyCode::PageUp, KeyModifiers::NONE);
-        assert_eq!(app.scroll, Scroll::Back(15));
-        app.handle_key_event(KeyCode::Home, KeyModifiers::NONE);
-        assert_eq!(app.scroll, Scroll::Top);
-        assert_eq!(app.scroll.to_string(), " \u{00B7} scroll: top");
-        // From the top, PageDown moves down from the first line.
-        app.handle_key_event(KeyCode::PageDown, KeyModifiers::NONE);
-        assert_eq!(app.scroll, Scroll::Back(25));
-        app.handle_key_event(KeyCode::End, KeyModifiers::NONE);
-        assert_eq!(app.scroll, Scroll::Latest);
-        assert!(app.scroll.to_string().is_empty());
-        app.handle_key_event(KeyCode::PageUp, KeyModifiers::NONE);
-        app.handle_key_event(KeyCode::PageDown, KeyModifiers::NONE);
-        assert_eq!(app.scroll, Scroll::Latest);
-        // A new message follows the transcript down.
-        app.handle_key_event(KeyCode::PageUp, KeyModifiers::NONE);
-        app.note(MessageKind::System, "news");
-        assert_eq!(app.scroll, Scroll::Latest);
-    }
-
-    #[test]
-    fn a_finished_job_reports_one_line() {
-        let table = BackgroundResult::Done {
-            kind: MessageKind::Sql,
-            text: String::from("a\n1\n(1 rows)\n3 ms"),
-        };
-        assert_eq!(table.outcome(), Ok(String::from("3 ms")));
-        let note = BackgroundResult::from(Ok(String::from("Loaded x\nYou can now ask")));
-        assert_eq!(note.outcome(), Ok(String::from("Loaded x")));
-        let failed = BackgroundResult::from(Err(anyhow!("outer").context("while loading")));
-        assert_eq!(failed.outcome(), Err(String::from("while loading: outer")));
-    }
-}
+mod tests;

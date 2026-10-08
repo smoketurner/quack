@@ -12,7 +12,19 @@ use crate::error::Error;
 
 /// How many numbers a vector has: a model's output width, and the width of
 /// a workspace's vector columns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(transparent)]
 pub struct Dimension(u32);
 

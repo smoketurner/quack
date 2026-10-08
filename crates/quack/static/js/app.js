@@ -3,23 +3,56 @@
 (function () {
   "use strict";
 
+  // Save-as-image and a read-only data view, from the vendored ECharts;
+  // the data view is the spec's own numbers, nothing is re-run.
+  function toolbox() {
+    return { feature: { saveAsImage: { title: "Save image" }, dataView: { title: "Data", readOnly: true, lang: ["Data", "Close", ""] } } };
+  }
+
   function chartOption(spec) {
     if (spec.kind === "pie") {
       var first = (spec.series && spec.series[0]) || { values: [] };
       return {
         title: { text: spec.title },
         tooltip: {},
+        toolbox: toolbox(),
         series: [{ type: "pie", radius: "60%", data: spec.x.values.map(function (l, i) { return { name: l, value: first.values[i] }; }) }]
       };
     }
     return {
       title: { text: spec.title },
-      tooltip: {},
+      tooltip: { trigger: "axis" },
+      toolbox: toolbox(),
       legend: { bottom: 0 },
       xAxis: { type: "category", name: spec.x.label, data: spec.x.values },
       yAxis: { type: "value" },
-      series: spec.series.map(function (s) { return { name: s.name, type: spec.kind, data: s.values }; })
+      series: spec.series.map(function (s) {
+        var out = { name: s.name, type: spec.kind, data: s.values };
+        if (spec.stacked && (spec.kind === "bar" || spec.kind === "line")) out.stack = "total";
+        return out;
+      })
     };
+  }
+
+  // The chart's numbers as CSV, built here from the spec: x label, then
+  // one column per series. Opens as a data URL, so no statement runs again.
+  function chartCsv(spec) {
+    function cell(v) {
+      var s = String(v == null ? "" : v);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }
+    var lines = [[spec.x.label].concat(spec.series.map(function (s) { return s.name; })).map(cell).join(",")];
+    spec.x.values.forEach(function (label, i) {
+      lines.push([label].concat(spec.series.map(function (s) { return s.values[i]; })).map(cell).join(","));
+    });
+    return lines.join("\n") + "\n";
+  }
+
+  function chartDownload(spec) {
+    var a = el("a", "mt-1 inline-block text-xs text-blue-400 hover:underline", "Download CSV");
+    a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(chartCsv(spec));
+    a.download = ((spec.title || "chart").replace(/[^A-Za-z0-9_-]+/g, "-") || "chart") + ".csv";
+    return a;
   }
 
   // The page is dark; charts take ECharts' dark theme over its background.
@@ -37,11 +70,21 @@
     var chart = initChart(el);
     chart.setOption(chartOption(spec));
     window.addEventListener("resize", function () { chart.resize(); });
+    if (el.parentNode) el.parentNode.insertBefore(chartDownload(spec), el.nextSibling);
   }
 
   function renderStoredCharts() {
     document.querySelectorAll(".chart[data-chart]").forEach(function (el) {
       try { renderChart(el, JSON.parse(el.getAttribute("data-chart"))); } catch (e) { /* malformed spec: leave empty */ }
+    });
+  }
+
+  // Text for an ECharts formatter, which returns HTML: labels come from
+  // extracted document text, so every character that could start markup
+  // is escaped.
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
     });
   }
 
@@ -52,7 +95,7 @@
     result.nodes.forEach(function (n) { if (classes.indexOf(n.class_id) < 0) classes.push(n.class_id); });
     var roots = result.roots || [];
     return {
-      tooltip: { formatter: function (p) { return p.dataType === "edge" ? p.data.label.formatter : p.data.name + " (" + classes[p.data.category] + ")"; } },
+      tooltip: { formatter: function (p) { return escapeHtml(p.dataType === "edge" ? p.data.label.formatter : p.data.name + " (" + classes[p.data.category] + ")"); } },
       legend: [{ data: classes, bottom: 0 }],
       series: [{
         type: "graph",
@@ -100,8 +143,8 @@
     });
   }
 
-  // The body may be JSON ({error}) or, from the timeout or rate-limit
-  // layers, plain text: either way the message is what the user sees.
+  // An API error is JSON ({error, code}); a page route's may be plain
+  // text: either way the message is what the user sees.
   function errorMessage(res) {
     return res.text().then(function (text) {
       try { var j = JSON.parse(text); if (j && j.error) return j.error; } catch (e) { }
@@ -164,13 +207,6 @@
     return header;
   }
 
-  function citationLabel(c) {
-    var label = c.filename || "";
-    if (c.page) label += ", page " + c.page;
-    if (c.heading) label += ', under "' + c.heading + '"';
-    return label;
-  }
-
   function startAssistant(messages) {
     var article = el("article", "rounded border border-slate-800 bg-slate-900 p-4 msg-assistant");
     // Busy until complete, so a screen reader reads the finished answer
@@ -214,7 +250,7 @@
     var form = el("form");
     form.method = "post";
     form.action = "/w/" + ws + "/chat/" + sessionId + "/delete";
-    form.onsubmit = function () { return confirm("Delete this session?"); };
+    form.setAttribute("data-confirm", "Delete this session?");
     var button = el("button", "rounded px-2 py-1 text-slate-500 hover:bg-red-950 hover:text-red-400", "×");
     button.type = "submit";
     button.title = "Delete session";
@@ -263,6 +299,27 @@
     return rest;
   }
 
+  function setMode(form, chat) {
+    var sid = chat.getAttribute("data-session");
+    if (!sid) return;
+    var status = document.getElementById("status");
+    var wanted = form.mode.value;
+    fetch("/api/v1/workspaces/" + chat.getAttribute("data-workspace") + "/sessions/" + sid, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: wanted }),
+      credentials: "same-origin"
+    }).then(function (res) {
+      if (res.ok) {
+        chat.setAttribute("data-mode", wanted);
+        status.textContent = "Mode set to " + wanted + " for this session.";
+        return;
+      }
+      form.mode.value = chat.getAttribute("data-mode");
+      return errorMessage(res).then(function (message) { status.textContent = "Mode not changed: " + message; });
+    });
+  }
+
   function submitAsk(form, chat) {
     var ws = chat.getAttribute("data-workspace");
     var messages = document.getElementById("messages");
@@ -283,6 +340,11 @@
     var body = { prompt: prompt, mode: form.mode.value };
     if (chat.getAttribute("data-session")) body.session_id = chat.getAttribute("data-session");
     if (form.allow_write && form.allow_write.checked) body.allow_write = true;
+    if (form.documents) {
+      var picked = Array.prototype.filter.call(form.documents.options, function (o) { return o.selected; })
+        .map(function (o) { return o.value; });
+      if (picked.length) body.document_ids = picked;
+    }
 
     // Stop aborts the request; the server sees the stream close and
     // cancels the turn, recording what streamed so far.
@@ -328,6 +390,34 @@
     });
   }
 
+  // The rows a run_sql or create_chart step kept, as a collapsed grid with
+  // a form that exports the whole result through the SQL page's download.
+  function stepResult(step, ws) {
+    var details = el("details", "step-result mt-1");
+    details.appendChild(el("summary", "cursor-pointer text-slate-500", "rows"));
+    var wrap = el("div", "mt-1 max-h-72 overflow-auto rounded border border-slate-800");
+    var table = el("table", "min-w-full text-xs");
+    var head = el("tr", "border-b border-slate-700 text-left");
+    step.result.columns.forEach(function (c) { head.appendChild(el("th", "px-2 py-1 font-mono whitespace-nowrap", c)); });
+    var thead = el("thead"); thead.appendChild(head); table.appendChild(thead);
+    var tbody = el("tbody");
+    step.result.rows.forEach(function (row) {
+      var tr = el("tr", "border-b border-slate-800");
+      row.forEach(function (v) { tr.appendChild(el("td", "px-2 py-1 whitespace-nowrap", v == null ? "" : (typeof v === "object" ? JSON.stringify(v) : String(v)))); });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody); wrap.appendChild(table); details.appendChild(wrap);
+    if (step.rows != null && step.rows > step.result.rows.length) details.appendChild(el("p", "mt-1 text-slate-500", "first " + step.result.rows.length + " of " + step.rows + " rows"));
+    var form = el("form", "mt-1");
+    form.method = "post";
+    form.action = "/w/" + ws + "/sql.csv";
+    var sql = el("input"); sql.type = "hidden"; sql.name = "sql"; sql.value = step.detail;
+    form.appendChild(sql);
+    form.appendChild(el("button", "text-blue-400 hover:underline", "Export full result"));
+    details.appendChild(form);
+    return details;
+  }
+
   function handle(event, data, view, chat, status) {
     if (event === "status") {
       setWorking(view, data);
@@ -351,6 +441,7 @@
       if (pending) {
         pending.removeAttribute("data-pending");
         pending.appendChild(el("span", "text-slate-400", " → " + f.summary + ", " + f.duration_ms + " ms"));
+        if (f.result && f.result.columns && f.result.columns.length) pending.appendChild(stepResult(f, chat.getAttribute("data-workspace")));
       }
     } else if (event === "complete") {
       var r = JSON.parse(data);
@@ -368,17 +459,19 @@
         view.article.appendChild(c);
         renderChart(c, r.chart);
       }
-      (r.graph || []).forEach(function (result) {
+      (r.graph || []).forEach(function (result, i) {
+        if (!result.nodes.length) return;
         var g = el("div", "graph mt-3 h-72 rounded border border-slate-800");
         view.article.appendChild(g);
         renderGraph(g, result);
+        view.article.appendChild(el("p", "mt-1 text-xs text-slate-400", r.graph_summaries[i]));
       });
       if (r.citations && r.citations.length) {
         var ol = el("ol", "mt-3 space-y-1 text-sm text-slate-400");
         r.citations.forEach(function (cit) {
           var li = el("li", null, "[" + cit.n + "] ");
-          var a = el("a", "text-blue-400 hover:underline", citationLabel(cit));
-          a.href = "/w/" + chat.getAttribute("data-workspace") + "/documents#doc-" + cit.document_id;
+          var a = el("a", "text-blue-400 hover:underline", cit.label);
+          a.href = "/w/" + chat.getAttribute("data-workspace") + "/documents/" + cit.document_id + "/chunks/" + cit.chunk_index;
           li.appendChild(a);
           ol.appendChild(li);
         });
@@ -394,7 +487,9 @@
       }
       finishWorking(view);
     } else if (event === "error") {
-      view.body.textContent = "Error: " + data;
+      var failure = data;
+      try { failure = JSON.parse(data).error || data; } catch (e) { }
+      view.body.textContent = "Error: " + failure;
       view.article.classList.add("border-red-800");
       finishWorking(view);
     } else if (event === "permission_required") {
@@ -403,37 +498,40 @@
   }
 
   // A write the agent wants to run waits for the person: the statement,
-  // three answers, and the time the turn stops waiting. The answer goes to
-  // the API; the step that follows shows what happened.
+  // the answers the server offers, and the time the turn stops waiting.
+  // The answer goes to the API; the step that follows shows what happened.
   function askPermission(view, p, ws) {
     var expires = new Date(p.expires_at);
     var card = el("div", "mt-3 rounded border border-amber-700 p-3 text-sm");
-    card.appendChild(el("p", "font-medium", "This statement changes the workspace:"));
+    card.appendChild(el("p", "font-medium", p.heading));
     card.appendChild(el("pre", "mt-2 whitespace-pre-wrap font-mono text-slate-200", p.sql));
+    if (p.notice) {
+      card.appendChild(el("p", "mt-2 text-amber-200", p.notice));
+    }
     var buttons = el("div", "mt-3 flex flex-wrap gap-2");
     var note = el("p", "mt-2 text-slate-400", "The agent waits until " + expires.toLocaleTimeString() + ".");
     var timer = setTimeout(function () {
       buttons.remove();
       note.textContent = "Not run: no answer by " + expires.toLocaleTimeString() + ".";
     }, Math.max(0, expires - new Date()));
-    [["allow", "Run it", "rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500"],
-     ["deny", "Don't run it", "rounded border border-slate-700 px-3 py-2 hover:bg-slate-800"],
-     ["allow_turn", "Allow for this turn", "rounded border border-slate-700 px-3 py-2 hover:bg-slate-800"]
-    ].forEach(function (choice) {
-      var b = el("button", choice[2], choice[1]);
+    p.choices.forEach(function (choice) {
+      var style = choice.decision === "allow"
+        ? "rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500"
+        : "rounded border border-slate-700 px-3 py-2 hover:bg-slate-800";
+      var b = el("button", style, choice.label);
       b.type = "button";
       b.addEventListener("click", function () {
         clearTimeout(timer);
         buttons.remove();
-        note.textContent = choice[0] === "deny" ? "Not run." : "Running it…";
+        note.textContent = "…";
         fetch("/api/v1/workspaces/" + ws + "/sessions/" + p.session_id + "/permissions/" + p.request, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ decision: choice[0] }),
+          body: JSON.stringify({ decision: choice.decision }),
           credentials: "same-origin"
         }).then(function (res) {
           if (res.ok) {
-            if (choice[0] !== "deny") note.textContent = "Ran it.";
+            note.textContent = choice.reply;
             return;
           }
           return errorMessage(res).then(function (message) { note.textContent = "Not run: " + message; });
@@ -447,13 +545,73 @@
     setWorking(view, "Waiting for your answer…");
   }
 
-  // The Jobs page follows the job stream instead of polling: every change
-  // asks htmx to refetch the rows, at most once per quarter second. If the
-  // stream drops, the browser reconnects on its own (EventSource retries).
+  // A job's last known state, so a finish is announced once.
+  var jobStates = {};
+  var FINISHED = { succeeded: true, failed: true, cancelled: true };
+  var NOTIFY_KEY = "quack.notify";
+
+  function wantsNotifications() {
+    try { return window.localStorage.getItem(NOTIFY_KEY) === "on"; } catch (e) { return false; }
+  }
+
+  // A finished background job, said in the corner and, when the person
+  // asked and the page is hidden, by the browser. Only the kind, number,
+  // state, and the label the server already redacted for this caller.
+  function announceJob(job) {
+    var text = "Job #" + job.number + " (" + job.kind + ") " + job.state + (job.label ? ": " + job.label : "");
+    var toasts = document.getElementById("toasts");
+    if (toasts) {
+      var toast = document.createElement("div");
+      toast.className = "rounded border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 shadow";
+      toast.textContent = text;
+      toasts.appendChild(toast);
+      setTimeout(function () { toast.remove(); }, 8000);
+    }
+    if (document.hidden && wantsNotifications() && window.Notification && Notification.permission === "granted") {
+      new Notification("quack", { body: text });
+    }
+  }
+
+  // Note a job's state; whether it changed.
+  function noteJob(job) {
+    if (!job || !job.id) return false;
+    var before = jobStates[job.id];
+    jobStates[job.id] = job.state;
+    if (job.kind !== "chat" && FINISHED[job.state] && before && !FINISHED[before]) announceJob(job);
+    return before !== job.state;
+  }
+
+  // The strip's "Notify me": asks once, remembered in this browser.
+  function offerNotifications() {
+    var strip = document.getElementById("jobs-strip");
+    if (!strip || !window.Notification || Notification.permission === "denied" || wantsNotifications()) return;
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "mt-1 text-xs text-blue-400 hover:underline";
+    button.textContent = "Notify me when jobs finish";
+    button.addEventListener("click", function () {
+      Notification.requestPermission().then(function (answer) {
+        if (answer === "granted") {
+          try { window.localStorage.setItem(NOTIFY_KEY, "on"); } catch (e) { /* notifications stay off */ }
+          button.remove();
+        }
+      });
+    });
+    strip.insertAdjacentElement("afterend", button);
+  }
+
+  // Every page follows the job stream instead of polling. A job that starts
+  // or ends refetches the strip and the page's rows within a quarter
+  // second; progress alone refetches them at most every five seconds, since
+  // each refetch counts against the rate limit and is an audited page read.
+  // If the stream drops, the browser reconnects on its own.
+  var PROGRESS_REFRESH_MS = 5000;
+
   function followJobs() {
     var rows = document.querySelector("[data-jobs-stream]");
     if (!rows || !window.EventSource) return;
     var pending = null;
+    var lastProgress = 0;
     function refresh() {
       if (pending) return;
       pending = setTimeout(function () {
@@ -462,13 +620,39 @@
       }, 250);
     }
     var source = new EventSource(rows.getAttribute("data-jobs-stream"));
-    source.addEventListener("job", refresh);
-    source.addEventListener("jobs", refresh);
+    source.addEventListener("job", function (ev) {
+      var changed = true;
+      try { changed = noteJob(JSON.parse(ev.data)); } catch (e) { /* refresh as for a change */ }
+      if (changed) {
+        refresh();
+      } else if (Date.now() - lastProgress >= PROGRESS_REFRESH_MS) {
+        lastProgress = Date.now();
+        refresh();
+      }
+    });
+    source.addEventListener("jobs", function (ev) {
+      try { JSON.parse(ev.data).forEach(function (job) { jobStates[job.id] = job.state; }); } catch (e) { /* a refresh still follows */ }
+      refresh();
+    });
+    offerNotifications();
   }
 
   // Relative times go stale; swapped-in rows arrive as UTC.
   setInterval(function () { formatTimes(); }, 30000);
   document.addEventListener("htmx:after:swap", function () { formatTimes(); });
+
+  // Behaviour the templates declare with data attributes, since the page's
+  // policy runs no inline script: a form with data-confirm asks first, and a
+  // checkbox with data-select-all sets every box its selector matches.
+  document.addEventListener("submit", function (ev) {
+    var message = ev.target.getAttribute && ev.target.getAttribute("data-confirm");
+    if (message && !window.confirm(message)) ev.preventDefault();
+  }, true);
+  document.addEventListener("click", function (ev) {
+    var selector = ev.target.getAttribute && ev.target.getAttribute("data-select-all");
+    if (!selector) return;
+    document.querySelectorAll(selector).forEach(function (box) { box.checked = ev.target.checked; });
+  });
 
   document.addEventListener("DOMContentLoaded", function () {
     formatTimes();
@@ -478,10 +662,11 @@
     var chat = document.getElementById("chat");
     var form = document.getElementById("ask");
     if (chat && form) {
-      // A session's mode is fixed when it is created; the selector only
-      // chooses the mode of a new session.
+      // The selector shows the session's mode and changes it, as the
+      // terminal's /mode does; with no session yet it picks the new one's.
       var mode = chat.getAttribute("data-mode");
-      if (mode) { form.mode.value = mode; form.mode.disabled = true; form.mode.title = "Set when the session was created"; }
+      if (mode) form.mode.value = mode;
+      form.mode.addEventListener("change", function () { setMode(form, chat); });
       form.addEventListener("submit", function (ev) { ev.preventDefault(); submitAsk(form, chat); });
       // Enter sends; Shift+Enter adds a line.
       form.prompt.addEventListener("keydown", function (ev) {

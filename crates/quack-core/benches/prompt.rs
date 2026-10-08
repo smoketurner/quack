@@ -17,9 +17,11 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::text_to_sql::{self, PromptOptions, Window};
+use quack_core::analysis::search::DocumentScope;
+use quack_core::analysis::text_to_sql::{self, PromptOptions};
 use quack_core::embedding::Dimension;
 use quack_core::ids::{ChunkId, DocumentId};
+use quack_core::ingestion::parser::SectionKind;
 use quack_core::ontology::store::Revision;
 use quack_core::ontology::{Ontology, store as ontology_store};
 use quack_core::storage::sessions::ChatMode;
@@ -46,17 +48,23 @@ fn workspace() -> WorkspaceDb {
             .with_status(DocumentStatus::Ready),
         )
         .unwrap();
-        for c in 0..CHUNKS_PER_DOC {
-            db.insert_chunk(&NewChunk {
-                id: &ChunkId::from(format!("chunk-{d}-{c}")),
-                document_id: &DocumentId::from(doc_id.as_str()),
-                chunk_index: c as u32,
-                content: "flood exclusion premium coverage claim policy audit",
-                heading: None,
-                page: Some(c as u32),
-                embedding: None,
-            })
+        let text = "flood exclusion premium coverage claim policy audit";
+        let writer = db
+            .chunk_writer(&DocumentId::from(doc_id.as_str()), text)
             .unwrap();
+        for c in 0..CHUNKS_PER_DOC {
+            writer
+                .insert(&NewChunk {
+                    id: &ChunkId::from(format!("chunk-{d}-{c}")),
+                    chunk_index: c as u32,
+                    content: text,
+                    heading: None,
+                    page: Some(c as u32),
+                    kind: SectionKind::Body,
+                    locator: None,
+                    embedding: None,
+                })
+                .unwrap();
         }
     }
     for t in 0..TABLES {
@@ -82,13 +90,16 @@ fn prompt(c: &mut Criterion) {
     let db = workspace();
     let options = PromptOptions {
         mode: ChatMode::Chat,
+        today: jiff::civil::Date::constant(2026, 10, 5),
         write_policy: WritePolicy::Deny,
         pinned_token_budget: Tokens::new(4_000),
         context: Some(String::from(
             "This workspace tracks insurance claims and their supporting policy documents.",
         )),
         context_max_tokens: Tokens::new(2_000),
-        window: Window::Provider,
+        ollama_context_cap: None,
+        scope: DocumentScope::default(),
+        question: None,
     };
     c.bench_function("build_system_prompt/150_tables", |b| {
         b.iter(|| {

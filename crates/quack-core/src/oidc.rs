@@ -126,16 +126,54 @@ pub struct SignedIn {
     /// subject.
     pub username: String,
     pub token: CachedToken,
+    /// The person's groups, when `[server.oidc].groups_claim` names a claim.
+    pub groups: Groups,
+}
+
+/// What a token said about the person's groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Groups {
+    /// No `groups_claim` is configured: memberships are by hand.
+    NotRead,
+    /// The claim's values, a string or an array of strings; absent from
+    /// the token means none.
+    Listed(Vec<String>),
+    /// Entra left the groups out (`_claim_names` names the claim) because
+    /// the person is in too many; nothing is known, so nothing changes.
+    Overage,
+}
+
+impl Groups {
+    /// The groups to reconcile memberships against, when they are known.
+    #[must_use]
+    pub fn listed(&self) -> Option<&[String]> {
+        match self {
+            Self::Listed(groups) => Some(groups),
+            Self::NotRead | Self::Overage => None,
+        }
+    }
 }
 
 /// What renewing a signed-in user's token found.
 #[derive(Debug)]
 pub enum Renewal {
-    /// The issuer still vouches for them: the new token.
-    Renewed(CachedToken),
+    /// The issuer still vouches for them: the new token, and what the new
+    /// ID token says of them when the issuer sent one.
+    Renewed {
+        token: CachedToken,
+        reissued: Option<Reissued>,
+    },
     /// The issuer refused the refresh token (revoked, expired, the account
     /// disabled); the session must end.
     Revoked(String),
+}
+
+/// A renewal's ID token: the subject, which must be the one the sign-in
+/// named (`OpenID` Connect Core 12.2), and the person's groups now.
+#[derive(Debug)]
+pub struct Reissued {
+    pub subject: OidcSubject,
+    pub groups: Groups,
 }
 
 /// Who a token names, in an ID token or an access token alike: every claim
@@ -169,6 +207,37 @@ impl Person {
             .find_map(|claim| self.text(claim))
             .unwrap_or(subject.as_str())
             .to_owned()
+    }
+
+    /// The person's groups under `claim`: a string, an array of strings,
+    /// or absent (none). An Entra overage marker, `_claim_names` naming
+    /// the claim, means the groups were left out, not that there are none.
+    fn groups(&self, claim: Option<&str>) -> Groups {
+        let Some(claim) = claim else {
+            return Groups::NotRead;
+        };
+        let overage = self
+            .claims
+            .get("_claim_names")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|names| names.contains_key(claim));
+        if overage {
+            tracing::warn!(
+                claim,
+                "the token names the groups claim in _claim_names (an overage); memberships are left as they are"
+            );
+            return Groups::Overage;
+        }
+        let groups = match self.claims.get(claim) {
+            Some(serde_json::Value::String(one)) => vec![one.trim().to_owned()],
+            Some(serde_json::Value::Array(many)) => many
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|g| g.trim().to_owned())
+                .collect(),
+            Some(_) | None => Vec::new(),
+        };
+        Groups::Listed(groups.into_iter().filter(|g| !g.is_empty()).collect())
     }
 }
 
@@ -254,6 +323,18 @@ impl Claims {
 
     /// `OpenID` Connect Core 3.1.3.7 steps 2, 3, 4, 9, and 11.
     fn check(&self, issuer: &str, client_id: &str, nonce: &str, now: Timestamp) -> Result<()> {
+        self.check_issued(issuer, client_id, now)?;
+        if self.nonce.as_deref() != Some(nonce) {
+            return Err(sign_in_error(
+                "the ID token does not carry this sign-in's nonce",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Steps 2, 3, 4, and 9: what a renewal's ID token, which carries no
+    /// nonce of a sign-in, must pass too.
+    fn check_issued(&self, issuer: &str, client_id: &str, now: Timestamp) -> Result<()> {
         if self.iss != issuer {
             return Err(sign_in_error(format!(
                 "the ID token names issuer '{}', not '{issuer}'",
@@ -274,11 +355,6 @@ impl Claims {
             .map_err(|e| sign_in_error(format!("the ID token expiry is out of range: {e}")))?;
         if expires.checked_add(CLOCK_LEEWAY).unwrap_or(Timestamp::MAX) <= now {
             return Err(sign_in_error("the ID token has expired"));
-        }
-        if self.nonce.as_deref() != Some(nonce) {
-            return Err(sign_in_error(
-                "the ID token does not carry this sign-in's nonce",
-            ));
         }
         Ok(())
     }
@@ -328,6 +404,8 @@ pub struct Bearer {
     pub username: String,
     /// When the token stops being accepted.
     pub expires_at: Timestamp,
+    /// The person's groups, when `[server.oidc].groups_claim` names a claim.
+    pub groups: Groups,
 }
 
 impl std::fmt::Debug for SignIn {
@@ -387,6 +465,21 @@ impl SignIn {
     /// Returns an error when discovery fails or names another issuer.
     pub async fn discover(&self) -> Result<()> {
         self.endpoints().await.map(drop)
+    }
+
+    /// Whether discovery's `claims_supported` lists `claim`; `None` when
+    /// the issuer publishes no such list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery fails.
+    pub async fn claim_supported(&self, claim: &str) -> Result<Option<bool>> {
+        Ok(self
+            .endpoints()
+            .await?
+            .claims_supported
+            .as_ref()
+            .map(|claims| claims.iter().any(|c| c == claim)))
     }
 
     /// Check the callback's `iss` against the issuer (RFC 9207).
@@ -580,8 +673,25 @@ impl SignIn {
         }
         Ok(SignedIn {
             username: claims.person.username(&subject),
+            groups: claims.person.groups(self.config.groups_claim.as_deref()),
             subject,
             token: CachedToken::from_response(&response),
+        })
+    }
+
+    /// What a renewal's ID token says, once it passes the checks a sign-in's
+    /// does but the nonce.
+    async fn reissued(&self, id_token: &str, issuer: &str) -> Result<Reissued> {
+        let claims = Claims::of(id_token)?;
+        claims.check_issued(issuer, self.client_id().await?, Timestamp::now())?;
+        let claim = &self.config.subject_claim;
+        let subject = claims
+            .person
+            .subject(claim)
+            .ok_or_else(|| sign_in_error(format!("the renewed ID token has no {claim} claim")))?;
+        Ok(Reissued {
+            groups: claims.person.groups(self.config.groups_claim.as_deref()),
+            subject,
         })
     }
 
@@ -593,7 +703,7 @@ impl SignIn {
     /// reason that is not about this user (a misconfigured client); a
     /// refusal of the grant itself is [`Renewal::Revoked`].
     pub async fn renew(&self, refresh: &SecretString) -> Result<Renewal> {
-        let (client, _, credential) = self.client().await?;
+        let (client, issuer, credential) = self.client().await?;
         let outcome = client
             .exchange_refresh_token(&RefreshToken::new(refresh.expose_secret().to_owned()))
             .request_async(&self.http.sender(&credential))
@@ -604,7 +714,11 @@ impl SignIn {
                 if token.refresh_token.is_none() {
                     token.refresh_token = Some(refresh.clone());
                 }
-                Ok(Renewal::Renewed(token))
+                let reissued = match response.extra_fields().id_token.as_deref() {
+                    Some(id_token) => Some(self.reissued(id_token, &issuer).await?),
+                    None => None,
+                };
+                Ok(Renewal::Renewed { token, reissued })
             }
             Err(RequestTokenError::ServerResponse(refused))
                 if *refused.error() == BasicErrorResponseType::InvalidGrant =>
@@ -665,6 +779,7 @@ impl SignIn {
             .ok_or_else(|| bearer_error(format!("the token has no {claim} claim")))?;
         Ok(Bearer {
             username: claims.person.username(&subject),
+            groups: claims.person.groups(self.config.groups_claim.as_deref()),
             subject,
             expires_at: Timestamp::from_second(claims.exp).unwrap_or(Timestamp::MIN),
         })
@@ -735,7 +850,7 @@ fn bearer_error(message: impl Into<String>) -> Error {
 mod subject_tokens;
 mod tokens;
 
-pub use subject_tokens::{Origin, RENEW_MARGIN, Revocations, Stored, SubjectTokens};
+pub use subject_tokens::{RENEW_MARGIN, Revocations, Stored, SubjectTokens};
 pub use tokens::UserTokens;
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use rig::tool::{Tool, ToolContext};
 use schemars::generate::SchemaSettings;
@@ -10,34 +11,40 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::ids::{ChunkId, NodeId};
+use crate::ids::ChunkId;
+use crate::storage::profile::TableProfile;
 use crate::storage::workspace::{
-    ChunkScope, ChunkSearchResult, HybridLimits, StatementKind, TEMP_OBJECT_REFUSED, WorkspaceDb,
-    creates_temp_object, quote_ident,
+    ChunkSearchResult, DocumentFilter, DocumentInfo, DocumentStatus, HybridLimits, SearchMode,
+    StatementKind, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object, quote_ident,
 };
 use crate::storage::writer::Writer;
 
-use super::chart::{ChartKind, ChartSpec};
+use super::chart::{ChartKind, ChartSpec, SeriesColumns};
 use super::citations::{ChunkLocation, Markers};
 use super::events::{DetailPreview, ToolName, TurnRecorder};
-use super::policy::{RefusalFlag, WritePolicy};
-use super::rerank::{self, ModelReranker, RerankAnswer, Reranker, ScoredReranker};
-use super::text_to_sql::Modeled;
-use crate::config::{RerankMode, RetrievalConfig};
+use super::policy::{Exposure, Hold, RefusalFlag, WriteDecision, WritePolicy};
+use super::rerank::{ModelReranker, RerankAnswer, Reranker, ScoredReranker};
+use super::search::{DocumentScope, DocumentSearch, SearchOutcome, SearchVectors};
+use super::table_search::TableCards;
+use super::text_to_sql::{ColumnLine, Modeled};
+use crate::config::{GraphConfig, RerankMode, RetrievalConfig};
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
+use crate::graph::views::ClassView;
+use crate::ingestion::parser::PageCounts;
+use crate::llm::vision::ImageReader;
 use crate::llm::{RerankModel, SchemaCall};
 use crate::ontology::{ClassRelations, Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
-use crate::text::NonBlankText;
+use crate::text::{Fenced, NonBlankText, OneLine, Tokens};
 
 /// A workspace's writer: its one write connection, on a thread of its own
 /// with a two-tier line of work ([`crate::storage::writer`]).
 pub type SharedDb = Arc<Writer>;
 
 /// One reader connection of a pool: a `try_clone_reader` clone of the
-/// writer, used by one read at a time.
-type ReaderConn = Arc<Mutex<WorkspaceDb>>;
+/// writer, used by one read at a time; `None` once a lease closed it.
+type ReaderConn = Arc<Mutex<Option<WorkspaceDb>>>;
 
 /// Where one read runs.
 enum Slot<'a> {
@@ -145,7 +152,7 @@ impl ReaderDb {
                     let guard = conn
                         .lock()
                         .map_err(|e| Error::Analysis(format!("reader lock poisoned: {e}")))?;
-                    guard.read_only(f)
+                    guard.as_ref().ok_or(Error::WriterStopped)?.read_only(f)
                 })
                 .await
                 .map_err(|e| Error::Analysis(format!("database task failed: {e}")))?
@@ -215,7 +222,7 @@ impl ReaderDb {
         let readers: Vec<ReaderConn> = clones
             .into_iter()
             .filter_map(|clone| match clone {
-                Ok(db) => Some(Arc::new(Mutex::new(db))),
+                Ok(db) => Some(Arc::new(Mutex::new(Some(db)))),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -226,6 +233,52 @@ impl ReaderDb {
             })
             .collect();
         Self::from_pool(readers, Arc::clone(shared_db))
+    }
+}
+
+impl ReaderDb {
+    /// Every reader connection, locked until the lease drops, so a read
+    /// waits for it. Blocks until reads in progress end.
+    #[must_use]
+    pub fn lend(&self) -> ReaderLease<'_> {
+        ReaderLease {
+            degraded: &self.0.degraded,
+            slots: self
+                .0
+                .readers
+                .iter()
+                .map(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner))
+                .collect(),
+        }
+    }
+}
+
+/// A reader pool's connections, held by [`ReaderDb::lend`].
+pub struct ReaderLease<'a> {
+    degraded: &'a AtomicBool,
+    slots: Vec<MutexGuard<'a, Option<WorkspaceDb>>>,
+}
+
+impl ReaderLease<'_> {
+    /// Close every reader connection.
+    pub fn close(&mut self) {
+        for slot in &mut self.slots {
+            **slot = None;
+        }
+    }
+
+    /// Fill every slot with a clone of `db`, the writer's new connection; a
+    /// clone that fails sends every later read to the writer.
+    pub fn restore(&mut self, db: &WorkspaceDb) {
+        for slot in &mut self.slots {
+            match db.try_clone_reader() {
+                Ok(clone) => **slot = Some(clone),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to clone a reader connection again; every read will share the writer");
+                    self.degraded.store(true, Ordering::Relaxed);
+                }
+            }
+        }
     }
 }
 
@@ -270,9 +323,10 @@ impl From<Error> for ToolError {
 
 /// What one turn's tools share, handed to each call as a runtime scope of
 /// rig's `ToolContext` ([`Turn::context`]): the record of steps, citations,
-/// and cached embeddings; the write policy and whether a write was refused;
-/// the statements `run_sql` ran; and the chart and graph results the
-/// response carries. The tools hold only the workspace and its settings.
+/// and cached embeddings; the write policy, whether the turn has read
+/// document text, and whether a write was refused; the statements `run_sql`
+/// ran; and the chart and graph results the response carries. The tools
+/// hold only the workspace and its settings.
 #[derive(Clone)]
 pub struct Turn {
     pub recorder: TurnRecorder,
@@ -280,10 +334,16 @@ pub struct Turn {
     pub refused: RefusalFlag,
     pub chart: TurnSlot<ChartSpec>,
     pub graph: GraphResults,
+    /// What the turn has read that could dictate a write; the policy
+    /// decides each write given it.
+    exposure: Arc<Mutex<Exposure>>,
     /// Each statement `run_sql` ran with its parse tree blanked of literals
     /// (`WorkspaceDb::statement_shape`), to spot the model re-running one
     /// statement once per value.
     shapes: Arc<Mutex<Vec<(String, String)>>>,
+    /// The documents the person limited the question to; a search the
+    /// model narrows further stays within them.
+    scope: DocumentScope,
 }
 
 impl Turn {
@@ -295,14 +355,50 @@ impl Turn {
             refused: RefusalFlag::default(),
             chart: TurnSlot::default(),
             graph: Arc::new(Mutex::new(Vec::new())),
+            exposure: Arc::new(Mutex::new(Exposure::None)),
             shapes: Arc::new(Mutex::new(Vec::new())),
+            scope: DocumentScope::default(),
         }
+    }
+
+    /// The documents the person limited the turn to.
+    #[must_use]
+    pub fn scope(&self) -> &DocumentScope {
+        &self.scope
+    }
+
+    /// Limit the turn's document searches to `scope`.
+    #[must_use]
+    pub fn within(mut self, scope: DocumentScope) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// The context the turn's run hands its tools.
     #[must_use]
     pub fn context(&self) -> ToolContext {
         ToolContext::new().with_scope(Arc::new(self.clone()))
+    }
+
+    /// Record that a tool handed the model document or graph text. From
+    /// here on no write of this turn runs without a person's approval.
+    pub fn read_documents(&self) {
+        *self.exposure.lock().unwrap_or_else(PoisonError::into_inner) = Exposure::Documents;
+    }
+
+    /// Number `chunks` for citing. The model is about to read them, so any
+    /// at all is document text the turn has read.
+    fn cite(&self, chunks: &[ChunkSearchResult]) -> Markers {
+        if !chunks.is_empty() {
+            self.read_documents();
+        }
+        self.recorder.citations().register(chunks)
+    }
+
+    /// What the turn has read so far.
+    #[must_use]
+    pub fn exposure(&self) -> Exposure {
+        *self.exposure.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The turn a tool call belongs to.
@@ -387,10 +483,16 @@ impl JsonSchema for NoArgs {
 
 /// An optional text argument, trimmed, and absent when blank: a model that
 /// sends `""` for an argument it meant to leave out has left it out.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, utoipa::ToSchema)]
 pub struct NonBlank(Option<String>);
 
 impl NonBlank {
+    /// Text as a caller gave it, trimmed, and absent when blank.
+    #[must_use]
+    pub fn new(text: Option<&str>) -> Self {
+        Self(text.and_then(str::non_blank).map(str::to_owned))
+    }
+
     #[must_use]
     pub fn get(&self) -> Option<&str> {
         self.0.as_deref()
@@ -400,9 +502,7 @@ impl NonBlank {
 impl<'de> Deserialize<'de> for NonBlank {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = Option::<String>::deserialize(deserializer)?;
-        Ok(Self(
-            text.as_deref().and_then(str::non_blank).map(str::to_owned),
-        ))
+        Ok(Self::new(text.as_deref()))
     }
 }
 
@@ -425,10 +525,6 @@ impl JsonSchema for NonBlank {
 /// error instead of rows. The model reads what follows and retries.
 pub const SQL_ERROR_PREFIX: &str = "SQL error: ";
 
-/// Message returned to the model when a write is refused.
-pub const WRITE_REFUSED: &str = "This statement would modify the workspace and was not permitted. \
-Do not retry it. Tell the user it needs write permission (re-run with --allow-write).";
-
 /// Message returned to the model when a statement touches internal tables.
 pub const INTERNAL_TABLE_REFUSED: &str =
     "This statement references quack's internal tables, which are not available to queries.";
@@ -440,8 +536,23 @@ enum Gate {
     Read,
     /// Run it bare: a write the policy allowed.
     Write,
-    /// Do not run; hand this text back to the model.
+    /// Do not run a statement that is not a write the policy weighed;
+    /// hand this text back to the model.
     Reject(String),
+    /// A write that may not run, and why: the one shape of a refused write.
+    Refused(Hold),
+}
+
+/// A statement from the agent, screened before the write policy.
+enum Screened {
+    Kind(StatementKind),
+    /// It names one of quack's internal tables.
+    Internal,
+    /// It writes something named `graph_`.
+    ReservedGraph,
+    /// A read of a `graph_` view, whose labels and properties were
+    /// extracted from document text.
+    GraphRead,
 }
 
 /// What a statement from the agent passes before it runs: no internal
@@ -456,11 +567,20 @@ struct SqlGate {
 
 impl SqlGate {
     /// Classify `sql` for `run_sql`: a write runs only if `turn`'s write
-    /// policy allows it, and a refusal is recorded on the turn. A
-    /// permission prompt holds no connection while it waits.
+    /// policy allows it given what the turn has read, and a refusal is
+    /// recorded on the turn. A permission prompt holds no connection while
+    /// it waits.
     async fn check(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolError> {
-        let Some(kind) = self.classify(sql).await? else {
-            return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)));
+        let kind = match self.classify(sql).await? {
+            Screened::Kind(kind) => kind,
+            Screened::GraphRead => {
+                turn.read_documents();
+                return Ok(Gate::Read);
+            }
+            Screened::Internal => return Ok(Gate::Reject(String::from(INTERNAL_TABLE_REFUSED))),
+            Screened::ReservedGraph => {
+                return Ok(Gate::Reject(String::from(graph::views::RESERVED_REFUSED)));
+            }
         };
         match kind {
             StatementKind::Read => Ok(Gate::Read),
@@ -468,50 +588,66 @@ impl SqlGate {
             StatementKind::Write => {
                 if creates_temp_object(sql) {
                     // A mutating statement the caller wanted to run did
-                    // not run, same as WRITE_REFUSED:
+                    // not run, as with a refused write:
                     // AgentResponse::write_refused should say so.
                     turn.refused.set();
                     tracing::info!(sql, "refused a statement that would create a temp object");
                     return Ok(Gate::Reject(String::from(TEMP_OBJECT_REFUSED)));
                 }
-                let allowed = match turn.policy {
-                    WritePolicy::Allow => true,
-                    WritePolicy::Deny => false,
-                    WritePolicy::Ask => turn.recorder.ask_permission(sql).await,
+                let hold = match turn.policy.decide(turn.exposure()) {
+                    WriteDecision::Run => return Ok(Gate::Write),
+                    WriteDecision::Ask(hold) => {
+                        if turn.recorder.ask_permission(sql, hold).await {
+                            return Ok(Gate::Write);
+                        }
+                        hold
+                    }
+                    WriteDecision::Refuse(hold) => hold,
                 };
-                if allowed {
-                    Ok(Gate::Write)
-                } else {
-                    turn.refused.set();
-                    tracing::info!(sql, "refused write statement from agent");
-                    Ok(Gate::Reject(String::from(WRITE_REFUSED)))
-                }
+                turn.refused.set();
+                tracing::info!(sql, %hold, "refused write statement from agent");
+                Ok(Gate::Refused(hold))
             }
         }
     }
 
     /// Classify `sql` for a chart, which only reads: any write is
-    /// rejected, and that is not the turn's refused write.
-    async fn check_read_only(&self, sql: &str) -> Result<Gate, ToolError> {
+    /// refused as not permitted, and that is not the turn's refused write.
+    async fn check_read_only(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolError> {
         Ok(match self.classify(sql).await? {
-            None => Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)),
-            Some(StatementKind::Read) => Gate::Read,
-            Some(StatementKind::Invalid(msg)) => Gate::Reject(format!("SQL syntax error: {msg}")),
-            Some(StatementKind::Write) => Gate::Reject(String::from(WRITE_REFUSED)),
+            Screened::GraphRead => {
+                turn.read_documents();
+                Gate::Read
+            }
+            Screened::Internal => Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)),
+            Screened::Kind(StatementKind::Read) => Gate::Read,
+            Screened::Kind(StatementKind::Invalid(msg)) => {
+                Gate::Reject(format!("SQL syntax error: {msg}"))
+            }
+            Screened::Kind(StatementKind::Write) | Screened::ReservedGraph => {
+                Gate::Refused(Hold::NotPermitted)
+            }
         })
     }
 
-    /// The statement's kind on a reader, or `None` when it names an
-    /// internal table.
-    async fn classify(&self, sql: &str) -> Result<Option<StatementKind>, ToolError> {
+    /// The statement's kind on a reader, unless it names an internal table
+    /// or writes something in the reserved `graph_` space.
+    async fn classify(&self, sql: &str) -> Result<Screened, ToolError> {
         let sql = sql.to_owned();
         Ok(self
             .db
             .with_db(move |db| {
                 if db.references_internal_table(&sql)? {
-                    return Ok(None);
+                    return Ok(Screened::Internal);
                 }
-                db.classify_statement(&sql).map(Some)
+                let kind = db.classify_statement(&sql)?;
+                if graph::views::write_names_reserved(&sql, &kind) {
+                    return Ok(Screened::ReservedGraph);
+                }
+                if kind == StatementKind::Read && db.references_graph_view(&sql)? {
+                    return Ok(Screened::GraphRead);
+                }
+                Ok(Screened::Kind(kind))
             })
             .await?)
     }
@@ -528,7 +664,12 @@ pub struct RunSqlTool {
     /// reads through it.
     gate: SqlGate,
     max_query_rows: u32,
+    /// Rows kept on the step for the transcript.
+    step_result_rows: usize,
 }
+
+/// Rows a step keeps when the config is not consulted (tests).
+pub const DEFAULT_STEP_RESULT_ROWS: usize = 50;
 
 impl RunSqlTool {
     #[must_use]
@@ -537,7 +678,15 @@ impl RunSqlTool {
             db,
             gate: SqlGate { db: reader_db },
             max_query_rows,
+            step_result_rows: DEFAULT_STEP_RESULT_ROWS,
         }
+    }
+
+    /// Keep `rows` rows of each result on its step.
+    #[must_use]
+    pub const fn with_step_rows(mut self, rows: usize) -> Self {
+        self.step_result_rows = rows;
+        self
     }
 
     /// The note for a statement that repeats an earlier one this turn with
@@ -604,6 +753,10 @@ impl Tool for RunSqlTool {
                 step.finish("refused");
                 return Ok(message);
             }
+            Gate::Refused(hold) => {
+                step.finish(hold.summary());
+                return Ok(String::from(hold.refusal()));
+            }
             Gate::Read => true,
             Gate::Write => false,
         };
@@ -635,10 +788,15 @@ impl Tool for RunSqlTool {
             // statement itself errored, since an earlier
             // statement in a batch can have already run.
             self.gate.db.observe_write().await;
+            TableProfile::after_write(&self.db).await;
         }
         match results {
             Ok(results) => {
-                step.finish_rows(u64::try_from(results.total_rows).unwrap_or(u64::MAX));
+                step.finish_with_result(
+                    u64::try_from(results.total_rows).unwrap_or(u64::MAX),
+                    results.results.clone(),
+                    self.step_result_rows,
+                );
                 let mut text = results.to_model_text()?;
                 if let Some(note) = Self::repeated_note(&turn, &args.query, shape) {
                     text.push('\n');
@@ -769,13 +927,17 @@ pub struct SearchDocumentsArgs {
     /// Number of chunks to return (default from config)
     pub top_k: Option<u32>,
     /// Restrict the search to these documents: ids from `list_documents`
-    /// (prefixes accepted) or exact file names
+    /// (prefixes accepted), exact file names, or exact titles
     #[serde(default)]
     pub document_ids: Vec<String>,
     /// Restrict the search to passages this entity was extracted from,
     /// named as it appears in the knowledge graph
     #[serde(default)]
     pub entity: NonBlank,
+    /// Restrict the search to documents of these types, sources, or tags,
+    /// written in a date range, or by an author
+    #[serde(default)]
+    pub filters: DocumentFilter,
 }
 
 impl<M> Tool for SearchDocumentsTool<M>
@@ -821,24 +983,27 @@ where
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let turn = Turn::of(context)?;
-        let entity = args.entity.get();
-        let detail = match (args.document_ids.is_empty(), entity) {
-            (true, None) => args.query.clone(),
-            (true, Some(entity)) => format!("{} (about {entity})", args.query),
-            (false, None) => format!("{} (in {})", args.query, args.document_ids.join(", ")),
-            (false, Some(entity)) => format!(
-                "{} (about {entity}, in {})",
-                args.query,
-                args.document_ids.join(", ")
-            ),
+        let top_k = args
+            .top_k
+            .unwrap_or(self.default_top_k)
+            .clamp(1, MAX_SEARCH_TOP_K);
+        let search = DocumentSearch {
+            query: args.query,
+            top_k,
+            documents: args.document_ids,
+            entity: args.entity.get().map(str::to_owned),
+            filter: args.filters,
+            mode: SearchMode::Hybrid,
         };
-        let step = turn.recorder.start(ToolName::SearchDocuments, &detail);
+        let step = turn
+            .recorder
+            .start(ToolName::SearchDocuments, &search.describe());
         let query_vec: Option<Vector> = match &self.embedding_model {
             None => None,
             Some(model) => {
                 match turn
                     .recorder
-                    .embed_cached(model, Input::Query(args.query.clone()))
+                    .embed_cached(model, Input::Query(search.query.clone()))
                     .await
                 {
                     Ok(vector) => Some(vector),
@@ -847,10 +1012,6 @@ where
             }
         };
 
-        let top_k = args
-            .top_k
-            .unwrap_or(self.default_top_k)
-            .clamp(1, MAX_SEARCH_TOP_K);
         let fetch = self
             .rerank
             .as_ref()
@@ -860,8 +1021,11 @@ where
         // so `search_documents(query, entity)` is one embed call each,
         // cached against a later call (search_graph, find_path) that
         // resolves the same label again this turn.
-        let entity_vec = match entity {
+        let entity_vec = match search.entity.as_deref() {
             Some(entity) => {
+                // Its resolution answers with the entity's chunks or with
+                // the graph's closest labels.
+                turn.read_documents();
                 turn.recorder
                     .embed_label(self.embedding_model.as_ref(), entity)
                     .await?
@@ -869,52 +1033,29 @@ where
             None => None,
         };
 
-        let query = args.query.clone();
-        let document_ids = args.document_ids.clone();
-        let entity = entity.map(str::to_owned);
-        let rrf_k = self.rrf_k;
-        let results = self
+        let vectors = SearchVectors {
+            query: query_vec,
+            entity: entity_vec,
+        };
+        let limits = HybridLimits {
+            top_k: fetch,
+            rrf_k: self.rrf_k,
+        };
+        let (searched, within) = (search.clone(), turn.scope.clone());
+        let explained = self
             .db
-            .with_db(move |db| {
-                let mut scope = ChunkScope::for_documents(db, &document_ids)?;
-                if let Some(entity) = entity.as_deref() {
-                    scope = scope.and_chunks(entity_chunks(db, entity, entity_vec.as_ref())?);
-                }
-                match &query_vec {
-                    Some(vector) => db.search_hybrid_chunks(
-                        &query,
-                        vector,
-                        HybridLimits {
-                            top_k: fetch,
-                            rrf_k,
-                        },
-                        &scope,
-                    ),
-                    None => db.search_keyword_chunks(&query, fetch, &scope),
-                }
-            })
+            .with_db(move |db| searched.explain(db, &vectors, limits, &within))
             .await;
-        let results = match results {
-            Ok(results) => results,
+        let explanation = match explained {
+            Ok(explanation) => explanation,
             Err(e) => return Err(step.fail(e.into())),
         };
-        let (results, note) = match &self.rerank {
-            Some(rerank) => {
-                let keep = usize::try_from(top_k).unwrap_or(usize::MAX);
-                let rerank::Reranked {
-                    results: kept,
-                    outcome,
-                } = rerank::apply(rerank.reranker.as_ref(), &args.query, results, keep).await;
-                let note = match outcome {
-                    rerank::RerankOutcome::Skipped => String::new(),
-                    rerank::RerankOutcome::Reranked(name) => format!(", reranked by {name}"),
-                    rerank::RerankOutcome::Failed(_) => String::from(", reranking failed"),
-                };
-                (kept, note)
-            }
-            None => (results, String::new()),
-        };
-        step.finish(format!("{} chunks{note}", results.len()));
+        let SearchOutcome {
+            explanation,
+            rerank: outcome,
+        } = SearchOutcome::rerank(explanation, self.rerank.as_ref(), &search.query, top_k).await;
+        let results = explanation.fused;
+        step.finish(format!("{} chunks{}", results.len(), outcome.suffix()));
         let chunk_ids: Vec<ChunkId> = results.iter().map(|r| r.id.clone()).collect();
         // Best effort: the annotation is extra context, so a graph that
         // cannot be read must not fail a search that already succeeded.
@@ -923,45 +1064,13 @@ where
             .with_db(move |db| graph::store::entities_of_chunks(db, &chunk_ids, CHUNK_ENTITIES))
             .await
             .unwrap_or_default();
-        let markers = turn.recorder.citations().register(&results);
+        let markers = turn.cite(&results);
         format_search_results(&results, markers, &entities).map_err(Into::into)
     }
 }
 
 /// Entities named per retrieved chunk before the rest are counted.
 const CHUNK_ENTITIES: usize = 8;
-
-/// The chunks an entity was extracted from, for `search_documents(entity)`.
-/// A name that resolves to nothing is an error naming the closest labels,
-/// and an entity that exists only in mapped tables says so: both beat an
-/// empty result the model reads as "the documents do not cover this".
-fn entity_chunks(
-    db: &WorkspaceDb,
-    entity: &str,
-    embedding: Option<&Vector>,
-) -> error::Result<Vec<ChunkId>> {
-    let nodes = graph::traverse::resolve_entry(db, entity, None, embedding)?;
-    if nodes.is_empty() {
-        let unknown = UnknownEntity::find(db, entity, embedding);
-        return Err(if unknown.closest.is_empty() {
-            Error::Analysis(format!(
-                "{unknown}; drop the entity argument to search every document"
-            ))
-        } else {
-            unknown.into()
-        });
-    }
-    let ids: Vec<NodeId> = nodes.iter().map(|n| n.id.clone()).collect();
-    let chunks = graph::store::chunks_of_nodes(db, &ids)?;
-    if chunks.is_empty() {
-        return Err(Error::Analysis(format!(
-            "'{entity}' is in the graph, but only from table rows, so no document passage is \
-             tied to it; search_graph has its connections, or drop the entity argument to search \
-             every document"
-        )));
-    }
-    Ok(chunks)
-}
 
 /// Render search hits as numbered, citable chunks.
 ///
@@ -971,15 +1080,17 @@ fn entity_chunks(
 pub fn format_search_results(
     results: &[ChunkSearchResult],
     markers: Markers,
-    entities: &std::collections::BTreeMap<ChunkId, Vec<String>>,
+    entities: &BTreeMap<ChunkId, Vec<String>>,
 ) -> Result<String, std::fmt::Error> {
     if results.is_empty() {
         return Ok(String::from(
             "No relevant chunks found. Tell the user the documents do not appear to cover this.",
         ));
     }
-    let mut out = String::from(
-        "Retrieved chunks. Cite each fact you use with the chunk's [n] marker at the end of the sentence.\n\n",
+    let mut out = format!(
+        "Retrieved chunks. Cite each fact you use with the chunk's [n] marker at the end of the \
+         sentence. {}\n\n",
+        Fenced::NOTICE
     );
     for (i, chunk) in results.iter().enumerate() {
         let n = markers.nth(i);
@@ -1000,10 +1111,273 @@ pub fn format_search_results(
             chunk.chunk_index,
             chunk.score
         )?;
-        writeln!(out, "{}", chunk.content.trim())?;
+        writeln!(out, "{}", Fenced(chunk.content.trim()))?;
         writeln!(out)?;
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// read_document
+// ---------------------------------------------------------------------------
+
+/// Chunks one `read_document` call fetches at most; the token budget then
+/// decides how many of them the model sees.
+const MAX_READ_CHUNKS: u32 = 50;
+
+pub struct ReadDocumentTool {
+    db: ReaderDb,
+    /// Chunk text one call hands the model, at most:
+    /// `[retrieval].pinned_token_budget`, the budget a whole-document read
+    /// already has.
+    budget: Tokens,
+}
+
+impl ReadDocumentTool {
+    #[must_use]
+    pub const fn new(db: ReaderDb, retrieval: &RetrievalConfig) -> Self {
+        Self {
+            db,
+            budget: retrieval.pinned_token_budget,
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ReadDocumentArgs {
+    /// The document: an id from `list_documents` (a prefix is enough),
+    /// its exact file name, or its exact title
+    pub document: String,
+    /// Position of the first chunk to read, counting from 0 (default 0)
+    pub from: Option<u32>,
+    /// How many chunks to read (default: as many as fit the budget, at
+    /// most 50)
+    pub limit: Option<u32>,
+}
+
+impl Tool for ReadDocumentTool {
+    const NAME: &'static str = ToolName::ReadDocument.as_str();
+    type Error = ToolError;
+    type Args = ReadDocumentArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        String::from(
+            "Read one document's chunks in order from a position, for a whole section or a \
+             document's start rather than the best-matching passages. Returns consecutive \
+             chunks numbered [n] for citing, like search_documents, within a token budget, \
+             and says where to continue.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        ReadDocumentArgs::schema()
+    }
+
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let turn = Turn::of(context)?;
+        let from = args.from.unwrap_or(0);
+        let limit = args
+            .limit
+            .unwrap_or(MAX_READ_CHUNKS)
+            .clamp(1, MAX_READ_CHUNKS);
+        let step = turn.recorder.start(
+            ToolName::ReadDocument,
+            &format!("{} from {from}", args.document),
+        );
+        let wanted = args.document;
+        let within = turn.scope().clone();
+        let read = self
+            .db
+            .with_db(move |db| {
+                let documents = db.list_documents()?;
+                let document = DocumentInfo::find(&documents, &wanted)?.clone();
+                // The person's scope bounds whole-document reads as it does search.
+                within.narrow(vec![document.id.clone()])?;
+                if document.status != DocumentStatus::Ready {
+                    return Err(Error::Analysis(format!(
+                        "{} is {}, not ready, so its text cannot be read",
+                        OneLine(&document.filename),
+                        document.status
+                    )));
+                }
+                let Some(total) = document.chunk_count.filter(|n| *n > 0) else {
+                    return Err(Error::Analysis(format!(
+                        "{} holds no text chunks: a tabular file is loaded as a table, which \
+                         run_sql reads",
+                        OneLine(&document.filename)
+                    )));
+                };
+                let chunks = db.document_chunks(&document.id, from, limit)?;
+                Ok((document, chunks, total))
+            })
+            .await;
+        let (document, chunks, total) = match read {
+            Ok(read) => read,
+            Err(e) => return Err(step.fail(e.into())),
+        };
+        // At least one chunk goes out whatever its size; the rest only
+        // while they fit the budget.
+        let mut kept: Vec<ChunkSearchResult> = Vec::with_capacity(chunks.len());
+        let mut used = Tokens::default();
+        for chunk in chunks {
+            let cost = Tokens::estimate(&chunk.content);
+            if !kept.is_empty() && used.saturating_add(cost) > self.budget {
+                break;
+            }
+            used = used.saturating_add(cost);
+            kept.push(chunk);
+        }
+        step.finish(format!("{} chunks", kept.len()));
+        let filename = OneLine(&document.filename);
+        let (Some(first), Some(last)) = (kept.first(), kept.last()) else {
+            return Ok(format!(
+                "{filename} has {total} chunks, positions 0 to {}; from = {from} is past the \
+                 end.",
+                total.saturating_sub(1)
+            ));
+        };
+        let (first, last) = (first.chunk_index, last.chunk_index);
+        let markers = turn.cite(&kept);
+        let mut out = format_search_results(&kept, markers, &BTreeMap::new())?;
+        if i64::from(last).saturating_add(1) >= total {
+            writeln!(
+                out,
+                "End of {filename}: chunks {first} to {last} of {total}."
+            )?;
+        } else {
+            writeln!(
+                out,
+                "Chunks {first} to {last} of {total} in {filename}; call read_document again \
+                 with from = {} for the rest.",
+                last.saturating_add(1)
+            )?;
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// view_image
+// ---------------------------------------------------------------------------
+
+/// Looks at an image document again for one question: the stored image and
+/// the question go to the chat model, which reads images. Registered only
+/// when the chat model is marked `images = true` and a ready document is
+/// an image.
+pub struct ViewImageTool {
+    db: ReaderDb,
+    reader: Arc<ImageReader>,
+}
+
+impl ViewImageTool {
+    #[must_use]
+    pub fn new(db: ReaderDb, reader: ImageReader) -> Self {
+        Self {
+            db,
+            reader: Arc::new(reader),
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ViewImageArgs {
+    /// The image document: an id from `list_documents` (a prefix is enough),
+    /// its exact file name, or its exact title
+    pub document: String,
+    /// What to find out from the image, as a full question
+    pub question: String,
+}
+
+impl Tool for ViewImageTool {
+    const NAME: &'static str = ToolName::ViewImage.as_str();
+    type Error = ToolError;
+    type Args = ViewImageArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        String::from(
+            "Look at an image document (a PNG, JPEG, WebP, or GIF the workspace holds) to answer \
+             a question its stored description does not: a value in a chart, a label, a \
+             detail. Returns what the image shows, citable as [n] like a document chunk.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        ViewImageArgs::schema()
+    }
+
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let turn = Turn::of(context)?;
+        let step = turn.recorder.start(
+            ToolName::ViewImage,
+            &format!("{}: {}", args.document, args.question),
+        );
+        let wanted = args.document;
+        let within = turn.scope().clone();
+        let found = self
+            .db
+            .with_db(move |db| {
+                let documents = db.list_documents()?;
+                let document = DocumentInfo::find(&documents, &wanted)?.clone();
+                within.narrow(vec![document.id.clone()])?;
+                if document.status != DocumentStatus::Ready {
+                    return Err(Error::Analysis(format!(
+                        "{} is {}, not ready, so it cannot be viewed",
+                        OneLine(&document.filename),
+                        document.status
+                    )));
+                }
+                let Some(image) = db.stored_image(&document) else {
+                    return Err(Error::Analysis(format!(
+                        "{} is not an image; read_document reads its text",
+                        OneLine(&document.filename)
+                    )));
+                };
+                let chunks = db.document_chunks(&document.id, 0, 1)?;
+                Ok((document, image, chunks))
+            })
+            .await;
+        let (document, image, chunks) = match found {
+            Ok(found) => found,
+            Err(e) => return Err(step.fail(e.into())),
+        };
+        let answer = match image.read().await {
+            Ok(bytes) => {
+                self.reader
+                    .read(&bytes, image.format(), &args.question)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(e) => return Err(step.fail(e.into())),
+        };
+        step.finish(format!("{} characters", answer.chars().count()));
+        // What the image shows can carry instructions like any document.
+        turn.read_documents();
+        let markers = turn.cite(&chunks);
+        let label = if chunks.is_empty() {
+            String::new()
+        } else {
+            format!("[{}] ", markers.nth(0))
+        };
+        Ok(format!(
+            "What {label}{} shows, as the chat model read it. Cite it with its marker. {}\n{}\n",
+            OneLine(&document.filename),
+            Fenced::NOTICE,
+            Fenced(&answer)
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,11 +1401,12 @@ impl Tool for DescribeTableTool {
     fn description(&self) -> String {
         String::from(
             "Describe one table in the workspace: its row count, every column with its DuckDB \
-             type, and up to 3 sample rows. Use it for a table the system prompt lists without \
-             columns or sample rows, or to confirm exact column names before writing SQL. A name \
-             that matches no table returns an error followed by the names of the tables that \
-             exist. It does not profile values; for min, max, null share, or distinct counts, \
-             run SUMMARIZE <table> with run_sql.",
+             type and, when the owner gave them, its meaning, unit, and synonyms, the owner's note \
+             on the table, warnings from its profile (empty columns, numbers or dates stored as \
+             text, a key that repeats), the measures defined over it, and up to 3 sample rows. A \
+             name that matches no table returns an error followed by the names of the tables that \
+             exist. For min, max, or distinct counts per column, run SUMMARIZE <table> with \
+             run_sql.",
         )
     }
 
@@ -1076,26 +1451,8 @@ impl Tool for DescribeTableTool {
             }
         };
 
-        let mut output = String::new();
-        writeln!(output, "Table: {}", desc.table_name)?;
-        writeln!(output, "Rows: {}", desc.row_count)?;
-        writeln!(output, "Columns:")?;
-        for col in &desc.columns {
-            writeln!(output, "  - {} ({})", col.name, col.column_type)?;
-        }
-
-        if !desc.sample_rows.rows.is_empty() {
-            writeln!(output, "\nSample rows:")?;
-            let mut buf = Vec::new();
-            if desc.sample_rows.write_table(&mut buf).is_ok()
-                && let Ok(text) = String::from_utf8(buf)
-            {
-                write!(output, "{text}")?;
-            }
-        }
-
         step.finish(format!("{} columns", desc.columns.len()));
-        Ok(output)
+        Ok(desc.to_string())
     }
 }
 
@@ -1164,6 +1521,139 @@ impl Tool for ListTablesTool {
 }
 
 // ---------------------------------------------------------------------------
+// find_tables
+// ---------------------------------------------------------------------------
+
+/// Tables `find_tables` returns by default, and at most.
+const FIND_TABLES_TOP_K: u32 = 10;
+const MAX_FIND_TABLES_TOP_K: u32 = 25;
+
+/// Ranks every table against a question, for a workspace with more tables
+/// than the prompt describes (`table_search`).
+pub struct FindTablesTool<M> {
+    db: ReaderDb,
+    /// `None` ranks by keyword alone.
+    embedding_model: Option<Embedder<M>>,
+    rrf_k: u32,
+}
+
+impl<M> FindTablesTool<M> {
+    #[must_use]
+    pub const fn new(db: ReaderDb, embedding_model: Option<Embedder<M>>, rrf_k: u32) -> Self {
+        Self {
+            db,
+            embedding_model,
+            rrf_k,
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FindTablesArgs {
+    /// What the tables should hold: the question, or the words for the
+    /// data it needs
+    pub query: String,
+    /// Number of tables to return (default 10, at most 25)
+    pub top_k: Option<u32>,
+}
+
+impl<M> Tool for FindTablesTool<M>
+where
+    M: EmbeddingModel + Send + Sync,
+{
+    const NAME: &'static str = ToolName::FindTables.as_str();
+    type Error = ToolError;
+    type Args = FindTablesArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        String::from(
+            "Find the tables that hold the data a question needs, ranked by their names, columns, \
+             the owner's notes, the ontology's descriptions and synonyms, and their common values. \
+             Returns each table with its row count, note, columns with their meaning, and \
+             warnings, so describe_table is rarely needed afterwards.",
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        FindTablesArgs::schema()
+    }
+
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let turn = Turn::of(context)?;
+        let step = turn.recorder.start(ToolName::FindTables, &args.query);
+        let query_vec = match &self.embedding_model {
+            None => None,
+            Some(model) => match turn
+                .recorder
+                .embed_cached(model, Input::Query(args.query.clone()))
+                .await
+            {
+                Ok(vector) => Some(vector),
+                Err(e) => return Err(ToolError::Embedding(step.fail(e).to_string())),
+            },
+        };
+        let top_k = args
+            .top_k
+            .unwrap_or(FIND_TABLES_TOP_K)
+            .clamp(1, MAX_FIND_TABLES_TOP_K);
+        let (query, rrf_k) = (args.query.clone(), self.rrf_k);
+        let found = self
+            .db
+            .with_db(move |db| {
+                let ontology = ontology_store::current(db)?;
+                let ranked = TableCards::read(db, ontology.as_ref())?.rank(
+                    db,
+                    &query,
+                    query_vec.as_ref(),
+                    usize::try_from(top_k).unwrap_or(usize::MAX),
+                    rrf_k,
+                )?;
+                let mut described = Vec::with_capacity(ranked.len());
+                for table in ranked {
+                    described.push(db.describe_table_under(&table.table, ontology.as_ref()));
+                }
+                Ok(described)
+            })
+            .await;
+        let found = match found {
+            Ok(found) => found,
+            Err(e) => return Err(step.fail(e.into())),
+        };
+        step.finish(format!("{} tables", found.len()));
+        if found.is_empty() {
+            return Ok(String::from(
+                "No table matched those words. Try other words for the data, or list_tables.",
+            ));
+        }
+        let mut output = String::from("Tables, best match first:\n");
+        for desc in found {
+            let Ok(desc) = desc else {
+                continue;
+            };
+            writeln!(output, "- {} ({} rows)", desc.table_name, desc.row_count)?;
+            if let Some(note) = &desc.note {
+                writeln!(output, "  Note (from the owner): {}", OneLine(note))?;
+            }
+            for col in &desc.columns {
+                writeln!(output, "  - {}", ColumnLine(col))?;
+            }
+            for flagged in &desc.warnings {
+                writeln!(output, "  ! {}: {}", flagged.column, flagged.warning)?;
+            }
+            for measure in &desc.measures {
+                writeln!(output, "  measure {measure}")?;
+            }
+        }
+        Ok(output)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // list_documents
 // ---------------------------------------------------------------------------
 
@@ -1178,10 +1668,13 @@ impl Tool for ListDocumentsTool {
     fn description(&self) -> String {
         String::from(
             "List every ingested document with its id, file name, status (queued, processing, \
-             ready, or error), MIME type, source, and title when it has one. A document's text is \
-             searchable once its status is ready; a tabular file is loaded as a table instead. To \
-             search within particular documents, pass their ids (a prefix is enough) or exact \
-             file names as search_documents' document_ids. Takes no arguments.",
+             ready, or error), MIME type, source, title, author, authored date, and tags when it \
+             has them. A document's text is \
+             searchable once its status is ready; a tabular file is loaded as a table instead. A \
+             document marked with unreadable pages or pages without text was only partly read: \
+             those pages are not searchable. To \
+             search within particular documents, pass their ids (a prefix is enough), exact \
+             file names, or exact titles as search_documents' document_ids. Takes no arguments.",
         )
     }
 
@@ -1206,11 +1699,25 @@ impl Tool for ListDocumentsTool {
             let title = doc
                 .title
                 .as_deref()
-                .map_or(String::new(), |t| format!(", title: {t}"));
+                .map_or(String::new(), |t| format!(", title: {}", OneLine(t)));
+            let pages = PageCounts::suffix(doc.pages);
+            let author = doc
+                .author
+                .as_deref()
+                .map_or(String::new(), |a| format!(", author: {}", OneLine(a)));
+            let authored = doc
+                .authored_at
+                .as_deref()
+                .map_or(String::new(), |d| format!(", authored: {d}"));
+            let tags = if doc.tags.is_empty() {
+                String::new()
+            } else {
+                format!(", tags: {}", OneLine(&doc.tags.join(", ")))
+            };
             writeln!(
                 output,
-                "- {} (id: {}, status: {}, type: {}, source: {}{title})",
-                doc.filename,
+                "- {} (id: {}, status: {}, type: {}, source: {}{title}{author}{authored}{tags}{pages})",
+                OneLine(&doc.filename),
                 doc.id,
                 doc.status,
                 doc.mime_type.as_deref().unwrap_or("unknown"),
@@ -1258,6 +1765,8 @@ impl<T> TurnSlot<T> {
 pub struct CreateChartTool {
     /// Charts only read: the gate lets no write through.
     gate: SqlGate,
+    /// Rows kept on the step for the transcript.
+    step_result_rows: usize,
 }
 
 impl CreateChartTool {
@@ -1265,7 +1774,15 @@ impl CreateChartTool {
     pub const fn new(db: ReaderDb) -> Self {
         Self {
             gate: SqlGate { db },
+            step_result_rows: DEFAULT_STEP_RESULT_ROWS,
         }
+    }
+
+    /// Keep `rows` rows of each chart's result on its step.
+    #[must_use]
+    pub const fn with_step_rows(mut self, rows: usize) -> Self {
+        self.step_result_rows = rows;
+        self
     }
 }
 
@@ -1280,8 +1797,15 @@ pub struct CreateChartArgs {
     pub kind: String,
     /// Column for the x axis (category labels; slice names for pie)
     pub x: String,
-    /// Numeric column for the y axis (slice values for pie)
-    pub y: String,
+    /// Numeric column(s) for the y axis, one series each (slice values
+    /// for pie, which takes one). Several for "revenue and cost by month".
+    pub y: Vec<String>,
+    /// For long-format rows ("orders by month, one line per region"): the
+    /// column whose distinct values become the series, each taking the
+    /// first y column. Leave unset for wide rows with several y columns.
+    pub series_by: Option<String>,
+    /// Stack bars or lines on each other instead of beside each other
+    pub stacked: Option<bool>,
     /// Chart title
     pub title: String,
 }
@@ -1295,7 +1819,10 @@ impl Tool for CreateChartTool {
     fn description(&self) -> String {
         String::from(
             "Draw a chart from a SQL query: runs the query and renders a bar, line, scatter, or pie \
-             chart of column y against column x. The query must return at most 200 rows.",
+             chart of the y column(s) against column x. Several y columns are several series; \
+             series_by pivots long rows (one row per x and group) into one series per group, at \
+             most 8. At most 200 distinct x values; for a histogram, bin in SQL and chart the \
+             counts as bars.",
         )
     }
 
@@ -1310,7 +1837,12 @@ impl Tool for CreateChartTool {
     ) -> Result<Self::Output, Self::Error> {
         let turn = Turn::of(context)?;
         let step = turn.recorder.start(ToolName::CreateChart, args.sql.trim());
-        if let Gate::Reject(message) = self.gate.check_read_only(&args.sql).await? {
+        let rejected = match self.gate.check_read_only(&args.sql, &turn).await? {
+            Gate::Reject(message) => Some(message),
+            Gate::Refused(hold) => Some(String::from(hold.refusal())),
+            Gate::Read | Gate::Write => None,
+        };
+        if let Some(message) = rejected {
             step.finish("rejected");
             return Ok(format!("Chart query rejected. {message}"));
         }
@@ -1330,7 +1862,17 @@ impl Tool for CreateChartTool {
         }
 
         let spec = args.kind.parse::<ChartKind>().and_then(|kind| {
-            ChartSpec::from_results(&results, kind, &args.x, &args.y, &args.title)
+            ChartSpec::from_results(
+                &results,
+                kind,
+                &args.x,
+                SeriesColumns {
+                    y: &args.y,
+                    series_by: args.series_by.as_deref(),
+                },
+                &args.title,
+            )
+            .map(|spec| spec.stacked(args.stacked.unwrap_or(false)))
         });
         let spec = match spec {
             Ok(spec) => spec,
@@ -1338,16 +1880,21 @@ impl Tool for CreateChartTool {
         };
 
         let summary = format!(
-            "{} chart \"{}\" with {} points ({} by {})",
+            "{}{} chart \"{}\" with {} points ({} by {})",
+            if spec.stacked { "stacked " } else { "" },
             spec.kind.as_str(),
             spec.title,
             spec.points(),
-            args.y,
+            spec.series_names().join(", "),
             args.x
         );
         turn.chart.put(spec);
 
-        step.finish(format!("{} points", results.rows.len()));
+        step.finish_with_result(
+            u64::try_from(results.rows.len()).unwrap_or(u64::MAX),
+            results,
+            self.step_result_rows,
+        );
         Ok(format!(
             "Chart created and shown to the user: {summary}. Describe what it shows; do not repeat the data."
         ))
@@ -1355,1134 +1902,14 @@ impl Tool for CreateChartTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use super::*;
-    use crate::analysis::chart::ChartKind;
-    use crate::analysis::events::{self, AgentEvent, Delivery};
-    use crate::embedding::{Dimension, Profile, Prompts};
-    use crate::graph::store::NewNode;
-    use crate::graph::{Properties, Standing};
-    use crate::ids::{ClassId, DocumentId};
-    use crate::llm::EmbedModel;
-    use crate::ontology::Mapping;
-    use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
-
-    #[expect(clippy::panic, reason = "test failure path")]
-    fn fail_test(msg: &str) -> ! {
-        panic!("{msg}")
-    }
-
-    /// Counts calls to `embed_texts` so a test can assert a cache actually
-    /// prevented one, rather than merely returning a plausible-looking
-    /// vector either way.
-    struct CountingEmbeddingModel {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl EmbeddingModel for CountingEmbeddingModel {
-        fn embed_texts(
-            &self,
-            texts: Vec<String>,
-        ) -> impl Future<Output = Result<Vec<rig::embeddings::Embedding>, rig::ProviderError>> + Send
-        {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let result = texts
-                .into_iter()
-                .map(|text| rig::embeddings::Embedding {
-                    document: text,
-                    vec: vec![0.1_f64; 4],
-                })
-                .collect();
-            std::future::ready(Ok(result))
-        }
-    }
-
-    #[tokio::test]
-    async fn cached_embed_asks_the_model_only_once_per_text() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let model = Embedder::new(
-            CountingEmbeddingModel {
-                calls: Arc::clone(&calls),
-            },
-            Profile::new("m", Dimension::new(4), Prompts::default()),
-        );
-        let (sink, _rx) = events::channel();
-        let recorder = TurnRecorder::new(sink);
-        let name = |text: &str| Input::Similarity(text.to_owned());
-
-        let first = recorder.embed_cached(&model, name("Acme")).await;
-        let second = recorder.embed_cached(&model, name("Acme")).await;
-        let other = recorder.embed_cached(&model, name("Beta")).await;
-        let as_query = recorder
-            .embed_cached(&model, Input::Query("Acme".into()))
-            .await;
-
-        assert!(first.is_ok());
-        assert_eq!(first.as_ref().ok(), second.as_ref().ok());
-        assert!(other.is_ok());
-        assert!(as_query.is_ok());
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            3,
-            "one call for \"Acme\", one for the different text \"Beta\", one for \"Acme\" \
-             as a query rather than a name, none for the repeat"
-        );
-    }
-
-    /// Two chunks about hail, the denser one second, for the search tests.
-    async fn seed_hail_chunks(db: &SharedDb) {
-        use crate::storage::workspace::{NewChunk, NewDocument};
-        db.run(|guard| {
-            guard.insert_document(
-                &NewDocument::new(&DocumentId::from("d"), "storms.md", "text/markdown", 1)
-                    .with_status(DocumentStatus::Ready),
-            )?;
-            for (i, text) in [
-                "Hail fell on Denver.",
-                "Hail and hail again in Denver county.",
-            ]
-            .iter()
-            .enumerate()
-            {
-                guard.insert_chunk(&NewChunk {
-                    id: &ChunkId::from(format!("c{i}")),
-                    document_id: &DocumentId::from("d"),
-                    chunk_index: u32::try_from(i).unwrap_or(0),
-                    content: text,
-                    heading: None,
-                    page: None,
-                    embedding: None,
-                })?;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap_or_else(|e| fail_test(&e.to_string()));
-    }
-
-    #[test]
-    fn an_entity_filter_resolves_to_its_chunks_or_says_why_it_cannot() {
-        let db = WorkspaceDb::open_in_memory(Dimension::new(4))
-            .unwrap_or_else(|e| fail_test(&e.to_string()));
-        assert!(
-            db.insert_document(
-                &NewDocument::new(&DocumentId::from("doc-1"), "notes.md", "text/markdown", 1)
-                    .with_status(DocumentStatus::Ready)
-            )
-            .is_ok()
-        );
-        assert!(
-            db.insert_chunk(&NewChunk {
-                id: &ChunkId::from("c1"),
-                document_id: &DocumentId::from("doc-1"),
-                chunk_index: 0,
-                content: "Acme ships to Kenya.",
-                heading: None,
-                page: None,
-                embedding: None,
-            })
-            .is_ok()
-        );
-        let node = |label: &str| NewNode {
-            label: String::from(label),
-            class_id: ClassId::from("organization"),
-            properties: Properties::default(),
-            standing: Standing::Reviewed,
-        };
-        let acme = graph::store::upsert_node(&db, &node("Acme"))
-            .unwrap_or_else(|e| fail_test(&e.to_string()));
-        assert!(
-            graph::store::add_provenance(
-                &db,
-                &acme,
-                &graph::store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from("c1"), 1.0)
-            )
-            .is_ok()
-        );
-        let from_table = graph::store::upsert_node(&db, &node("Orgenics"))
-            .unwrap_or_else(|e| fail_test(&e.to_string()));
-        assert!(
-            graph::store::add_provenance(
-                &db,
-                &from_table,
-                &graph::store::Source::row("vendors", "V-1")
-            )
-            .is_ok()
-        );
-
-        assert_eq!(
-            entity_chunks(&db, "acme", None).unwrap_or_default(),
-            [ChunkId::from("c1")],
-            "the entry point normalizes the label"
-        );
-
-        // In the graph, but only from a table: the model is told to use
-        // search_graph rather than reading an empty document search.
-        let tables_only = entity_chunks(&db, "Orgenics", None)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(
-            tables_only.contains("only from table rows") && tables_only.contains("search_graph"),
-            "{tables_only}"
-        );
-
-        // Not in the graph at all, with and without a near label.
-        let near = entity_chunks(&db, "Acme Corporation", None)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(
-            near.contains("the closest labels are: Acme (organization)"),
-            "{near}"
-        );
-        let nothing = entity_chunks(&db, "Helsinki", None)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(
-            nothing.contains("drop the entity argument") && !nothing.contains("closest"),
-            "{nothing}"
-        );
-    }
-
-    #[test]
-    fn row_provenance_becomes_a_predicate_when_the_class_is_mapped() {
-        let mut ontology = Ontology::builtin_default();
-        ontology.mappings.push(Mapping {
-            table: String::from("orders"),
-            class: ClassId::from("organization"),
-            key: String::from("order id"),
-            properties: BTreeMap::new(),
-            relations: Vec::new(),
-        });
-        let row = |ontology, table, row_key| {
-            RowReference {
-                ontology,
-                table,
-                row_key,
-            }
-            .to_string()
-        };
-        assert_eq!(
-            row(Some(&ontology), "orders", Some("A-42")),
-            "\"orders\" WHERE \"order id\" = 'A-42'"
-        );
-        // A quote in the key is escaped, not left to break the statement.
-        assert_eq!(
-            row(Some(&ontology), "orders", Some("O'Hara")),
-            "\"orders\" WHERE \"order id\" = 'O''Hara'"
-        );
-        // Without a mapping the column is unknown: say the row, do not guess.
-        assert_eq!(row(Some(&ontology), "audit", Some("7")), "audit row 7");
-        assert_eq!(row(None, "orders", Some("7")), "orders row 7");
-        assert_eq!(
-            row(Some(&ontology), "orders", None),
-            "orders (row key unknown)"
-        );
-    }
-
-    #[test]
-    fn describe_class_covers_the_ontology_and_the_graph() {
-        let ontology = Ontology::builtin_default();
-        let describe = |class_id, total, samples: &[String]| {
-            ClassDescription {
-                ontology: &ontology,
-                class_id,
-                census: &ClassCensus {
-                    total,
-                    samples: samples.to_vec(),
-                },
-            }
-            .to_string()
-        };
-        let text = describe("person", 3, &[String::from("Ada"), String::from("Alan")]);
-        assert!(
-            text.contains("Class person (inherits: person -> entity)"),
-            "{text}"
-        );
-        assert!(
-            text.contains("Properties: email (string), title (string)"),
-            "{text}"
-        );
-        assert!(
-            text.contains("Relations from it: works_at -> organization"),
-            "{text}"
-        );
-        // Inherited from `entity`, which every class is a subclass of.
-        assert!(text.contains("part_of"), "{text}");
-        assert!(text.contains("Subclasses: none"), "{text}");
-        assert!(
-            text.contains("In the graph: 3 entities, for example Ada, Alan"),
-            "{text}"
-        );
-
-        let empty = describe("product", 0, &[]);
-        assert!(empty.contains("In the graph: no entities"), "{empty}");
-        assert!(empty.contains("Properties: none"), "{empty}");
-        assert!(empty.contains("produced_by -> organization"), "{empty}");
-        // `part_of` ranges over `entity`, so every class is a target of it.
-        assert!(
-            empty.contains("Relations to it: part_of from entity"),
-            "{empty}"
-        );
-    }
-
-    #[test]
-    fn an_oversized_rendering_is_cut_but_keeps_its_totals() {
-        let mut lines: Vec<String> = Vec::new();
-        for i in 0..400 {
-            lines.push(format!(
-                "Node {i:03} (storm_event) {{event_type: Tornado, state: OKLAHOMA}}"
-            ));
-        }
-        let body = format!("{}\n", lines.join("\n"));
-        let text = format!("{body}200 of 1529 matching nodes, 0 edges, 200 sources — cut off\n");
-        let trimmed = trim_graph_text(&text, MAX_GRAPH_TEXT_CHARS);
-        assert!(
-            trimmed.chars().count() < text.chars().count(),
-            "it should be shorter"
-        );
-        assert!(trimmed.contains("Node 000"), "{trimmed}");
-        assert!(!trimmed.contains("Node 399"), "the tail is cut");
-        // The summary line survives, so the totals are never what gets lost.
-        assert!(trimmed.contains("200 of 1529 matching nodes"), "{trimmed}");
-        assert!(
-            trimmed.contains("more lines not shown") && trimmed.contains("describe_class"),
-            "{trimmed}"
-        );
-        // Comfortably inside a turn's budget once cut.
-        assert!(
-            trimmed.chars().count() < MAX_GRAPH_TEXT_CHARS + 400,
-            "{}",
-            trimmed.chars().count()
-        );
-    }
-
-    #[test]
-    fn an_empty_result_says_which_kind_of_empty_it_is() {
-        let nothing = EmptyLookup::NoMatch(&[]).text().unwrap_or_default();
-        assert!(
-            nothing.contains("the graph has nothing on this"),
-            "{nothing}"
-        );
-
-        let suggested = EmptyLookup::NoMatch(&[String::from("Acme (organization)")])
-            .text()
-            .unwrap_or_default();
-        assert!(
-            suggested.contains("Acme (organization)") && suggested.contains("Search again"),
-            "{suggested}"
-        );
-
-        // Provisional matches were found and then stripped: the workspace
-        // has the entity, query mode just will not answer from it.
-        let stripped = EmptyLookup::AllProvisional.text().unwrap_or_default();
-        assert!(
-            stripped.contains("provisional") && stripped.contains("quack graph review"),
-            "{stripped}"
-        );
-        assert!(!stripped.contains("No matching entities"), "{stripped}");
-    }
-
-    #[test]
-    fn document_ids_resolve_by_id_prefix_or_filename() {
-        let db = WorkspaceDb::open_in_memory(Dimension::new(4))
-            .unwrap_or_else(|e| fail_test(&e.to_string()));
-        assert!(
-            db.insert_document(
-                &NewDocument::new(
-                    &DocumentId::from("01a0-first"),
-                    "policy.pdf",
-                    "application/pdf",
-                    1
-                )
-                .with_status(DocumentStatus::Ready)
-            )
-            .is_ok()
-        );
-        assert!(
-            db.insert_document(
-                &NewDocument::new(
-                    &DocumentId::from("01b0-second"),
-                    "notes.md",
-                    "text/markdown",
-                    1
-                )
-                .with_status(DocumentStatus::Ready)
-            )
-            .is_ok()
-        );
-        let scope = |wanted: &[&str]| {
-            let wanted: Vec<String> = wanted.iter().map(|w| (*w).to_owned()).collect();
-            ChunkScope::for_documents(&db, &wanted)
-        };
-        let documents =
-            |ids: &[&str]| ChunkScope::documents(ids.iter().map(|i| DocumentId::from(*i)));
-        assert_eq!(
-            scope(&["policy.pdf"]).ok(),
-            Some(documents(&["01a0-first"]))
-        );
-        assert_eq!(scope(&["01b0"]).ok(), Some(documents(&["01b0-second"])));
-        assert_eq!(
-            scope(&["01a0-first", "notes.md"]).ok(),
-            Some(documents(&["01a0-first", "01b0-second"]))
-        );
-        assert_eq!(scope(&[]).ok(), Some(ChunkScope::all()));
-        let err = scope(&["missing.pdf"]).err();
-        assert!(err.is_some_and(|e| {
-            let text = e.to_string();
-            text.contains("no document matches 'missing.pdf'") && text.contains("policy.pdf")
-        }));
-    }
-
-    fn hit(n: u32, filename: &str, content: &str) -> ChunkSearchResult {
-        ChunkSearchResult {
-            id: ChunkId::from(format!("c{n}")),
-            content: content.to_owned(),
-            document_id: DocumentId::from("doc-1"),
-            chunk_index: n,
-            filename: filename.to_owned(),
-            heading: (n == 0).then(|| String::from("Exclusions")),
-            page: (n == 0).then_some(12),
-            score: 0.125,
-        }
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn format_search_results_numbers_hits_with_filename() {
-        let out = format_search_results(
-            &[
-                hit(0, "policy.pdf", "  Flood is excluded.  "),
-                hit(1, "faq.md", "Claims close in 30 days."),
-            ],
-            Markers::starting_at(1),
-            &BTreeMap::new(),
-        )
-        .unwrap();
-        assert!(
-            out.contains(
-                "\n[1] policy.pdf, page 12, under \"Exclusions\" (document_id: doc-1, chunk 0, score 0.1250)\n"
-            ),
-            "{out}"
-        );
-        assert!(out.starts_with("Retrieved chunks. Cite"));
-        assert!(out.contains("\nFlood is excluded.\n"));
-        assert!(out.contains("[2] faq.md (document_id: doc-1, chunk 1, score 0.1250)\n"));
-        assert!(out.contains("Claims close in 30 days."));
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn search_results_name_the_entities_a_chunk_was_the_source_of() {
-        let entities = BTreeMap::from([(
-            ChunkId::from("c0"),
-            vec![
-                String::from("OKLAHOMA (state)"),
-                String::from("EF4 (scale)"),
-            ],
-        )]);
-        let out = format_search_results(
-            &[hit(0, "efscale.html", "Damage indicators.")],
-            Markers::starting_at(1),
-            &entities,
-        )
-        .unwrap();
-        // On the metadata line, not above the passage: a line of its own
-        // gets quoted back as though it were the document's text.
-        assert!(
-            out.contains("graph entities: OKLAHOMA (state), EF4 (scale))"),
-            "{out}"
-        );
-        assert!(out.contains("\nDamage indicators.\n"), "{out}");
-        // A chunk with no entities keeps the plain metadata line.
-        let none = format_search_results(
-            &[hit(0, "efscale.html", "x")],
-            Markers::starting_at(1),
-            &BTreeMap::new(),
-        )
-        .unwrap();
-        assert!(!none.contains("graph entities"), "{none}");
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn format_search_results_continues_numbering() {
-        let out = format_search_results(
-            &[hit(0, "a.md", "x")],
-            Markers::starting_at(5),
-            &BTreeMap::new(),
-        )
-        .unwrap();
-        assert!(out.contains("\n[5] a.md"), "{out}");
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn format_search_results_empty_tells_model_to_say_so() {
-        let out = format_search_results(&[], Markers::starting_at(4), &BTreeMap::new()).unwrap();
-        assert!(out.contains("No relevant chunks found"));
-    }
-
-    fn shared_db() -> SharedDb {
-        Arc::new(
-            Writer::spawn(
-                WorkspaceDb::open_in_memory(Dimension::new(4))
-                    .unwrap_or_else(|e| unreachable_db(&e.to_string())),
-            )
-            .unwrap_or_else(|e| fail_test(&e.to_string())),
-        )
-    }
-
-    #[expect(clippy::panic, reason = "test helper: in-memory DuckDB must open")]
-    fn unreachable_db(msg: &str) -> WorkspaceDb {
-        panic!("in-memory DuckDB failed to open: {msg}");
-    }
-
-    /// A gate over `db`, writes decided by a turn with `policy` that
-    /// records refusals in `refused`.
-    struct Gated {
-        gate: SqlGate,
-        turn: Turn,
-    }
-
-    impl Gated {
-        async fn check(&self, sql: &str) -> Result<Gate, ToolError> {
-            self.gate.check(sql, &self.turn).await
-        }
-    }
-
-    fn gate(
-        db: &SharedDb,
-        policy: WritePolicy,
-        refused: &RefusalFlag,
-        recorder: &TurnRecorder,
-    ) -> Gated {
-        let mut turn = Turn::new(recorder.clone(), policy);
-        turn.refused = refused.clone();
-        Gated {
-            gate: SqlGate {
-                db: ReaderDb::new(Arc::clone(db)),
-            },
-            turn,
-        }
-    }
-
-    /// Retrieval as the search tests expect it: five chunks, `rrf_k` 60.
-    fn retrieval() -> RetrievalConfig {
-        RetrievalConfig {
-            top_k: 5,
-            rrf_k: 60,
-            ..RetrievalConfig::default()
-        }
-    }
-
-    /// A tool reads its turn from the context rig hands each call; without
-    /// one it does not run.
-    #[tokio::test]
-    async fn a_tool_called_outside_a_turn_says_so() {
-        let tool = ListTablesTool(ReaderDb::new(shared_db()));
-        let outcome = tool.call(&mut ToolContext::new(), NoArgs).await;
-        assert!(
-            matches!(&outcome, Err(ToolError::Analysis(m)) if m.contains("outside an agent turn")),
-            "{outcome:?}"
-        );
-        let (sink, _rx) = events::channel();
-        let turn = Turn::new(TurnRecorder::new(sink), WritePolicy::Deny);
-        assert!(tool.call(&mut turn.context(), NoArgs).await.is_ok());
-        assert_eq!(
-            turn.recorder.steps().len(),
-            1,
-            "the step landed in the turn"
-        );
-    }
-
-    #[tokio::test]
-    async fn gate_runs_reads_and_rejects_internal_tables_and_syntax_errors() {
-        let (sink, _rx) = events::channel();
-        let recorder = TurnRecorder::new(sink);
-        let db = shared_db();
-        let refused = RefusalFlag::default();
-        let deny = gate(&db, WritePolicy::Deny, &refused, &recorder);
-        let allow = gate(&db, WritePolicy::Allow, &refused, &recorder);
-        assert_eq!(deny.check("SELECT 1").await.ok(), Some(Gate::Read));
-        assert!(matches!(
-            allow.check("SELECT * FROM _quack_chunks").await,
-            Ok(Gate::Reject(m)) if m == INTERNAL_TABLE_REFUSED
-        ));
-        assert!(matches!(
-            allow.check("SELEC 1").await,
-            Ok(Gate::Reject(m)) if m.starts_with("SQL syntax error")
-        ));
-        assert!(!refused.was_refused());
-    }
-
-    #[test]
-    fn creates_temp_object_detects_temp_and_temporary_create_statements() {
-        assert!(creates_temp_object("CREATE TEMP TABLE t AS SELECT 1"));
-        assert!(creates_temp_object("create temporary table t(a int)"));
-        assert!(creates_temp_object(
-            "CREATE OR REPLACE TEMP TABLE t AS SELECT 1"
-        ));
-        assert!(!creates_temp_object("CREATE TABLE t(a INT)"));
-        assert!(!creates_temp_object("CREATE OR REPLACE TABLE t(a INT)"));
-        assert!(!creates_temp_object("SELECT 1"));
-    }
-
-    /// The text matcher is a fast path for the obvious case, not a
-    /// complete check — these four all reach the writer undetected. Pinned
-    /// here so the limitation is explicit; `observe_write` (tested below)
-    /// is what actually closes the gap they leave.
-    #[test]
-    fn creates_temp_object_misses_known_bypasses() {
-        assert!(!creates_temp_object(
-            "-- scratch\nCREATE TEMP TABLE c1(a INT)"
-        ));
-        assert!(!creates_temp_object(
-            "/* scratch */ CREATE TEMP TABLE c2(a INT)"
-        ));
-        assert!(!creates_temp_object(
-            "SELECT 1; CREATE TEMP TABLE c3(a INT)"
-        ));
-        assert!(!creates_temp_object("; CREATE TEMP TABLE c4(a INT)"));
-    }
-
-    /// The actual correctness backstop for the bypasses above: once a temp
-    /// object appears on the writer by any means, `observe_write` degrades
-    /// every clone of that `ReaderDb` to the writer, so a table a bypass
-    /// created is still visible to reads.
-    #[tokio::test]
-    async fn observe_write_degrades_every_clone_once_a_temp_table_appears() {
-        let db = shared_db();
-        let reader_db = ReaderDb::open(&db, 2).await;
-        let reader_clone = reader_db.clone();
-
-        // Before the write: the reader pool is real clones, so a temp
-        // table on the writer is not yet visible to them.
-        db.run(|db| db.execute_statement("CREATE TEMP TABLE scratch AS SELECT 1 AS a"))
-            .await
-            .unwrap_or_else(|e| fail_test(&e.to_string()));
-        assert!(
-            reader_db
-                .with_db(|db| db.execute_query("SELECT * FROM scratch"))
-                .await
-                .is_err()
-        );
-
-        reader_db.observe_write().await;
-
-        // Now every clone of the ReaderDb sees it, because the degrade is
-        // sticky state shared behind the `Arc`, not per-clone.
-        assert!(
-            reader_db
-                .with_db(|db| db.execute_query("SELECT * FROM scratch"))
-                .await
-                .is_ok()
-        );
-        assert!(
-            reader_clone
-                .with_db(|db| db.execute_query("SELECT * FROM scratch"))
-                .await
-                .is_ok()
-        );
-    }
-
-    /// The four `creates_temp_object` bypasses: a leading line comment, a
-    /// leading block comment, a leading semicolon, and a harmless first
-    /// statement ahead of the real one. Each reaches `run_sql`'s writer
-    /// undetected (`creates_temp_object_misses_known_bypasses` pins that),
-    /// but correctness does not rest on the detector — this runs each one
-    /// through the real tool and then reads the table back through the
-    /// reader, proving `observe_write`'s post-write degrade catches what
-    /// the pre-check misses. Asserting only that the detector misses them
-    /// would just re-encode the brittleness the sticky degrade replaces.
-    #[tokio::test]
-    async fn run_sql_bypasses_are_still_visible_to_reads_after_they_run() {
-        for bypass in [
-            "-- scratch\nCREATE TEMP TABLE scratch(a INT)",
-            "/* scratch */ CREATE TEMP TABLE scratch(a INT)",
-            "; CREATE TEMP TABLE scratch(a INT)",
-            "SELECT 1; CREATE TEMP TABLE scratch(a INT)",
-        ] {
-            let db = shared_db();
-            let reader_db = ReaderDb::open(&db, 2).await;
-            let (sink, _rx) = events::channel();
-            let recorder = TurnRecorder::new(sink);
-            let turn = Turn::new(recorder, WritePolicy::Allow);
-            let tool = RunSqlTool::new(Arc::clone(&db), reader_db.clone(), 100);
-            let out = tool
-                .call(
-                    &mut turn.context(),
-                    RunSqlArgs {
-                        query: String::from(bypass),
-                    },
-                )
-                .await
-                .unwrap_or_else(|e| fail_test(&format!("{bypass}: tool call failed: {e}")));
-            assert!(
-                !out.starts_with(SQL_ERROR_PREFIX),
-                "{bypass}: statement did not run: {out}"
-            );
-
-            let visible = reader_db
-                .with_db(|db| db.execute_query("SELECT * FROM scratch"))
-                .await;
-            assert!(
-                visible.is_ok(),
-                "{bypass}: reader still cannot see the bypass table: {visible:?}"
-            );
-        }
-    }
-
-    /// A temp table created mid-turn would be invisible to every
-    /// reader-routed tool for the rest of the turn, so `run_sql` refuses to
-    /// create one outright rather than let that happen.
-    #[tokio::test]
-    async fn gate_refuses_statements_that_create_temp_tables() {
-        let (sink, _rx) = events::channel();
-        let recorder = TurnRecorder::new(sink);
-        let db = shared_db();
-        let refused = RefusalFlag::default();
-        assert!(matches!(
-            gate(&db, WritePolicy::Allow, &refused, &recorder)
-                .check("CREATE TEMP TABLE t AS SELECT 1")
-                .await,
-            Ok(Gate::Reject(m)) if m == TEMP_OBJECT_REFUSED
-        ));
-        assert!(refused.was_refused());
-    }
-
-    /// Without an embedding model the search tool answers from the term
-    /// index alone (issue #58); with a reranker the fused order is handed
-    /// to it and the step says so (issue #63).
-    #[tokio::test]
-    async fn search_tool_runs_keyword_only_without_a_model_and_applies_the_reranker() {
-        struct Reverse;
-        impl Reranker for Reverse {
-            fn rank<'a>(
-                &'a self,
-                _query: &'a str,
-                candidates: &'a [ChunkSearchResult],
-            ) -> rerank::RankFuture<'a> {
-                Box::pin(async move { Ok((0..candidates.len()).rev().collect()) })
-            }
-            fn name(&self) -> &'static str {
-                "reverse"
-            }
-        }
-        let db = shared_db();
-        seed_hail_chunks(&db).await;
-        let (sink, _rx) = events::channel();
-        let recorder = TurnRecorder::new(sink);
-        let turn = Turn::new(recorder.clone(), WritePolicy::Deny);
-        let tool = SearchDocumentsTool::<EmbedModel>::new(
-            ReaderDb::new(Arc::clone(&db)),
-            None,
-            &retrieval(),
-        );
-        let text = tool
-            .call(
-                &mut turn.context(),
-                SearchDocumentsArgs {
-                    query: String::from("hail"),
-                    top_k: None,
-                    document_ids: Vec::new(),
-                    entity: NonBlank::default(),
-                },
-            )
-            .await
-            .unwrap_or_else(|e| fail_test(&e.to_string()));
-        assert!(text.contains("Denver"), "{text}");
-        let first_plain = text.find("hail again").unwrap_or(usize::MAX);
-        let second_plain = text.find("Hail fell").unwrap_or(usize::MAX);
-        assert!(
-            first_plain < second_plain,
-            "BM25 puts the denser chunk first: {text}"
-        );
-
-        let reranked = SearchDocumentsTool::<EmbedModel>::new(
-            ReaderDb::new(Arc::clone(&db)),
-            None,
-            &retrieval(),
-        )
-        .with_reranker(Rerank {
-            reranker: Arc::new(Reverse),
-            candidates: 5,
-        });
-        let text = reranked
-            .call(
-                &mut turn.context(),
-                SearchDocumentsArgs {
-                    query: String::from("hail"),
-                    top_k: None,
-                    document_ids: Vec::new(),
-                    entity: NonBlank::default(),
-                },
-            )
-            .await
-            .unwrap_or_else(|e| fail_test(&e.to_string()));
-        assert!(
-            text.find("Hail fell").unwrap_or(usize::MAX)
-                < text.find("hail again").unwrap_or(usize::MAX),
-            "the reranker reversed the order: {text}"
-        );
-        let last = recorder.steps().last().map(|s| s.summary.clone());
-        assert!(
-            last.as_deref()
-                .is_some_and(|s| s.contains("reranked by reverse")),
-            "{last:?}"
-        );
-    }
-
-    #[test]
-    fn search_documents_offers_the_entity_argument_only_with_a_graph() {
-        let tool =
-            SearchDocumentsTool::<EmbedModel>::new(ReaderDb::new(shared_db()), None, &retrieval());
-        let has_entity = |tool: &SearchDocumentsTool<EmbedModel>| {
-            tool.parameters().pointer("/properties/entity").is_some()
-        };
-
-        assert!(!has_entity(&tool));
-        assert!(tool.parameters().pointer("/properties/query").is_some());
-        assert!(!tool.description().contains("entity"));
-
-        let tool = tool.with_model(Modeled::Graph);
-        assert!(has_entity(&tool));
-        assert!(tool.description().contains("Pass entity"));
-    }
-
-    #[tokio::test]
-    async fn search_documents_top_k_is_capped_regardless_of_what_the_model_asks_for() {
-        let db = shared_db();
-        db.run(|guard| {
-            guard.insert_document(
-                &NewDocument::new(&DocumentId::from("d"), "storms.md", "text/markdown", 1)
-                    .with_status(DocumentStatus::Ready),
-            )?;
-            for i in 0..(MAX_SEARCH_TOP_K * 2) {
-                guard.insert_chunk(&NewChunk {
-                    id: &ChunkId::from(format!("c{i}")),
-                    document_id: &DocumentId::from("d"),
-                    chunk_index: i,
-                    content: &format!("Hail fell in county {i}."),
-                    heading: None,
-                    page: None,
-                    embedding: None,
-                })?;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap_or_else(|e| fail_test(&e.to_string()));
-        let (sink, _rx) = events::channel();
-        let turn = Turn::new(TurnRecorder::new(sink), WritePolicy::Deny);
-        let tool = SearchDocumentsTool::<EmbedModel>::new(
-            ReaderDb::new(Arc::clone(&db)),
-            None,
-            &retrieval(),
-        );
-        let text = tool
-            .call(
-                &mut turn.context(),
-                SearchDocumentsArgs {
-                    query: String::from("hail"),
-                    // Twice the cap and then some: a model is free to ask
-                    // for this, and used to get every chunk it named back
-                    // in full.
-                    top_k: Some(1_000_000),
-                    document_ids: Vec::new(),
-                    entity: NonBlank::default(),
-                },
-            )
-            .await
-            .unwrap_or_else(|e| fail_test(&e.to_string()));
-        let returned = text.matches("(document_id: d, chunk ").count();
-        assert_eq!(
-            u32::try_from(returned).unwrap_or(u32::MAX),
-            MAX_SEARCH_TOP_K,
-            "{text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_sql_caps_rows_and_reports_the_rest() {
-        let (sink, _rx) = events::channel();
-        let recorder = TurnRecorder::new(sink);
-        let db = shared_db();
-        let turn = Turn::new(recorder.clone(), WritePolicy::Deny);
-        let tool = RunSqlTool::new(Arc::clone(&db), ReaderDb::new(db), 2);
-        let out = tool
-            .call(
-                &mut turn.context(),
-                RunSqlArgs {
-                    query: String::from("SELECT range AS n FROM range(5)"),
-                },
-            )
-            .await;
-        let text = match out {
-            Ok(text) => text,
-            Err(e) => fail_test(&format!("expected tool text, got error: {e}")),
-        };
-        assert!(text.contains("3 more rows not shown"), "{text}");
-        let numeric_rows = text
-            .lines()
-            .filter(|l| !l.trim().is_empty() && l.trim().chars().all(|c| c.is_ascii_digit()))
-            .count();
-        assert_eq!(numeric_rows, 2, "{text}");
-        let last = recorder.steps().last().map(|s| s.summary.clone());
-        assert_eq!(last.as_deref(), Some("5 rows"));
-    }
-
-    /// The one-query-per-group loop: the second statement, the first with
-    /// another literal, comes back with the note and the turn budget; a
-    /// different statement gets the budget alone.
-    #[tokio::test]
-    async fn run_sql_flags_a_statement_repeated_with_other_literals() {
-        let (sink, _rx) = events::channel();
-        let recorder = TurnRecorder::new(sink).with_turn_limit(15);
-        let db = shared_db();
-        let turn = Turn::new(recorder, WritePolicy::Deny);
-        let tool = RunSqlTool::new(Arc::clone(&db), ReaderDb::new(db), 100);
-        let run = |query: &str| {
-            let query = query.to_owned();
-            let (tool, turn) = (&tool, &turn);
-            async move {
-                match tool.call(&mut turn.context(), RunSqlArgs { query }).await {
-                    Ok(text) => text,
-                    Err(e) => fail_test(&format!("expected tool text, got error: {e}")),
-                }
-            }
-        };
-        let first = run("SELECT range AS n FROM range(5) WHERE n = 1").await;
-        assert!(!first.contains("repeats an earlier one"), "{first}");
-        assert!(
-            first.ends_with("(tool call 1 of at most 15 this turn)"),
-            "{first}"
-        );
-        let second = run("SELECT range AS n FROM range(5) WHERE n = 3").await;
-        assert!(second.contains("repeats an earlier one"), "{second}");
-        assert!(second.contains("WHERE n = 1"), "{second}");
-        assert!(second.contains("arg_max"), "{second}");
-        assert!(
-            second.ends_with("(tool call 2 of at most 15 this turn)"),
-            "{second}"
-        );
-        let third = run("SELECT count() FROM range(5)").await;
-        assert!(!third.contains("repeats an earlier one"), "{third}");
-        // The second statement again: still the first with another literal.
-        let again = run("SELECT range AS n FROM range(5) WHERE n = 3").await;
-        assert!(again.contains("WHERE n = 1"), "{again}");
-    }
-
-    /// The retry loop the prompt promises: a binder error, with `DuckDB`'s
-    /// candidate bindings, comes back as tool text the model can act on
-    /// rather than as a tool failure whose message rig withholds.
-    #[tokio::test]
-    async fn run_sql_hands_duckdb_errors_to_the_model_with_candidate_bindings() {
-        let (sink, _rx) = events::channel();
-        let recorder = TurnRecorder::new(sink);
-        let db = shared_db();
-        assert!(
-            db.run(|guard| guard.execute_statement("CREATE TABLE trips(trip_distance DOUBLE)"))
-                .await
-                .is_ok()
-        );
-        let turn = Turn::new(recorder.clone(), WritePolicy::Deny);
-        let tool = RunSqlTool::new(Arc::clone(&db), ReaderDb::new(Arc::clone(&db)), 100);
-        let out = tool
-            .call(
-                &mut turn.context(),
-                RunSqlArgs {
-                    query: String::from("SELECT count(*) FROM trips WHERE distance > 10"),
-                },
-            )
-            .await;
-        let text = match out {
-            Ok(text) => text,
-            Err(e) => fail_test(&format!("expected tool text, got error: {e}")),
-        };
-        assert!(text.starts_with(SQL_ERROR_PREFIX), "{text}");
-        assert!(text.contains("Candidate bindings"), "{text}");
-        assert!(text.contains("trip_distance"), "{text}");
-        let last = recorder.steps().last().map(|s| s.summary.clone());
-        assert!(
-            last.as_deref().is_some_and(|d| d.starts_with("error: ")),
-            "{last:?}"
-        );
-
-        // A missing table names the tables that do exist.
-        let describe = DescribeTableTool(ReaderDb::new(Arc::clone(&db)));
-        let out = describe
-            .call(
-                &mut turn.context(),
-                DescribeTableArgs {
-                    table_name: String::from("trip"),
-                },
-            )
-            .await;
-        let text = match out {
-            Ok(text) => text,
-            Err(e) => fail_test(&format!("expected tool text, got error: {e}")),
-        };
-        assert!(text.starts_with(SQL_ERROR_PREFIX), "{text}");
-        assert!(text.contains("Tables in this workspace: trips"), "{text}");
-
-        // And a good statement still returns rows, with the count in the step.
-        let out = tool
-            .call(
-                &mut turn.context(),
-                RunSqlArgs {
-                    query: String::from("SELECT count(*) AS n FROM trips WHERE trip_distance > 10"),
-                },
-            )
-            .await;
-        assert!(out.is_ok_and(|t| t.contains('n') && !t.starts_with(SQL_ERROR_PREFIX)));
-    }
-
-    #[tokio::test]
-    async fn gate_applies_allow_and_deny_to_writes() {
-        let (sink, _rx) = events::channel();
-        let recorder = TurnRecorder::new(sink);
-        let db = shared_db();
-        let refused = RefusalFlag::default();
-        assert_eq!(
-            gate(&db, WritePolicy::Allow, &refused, &recorder)
-                .check("CREATE TABLE t(a INT)")
-                .await
-                .ok(),
-            Some(Gate::Write)
-        );
-        assert!(!refused.was_refused());
-        assert!(matches!(
-            gate(&db, WritePolicy::Deny, &refused, &recorder).check("DROP TABLE t").await,
-            Ok(Gate::Reject(m)) if m == WRITE_REFUSED
-        ));
-        assert!(refused.was_refused());
-    }
-
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test asserts the event kind")]
-    async fn gate_ask_waits_for_the_interface() {
-        let (sink, mut rx) = events::channel();
-        let recorder = TurnRecorder::new(sink);
-        let db = shared_db();
-        let refused = RefusalFlag::default();
-
-        let gate = tokio::spawn({
-            let db = Arc::clone(&db);
-            let recorder = recorder.clone();
-            let refused = refused.clone();
-            async move {
-                gate(&db, WritePolicy::Ask, &refused, &recorder)
-                    .check("DELETE FROM t")
-                    .await
-                    .is_ok_and(|gate| gate == Gate::Write)
-            }
-        });
-        let req = match rx.recv().await {
-            Some(AgentEvent::PermissionRequired(req)) => Some(req),
-            _ => None,
-        }
-        .unwrap();
-        assert_eq!(req.sql, "DELETE FROM t");
-        assert_eq!(req.allow(), Delivery::Delivered);
-        assert!(gate.await.is_ok_and(|ran| ran));
-        assert!(!refused.was_refused());
-    }
-
-    /// A blank optional argument reads as absent; its schema is still the
-    /// optional string the model has always been shown.
-    #[test]
-    fn optional_text_arguments_trim_and_treat_blank_as_absent() {
-        let args = |value: serde_json::Value| {
-            serde_json::from_value::<SearchGraphArgs>(value)
-                .unwrap_or_else(|e| fail_test(&e.to_string()))
-        };
-        let given = args(json!({ "entity": "  Alice ", "class": "", "relation": null }));
-        assert_eq!(given.entity.get(), Some("Alice"));
-        assert_eq!(given.class.get(), None);
-        assert_eq!(given.relation.get(), None);
-        assert_eq!(args(json!({})).entity, NonBlank::default());
-
-        let schema = SearchGraphArgs::schema();
-        assert_eq!(
-            schema.pointer("/properties/entity/type"),
-            Some(&json!("string"))
-        );
-        assert!(
-            schema
-                .pointer("/properties/entity/description")
-                .is_some_and(|d| d.as_str().is_some_and(|d| d.contains("entity to start"))),
-            "{schema}"
-        );
-        let required = schema.get("required").cloned().unwrap_or_default();
-        assert!(!required.to_string().contains("entity"), "{schema}");
-    }
-
-    /// A tool with no arguments shows an empty object and takes whatever
-    /// the model sends.
-    #[test]
-    fn no_args_is_an_empty_object_that_accepts_anything() {
-        let schema = NoArgs::schema();
-        assert_eq!(schema.get("type"), Some(&json!("object")));
-        assert_eq!(schema.get("properties"), Some(&json!({})));
-        for sent in [json!({}), json!(null), json!({ "table": "x" }), json!("")] {
-            assert!(serde_json::from_value::<NoArgs>(sent).is_ok());
-        }
-    }
-
-    /// The model sees the chart kinds in the tool's schema, not only in
-    /// prose.
-    #[test]
-    fn the_chart_schema_lists_every_kind() {
-        let schema = CreateChartArgs::schema();
-        assert_eq!(
-            schema.pointer("/properties/kind/enum"),
-            Some(&json!(
-                ChartKind::ALL
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            ))
-        );
-    }
-
-    /// Every tool schema is self-contained and names one type per argument,
-    /// which servers that reject `$ref` or type arrays (Apple's `fm serve`)
-    /// require.
-    #[test]
-    fn tool_schemas_have_no_references_or_null_types() {
-        for schema in [
-            RunSqlArgs::schema(),
-            SearchDocumentsArgs::schema(),
-            DescribeTableArgs::schema(),
-            CreateChartArgs::schema(),
-            SearchGraphArgs::schema(),
-            FindPathArgs::schema(),
-            DescribeClassArgs::schema(),
-            NoArgs::schema(),
-        ] {
-            let text = schema.to_string();
-            for banned in ["$ref", "$defs", "\"null\""] {
-                assert!(!text.contains(banned), "{banned} in {text}");
-            }
-        }
-        assert_eq!(
-            SearchDocumentsArgs::schema().pointer("/properties/top_k/type"),
-            Some(&json!("integer"))
-        );
-    }
-}
+mod tests;
 
 // ---------------------------------------------------------------------------
 // search_graph and find_path
 // ---------------------------------------------------------------------------
 
 use crate::error;
-use crate::graph::query::{GraphQuery, Listed, OntologyId, PathEnds, PathQuery, UnknownEntity};
+use crate::graph::query::{GraphQuery, Listed, OntologyId, PathEnds, PathQuery};
 use crate::graph::store::ClassCensus;
 use crate::graph::{self, GraphResult, Origin};
 
@@ -2495,7 +1922,7 @@ pub struct GraphTools<M> {
     pub db: ReaderDb,
     /// `None` resolves entities by exact label and alias only.
     pub embedding_model: Option<Embedder<M>>,
-    pub options: graph::GraphOptions,
+    pub options: GraphConfig,
     /// Query mode does not answer from provisional nodes.
     pub mode: ChatMode,
 }
@@ -2531,7 +1958,10 @@ impl<M> GraphTools<M> {
 
 pub struct SearchGraphTool<M>(pub GraphTools<M>);
 
-#[derive(Deserialize, JsonSchema)]
+/// A graph search as every interface takes it: the agent tool's
+/// arguments, the MCP tool's, the REST body, and what the CLI and the
+/// web form fill in.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema, utoipa::ToSchema)]
 pub struct SearchGraphArgs {
     /// The entity to start from (its name as it appears in the data); omit
     /// to list every entity of `class`
@@ -2545,6 +1975,22 @@ pub struct SearchGraphArgs {
     pub relation: NonBlank,
     /// How many hops out from the entity (default 2)
     pub hops: Option<u32>,
+}
+
+impl SearchGraphArgs {
+    /// The query these arguments ask for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when there is neither an entity nor a class.
+    pub fn query(&self) -> Result<GraphQuery, Error> {
+        GraphQuery::new(
+            self.entity.get(),
+            self.class.get(),
+            self.relation.get(),
+            self.hops,
+        )
+    }
 }
 
 impl<M> Tool for SearchGraphTool<M>
@@ -2583,12 +2029,7 @@ where
             (None, None) => String::new(),
         };
         let step = turn.recorder.start(ToolName::SearchGraph, &detail);
-        let query = match GraphQuery::new(
-            args.entity.get(),
-            args.class.get(),
-            args.relation.get(),
-            args.hops,
-        ) {
+        let query = match args.query() {
             Ok(query) => query,
             Err(e) => return Err(step.fail(e.into())),
         };
@@ -2615,7 +2056,11 @@ where
             .await;
         let (result, suggestions) = match lookup {
             Ok(lookup) => lookup,
-            Err(e) => return Err(step.fail(e.into())),
+            Err(e) => {
+                // A refusal can name the graph's closest labels.
+                turn.read_documents();
+                return Err(step.fail(e.into()));
+            }
         };
         let Shown {
             result,
@@ -2628,6 +2073,9 @@ where
                 EmptyLookup::NoMatch(&suggestions)
             };
             step.finish(empty.summary());
+            if !suggestions.is_empty() {
+                turn.read_documents();
+            }
             let text = empty.text()?;
             GraphTools::<M>::keep(&turn, result);
             return Ok(text);
@@ -2641,7 +2089,7 @@ where
             result.nodes.len(),
             result.edges.len()
         ));
-        let text = format_graph_result(&result, &turn.recorder, &tools.db).await?;
+        let text = format_graph_result(&result, &turn, &tools.db).await?;
         GraphTools::<M>::keep(&turn, result);
         Ok(text)
     }
@@ -2649,7 +2097,8 @@ where
 
 pub struct FindPathTool<M>(pub GraphTools<M>);
 
-#[derive(Deserialize, JsonSchema)]
+/// A path request as every interface takes it, like [`SearchGraphArgs`].
+#[derive(Debug, Clone, Deserialize, JsonSchema, utoipa::ToSchema)]
 pub struct FindPathArgs {
     /// The entity to start from
     pub from: String,
@@ -2657,6 +2106,17 @@ pub struct FindPathArgs {
     pub to: String,
     /// Longest path to consider (default 4)
     pub max_hops: Option<u32>,
+}
+
+impl FindPathArgs {
+    /// The query these arguments ask for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either end is blank.
+    pub fn query(&self) -> Result<PathQuery, Error> {
+        PathQuery::new(&self.from, &self.to, self.max_hops)
+    }
 }
 
 impl<M> Tool for FindPathTool<M>
@@ -2690,7 +2150,7 @@ where
             ToolName::FindPath,
             &format!("{} -> {}", args.from.trim(), args.to.trim()),
         );
-        let query = match PathQuery::new(&args.from, &args.to, args.max_hops) {
+        let query = match args.query() {
             Ok(query) => query,
             Err(e) => return Err(step.fail(e.into())),
         };
@@ -2712,7 +2172,11 @@ where
             .await;
         let result = match result {
             Ok(result) => result,
-            Err(e) => return Err(step.fail(e.into())),
+            Err(e) => {
+                // A refusal can name the graph's closest labels.
+                turn.read_documents();
+                return Err(step.fail(e.into()));
+            }
         };
         let Shown {
             result,
@@ -2735,7 +2199,7 @@ where
             ));
         }
         step.finish(format!("{} hops", result.edges.len()));
-        let text = format_graph_result(&result, &turn.recorder, &tools.db).await?;
+        let text = format_graph_result(&result, &turn, &tools.db).await?;
         GraphTools::<M>::keep(&turn, result);
         Ok(text)
     }
@@ -2781,7 +2245,11 @@ impl EmptyLookup<'_> {
             out,
             " The closest labels in the graph are: {}. Search again with one of them if that is \
              what the user meant; otherwise tell the user the graph has nothing on this.",
-            suggestions.join(", ")
+            suggestions
+                .iter()
+                .map(|label| OneLine(label).to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         )?;
         Ok(out)
     }
@@ -2789,7 +2257,7 @@ impl EmptyLookup<'_> {
 
 /// The most characters one graph result may put into a turn. A listing of
 /// `max_nodes` entities, each with its properties, is otherwise large
-/// enough to push Ollama's context window over: the front of the prompt
+/// enough to push a fixed Ollama `num_ctx` over: the front of the prompt
 /// is cut, the tool list goes with it, and the model invents a tool name
 /// (seen live on gpt-oss:20b, the failure #40 describes).
 const MAX_GRAPH_TEXT_CHARS: usize = 6_000;
@@ -2824,12 +2292,14 @@ fn trim_graph_text(text: &str, budget: usize) -> String {
 /// Render a graph result for the model: the tree, then the sources each
 /// node and edge came from, registered as citable `[n]` markers (chunks)
 /// or named as table rows. Bounded as a whole, not just per node. The
-/// callers answer an empty result themselves.
+/// callers answer an empty result themselves. The turn has then read
+/// graph text.
 async fn format_graph_result(
     result: &GraphResult,
-    recorder: &TurnRecorder,
+    turn: &Turn,
     db: &ReaderDb,
 ) -> Result<String, ToolError> {
+    turn.read_documents();
     let tree = result.to_string();
     let mut out = if tree.chars().count() > MAX_GRAPH_TEXT_CHARS {
         trim_graph_text(&tree, MAX_GRAPH_TEXT_CHARS)
@@ -2845,15 +2315,31 @@ async fn format_graph_result(
         .collect();
     let hidden_chunks = all_chunk_ids.len().saturating_sub(MAX_GRAPH_SOURCES);
     let chunk_ids: Vec<ChunkId> = all_chunk_ids.into_iter().take(MAX_GRAPH_SOURCES).collect();
-    let (chunks, ontology) = db
+    let (mut chunks, ontology) = db
         .with_db(move |db| {
             let chunks = db.chunks_by_ids(&chunk_ids)?;
             Ok((chunks, ontology_store::current(db)?))
         })
         .await?;
+    // The graph is the workspace's, but a question limited to some
+    // documents quotes and cites only those.
+    let before = chunks.len();
+    chunks.retain(|chunk| turn.scope().includes(&chunk.document_id));
+    let out_of_scope = before.saturating_sub(chunks.len());
+    if out_of_scope > 0 {
+        writeln!(
+            out,
+            "\n{out_of_scope} sources from documents outside this question's scope ({}) are not shown.",
+            turn.scope().names()
+        )?;
+    }
     if !chunks.is_empty() {
-        let markers = recorder.citations().register(&chunks);
-        writeln!(out, "\nSources (cite with the [n] marker):")?;
+        let markers = turn.cite(&chunks);
+        writeln!(
+            out,
+            "\nSources (cite with the [n] marker). {}",
+            Fenced::NOTICE
+        )?;
         for (i, chunk) in chunks.iter().enumerate() {
             let n = markers.nth(i);
             let excerpt: String = chunk.content.trim().chars().take(200).collect();
@@ -2862,7 +2348,7 @@ async fn format_graph_result(
                 heading: None,
                 ..ChunkLocation::from(chunk)
             };
-            writeln!(out, "[{n}] {location}: {excerpt}")?;
+            writeln!(out, "[{n}] {location}:\n{}", Fenced(&excerpt))?;
         }
         if hidden_chunks > 0 {
             writeln!(out, "... and {hidden_chunks} more sources")?;
@@ -2883,7 +2369,7 @@ async fn format_graph_result(
                 }
                 .to_string(),
             ),
-            Origin::Chunk { .. } => None,
+            Origin::Chunk { .. } | Origin::Manual { .. } => None,
         })
         .collect();
     if !rows.is_empty() {
@@ -2958,16 +2444,21 @@ impl Tool for DescribeClassTool {
                 };
                 let classes = ontology.class_and_descendants(&class_id);
                 let census = graph::store::class_census(db, &classes, CLASS_SAMPLES)?;
-                Ok(ClassDescription {
+                let text = ClassDescription {
                     ontology: &ontology,
                     class_id: &class_id,
                     census: &census,
                 }
-                .to_string())
+                .to_string();
+                Ok((text, census.samples.is_empty()))
             })
             .await;
         match text {
-            Ok(text) => {
+            Ok((text, unnamed)) => {
+                // Example names are graph labels, as a graph search's are.
+                if !unnamed {
+                    turn.read_documents();
+                }
                 step.finish(format!("{} lines", text.lines().count()));
                 Ok(text)
             }
@@ -3062,7 +2553,12 @@ impl std::fmt::Display for ClassDescription<'_> {
                 mapping.table, mapping.key
             )?;
         }
+        writeln!(f, "{}", ViewLine(ClassView::of(ontology, class_id)))?;
 
+        let samples: Vec<String> = samples
+            .iter()
+            .map(|label| OneLine(label).to_string())
+            .collect();
         if *total == 0 {
             writeln!(f, "In the graph: no entities of this class")
         } else if samples.len() < usize::try_from(*total).unwrap_or(usize::MAX) {
@@ -3078,6 +2574,28 @@ impl std::fmt::Display for ClassDescription<'_> {
                 samples.join(", ")
             )
         }
+    }
+}
+
+/// A class's SQL view as `describe_class` names it: the view and its
+/// typed columns.
+struct ViewLine(ClassView);
+
+impl std::fmt::Display for ViewLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let columns: Vec<String> = self
+            .0
+            .columns
+            .iter()
+            .map(|(name, kind)| format!("{name} {kind}"))
+            .collect();
+        write!(
+            f,
+            "SQL view: {} ({}); one row per entity of this class and its subclasses, for \
+             run_sql to count, filter, and join",
+            self.0.name,
+            columns.join(", ")
+        )
     }
 }
 

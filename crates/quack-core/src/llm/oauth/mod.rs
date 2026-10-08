@@ -57,6 +57,7 @@ use crate::error::{AuthReason, Error, Result};
 use crate::ids::UserId;
 use crate::llm::acting::Acting;
 use crate::oidc::Revocations;
+use crate::proxy::Proxies;
 
 /// RFC 7523's grant, which Entra's On-Behalf-Of flow uses.
 const JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
@@ -114,6 +115,8 @@ pub(crate) struct Endpoints {
     /// Whether every authorization redirect carries `iss` (RFC 9207).
     #[serde(default)]
     authorization_response_iss_parameter_supported: bool,
+    /// The claims the issuer may put in its tokens, when it lists them.
+    pub(crate) claims_supported: Option<Vec<String>>,
 }
 
 impl Endpoints {
@@ -185,7 +188,8 @@ impl OAuthHttp {
     ///
     /// Returns an error when the HTTP client cannot be built.
     pub(crate) fn new() -> Result<Self> {
-        reqwest::Client::builder()
+        Proxies::from_env()
+            .client()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .build()

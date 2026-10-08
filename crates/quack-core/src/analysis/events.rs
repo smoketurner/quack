@@ -6,16 +6,18 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot};
 
 use super::agent::AgentResponse;
 use super::citations::CitationRegistry;
+use super::policy::Hold;
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
+use crate::storage::control::Outcome;
+use crate::storage::workspace::QueryResults;
 
 /// A turn's embeddings, by input (the role is part of it).
 type EmbeddingCache = HashMap<Input, Vector>;
@@ -54,30 +56,38 @@ impl<'a> DetailPreview<'a> {
 }
 
 /// The agent's tools, by the name the model calls each one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolName {
     RunSql,
     SearchDocuments,
+    ReadDocument,
     ListDocuments,
     ListTables,
     DescribeTable,
+    FindTables,
     CreateChart,
     SearchGraph,
     FindPath,
     DescribeClass,
+    ViewImage,
 }
 
 text_enum!(ToolName, "tool", {
     RunSql => "run_sql",
     SearchDocuments => "search_documents",
+    ReadDocument => "read_document",
     ListDocuments => "list_documents",
     ListTables => "list_tables",
     DescribeTable => "describe_table",
+    FindTables => "find_tables",
     CreateChart => "create_chart",
     SearchGraph => "search_graph",
     FindPath => "find_path",
     DescribeClass => "describe_class",
+    ViewImage => "view_image",
 });
 
 impl ToolName {
@@ -87,18 +97,21 @@ impl ToolName {
         match self {
             Self::RunSql | Self::CreateChart => true,
             Self::SearchDocuments
+            | Self::ReadDocument
             | Self::ListDocuments
             | Self::ListTables
             | Self::DescribeTable
+            | Self::FindTables
             | Self::SearchGraph
             | Self::FindPath
-            | Self::DescribeClass => false,
+            | Self::DescribeClass
+            | Self::ViewImage => false,
         }
     }
 }
 
 /// One tool invocation, recorded for the transcript and the final response.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ToolStep {
     pub tool: ToolName,
     /// What the tool was asked to do: the SQL text, the search query, the
@@ -109,6 +122,10 @@ pub struct ToolStep {
     /// Rows a statement produced, on a step that ran one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<u64>,
+    /// The first `[analysis].step_result_rows` rows the statement
+    /// returned, so a reader can check the answer against them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<QueryResults>,
     pub duration_ms: u64,
 }
 
@@ -117,6 +134,8 @@ pub struct ToolStep {
 #[derive(Debug)]
 pub struct PermissionRequest {
     pub sql: String,
+    /// Why the write waits for an answer; the interface shows its notice.
+    pub hold: Hold,
     reply: oneshot::Sender<Decision>,
 }
 
@@ -133,16 +152,73 @@ pub enum Delivery {
     TurnGone,
 }
 
-/// The interface's answer to a permission request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl Delivery {
+    /// What every interface says when an answer came after the turn
+    /// stopped waiting.
+    pub const TURN_GONE: &'static str =
+        "The question that asked for this write has already ended; nothing ran.";
+}
+
+/// The interface's answer to a permission request: the API body's
+/// `decision` and the audit detail's, as `deny`, `allow`, `allow_turn`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Decision {
     Deny,
     /// This statement only.
     Allow,
-    /// This statement and every later write in the same turn (the
-    /// terminal's `a`; issue #56). The interface keeps its own flag for
-    /// the turns after.
-    AllowForTurn,
+    /// This statement and every later write in the same turn held for the
+    /// same reason.
+    AllowTurn,
+}
+
+impl Decision {
+    /// Every answer, in the order an interface offers them.
+    pub const CHOICES: [Self; 3] = [Self::Allow, Self::Deny, Self::AllowTurn];
+
+    /// What a write prompt says above the statement, in every interface.
+    pub const HEADING: &'static str = "This statement changes the workspace:";
+
+    /// The words every interface offers the answer under.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Allow => "Run it",
+            Self::Deny => "Don't run it",
+            Self::AllowTurn => "Allow for this turn",
+        }
+    }
+
+    /// What every interface says once the turn has the answer.
+    #[must_use]
+    pub const fn reply(self) -> &'static str {
+        match self {
+            Self::Allow => "Ran it.",
+            Self::Deny => "Not run.",
+            Self::AllowTurn => "Ran it; the rest of this turn's writes run too.",
+        }
+    }
+
+    /// The text form, as the API body and the audit detail carry it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Allow => "allow",
+            Self::AllowTurn => "allow_turn",
+        }
+    }
+
+    /// How the audit log records the answer.
+    #[must_use]
+    pub const fn outcome(self) -> Outcome {
+        match self {
+            Self::Allow | Self::AllowTurn => Outcome::Allowed,
+            Self::Deny => Outcome::Denied,
+        }
+    }
 }
 
 impl PermissionRequest {
@@ -154,7 +230,7 @@ impl PermissionRequest {
     /// Run this statement and every later write of the turn. `TurnGone`
     /// means nothing ran.
     pub fn allow_for_turn(self) -> Delivery {
-        self.answer(Decision::AllowForTurn)
+        self.answer(Decision::AllowTurn)
     }
 
     /// Refuse the statement. A refusal needs no turn to take it: a request
@@ -165,7 +241,9 @@ impl PermissionRequest {
         }
     }
 
-    fn answer(self, decision: Decision) -> Delivery {
+    /// Give `decision` to the turn. `TurnGone` means it had stopped
+    /// waiting, so nothing ran.
+    pub fn answer(self, decision: Decision) -> Delivery {
         if self.reply.send(decision).is_ok() {
             Delivery::Delivered
         } else {
@@ -182,6 +260,9 @@ pub enum AgentEvent {
     /// Ollama has to load first), in one line. Informational: an
     /// interface that shows nothing but the answer may drop it.
     Status(String),
+    /// The model began reasoning before its next output: once per model
+    /// call, without the reasoning text. Informational, like `Status`.
+    Reasoning,
     /// A piece of the assistant's answer, as it streams.
     TextDelta(String),
     ToolStarted {
@@ -216,6 +297,8 @@ pub enum FailureKind {
     NoChatModel,
     /// The session (or another named record) does not exist.
     NotFound,
+    /// The workspace's provider allow-list refused a model the turn needs.
+    ProviderNotAllowed,
     /// A model, tool, or storage failure.
     Other,
 }
@@ -226,6 +309,7 @@ impl From<&Error> for TurnFailure {
             Error::AuthRequired { .. } => FailureKind::AuthRequired,
             Error::NoChatModel { .. } => FailureKind::NoChatModel,
             Error::NotFound { .. } => FailureKind::NotFound,
+            refused if refused.is_provider_refusal() => FailureKind::ProviderNotAllowed,
             _ => FailureKind::Other,
         };
         Self {
@@ -258,9 +342,9 @@ pub struct TurnRecorder {
     sink: EventSink,
     steps: Arc<Mutex<Vec<ToolStep>>>,
     citations: CitationRegistry,
-    /// Set once the interface answered `AllowForTurn`: later writes in
-    /// this turn run without asking.
-    writes_granted: Arc<AtomicBool>,
+    /// The hold the interface answered `AllowTurn` to: later writes in
+    /// this turn held for that reason, or one before it, run without asking.
+    writes_granted: Arc<Mutex<Option<Hold>>>,
     /// Embeddings computed so far this turn, by exact input text: more
     /// than one tool can resolve the same entity label (`search_documents`
     /// and `search_graph` on the same name, `find_path` reusing an entity
@@ -282,7 +366,7 @@ impl TurnRecorder {
             sink,
             steps: Arc::new(Mutex::new(Vec::new())),
             citations: CitationRegistry::default(),
-            writes_granted: Arc::new(AtomicBool::new(false)),
+            writes_granted: Arc::new(Mutex::new(None)),
             embedding_cache: Arc::new(Mutex::new(HashMap::new())),
             turn_limit: None,
         }
@@ -399,26 +483,40 @@ impl TurnRecorder {
         }
     }
 
-    /// Ask the interface whether a write may run, unless an earlier
-    /// answer this turn already granted every write. Resolves to `false`
-    /// when the interface drops the request.
-    pub async fn ask_permission(&self, sql: &str) -> bool {
-        if self.writes_granted.load(Ordering::Acquire) {
+    /// Ask the interface whether a write held for `hold` may run, unless an
+    /// earlier answer this turn already granted every write so held: a
+    /// grant given before the turn read document text does not cover a
+    /// write after it. Resolves to `false` when the interface drops the
+    /// request.
+    pub async fn ask_permission(&self, sql: &str, hold: Hold) -> bool {
+        if self.granted() >= Some(hold) {
             return true;
         }
         let (reply, answer) = oneshot::channel();
         self.emit(AgentEvent::PermissionRequired(PermissionRequest {
             sql: sql.to_owned(),
+            hold,
             reply,
         }));
         match answer.await.unwrap_or(Decision::Deny) {
             Decision::Deny => false,
             Decision::Allow => true,
-            Decision::AllowForTurn => {
-                self.writes_granted.store(true, Ordering::Release);
+            Decision::AllowTurn => {
+                *self
+                    .writes_granted
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(hold);
                 true
             }
         }
+    }
+
+    /// The hold an `AllowTurn` answer has covered so far.
+    fn granted(&self) -> Option<Hold> {
+        *self
+            .writes_granted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The steps recorded so far, in order.
@@ -438,20 +536,28 @@ pub struct StepInProgress {
 
 impl StepInProgress {
     pub fn finish(self, summary: impl Into<String>) {
-        self.record(summary.into(), None);
+        self.record(summary.into(), None, None);
     }
 
     /// Finish a statement that produced `rows` rows.
     pub fn finish_rows(self, rows: u64) {
-        self.record(format!("{rows} rows"), Some(rows));
+        self.record(format!("{rows} rows"), Some(rows), None);
     }
 
-    fn record(self, summary: String, rows: Option<u64>) {
+    /// Finish a statement that produced `rows` rows, keeping the first
+    /// `keep` of `result` on the step for the transcript.
+    pub fn finish_with_result(self, rows: u64, mut result: QueryResults, keep: usize) {
+        result.rows.truncate(keep);
+        self.record(format!("{rows} rows"), Some(rows), Some(result));
+    }
+
+    fn record(self, summary: String, rows: Option<u64>, result: Option<QueryResults>) {
         let step = ToolStep {
             tool: self.tool,
             detail: self.detail,
             summary,
             rows,
+            result,
             duration_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         };
         if let Ok(mut steps) = self.recorder.steps.lock() {
@@ -470,11 +576,14 @@ impl StepInProgress {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     use super::*;
     use crate::embedding::Dimension;
-    use crate::error::{AuthReason, Record};
+    use crate::error::AuthReason;
+    use crate::llm::egress::Refusal;
+    use crate::storage::control::{AllowedProviders, ResourceKind};
 
     /// Interfaces choose their answer from the kind, never the text.
     #[test]
@@ -493,12 +602,20 @@ mod tests {
             }),
             FailureKind::NoChatModel
         );
-        assert_eq!(kind(Record::Session.missing("s1")), FailureKind::NotFound);
+        assert_eq!(
+            kind(ResourceKind::Session.missing("s1")),
+            FailureKind::NotFound
+        );
+        let refused = Refusal::Provider {
+            provider: String::from("hosted"),
+            allowed: AllowedProviders::Only(BTreeSet::new()),
+        };
+        assert_eq!(kind(Error::from(refused)), FailureKind::ProviderNotAllowed);
         assert_eq!(
             kind(Error::Llm(String::from("the model went away"))),
             FailureKind::Other
         );
-        let failure = TurnFailure::from(&Record::Session.missing("s1"));
+        let failure = TurnFailure::from(&ResourceKind::Session.missing("s1"));
         assert_eq!(failure.to_string(), "session 's1' does not exist");
     }
 
@@ -601,31 +718,73 @@ mod tests {
         let recorder = TurnRecorder::new(sink);
 
         let asker = recorder.clone();
-        let allowed = tokio::spawn(async move { asker.ask_permission("DROP TABLE t").await });
+        let allowed = tokio::spawn(async move {
+            asker
+                .ask_permission("DROP TABLE t", Hold::NotPermitted)
+                .await
+        });
         let req = permission_request(rx.recv().await).unwrap();
         assert_eq!(req.sql, "DROP TABLE t");
         assert_eq!(req.allow(), Delivery::Delivered);
         assert!(allowed.await.is_ok_and(|a| a));
 
         let asker = recorder.clone();
-        let denied = tokio::spawn(async move { asker.ask_permission("DELETE FROM t").await });
+        let denied = tokio::spawn(async move {
+            asker
+                .ask_permission("DELETE FROM t", Hold::NotPermitted)
+                .await
+        });
         let req = permission_request(rx.recv().await).unwrap();
         drop(req);
         assert!(denied.await.is_ok_and(|a| !a));
 
         // `a` grants the rest of the turn: the next write is not asked.
         let asker = recorder.clone();
-        let granted = tokio::spawn(async move { asker.ask_permission("UPDATE t SET a = 1").await });
+        let granted = tokio::spawn(async move {
+            asker
+                .ask_permission("UPDATE t SET a = 1", Hold::NotPermitted)
+                .await
+        });
         let req = permission_request(rx.recv().await).unwrap();
         assert_eq!(req.allow_for_turn(), Delivery::Delivered);
         assert!(granted.await.is_ok_and(|a| a));
-        assert!(recorder.ask_permission("DELETE FROM t").await);
+        assert!(
+            recorder
+                .ask_permission("DELETE FROM t", Hold::NotPermitted)
+                .await
+        );
+        assert!(rx.try_recv().is_err(), "no request was emitted");
+        // The grant was given before the turn read document text, so a
+        // write after it asks again, with the reason; granting that covers
+        // both.
+        let asker = recorder.clone();
+        let mut after_reading = tokio::spawn(async move {
+            asker
+                .ask_permission("DELETE FROM t", Hold::ReadDocuments)
+                .await
+        });
+        // Raced, so a grant that wrongly covered this fails, not hangs.
+        let req = tokio::select! {
+            event = rx.recv() => permission_request(event),
+            _ = &mut after_reading => None,
+        }
+        .unwrap();
+        assert_eq!(req.hold, Hold::ReadDocuments);
+        assert_eq!(req.allow_for_turn(), Delivery::Delivered);
+        assert!(after_reading.await.is_ok_and(|a| a));
+        for hold in [Hold::ReadDocuments, Hold::NotPermitted] {
+            assert!(recorder.ask_permission("DELETE FROM t", hold).await);
+        }
         assert!(rx.try_recv().is_err(), "no request was emitted");
         // A fresh recorder (the next turn) asks again.
         let (sink, mut rx) = channel();
         let next = TurnRecorder::new(sink);
         let asker = next.clone();
-        let pending = tokio::spawn(async move { asker.ask_permission("DELETE FROM t").await });
+        let pending = tokio::spawn(async move {
+            asker
+                .ask_permission("DELETE FROM t", Hold::NotPermitted)
+                .await
+        });
         assert!(permission_request(rx.recv().await).is_some());
         pending.abort();
     }
@@ -638,14 +797,22 @@ mod tests {
         let (sink, mut rx) = channel();
         let recorder = TurnRecorder::new(sink);
         let asker = recorder.clone();
-        let pending = tokio::spawn(async move { asker.ask_permission("DROP TABLE t").await });
+        let pending = tokio::spawn(async move {
+            asker
+                .ask_permission("DROP TABLE t", Hold::NotPermitted)
+                .await
+        });
         let req = permission_request(rx.recv().await).unwrap();
         pending.abort();
         assert!(pending.await.is_err_and(|e| e.is_cancelled()));
         assert_eq!(req.allow(), Delivery::TurnGone);
 
         let asker = recorder.clone();
-        let pending = tokio::spawn(async move { asker.ask_permission("DELETE FROM t").await });
+        let pending = tokio::spawn(async move {
+            asker
+                .ask_permission("DELETE FROM t", Hold::NotPermitted)
+                .await
+        });
         let req = permission_request(rx.recv().await).unwrap();
         pending.abort();
         assert!(pending.await.is_err_and(|e| e.is_cancelled()));

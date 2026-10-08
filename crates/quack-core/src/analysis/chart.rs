@@ -1,14 +1,28 @@
 //! quack's chart spec: small enough for the model to fill and for every
 //! interface to render (ratatui in the terminal, `ECharts` in a browser later).
 
-use crate::error::{Error, Result};
-use crate::storage::workspace::QueryResults;
+use std::collections::HashMap;
 
-/// Most points per series; beyond this the query should aggregate.
+use crate::error::{Error, Result};
+use crate::storage::workspace::{Cell, QueryResults};
+
+/// Most points per series (distinct x values); beyond this the query
+/// should aggregate.
 pub const MAX_POINTS: usize = 200;
+/// Most series on one chart: the terminal's colour cycle, and what a
+/// legend still reads.
+pub const MAX_SERIES: usize = 8;
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    utoipa::ToSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum ChartKind {
@@ -25,25 +39,41 @@ text_enum!(ChartKind, "chart kind", {
     Pie => "pie",
 });
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Axis {
     pub label: String,
     /// Category labels, one per point (or per pie slice).
     pub values: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Series {
     pub name: String,
+    /// One value per x label; a label the series has no row for is 0.
     pub values: Vec<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct ChartSpec {
     pub title: String,
     pub kind: ChartKind,
     pub x: Axis,
     pub series: Vec<Series>,
+    /// Bars and lines stacked on each other instead of beside; a stored
+    /// spec from before the flag is not stacked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stacked: bool,
+}
+
+/// Which columns make a chart's series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeriesColumns<'a> {
+    /// One series per column, named after it.
+    pub y: &'a [String],
+    /// Long-format rows: one series per distinct value of this column,
+    /// each taking its rows' first `y` value. Distinct x values in
+    /// first-seen order become the axis.
+    pub series_by: Option<&'a str>,
 }
 
 impl ChartSpec {
@@ -57,18 +87,25 @@ impl ChartSpec {
             .unwrap_or(0)
     }
 
+    /// The series names, for a summary line.
+    #[must_use]
+    pub fn series_names(&self) -> Vec<&str> {
+        self.series.iter().map(|s| s.name.as_str()).collect()
+    }
+
     /// A `kind` chart of a result set: `x_column` supplies the labels and
-    /// `y_column` the values. At most [`MAX_POINTS`] rows.
+    /// `columns` the series. At most [`MAX_POINTS`] distinct labels and
+    /// [`MAX_SERIES`] series.
     ///
     /// # Errors
     ///
-    /// Returns an error if a column is missing, a value is not numeric, or
-    /// there are too many rows.
+    /// Returns an error if a column is missing, a value is not numeric, no
+    /// `y` column is named, or there are too many labels or series.
     pub fn from_results(
         results: &QueryResults,
         kind: ChartKind,
         x_column: &str,
-        y_column: &str,
+        columns: SeriesColumns<'_>,
         title: &str,
     ) -> Result<Self> {
         let column = |name: &str| {
@@ -81,39 +118,86 @@ impl ChartSpec {
                 })
         };
         let x_idx = column(x_column)?;
-        let y_idx = column(y_column)?;
-
-        if results.rows.len() > MAX_POINTS {
-            return Err(Error::Analysis(format!(
-                "{} rows is too many for a chart (max {MAX_POINTS}); aggregate or limit the query",
-                results.rows.len()
+        let y_idx: Vec<usize> = columns
+            .y
+            .iter()
+            .map(|name| column(name))
+            .collect::<Result<_>>()?;
+        let Some(&first_y) = y_idx.first() else {
+            return Err(Error::Analysis(String::from(
+                "a chart needs at least one y column",
             )));
-        }
+        };
+        let by_idx = columns.series_by.map(column).transpose()?;
 
-        let mut labels = Vec::with_capacity(results.rows.len());
-        let mut values = Vec::with_capacity(results.rows.len());
+        // Distinct labels in first-seen order, each with its position.
+        let mut labels: Vec<String> = Vec::new();
+        let mut positions: HashMap<String, usize> = HashMap::new();
+        // Series by name, in first-seen order, each a sparse row of values.
+        let mut names: Vec<String> = Vec::new();
+        let mut values: HashMap<String, Vec<Option<f64>>> = HashMap::new();
         for (i, row) in results.rows.iter().enumerate() {
-            let x = row.get(x_idx).cloned().unwrap_or(serde_json::Value::Null);
-            let y = row.get(y_idx).cloned().unwrap_or(serde_json::Value::Null);
-            labels.push(match x {
-                serde_json::Value::String(s) => s,
-                serde_json::Value::Null => String::from("NULL"),
-                other => other.to_string(),
-            });
-            let number = match &y {
-                serde_json::Value::Number(n) => n.as_f64(),
-                serde_json::Value::String(s) => s.parse::<f64>().ok(),
-                serde_json::Value::Null => Some(0.0),
-                _ => None,
+            let label = Cell::at(row, x_idx).label();
+            let position = if let Some(&position) = positions.get(&label) {
+                position
+            } else {
+                if labels.len() >= MAX_POINTS {
+                    return Err(Error::Analysis(format!(
+                        "more than {MAX_POINTS} distinct {x_column} values is too many for a chart; aggregate or limit the query"
+                    )));
+                }
+                positions.insert(label.clone(), labels.len());
+                labels.push(label);
+                labels.len().saturating_sub(1)
             };
-            values.push(number.ok_or_else(|| {
-                Error::Analysis(format!(
-                    "row {} of column '{y_column}' is not numeric: {y}",
-                    i.saturating_add(1)
-                ))
-            })?);
+            let targets: Vec<(String, usize)> = match by_idx {
+                Some(by) => vec![(Cell::at(row, by).label(), first_y)],
+                None => columns
+                    .y
+                    .iter()
+                    .cloned()
+                    .zip(y_idx.iter().copied())
+                    .collect(),
+            };
+            for (name, idx) in targets {
+                if !values.contains_key(&name) {
+                    if names.len() >= MAX_SERIES {
+                        return Err(Error::Analysis(format!(
+                            "more than {MAX_SERIES} series is too many for one chart; filter or aggregate the query"
+                        )));
+                    }
+                    names.push(name.clone());
+                    values.insert(name.clone(), Vec::new());
+                }
+                let y = row.get(idx).cloned().unwrap_or(serde_json::Value::Null);
+                let number = Cell(&y).number().ok_or_else(|| {
+                    Error::Analysis(format!(
+                        "row {} of column '{}' is not numeric: {y}",
+                        i.saturating_add(1),
+                        results.columns.get(idx).map_or("", String::as_str)
+                    ))
+                })?;
+                let series = values.entry(name).or_default();
+                if series.len() <= position {
+                    series.resize(position.saturating_add(1), None);
+                }
+                if let Some(slot) = series.get_mut(position) {
+                    *slot = Some(number);
+                }
+            }
         }
 
+        let series = names
+            .into_iter()
+            .map(|name| {
+                let mut row = values.remove(&name).unwrap_or_default();
+                row.resize(labels.len(), None);
+                Series {
+                    name,
+                    values: row.into_iter().map(Option::unwrap_or_default).collect(),
+                }
+            })
+            .collect();
         Ok(Self {
             title: title.to_owned(),
             kind,
@@ -121,11 +205,16 @@ impl ChartSpec {
                 label: x_column.to_owned(),
                 values: labels,
             },
-            series: vec![Series {
-                name: y_column.to_owned(),
-                values,
-            }],
+            series,
+            stacked: false,
         })
+    }
+
+    /// The same chart, stacked.
+    #[must_use]
+    pub fn stacked(mut self, stacked: bool) -> Self {
+        self.stacked = stacked;
+        self
     }
 }
 
@@ -157,7 +246,7 @@ mod tests {
             &sample_results(),
             ChartKind::Bar,
             "region",
-            "sales",
+            one("sales"),
             "Sales by Region",
         )
         .unwrap();
@@ -182,15 +271,29 @@ mod tests {
             &sample_results(),
             ChartKind::Pie,
             "region",
-            "sales",
+            one("sales"),
             "Share",
         )
         .unwrap();
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["kind"], "pie");
         assert_eq!(json["x"]["values"][0], "North");
+        assert!(
+            json.get("stacked").is_none(),
+            "an unstacked spec stays as it was"
+        );
         let back: ChartSpec = serde_json::from_value(json).unwrap();
         assert_eq!(back, spec);
+        // A stored spec from before the flag, and a stacked one.
+        let old: ChartSpec = serde_json::from_str(
+            r#"{"title":"t","kind":"bar","x":{"label":"x","values":["a"]},"series":[{"name":"s","values":[1.0]}]}"#,
+        )
+        .unwrap();
+        assert!(!old.stacked);
+        let stacked = spec.stacked(true);
+        let json = serde_json::to_value(&stacked).unwrap();
+        assert_eq!(json["stacked"], true);
+        assert_eq!(serde_json::from_value::<ChartSpec>(json).unwrap(), stacked);
     }
 
     #[test]
@@ -210,7 +313,27 @@ mod tests {
     #[test]
     fn missing_column_and_non_numeric_values_are_errors() {
         assert!(
-            ChartSpec::from_results(&sample_results(), ChartKind::Bar, "missing", "sales", "t")
+            ChartSpec::from_results(
+                &sample_results(),
+                ChartKind::Bar,
+                "missing",
+                one("sales"),
+                "t"
+            )
+            .is_err()
+        );
+        assert!(
+            ChartSpec::from_results(
+                &sample_results(),
+                ChartKind::Bar,
+                "region",
+                one("missing"),
+                "t"
+            )
+            .is_err()
+        );
+        assert!(
+            ChartSpec::from_results(&sample_results(), ChartKind::Bar, "region", none(), "t")
                 .is_err()
         );
         let text_values = QueryResults {
@@ -220,7 +343,7 @@ mod tests {
                 serde_json::Value::String("not a number".into()),
             ]],
         };
-        let err = ChartSpec::from_results(&text_values, ChartKind::Bar, "a", "b", "t").err();
+        let err = ChartSpec::from_results(&text_values, ChartKind::Bar, "a", one("b"), "t").err();
         assert!(err.is_some_and(|e| e.to_string().contains("not numeric")));
     }
 
@@ -238,7 +361,124 @@ mod tests {
             columns: vec!["a".into(), "b".into()],
             rows,
         };
-        let err = ChartSpec::from_results(&big, ChartKind::Line, "a", "b", "t").err();
+        let err = ChartSpec::from_results(&big, ChartKind::Line, "a", one("b"), "t").err();
         assert!(err.is_some_and(|e| e.to_string().contains("too many")));
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn several_y_columns_are_several_series() {
+        let wide = QueryResults {
+            columns: vec!["month".into(), "revenue".into(), "cost".into()],
+            rows: vec![
+                vec!["jan".into(), 10.into(), 4.into()],
+                vec!["feb".into(), 12.into(), 5.into()],
+            ],
+        };
+        let ys = [String::from("revenue"), String::from("cost")];
+        let spec = ChartSpec::from_results(
+            &wide,
+            ChartKind::Line,
+            "month",
+            SeriesColumns {
+                y: &ys,
+                series_by: None,
+            },
+            "t",
+        )
+        .unwrap();
+        assert_eq!(spec.x.values, vec!["jan", "feb"]);
+        assert_eq!(spec.series_names(), vec!["revenue", "cost"]);
+        assert_eq!(
+            spec.series.get(1).map(|s| s.values.clone()),
+            Some(vec![4.0, 5.0])
+        );
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn long_rows_pivot_by_the_series_column_with_gaps_as_zero() {
+        let long = QueryResults {
+            columns: vec!["month".into(), "region".into(), "orders".into()],
+            rows: vec![
+                vec!["jan".into(), "north".into(), 3.into()],
+                vec!["jan".into(), "south".into(), 5.into()],
+                vec!["feb".into(), "south".into(), 7.into()],
+                vec!["mar".into(), "north".into(), 1.into()],
+            ],
+        };
+        let ys = [String::from("orders")];
+        let spec = ChartSpec::from_results(
+            &long,
+            ChartKind::Bar,
+            "month",
+            SeriesColumns {
+                y: &ys,
+                series_by: Some("region"),
+            },
+            "t",
+        )
+        .unwrap();
+        assert_eq!(spec.x.values, vec!["jan", "feb", "mar"]);
+        assert_eq!(spec.series_names(), vec!["north", "south"]);
+        assert_eq!(
+            spec.series.first().map(|s| s.values.clone()),
+            Some(vec![3.0, 0.0, 1.0])
+        );
+        assert_eq!(
+            spec.series.get(1).map(|s| s.values.clone()),
+            Some(vec![5.0, 7.0, 0.0])
+        );
+        assert_eq!(spec.points(), 3);
+    }
+
+    #[test]
+    fn the_caps_count_distinct_labels_per_series_and_series_in_all() {
+        // 400 rows but only 2 distinct labels: fine.
+        let rows: Vec<Vec<serde_json::Value>> = (0..400)
+            .map(|i: u32| {
+                vec![
+                    (i.rem_euclid(2)).to_string().into(),
+                    (i.rem_euclid(3)).to_string().into(),
+                    i.into(),
+                ]
+            })
+            .collect();
+        let long = QueryResults {
+            columns: vec!["x".into(), "s".into(), "v".into()],
+            rows,
+        };
+        let ys = [String::from("v")];
+        let by = SeriesColumns {
+            y: &ys,
+            series_by: Some("s"),
+        };
+        let spec = ChartSpec::from_results(&long, ChartKind::Line, "x", by, "t");
+        assert!(spec.is_ok_and(|s| s.series.len() == 3 && s.points() == 2));
+        // Nine distinct series values is one too many.
+        let rows: Vec<Vec<serde_json::Value>> = (0..9)
+            .map(|i| vec!["a".into(), i.to_string().into(), i.into()])
+            .collect();
+        let many = QueryResults {
+            columns: vec!["x".into(), "s".into(), "v".into()],
+            rows,
+        };
+        let err = ChartSpec::from_results(&many, ChartKind::Line, "x", by, "t").err();
+        assert!(err.is_some_and(|e| e.to_string().contains("series")));
+    }
+
+    fn one(name: &str) -> SeriesColumns<'static> {
+        let leaked: &'static [String] = Box::leak(vec![name.to_owned()].into_boxed_slice());
+        SeriesColumns {
+            y: leaked,
+            series_by: None,
+        }
+    }
+
+    fn none() -> SeriesColumns<'static> {
+        SeriesColumns {
+            y: &[],
+            series_by: None,
+        }
     }
 }

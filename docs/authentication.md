@@ -47,6 +47,7 @@ An administrator creates password users and API tokens from the command line:
 ```bash
 quack user add alice            # prompts for the password
 quack user add admin --admin
+quack workspace create sales    # or create it in the web console
 quack token create -w sales --user alice --name reporting --scopes read,write --expires 90
 quack token list -w sales
 quack token revoke -w sales HASH          # a prefix of the hash is enough
@@ -82,6 +83,27 @@ owner adds them with `quack member add` or on the workspace's Settings page. qua
 the person's tokens and renews them. When the issuer revokes the grant or disables the
 account, quack ends all of that person's sessions. Without the `offline_access` scope, the
 issuer sends no refresh token, and a sign-in lasts only as long as quack's session limits.
+
+### Memberships from the identity provider's groups
+
+Set `groups_claim` to the claim that lists a person's groups, and give each group a role
+in a workspace with `quack member add --group NAME --role ROLE -w WORKSPACE`:
+
+```toml
+[server.oidc]
+# ...as above
+groups_claim = "groups"
+```
+
+quack sets a person's memberships from the claim at each sign-in, at each renewal whose
+response carries a new ID token, and on the first request with each new access token
+presented as a bearer. In each workspace the person gets the highest role among their
+groups. Leaving every group with a role in a workspace removes the membership. quack
+changes only memberships it granted from groups; a membership an owner granted by hand
+stays. A renewal whose ID token names a different subject ends the sign-in. When the claim
+is missing from a token, the person is in no group; when Entra ID leaves the groups out
+because the person has too many, quack changes nothing. `quack doctor` warns when the
+issuer does not list the claim.
 
 ### Accepting the identity provider's access tokens
 
@@ -184,7 +206,9 @@ Three consequences for operators:
 - A locked keychain stops quack with an error; quack does not fall back to `vault.key`.
   Unlock the keychain and retry.
 - A backup of `control.db` without the vault key cannot decrypt its tokens. Restore both, or
-  expect everyone to sign in again.
+  expect everyone to sign in again. `quack vault export-key --to FILE` writes the key to a
+  file only its owner can read (or prints it after a yes); on the new host, put it at
+  `<data_dir>/vault.key` before the first start. `quack doctor` reports where the key is.
 
 ## Troubleshooting
 

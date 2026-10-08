@@ -13,7 +13,7 @@
         <li><strong>Explore.</strong> Type a name to see what it connects to, or pick a kind to list everything of that kind. <em>Path</em> finds how two things are linked. Click a dot to see its details and sources.</li>
         <li><strong>Clean up.</strong> When the same thing appears under two names, it shows up in <em>Merge review</em>: merge it or keep both.</li>
       </ol>
-      <p class="mt-3">A <strong>provisional</strong> banner means the ontology was accepted without review; questions in query mode ignore the graph until someone marks it reviewed. A <strong>stale</strong> banner means the ontology changed since the last extraction: <em>Revalidate</em> drops what no longer fits, and extracting again adds what is new.</p>
+      <p class="mt-3">A <strong>provisional</strong> banner means the ontology was accepted without review; questions in query mode ignore the graph until someone marks it reviewed. A <strong>stale</strong> banner means the ontology changed since the last extraction: <em>Revalidate</em> drops what no longer fits, after listing it, and extracting again adds what is new. To rename a class or relation without losing its nodes and edges, use <em>Rename</em> on the Ontology page.</p>
     </div>
   </details>
 </div>
@@ -21,31 +21,74 @@
 {% if let Some(error) = error %}<p role="alert" class="mt-3 rounded border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}
 {% if let Some(notice) = notice %}<p role="status" class="mt-3 rounded border border-green-900 bg-green-950 px-3 py-2 text-sm text-green-300 wrap-anywhere">{{ notice }}</p>{% endif %}
 <p class="mt-3 text-sm text-slate-300">{{ status.nodes }} nodes, {{ status.edges }} edges · ontology version {% if let Some(v) = status.ontology_version %}{{ v }}{% else %}none{% endif %}, {% if let Some(v) = status.built_with_version %}graph built with {{ v }}{% else %}graph never built{% endif %}</p>
+<form method="get" action="/api/v1/workspaces/{{ ws.membership.workspace.id }}/graph/export" class="mt-2 flex flex-wrap items-center gap-3 text-sm">
+  <label for="graph-export-format" class="text-slate-400">Download the whole graph as</label>
+  <select id="graph-export-format" name="format" class="rounded border border-slate-700 bg-slate-900 px-2 py-1">
+    <option value="csv">CSV (nodes, edges, provenance in a tar)</option>
+    <option value="graphml">GraphML</option>
+    <option value="jsonld">JSON-LD</option>
+  </select>
+  <label class="flex items-center gap-1 text-slate-300"><input type="checkbox" name="include_provisional" value="true"> include provisional</label>
+  <button type="submit" class="rounded border border-slate-700 px-2 py-1 hover:bg-slate-800">Download</button>
+</form>
 {% if status.provisional() %}
 <div class="mt-3 flex flex-wrap items-center gap-3 rounded border border-amber-900 bg-amber-950 px-3 py-2 text-sm text-amber-200">
   <span>Provisional: built from an ontology accepted without review. Query mode ignores it until someone reviews.</span>
-  {% if ws.can_write %}<form method="post" action="/w/{{ ws.id }}/graph/review"><button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Mark reviewed</button></form>{% endif %}
+  {% if ws.can_write %}<form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/review"><button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Mark reviewed</button></form>{% endif %}
 </div>
 {% endif %}
 {% if status.stale %}
 <div class="mt-3 flex flex-wrap items-center gap-3 rounded border border-amber-900 bg-amber-950 px-3 py-2 text-sm text-amber-200">
   <span>Stale: the ontology changed since the graph was built (version {% if let Some(v) = status.built_with_version %}{{ v }}{% else %}none{% endif %} → {% if let Some(v) = status.ontology_version %}{{ v }}{% endif %}).</span>
-  {% if ws.can_write %}<form method="post" action="/w/{{ ws.id }}/graph/revalidate"><button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Revalidate (no model calls)</button></form>{% endif %}
+  {% if let Some(Err(e)) = revalidation %}
+  <span role="alert" class="w-full wrap-anywhere">What revalidating would drop could not be counted: {{ e }}</span>
+  {% endif %}
+  {% if let Some(Ok(r)) = revalidation %}
+  {% if r.is_empty() %}
+  {% if ws.can_write %}<form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/revalidate"><button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Revalidate (no model calls)</button></form>{% endif %}
+  <span>Every node and edge fits the new version: revalidating drops nothing.</span>
+  {% else %}
+  <div class="w-full">
+    <p>Revalidating drops <strong>{{ r.dropped_nodes }} nodes and {{ r.dropped_edges }} edges</strong>:</p>
+    <ul class="mt-1 list-disc pl-5 wrap-anywhere">
+      {% for (class, nodes) in r.classes %}<li>class <span class="font-mono">{{ class }}</span>, which the ontology no longer defines: {{ nodes }} nodes</li>{% endfor %}
+      {% for (relation, edges) in r.relations %}<li>relation <span class="font-mono">{{ relation }}</span>, which the ontology no longer defines: {{ edges }} edges</li>{% endfor %}
+      {% if r.misfit_edges() > 0 %}<li>{{ r.misfit_edges() }} edges that lose an end or no longer fit their relation's domain and range</li>{% endif %}
+    </ul>
+    <p class="mt-1">If a class or relation was renamed, restore the earlier version and <a class="underline" href="/w/{{ ws.membership.workspace.id }}/ontology">rename it on the ontology page</a>, which moves its nodes and edges. Dropped document nodes come back only by extracting again from an empty graph.</p>
+    {% if ws.can_write %}
+    <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/revalidate" class="mt-2">
+      <input type="hidden" name="dropped_nodes" value="{{ r.dropped_nodes }}">
+      <input type="hidden" name="dropped_edges" value="{{ r.dropped_edges }}">
+      <button type="submit" class="rounded bg-amber-800 px-2 py-1 text-white hover:bg-amber-700">Drop {{ r.dropped_nodes }} nodes and {{ r.dropped_edges }} edges and revalidate</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endif %}
+  {% endif %}
+</div>
+{% endif %}
+{% if status.pending_chunks > 0 || !status.pending_tables.is_empty() %}
+<div class="mt-3 rounded border border-amber-900 bg-amber-950 px-3 py-2 text-sm text-amber-200">
+  Behind the workspace:
+  {% if status.pending_chunks > 0 %}{{ status.pending_chunks }} chunks not yet extracted{% if !status.pending_tables.is_empty() %};{% endif %}{% endif %}
+  {% if !status.pending_tables.is_empty() %}mapped tables changed since the graph read them: {{ status.pending_tables.join(", ") }}{% endif %}.
+  {% if ws.can_write && has_ontology %}Extract below to catch up.{% endif %}
 </div>
 {% endif %}
 {% if !status.missing_tables.is_empty() %}
 <div class="mt-3 rounded border border-amber-900 bg-amber-950 px-3 py-2 text-sm text-amber-200">
-  The ontology maps tables that are no longer in the workspace: {{ status.missing_tables.join(", ") }}. Extraction skips them; <a class="underline" href="/w/{{ ws.id }}/ontology">remove the mapping on the ontology page</a> or ingest the data again.
+  The ontology maps tables that are no longer in the workspace: {{ status.missing_tables.join(", ") }}. Extraction skips them; <a class="underline" href="/w/{{ ws.membership.workspace.id }}/ontology">remove the mapping on the ontology page</a> or ingest the data again.
 </div>
 {% endif %}
 {% if !drift.is_empty() %}
 <div class="mt-3 rounded border border-blue-900 bg-blue-950 px-3 py-2 text-sm text-blue-200">
-  The documents expressed {{ drift.len() }} things the ontology lacks: {{ drift.join(", ") }}. <a class="underline" href="/w/{{ ws.id }}/ontology">Propose extensions on the ontology page.</a>
+  The documents expressed {{ drift.len() }} things the ontology lacks: {{ drift.join(", ") }}. <a class="underline" href="/w/{{ ws.membership.workspace.id }}/ontology">Propose extensions on the ontology page.</a>
 </div>
 {% endif %}
 
 <div class="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
-  <form method="post" action="/w/{{ ws.id }}/graph" class="rounded border border-slate-800 bg-slate-900 p-3 text-sm">
+  <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph" class="rounded border border-slate-800 bg-slate-900 p-3 text-sm">
     <h2 class="font-medium">Explore</h2>
     <div class="mt-2 flex flex-wrap items-center gap-2">
       <input aria-label="Entity" name="entity" value="{{ query.entity }}" placeholder="entity (as named in the data)" class="w-56 rounded border border-slate-700 px-2 py-1">
@@ -56,7 +99,7 @@
     </div>
     <p class="mt-1 text-xs text-slate-400">An entity shows its neighbourhood; a class alone lists its entities (subclasses included).</p>
   </form>
-  <form method="post" action="/w/{{ ws.id }}/graph" class="rounded border border-slate-800 bg-slate-900 p-3 text-sm">
+  <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph" class="rounded border border-slate-800 bg-slate-900 p-3 text-sm">
     <h2 class="font-medium">Path</h2>
     <div class="mt-2 flex flex-wrap items-center gap-2">
       <input aria-label="Path start" name="from" value="{{ query.from }}" placeholder="from" class="w-40 rounded border border-slate-700 px-2 py-1">
@@ -68,7 +111,7 @@
 </div>
 
 {% if ws.can_write && has_ontology %}
-<form method="post" action="/w/{{ ws.id }}/graph/extract" class="mt-4 flex flex-wrap items-center gap-3 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
+<form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/extract" class="mt-4 flex flex-wrap items-center gap-3 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
   <span class="font-medium">Build</span>
   <select aria-label="What to extract from" name="source" class="rounded border border-slate-700 px-2 py-1">
     <option value="all">tables and documents</option>
@@ -77,12 +120,35 @@
   </select>
   <label class="inline-flex items-center gap-1">at most <input name="sample" type="number" min="1" placeholder="all" class="w-20 rounded border border-slate-700 px-2 py-1"> chunks</label>
   <label class="inline-flex items-center gap-1"><input type="checkbox" name="reset" value="true"> start from an empty graph</label>
+  <label class="inline-flex items-center gap-1"><input type="checkbox" name="all" value="true"> drop asserted nodes too</label>
   <button type="submit" class="rounded bg-blue-600 px-3 py-1 text-white hover:bg-blue-500">Extract</button>
-  <span class="text-slate-400">Documents cost one model call per chunk ({{ chunk_count }} not yet extracted) and run in the background.</span>
+  <span class="text-slate-400">Documents cost one model call per chunk ({{ status.pending_chunks }} not yet extracted) and run in the background.</span>
 </form>
+<details class="mt-4 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
+  <summary class="cursor-pointer font-medium">Correct the graph</summary>
+  <p class="mt-1 text-xs text-slate-400">What you add or change here is recorded as asserted by you, kept when the graph is rebuilt, and shown beside every node and edge it touches.</p>
+  <div class="mt-3 grid grid-cols-1 gap-4 md:grid-cols-2">
+    <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/nodes" class="space-y-2">
+      <h3 class="text-xs font-semibold uppercase text-slate-400">Add a node</h3>
+      <input aria-label="Label" name="label" required placeholder="label, as named in the data" class="w-full rounded border border-slate-700 px-2 py-1">
+      <input aria-label="Class" name="class" required placeholder="class id" class="w-full rounded border border-slate-700 px-2 py-1">
+      <textarea aria-label="Properties" name="properties" rows="2" placeholder="one property per line: key=value" class="w-full rounded border border-slate-700 px-2 py-1 font-mono text-xs"></textarea>
+      <input aria-label="Note" name="note" placeholder="why (kept with the assertion)" class="w-full rounded border border-slate-700 px-2 py-1">
+      <button type="submit" class="rounded bg-blue-600 px-3 py-1 text-white hover:bg-blue-500">Add node</button>
+    </form>
+    <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/edges" class="space-y-2">
+      <h3 class="text-xs font-semibold uppercase text-slate-400">Add an edge</h3>
+      <input aria-label="Source node id" name="source" required placeholder="source node id (from the inspector)" class="w-full rounded border border-slate-700 px-2 py-1 font-mono text-xs">
+      <input aria-label="Relation" name="relation" required placeholder="relation id" class="w-full rounded border border-slate-700 px-2 py-1">
+      <input aria-label="Target node id" name="target" required placeholder="target node id" class="w-full rounded border border-slate-700 px-2 py-1 font-mono text-xs">
+      <input aria-label="Note" name="note" placeholder="why (kept with the assertion)" class="w-full rounded border border-slate-700 px-2 py-1">
+      <button type="submit" class="rounded bg-blue-600 px-3 py-1 text-white hover:bg-blue-500">Add edge</button>
+    </form>
+  </div>
+</details>
 {% endif %}
 {% if !has_ontology %}
-<p class="mt-4 text-sm text-slate-400">No ontology yet: the graph needs one. <a class="text-blue-400 hover:underline" href="/w/{{ ws.id }}/ontology">Install or propose an ontology first.</a></p>
+<p class="mt-4 text-sm text-slate-400">No ontology yet: the graph needs one. <a class="text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/ontology">Install or propose an ontology first.</a></p>
 {% endif %}
 
 {% if !merges.is_empty() %}
@@ -98,8 +164,8 @@
       <td class="tabular-nums">{{ m.distance }}</td>
       <td class="text-right whitespace-nowrap">
         {% if ws.can_write %}
-        <form method="post" action="/w/{{ ws.id }}/graph/merges/{{ m.id }}" class="inline"><input type="hidden" name="action" value="accept"><button type="submit" class="rounded bg-blue-600 px-2 py-0.5 text-xs text-white hover:bg-blue-500">Merge</button></form>
-        <form method="post" action="/w/{{ ws.id }}/graph/merges/{{ m.id }}" class="inline"><input type="hidden" name="action" value="reject"><button type="submit" class="ml-1 rounded border border-slate-700 px-2 py-0.5 text-xs hover:bg-slate-800">Keep apart</button></form>
+        <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/merges/{{ m.id }}" class="inline"><input type="hidden" name="action" value="accept"><button type="submit" class="rounded bg-blue-600 px-2 py-0.5 text-xs text-white hover:bg-blue-500">Merge</button></form>
+        <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/merges/{{ m.id }}" class="inline"><input type="hidden" name="action" value="reject"><button type="submit" class="ml-1 rounded border border-slate-700 px-2 py-0.5 text-xs hover:bg-slate-800">Keep apart</button></form>
         {% endif %}
       </td>
     </tr>
@@ -122,9 +188,23 @@
       <ul class="mt-1 space-y-2 text-sm wrap-anywhere">
         {% for n in r.nodes %}
         <li id="node-{{ n.id }}" class="rounded border border-slate-800 bg-slate-900 p-2">
-          <span class="font-medium">{{ n.label }}</span> <span class="text-slate-400">({{ n.class_id }}){% if n.provisional %} · provisional{% endif %}</span>
+          <span class="font-medium">{{ n.label }}</span> <span class="text-slate-400">({{ n.class_id }}){% if n.standing == GraphStanding::Provisional %} · provisional{% endif %}</span>
           {% if !n.properties.is_empty() %}<div class="mt-1 font-mono text-xs text-slate-400">{{ n.properties }}</div>{% endif %}
           {% if !n.sources.is_empty() %}<div class="mt-1 text-xs text-slate-400">from {{ n.sources }}</div>{% endif %}
+          <div class="mt-1 font-mono text-xs text-slate-500">{{ n.id }}</div>
+          {% if ws.can_write %}
+          <details class="mt-1 text-xs">
+            <summary class="cursor-pointer text-slate-400">Edit or delete</summary>
+            <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/nodes/{{ n.id }}" class="mt-1 space-y-1">
+              <input aria-label="New label" name="label" placeholder="new label (blank keeps {{ n.label }})" class="w-full rounded border border-slate-700 px-2 py-1">
+              <input aria-label="New class" name="class" placeholder="new class (blank keeps {{ n.class_id }})" class="w-full rounded border border-slate-700 px-2 py-1">
+              <textarea aria-label="Property changes" name="properties" rows="2" placeholder="key=value sets a property; key= removes it" class="w-full rounded border border-slate-700 px-2 py-1 font-mono"></textarea>
+              <input aria-label="Note" name="note" placeholder="why" class="w-full rounded border border-slate-700 px-2 py-1">
+              <button type="submit" class="rounded bg-blue-600 px-2 py-0.5 text-white hover:bg-blue-500">Save</button>
+            </form>
+            <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/nodes/{{ n.id }}/delete" class="mt-1"><button type="submit" class="rounded border border-red-900 px-2 py-0.5 text-red-300 hover:bg-red-950">Delete node and its edges</button></form>
+          </details>
+          {% endif %}
         </li>
         {% endfor %}
       </ul>
@@ -132,7 +212,7 @@
     <div>
       <h3 class="text-xs font-semibold uppercase text-slate-400">Edges</h3>
       <ul class="mt-1 space-y-1 text-sm wrap-anywhere">
-        {% for e in r.edges %}<li class="font-mono">{{ e.source }} <span class="text-slate-400">—{{ e.relation }}→</span> {{ e.target }}{% if !e.sources.is_empty() %} <span class="text-xs text-slate-400">from {{ e.sources }}</span>{% endif %}</li>{% endfor %}
+        {% for e in r.edges %}<li class="font-mono">{{ e.source }} <span class="text-slate-400">—{{ e.relation }}→</span> {{ e.target }}{% if !e.sources.is_empty() %} <span class="text-xs text-slate-400">from {{ e.sources }}</span>{% endif %}{% if ws.can_write %} <form method="post" action="/w/{{ ws.membership.workspace.id }}/graph/edges/{{ e.id }}/delete" class="inline"><button type="submit" class="rounded border border-slate-700 px-1 text-xs text-slate-400 hover:bg-slate-800" title="Delete this edge">delete</button></form>{% endif %}</li>{% endfor %}
       </ul>
     </div>
   </div>

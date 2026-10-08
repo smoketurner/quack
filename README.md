@@ -164,9 +164,12 @@ supply chain shipments.
 ## Use it
 
 ```bash
+quack workspace create sales             # -w names a workspace that exists; with no -w, commands use "default"
 quack ingest sales.csv -w sales          # CSV, Parquet, JSON, and XLSX become tables
 quack ingest policy.pdf -w sales --pin   # PDF, DOCX, PPTX, HTML, Markdown, and text become chunks; --pin puts the full text in every prompt
-quack import postgres://u:p@host/db --table orders --from public.orders   # snapshot a Postgres or SQLite query, or an https file
+quack ingest policy.pdf -w sales --replace   # a changed file takes the old document's place once ready; the old one stays until then
+quack ingest contracts/ -w sales [--prune]   # every supported file in a folder; run it again to pick up changed files and report (or --prune) deleted ones
+quack import sqlite:/data/shop.db --table orders --from orders   # snapshot a SQLite query, or an https file
 ```
 
 ```bash
@@ -176,6 +179,9 @@ cat orders.csv | quack -q "SELECT count(*) FROM stdin"   # piped data is the tab
 ```
 
 ```bash
+quack -p "which invoices are overdue?" -f json -w sales   # one answer as JSON, with its session_id
+quack saved add overdue --from-session ID                 # keep that answer's SQL under a name
+quack saved run overdue --exit-code      # re-run it without the model; exit 5 when the result changed (cron is the scheduler)
 quack context edit                       # definitions and rules the agent follows
 quack ontology propose                   # draft classes and relations from the tables, then review
 quack graph extract -y                   # build the knowledge graph
@@ -185,6 +191,7 @@ quack graph extract -y                   # build the knowledge graph
 quack serve --local                      # web UI, REST API, and MCP on http://127.0.0.1:8080
 quack mcp -w sales                       # MCP over stdio for Claude Code and editors
 quack user add alice --admin             # users, tokens, members, and the audit log for `quack serve`
+quack workspace list                     # every workspace in the data directory
 ```
 
 ```bash
@@ -197,14 +204,17 @@ You need no configuration to start. Without a chat model, `quack` and `quack -q`
 SQL, load files, and take every slash command; asking a question tells you how to set up a
 model.
 
-Exit codes: 0 ok, 1 error, 2 usage, 3 write refused, 4 auth required.
+Exit codes: 0 ok, 1 error, 2 usage, 3 write refused, 4 auth required, 5 a saved question's result changed (`--exit-code`).
 
 ## How it works
 
 - Retrieval combines vector search with quack's own BM25 index. No DuckDB extension is
   loaded at runtime, so the binary stays one file.
 - The agent asks before it writes. Print mode refuses writes without `--allow-write`, and
-  the API requires the write scope.
+  the API requires the write scope. Once a turn has read document or graph text, a write
+  needs a person's approval even with `--allow-write`, and is refused where nobody can be
+  asked, so a document cannot dictate a write. Pinned documents and table rows are not
+  covered by this rule.
 - quack proposes the ontology from your tables and documents, and a person accepts it.
   Extraction follows it, and every node and edge records where it came from.
 - Everything that could reveal workspace content stays in that workspace's file. The

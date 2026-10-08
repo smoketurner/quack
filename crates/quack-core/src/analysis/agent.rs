@@ -1,15 +1,17 @@
+use std::mem;
 use std::sync::{Arc, PoisonError};
 use std::time::Instant;
 
 use futures::StreamExt;
 use rig::completion::PromptError;
 use rig::prelude::*;
-use rig::streaming::{Item, StreamEvent};
+use rig::streaming::{Item, PartKind, StreamEvent};
 
-use crate::config::{AnalysisConfig, RetrievalConfig};
-use crate::embedding::{Embedder, EmbeddingModel};
+use crate::config::{AnalysisConfig, GraphConfig, RetrievalConfig};
+use crate::embedding::{Embedder, EmbeddingModel, Input};
 use crate::error::{Error, Result};
 use crate::ids::SessionId;
+use crate::text::Tokens;
 
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
@@ -17,23 +19,36 @@ use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, Turn
 use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls};
 use super::policy::WritePolicy;
 use super::rerank::RerankAnswer;
-use super::text_to_sql::{Modeled, PromptOptions, SystemPrompt, Window};
+use super::search::DocumentScope;
+use super::table_search::{TableCards, TableLayout, user_tables};
+use super::text_to_sql::{Modeled, PromptOptions, Question, SystemPrompt};
 use super::tools::{
-    CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, GraphTools,
-    ListDocumentsTool, ListTablesTool, ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool,
-    SharedDb, Turn,
+    CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, FindTablesTool,
+    GraphTools, ListDocumentsTool, ListTablesTool, ReadDocumentTool, ReaderDb, RunSqlTool,
+    SearchDocumentsTool, SearchGraphTool, SharedDb, Turn, ViewImageTool,
 };
 use super::vector_index::DuckDbVectorIndex;
-use crate::graph::{GraphOptions, GraphResult, store as graph_store};
+use crate::graph::{GraphResult, store as graph_store};
+use crate::llm::vision::ImageReader;
 use crate::llm::{ChatModel, OLLAMA_KEEP_ALIVE, RerankModel, SchemaCall};
 use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
 
 /// What the provider charged for a turn. Every budget quack computes
-/// itself, such as the history trim, is a four-characters-per-token
-/// estimate; this is the measured count the provider reported,
+/// itself — the history trim, Ollama's `num_ctx` — is a four-characters-
+/// per-token estimate; this is the measured count the provider reported,
 /// for the response object and the transcript.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
 #[expect(
     clippy::struct_field_names,
     reason = "these are the field names of rig's Usage and of every provider's API, and they are the response object's JSON keys"
@@ -49,7 +64,7 @@ pub struct TokenUsage {
 }
 
 /// A counter the provider did not report counts as zero here; a turn where
-/// it reported none at all is `None` (see [`TokenUsage::reported`]).
+/// it reported none at all is `None` (see `TokenUsage::reported`).
 impl From<rig::completion::Usage> for TokenUsage {
     fn from(usage: rig::completion::Usage) -> Self {
         Self {
@@ -103,10 +118,14 @@ pub struct AgentResponse {
     /// included. `None` on a response no turn timed.
     #[serde(default)]
     pub duration_ms: Option<u64>,
+    /// The documents the person limited the question to; empty for the
+    /// whole workspace.
+    #[serde(default)]
+    pub documents: DocumentScope,
 }
 
 /// One SQL statement the turn ran, as the response object lists it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct QueryRun {
     pub sql: String,
     /// Rows the statement produced, when the step reported a count.
@@ -133,32 +152,63 @@ impl AgentResponse {
     /// issue #50): print mode's `--format json`, the REST body and SSE
     /// `complete` event, and the MCP structured content all carry this.
     #[must_use]
-    pub fn to_json(&self, session_id: &SessionId) -> serde_json::Value {
-        let citations: Vec<serde_json::Value> = self
-            .citations
-            .iter()
-            .map(|c| {
-                let mut value = serde_json::json!(c);
-                if let Some(fields) = value.as_object_mut() {
-                    fields.insert(String::from("label"), c.label().into());
-                }
-                value
-            })
-            .collect();
-        serde_json::json!({
-            "answer": self.content,
-            "citations": citations,
-            "queries": self.queries(),
-            "steps": self.steps,
-            "graph": self.graph,
-            "chart": self.chart,
-            "write_refused": self.write_refused,
-            "cancelled": self.cancelled,
-            "usage": self.usage,
-            "duration_ms": self.duration_ms,
-            "session_id": session_id,
-        })
+    pub fn body(&self, session_id: &SessionId) -> AgentResponseBody {
+        AgentResponseBody {
+            answer: self.content.clone(),
+            citations: self
+                .citations
+                .iter()
+                .map(|c| LabeledCitation {
+                    label: c.label(),
+                    citation: c.clone(),
+                })
+                .collect(),
+            queries: self.queries(),
+            steps: self.steps.clone(),
+            graph: self.graph.clone(),
+            chart: self.chart.clone(),
+            write_refused: self.write_refused,
+            cancelled: self.cancelled,
+            usage: self.usage,
+            duration_ms: self.duration_ms,
+            documents: self.documents.clone(),
+            session_id: session_id.clone(),
+        }
     }
+}
+
+/// The response object (design doc 11.2): the answer, its sources, and
+/// what the turn did to reach it.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct AgentResponseBody {
+    pub answer: String,
+    pub citations: Vec<LabeledCitation>,
+    /// The `run_sql` steps, as statements with their row counts.
+    pub queries: Vec<QueryRun>,
+    pub steps: Vec<ToolStep>,
+    /// What the graph tools returned, in call order.
+    pub graph: Vec<GraphResult>,
+    pub chart: Option<ChartSpec>,
+    /// At least one mutating statement was refused during the turn.
+    pub write_refused: bool,
+    /// The turn was cancelled; `answer` holds what streamed before.
+    pub cancelled: bool,
+    /// Tokens the provider reported; `null` when it reported none.
+    pub usage: Option<TokenUsage>,
+    /// Milliseconds from the question to the answer.
+    pub duration_ms: Option<u64>,
+    /// The documents the question was limited to; empty for all.
+    pub documents: DocumentScope,
+    pub session_id: SessionId,
+}
+
+/// A citation with the label every interface shows for it.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct LabeledCitation {
+    #[serde(flatten)]
+    pub citation: Citation,
+    /// `file.pdf p. 3`, `notes.md § Heading`: the source as a person reads it.
+    pub label: String,
 }
 
 /// One question for the agent: the workspace handles, the embedding model
@@ -177,7 +227,7 @@ pub struct Analysis<'a, M> {
     pub rerank_model: Option<RerankModel>,
     pub config: &'a AnalysisConfig,
     pub retrieval_config: &'a RetrievalConfig,
-    pub graph_options: GraphOptions,
+    pub graph_options: GraphConfig,
     pub write_policy: WritePolicy,
     pub prompt: PromptOptions,
     pub history: Vec<Message>,
@@ -206,13 +256,26 @@ where
         self,
         completion_model: ChatModel,
         reranker_call: Option<SchemaCall<RerankAnswer>>,
+        images: Option<ImageReader>,
         sink: EventSink,
     ) -> Result<AgentResponse> {
         let max_turns = usize::try_from(self.config.max_turns)
             .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
         let recorder = TurnRecorder::new(sink).with_turn_limit(max_turns);
-        match self
-            .run_inner(completion_model, reranker_call, &recorder)
+        let mut this = self;
+        this.prompt.question = Some(
+            Question::of_turn(
+                this.message,
+                this.retrieval_config.rrf_k,
+                &this.reader_db,
+                &this.db,
+                this.embedder.as_ref(),
+                &recorder,
+            )
+            .await,
+        );
+        match this
+            .run_inner(completion_model, reranker_call, images, &recorder)
             .await
         {
             Ok(response) => {
@@ -232,6 +295,61 @@ where
 struct PromptAndModel {
     system_prompt: String,
     modeled: Modeled,
+    tables: TableLayout,
+    /// Whether a ready document is an image, for `view_image` to look at.
+    has_images: bool,
+}
+
+impl Question {
+    /// The turn's question with its embedding, after bringing the stored
+    /// table vectors up to date: both only when an embedding model exists
+    /// and the workspace has more tables than the prompt describes. A model
+    /// that fails leaves the keyword ranking, with a warning.
+    async fn of_turn<M: EmbeddingModel>(
+        text: &str,
+        rrf_k: u32,
+        reader: &ReaderDb,
+        writer: &SharedDb,
+        embedder: Option<&Embedder<M>>,
+        recorder: &TurnRecorder,
+    ) -> Self {
+        let mut question = Self {
+            text: text.to_owned(),
+            vector: None,
+            rrf_k,
+        };
+        let Some(embedder) = embedder else {
+            return question;
+        };
+        let layout = reader
+            .with_db(|db| Ok(TableLayout::of(user_tables(db)?.len())))
+            .await;
+        match layout {
+            Ok(TableLayout::Ranked) => {}
+            Ok(TableLayout::AllDescribed) => return question,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not count the tables; ranking tables by keyword");
+                return question;
+            }
+        }
+        match TableCards::refresh_vectors(reader, writer, embedder).await {
+            Ok(made) => tracing::debug!(tables = made, "embedded table cards"),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not embed the table cards; ranking tables by keyword");
+                return question;
+            }
+        }
+        match recorder
+            .embed_cached(embedder, Input::Query(text.to_owned()))
+            .await
+        {
+            Ok(vector) => question.vector = Some(vector),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not embed the question; ranking tables by keyword");
+            }
+        }
+        question
+    }
 }
 
 impl PromptAndModel {
@@ -245,6 +363,8 @@ impl PromptAndModel {
                         ontology_store::current(db)?.as_ref(),
                         &graph_store::status(db)?,
                     ),
+                    tables: TableLayout::of(user_tables(db)?.len()),
+                    has_images: db.has_images()?,
                 })
             })
             .await
@@ -270,7 +390,7 @@ impl Cutoff {
         match reason? {
             FinishReason::Length => Some(Self::Length),
             FinishReason::ContentFilter => Some(Self::Filtered),
-            FinishReason::Stop | FinishReason::ToolCalls | FinishReason::Other(_) => None,
+            _ => None,
         }
     }
 
@@ -278,10 +398,10 @@ impl Cutoff {
     /// through before the stop.
     fn note(self, answered: bool, window: Window) -> String {
         let advice = match window {
-            Window::Ollama => {
+            Window::Ollama(_) => {
                 " With Ollama the answer shares the context window with the prompt and the \
-                 model's reasoning; raise the server's window (OLLAMA_CONTEXT_LENGTH) or ask a \
-                 narrower question."
+                 model's reasoning; raise [analysis].max_context_tokens or ask a narrower \
+                 question."
             }
             Window::Provider => " Ask a narrower question.",
         };
@@ -307,12 +427,97 @@ impl Cutoff {
         Error::Llm(match self {
             Self::Length => format!(
                 "the {what} answer was cut off at the model's output limit (with Ollama, the \
-                 server's context window: OLLAMA_CONTEXT_LENGTH)"
+                 context window: [analysis].max_context_tokens)"
             ),
             Self::Filtered => {
                 format!("the {what} answer was stopped by the provider's content filter")
             }
         })
+    }
+}
+
+/// Who sizes the model's context window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Window {
+    /// The provider sizes its own.
+    Provider,
+    /// Ollama, asked for this `num_ctx`.
+    Ollama(OllamaWindow),
+}
+
+impl Window {
+    /// Ollama's window when the prompt options cap one, else the provider's.
+    fn for_turn(
+        prompt: &PromptOptions,
+        system_prompt: &str,
+        history: &[Message],
+        user_message: &str,
+    ) -> Self {
+        prompt.ollama_context_cap.map_or(Self::Provider, |cap| {
+            Self::Ollama(OllamaWindow::for_turn(
+                cap,
+                system_prompt,
+                history,
+                user_message,
+            ))
+        })
+    }
+}
+
+/// The `num_ctx` to ask Ollama for: the prompt's estimated tokens plus
+/// room for tool results and the answer, rounded up to 8,192, between
+/// 8,192 and `cap`. Ollama's default of 4,096 truncates the front of
+/// most workspace prompts, which loses the tool guidance and the question.
+///
+/// `num_ctx` is a load option: asking Ollama for a different value than
+/// the one the model is already loaded with forces a full model reload,
+/// which measured 4-5 seconds for `gpt-oss:20b` on this machine (`ollama
+/// serve`, repeated `/api/generate` calls that only changed `num_ctx`) —
+/// against single-digit milliseconds for a request that keeps the same
+/// value. A session's history only grows turn over turn until the
+/// history trim caps it, so the requested size is non-decreasing within
+/// a session; the step below is deliberately coarse (four tiers instead
+/// of one every 2,048 tokens) so a growing conversation crosses it, and
+/// pays that reload, at most three times instead of up to twelve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OllamaWindow(u32);
+
+impl OllamaWindow {
+    const HEADROOM: u32 = 8_192;
+    const FLOOR: u32 = 8_192;
+    const STEP: u32 = 8_192;
+
+    /// The window for a turn: the system prompt, the replayed history, and
+    /// the question, under `cap` (`[analysis].max_context_tokens`). Ollama
+    /// loads a model with a 4,096-token window unless the request says
+    /// otherwise and truncates the front of a longer prompt, which is where
+    /// the tool guidance is.
+    fn for_turn(cap: Tokens, system_prompt: &str, history: &[Message], user_message: &str) -> Self {
+        let history_chars = serde_json::to_string(history).map_or(0, |h| h.len());
+        let prompt = Tokens::of_chars(
+            system_prompt
+                .len()
+                .saturating_add(history_chars)
+                .saturating_add(user_message.len()),
+        );
+        if prompt > cap {
+            tracing::warn!(
+                prompt_tokens = %prompt,
+                %cap,
+                "the prompt is larger than [analysis].max_context_tokens; Ollama will truncate it"
+            );
+        }
+        Self::for_prompt(prompt, cap)
+    }
+
+    /// The window for a prompt of `prompt` tokens under `cap`.
+    fn for_prompt(prompt: Tokens, cap: Tokens) -> Self {
+        let needed = prompt.get().saturating_add(Self::HEADROOM);
+        let rounded = needed
+            .div_ceil(Self::STEP)
+            .saturating_mul(Self::STEP)
+            .max(Self::FLOOR);
+        Self(rounded.min(cap.get().max(Self::FLOOR)))
     }
 }
 
@@ -324,6 +529,7 @@ where
         self,
         completion_model: ChatModel,
         reranker_call: Option<SchemaCall<RerankAnswer>>,
+        images: Option<ImageReader>,
         recorder: &TurnRecorder,
     ) -> Result<AgentResponse> {
         let Self {
@@ -341,9 +547,9 @@ where
             asked,
         } = self;
         let read = PromptAndModel::read(&reader_db, &prompt).await?;
-        let turn = Turn::new(recorder.clone(), write_policy);
+        let turn = Turn::new(recorder.clone(), write_policy).within(prompt.scope.clone());
         let Replay { history, dropped } = Replay::check(history);
-        let window = prompt.window;
+        let window = Window::for_turn(&prompt, &read.system_prompt, &history, user_message);
         let agent = BuildContext {
             shared_db: Arc::clone(&shared_db),
             reader_db,
@@ -351,10 +557,13 @@ where
             retrieval_config,
             graph_options,
             modeled: read.modeled,
+            tables: read.tables,
             mode: prompt.mode,
             window,
             rerank_model,
             reranker_call,
+            images: images.filter(|_| read.has_images),
+            turn: turn.clone(),
         }
         .build_agent(completion_model, embedding_model, &read.system_prompt)?;
         let max_turns = usize::try_from(analysis_config.max_turns)
@@ -368,7 +577,7 @@ where
             .tool_context(turn.context())
             .stream();
 
-        let mut streamed = String::new();
+        let mut output = ModelOutput::default();
         let mut final_text: Option<String> = None;
         let mut stopped: Option<String> = None;
         // The final response carries rig's aggregate for the whole run; the
@@ -389,24 +598,20 @@ where
                     // the text, say what happened, record it. A model that
                     // could not be reached at all stays an error.
                     let stop = StreamStop(&e);
-                    if streamed.trim().is_empty() && cutoff.is_none() && !stop.by_agent_loop() {
+                    if output.text.trim().is_empty() && cutoff.is_none() && !stop.by_agent_loop() {
                         return Err(Error::Analysis(e.to_string()));
                     }
                     tracing::warn!(error = %e, "agent turn stopped early");
                     stopped = Some(cutoff.map_or_else(
                         || stop.explain(analysis_config.max_turns, window),
-                        |cut| cut.note(!streamed.trim().is_empty(), window),
+                        |cut| cut.note(!output.text.trim().is_empty(), window),
                     ));
                     break;
                 }
             };
             match item {
-                MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
-                    text,
-                    ..
-                })) => {
-                    streamed.push_str(&text);
-                    recorder.emit(AgentEvent::TextDelta(text));
+                MultiTurnStreamItem::StreamAssistantItem(Item::Event(event)) => {
+                    output.take(event, recorder);
                 }
                 MultiTurnStreamItem::FinalResponse(response) => {
                     if response.usage.is_reported() {
@@ -417,19 +622,19 @@ where
                 MultiTurnStreamItem::CompletionCall(call) => {
                     per_call.add(call.usage);
                     cutoff = Cutoff::of(call.finish_reason.as_ref());
+                    output.call_ended();
                 }
-                MultiTurnStreamItem::StreamAssistantItem(_)
-                | MultiTurnStreamItem::ToolResult { .. }
-                | MultiTurnStreamItem::ToolCall { .. }
-                | MultiTurnStreamItem::ToolExecutionCommitted { .. }
-                | MultiTurnStreamItem::ModelTurnRetried { .. } => {}
+                MultiTurnStreamItem::ToolCall { .. }
+                | MultiTurnStreamItem::ToolExecutionCommitted { .. } => output.call_kept(),
+                MultiTurnStreamItem::ModelTurnRetried { .. } => output.call_rejected(),
+                _ => {}
             }
         }
 
         // A turn that answered but was cut short says so; rig counts a
         // partial answer as a valid one.
         let stopped = stopped.or_else(|| cutoff.map(|cut| cut.note(true, window)));
-        let mut answer = turn_text(streamed, final_text, stopped, window, |text| {
+        let mut answer = turn_text(output.text, final_text, stopped, window, |text| {
             recorder.citations().validate(text)
         });
         if let Some(note) = dropped {
@@ -490,13 +695,12 @@ fn turn_text(
     let mut answer = check(&raw);
     let note = stopped.or_else(|| {
         answer.text.trim().is_empty().then(|| {
-            String::from(match window {
-                Window::Ollama => {
-                    "The model returned no text. With Ollama this usually means the answer or \
-                     the prompt did not fit the context window; raise the server's window \
-                     (OLLAMA_CONTEXT_LENGTH) or ask a narrower question."
-                }
-                Window::Provider => "The model returned no text; ask again or narrow the question.",
+            String::from(if matches!(window, Window::Ollama(_)) {
+                "The model returned no text. With Ollama this usually means the answer or the \
+                 prompt did not fit the context window; raise [analysis].max_context_tokens or \
+                 ask a narrower question."
+            } else {
+                "The model returned no text; ask again or narrow the question."
             })
         })
     });
@@ -511,6 +715,67 @@ fn turn_text(
     answer
 }
 
+/// What the model has streamed this turn: its answer so far, and whether
+/// the model call under way has been reported as reasoning.
+///
+/// A call's text is provisional until rig runs a tool it asked for: a call
+/// rig rejects and asks again is left out of its final text, so it is left
+/// out here too.
+#[derive(Default)]
+struct ModelOutput {
+    text: String,
+    /// How much of `text` came from calls whose tools ran.
+    kept: usize,
+    /// The last call ended and none of its tools has run yet.
+    ended: bool,
+    reasoning: bool,
+}
+
+impl ModelOutput {
+    /// Keep answer text and pass it on, and tell the interface once per
+    /// model call that the model is reasoning.
+    fn take(&mut self, event: StreamEvent, recorder: &TurnRecorder) {
+        // Another call starting after one that ran no tool: rig rejected it.
+        if mem::take(&mut self.ended) {
+            self.text.truncate(self.kept);
+        }
+        match event {
+            StreamEvent::Text { text, .. } => {
+                self.text.push_str(&text);
+                recorder.emit(AgentEvent::TextDelta(text));
+            }
+            StreamEvent::Reasoning { .. }
+            | StreamEvent::Start {
+                kind: PartKind::Reasoning,
+                ..
+            } => {
+                if !mem::replace(&mut self.reasoning, true) {
+                    recorder.emit(AgentEvent::Reasoning);
+                }
+            }
+            StreamEvent::Start { .. } | StreamEvent::Arguments { .. } | StreamEvent::End { .. } => {
+            }
+        }
+    }
+
+    fn call_ended(&mut self) {
+        self.ended = true;
+        self.reasoning = false;
+    }
+
+    /// A tool the last call asked for ran, so its text stays.
+    const fn call_kept(&mut self) {
+        self.kept = self.text.len();
+        self.ended = false;
+    }
+
+    /// A hook rejected the last call for another try.
+    fn call_rejected(&mut self) {
+        self.text.truncate(self.kept);
+        self.ended = false;
+    }
+}
+
 /// Why a turn's stream ended early.
 struct StreamStop<'a>(&'a PromptError);
 
@@ -518,13 +783,13 @@ impl StreamStop<'_> {
     /// Whether the agent loop itself stopped it (an unknown tool, the turn
     /// limit) rather than the provider call failing.
     const fn by_agent_loop(&self) -> bool {
-        match self.0 {
+        matches!(
+            self.0,
             PromptError::UnknownToolCall { .. }
-            | PromptError::MaxTurns { .. }
-            | PromptError::Cancelled { .. }
-            | PromptError::Memory(_) => true,
-            PromptError::Provider(_) | PromptError::Report(_) => false,
-        }
+                | PromptError::MaxTurns { .. }
+                | PromptError::Cancelled { .. }
+                | PromptError::Memory(_)
+        )
     }
 
     /// A user-facing sentence, for a stop worth keeping the turn for.
@@ -534,10 +799,10 @@ impl StreamStop<'_> {
                 "The model called a tool that does not exist ({tool_name}), so the turn \
                  stopped.{}",
                 match window {
-                    Window::Ollama => {
+                    Window::Ollama(_) => {
                         " With Ollama this usually means the prompt was cut to the context \
-                         window; check the server's window (OLLAMA_CONTEXT_LENGTH) and the \
-                         model's own limit."
+                         window; check [analysis].max_context_tokens and the model's own \
+                         limit."
                     }
                     Window::Provider => "",
                 }
@@ -552,6 +817,7 @@ impl StreamStop<'_> {
             PromptError::Provider(e) => format!("The model call failed part way through: {e}"),
             PromptError::Memory(e) => format!("The turn failed: {e}"),
             PromptError::Report(report) => format!("The turn failed: {report}"),
+            other => format!("The turn failed: {other}"),
         }
     }
 }
@@ -565,7 +831,7 @@ impl Turn {
         usage: Option<TokenUsage>,
         asked: Instant,
     ) -> AgentResponse {
-        let graph = std::mem::take(&mut *self.graph.lock().unwrap_or_else(PoisonError::into_inner));
+        let graph = mem::take(&mut *self.graph.lock().unwrap_or_else(PoisonError::into_inner));
         AgentResponse {
             content: answer.text,
             steps: self.recorder.steps(),
@@ -576,6 +842,7 @@ impl Turn {
             cancelled: false,
             usage,
             duration_ms: Some(u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX)),
+            documents: self.scope().clone(),
         }
     }
 }
@@ -588,8 +855,9 @@ struct BuildContext<'a> {
     reader_db: ReaderDb,
     analysis_config: &'a AnalysisConfig,
     retrieval_config: &'a RetrievalConfig,
-    graph_options: GraphOptions,
+    graph_options: GraphConfig,
     modeled: Modeled,
+    tables: TableLayout,
     mode: ChatMode,
     window: Window,
     rerank_model: Option<RerankModel>,
@@ -597,6 +865,12 @@ struct BuildContext<'a> {
     /// `dispatch`'s `schema_call`. `Some` only when `rerank = "model"`; the
     /// search tool wires it in, the other rerank modes ignore it.
     reranker_call: Option<SchemaCall<RerankAnswer>>,
+    /// The chat model reading images for `view_image`, when it reads them
+    /// and the workspace holds one.
+    images: Option<ImageReader>,
+    /// The turn the agent runs: `always_retrieve` records on it that it
+    /// put chunk text in the prompt.
+    turn: Turn,
 }
 
 impl BuildContext<'_> {
@@ -623,23 +897,42 @@ impl BuildContext<'_> {
         let mut builder = AgentBuilder::new(completion_model)
             .preamble(system_prompt)
             .tool(search)
-            .tool(RunSqlTool::new(
-                Arc::clone(&ctx.shared_db),
-                reader(),
-                ctx.analysis_config.max_query_rows,
-            ))
+            .tool(ReadDocumentTool::new(reader(), ctx.retrieval_config))
+            .tool(
+                RunSqlTool::new(
+                    Arc::clone(&ctx.shared_db),
+                    reader(),
+                    ctx.analysis_config.max_query_rows,
+                )
+                .with_step_rows(
+                    usize::try_from(ctx.analysis_config.step_result_rows).unwrap_or(usize::MAX),
+                ),
+            )
             .tool(DescribeTableTool(reader()))
             .tool(ListTablesTool(reader()))
             .tool(ListDocumentsTool(reader()))
-            .tool(CreateChartTool::new(reader()))
+            .tool(CreateChartTool::new(reader()).with_step_rows(
+                usize::try_from(ctx.analysis_config.step_result_rows).unwrap_or(usize::MAX),
+            ))
             .temperature(0.1)
             .add_hook(InvalidToolCalls)
             .add_hook(EmptyAnswer);
-        if ctx.window == Window::Ollama {
-            // Ollama unloads a model 5 minutes after its last request unless
-            // the request says otherwise, and a reload costs seconds.
-            builder =
-                builder.additional_params(serde_json::json!({ "keep_alive": OLLAMA_KEEP_ALIVE }));
+        if let Window::Ollama(OllamaWindow(num_ctx)) = ctx.window {
+            // `keep_alive` is Ollama-only too (rig lifts it out of
+            // `additional_params` into the request's top-level field, never
+            // into `options`). Nothing was setting it, so every request fell
+            // back to Ollama's own default (`OLLAMA_KEEP_ALIVE`, 5 minutes
+            // unless the operator changed it) each time it decided whether to
+            // keep the model loaded. A turn with several tool calls, or an
+            // idle stretch between turns in a TUI or web session, can leave a
+            // gap longer than that, which pays a multi-second reload the same
+            // way a changed `num_ctx` does (measured live, both in the perf
+            // handoff). Sending it explicitly on every request keeps the
+            // model warm through longer gaps regardless of the server's
+            // default.
+            builder = builder.additional_params(
+                serde_json::json!({ "num_ctx": num_ctx, "keep_alive": OLLAMA_KEEP_ALIVE }),
+            );
         }
 
         // The ontology is describable as soon as it exists: the prompt block
@@ -647,6 +940,18 @@ impl BuildContext<'_> {
         // even when nothing has been extracted into the graph yet.
         if ctx.modeled.has_ontology() {
             builder = builder.tool(DescribeClassTool(reader()));
+        }
+
+        if let Some(images) = ctx.images {
+            builder = builder.tool(ViewImageTool::new(reader(), images));
+        }
+
+        if ctx.tables == TableLayout::Ranked {
+            builder = builder.tool(FindTablesTool::new(
+                reader(),
+                embedding_model.clone(),
+                ctx.retrieval_config.rrf_k,
+            ));
         }
 
         if ctx.modeled.has_graph() {
@@ -666,7 +971,8 @@ impl BuildContext<'_> {
         {
             let samples = usize::try_from(ctx.retrieval_config.top_k)
                 .map_err(|e| Error::Analysis(format!("top_k overflow: {e}")))?;
-            let vector_index = DuckDbVectorIndex::new(ctx.reader_db.clone(), embedding_model);
+            let vector_index =
+                DuckDbVectorIndex::new(ctx.reader_db.clone(), embedding_model, ctx.turn);
             builder = builder.dynamic_context(samples, vector_index);
         }
 
@@ -675,182 +981,4 @@ impl BuildContext<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::analysis::citations::CitationRegistry;
-
-    use crate::ids::{ChunkId, DocumentId};
-    #[test]
-    fn stream_errors_are_explained_for_the_user() {
-        let config = AnalysisConfig::default();
-        let unknown = PromptError::UnknownToolCall {
-            tool_name: String::from("container.exec"),
-            available_tools: vec![String::from("run_sql")],
-            allowed_tools: vec![String::from("run_sql")],
-            chat_history: Vec::new(),
-        };
-        assert!(StreamStop(&unknown).by_agent_loop());
-        let text = StreamStop(&unknown).explain(config.max_turns, Window::Ollama);
-        assert!(text.contains("container.exec"), "{text}");
-        assert!(text.contains("OLLAMA_CONTEXT_LENGTH"), "{text}");
-        let text = StreamStop(&unknown).explain(config.max_turns, Window::Provider);
-        assert!(!text.contains("Ollama"), "{text}");
-
-        let limit = PromptError::MaxTurns {
-            max_turns: 10,
-            chat_history: Vec::new(),
-            prompt: Message::user("q"),
-        };
-        let text = StreamStop(&limit).explain(config.max_turns, Window::Provider);
-        assert!(
-            text.contains(&format!("{} tool calls", config.max_turns)),
-            "{text}"
-        );
-
-        let provider =
-            PromptError::Provider(ProviderError::Provider(String::from("connection refused")));
-        assert!(!StreamStop(&provider).by_agent_loop());
-        let text = StreamStop(&provider).explain(config.max_turns, Window::Provider);
-        assert!(text.contains("connection refused"), "{text}");
-    }
-
-    #[test]
-    #[expect(clippy::indexing_slicing, reason = "test asserts fixed keys")]
-    fn to_json_carries_every_field_and_derives_queries() {
-        let response = AgentResponse {
-            content: String::from("12 storms [1]"),
-            steps: vec![
-                ToolStep {
-                    tool: ToolName::RunSql,
-                    detail: String::from("SELECT count(*) FROM events"),
-                    summary: String::from("the summary is not parsed"),
-                    rows: Some(1),
-                    duration_ms: 7,
-                },
-                ToolStep {
-                    tool: ToolName::SearchDocuments,
-                    detail: String::from("storms"),
-                    summary: String::from("3 chunks"),
-                    rows: None,
-                    duration_ms: 4,
-                },
-            ],
-            citations: vec![Citation {
-                n: 1,
-                chunk_id: ChunkId::from("c"),
-                document_id: DocumentId::from("d"),
-                filename: String::from("noaa.pdf"),
-                chunk_index: 2,
-                page: Some(4),
-                heading: None,
-            }],
-            ..AgentResponse::default()
-        };
-        let json = response.to_json(&SessionId::from("s1"));
-        assert_eq!(json["answer"], "12 storms [1]");
-        assert_eq!(json["queries"][0]["sql"], "SELECT count(*) FROM events");
-        assert_eq!(json["queries"][0]["rows"], 1);
-        assert_eq!(json["queries"].as_array().map(Vec::len), Some(1));
-        assert_eq!(json["citations"][0]["label"], "noaa.pdf, page 4");
-        assert_eq!(json["citations"][0]["chunk_id"], "c");
-        assert_eq!(json["session_id"], "s1");
-        assert_eq!(json["write_refused"], false);
-        assert_eq!(json["cancelled"], false);
-        assert!(json["graph"].is_array() && json["chart"].is_null());
-        // A provider that reported nothing leaves `usage` null rather than
-        // claiming the turn was free.
-        assert!(json["usage"].is_null());
-
-        let counted = AgentResponse {
-            usage: Some(TokenUsage {
-                input_tokens: 980,
-                output_tokens: 43,
-                total_tokens: 1_023,
-            }),
-            ..AgentResponse::default()
-        };
-        let json = counted.to_json(&SessionId::from("s1"));
-        assert_eq!(json["usage"]["input_tokens"], 980);
-        assert_eq!(json["usage"]["output_tokens"], 43);
-        assert_eq!(json["usage"]["total_tokens"], 1_023);
-    }
-
-    #[test]
-    fn per_call_usage_accumulates_across_a_turns_completion_requests() {
-        let call = |input: u64, output: u64| rig::completion::Usage {
-            input_tokens: Some(input),
-            output_tokens: Some(output),
-            total_tokens: Some(input.saturating_add(output)),
-            ..rig::completion::Usage::default()
-        };
-        let mut usage = TokenUsage::default();
-        usage.add(call(400, 20));
-        usage.add(call(650, 35));
-        assert_eq!(
-            usage,
-            TokenUsage {
-                input_tokens: 1_050,
-                output_tokens: 55,
-                total_tokens: 1_105,
-            }
-        );
-        assert_eq!(usage.reported(), Some(usage));
-        // A provider that reports nothing leaves the accumulator at its
-        // default, which `run_inner` reads as "no counts", not zero cost.
-        let mut none = TokenUsage::default();
-        none.add(rig::completion::Usage::default());
-        assert_eq!(none, TokenUsage::default());
-        assert_eq!(none.reported(), None);
-    }
-
-    #[test]
-    fn turn_text_keeps_streamed_text_and_notes_early_stops() {
-        let as_is = |text: &str| CitedAnswer {
-            text: text.to_owned(),
-            citations: Vec::new(),
-        };
-        let text = |streamed: &str, final_text: Option<&str>, stopped: Option<&str>, window| {
-            turn_text(
-                streamed.to_owned(),
-                final_text.map(str::to_owned),
-                stopped.map(str::to_owned),
-                window,
-                as_is,
-            )
-            .text
-        };
-        assert_eq!(
-            text("so far", None, Some("why"), Window::Provider),
-            "so far\n\n(why)"
-        );
-        assert_eq!(text("", Some("final"), None, Window::Provider), "final");
-        let empty = text("", Some(""), None, Window::Ollama);
-        assert!(empty.contains("OLLAMA_CONTEXT_LENGTH"), "{empty}");
-        let empty = text("", None, None, Window::Provider);
-        assert!(!empty.contains("Ollama"), "{empty}");
-    }
-
-    /// The note goes on after the citation check: an answer the check
-    /// empties (a lone invented marker) gets the no-text note, and the
-    /// check, which drops leaked `[analysis]` channel tokens, never sees
-    /// quack's own `[analysis]` setting names.
-    #[test]
-    fn notes_are_added_after_the_citation_check() {
-        let check = |text: &str| CitationRegistry::default().validate(text);
-        let answer = turn_text(String::from("[7]"), None, None, Window::Ollama, check);
-        assert!(
-            answer.text.starts_with("(The model returned no text.")
-                && answer.text.contains("OLLAMA_CONTEXT_LENGTH"),
-            "{}",
-            answer.text
-        );
-        let answer = turn_text(
-            String::from("Partly [analysis]answered"),
-            None,
-            Some(String::from("see [analysis].max_turns")),
-            Window::Provider,
-            check,
-        );
-        assert_eq!(answer.text, "Partly answered\n\n(see [analysis].max_turns)");
-    }
-}
+mod tests;

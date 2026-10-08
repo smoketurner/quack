@@ -38,8 +38,8 @@ slot; a success opens the same session cookie a password login does.
 
 Every page struct carries a `page: Page`: title, its `Tab`, username, admin flag, local flag,
 and the current workspace with its role and what the caller may do. `base.html` reads it for
-the header and the workspace tabs (`Tab::WORKSPACE`: chat, documents, tables with the import
-form, SQL, context, ontology, graph, jobs, settings), highlighting the page's tab, or the
+the header and the workspace tabs (`Tab::WORKSPACE`: chat, documents, search, tables with
+the import form, SQL, context, ontology, graph, jobs, settings), highlighting the page's tab, or the
 Users, Audit, or About link, with `aria-current="page"`. Users and Audit show to admins;
 About (`/about`: the running version and the projects quack is built with) shows to every
 signed-in user and reads no workspace, so it writes no audit row.
@@ -48,12 +48,59 @@ signed-in user and reads no workspace, so it writes no audit row.
   when it was created, and when a request last touched it (`ControlDb::workspace_times`:
   the newest `audit_log` row naming it, allowed or denied; "never used" for a workspace
   the CLI made and nothing has opened through the server), one column each.
-- **`ontology.html`** shows the class tree, relations, properties, and mappings; the JSON
-  editor; the version list with the diff to the previous version; the propose form; and the
-  paged review queue with bulk accept and reject.
+- **`documents.html`** lists what the workspace holds now; "Show replaced documents"
+  (`?all=true`) adds each superseded document with a link to the one that took its place. A
+  ready row's Replace control (`POST /w/{id}/documents/{doc}/replace`, one file) queues the
+  file through the same `documents::enqueue` as the upload form with the row as its
+  predecessor; the row reads "being replaced by …" until the new document is ready. The
+  htmx actions on a row (pin, unpin, delete) swap in the live listing. The upload form takes
+  files, not a folder; `quack ingest DIR` is the folder path (design doc section 6.1).
+- **`passage.html`** (`/w/{id}/documents/{doc}/chunks/{n}`) is where a citation link lands:
+  one chunk of a document with its position and total, page and heading, when the document
+  was ingested, the chunk's full text, and links to the chunks before and after. It reads
+  through the same `documents::read_chunks` as `GET .../documents/{doc}/chunks`, so each
+  visit is audited as opening the document; a position the document does not have is a 404
+  page. The chunk is shown whatever the document's status, so a citation in an old answer
+  still opens after its document was replaced.
+- **`saved.html`** (`/w/{id}/saved`, `server::web::saved`) lists the saved questions with
+  Run and, for the creator or an owner, Remove (asked first). Run shows each statement, its
+  kept rows, and `StatementRun::outcome` (the line `quack saved run` prints), then the run's
+  verdict. The chat page's Save form posts a name and the current session to
+  `/w/{id}/saved`, which saves the session's last answer; a refused save lands back on the
+  chat with the reason. Every action goes through the `Access` methods the `.../saved` REST
+  routes use (`list_saved`, `save_answer`, `run_saved`, `remove_saved`), so the audit rows
+  match. The chat page also links the session's Markdown and SQL export
+  (`GET .../sessions/{sid}/export`), and Settings links the workspace's OKF bundle
+  (`GET .../okf`).
+- **`search.html`** (`/w/{id}/search`, `server::web::search`) runs one document search
+  without the model. The form posts its query in the body (search text is workspace
+  content, and a URL ends up in logs) with a multi-select of the newest 200 ready
+  documents, the mode, and an optional graph entity. It goes through the same
+  `Access::search` as `POST .../search`, audited as `search`, and shows each hit's fused
+  score, its vector, keyword, and rerank rank and score, and a link to its passage page,
+  then both legs' candidates in collapsed sections, the phrase note, and the rerank
+  outcome. A search the core refuses (an unknown document, vector mode with no embedding
+  model) is shown on the page, not as a failed page. The chat form offers the same
+  documents in a multi-select; picked ones go out as the turn's `document_ids`.
+- **`ontology.html`** shows the class tree, relations, properties with their meaning, mappings,
+  and measures; an Edit meaning form per property (description, unit, comma-separated
+  synonyms; a blank field clears it); forms to add a measure (id, a table from a list of the
+  workspace's tables, expression, description) and to change or remove one, each a new
+  version through `ontology::store::save`, its refusal (such as an expression that is not a
+  read of the table) shown on the page; the JSON editor; the version list with the diff to the previous version; the propose form; the
+  Rename form, which gives a class or relation a new id and moves the graph's nodes and
+  edges with it; the paged review queue with bulk accept and reject; and links to download
+  the ontology's JSON and its JSON Schema.
 - **`graph.html`** shows status banners (provisional, stale, missing mapped tables,
-  drift), the search and path forms, the ECharts result with a node inspector, the merge
-  queue, and the extract, revalidate, and review buttons.
+  chunks and tables the graph has not caught up with, drift), the search and path forms,
+  the ECharts result with a node inspector (each entry carries an edit form and a delete
+  button for people who may write; each edge a delete button), a "Correct the graph"
+  section with add-node and add-edge forms, the merge queue, the extract, revalidate,
+  and review buttons, and a Download form (a `GET` to `.../graph/export` with the format and
+  whether to include provisional rows). The stale banner lists what a
+  revalidation would drop (totals, per class id, per relation id). Its button names those
+  totals and posts them, and the server drops only when they still match what it counts.
+  When the preview cannot be counted, the banner says why and offers no drop.
 - **Dark only.** `styles/input.css` sets `color-scheme: dark`, so native controls and the
   file picker follow; panels are `slate-900` on a `slate-950` page and primary buttons are
   `blue-600`. Charts and the graph use ECharts' built-in `dark` theme.
@@ -72,9 +119,9 @@ signed-in user and reads no workspace, so it writes no audit row.
   `clock` (chat messages, versions, the audit log, token expiry) is the time of day, with the
   date when not today; `relative` (jobs, documents, sessions, token last use) is written by the
   server as "5 min ago", "3 h ago", or the date, and the page leaves it as written, so nothing
-  changes under the reader. While a document processes, the Documents page polls
-  `.../documents/status` and swaps in only each row's status and the note (`hx-swap-oob`),
-  never the whole table.
+  changes under the reader. While a document processes, the Documents page refetches
+  `.../documents/status` on each job event (`jobs-changed`, from the page's one job stream) and
+  swaps in only each row's status and the note (`hx-swap-oob`), never the whole table.
   Chat messages show when they were asked or answered, and an answer how many milliseconds it
   took (`duration_ms` on the response object and the assistant message's metadata). A SQL
   result shows its row count and the statement's own run time in milliseconds
@@ -91,6 +138,10 @@ signed-in user and reads no workspace, so it writes no audit row.
   Without a click, rows come back in the statement's own order. Anything else (a write,
   several statements) runs as typed with plain headers. "Download CSV" is a `POST` of the
   same statement: SQL never travels in a URL, where request logs and proxies would keep it.
+  The file holds the rows the grid holds, at most `[analysis].max_query_rows`. When that cap
+  cut the result, the button reads "Download CSV (first 250 of 1000 rows)" and the file is
+  named `query-first-250-of-1000.csv`; a complete result downloads as `query.csv`. The file
+  itself carries no marker row, which would break a CSV parser.
 - **Accessibility.** Every page starts with a "Skip to content" link to `<main id="main">`;
   the workspace tabs and the admin links are named `<nav>` landmarks, and the current tab or
   chat session carries `aria-current="page"`. A control with only a placeholder has an
@@ -111,8 +162,12 @@ workspace content, so it never goes in the URL: `web::flash::keep` stashes it in
 process's memory (`Flashes`, one minute) under a random id, and the browser carries only the
 id in an `HttpOnly` `quack_flash` cookie; the landing page's `Flashed` extractor takes it, so
 it shows once. The graph page's searches and the Tables page's choice of table are posted
-forms for the same reason. The documents list polls its rows fragment only while a
-row is processing (marked `data-pending`).
+forms for the same reason. The documents list refetches its rows fragment on job events
+only while a row is processing (marked `data-pending`). Every workspace page carries the job
+strip (`#jobs-strip` in `base.html`): it holds the page's `data-jobs-stream`, and
+`followJobs` in `app.js` turns each stream event into `jobs-changed` for any fragment that
+listens, shows a toast when a background job finishes, and offers "Notify me" for browser
+notifications while the page is hidden.
 
 ## Assets
 
@@ -122,6 +177,19 @@ row is processing (marked `data-pending`).
   commit it whenever a template changes classes.
 - `static/js/htmx.min.js` (htmx 4.0.0) and `static/js/echarts.min.js` (ECharts 6.1.0) are
   vendored so the binary works air-gapped.
+- `static/js/redoc.standalone.js` (Redoc 2.5.4, MIT, the npm package's
+  `bundles/redoc.standalone.js`, with its `redoc.standalone.js.LICENSE.txt` beside it) is
+  vendored the same way. It renders the API reference at `/api/v1/docs`
+  (`templates/api_docs.html`, a page of its own outside `base.html`) from
+  `/api/v1/openapi.json`. Redoc was chosen over Swagger UI (Apache-2.0, a 1.6 MB bundle plus
+  a stylesheet) and Scalar (MIT, 4.4 MB) for its size, 1.1 MB in one file, and because it
+  is read-only: the page sends no requests to the API on the reader's behalf. Neither the
+  page nor the document needs sign-in, like the static assets: the document describes
+  routes and reveals no workspace content. The Settings page's API tokens section and the
+  About page link to it. To update it, download the new version's two files from the npm
+  package and replace both.
+- `.pre-commit-config.yaml` keeps prek's whitespace and file-size hooks off the vendored
+  scripts and `output.css`, so each stays byte for byte as built or downloaded.
 - `static/js/sql-editor.min.js` is the SQL page's editor: CodeMirror 6 with
   `@codemirror/lang-sql`, highlighting SQL and completing the table and column names that
   `GET /api/v1/workspaces/{id}/tables/schema` returns (audited, `no-store`, never a
@@ -140,10 +208,18 @@ row is processing (marked `data-pending`).
   download post it as before, and without JavaScript the textarea is the editor.
   Ctrl/Cmd+Enter runs the statement.
 - `static/js/app.js` is quack's own. It posts to `/api/v1/workspaces/{id}/query/stream`,
-  parses the SSE events, and renders the steps block, the answer, citations as links to the
-  document list, and the chart spec as an ECharts option. A `permission_required` event
-  becomes a card with the statement, Run it, Don't run it, and Allow for this turn, posted to
-  `.../sessions/{sid}/permissions/{request}`, and the time the turn stops waiting. On page load it renders stored
+  parses the SSE events, and renders the steps block (a `run_sql` or `create_chart` step's
+  kept rows as a collapsed grid with an Export full result form that posts the statement to
+  the SQL page's download), the answer, citations as links to the
+  passage each one cites, and the chart spec as an ECharts option with the toolbox's
+  save-as-image and read-only data view, `stack` on bar and line series when the spec is
+  stacked, and a Download CSV link built from the spec as a data URL. A `permission_required` event
+  becomes a card with the event's `heading`, the statement, and a button per entry of its
+  `choices` (the words `analysis::events::Decision` gives every interface), posted to
+  `.../sessions/{sid}/permissions/{request}`, and the time the turn stops waiting. When the event carries a `notice`
+  (its `reason` is `read_documents`: the turn read document text, so the write is asked for even
+  under "Run changes without asking"), the card shows that sentence; the text lives in
+  `policy::Hold::notice` only. On page load it renders stored
   charts and draws the graph page's result as an ECharts force graph (nodes coloured by
   class; a click scrolls to the inspector entry).
 

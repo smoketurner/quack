@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+{% if let Some(ws) = page.workspace %}
+<h1 class="text-xl font-semibold">Search</h1>
+<p class="mt-1 text-sm text-slate-400">Find passages the way the agent's search does, without the model. Each hit shows its fused score and its rank in the vector leg, the keyword (BM25) leg, and the reranker, so you can see which step found or missed a passage. Put a phrase in "double quotes" to require it exactly.</p>
+<form method="post" action="/w/{{ ws.membership.workspace.id }}/search" class="mt-4 rounded border border-slate-800 bg-slate-900 p-4">
+  <label class="block text-sm"><span class="text-slate-300">Query</span>
+    <input type="text" name="query" value="{{ query }}" required class="mt-1 w-full rounded border border-slate-700 px-3 py-2"></label>
+  <div class="mt-3 flex flex-wrap items-start gap-4 text-sm">
+    <label class="flex flex-col gap-1"><span class="text-slate-300">Documents <span class="text-slate-500">(none picked: all)</span></span>
+      <select name="documents" multiple size="5" class="min-w-64 max-w-full rounded border border-slate-700 px-2 py-1">
+        {% for d in documents %}<option value="{{ d.id }}"{% if self.is_picked(d.id) %} selected{% endif %}>{{ d.name }}</option>{% endfor %}
+      </select></label>
+    <label class="flex flex-col gap-1"><span class="text-slate-300">Mode</span>
+      <select name="mode" class="rounded border border-slate-700 px-2 py-1">
+        {% for (value, label) in SearchPage::MODES %}<option value="{{ value }}"{% if mode == value %} selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select></label>
+    <label class="flex flex-col gap-1"><span class="text-slate-300">Graph entity <span class="text-slate-500">(optional)</span></span>
+      <input type="text" name="entity" value="{{ entity }}" class="rounded border border-slate-700 px-2 py-1"></label>
+    <button type="submit" class="self-end rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500">Search</button>
+  </div>
+</form>
+{% if let Some(error) = error %}<p role="alert" class="mt-3 rounded border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-300 wrap-anywhere">{{ error }}</p>{% endif %}
+{% if let Some(r) = result %}
+<section class="mt-6" aria-labelledby="hits">
+  <h2 id="hits" class="text-lg font-semibold">{{ r.hits.len() }} passages</h2>
+  <p class="mt-1 text-sm text-slate-400">{{ r.rerank }}{% if let Some(note) = r.phrase_note %} · {{ note }}{% endif %}</p>
+  {% if r.hits.is_empty() %}<p class="mt-2 text-sm text-slate-300">No passages found.</p>{% endif %}
+  <ol class="mt-3 space-y-3">
+    {% for h in r.hits %}
+    <li class="rounded border border-slate-800 bg-slate-900 p-3">
+      <p class="text-sm"><a class="text-blue-400 hover:underline" href="{{ h.href }}">{{ h.location }}</a></p>
+      <dl class="mt-1 flex flex-wrap gap-x-4 text-xs text-slate-400">
+        <div><dt class="inline">Fused</dt> <dd class="inline font-mono text-slate-200">{{ h.score }}</dd></div>
+        <div><dt class="inline">Vector</dt> <dd class="inline font-mono text-slate-200">{{ h.vector }}</dd></div>
+        <div><dt class="inline">Keyword</dt> <dd class="inline font-mono text-slate-200">{{ h.keyword }}</dd></div>
+        <div><dt class="inline">Rerank</dt> <dd class="inline font-mono text-slate-200">{{ h.rerank }}</dd></div>
+      </dl>
+      <p class="mt-2 whitespace-pre-wrap text-sm text-slate-300 wrap-anywhere">{{ h.excerpt }}</p>
+    </li>
+    {% endfor %}
+  </ol>
+</section>
+<details class="mt-4 rounded border border-slate-800 bg-slate-900 p-3">
+  <summary class="cursor-pointer text-sm font-medium">Vector leg: {{ r.vector.len() }} candidates</summary>
+  <table class="mt-2 w-full text-left text-xs">
+    <thead class="text-slate-400"><tr><th class="px-2 py-1">Passage</th><th class="px-2 py-1">Rank (cosine score)</th></tr></thead>
+    <tbody>
+      {% for h in r.vector %}<tr class="border-t border-slate-800"><td class="px-2 py-1"><a class="text-blue-400 hover:underline" href="{{ h.href }}">{{ h.location }}</a></td><td class="px-2 py-1 font-mono">{{ h.vector }}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</details>
+<details class="mt-4 rounded border border-slate-800 bg-slate-900 p-3">
+  <summary class="cursor-pointer text-sm font-medium">Keyword leg: {{ r.keyword.len() }} candidates</summary>
+  <table class="mt-2 w-full text-left text-xs">
+    <thead class="text-slate-400"><tr><th class="px-2 py-1">Passage</th><th class="px-2 py-1">Rank (BM25)</th></tr></thead>
+    <tbody>
+      {% for h in r.keyword %}<tr class="border-t border-slate-800"><td class="px-2 py-1"><a class="text-blue-400 hover:underline" href="{{ h.href }}">{{ h.location }}</a></td><td class="px-2 py-1 font-mono">{{ h.keyword }}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endif %}
+{% endif %}
+{% endblock %}

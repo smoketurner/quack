@@ -70,6 +70,10 @@ pub enum Users {
     OidcSubject,
     IsAdmin,
     CreatedAt,
+    DisabledAt,
+    PasswordChangedAt,
+    FailedLogins,
+    LockedUntil,
 }
 
 /// The columns every sealed-token table shares.
@@ -91,6 +95,15 @@ pub enum UserTokens {
 pub enum ProviderTokens {
     Table,
     Provider,
+}
+
+/// The sealed secret a saved import refreshes with, kept with the
+/// workspace it belongs to.
+#[derive(Iden)]
+pub enum ImportCredentials {
+    Table,
+    ImportId,
+    WorkspaceId,
 }
 
 /// Each OAuth client's private key for `private_key_jwt`, sealed like the
@@ -132,6 +145,17 @@ pub enum Members {
     Table,
     WorkspaceId,
     UserId,
+    Role,
+    CreatedAt,
+    GrantedBy,
+}
+
+/// Roles an identity provider's groups carry in a workspace.
+#[derive(Iden)]
+pub enum GroupRoles {
+    Table,
+    WorkspaceId,
+    GroupName,
     Role,
     CreatedAt,
 }

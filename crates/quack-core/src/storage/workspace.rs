@@ -5,16 +5,34 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use aws_lc_rs::digest;
+use jiff::civil::DateTime;
+
+use std::collections::BTreeMap;
+
+use crate::analysis::table_search;
+use crate::analysis::text_to_sql::ColumnLine;
 use crate::config::Config;
+use crate::crypto;
 use crate::embedding::{
     Dimension, EmbeddingStatus, Fingerprint, Input, Profile, Prompts, StaleVectors, Vector,
 };
-use crate::error::{Error, Record, Result};
+use crate::error::{Error, Result, WrittenBy};
 use crate::graph;
-use crate::ids::{ChunkId, DocumentId, NodeId};
-use crate::ingestion::TableName;
-use crate::ingestion::parser::{FileType, Load};
-use crate::ontology::store::Acceptance;
+use crate::ids::{ChunkId, DocumentId, NodeId, UserId};
+use crate::ingestion::parser::{DocumentMeta, FileType, Load, PageCounts, SectionKind};
+use crate::ingestion::{StoredImage, TableName};
+use crate::ontology::store::{self as ontology_store, Acceptance};
+use crate::ontology::{Measure, Ontology, Property};
+use crate::saved;
+use crate::storage::control::ResourceKind;
+use crate::storage::profile::{self, ColumnType, ColumnWarning, TableNote, TableProfile};
+use crate::text::OneLine;
+
+mod terms;
+
+use terms::TermFrequencies;
+pub use terms::{Analyzer, Language, LanguageSetting, Stemming, Unspaced};
 
 /// BM25 parameters for the keyword index quack maintains in `_quack_terms`.
 const BM25_K1: f64 = 1.2;
@@ -32,9 +50,10 @@ const REINDEX_PAGE: u32 = 1000;
 /// Every internal table carries this prefix; anything starting with it is hidden.
 pub const INTERNAL_PREFIX: &str = "_quack_";
 
-/// The keyword index gained joined identifier terms (`pol8841` beside
-/// `pol` and `8841`); every chunk is reindexed.
-const JOINED_IDENTIFIER_TERMS: u32 = 7;
+/// What a deleted user's id and name become in a workspace file
+/// (`WorkspaceDb::forget_user`).
+pub const REMOVED_USER: &str = "removed";
+
 /// Every stored vector records the profile it was made under.
 const VECTOR_PROFILES: u32 = 8;
 /// A document's status is one of four values.
@@ -46,6 +65,85 @@ const ONTOLOGY_ACCEPTANCE: u32 = 10;
 /// as `(keep, drop)` and once as `(drop, keep)`; collapse each pair to one
 /// row, keeping the more-decided one so a reviewer's rejection is not lost.
 const MERGE_DEDUP: u32 = 11;
+/// Every user table is profiled (`storage::profile`), and the graph is
+/// readable through `graph_` views.
+const TABLE_PROFILES: u32 = 12;
+/// Each document records the language it was detected as, and its chunks
+/// are stemmed under it, with unspaced scripts as bigrams (issue #395):
+/// every document is detected and every chunk reindexed.
+const DOCUMENT_LANGUAGES: u32 = 13;
+/// Imports can be saved under a name and refreshed (`_quack_imports`);
+/// the table needs no backfill.
+const SAVED_IMPORTS: u32 = 14;
+
+/// The documents table, and the columns older files gain on open.
+const DOCUMENTS_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS _quack_documents (
+        id TEXT PRIMARY KEY,
+        filename TEXT NOT NULL,
+        title TEXT,
+        mime_type TEXT,
+        size_bytes BIGINT,
+        sha256 TEXT,
+        source TEXT,
+        ingested_at TIMESTAMP DEFAULT now(),
+        status TEXT DEFAULT 'queued',
+        error_message TEXT,
+        pinned BOOLEAN NOT NULL DEFAULT false,
+        chunk_count INTEGER,
+        ingested_by TEXT,
+        tables JSON,
+        page_count INTEGER,
+        pages_unreadable INTEGER,
+        pages_empty INTEGER,
+        superseded_by TEXT,
+        source_root TEXT,
+        source_path TEXT
+    );
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS title TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS sha256 TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS chunk_count INTEGER;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS ingested_by TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS tables JSON;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS page_count INTEGER;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_unreadable INTEGER;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pages_empty INTEGER;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS superseded_by TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_root TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source_path TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS author TEXT;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS authored_at TIMESTAMP;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS modified_at TIMESTAMP;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS tags JSON;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS metadata JSON;
+    ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS language TEXT;";
+
+/// Imports saved under a name so `quack import refresh` can run them again
+/// (`import::saved`): what to read, where it loads, and how the last run
+/// went. Secrets are never here: a URL is stored redacted and a header by
+/// name; a secret the owner chose to keep is sealed in `control.db`.
+const SAVED_IMPORTS_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_imports (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    url TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    query TEXT,
+    source_table TEXT,
+    row_limit UBIGINT,
+    types TEXT,
+    json_pointer TEXT,
+    bearer_env TEXT,
+    header_names JSON,
+    sealed_secret BOOLEAN NOT NULL DEFAULT false,
+    document_id TEXT,
+    created_by TEXT,
+    created_at TIMESTAMP DEFAULT now(),
+    last_run_at TIMESTAMP,
+    last_rows UBIGINT,
+    last_error TEXT
+);";
 
 /// Summaries of the turns a session's history window leaves out
 /// (`[analysis].compact_history`), each with how many replayable messages,
@@ -60,7 +158,14 @@ const SESSION_SUMMARIES_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_session_s
 
 /// Schema version of the internal tables, recorded in `_quack_meta`: the
 /// newest step above.
-const WORKSPACE_SCHEMA_VERSION: u32 = MERGE_DEDUP;
+const WORKSPACE_SCHEMA_VERSION: u32 = SAVED_IMPORTS;
+
+/// The oldest `DuckDB` that must read a file created here, given to `DuckDB`
+/// when the file is opened. It is the bundled library's own default, named so
+/// that a `duckdb` upgrade cannot change the format of new files unnoticed.
+/// `DuckDB` uses it only when it creates a file; an existing one keeps its
+/// format.
+const STORAGE_COMPATIBILITY_VERSION: &str = "v0.10.2";
 
 /// The tables that hold embedding vectors, with the same `embedding` and
 /// `embedding_profile` columns.
@@ -90,7 +195,7 @@ impl fmt::Display for VectorTable {
 /// The keys of `_quack_meta`, the workspace's own settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetaKey {
-    /// [`WORKSPACE_SCHEMA_VERSION`] when the internal tables were last upgraded.
+    /// `WORKSPACE_SCHEMA_VERSION` when the internal tables were last upgraded.
     SchemaVersion,
     /// The width of the vector columns.
     EmbeddingDimension,
@@ -100,6 +205,13 @@ pub enum MetaKey {
     GraphBuiltWithOntologyVersion,
     /// Extraction's unknown classes and relations, as a JSON count map.
     GraphDrift,
+    /// The quack version that last opened the file for writing.
+    WrittenByQuack,
+    /// The `DuckDB` library version that quack was built with.
+    WrittenByDuckDb,
+    /// The stemmings the documents were indexed under, comma-separated: a
+    /// query is tokenized under all of them.
+    Languages,
 }
 
 text_enum!(MetaKey, "meta key", {
@@ -108,6 +220,9 @@ text_enum!(MetaKey, "meta key", {
     EmbeddingModel => "embedding_model",
     GraphBuiltWithOntologyVersion => "graph_built_with_ontology_version",
     GraphDrift => "graph_drift",
+    WrittenByQuack => "written_by_quack",
+    WrittenByDuckDb => "written_by_duckdb",
+    Languages => "languages",
 });
 text_enum_sql!(MetaKey);
 
@@ -358,8 +473,141 @@ const READ_ONLY_KEYWORDS: &[&str] = &[
     "EXPLAIN",
 ];
 
+/// How a streamed result set is written ([`WorkspaceDb::stream_query`]).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+#[schema(as = SqlExportFormat)]
+pub enum ExportFormat {
+    #[default]
+    Csv,
+    Ndjson,
+    Json,
+}
+
+text_enum!(ExportFormat, "export format", {
+    Csv => "csv",
+    Ndjson => "ndjson",
+    Json => "json",
+});
+
+impl ExportFormat {
+    /// The media type of what is written.
+    #[must_use]
+    pub const fn content_type(self) -> &'static str {
+        match self {
+            Self::Csv => "text/csv; charset=utf-8",
+            Self::Ndjson => "application/x-ndjson",
+            Self::Json => "application/json",
+        }
+    }
+}
+
+/// One row at a time in an [`ExportFormat`], the same shapes
+/// [`QueryResults::write_csv`], `write_ndjson`, and `write_json` make.
+enum RowWriter<'a, W: Write> {
+    Csv(Box<csv::Writer<&'a mut W>>),
+    Ndjson {
+        out: &'a mut W,
+        keys: Vec<String>,
+    },
+    Json {
+        out: &'a mut W,
+        keys: Vec<String>,
+        first: bool,
+    },
+}
+
+impl<'a, W: Write> RowWriter<'a, W> {
+    fn start(format: ExportFormat, columns: &[String], out: &'a mut W) -> Result<Self> {
+        let keys = QueryResults {
+            columns: columns.to_vec(),
+            rows: Vec::new(),
+        }
+        .json_keys();
+        Ok(match format {
+            ExportFormat::Csv => {
+                let mut writer = csv::Writer::from_writer(out);
+                writer.write_record(columns)?;
+                Self::Csv(Box::new(writer))
+            }
+            ExportFormat::Ndjson => Self::Ndjson { out, keys },
+            ExportFormat::Json => {
+                out.write_all(b"[")?;
+                Self::Json {
+                    out,
+                    keys,
+                    first: true,
+                }
+            }
+        })
+    }
+
+    fn row(&mut self, values: &[serde_json::Value]) -> Result<()> {
+        match self {
+            Self::Csv(writer) => {
+                let cells: Vec<String> = values.iter().map(|v| Cell(v).text()).collect();
+                writer.write_record(&cells)?;
+            }
+            Self::Ndjson { out, keys } => {
+                writeln!(out, "{}", JsonRow { keys, values }.render()?)?;
+            }
+            Self::Json { out, keys, first } => {
+                if !*first {
+                    out.write_all(b",")?;
+                }
+                *first = false;
+                write!(out, "\n{}", JsonRow { keys, values }.render()?)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            Self::Csv(mut writer) => writer.flush()?,
+            Self::Ndjson { out, .. } => out.flush()?,
+            Self::Json { out, .. } => {
+                out.write_all(b"\n]\n")?;
+                out.flush()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One row as a JSON object whose keys keep column order, written by hand
+/// because `serde_json`'s map sorts its keys.
+struct JsonRow<'a> {
+    keys: &'a [String],
+    values: &'a [serde_json::Value],
+}
+
+impl JsonRow<'_> {
+    fn render(&self) -> Result<String> {
+        let mut fields = Vec::with_capacity(self.keys.len());
+        for (column, value) in self.keys.iter().zip(self.values) {
+            fields.push(format!(
+                "{}:{}",
+                serde_json::to_string(column)?,
+                serde_json::to_string(value)?
+            ));
+        }
+        Ok(format!("{{{}}}", fields.join(",")))
+    }
+}
+
 /// Query result set from a `DuckDB` workspace database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct QueryResults {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
@@ -409,6 +657,58 @@ impl CappedResults {
     }
 }
 
+/// Query results with a digest of the whole result set (`ResultDigest`).
+/// Rows past the cap are digested and counted but not kept.
+#[derive(Debug, Clone)]
+pub struct DigestedResults {
+    pub results: CappedResults,
+    pub digest: String,
+}
+
+/// A digest of a result set that does not depend on row order: the SHA-256
+/// of the column names in order, then the sum modulo 2^256 of every row's
+/// SHA-256, each row as one JSON array. A statement without `ORDER BY` can
+/// return the same rows in a different order from one run to the next, so
+/// row order must not count; a sum, unlike XOR, keeps a repeated row
+/// distinct from a single one, and unlike sorting the row hashes needs no
+/// memory per row.
+struct ResultDigest {
+    columns: digest::Context,
+    /// The row-hash sum, 64-bit limbs least significant first.
+    rows: [u64; 4],
+}
+
+impl ResultDigest {
+    fn new(columns: &[String]) -> Result<Self> {
+        let mut context = digest::Context::new(&digest::SHA256);
+        context.update(&serde_json::to_vec(columns)?);
+        Ok(Self {
+            columns: context,
+            rows: [0; 4],
+        })
+    }
+
+    fn add_row(&mut self, values: &[serde_json::Value]) -> Result<()> {
+        let hash = digest::digest(&digest::SHA256, &serde_json::to_vec(values)?);
+        let mut carry = false;
+        let (words, _) = hash.as_ref().as_chunks::<8>();
+        for (limb, word) in self.rows.iter_mut().zip(words) {
+            let (sum, overflowed) = limb.overflowing_add(u64::from_le_bytes(*word));
+            let (sum, overflowed_again) = sum.overflowing_add(u64::from(carry));
+            *limb = sum;
+            carry = overflowed || overflowed_again;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> String {
+        for limb in self.rows {
+            self.columns.update(&limb.to_le_bytes());
+        }
+        crypto::hex_lower(self.columns.finish().as_ref())
+    }
+}
+
 /// The ontology tables (design doc 5.4), created with the other internal
 /// tables.
 const ONTOLOGY_DDL: &str = "            CREATE TABLE IF NOT EXISTS _quack_ontology_versions (
@@ -444,6 +744,16 @@ const ONTOLOGY_DDL: &str = "            CREATE TABLE IF NOT EXISTS _quack_ontolo
                 enum_values JSON,
                 since_version INTEGER NOT NULL,
                 PRIMARY KEY (id, class_id)
+            );
+            ALTER TABLE _quack_ontology_properties ADD COLUMN IF NOT EXISTS description TEXT;
+            ALTER TABLE _quack_ontology_properties ADD COLUMN IF NOT EXISTS unit TEXT;
+            ALTER TABLE _quack_ontology_properties ADD COLUMN IF NOT EXISTS synonyms JSON;
+            CREATE TABLE IF NOT EXISTS _quack_ontology_measures (
+                id TEXT PRIMARY KEY,
+                description TEXT,
+                table_name TEXT NOT NULL,
+                expression TEXT NOT NULL,
+                since_version INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS _quack_ontology_mappings (
                 id TEXT PRIMARY KEY,
@@ -498,8 +808,9 @@ pub struct PinnedDocument {
 }
 
 /// Whether a document is sent to the model in full on every turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(from = "bool")]
+/// Serializes as the `pinned` boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "bool", into = "bool")]
 pub enum Pinning {
     Unpinned,
     /// Injected whole, within `[retrieval].pinned_token_budget`.
@@ -516,9 +827,17 @@ pub struct WorkspaceDb {
     /// `files/` under the workspace directory, where ingested files are
     /// kept; `None` in memory.
     files_dir: Option<PathBuf>,
+    /// `[retrieval].languages`: what a document may be detected as.
+    languages: LanguageSetting,
 }
 
 impl WorkspaceDb {
+    /// The schema version this build writes.
+    #[must_use]
+    pub const fn schema_version() -> u32 {
+        WORKSPACE_SCHEMA_VERSION
+    }
+
     /// Open an in-memory `DuckDB` database (for tests).
     ///
     /// # Errors
@@ -547,10 +866,18 @@ impl WorkspaceDb {
             vectors,
             query_timeout: Duration::from_secs(30),
             files_dir: None,
+            languages: LanguageSetting::Auto,
         };
         db.confine_to(None)?;
         db.create_internal_tables()?;
         Ok(db)
+    }
+
+    /// Detect documents among `languages` from now on (`[retrieval].languages`).
+    #[must_use]
+    pub fn with_languages(mut self, languages: LanguageSetting) -> Self {
+        self.languages = languages;
+        self
     }
 
     /// Override the per-statement timeout (tests and callers with special needs).
@@ -560,9 +887,9 @@ impl WorkspaceDb {
         self
     }
 
-    /// The vector width a workspace file recorded, before anything else runs
-    /// on it: `None` for a new file.
-    fn recorded_dimension(conn: &duckdb::Connection) -> Result<Option<Dimension>> {
+    /// A `_quack_meta` value as a workspace file recorded it, before anything
+    /// else runs on it: `None` for a new file or a key it never set.
+    fn recorded(conn: &duckdb::Connection, key: MetaKey) -> Result<Option<String>> {
         let has_meta: bool = conn.query_row(
         "SELECT count(*) > 0 FROM duckdb_tables() WHERE table_name = '_quack_meta' AND NOT temporary",
         [],
@@ -574,7 +901,7 @@ impl WorkspaceDb {
         let value: Option<String> = conn
             .query_row(
                 "SELECT value FROM _quack_meta WHERE key = ?",
-                duckdb::params![MetaKey::EmbeddingDimension],
+                duckdb::params![key],
                 |row| row.get(0),
             )
             .map(Some)
@@ -582,7 +909,76 @@ impl WorkspaceDb {
                 duckdb::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        Ok(value.and_then(|v| v.parse().ok()).map(Dimension::new))
+        Ok(value)
+    }
+
+    /// The vector width a workspace file recorded: `None` for a new file.
+    fn recorded_dimension(conn: &duckdb::Connection) -> Result<Option<Dimension>> {
+        Ok(Self::recorded(conn, MetaKey::EmbeddingDimension)?
+            .and_then(|v| v.parse().ok())
+            .map(Dimension::new))
+    }
+
+    /// Refuse a file a newer quack upgraded, before any statement changes
+    /// it: this binary's table definitions and rebuilds do not know that
+    /// schema, and recording its own lower version would hide the rollback.
+    fn refuse_newer_schema(conn: &duckdb::Connection, path: &Path) -> Result<()> {
+        // A file from before the version was recorded has none.
+        let recorded = match Self::recorded(conn, MetaKey::SchemaVersion)? {
+            None => 0,
+            Some(text) => text
+                .parse::<u32>()
+                .map_err(|_| Error::WorkspaceSchemaUnreadable {
+                    path: path.to_path_buf(),
+                    recorded: text,
+                })?,
+        };
+        if recorded <= WORKSPACE_SCHEMA_VERSION {
+            return Ok(());
+        }
+        Err(Error::WorkspaceTooNew {
+            path: path.to_path_buf(),
+            recorded,
+            supported: WORKSPACE_SCHEMA_VERSION,
+            written_by: WrittenBy(Self::recorded(conn, MetaKey::WrittenByQuack)?),
+        })
+    }
+
+    /// The schema version a workspace's file records, read through a
+    /// read-only connection so nothing is created or upgraded: 0 for a file
+    /// from before versions were recorded. [`Self::open`] upgrades a file
+    /// older than [`Self::schema_version`] in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::WorkspaceLocked` when another process holds the
+    /// file, or an error if it cannot be read.
+    pub fn recorded_schema(config: &Config, workspace_id: &str) -> Result<u32> {
+        let db_path = config.workspace_db_path(workspace_id);
+        let read_only = duckdb::Config::default()
+            .with(
+                "storage_compatibility_version",
+                STORAGE_COMPATIBILITY_VERSION,
+            )?
+            .access_mode(duckdb::AccessMode::ReadOnly)?;
+        let conn = duckdb::Connection::open_with_flags(&db_path, read_only).map_err(|e| {
+            if e.to_string().contains("Could not set lock") {
+                Error::WorkspaceLocked {
+                    path: db_path.clone(),
+                }
+            } else {
+                Error::from(e)
+            }
+        })?;
+        match Self::recorded(&conn, MetaKey::SchemaVersion)? {
+            None => Ok(0),
+            Some(text) => text
+                .parse::<u32>()
+                .map_err(|_| Error::WorkspaceSchemaUnreadable {
+                    path: db_path,
+                    recorded: text,
+                }),
+        }
     }
 
     /// Open (or create) the `DuckDB` database for a workspace.
@@ -607,7 +1003,11 @@ impl WorkspaceDb {
         // DuckDB reports a file held by another process only in its message
         // text ("Could not set lock on file ..."); it is classified here, once,
         // so callers match a variant instead.
-        let conn = duckdb::Connection::open(&db_path).map_err(|e| {
+        let storage = duckdb::Config::default().with(
+            "storage_compatibility_version",
+            STORAGE_COMPATIBILITY_VERSION,
+        )?;
+        let conn = duckdb::Connection::open_with_flags(&db_path, storage).map_err(|e| {
             if e.to_string().contains("Could not set lock") {
                 Error::WorkspaceLocked {
                     path: db_path.clone(),
@@ -616,6 +1016,7 @@ impl WorkspaceDb {
                 Error::from(e)
             }
         })?;
+        Self::refuse_newer_schema(&conn, &db_path)?;
         // The columns keep the width they were created with until the
         // reconciliation below decides otherwise.
         let column_dimension = Self::recorded_dimension(&conn)?
@@ -627,6 +1028,7 @@ impl WorkspaceDb {
             vectors: Vectors::new(column_dimension, profile),
             query_timeout: config.analysis.query_timeout(),
             files_dir: Some(files_dir),
+            languages: config.retrieval.languages.clone(),
         };
         db.apply_resource_limits(config)?;
         let workspace_dir = std::fs::canonicalize(config.workspace_dir(workspace_id))?;
@@ -647,8 +1049,8 @@ impl WorkspaceDb {
     /// second `DatabaseInstance` and take the file's exclusive lock.
     ///
     /// The clone inherits the confinement and resource limits already
-    /// locked in on `self`, so it must never call [`Self::confine_to`] or
-    /// [`Self::apply_resource_limits`] again — both `SET`s would fail once
+    /// locked in on `self`, so it must never call `confine_to` or
+    /// `apply_resource_limits` again — both `SET`s would fail once
     /// the configuration is locked.
     ///
     /// # Errors
@@ -660,7 +1062,19 @@ impl WorkspaceDb {
             vectors: Arc::clone(&self.vectors),
             query_timeout: self.query_timeout,
             files_dir: self.files_dir.clone(),
+            languages: self.languages.clone(),
         })
+    }
+
+    /// Write everything committed into the database file, so a copy of the
+    /// file once every connection has closed holds it all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint fails.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.conn.execute_batch("CHECKPOINT")?;
+        Ok(())
     }
 
     /// Whether this connection has any temp tables: only ever the CLI's
@@ -888,7 +1302,13 @@ impl WorkspaceDb {
                 "internal tables are not accessible",
             )));
         }
-        self.classify_statement(sql)
+        let kind = self.classify_statement(sql)?;
+        if graph::views::write_names_reserved(sql, &kind) {
+            return Err(Error::Analysis(String::from(
+                graph::views::RESERVED_REFUSED,
+            )));
+        }
+        Ok(kind)
     }
 
     /// Whether a statement touches any of quack's internal tables.
@@ -907,6 +1327,21 @@ impl WorkspaceDb {
         }
     }
 
+    /// Whether a statement reads one of the graph's `graph_` views, as
+    /// `DuckDB` parsed it, or by its words when it cannot be serialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the serialization query itself fails.
+    pub fn references_graph_view(&self, sql: &str) -> Result<bool> {
+        Ok(match self.referenced_base_tables(sql)? {
+            Some(names) => names.iter().any(|n| graph::views::is_reserved(n)),
+            None => sql
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(graph::views::is_reserved),
+        })
+    }
+
     fn create_internal_tables(&self) -> Result<()> {
         self.rename_legacy_tables()?;
         let dim = self.embedding_dimension();
@@ -914,22 +1349,6 @@ impl WorkspaceDb {
             "CREATE TABLE IF NOT EXISTS _quack_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS _quack_documents (
-                id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                title TEXT,
-                mime_type TEXT,
-                size_bytes BIGINT,
-                sha256 TEXT,
-                source TEXT,
-                ingested_at TIMESTAMP DEFAULT now(),
-                status TEXT DEFAULT 'queued',
-                error_message TEXT,
-                pinned BOOLEAN NOT NULL DEFAULT false,
-                chunk_count INTEGER,
-                ingested_by TEXT,
-                tables JSON
             );
             CREATE TABLE IF NOT EXISTS _quack_chunks (
                 id TEXT PRIMARY KEY,
@@ -941,16 +1360,11 @@ impl WorkspaceDb {
                 embedding FLOAT[{dim}],
                 token_count INTEGER
             );
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS title TEXT;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS sha256 TEXT;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS source TEXT;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS chunk_count INTEGER;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS ingested_by TEXT;
-            ALTER TABLE _quack_documents ADD COLUMN IF NOT EXISTS tables JSON;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS heading TEXT;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS page INTEGER;
             ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS embedding_profile TEXT;
+            ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS kind TEXT;
+            ALTER TABLE _quack_chunks ADD COLUMN IF NOT EXISTS locator TEXT;
             CREATE TABLE IF NOT EXISTS _quack_embedding_profiles (
                 fingerprint TEXT PRIMARY KEY,
                 profile JSON NOT NULL,
@@ -980,6 +1394,7 @@ impl WorkspaceDb {
                 created_at TIMESTAMP DEFAULT now(),
                 updated_at TIMESTAMP DEFAULT now()
             );
+            ALTER TABLE _quack_sessions ADD COLUMN IF NOT EXISTS title_by TEXT;
             CREATE TABLE IF NOT EXISTS _quack_messages (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -998,12 +1413,22 @@ impl WorkspaceDb {
                 detail JSON
             );"
         );
+        self.conn.execute_batch(DOCUMENTS_DDL)?;
         self.conn.execute_batch(&sql)?;
         self.conn.execute_batch(SESSION_SUMMARIES_DDL)?;
+        self.conn.execute_batch(SAVED_IMPORTS_DDL)?;
+        self.conn.execute_batch(saved::DDL)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&graph::ddl(dim))?;
+        self.conn.execute_batch(profile::DDL)?;
+        self.conn.execute_batch(table_search::DDL)?;
         self.upgrade_data(dim)?;
+        if let Some(ontology) = ontology_store::current(self)? {
+            graph::views::ensure(self, &ontology)?;
+        }
         self.set_meta(MetaKey::EmbeddingDimension, &dim.to_string())?;
+        self.set_meta(MetaKey::WrittenByQuack, env!("CARGO_PKG_VERSION"))?;
+        self.set_meta(MetaKey::WrittenByDuckDb, &self.duckdb_version()?)?;
         // DuckDB cannot replay an `ADD COLUMN` from the write-ahead log (an
         // internal error on the next open), so a column added to an older
         // file goes into the database file before anything else runs.
@@ -1012,16 +1437,19 @@ impl WorkspaceDb {
     }
 
     /// The data rebuilds a schema version asks of a workspace recorded
-    /// under an older one, then the version it now matches.
+    /// under an older one, then the version it now matches. A file recorded
+    /// under a newer one never gets here: [`Self::open`] refuses it first.
     fn upgrade_data(&self, dim: Dimension) -> Result<()> {
         let recorded = self
             .meta(MetaKey::SchemaVersion)?
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
-        // Version 4 introduced the term index and version 6 changed its
-        // tokens (stemming); both are before the joined terms.
-        if recorded < JOINED_IDENTIFIER_TERMS && self.chunk_count()? > 0 {
-            tracing::info!("indexing existing chunks for keyword search");
+        // Version 4 introduced the term index, version 6 stemmed it, version
+        // 7 added joined identifiers, and version 13 stems each document
+        // under its own language: every one of them rebuilds the index.
+        if recorded < DOCUMENT_LANGUAGES && self.chunk_count()? > 0 {
+            tracing::info!("detecting document languages and indexing chunks for keyword search");
+            self.detect_missing_languages()?;
             self.reindex_terms()?;
         }
         // Vectors made before profiles went to the model unprefixed, under
@@ -1054,6 +1482,12 @@ impl WorkspaceDb {
         // twice and a rejected pair stays rejected.
         if recorded < MERGE_DEDUP {
             self.collapse_duplicate_merge_proposals()?;
+        }
+        if recorded < TABLE_PROFILES {
+            let profiled = TableProfile::refresh_stale(self)?;
+            if profiled > 0 {
+                tracing::info!(tables = profiled, "profiled existing tables");
+            }
         }
         self.set_meta(
             MetaKey::SchemaVersion,
@@ -1368,8 +1802,8 @@ impl WorkspaceDb {
             .map_err(|_| Error::Ingestion("file size overflow".into()))?;
 
         self.conn.execute(
-            "INSERT INTO _quack_documents (id, filename, title, mime_type, size_bytes, sha256, source, status, ingested_by) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO _quack_documents (id, filename, title, mime_type, size_bytes, sha256, source, status, ingested_by, source_root, source_path) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             duckdb::params![
                 doc.id,
                 doc.filename,
@@ -1380,6 +1814,8 @@ impl WorkspaceDb {
                 doc.source.as_str(),
                 doc.status,
                 doc.ingested_by,
+                doc.source_root,
+                doc.source_path,
             ],
         )?;
         Ok(())
@@ -1394,33 +1830,187 @@ impl WorkspaceDb {
     /// Returns an error if the query fails.
     pub fn document_by_sha256(&self, sha256: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
-            "{DOCUMENT_SELECT} WHERE sha256 = ? AND status <> ? ORDER BY ingested_at, id LIMIT 1"
+            "{DOCUMENT_SELECT} WHERE sha256 = ? AND {LIVE_STATUS} ORDER BY ingested_at, id LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(duckdb::params![sha256, DocumentStatus::Error])?;
+        let mut rows = stmt.query(duckdb::params![sha256])?;
         match rows.next()? {
             Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
             None => Ok(None),
         }
     }
 
-    /// The live (non-error) document that loaded `table`, if any: one
-    /// document owns a table (issue #51).
+    /// The live document that loaded `table`, if any: one document owns a
+    /// table (issue #51).
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
     pub fn table_owner(&self, table: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
-            "{DOCUMENT_SELECT} WHERE status <> ? AND tables IS NOT NULL \
+            "{DOCUMENT_SELECT} WHERE {LIVE_STATUS} AND tables IS NOT NULL \
              AND list_contains(CAST(tables AS VARCHAR[]), ?) ORDER BY ingested_at, id LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(duckdb::params![DocumentStatus::Error, table])?;
+        let mut rows = stmt.query(duckdb::params![table])?;
         match rows.next()? {
             Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
             None => Ok(None),
         }
+    }
+
+    /// The newest ready document named `filename`: what `--replace` with
+    /// no id replaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn newest_document_named(&self, filename: &str) -> Result<Option<DocumentInfo>> {
+        let sql = format!(
+            "{DOCUMENT_SELECT} WHERE filename = ? AND status = ? \
+             ORDER BY ingested_at DESC, id DESC LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(duckdb::params![filename, DocumentStatus::Ready])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The ready document a run of the folder `source_root` stored from
+    /// `source_path` under it, if one is: what a changed file at that path
+    /// replaces. The same relative path under another folder is another
+    /// document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn newest_document_at_path(
+        &self,
+        source_root: &str,
+        source_path: &str,
+    ) -> Result<Option<DocumentInfo>> {
+        let sql = format!(
+            "{DOCUMENT_SELECT} WHERE source_root = ? AND source_path = ? AND status = ? \
+             ORDER BY ingested_at DESC, id DESC LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(duckdb::params![
+            source_root,
+            source_path,
+            DocumentStatus::Ready
+        ])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(DocumentInfo::try_from(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record that `id`'s file now sits at `source_path` under the same
+    /// folder. Its name stays the one it was ingested under, which its
+    /// stored copy in `files/` is named after.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn move_document(&self, id: &DocumentId, source_path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _quack_documents SET source_path = ? WHERE id = ?",
+            duckdb::params![source_path, id],
+        )?;
+        Ok(())
+    }
+
+    /// Every ready document a run of the folder `source_root` stored, by
+    /// its path: what a run compares that folder against to find the files
+    /// that are gone. Documents from any other folder are not touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn documents_under(&self, source_root: &str) -> Result<Vec<DocumentInfo>> {
+        let sql = format!(
+            "{DOCUMENT_SELECT} WHERE source_root = ? AND source_path IS NOT NULL AND status = ? \
+             ORDER BY source_path, ingested_at DESC, id DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let docs = stmt.query_map(duckdb::params![source_root, DocumentStatus::Ready], |row| {
+            DocumentInfo::try_from(row)
+        })?;
+        Ok(docs.collect::<duckdb::Result<_>>()?)
+    }
+
+    /// Mark `old` as being replaced by `new`: `old` keeps serving until
+    /// `new` is ready ([`Self::finish_replacement`]), and a failure of
+    /// `new` undoes the mark ([`Self::mark_document_error`]).
+    ///
+    /// # Errors
+    ///
+    /// `old` must exist, be `ready`, and not already have a replacement
+    /// on its way.
+    pub fn begin_replacement(&self, old: &DocumentId, new: &DocumentId) -> Result<()> {
+        let document = self
+            .document(old)?
+            .ok_or_else(|| ResourceKind::Document.missing(old.as_str()))?;
+        if document.status != DocumentStatus::Ready {
+            return Err(Error::Ingestion(format!(
+                "cannot replace {} ({old}): it is {}, not ready",
+                OneLine(&document.filename),
+                document.status
+            )));
+        }
+        if let Some(pending) = document.superseded_by {
+            return Err(Error::Ingestion(format!(
+                "cannot replace {} ({old}): a replacement ({pending}) is already being processed",
+                OneLine(&document.filename)
+            )));
+        }
+        self.conn.execute(
+            "UPDATE _quack_documents SET superseded_by = ? WHERE id = ?",
+            duckdb::params![new, old],
+        )?;
+        Ok(())
+    }
+
+    /// `new` is ready: the document it replaces becomes `superseded` and
+    /// `new` takes over its pin. Returns the replaced document's id, if
+    /// there was one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an update fails.
+    pub fn finish_replacement(&self, new: &DocumentId) -> Result<Option<DocumentId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, pinned FROM _quack_documents WHERE superseded_by = ?")?;
+        let mut rows = stmt.query(duckdb::params![new])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let (old, pinned): (DocumentId, bool) = (row.get(0)?, row.get(1)?);
+        drop(rows);
+        self.conn.execute(
+            "UPDATE _quack_documents SET status = ? WHERE id = ?",
+            duckdb::params![DocumentStatus::Superseded, old],
+        )?;
+        if pinned {
+            self.conn.execute(
+                "UPDATE _quack_documents SET pinned = true WHERE id = ?",
+                duckdb::params![new],
+            )?;
+        }
+        Ok(Some(old))
+    }
+
+    /// Forget that `new` was to replace anything: the document it would
+    /// have replaced stays as it was.
+    fn abandon_replacement(&self, new: &DocumentId) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _quack_documents SET superseded_by = NULL WHERE superseded_by = ?",
+            duckdb::params![new],
+        )?;
+        Ok(())
     }
 
     /// Whether what a ready document loaded is still there: every table
@@ -1449,6 +2039,64 @@ impl WorkspaceDb {
             return Ok(chunks > 0);
         }
         Ok(true)
+    }
+
+    /// Replace a deleted user's id and name in this file with
+    /// [`REMOVED_USER`]: the sessions, saved questions, and saved imports
+    /// they made, the documents they ingested, the context versions and
+    /// table notes they edited, their assertions in the graph and the merges
+    /// they decided, and the detail audit rows that name them. The access
+    /// audit in `control.db` keeps the id. Returns how many rows changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an update fails.
+    pub fn forget_user(&self, user_id: &UserId, username: &str) -> Result<usize> {
+        let mut changed = 0_usize;
+        for (sql, value) in [
+            (
+                "UPDATE _quack_sessions SET created_by = ? WHERE created_by = ?",
+                user_id.as_str(),
+            ),
+            (
+                "UPDATE _quack_documents SET ingested_by = ? WHERE ingested_by = ?",
+                user_id.as_str(),
+            ),
+            (
+                "UPDATE _quack_audit SET user_id = ? WHERE user_id = ?",
+                user_id.as_str(),
+            ),
+            (
+                "UPDATE _quack_saved_questions SET created_by = ? WHERE created_by = ?",
+                user_id.as_str(),
+            ),
+            (
+                "UPDATE _quack_imports SET created_by = ? WHERE created_by = ?",
+                user_id.as_str(),
+            ),
+            (
+                "UPDATE _quack_context SET edited_by = ? WHERE edited_by = ?",
+                username,
+            ),
+            (
+                "UPDATE _quack_table_notes SET edited_by = ? WHERE edited_by = ?",
+                username,
+            ),
+            (
+                "UPDATE _quack_provenance SET author = ? WHERE author = ?",
+                username,
+            ),
+            (
+                "UPDATE _quack_graph_merges SET decided_by = ? WHERE decided_by = ?",
+                username,
+            ),
+        ] {
+            changed = changed.saturating_add(
+                self.conn
+                    .execute(sql, duckdb::params![REMOVED_USER, value])?,
+            );
+        }
+        Ok(changed)
     }
 
     /// Fail every document still `queued` or `processing`: called once
@@ -1501,6 +2149,118 @@ impl WorkspaceDb {
         Ok(())
     }
 
+    /// Record what a parse found the document says about itself. A date
+    /// the database cannot read as a timestamp is kept in `metadata`
+    /// under its key instead of being lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn set_document_meta(&self, id: &DocumentId, meta: &DocumentMeta) -> Result<()> {
+        let mut extra = meta.extra.clone();
+        for (key, value) in [
+            ("authored_at", &meta.authored_at),
+            ("modified_at", &meta.modified_at),
+        ] {
+            if let Some(v) = value
+                && !self.parses_as_timestamp(v)?
+            {
+                extra.insert(key.to_owned(), v.clone());
+            }
+        }
+        self.conn.execute(
+            "UPDATE _quack_documents SET \
+                author = COALESCE(author, ?), \
+                authored_at = COALESCE(authored_at, TRY_CAST(? AS TIMESTAMP)), \
+                modified_at = COALESCE(modified_at, TRY_CAST(? AS TIMESTAMP)), \
+                tags = CASE WHEN tags IS NULL OR CAST(tags AS VARCHAR) = '[]' THEN ?::JSON ELSE tags END, \
+                metadata = ?::JSON \
+             WHERE id = ?",
+            duckdb::params![
+                meta.author,
+                meta.authored_at,
+                meta.modified_at,
+                serde_json::to_string(&meta.tags)?,
+                serde_json::to_string(&extra)?,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn parses_as_timestamp(&self, text: &str) -> Result<bool> {
+        let parsed: Option<String> = self.conn.query_row(
+            "SELECT CAST(TRY_CAST(? AS TIMESTAMP) AS VARCHAR)",
+            duckdb::params![text],
+            |r| r.get(0),
+        )?;
+        Ok(parsed.is_some())
+    }
+
+    /// A person's edit of a document's own fields: each given value
+    /// replaces the stored one (an empty text clears it), tags replace the
+    /// list whole.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document is missing, a date does not read
+    /// as one, or the update fails.
+    pub fn set_document_fields(&self, id: &DocumentId, fields: &DocumentFields) -> Result<()> {
+        if self.document(id)?.is_none() {
+            return Err(ResourceKind::Document.missing(id.as_str()));
+        }
+        if let Some(date) = fields
+            .authored_at
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+            && !self.parses_as_timestamp(date)?
+        {
+            return Err(Error::Analysis(format!(
+                "'{date}' is not a date; give one as YYYY-MM-DD or an ISO 8601 timestamp"
+            )));
+        }
+        let clear = |value: &Option<String>| value.as_deref().map(str::trim).map(str::is_empty);
+        if let Some(title) = &fields.title {
+            self.conn.execute(
+                "UPDATE _quack_documents SET title = ? WHERE id = ?",
+                duckdb::params![
+                    (clear(&fields.title) != Some(true)).then_some(title.trim()),
+                    id
+                ],
+            )?;
+        }
+        if let Some(author) = &fields.author {
+            self.conn.execute(
+                "UPDATE _quack_documents SET author = ? WHERE id = ?",
+                duckdb::params![
+                    (clear(&fields.author) != Some(true)).then_some(author.trim()),
+                    id
+                ],
+            )?;
+        }
+        if let Some(date) = &fields.authored_at {
+            self.conn.execute(
+                "UPDATE _quack_documents SET authored_at = TRY_CAST(? AS TIMESTAMP) WHERE id = ?",
+                duckdb::params![
+                    (clear(&fields.authored_at) != Some(true)).then_some(date.trim()),
+                    id
+                ],
+            )?;
+        }
+        if let Some(tags) = &fields.tags {
+            let tags: Vec<String> = tags
+                .iter()
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .collect();
+            self.conn.execute(
+                "UPDATE _quack_documents SET tags = ?::JSON WHERE id = ?",
+                duckdb::params![serde_json::to_string(&tags)?, id],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Record how many chunks a processed document produced.
     ///
     /// # Errors
@@ -1510,6 +2270,26 @@ impl WorkspaceDb {
         self.conn.execute(
             "UPDATE _quack_documents SET chunk_count = ? WHERE id = ?",
             duckdb::params![count, id],
+        )?;
+        Ok(())
+    }
+
+    /// Record how a processed document's pages read; `None` for a source
+    /// without pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the update fails.
+    pub fn set_document_pages(&self, id: &DocumentId, pages: Option<PageCounts>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _quack_documents SET page_count = ?, pages_unreadable = ?, pages_empty = ? \
+             WHERE id = ?",
+            duckdb::params![
+                pages.map(|p| p.total),
+                pages.map(|p| p.unreadable),
+                pages.map(|p| p.empty),
+                id
+            ],
         )?;
         Ok(())
     }
@@ -1537,7 +2317,8 @@ impl WorkspaceDb {
             "UPDATE _quack_documents SET status = ?, error_message = ? WHERE id = ?",
             duckdb::params![DocumentStatus::Error, message, id],
         )?;
-        Ok(())
+        // A failed replacement leaves the document it was to replace as it was.
+        self.abandon_replacement(id)
     }
 
     /// One document by id.
@@ -1569,7 +2350,11 @@ impl WorkspaceDb {
         let Some(doc) = self.document(id)? else {
             return Ok(false);
         };
-        let tables = if let Some(tables) = doc.tables.clone() {
+        // A replaced document's tables and file now belong to its
+        // replacement; only its own rows go.
+        let tables = if doc.status == DocumentStatus::Superseded {
+            Vec::new()
+        } else if let Some(tables) = doc.tables.clone() {
             tables
         } else {
             // Never a table another document loaded: a row still queued, or
@@ -1606,7 +2391,10 @@ impl WorkspaceDb {
             self.conn
                 .execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)))?;
         }
-        self.remove_document_files(&doc.filename, &tables);
+        if doc.status != DocumentStatus::Superseded {
+            self.remove_document_files(id, &doc.filename, &tables);
+        }
+        self.abandon_replacement(id)?;
         Ok(true)
     }
 
@@ -1664,16 +2452,45 @@ impl WorkspaceDb {
         Ok(())
     }
 
+    /// Whether a ready document is an image, which `view_image` can look at.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn has_images(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM _quack_documents \
+             WHERE status = ? AND mime_type LIKE 'image/%')",
+            duckdb::params![DocumentStatus::Ready],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The image `document` keeps in the workspace's `files/`, when it is
+    /// an image and the connection knows the workspace's directory.
+    #[must_use]
+    pub fn stored_image(&self, document: &DocumentInfo) -> Option<StoredImage> {
+        let FileType::Image(format) = FileType::of(&document.filename)? else {
+            return None;
+        };
+        let files_dir = self.files_dir.as_ref()?;
+        Some(StoredImage::in_dir(files_dir, &document.id, format))
+    }
+
     /// Remove what ingestion wrote under `files/` for a document: the file
-    /// itself and, for workbooks and imports, one CSV per table. A missing
-    /// file is fine; any other failure is logged, since the rows are gone.
-    fn remove_document_files(&self, filename: &str, tables: &[String]) {
+    /// itself, for workbooks and imports one CSV per table, and for an
+    /// image its stored copy. A missing file is fine; any other failure is
+    /// logged, since the rows are gone.
+    fn remove_document_files(&self, id: &DocumentId, filename: &str, tables: &[String]) {
         let Some(files_dir) = &self.files_dir else {
             return;
         };
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(name) = Path::new(filename).file_name() {
             candidates.push(files_dir.join(name));
+        }
+        if let Some(FileType::Image(format)) = FileType::of(filename) {
+            candidates.push(StoredImage::in_dir(files_dir, id, format).path().to_owned());
         }
         for table in tables {
             candidates.push(files_dir.join(format!("{table}.csv")));
@@ -1689,57 +2506,26 @@ impl WorkspaceDb {
         }
     }
 
-    /// Insert a text chunk, optionally with an embedding vector, and index
-    /// its terms for keyword search.
+    /// Detect a document's language from `sample` (its opening text, under
+    /// `[retrieval].languages`), record it, and return what stores the
+    /// document's chunks under that language's stemming, so the language
+    /// is resolved once per document rather than once per chunk.
     ///
     /// # Errors
     ///
-    /// Returns an error if the insert fails.
-    pub fn insert_chunk(&self, chunk: &NewChunk<'_>) -> Result<()> {
-        let page = chunk.page.map(i64::from);
-        let terms = TermFrequencies::of(chunk.content, chunk.heading);
-        let length = terms.total();
-        match chunk.embedding {
-            Some(emb) => {
-                self.check_vector_width(emb.len())?;
-                let sql = format!(
-                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, embedding, embedding_profile) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?::{}, ?)",
-                    self.vector_type()
-                );
-                self.conn.execute(
-                    &sql,
-                    duckdb::params![
-                        chunk.id,
-                        chunk.document_id,
-                        chunk.chunk_index,
-                        chunk.content,
-                        chunk.heading,
-                        page,
-                        length,
-                        emb.sql_literal(),
-                        self.embedding_fingerprint()
-                    ],
-                )?;
-            }
-            None => {
-                self.conn.execute(
-                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    duckdb::params![
-                        chunk.id,
-                        chunk.document_id,
-                        chunk.chunk_index,
-                        chunk.content,
-                        chunk.heading,
-                        page,
-                        length
-                    ],
-                )?;
-            }
-        }
-        self.insert_terms(chunk.id, &terms)?;
-        Ok(())
+    /// Returns an error if a write fails.
+    pub fn chunk_writer(&self, id: &DocumentId, sample: &str) -> Result<ChunkWriter<'_>> {
+        let code = self.languages.detect(sample);
+        self.conn.execute(
+            "UPDATE _quack_documents SET language = ? WHERE id = ?",
+            duckdb::params![code, id],
+        )?;
+        self.record_languages()?;
+        Ok(ChunkWriter {
+            db: self,
+            document_id: id.clone(),
+            analyzer: Analyzer::of(Stemming::of_code(Some(code))),
+        })
     }
 
     fn insert_terms(&self, chunk_id: &ChunkId, terms: &TermFrequencies) -> Result<()> {
@@ -1752,6 +2538,59 @@ impl WorkspaceDb {
         }
         appender.flush()?;
         Ok(())
+    }
+
+    /// Record the stemmings the documents were indexed under, which a
+    /// query is tokenized under.
+    fn record_languages(&self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT language FROM _quack_documents WHERE language IS NOT NULL")?;
+        let codes = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        let recorded = Analyzer::record(codes.iter().map(|c| Some(c.as_str())));
+        self.set_meta(MetaKey::Languages, &recorded)
+    }
+
+    /// The stemmings a query is tokenized under: every one a document of
+    /// the workspace was indexed under.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `_quack_meta` cannot be read.
+    pub fn query_analyzer(&self) -> Result<Analyzer> {
+        Ok(Analyzer::of_recorded(
+            self.meta(MetaKey::Languages)?.as_deref(),
+        ))
+    }
+
+    /// Characters of a document's opening text its language is detected
+    /// from.
+    pub const LANGUAGE_SAMPLE_CHARS: usize = 8000;
+
+    /// Detect the language of every document with chunks that has none,
+    /// from its first chunks: documents ingested before detection.
+    fn detect_missing_languages(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.document_id, left(string_agg(c.content, ' ' ORDER BY c.chunk_index), ?) \
+             FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE d.language IS NULL AND c.chunk_index < 16 \
+             GROUP BY c.document_id",
+        )?;
+        let samples = stmt
+            .query_map(
+                duckdb::params![i64::try_from(Self::LANGUAGE_SAMPLE_CHARS).unwrap_or(i64::MAX)],
+                |row| Ok((row.get::<_, DocumentId>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        for (id, sample) in samples {
+            self.conn.execute(
+                "UPDATE _quack_documents SET language = ? WHERE id = ?",
+                duckdb::params![self.languages.detect(&sample), id],
+            )?;
+        }
+        self.record_languages()
     }
 
     fn chunk_count(&self) -> Result<i64> {
@@ -1773,8 +2612,9 @@ impl WorkspaceDb {
     fn reindex_terms_by(&self, page: u32) -> Result<()> {
         self.conn.execute("DELETE FROM _quack_terms", [])?;
         let mut stmt = self.conn.prepare(
-            "SELECT id, heading, content FROM _quack_chunks \
-             WHERE ?::VARCHAR IS NULL OR id > ? ORDER BY id LIMIT ?",
+            "SELECT c.id, c.heading, c.content, d.language FROM _quack_chunks c \
+             LEFT JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE ?::VARCHAR IS NULL OR c.id > ? ORDER BY c.id LIMIT ?",
         )?;
         // A page at a time by id, so a large workspace never holds every
         // chunk's text at once.
@@ -1782,15 +2622,20 @@ impl WorkspaceDb {
         loop {
             let page = stmt
                 .query_map(duckdb::params![after, after, i64::from(page)], |row| {
-                    PendingChunk::try_from(row)
+                    Ok((
+                        PendingChunk::try_from(row)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
                 })?
                 .collect::<duckdb::Result<Vec<_>>>()?;
-            let Some(last) = page.last() else {
+            let Some((last, _)) = page.last() else {
                 return Ok(());
             };
             after = Some(last.id.clone());
-            for chunk in &page {
-                let terms = TermFrequencies::of(&chunk.content, chunk.heading.as_deref());
+            for (chunk, language) in &page {
+                let analyzer = Analyzer::of(Stemming::of_code(language.as_deref()));
+                let terms =
+                    TermFrequencies::of(&analyzer, &chunk.content, chunk.heading.as_deref());
                 self.conn.execute(
                     "UPDATE _quack_chunks SET token_count = ? WHERE id = ?",
                     duckdb::params![terms.total(), chunk.id],
@@ -1946,11 +2791,7 @@ impl WorkspaceDb {
         if scope.is_empty() {
             return Ok(Vec::new());
         }
-        let terms: Vec<String> = TermFrequencies::of(query, None)
-            .0
-            .into_iter()
-            .map(|(t, _)| t)
-            .collect();
+        let terms = TermFrequencies::distinct(&self.query_analyzer()?, query);
         if terms.is_empty() {
             return Ok(Vec::new());
         }
@@ -1974,7 +2815,8 @@ impl WorkspaceDb {
                          JOIN df d ON d.term = t.term \
                          JOIN _quack_chunks ch ON ch.id = t.chunk_id, stats s \
                          GROUP BY t.chunk_id) \
-             SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, sc.score \
+             SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, sc.score, \
+                    CAST(d.ingested_at AS VARCHAR), c.kind, c.locator \
              FROM scored sc \
              JOIN _quack_chunks c ON c.id = sc.chunk_id \
              JOIN _quack_documents d ON d.id = c.document_id \
@@ -1993,6 +2835,10 @@ impl WorkspaceDb {
             .query_map(params.as_slice(), |row| ChunkSearchResult::try_from(row))?
             .collect::<duckdb::Result<Vec<_>>>()?;
         phrases.retain_matching(&mut results, top_k);
+        for (i, hit) in results.iter_mut().enumerate() {
+            hit.ranks.keyword_rank = Some(Ranks::place(i));
+            hit.ranks.bm25 = Some(hit.score);
+        }
         Ok(results)
     }
 
@@ -2014,14 +2860,72 @@ impl WorkspaceDb {
         limits: HybridLimits,
         scope: &ChunkScope,
     ) -> Result<Vec<ChunkSearchResult>> {
+        Ok(self
+            .explain_search(query_text, query_embedding, limits, scope)?
+            .fused)
+    }
+
+    /// One search in `mode`, with its workings. Hybrid without a query
+    /// vector (no embedding model) runs the keyword leg alone; vector mode
+    /// without one is an error, since nothing else would answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a leg fails, or vector mode has no vector.
+    pub fn search_chunks(
+        &self,
+        query: &str,
+        embedding: Option<&Vector>,
+        mode: SearchMode,
+        limits: HybridLimits,
+        scope: &ChunkScope,
+    ) -> Result<SearchExplanation> {
+        match (mode, embedding) {
+            (SearchMode::Hybrid, Some(vector)) => self.explain_search(query, vector, limits, scope),
+            (SearchMode::Hybrid | SearchMode::Keyword, _) => Ok(SearchExplanation::keyword_only(
+                query,
+                self.search_keyword_chunks(query, limits.top_k, scope)?,
+            )),
+            (SearchMode::Vector, Some(vector)) => {
+                let phrases = Phrases::parse(query);
+                let fetch = phrases.fetch(limits.top_k, limits.top_k);
+                let hits = self.search_similar_chunks(vector, fetch, scope)?;
+                Ok(SearchExplanation::vector_only(phrases, hits, limits.top_k))
+            }
+            (SearchMode::Vector, None) => Err(Error::Analysis(String::from(
+                "vector search needs an embedding model ([embedding].model); search by keyword instead",
+            ))),
+        }
+    }
+
+    /// [`Self::search_hybrid_chunks`] with its workings: both legs as they
+    /// ranked their (over-fetched) candidates, the fused ranking, and the
+    /// quoted phrases that filtered it. Each hit carries its rank and score
+    /// in every leg that found it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either search fails.
+    pub fn explain_search(
+        &self,
+        query_text: &str,
+        query_embedding: &Vector,
+        limits: HybridLimits,
+        scope: &ChunkScope,
+    ) -> Result<SearchExplanation> {
         let phrases = Phrases::parse(query_text);
         let candidates = limits.top_k.saturating_mul(2).max(1);
         let fuse_k = phrases.fetch(limits.top_k, candidates);
         let vector = self.search_similar_chunks(query_embedding, fuse_k, scope)?;
         let keyword = self.search_keyword_chunks(query_text, fuse_k, scope)?;
-        let mut fused = limits.fuse(vector, keyword, fuse_k);
+        let mut fused = limits.fuse(vector.clone(), keyword.clone(), fuse_k);
         phrases.retain_matching(&mut fused, limits.top_k);
-        Ok(fused)
+        Ok(SearchExplanation {
+            vector,
+            keyword,
+            fused,
+            phrases: phrases.0,
+        })
     }
 
     /// Search for the most similar chunks to a query embedding. `score` is
@@ -2053,7 +2957,8 @@ impl WorkspaceDb {
         let filter = scope.sql();
         let sql = format!(
             "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, \
-                    1.0 / (1.0 + array_cosine_distance(c.embedding, ?::{})) AS score \
+                    1.0 / (1.0 + array_cosine_distance(c.embedding, ?::{})) AS score, \
+                    CAST(d.ingested_at AS VARCHAR), c.kind, c.locator \
              FROM _quack_chunks c \
              JOIN _quack_documents d ON d.id = c.document_id \
              WHERE c.embedding IS NOT NULL AND c.embedding_profile IS NOT DISTINCT FROM ? \
@@ -2073,9 +2978,13 @@ impl WorkspaceDb {
         params.push(&DocumentStatus::Ready);
         scope.bind(&mut params);
         params.push(&limit);
-        let results = stmt
+        let mut results = stmt
             .query_map(params.as_slice(), |row| ChunkSearchResult::try_from(row))?
             .collect::<duckdb::Result<Vec<_>>>()?;
+        for (i, hit) in results.iter_mut().enumerate() {
+            hit.ranks.vector_rank = Some(Ranks::place(i));
+            hit.ranks.vector_score = Some(hit.score);
+        }
         Ok(results)
     }
 
@@ -2158,7 +3067,8 @@ impl WorkspaceDb {
         size: u32,
     ) -> Result<Vec<ChunkSearchResult>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0 \
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0, \
+                    CAST(d.ingested_at AS VARCHAR), c.kind, c.locator \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
              WHERE d.status = ? AND {} AND (?::VARCHAR IS NULL OR c.id > ?) \
              ORDER BY c.id LIMIT ?",
@@ -2166,6 +3076,34 @@ impl WorkspaceDb {
         ))?;
         let rows = stmt.query_map(
             duckdb::params![DocumentStatus::Ready, after, after, i64::from(size)],
+            |row| ChunkSearchResult::try_from(row),
+        )?;
+        Ok(rows.collect::<duckdb::Result<_>>()?)
+    }
+
+    /// Up to `limit` of a document's chunks from position `from` on, in
+    /// document order, with the citation metadata a search hit carries
+    /// (score 1). Status is not checked: a passage cited by an earlier
+    /// answer must still open after its document was replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn document_chunks(
+        &self,
+        document_id: &DocumentId,
+        from: u32,
+        limit: u32,
+    ) -> Result<Vec<ChunkSearchResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0, \
+                    CAST(d.ingested_at AS VARCHAR), c.kind, c.locator \
+             FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
+             WHERE c.document_id = ? AND c.chunk_index >= ? \
+             ORDER BY c.chunk_index LIMIT ?",
+        )?;
+        let rows = stmt.query_map(
+            duckdb::params![document_id, i64::from(from), i64::from(limit)],
             |row| ChunkSearchResult::try_from(row),
         )?;
         Ok(rows.collect::<duckdb::Result<_>>()?)
@@ -2180,7 +3118,8 @@ impl WorkspaceDb {
     pub fn chunks_by_ids(&self, ids: &[ChunkId]) -> Result<Vec<ChunkSearchResult>> {
         let mut out = Vec::with_capacity(ids.len());
         let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0 \
+            "SELECT c.id, c.content, c.document_id, c.chunk_index, d.filename, c.heading, c.page, 1.0, \
+                    CAST(d.ingested_at AS VARCHAR), c.kind, c.locator \
              FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id WHERE c.id = ?",
         )?;
         for id in ids {
@@ -2204,7 +3143,7 @@ impl WorkspaceDb {
             duckdb::params![pinning, document_id],
         )?;
         if changed == 0 {
-            return Err(Record::Document.missing(document_id.as_str()));
+            return Err(ResourceKind::Document.missing(document_id.as_str()));
         }
         Ok(())
     }
@@ -2216,7 +3155,11 @@ impl WorkspaceDb {
     /// Returns an error if the query fails.
     pub fn pinned_documents(&self) -> Result<Vec<PinnedDocument>> {
         let mut out = Vec::new();
-        for doc in self.list_documents()?.into_iter().filter(|d| d.pinned) {
+        for doc in self
+            .list_documents()?
+            .into_iter()
+            .filter(|d| d.pinning == Pinning::Pinned)
+        {
             let mut stmt = self.conn.prepare(
                 "SELECT content FROM _quack_chunks WHERE document_id = ? ORDER BY chunk_index",
             )?;
@@ -2254,53 +3197,123 @@ impl WorkspaceDb {
         self.read_rows(sql, Some(max_rows as usize))
     }
 
-    fn read_rows(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
-        self.under_timeout(|db| db.read_rows_untimed(sql, keep))
+    /// [`Self::execute_query_capped`], with a `ResultDigest` of the
+    /// whole result set: every row is read and digested, and only the
+    /// first `max_rows` are kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL is invalid or execution fails.
+    pub fn execute_query_digested(&self, sql: &str, max_rows: u32) -> Result<DigestedResults> {
+        self.under_timeout(|db| {
+            let (results, digest) = db.read_rows_untimed(sql, Some(max_rows as usize), true)?;
+            Ok(DigestedResults {
+                results,
+                digest: digest.unwrap_or_default(),
+            })
+        })
     }
 
-    fn read_rows_untimed(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
+    fn read_rows(&self, sql: &str, keep: Option<usize>) -> Result<CappedResults> {
+        self.under_timeout(|db| Ok(db.read_rows_untimed(sql, keep, false)?.0))
+    }
+
+    /// Write every row of `sql` to `out` as it arrives, in `format`, under
+    /// the query timeout: the whole result set with nothing held in memory
+    /// but one row. The caller classifies the statement as a read and runs
+    /// this inside [`Self::read_only`]. Returns how many rows were written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL is invalid, execution fails, or a write
+    /// to `out` fails.
+    pub fn stream_query(
+        &self,
+        sql: &str,
+        format: ExportFormat,
+        out: &mut impl Write,
+    ) -> Result<u64> {
+        self.under_timeout(|db| db.stream_query_untimed(sql, format, out))
+    }
+
+    fn stream_query_untimed(
+        &self,
+        sql: &str,
+        format: ExportFormat,
+        out: &mut impl Write,
+    ) -> Result<u64> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        let (columns, column_count) = match rows.as_ref() {
+            Some(stmt_ref) if stmt_ref.column_count() > 0 => {
+                (stmt_ref.column_names(), stmt_ref.column_count())
+            }
+            _ => (Vec::new(), 0),
+        };
+        let mut writer = RowWriter::start(format, &columns, out)?;
+        let mut written = 0_u64;
+        if column_count > 0 {
+            while let Some(row) = rows.next()? {
+                let mut values = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    values.push(extract_value(row, i));
+                }
+                writer.row(&values)?;
+                written = written.saturating_add(1);
+            }
+        }
+        writer.finish()?;
+        Ok(written)
+    }
+
+    /// Read `sql`'s rows, keeping `keep` of them, and when `digested`,
+    /// digest every row, kept or not: a digest covers the whole result, so
+    /// rows past the cap are converted only then.
+    fn read_rows_untimed(
+        &self,
+        sql: &str,
+        keep: Option<usize>,
+        digested: bool,
+    ) -> Result<(CappedResults, Option<String>)> {
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
 
-        let empty = CappedResults {
+        let (columns, column_count) = match rows.as_ref() {
+            Some(stmt_ref) if stmt_ref.column_count() > 0 => {
+                (stmt_ref.column_names(), stmt_ref.column_count())
+            }
+            _ => (Vec::new(), 0),
+        };
+        let mut digest = digested.then(|| ResultDigest::new(&columns)).transpose()?;
+        let mut results = CappedResults {
             results: QueryResults {
-                columns: Vec::new(),
+                columns,
                 rows: Vec::new(),
             },
             total_rows: 0,
         };
-        let (columns, column_count) = {
-            let Some(stmt_ref) = rows.as_ref() else {
-                return Ok(empty);
-            };
-            let count = stmt_ref.column_count();
-            if count == 0 {
-                return Ok(empty);
-            }
-            (stmt_ref.column_names(), count)
-        };
+        if column_count == 0 {
+            return Ok((results, digest.map(ResultDigest::finish)));
+        }
 
-        let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
-        let mut total_rows: usize = 0;
         while let Some(row) = rows.next()? {
-            total_rows = total_rows.saturating_add(1);
-            if keep.is_some_and(|keep| result_rows.len() >= keep) {
+            results.total_rows = results.total_rows.saturating_add(1);
+            let kept = keep.is_none_or(|keep| results.results.rows.len() < keep);
+            if !kept && digest.is_none() {
                 continue;
             }
             let mut values = Vec::with_capacity(column_count);
             for i in 0..column_count {
                 values.push(extract_value(row, i));
             }
-            result_rows.push(values);
+            if let Some(digest) = digest.as_mut() {
+                digest.add_row(&values)?;
+            }
+            if kept {
+                results.results.rows.push(values);
+            }
         }
-
-        Ok(CappedResults {
-            results: QueryResults {
-                columns,
-                rows: result_rows,
-            },
-            total_rows,
-        })
+        Ok((results, digest.map(ResultDigest::finish)))
     }
 
     /// Execute a SQL statement that does not return rows.
@@ -2365,6 +3378,20 @@ impl WorkspaceDb {
         let result = f(self);
         canceller.slot().running = None;
         result
+    }
+
+    /// An anonymous file, removed when closed, for an export to stage
+    /// workspace content in: under the workspace's own directory, or the
+    /// system's temporary directory for an in-memory database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be created.
+    pub fn spool_file(&self) -> Result<std::fs::File> {
+        Ok(match &self.files_dir {
+            Some(dir) => tempfile::tempfile_in(dir)?,
+            None => tempfile::tempfile()?,
+        })
     }
 
     /// Run `f`'s reads inside `BEGIN TRANSACTION READ ONLY`, scoped to `f`
@@ -2506,12 +3533,12 @@ impl WorkspaceDb {
             .collect())
     }
 
-    /// Describe a table's columns (name, type) and return up to 3 sample rows.
+    /// A table's columns, name and `DuckDB` type, in order.
     ///
     /// # Errors
     ///
     /// Returns an error if the table does not exist or the query fails.
-    pub fn describe_table(&self, table_name: &str) -> Result<TableDescription> {
+    pub fn describe_columns(&self, table_name: &str) -> Result<Vec<ColumnInfo>> {
         let describe_sql = format!("DESCRIBE {}", quote_ident(table_name));
         let mut stmt = self.conn.prepare(&describe_sql)?;
         let columns = stmt
@@ -2519,19 +3546,67 @@ impl WorkspaceDb {
                 Ok(ColumnInfo {
                     name: row.get(0)?,
                     column_type: row.get(1)?,
+                    meaning: None,
                 })
             })?
             .collect::<duckdb::Result<Vec<_>>>()?;
+        Ok(columns)
+    }
 
+    /// Describe a table: its columns with what the ontology says of them,
+    /// up to 3 sample rows, the owner's note, its profile when current,
+    /// and the measures defined over it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table does not exist or the query fails.
+    pub fn describe_table(&self, table_name: &str) -> Result<TableDescription> {
+        let ontology = ontology_store::current(self)?;
+        self.describe_table_under(table_name, ontology.as_ref())
+    }
+
+    /// [`Self::describe_table`] with the ontology already read, for a
+    /// caller describing many tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table does not exist or the query fails.
+    pub fn describe_table_under(
+        &self,
+        table_name: &str,
+        ontology: Option<&Ontology>,
+    ) -> Result<TableDescription> {
+        let mut columns = self.describe_columns(table_name)?;
         let sample_sql = format!("SELECT * FROM {} LIMIT 3", quote_ident(table_name));
         let sample = self.execute_query(&sample_sql)?;
         let row_count = self.count_rows(table_name)?;
-
+        let mapping = ontology.and_then(|o| o.mapping_for_table(table_name));
+        if let (Some(ontology), Some(mapping)) = (ontology, mapping) {
+            for column in &mut columns {
+                column.meaning = mapping
+                    .properties
+                    .get(&column.name)
+                    .and_then(|id| ontology.property(id))
+                    .and_then(ColumnMeaning::of);
+            }
+        }
+        let profile =
+            TableProfile::current(self, table_name, u64::try_from(row_count).unwrap_or(0))?;
+        let warnings = profile
+            .as_ref()
+            .map(|p| p.warnings(mapping.map(|m| m.key.as_str())))
+            .unwrap_or_default();
         Ok(TableDescription {
             table_name: table_name.to_owned(),
             columns,
             row_count,
             sample_rows: sample,
+            note: TableNote::get(self, table_name)?.map(|n| n.note),
+            profile,
+            warnings,
+            measures: ontology
+                .map(|o| o.measures_on(table_name).into_iter().cloned().collect())
+                .unwrap_or_default(),
         })
     }
 
@@ -2568,26 +3643,66 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the query fails.
     pub fn recent_documents(&self, limit: usize) -> Result<(Vec<DocumentInfo>, usize)> {
-        let sql = format!("{DOCUMENT_SELECT} ORDER BY ingested_at DESC, id DESC LIMIT ?");
+        let sql = format!(
+            "{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} ORDER BY ingested_at DESC, id DESC LIMIT ?"
+        );
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(&sql)?;
         let docs = stmt
             .query_map(duckdb::params![limit], |row| DocumentInfo::try_from(row))?
             .collect::<duckdb::Result<Vec<_>>>()?;
-        let total: i64 =
-            self.conn
-                .query_row("SELECT count(*) FROM _quack_documents", [], |row| {
-                    row.get(0)
-                })?;
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM _quack_documents WHERE {NOT_SUPERSEDED}"),
+            [],
+            |row| row.get(0),
+        )?;
         Ok((docs, usize::try_from(total).unwrap_or(usize::MAX)))
     }
 
-    /// List all ingested documents with their status.
+    /// Every document with its status, newest first, failed ones with
+    /// their reason: what the workspace holds now. A replaced document is
+    /// left out ([`Self::list_all_documents`] has it).
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
     pub fn list_documents(&self) -> Result<Vec<DocumentInfo>> {
+        let sql =
+            format!("{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} ORDER BY ingested_at DESC, id DESC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let docs = stmt.query_map([], |row| DocumentInfo::try_from(row))?;
+        Ok(docs.collect::<duckdb::Result<_>>()?)
+    }
+
+    /// The documents [`Self::list_documents`] lists that `filter` lets
+    /// through.
+    ///
+    /// # Errors
+    ///
+    /// An unknown file type, `since` after `until`, or a failed query.
+    pub fn list_documents_matching(&self, filter: &DocumentFilter) -> Result<Vec<DocumentInfo>> {
+        let clause = filter.clause()?;
+        let sql = format!(
+            "{DOCUMENT_SELECT} d WHERE {NOT_SUPERSEDED}{} ORDER BY ingested_at DESC, id DESC",
+            clause.sql
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(clause.params.len());
+        for param in &clause.params {
+            params.push(param);
+        }
+        let docs = stmt.query_map(params.as_slice(), |row| DocumentInfo::try_from(row))?;
+        Ok(docs.collect::<duckdb::Result<_>>()?)
+    }
+
+    /// Every document row, replaced ones included, newest first: the
+    /// listing behind `quack docs --all` and the Documents page's
+    /// "show replaced" view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn list_all_documents(&self) -> Result<Vec<DocumentInfo>> {
         let sql = format!("{DOCUMENT_SELECT} ORDER BY ingested_at DESC, id DESC");
         let mut stmt = self.conn.prepare(&sql)?;
         let docs = stmt.query_map([], |row| DocumentInfo::try_from(row))?;
@@ -2601,15 +3716,62 @@ impl WorkspaceDb {
     }
 }
 
-/// Column metadata from DESCRIBE.
-#[derive(Debug)]
+/// Column metadata from DESCRIBE, with what the ontology says of it.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ColumnInfo {
     pub name: String,
+    #[serde(rename = "type")]
     pub column_type: String,
+    /// From the property a table mapping gives the column; `None` when the
+    /// table is not mapped or the property says nothing.
+    #[serde(flatten)]
+    pub meaning: Option<ColumnMeaning>,
+}
+
+/// What a column means, from its ontology property.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct ColumnMeaning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
+}
+
+impl ColumnMeaning {
+    /// What `property` says, or `None` when it says nothing.
+    #[must_use]
+    pub fn of(property: &Property) -> Option<Self> {
+        let meaning = Self {
+            description: property.description.clone(),
+            unit: property.unit.clone(),
+            synonyms: property.synonyms.clone(),
+        };
+        (meaning.description.is_some() || meaning.unit.is_some() || !meaning.synonyms.is_empty())
+            .then_some(meaning)
+    }
+}
+
+/// `: monthly revenue [USD] (also: sales, turnover)`, the suffix a column
+/// line carries.
+impl fmt::Display for ColumnMeaning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(description) = &self.description {
+            write!(f, ": {}", OneLine(description))?;
+        }
+        if let Some(unit) = &self.unit {
+            write!(f, " [{}]", OneLine(unit))?;
+        }
+        if !self.synonyms.is_empty() {
+            write!(f, " (also: {})", OneLine(&self.synonyms.join(", ")))?;
+        }
+        Ok(())
+    }
 }
 
 /// The user tables and columns SQL completion offers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct SqlSchema {
     pub tables: Vec<TableColumns>,
     /// Some tables or columns were left out to stay within the caps.
@@ -2632,7 +3794,7 @@ impl SqlSchema {
 }
 
 /// One table's name and its columns, in column order.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct TableColumns {
     pub name: SqlName,
     pub columns: Vec<SqlName>,
@@ -2641,7 +3803,7 @@ pub struct TableColumns {
 /// An identifier and how a statement writes it: bare when `DuckDB` reads
 /// it unquoted as the same name (lowercase letters, digits, and
 /// underscores, not a reserved keyword), quoted otherwise.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct SqlName {
     pub name: String,
     pub sql: String,
@@ -2673,10 +3835,118 @@ pub struct TableDescription {
     /// Exact row count at describe time.
     pub row_count: i64,
     pub sample_rows: QueryResults,
+    /// The owner's note on the table.
+    pub note: Option<String>,
+    /// The stored profile, when it was taken at the current row count.
+    pub profile: Option<TableProfile>,
+    /// The profile's warnings, the mapped key column held to the key rule.
+    pub warnings: Vec<profile::Flagged>,
+    /// The ontology's measures over this table.
+    pub measures: Vec<Measure>,
+}
+
+impl TableDescription {
+    /// The description as every interface sends it: columns with their
+    /// meaning, the note, the profile's counts per column, each warning with
+    /// its sentence and the type that fixes it, the measures, and the
+    /// sample rows.
+    #[must_use]
+    pub fn body(&self) -> TableDescriptionBody {
+        TableDescriptionBody {
+            table: self.table_name.clone(),
+            row_count: self.row_count,
+            note: self.note.clone(),
+            columns: self.columns.clone(),
+            profile: self.profile.clone(),
+            warnings: self
+                .warnings
+                .iter()
+                .map(|f| WarningBody {
+                    column: f.column.clone(),
+                    message: f.warning.to_string(),
+                    fix: f.warning.fix(),
+                    warning: f.warning,
+                })
+                .collect(),
+            measures: self.measures.clone(),
+            sample: self.sample_rows.clone(),
+        }
+    }
+}
+
+/// A table's description as every interface sends it.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct TableDescriptionBody {
+    pub table: String,
+    /// Exact row count at describe time.
+    pub row_count: i64,
+    /// The owner's note on the table.
+    pub note: Option<String>,
+    pub columns: Vec<ColumnInfo>,
+    /// The stored profile, when it was taken at the current row count.
+    pub profile: Option<TableProfile>,
+    pub warnings: Vec<WarningBody>,
+    /// The ontology's measures over this table.
+    pub measures: Vec<Measure>,
+    /// A few rows.
+    pub sample: QueryResults,
+}
+
+/// One column's warning: what it is, in a sentence, and the type that
+/// fixes it.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct WarningBody {
+    pub column: String,
+    pub message: String,
+    /// The type every value converts to, when retyping fixes it.
+    pub fix: Option<ColumnType>,
+    #[serde(flatten)]
+    pub warning: ColumnWarning,
+}
+
+/// The description as a person or the model reads it: the note, columns
+/// with their meaning, the profile's warnings, the measures, and the sample
+/// rows (`describe_table`, the terminal's `/schema`).
+impl fmt::Display for TableDescription {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Table: {}", self.table_name)?;
+        writeln!(f, "Rows: {}", self.row_count)?;
+        if let Some(note) = &self.note {
+            writeln!(f, "Note (from the owner): {}", OneLine(note))?;
+        }
+        writeln!(f, "Columns:")?;
+        for col in &self.columns {
+            writeln!(f, "  - {}", ColumnLine(col))?;
+        }
+        if !self.warnings.is_empty() {
+            writeln!(f, "Warnings:")?;
+            for flagged in &self.warnings {
+                writeln!(f, "  - {}: {}", flagged.column, flagged.warning)?;
+            }
+        }
+        if !self.measures.is_empty() {
+            writeln!(f, "Measures (compute them with the expression as given):")?;
+            for measure in &self.measures {
+                writeln!(f, "  - {measure}")?;
+            }
+        }
+        if !self.sample_rows.rows.is_empty() {
+            writeln!(f, "\nSample rows:")?;
+            let mut buf = Vec::new();
+            if self.sample_rows.write_table(&mut buf).is_ok()
+                && let Ok(text) = String::from_utf8(buf)
+            {
+                write!(f, "{text}")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Where a document is in ingestion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum DocumentStatus {
     /// Registered; its bytes wait on the work queue.
@@ -2687,6 +3957,9 @@ pub enum DocumentStatus {
     Ready,
     /// Failed; `error_message` says why.
     Error,
+    /// Replaced by the document `superseded_by` names: no longer searched,
+    /// listed, or read, though its chunks stay so earlier citations open.
+    Superseded,
 }
 
 text_enum!(DocumentStatus, "document status", {
@@ -2694,6 +3967,7 @@ text_enum!(DocumentStatus, "document status", {
     Processing => "processing",
     Ready => "ready",
     Error => "error",
+    Superseded => "superseded",
 });
 
 impl DocumentStatus {
@@ -2702,7 +3976,7 @@ impl DocumentStatus {
     pub fn is_in_flight(self) -> bool {
         match self {
             Self::Queued | Self::Processing => true,
-            Self::Ready | Self::Error => false,
+            Self::Ready | Self::Error | Self::Superseded => false,
         }
     }
 }
@@ -2710,7 +3984,7 @@ impl DocumentStatus {
 text_enum_sql!(DocumentStatus);
 
 /// Document metadata row.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct DocumentInfo {
     pub id: DocumentId,
     pub filename: String,
@@ -2725,7 +3999,8 @@ pub struct DocumentInfo {
     pub source: DocumentSource,
     pub status: DocumentStatus,
     pub error_message: Option<String>,
-    pub pinned: bool,
+    #[serde(rename = "pinned")]
+    pub pinning: Pinning,
     /// Chunks stored once processed; `None` until then and for tables.
     pub chunk_count: Option<i64>,
     /// Server user who uploaded it; `None` from the CLI.
@@ -2733,7 +4008,72 @@ pub struct DocumentInfo {
     /// Tables a structured document loaded into; `None` until processed
     /// and for rows written before this was recorded.
     pub tables: Option<Vec<String>>,
+    /// How a PDF's pages read; `None` for other sources, until processed,
+    /// and for rows written before this was recorded.
+    pub pages: Option<PageCounts>,
     pub ingested_at: String,
+    /// The document replacing this one: on its way while this one is
+    /// still `ready`, in place once this one is `superseded`.
+    pub superseded_by: Option<DocumentId>,
+    /// The folder the file was ingested from, as its canonical absolute
+    /// path; `None` for a document from anywhere else.
+    pub source_root: Option<String>,
+    /// Where the file was under that folder, with `/` separators; a later
+    /// run of the folder matches the file by root and path together.
+    pub source_path: Option<String>,
+    /// Who wrote the document, as the file says or a person set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// When it was written (the file's creation date, front matter's
+    /// `date`, a mail's `Date`), as `YYYY-MM-DD HH:MM:SS` when the source
+    /// gave a date the store could parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Other named values the file carried (a subject, recipients, a
+    /// description).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+    /// The ISO 639-3 code of the language its text was indexed under
+    /// (`deu`, `cmn`); `None` for a table or a document not yet processed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+/// One way a name can name a document, in the order `DocumentInfo::find`
+/// tries them.
+#[derive(Debug, Clone, Copy)]
+enum NameMatch {
+    Id,
+    FileName,
+    Title,
+    IdPrefix,
+}
+
+impl NameMatch {
+    const IN_ORDER: [Self; 4] = [Self::Id, Self::FileName, Self::Title, Self::IdPrefix];
+
+    fn matches(self, document: &DocumentInfo, want: &str) -> bool {
+        match self {
+            Self::Id => document.id.as_str() == want,
+            Self::FileName => document.filename == want,
+            Self::Title => document.title.as_deref().map(str::trim) == Some(want),
+            Self::IdPrefix => document.id.as_str().starts_with(want),
+        }
+    }
+
+    /// How an error says several documents match this way.
+    const fn phrase(self) -> &'static str {
+        match self {
+            Self::Id => "have the id",
+            Self::FileName => "are named",
+            Self::Title => "are titled",
+            Self::IdPrefix => "have ids starting with",
+        }
+    }
 }
 
 impl DocumentInfo {
@@ -2743,6 +4083,71 @@ impl DocumentInfo {
         self.title.as_deref().unwrap_or(&self.filename)
     }
 
+    /// The document in `documents` a person or the model named: by id,
+    /// exact file name, exact title (the name the prompt's inventory
+    /// shows), or id prefix, tried in that order.
+    ///
+    /// # Errors
+    ///
+    /// A name that matches several documents the same way is an error
+    /// naming them, never a pick. A name that matches none is an error
+    /// listing some of the documents there are, so the caller corrects it
+    /// rather than reading an empty result as "the workspace has nothing on
+    /// this".
+    pub fn find<'a>(documents: &'a [Self], want: &str) -> Result<&'a Self> {
+        /// Documents a listing in an error names at most.
+        const LISTED: usize = 20;
+        let want = want.trim();
+        let listed = |matches: &[&Self]| -> String {
+            let mut names: Vec<String> = matches
+                .iter()
+                .take(LISTED)
+                .map(|d| match d.title.as_deref() {
+                    Some(title) => format!(
+                        "{} ({}, \"{}\")",
+                        d.id,
+                        OneLine(&d.filename),
+                        OneLine(title)
+                    ),
+                    None => format!("{} ({})", d.id, OneLine(&d.filename)),
+                })
+                .collect();
+            if matches.len() > LISTED {
+                names.push(format!(
+                    "and {} more; list_documents names them all",
+                    matches.len().saturating_sub(LISTED)
+                ));
+            }
+            names.join(", ")
+        };
+        if want.is_empty() {
+            return Err(Error::Analysis(String::from(
+                "no document named; pass an id, a file name, or a title from list_documents",
+            )));
+        }
+        for way in NameMatch::IN_ORDER {
+            let found: Vec<&Self> = documents.iter().filter(|d| way.matches(d, want)).collect();
+            match found.as_slice() {
+                [] => {}
+                [one] => return Ok(one),
+                several => {
+                    return Err(Error::Analysis(format!(
+                        "{} documents {} '{want}'; pass one's full id: {}",
+                        several.len(),
+                        way.phrase(),
+                        listed(several)
+                    )));
+                }
+            }
+        }
+        let all: Vec<&Self> = documents.iter().collect();
+        Err(Error::Analysis(format!(
+            "no document matches '{want}'; pass an id (a prefix is enough), an exact file name, \
+             or an exact title from list_documents. Documents: {}",
+            listed(&all)
+        )))
+    }
+
     /// The tables a row from before `tables` was recorded loaded into: the
     /// one named after the file, for a CSV, Parquet, or JSON file. Workbooks
     /// arrived with the `tables` column, so their rows always carry it.
@@ -2750,13 +4155,23 @@ impl DocumentInfo {
     pub fn fallback_tables(&self) -> Vec<String> {
         match FileType::of(&self.filename).map(FileType::load) {
             Some(Load::Table(_)) => vec![TableName::of_file(&self.filename).into_string()],
-            Some(Load::Workbook | Load::Chunks(_)) | None => Vec::new(),
+            Some(Load::Workbook | Load::Chunks(_) | Load::Image(_)) | None => Vec::new(),
         }
     }
 }
 
 /// How a document reached the workspace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentSource {
     /// A file sent through the API or web UI.
@@ -2791,6 +4206,27 @@ impl DocumentSource {
     }
 }
 
+/// What a person may change on a document: each `Some` is applied, an
+/// empty text clears the field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentFields {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub authored_at: Option<String>,
+    pub tags: Option<Vec<String>>,
+}
+
+impl DocumentFields {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.author.is_none()
+            && self.authored_at.is_none()
+            && self.tags.is_none()
+    }
+}
+
 /// A document row to insert.
 #[derive(Debug, Clone, Copy)]
 pub struct NewDocument<'a> {
@@ -2803,6 +4239,10 @@ pub struct NewDocument<'a> {
     pub source: DocumentSource,
     pub status: DocumentStatus,
     pub ingested_by: Option<&'a str>,
+    /// The folder the file came from and its path under it, when it came
+    /// from one.
+    pub source_root: Option<&'a str>,
+    pub source_path: Option<&'a str>,
 }
 
 impl<'a> NewDocument<'a> {
@@ -2825,6 +4265,8 @@ impl<'a> NewDocument<'a> {
             source: DocumentSource::Upload,
             status: DocumentStatus::Queued,
             ingested_by: None,
+            source_root: None,
+            source_path: None,
         }
     }
 
@@ -2837,9 +4279,21 @@ impl<'a> NewDocument<'a> {
 
 const DOCUMENT_SELECT: &str = "SELECT id, filename, mime_type, size_bytes, status, error_message, \
      COALESCE(pinned, false), CAST(ingested_at AS VARCHAR), title, sha256, source, chunk_count, \
-     ingested_by, CAST(tables AS VARCHAR) FROM _quack_documents";
+     ingested_by, CAST(tables AS VARCHAR), page_count, pages_unreadable, pages_empty, \
+     superseded_by, source_root, source_path, author, CAST(authored_at AS VARCHAR), \
+     CAST(modified_at AS VARCHAR), CAST(tags AS VARCHAR), CAST(metadata AS VARCHAR), language \
+     FROM _quack_documents";
 
-/// A row selected with [`DOCUMENT_SELECT`].
+/// The `WHERE` clause that keeps a document that still stands for its
+/// bytes, neither failed nor replaced: only such a document is a duplicate
+/// of a re-upload or owns a table.
+const LIVE_STATUS: &str = "status NOT IN ('error', 'superseded')";
+
+/// The `WHERE` clause of every listing of what the workspace holds now: a
+/// failed document stays listed with its reason, a replaced one does not.
+const NOT_SUPERSEDED: &str = "status <> 'superseded'";
+
+/// A row selected with `DOCUMENT_SELECT`.
 impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
     type Error = duckdb::Error;
 
@@ -2851,7 +4305,7 @@ impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
             size_bytes: row.get(3)?,
             status: row.get(4)?,
             error_message: row.get(5)?,
-            pinned: row.get(6)?,
+            pinning: row.get(6)?,
             ingested_at: row.get(7)?,
             title: row.get(8)?,
             sha256: row.get(9)?,
@@ -2861,6 +4315,29 @@ impl TryFrom<&duckdb::Row<'_>> for DocumentInfo {
             tables: row
                 .get::<_, Option<String>>(13)?
                 .and_then(|json| serde_json::from_str(&json).ok()),
+            pages: match row.get::<_, Option<u32>>(14)? {
+                Some(total) => Some(PageCounts {
+                    total,
+                    unreadable: row.get::<_, Option<u32>>(15)?.unwrap_or(0),
+                    empty: row.get::<_, Option<u32>>(16)?.unwrap_or(0),
+                }),
+                None => None,
+            },
+            superseded_by: row.get(17)?,
+            source_root: row.get(18)?,
+            source_path: row.get(19)?,
+            author: row.get(20)?,
+            authored_at: row.get(21)?,
+            modified_at: row.get(22)?,
+            tags: row
+                .get::<_, Option<String>>(23)?
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default(),
+            metadata: row
+                .get::<_, Option<String>>(24)?
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default(),
+            language: row.get(25)?,
         })
     }
 }
@@ -2898,20 +4375,90 @@ impl TryFrom<&duckdb::Row<'_>> for PendingChunk {
     }
 }
 
-/// A chunk to store.
+/// A chunk to store through its document's [`ChunkWriter`].
 #[derive(Debug, Clone, Copy)]
 pub struct NewChunk<'a> {
     pub id: &'a ChunkId,
-    pub document_id: &'a DocumentId,
     pub chunk_index: u32,
     pub content: &'a str,
     pub heading: Option<&'a str>,
     pub page: Option<u32>,
     pub embedding: Option<&'a Vector>,
+    pub kind: SectionKind,
+    /// Where the chunk sits in a source without pages (`line 40`, `12:04`,
+    /// `chapter 3`, `message 2`).
+    pub locator: Option<&'a str>,
+}
+
+/// Stores one document's chunks under the stemming its language was
+/// detected as ([`WorkspaceDb::chunk_writer`]).
+pub struct ChunkWriter<'db> {
+    db: &'db WorkspaceDb,
+    document_id: DocumentId,
+    analyzer: Analyzer,
+}
+
+impl ChunkWriter<'_> {
+    /// Insert a text chunk, optionally with an embedding vector, and index
+    /// its terms for keyword search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the insert fails.
+    pub fn insert(&self, chunk: &NewChunk<'_>) -> Result<()> {
+        let db = self.db;
+        let page = chunk.page.map(i64::from);
+        let terms = TermFrequencies::of(&self.analyzer, chunk.content, chunk.heading);
+        let length = terms.total();
+        match chunk.embedding {
+            Some(emb) => {
+                db.check_vector_width(emb.len())?;
+                let sql = format!(
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, embedding, embedding_profile, kind, locator) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?::{}, ?, ?, ?)",
+                    db.vector_type()
+                );
+                db.conn.execute(
+                    &sql,
+                    duckdb::params![
+                        chunk.id,
+                        self.document_id,
+                        chunk.chunk_index,
+                        chunk.content,
+                        chunk.heading,
+                        page,
+                        length,
+                        emb.sql_literal(),
+                        db.embedding_fingerprint(),
+                        chunk.kind,
+                        chunk.locator
+                    ],
+                )?;
+            }
+            None => {
+                db.conn.execute(
+                    "INSERT INTO _quack_chunks (id, document_id, chunk_index, content, heading, page, token_count, kind, locator) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    duckdb::params![
+                        chunk.id,
+                        self.document_id,
+                        chunk.chunk_index,
+                        chunk.content,
+                        chunk.heading,
+                        page,
+                        length,
+                        chunk.kind,
+                        chunk.locator
+                    ],
+                )?;
+            }
+        }
+        db.insert_terms(chunk.id, &terms)
+    }
 }
 
 /// A chunk returned from retrieval, with what a citation needs.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ChunkSearchResult {
     pub id: ChunkId,
     pub content: String,
@@ -2923,15 +4470,72 @@ pub struct ChunkSearchResult {
     /// Higher is better. Vector-only: `1 / (1 + distance)`; keyword-only:
     /// BM25; hybrid: reciprocal rank fusion.
     pub score: f64,
+    /// When the chunk's document was ingested (UTC).
+    #[schema(value_type = String)]
+    pub ingested_at: DateTime,
+    /// What the chunk holds: body text, a table, a note, or code.
+    #[serde(default)]
+    pub kind: SectionKind,
+    /// Where it sits in a source without pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
+    /// Where it stood in each ranking that found it.
+    #[serde(flatten)]
+    pub ranks: Ranks,
+}
+
+/// Where a hit stood in each ranking of one search, for a person checking
+/// why retrieval found or missed a passage. Ranks count from 1; a ranking
+/// that did not return the hit leaves its fields empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, utoipa::ToSchema)]
+pub struct Ranks {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_rank: Option<u32>,
+    /// `1 / (1 + cosine distance)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyword_rank: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bm25: Option<f64>,
+    /// Its place in the reranker's order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_rank: Option<u32>,
+    /// The rerank model's relevance score; the chat model ranks without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f64>,
+}
+
+impl Ranks {
+    /// A 1-based rank from a 0-based position.
+    #[must_use]
+    pub fn place(index: usize) -> u32 {
+        u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1)
+    }
+
+    /// Keep every rank `other` has that this one lacks.
+    fn merge(&mut self, other: Self) {
+        self.vector_rank = self.vector_rank.or(other.vector_rank);
+        self.vector_score = self.vector_score.or(other.vector_score);
+        self.keyword_rank = self.keyword_rank.or(other.keyword_rank);
+        self.bm25 = self.bm25.or(other.bm25);
+        self.rerank_rank = self.rerank_rank.or(other.rerank_rank);
+        self.rerank_score = self.rerank_score.or(other.rerank_score);
+    }
 }
 
 /// A row of `id, content, document_id, chunk_index, filename, heading,
-/// page, score`, the columns every search selects.
+/// page, score, ingested_at, kind, locator`, the columns every search
+/// selects. A chunk stored before `kind` existed reads as body text.
 impl TryFrom<&duckdb::Row<'_>> for ChunkSearchResult {
     type Error = duckdb::Error;
 
     fn try_from(row: &duckdb::Row<'_>) -> duckdb::Result<Self> {
         let page: Option<i64> = row.get(6)?;
+        let ingested_at: String = row.get(8)?;
+        let ingested_at = ingested_at.parse().map_err(|e: jiff::Error| {
+            duckdb::Error::FromSqlConversionFailure(8, duckdb::types::Type::Text, Box::new(e))
+        })?;
         Ok(Self {
             id: row.get(0)?,
             content: row.get(1)?,
@@ -2941,49 +4545,12 @@ impl TryFrom<&duckdb::Row<'_>> for ChunkSearchResult {
             heading: row.get(5)?,
             page: page.and_then(|p| u32::try_from(p).ok()),
             score: row.get(7)?,
+            ingested_at,
+            kind: row.get::<_, Option<SectionKind>>(9)?.unwrap_or_default(),
+            locator: row.get(10)?,
+            ranks: Ranks::default(),
         })
     }
-}
-
-/// Punctuation that joins alphanumeric runs into one identifier (`POL-8841`,
-/// `v1.2.3`, `ns/part:7`) without introducing whitespace.
-fn is_identifier_joiner(c: char) -> bool {
-    matches!(c, '-' | '.' | '_' | '/' | ':')
-}
-
-/// Lowercased alphanumeric runs, stemmed; the same rule indexes chunks and
-/// parses queries. A run joined by identifier punctuation with no
-/// whitespace (`POL-8841`, `v1.2.3`, `ABC_123`, `ns/part:7`) additionally
-/// indexes its punctuation-stripped, lowercased, unstemmed form (`pol8841`)
-/// alongside the split, stemmed pieces (`pol`, `8841`), so the query
-/// `POL-8841` matches a document containing that exact identifier ahead of
-/// one that merely contains `pol` and `8841` apart. Because the joined form
-/// is derived the same way on both sides, a bare run like `pol8841` in text
-/// is also found by the query `POL-8841` — desirable, since both spell the
-/// same identifier. Ordinary prose has no joiner in a run, so it tokenizes
-/// exactly as before.
-#[must_use]
-pub fn tokenize(text: &str) -> Vec<String> {
-    static STEMMER: std::sync::LazyLock<rust_stemmers::Stemmer> = std::sync::LazyLock::new(|| {
-        rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English)
-    });
-    let mut terms = Vec::new();
-    for run in text.split(|c: char| !(c.is_alphanumeric() || is_identifier_joiner(c))) {
-        let run = run.trim_matches(|c: char| !c.is_alphanumeric());
-        if run.is_empty() {
-            continue;
-        }
-        for token in run.split(|c: char| !c.is_alphanumeric()) {
-            if !token.is_empty() {
-                terms.push(STEMMER.stem(&token.to_lowercase()).into_owned());
-            }
-        }
-        if run.contains(is_identifier_joiner) {
-            let alnum: String = run.chars().filter(|c| c.is_alphanumeric()).collect();
-            terms.push(alnum.to_lowercase());
-        }
-    }
-    terms
 }
 
 /// The quoted phrases of a keyword query: each `"..."` pair is an exact
@@ -3053,30 +4620,6 @@ impl Phrases {
     }
 }
 
-/// How often each term occurs in a chunk's content and heading, by term.
-struct TermFrequencies(Vec<(String, u32)>);
-
-impl TermFrequencies {
-    fn of(content: &str, heading: Option<&str>) -> Self {
-        let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-        for term in tokenize(content)
-            .into_iter()
-            .chain(heading.map(tokenize).unwrap_or_default())
-        {
-            let entry = counts.entry(term).or_insert(0);
-            *entry = entry.saturating_add(1);
-        }
-        Self(counts.into_iter().collect())
-    }
-
-    /// Total term occurrences, the chunk length BM25 normalizes by.
-    fn total(&self) -> i64 {
-        self.0
-            .iter()
-            .fold(0i64, |acc, (_, tf)| acc.saturating_add(i64::from(*tf)))
-    }
-}
-
 /// The chunks of ready documents a long run draws from, and the order
 /// its documents come in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3109,6 +4652,182 @@ impl SamplePool {
     }
 }
 
+/// Which rankings a search runs.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    /// Vector and keyword, fused by reciprocal rank; keyword alone without
+    /// an embedding model.
+    #[default]
+    Hybrid,
+    /// BM25 over the term index only.
+    Keyword,
+    /// Cosine similarity only.
+    Vector,
+}
+
+text_enum!(SearchMode, "search mode", {
+    Hybrid => "hybrid",
+    Keyword => "keyword",
+    Vector => "vector",
+});
+
+/// What a document must be for a search or a listing to include it. Each
+/// list keeps a document matching any of its entries; every field given
+/// must hold.
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    utoipa::ToSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentFilter {
+    /// File types, as extensions (`pdf`, `md`, `docx`) or MIME types
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<String>,
+    /// How documents arrived: `upload`, `paste`, `path`, `stdin`, or `import`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<DocumentSource>,
+    /// Tags, compared without regard to case
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Written on or after this date, `YYYY-MM-DD` (the ingest date for a
+    /// document that gives none)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub since: Option<jiff::civil::Date>,
+    /// Written on or before this date, `YYYY-MM-DD`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub until: Option<jiff::civil::Date>,
+    /// Text the author contains, compared without regard to case
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+}
+
+impl DocumentFilter {
+    /// Whether it lets every document through.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The `AND ...` conditions on `_quack_documents d`, with their
+    /// parameters in order.
+    ///
+    /// # Errors
+    ///
+    /// An unknown file type, or `since` after `until`.
+    fn clause(&self) -> Result<FilterClause> {
+        let mut clause = FilterClause::default();
+        let mut mime_types: Vec<String> = Vec::new();
+        for kind in &self.types {
+            let kind = kind.trim().trim_start_matches('.').to_ascii_lowercase();
+            let mime = if kind.contains('/') {
+                kind
+            } else {
+                FileType::of(&format!("file.{kind}"))
+                    .map(|t| t.mime_type().to_owned())
+                    .ok_or_else(|| {
+                        Error::Analysis(format!(
+                            "unknown document type '{kind}'; give an extension such as pdf, md, \
+                             or docx, or a MIME type"
+                        ))
+                    })?
+            };
+            if !mime_types.contains(&mime) {
+                mime_types.push(mime);
+            }
+        }
+        clause.any_of("d.mime_type", mime_types);
+        clause.any_of(
+            "COALESCE(d.source, 'upload')",
+            self.sources.iter().map(ToString::to_string).collect(),
+        );
+        let tags: Vec<String> = self
+            .tags
+            .iter()
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !tags.is_empty() {
+            clause.sql.push_str(
+                " AND list_has_any(COALESCE(from_json(lower(CAST(d.tags AS VARCHAR)), '[\"VARCHAR\"]'), []), ?::VARCHAR[])",
+            );
+            clause.params.push(sql_text_list(&tags));
+        }
+        if let (Some(since), Some(until)) = (self.since, self.until)
+            && since > until
+        {
+            return Err(Error::Analysis(format!(
+                "since ({since}) is after until ({until})"
+            )));
+        }
+        for (bound, op) in [(self.since, ">="), (self.until, "<=")] {
+            if let Some(date) = bound {
+                clause
+                    .sql
+                    .push_str(" AND CAST(COALESCE(d.authored_at, d.ingested_at) AS DATE) ");
+                clause.sql.push_str(op);
+                clause.sql.push_str(" ?::DATE");
+                clause.params.push(date.to_string());
+            }
+        }
+        if let Some(author) = self
+            .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            clause
+                .sql
+                .push_str(" AND contains(lower(COALESCE(d.author, '')), lower(?))");
+            clause.params.push(author.to_owned());
+        }
+        Ok(clause)
+    }
+}
+
+/// A [`DocumentFilter`] as SQL: conditions on `_quack_documents d` and their
+/// text parameters, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FilterClause {
+    sql: String,
+    params: Vec<String>,
+}
+
+impl FilterClause {
+    /// `AND column IN (...)` over `values`, unless there are none.
+    fn any_of(&mut self, column: &str, values: Vec<String>) {
+        if values.is_empty() {
+            return;
+        }
+        self.sql.push_str(" AND ");
+        self.sql.push_str(column);
+        self.sql.push_str(" IN (");
+        self.sql.push_str(&vec!["?"; values.len()].join(", "));
+        self.sql.push(')');
+        self.params.extend(values);
+    }
+}
+
 /// Which chunks a search may return. Empty means the whole workspace; a
 /// scope narrows it to certain documents, to an explicit set of chunks
 /// (the chunks a graph entity was extracted from), or to both at once.
@@ -3121,6 +4840,8 @@ pub struct ChunkScope {
     /// those chunks, and `Some(empty)` means none — an entity whose chunks
     /// came back empty must return no rows, not the whole workspace.
     chunks: Option<Vec<ChunkId>>,
+    /// What the chunks' documents must be.
+    filter: FilterClause,
 }
 
 impl ChunkScope {
@@ -3136,6 +4857,7 @@ impl ChunkScope {
         Self {
             documents: ids.into_iter().collect(),
             chunks: None,
+            filter: FilterClause::default(),
         }
     }
 
@@ -3154,29 +4876,25 @@ impl ChunkScope {
         let documents = db.list_documents()?;
         let mut resolved = Vec::with_capacity(wanted.len());
         for want in wanted {
-            let want = want.trim();
-            let found = documents
-                .iter()
-                .find(|d| d.id.as_str() == want || d.filename == want)
-                .or_else(|| {
-                    documents
-                        .iter()
-                        .find(|d| !want.is_empty() && d.id.as_str().starts_with(want))
-                });
-            let Some(d) = found else {
-                let known: Vec<String> = documents
-                    .iter()
-                    .map(|d| format!("{} ({})", d.id, d.filename))
-                    .collect();
-                return Err(Error::Analysis(format!(
-                    "no document matches '{want}'; pass an id from list_documents or omit \
-                     document_ids to search everything. Documents: {}",
-                    known.join(", ")
-                )));
-            };
-            resolved.push(d.id.clone());
+            resolved.push(DocumentInfo::find(&documents, want)?.id.clone());
         }
         Ok(Self::documents(resolved))
+    }
+
+    /// Narrow further to the documents `filter` lets through.
+    ///
+    /// # Errors
+    ///
+    /// An unknown file type, or `since` after `until`.
+    pub fn with_filter(mut self, filter: &DocumentFilter) -> Result<Self> {
+        self.filter = filter.clause()?;
+        Ok(self)
+    }
+
+    /// The documents it is limited to; empty for every document.
+    #[must_use]
+    pub fn document_ids(&self) -> &[DocumentId] {
+        &self.documents
     }
 
     /// Narrow further to these chunk ids, however few.
@@ -3204,6 +4922,7 @@ impl ChunkScope {
             let placeholders = vec!["?"; chunks.len()].join(", ");
             clauses.push(format!(" AND c.id IN ({placeholders})"));
         }
+        clauses.push(self.filter.sql.clone());
         clauses.concat()
     }
 
@@ -3212,6 +4931,7 @@ impl ChunkScope {
         self.documents
             .len()
             .saturating_add(self.chunks.as_ref().map_or(0, Vec::len))
+            .saturating_add(self.filter.params.len())
     }
 
     /// Push the scope's parameters, in the order [`ChunkScope::sql`] names
@@ -3222,6 +4942,9 @@ impl ChunkScope {
         }
         for id in self.chunks.iter().flatten() {
             params.push(id);
+        }
+        for param in &self.filter.params {
+            params.push(param);
         }
     }
 }
@@ -3251,6 +4974,7 @@ impl HybridLimits {
                     1.0 / (k + f64::from(u32::try_from(rank).unwrap_or(u32::MAX)) + 1.0);
                 if let Some(existing) = fused.iter_mut().find(|h| h.id == hit.id) {
                     existing.score += contribution;
+                    existing.ranks.merge(hit.ranks);
                 } else {
                     hit.score = contribution;
                     fused.push(hit);
@@ -3265,6 +4989,63 @@ impl HybridLimits {
         });
         fused.truncate(usize::try_from(keep).unwrap_or(usize::MAX));
         fused
+    }
+}
+
+/// What one search did, for a person checking why it found or missed a
+/// passage.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SearchExplanation {
+    /// The vector leg's candidates, best first; empty without one.
+    pub vector: Vec<ChunkSearchResult>,
+    /// The keyword (BM25) leg's candidates, best first.
+    pub keyword: Vec<ChunkSearchResult>,
+    /// What the search returns: the legs fused, or the one leg that ran.
+    pub fused: Vec<ChunkSearchResult>,
+    /// Quoted phrases in the query, which a hit must contain exactly.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub phrases: Vec<String>,
+}
+
+impl SearchExplanation {
+    /// The keyword leg alone, as a search without vectors runs.
+    fn keyword_only(query: &str, keyword: Vec<ChunkSearchResult>) -> Self {
+        Self {
+            fused: keyword.clone(),
+            keyword,
+            vector: Vec::new(),
+            phrases: Phrases::parse(query).0,
+        }
+    }
+
+    /// The vector leg alone. A quoted phrase still filters it.
+    fn vector_only(phrases: Phrases, vector: Vec<ChunkSearchResult>, top_k: u32) -> Self {
+        let mut fused = vector.clone();
+        phrases.retain_matching(&mut fused, top_k);
+        Self {
+            vector,
+            keyword: Vec::new(),
+            fused,
+            phrases: phrases.0,
+        }
+    }
+
+    /// What the quoted phrases did, when there are any.
+    #[must_use]
+    pub fn phrase_note(&self) -> Option<String> {
+        if self.phrases.is_empty() {
+            return None;
+        }
+        let quoted: Vec<String> = self.phrases.iter().map(|p| format!("\"{p}\"")).collect();
+        Some(format!(
+            "{} must appear exactly: the candidates were over-fetched and only those containing {} kept",
+            quoted.join(", "),
+            if self.phrases.len() == 1 {
+                "it"
+            } else {
+                "them all"
+            }
+        ))
     }
 }
 
@@ -3677,13 +5458,49 @@ fn time_text(unit: duckdb::types::TimeUnit, n: i64) -> String {
         )
 }
 
-fn display_json_value(val: &serde_json::Value) -> String {
-    match val {
-        serde_json::Value::Null => String::from("NULL"),
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        other => other.to_string(),
+/// One result cell, as each consumer shows it: a string bare, anything
+/// else as JSON, and NULL as the word (tables, Markdown, chart labels) or
+/// as nothing (CSV, the web console's grid).
+#[derive(Debug, Clone, Copy)]
+pub struct Cell<'a>(pub &'a serde_json::Value);
+
+impl<'a> Cell<'a> {
+    /// The cell at `index` of `row`; a short row reads as NULL.
+    #[must_use]
+    pub fn at(row: &'a [serde_json::Value], index: usize) -> Self {
+        const NULL: &serde_json::Value = &serde_json::Value::Null;
+        Self(row.get(index).unwrap_or(NULL))
+    }
+
+    /// NULL spelled out.
+    #[must_use]
+    pub fn label(self) -> String {
+        match self.0 {
+            serde_json::Value::Null => String::from("NULL"),
+            _ => self.text(),
+        }
+    }
+
+    /// NULL as nothing.
+    #[must_use]
+    pub fn text(self) -> String {
+        match self.0 {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    /// The cell as a number: a numeric string parses, NULL is 0, anything
+    /// else is none.
+    #[must_use]
+    pub fn number(self) -> Option<f64> {
+        match self.0 {
+            serde_json::Value::Number(n) => n.as_f64(),
+            serde_json::Value::String(s) => s.parse::<f64>().ok(),
+            serde_json::Value::Null => Some(0.0),
+            _ => None,
+        }
     }
 }
 
@@ -3697,7 +5514,7 @@ impl QueryResults {
         let mut out = self.clone();
         for row in &mut out.rows {
             for cell in row.iter_mut() {
-                let text = display_json_value(cell);
+                let text = Cell(cell).label();
                 if text.chars().count() > max_chars {
                     let mut cut: String = text.chars().take(max_chars).collect();
                     cut.push('\u{2026}');
@@ -3722,7 +5539,7 @@ impl QueryResults {
         let display_rows: Vec<Vec<String>> = self
             .rows
             .iter()
-            .map(|row| row.iter().map(display_json_value).collect())
+            .map(|row| row.iter().map(|v| Cell(v).label()).collect())
             .collect();
 
         let mut widths: Vec<usize> = self.columns.iter().map(String::len).collect();
@@ -3771,18 +5588,13 @@ impl QueryResults {
     ///
     /// Returns an error if serialization or writing fails.
     pub fn write_ndjson(&self, out: &mut impl Write) -> Result<()> {
-        // Written by hand so keys keep column order; serde_json's map sorts.
         let keys = self.json_keys();
         for row in &self.rows {
-            let mut fields = Vec::with_capacity(keys.len());
-            for (column, value) in keys.iter().zip(row) {
-                fields.push(format!(
-                    "{}:{}",
-                    serde_json::to_string(column)?,
-                    serde_json::to_string(value)?
-                ));
-            }
-            writeln!(out, "{{{}}}", fields.join(","))?;
+            let row = JsonRow {
+                keys: &keys,
+                values: row,
+            };
+            writeln!(out, "{}", row.render()?)?;
         }
         Ok(())
     }
@@ -3797,13 +5609,7 @@ impl QueryResults {
         let mut writer = csv::Writer::from_writer(out);
         writer.write_record(&self.columns)?;
         for row in &self.rows {
-            let cells: Vec<String> = row
-                .iter()
-                .map(|v| match v {
-                    serde_json::Value::Null => String::new(),
-                    other => display_json_value(other),
-                })
-                .collect();
+            let cells: Vec<String> = row.iter().map(|v| Cell(v).text()).collect();
             writer.write_record(&cells)?;
         }
         writer.flush()?;
@@ -3828,7 +5634,7 @@ impl QueryResults {
         let rule: Vec<&str> = self.columns.iter().map(|_| "---").collect();
         writeln!(out, "| {} |", rule.join(" | "))?;
         for row in &self.rows {
-            let cells: Vec<String> = row.iter().map(|v| cell(&display_json_value(v))).collect();
+            let cells: Vec<String> = row.iter().map(|v| cell(&Cell(v).label())).collect();
             writeln!(out, "| {} |", cells.join(" | "))?;
         }
         Ok(())
@@ -3878,1727 +5684,4 @@ impl QueryResults {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[expect(clippy::panic, reason = "test failure path")]
-    fn fail(msg: &str) -> ! {
-        panic!("{msg}")
-    }
-
-    #[test]
-    fn the_sql_schema_quotes_what_needs_it_and_hides_internal_tables() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        let wide: Vec<String> = (0..=SqlSchema::MAX_COLUMNS)
-            .map(|i| format!("1 AS c{i}"))
-            .collect();
-        for sql in [
-            String::from(
-                "CREATE TABLE sales (region VARCHAR, \"Revenue\" INTEGER, \"select\" INTEGER)",
-            ),
-            String::from("CREATE TABLE \"Order Items\" (id INTEGER)"),
-            format!("CREATE TABLE wide AS SELECT {}", wide.join(", ")),
-        ] {
-            db.execute_statement(&sql)
-                .unwrap_or_else(|e| fail(&e.to_string()));
-        }
-        let schema = db.sql_schema().unwrap_or_else(|e| fail(&e.to_string()));
-        let names: Vec<(&str, &str)> = schema
-            .tables
-            .iter()
-            .map(|t| (t.name.name.as_str(), t.name.sql.as_str()))
-            .collect();
-        assert_eq!(
-            names,
-            [
-                ("Order Items", "\"Order Items\""),
-                ("sales", "sales"),
-                ("wide", "wide")
-            ]
-        );
-        let columns = |at: usize| -> Vec<&str> {
-            schema
-                .tables
-                .get(at)
-                .map(|t| t.columns.iter().map(|c| c.sql.as_str()).collect())
-                .unwrap_or_default()
-        };
-        let sales = columns(1);
-        assert_eq!(sales, ["region", "\"Revenue\"", "\"select\""]);
-        assert_eq!(
-            columns(2).len(),
-            usize::try_from(SqlSchema::MAX_COLUMNS).unwrap_or_default()
-        );
-        assert!(schema.truncated, "the wide table's last column was cut");
-    }
-
-    /// A row from before `tables` was recorded drops the one table named
-    /// after its file, and nothing else; a chunked document has none.
-    #[test]
-    fn deleting_a_row_without_recorded_tables_drops_its_file_table() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        for sql in [
-            "CREATE TABLE sales AS SELECT 1 AS n",
-            "CREATE TABLE sales_notes AS SELECT 2 AS n",
-        ] {
-            db.execute_statement(sql)
-                .unwrap_or_else(|e| fail(&e.to_string()));
-        }
-        db.insert_document(&NewDocument::new(
-            &DocumentId::from("d1"),
-            "sales.csv",
-            "text/csv",
-            1,
-        ))
-        .unwrap_or_else(|e| fail(&e.to_string()));
-        let doc = db
-            .document(&DocumentId::from("d1"))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(doc.as_ref().is_some_and(|d| d.tables.is_none()));
-        assert_eq!(
-            doc.map(|d| d.fallback_tables()),
-            Some(vec![String::from("sales")])
-        );
-        assert!(
-            db.delete_document(&DocumentId::from("d1"))
-                .is_ok_and(|existed| existed)
-        );
-        assert!(db.table_exists("sales").is_ok_and(|exists| !exists));
-        assert!(db.table_exists("sales_notes").is_ok_and(|exists| exists));
-
-        // A queued row with the same file name has no tables yet: deleting
-        // it leaves the table another document loaded.
-        db.execute_statement("CREATE TABLE sales AS SELECT 3 AS n")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        db.insert_document(&NewDocument::new(
-            &DocumentId::from("owner"),
-            "sales.csv",
-            "text/csv",
-            1,
-        ))
-        .unwrap_or_else(|e| fail(&e.to_string()));
-        db.set_document_tables(&DocumentId::from("owner"), &[String::from("sales")])
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        db.insert_document(&NewDocument::new(
-            &DocumentId::from("queued"),
-            "sales.csv",
-            "text/csv",
-            1,
-        ))
-        .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(
-            db.delete_document(&DocumentId::from("queued"))
-                .is_ok_and(|existed| existed)
-        );
-        assert!(db.table_exists("sales").is_ok_and(|exists| exists));
-
-        db.insert_document(&NewDocument::new(
-            &DocumentId::from("d2"),
-            "notes.md",
-            "text/markdown",
-            1,
-        ))
-        .unwrap_or_else(|e| fail(&e.to_string()));
-        let notes = db
-            .document(&DocumentId::from("d2"))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(notes.is_some_and(|d| d.fallback_tables().is_empty()));
-    }
-
-    /// A stored source reads back as written; a NULL (rows from before the
-    /// column) is an upload; anything else is an error, not a guess.
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    fn document_sources_read_back_and_unknown_ones_are_refused() {
-        let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
-        let d1 = DocumentId::from("d1");
-        let mut doc = NewDocument::new(&d1, "a.txt", "text/plain", 1);
-        doc.source = DocumentSource::Import;
-        db.insert_document(&doc).unwrap();
-        let read = db
-            .document(&DocumentId::from("d1"))
-            .unwrap()
-            .map(|d| d.source);
-        assert_eq!(read, Some(DocumentSource::Import));
-        db.connection()
-            .execute("UPDATE _quack_documents SET source = NULL", [])
-            .unwrap();
-        let read = db
-            .document(&DocumentId::from("d1"))
-            .unwrap()
-            .map(|d| d.source);
-        assert_eq!(read, Some(DocumentSource::Upload));
-        db.connection()
-            .execute("UPDATE _quack_documents SET source = 'fax'", [])
-            .unwrap();
-        assert!(db.document(&DocumentId::from("d1")).is_err());
-    }
-
-    fn config_in(dir: &Path) -> Config {
-        let mut config = Config::default();
-        config.general.data_dir = dir.join("data");
-        config
-    }
-
-    /// Two statements that differ only in their literals, spacing, and
-    /// case share a shape; a different column, a different statement kind,
-    /// and anything `DuckDB` cannot serialize do not.
-    #[test]
-    fn a_canceller_interrupts_only_the_work_it_guards() {
-        let db = WorkspaceDb::open_in_memory(Dimension::new(4))
-            .unwrap_or_else(|e| fail(&e.to_string()))
-            .with_query_timeout(Duration::from_secs(60));
-        // Cancelled before the work starts: it never runs.
-        let early = QueryCanceller::default();
-        early.cancel();
-        assert!(matches!(
-            db.cancellable(&early, |_| Ok(())),
-            Err(Error::Cancelled)
-        ));
-
-        // Cancelled while a long statement runs: the statement stops.
-        let canceller = QueryCanceller::default();
-        let remote = canceller.clone();
-        let stopper = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            remote.cancel();
-        });
-        let started = std::time::Instant::now();
-        let outcome = db.cancellable(&canceller, |db| {
-            db.execute_query_capped(
-                "SELECT count(*) FROM range(100000000000) t(i) WHERE i % 7 = 0",
-                10,
-            )
-        });
-        assert!(outcome.is_err(), "the statement was interrupted");
-        assert!(started.elapsed() < Duration::from_secs(30));
-        assert!(stopper.join().is_ok());
-
-        // The connection is free again, and a canceller no longer guarding
-        // anything interrupts nothing.
-        let after = QueryCanceller::default();
-        assert!(
-            db.cancellable(&after, |db| db.execute_query_capped("SELECT 1", 10))
-                .is_ok()
-        );
-        after.cancel();
-        assert!(db.execute_query_capped("SELECT 2", 10).is_ok());
-    }
-
-    #[test]
-    fn statement_shape_ignores_literals_and_source_positions() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        let shape = |sql: &str| {
-            db.statement_shape(sql)
-                .unwrap_or_else(|e| fail(&e.to_string()))
-        };
-        let nevada = shape("SELECT x FROM t WHERE s = 'NEVADA' AND n > 10 LIMIT 5");
-        let carolina = shape("select x\n from t where s='NORTH CAROLINA' and n > 250 limit 5");
-        assert!(nevada.is_some());
-        assert_eq!(nevada, carolina);
-        assert_ne!(
-            nevada,
-            shape("SELECT y FROM t WHERE s = 'NEVADA' AND n > 10 LIMIT 5")
-        );
-        assert_ne!(nevada, shape("SELECT x FROM t WHERE s = 'NEVADA' LIMIT 5"));
-        assert_eq!(shape("CREATE TABLE t2 AS SELECT 1"), None);
-        assert_eq!(shape("SELECT FROM WHERE"), None);
-    }
-
-    /// An error never suggests one of quack's internal tables, on the
-    /// writer or a reader clone: a misspelled name gets the user's own near
-    /// matches or none, and every other error reads as `DuckDB` wrote it.
-    #[test]
-    fn errors_never_suggest_internal_tables() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let config = config_in(dir.path());
-        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        db.execute_query("CREATE TABLE orders (id INTEGER, customer VARCHAR, customers VARCHAR)")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let reader = db
-            .try_clone_reader()
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        for conn in [&db, &reader] {
-            let error = |sql: &str| {
-                conn.execute_query(sql)
-                    .err()
-                    .map_or_else(|| fail(&format!("{sql} ran")), |e| e.to_string())
-            };
-            // The only near match is internal: no suggestion at all.
-            assert_eq!(
-                error("SELECT * FROM _quack_meto"),
-                "Catalog Error: Table with name _quack_meto does not exist!"
-            );
-            let missing = error("SELECT * FROM no_such_table");
-            assert!(
-                missing.starts_with("Catalog Error: Table with name no_such_table does not exist!")
-                    && !missing.contains("_quack_"),
-                "{missing}"
-            );
-            // The user's own near matches still come through.
-            assert_eq!(
-                error("SELECT * FROM orderz"),
-                "Catalog Error: Table with name orderz does not exist!\nDid you mean \"orders\"?"
-            );
-            assert_eq!(
-                error("SELECT customr FROM orders"),
-                "Binder Error: Referenced column \"customr\" not found in FROM clause!\n\
-                 Candidate bindings: \"customer\", \"customers\""
-            );
-            // Everything else reads as it always did.
-            assert_eq!(
-                error("SELEC 1"),
-                "Parser Error: syntax error at or near \"SELEC\""
-            );
-            assert_eq!(
-                error("INSERT INTO orders VALUES ('x', 'a', 'b')"),
-                "Conversion Error: Could not convert string 'x' to INT32"
-            );
-        }
-    }
-
-    /// Design doc 7.4: a read-classified statement may still name a file, so
-    /// the connection itself is confined to the workspace directory and then
-    /// locked, for agent SQL and user SQL alike.
-    #[test]
-    fn workspace_connection_is_confined_to_its_directory_and_locked() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let config = config_in(dir.path());
-        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-
-        let outside = dir.path().join("outside.csv");
-        std::fs::write(&outside, "a\n1\n").unwrap_or_else(|e| fail(&e.to_string()));
-        let inside = config.workspace_files_dir("ws").join("inside.csv");
-        std::fs::write(&inside, "a\n1\n2\n").unwrap_or_else(|e| fail(&e.to_string()));
-
-        for sql in [
-            format!("SELECT * FROM read_csv_auto('{}')", outside.display()),
-            format!("SELECT * FROM read_text('{}')", outside.display()),
-            format!("SELECT * FROM '{}'", outside.display()),
-            format!(
-                "ATTACH '{}' AS other",
-                dir.path().join("other.duckdb").display()
-            ),
-            String::from("INSTALL httpfs"),
-            String::from("SET memory_limit = '8GB'"),
-            String::from("SET enable_external_access = true"),
-            String::from("SET allowed_directories = ['/']"),
-        ] {
-            let err = db.execute_query(&sql).err();
-            assert!(err.is_some(), "ran outside the sandbox: {sql}");
-            let text = err.map(|e| e.to_string()).unwrap_or_default();
-            // Replacement scans are simply gone, so `FROM 'file'` is a
-            // catalog miss; everything else is a permission or lock error.
-            assert!(
-                text.contains("Permission Error")
-                    || text.contains("locked")
-                    || text.contains("Catalog Error"),
-                "{sql}: {text}"
-            );
-        }
-
-        // Ingestion's own reads under files/ still work, through the same reader.
-        let rows = db
-            .execute_query(&format!(
-                "SELECT count(*) FROM read_csv_auto('{}')",
-                inside.display()
-            ))
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(rows.rows.len(), 1);
-        assert_eq!(
-            rows.rows.first().and_then(|r| r.first()),
-            Some(&serde_json::Value::Number(2.into()))
-        );
-        // Ordinary statements are untouched.
-        assert!(db.execute_statement("CREATE TABLE t(a INT)").is_ok());
-        assert!(db.execute_query("SELECT * FROM t").is_ok());
-    }
-
-    /// Proof-of-concept for the reader connection: `try_clone`
-    /// succeeds once `lock_configuration = true` (set by `confine_to` on
-    /// open), because `DuckDB` locks the connection's *configuration*, not
-    /// its ability to open more connections to the same database; and a
-    /// write inside `BEGIN TRANSACTION READ ONLY` is rejected by `DuckDB`
-    /// itself, before it ever reaches the workspace's write-gating.
-    #[test]
-    fn reader_connection_clones_after_lock_configuration_and_cannot_write() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        let reader = db.conn.try_clone().unwrap_or_else(|e| fail(&e.to_string()));
-
-        reader
-            .execute_batch("BEGIN TRANSACTION READ ONLY")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let err = reader
-            .execute_batch("CREATE TABLE t(a INT)")
-            .err()
-            .unwrap_or_else(|| fail("write inside a read-only transaction should have failed"));
-        // The connection and its in-memory database are dropped at the end
-        // of the test; no need to end the transaction explicitly.
-        assert!(
-            err.to_string().to_lowercase().contains("read"),
-            "unexpected error: {err}"
-        );
-    }
-
-    /// The actual guarded path (`try_clone_reader` plus `read_only`), not
-    /// just the raw statements the proof above assumes: a write attempted
-    /// inside `read_only` on a reader clone is rejected, and the connection
-    /// is still usable for a genuine read right after.
-    #[test]
-    fn read_only_on_a_reader_clone_rejects_a_write() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        let reader = db
-            .try_clone_reader()
-            .unwrap_or_else(|e| fail(&e.to_string()));
-
-        let err = reader
-            .read_only(|db| db.execute_statement("CREATE TABLE t(a INT)"))
-            .err()
-            .unwrap_or_else(|| fail("a write inside read_only on a reader should have failed"));
-        assert!(
-            err.to_string().to_lowercase().contains("read"),
-            "unexpected error: {err}"
-        );
-        assert!(reader.read_only(|db| db.execute_query("SELECT 1")).is_ok());
-    }
-
-    /// A write on the writer, made before a reader is cloned from it, is
-    /// still visible to the reader afterward, and so is a write made even
-    /// later: `DuckDB` snapshots a transaction at `BEGIN`, not at
-    /// `try_clone`, and the writer's statements autocommit.
-    #[test]
-    fn reader_clone_sees_the_writers_prior_and_later_writes() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        db.execute_statement("CREATE TABLE t(a INT)")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        db.execute_statement("INSERT INTO t VALUES (1)")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let reader = db
-            .try_clone_reader()
-            .unwrap_or_else(|e| fail(&e.to_string()));
-
-        let count = |reader: &WorkspaceDb| -> i64 {
-            reader
-                .read_only(|db| db.execute_query("SELECT count(*) FROM t"))
-                .unwrap_or_else(|e| fail(&e.to_string()))
-                .rows
-                .first()
-                .and_then(|row| row.first())
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or_else(|| fail("no count returned"))
-        };
-        assert_eq!(count(&reader), 1);
-
-        db.execute_statement("INSERT INTO t VALUES (2)")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(count(&reader), 2);
-    }
-
-    /// A closure that errors inside `read_only` rolls the transaction
-    /// back, and the connection is immediately reusable for another
-    /// `read_only` call: `ReadOnlyGuard::drop` did not leave one open.
-    #[test]
-    fn read_only_rolls_back_on_error_and_the_connection_stays_usable() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(
-            db.read_only(|db| db.execute_query("SELECT * FROM no_such_table"))
-                .is_err()
-        );
-        assert!(db.read_only(|db| db.execute_query("SELECT 1")).is_ok());
-    }
-
-    /// The reader clone inherits confinement: it cannot read outside the
-    /// workspace directory either, exactly like the writer (mirrors
-    /// `workspace_connection_is_confined_to_its_directory_and_locked`).
-    #[test]
-    fn reader_clone_is_confined_like_the_writer() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let config = config_in(dir.path());
-        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        let reader = db
-            .try_clone_reader()
-            .unwrap_or_else(|e| fail(&e.to_string()));
-
-        let outside = dir.path().join("outside.csv");
-        std::fs::write(&outside, "a\n1\n").unwrap_or_else(|e| fail(&e.to_string()));
-        let err = reader
-            .execute_query(&format!(
-                "SELECT * FROM read_csv_auto('{}')",
-                outside.display()
-            ))
-            .err();
-        assert!(err.is_some(), "the reader escaped the sandbox");
-        let text = err.map(|e| e.to_string()).unwrap_or_default();
-        // `read_csv_auto` on a real, existing file outside the workspace
-        // has only one legitimate way to fail: the confinement check.
-        // Unlike the writer's confinement test, nothing here can produce a
-        // Catalog Error, so that arm would only ever hide an unrelated
-        // regression (`read_csv_auto` itself going missing, say).
-        assert!(text.contains("Permission Error"), "{text}");
-
-        let inside = config.workspace_files_dir("ws").join("inside.csv");
-        std::fs::write(&inside, "a\n1\n2\n").unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(
-            reader
-                .execute_query(&format!(
-                    "SELECT * FROM read_csv_auto('{}')",
-                    inside.display()
-                ))
-                .is_ok()
-        );
-    }
-
-    /// `DuckDB` temp tables (the CLI's `stdin` table, `ingestion::STDIN_TABLE`)
-    /// are connection-local: a reader clone opened after the writer created
-    /// one does not see it. Tools reading through the reader must never be
-    /// pointed at it; only the writer connection (`run_sql`) can.
-    #[test]
-    fn reader_connection_cannot_see_the_writers_temp_tables() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        db.execute_statement("CREATE TEMP TABLE stdin AS SELECT 1 AS a")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(db.execute_query("SELECT * FROM stdin").is_ok());
-
-        let reader = db
-            .try_clone_reader()
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let err = reader
-            .execute_query("SELECT * FROM stdin")
-            .err()
-            .unwrap_or_else(|| fail("the reader should not see the writer's temp table"));
-        assert!(err.to_string().contains("stdin"), "{err}");
-    }
-
-    #[test]
-    fn has_temp_tables_reports_a_piped_stdin_table() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(
-            !db.has_temp_tables()
-                .unwrap_or_else(|e| fail(&e.to_string()))
-        );
-        db.execute_statement("CREATE TEMP TABLE stdin AS SELECT 1 AS a")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(
-            db.has_temp_tables()
-                .unwrap_or_else(|e| fail(&e.to_string()))
-        );
-    }
-
-    #[test]
-    fn in_memory_connection_reads_no_files_at_all() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let file = dir.path().join("x.csv");
-        std::fs::write(&file, "a\n1\n").unwrap_or_else(|e| fail(&e.to_string()));
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        let err = db
-            .execute_query(&format!(
-                "SELECT * FROM read_csv_auto('{}')",
-                file.display()
-            ))
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(err.contains("Permission Error"), "{err}");
-        assert!(db.execute_statement("SET threads = 1").is_err());
-    }
-
-    #[test]
-    fn query_values_keep_fractions_dates_and_nested_types() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        let results = db
-            .execute_query(
-                "SELECT 20.5 AS dec, 20.5::DOUBLE AS dbl, 3.25::FLOAT AS flt, \
-                 DATE '2024-01-02' AS d, TIMESTAMP '2024-01-02 03:04:05' AS ts, \
-                 TIMESTAMP '2024-01-02 03:04:05.25' AS tsf, TIME '03:04:05' AS t, \
-                 12345678901234567890::HUGEINT AS big, [1, 2] AS arr, {'a': 1, 'b': 'x'} AS st, \
-                 MAP {'k': 1} AS m, NULL AS n, 'text' AS s, true AS b, 7::UTINYINT AS u",
-            )
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let row = results.rows.first().unwrap_or_else(|| fail("no row"));
-        let expected = serde_json::json!([
-            20.5,
-            20.5,
-            3.25,
-            "2024-01-02",
-            "2024-01-02 03:04:05",
-            "2024-01-02 03:04:05.250000",
-            "03:04:05",
-            "12345678901234567890",
-            [1, 2],
-            {"a": 1, "b": "x"},
-            {"k": 1},
-            null,
-            "text",
-            true,
-            7
-        ]);
-        assert_eq!(serde_json::Value::Array(row.clone()), expected);
-    }
-
-    /// `DECIMAL` cells stay JSON numbers when their normalized digits survive
-    /// an `f64` (so `12.50` and `100.00` in a money column are numbers like
-    /// every other row), and keep their exact digit string only when they
-    /// would lose digits (more than about 16 significant digits). Guards the
-    /// `json_of` docstring contract.
-    #[test]
-    fn decimal_cells_stay_numbers_unless_they_lose_digits() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        db.execute_statement(
-            "CREATE TABLE d (hi DECIMAL(20,2), wide DECIMAL(38,10), price DECIMAL(10,2), \
-             round DECIMAL(10,2), big DECIMAL(18,2), int DECIMAL(5,0))",
-        )
-        .unwrap_or_else(|e| fail(&e.to_string()));
-        db.execute_statement(
-            "INSERT INTO d VALUES (123456789012345678.99, 99999999999999999999.1234567890, \
-             12.50, 100.00, 1234567890123.45, 42)",
-        )
-        .unwrap_or_else(|e| fail(&e.to_string()));
-        let results = db
-            .execute_query("SELECT hi, wide, price, round, big, int FROM d")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let row = results.rows.first().unwrap_or_else(|| fail("no row"));
-
-        // Only the cells with more significant digits than an f64 holds keep
-        // their text; the declared scale's trailing zeros do not make a cell
-        // a string.
-        assert_eq!(
-            serde_json::Value::Array(row.clone()),
-            serde_json::json!([
-                "123456789012345678.99",
-                "99999999999999999999.1234567890",
-                12.5,
-                100,
-                1_234_567_890_123.45,
-                42
-            ])
-        );
-    }
-
-    /// One money column is all numbers: trailing zeros from the declared
-    /// scale never turn some of its cells into strings.
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn a_money_column_does_not_mix_numbers_and_strings() {
-        let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
-        db.execute_statement("CREATE TABLE m (amount DECIMAL(12,2))")
-            .unwrap();
-        db.execute_statement("INSERT INTO m VALUES (12.50), (100.00), (3.99), (0.10), (-7.00)")
-            .unwrap();
-        let results = db
-            .execute_query("SELECT amount FROM m ORDER BY rowid")
-            .unwrap();
-        let cells: Vec<serde_json::Value> = results
-            .rows
-            .iter()
-            .filter_map(|row| row.first().cloned())
-            .collect();
-        assert_eq!(
-            serde_json::Value::Array(cells),
-            serde_json::json!([12.5, 100, 3.99, 0.1, -7])
-        );
-    }
-
-    /// The exact `DECIMAL` digits of a cell that would lose them survive
-    /// every output sink: the JSON serializers (REST `/sql`, MCP `sql`,
-    /// `quack -q` JSON/NdJSON) quote the strings, and the text paths (table,
-    /// CSV, markdown) keep the raw digits via `display_json_value`. A cell
-    /// that fits stays a number everywhere.
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn decimal_digits_survive_every_output_sink() {
-        let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
-        db.execute_statement("CREATE TABLE d (hi DECIMAL(20,2), scaled DECIMAL(3,2))")
-            .unwrap();
-        db.execute_statement("INSERT INTO d VALUES (123456789012345678.99, 1.50)")
-            .unwrap();
-        let results = db.execute_query("SELECT hi, scaled FROM d").unwrap();
-
-        // NdJSON: the lossy cell is a quoted string, the other a number.
-        let mut buf = Vec::new();
-        results.write_ndjson(&mut buf).unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "{\"hi\":\"123456789012345678.99\",\"scaled\":1.5}\n"
-        );
-
-        // JSON array: same cells.
-        let mut buf = Vec::new();
-        results.write_json(&mut buf).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(
-            parsed,
-            serde_json::json!([{ "hi": "123456789012345678.99", "scaled": 1.5 }])
-        );
-
-        // CSV: the text path keeps the digits, unquoted.
-        let mut buf = Vec::new();
-        results.write_csv(&mut buf).unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "hi,scaled\n123456789012345678.99,1.5\n"
-        );
-
-        // Markdown: the text path keeps the digits verbatim.
-        let mut buf = Vec::new();
-        results.write_markdown(&mut buf).unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "| hi | scaled |\n| --- | --- |\n| 123456789012345678.99 | 1.5 |\n"
-        );
-
-        // Table: the aligned text path keeps the digits and never shows
-        // the `f64` approximation.
-        let mut buf = Vec::new();
-        results.write_table(&mut buf).unwrap();
-        let table = String::from_utf8(buf).unwrap();
-        assert!(table.contains("123456789012345678.99"), "{table}");
-        assert!(table.contains("1.5"), "{table}");
-        assert!(!table.contains("1.2345678901234566e+17"), "{table}");
-    }
-
-    #[test]
-    fn describe_table_reports_the_exact_row_count() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(db.execute_statement("CREATE TABLE t(a INT)").is_ok());
-        assert!(
-            db.execute_statement("INSERT INTO t VALUES (1), (2), (3)")
-                .is_ok()
-        );
-        let desc = db
-            .describe_table("t")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(desc.row_count, 3);
-        assert_eq!(desc.sample_rows.rows.len(), 3);
-        assert!(db.count_rows("missing").is_err());
-        let version = db.duckdb_version().unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(version.starts_with('v'), "{version}");
-    }
-
-    fn sample() -> QueryResults {
-        QueryResults {
-            columns: vec![String::from("name"), String::from("n")],
-            rows: vec![
-                vec![
-                    serde_json::Value::String(String::from("a,b")),
-                    serde_json::Value::Number(1.into()),
-                ],
-                vec![
-                    serde_json::Value::String(String::from("say \"hi\"")),
-                    serde_json::Value::Null,
-                ],
-            ],
-        }
-    }
-
-    #[test]
-    fn capped_query_keeps_the_cap_and_counts_the_rest() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        let capped = db
-            .execute_query_capped("SELECT range AS n FROM range(10)", 3)
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(capped.results.columns, vec![String::from("n")]);
-        assert_eq!(capped.results.rows.len(), 3);
-        assert_eq!(capped.total_rows, 10);
-        assert!(capped.truncated());
-        assert_eq!(capped.omitted(), 7);
-
-        let exact = db
-            .execute_query_capped("SELECT range AS n FROM range(3)", 3)
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(exact.results.rows.len(), 3);
-        assert!(!exact.truncated());
-        assert_eq!(exact.omitted(), 0);
-
-        let none = db
-            .execute_query_capped("SELECT 1 WHERE false", 3)
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(none.total_rows, 0);
-        assert!(!none.truncated());
-
-        let all = db
-            .execute_query("SELECT range AS n FROM range(10)")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(all.rows.len(), 10);
-    }
-
-    /// Columns that share a name keep every value under suffixed keys in
-    /// both JSON shapes; CSV, table, and markdown already kept them
-    /// (issue #65).
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn json_writers_keep_columns_that_share_a_name() {
-        let results = QueryResults {
-            columns: vec![
-                String::from("a"),
-                String::from("a"),
-                String::from("a_1"),
-                String::from("a"),
-            ],
-            rows: vec![vec![
-                serde_json::Value::from(1),
-                serde_json::Value::from(2),
-                serde_json::Value::from(3),
-                serde_json::Value::from(4),
-            ]],
-        };
-        assert_eq!(results.json_keys(), ["a", "a_1", "a_1_1", "a_2"]);
-        let mut buf = Vec::new();
-        results.write_ndjson(&mut buf).unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "{\"a\":1,\"a_1\":2,\"a_1_1\":3,\"a_2\":4}\n"
-        );
-        let mut buf = Vec::new();
-        results.write_json(&mut buf).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(
-            parsed,
-            serde_json::json!([{ "a": 1, "a_1": 2, "a_1_1": 3, "a_2": 4 }])
-        );
-        assert_eq!(sample().json_keys(), ["name", "n"]);
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn write_ndjson_one_object_per_line() {
-        let mut buf = Vec::new();
-        sample().write_ndjson(&mut buf).unwrap();
-        let text = String::from_utf8(buf).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines.first().copied(), Some(r#"{"name":"a,b","n":1}"#));
-        assert_eq!(
-            lines.last().copied(),
-            Some(r#"{"name":"say \"hi\"","n":null}"#)
-        );
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn write_csv_quotes_and_escapes() {
-        let mut buf = Vec::new();
-        sample().write_csv(&mut buf).unwrap();
-        let text = String::from_utf8(buf).unwrap();
-        assert_eq!(text, "name,n\n\"a,b\",1\n\"say \"\"hi\"\"\",\n");
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-    fn write_markdown_renders_table() {
-        let mut buf = Vec::new();
-        sample().write_markdown(&mut buf).unwrap();
-        let text = String::from_utf8(buf).unwrap();
-        assert!(text.starts_with("| name | n |\n| --- | --- |\n| a,b | 1 |\n"));
-        assert!(text.contains("| say \"hi\" | NULL |"));
-    }
-
-    #[test]
-    fn direct_sql_detection_by_leading_keyword() {
-        for yes in [
-            "SELECT 1",
-            "  with x as (select 1) select * from x",
-            "FROM t",
-            "describe t",
-            "SHOW TABLES",
-            "summarize t",
-            "PIVOT t ON a",
-            "explain select 1",
-            "select(1)",
-        ] {
-            assert!(looks_like_direct_sql(yes), "{yes}");
-        }
-        for no in [
-            "what were sales by region",
-            "",
-            "   ",
-            "/sql select 1",
-            "selected items please",
-            "DROP TABLE t",
-            "insert into t values (1)",
-        ] {
-            assert!(!looks_like_direct_sql(no), "{no}");
-        }
-    }
-
-    #[test]
-    fn tokenize_lowercases_and_splits_on_punctuation() {
-        assert_eq!(
-            tokenize("Policy POL-8841 renews; see \"Exclusions\" (page 12)."),
-            vec![
-                "polici", "pol", "8841", "pol8841", "renew", "see", "exclus", "page", "12"
-            ]
-        );
-        // Inflections meet at one stem; codes and numbers are untouched.
-        assert_eq!(
-            tokenize("renewal renewals renewing"),
-            vec!["renew", "renew", "renew"]
-        );
-        assert_eq!(tokenize("AB-12X9"), vec!["ab", "12x9", "ab12x9"]);
-        assert!(tokenize("  --- ").is_empty());
-    }
-
-    #[test]
-    fn tokenize_indexes_the_joined_form_of_an_identifier() {
-        // Hyphen, dot, underscore, slash, and colon all join.
-        assert_eq!(tokenize("v1.2.3"), vec!["v1", "2", "3", "v123"]);
-        assert_eq!(tokenize("ABC_123"), vec!["abc", "123", "abc123"]);
-        assert_eq!(tokenize("ns/part:7"), vec!["ns", "part", "7", "nspart7"]);
-        // A joiner touching whitespace does not merge across words: prose
-        // punctuation still tokenizes exactly as before.
-        assert_eq!(
-            tokenize("end of sentence - new sentence."),
-            vec!["end", "of", "sentenc", "new", "sentenc"]
-        );
-        // The query side uses the same function, so a bare joined form
-        // already in text (`pol8841`) is found by the query `POL-8841`.
-        assert!(tokenize("POL-8841").contains(&String::from("pol8841")));
-        assert_eq!(tokenize("pol8841"), vec!["pol8841"]);
-        // The joined form uses full Unicode case folding, not ASCII-only
-        // lowercasing, so a non-ASCII identifier's casing does not change
-        // which term it indexes: `Ünit-9` in text and `ünit-9` in a query
-        // must both produce the joined term `ünit9`.
-        assert_eq!(tokenize("Ünit-9").last(), tokenize("ünit-9").last(),);
-        assert_eq!(tokenize("Ünit-9").last(), Some(&String::from("ünit9")));
-    }
-
-    #[test]
-    fn term_frequencies_count_heading_too() {
-        let tf = TermFrequencies::of("flood flood damage", Some("Flood Exclusions"));
-        assert_eq!(
-            tf.0,
-            vec![
-                (String::from("damag"), 1),
-                (String::from("exclus"), 1),
-                (String::from("flood"), 3),
-            ]
-        );
-        assert_eq!(tf.total(), 5);
-    }
-
-    #[test]
-    fn phrases_read_balanced_quotes() {
-        assert_eq!(
-            Phrases::parse("\"flood exclusion\"").0,
-            vec![String::from("flood exclusion")]
-        );
-        assert_eq!(
-            Phrases::parse("find \"flood exclusion\" near \"water damage\"").0,
-            vec![
-                String::from("flood exclusion"),
-                String::from("water damage")
-            ]
-        );
-        assert!(Phrases::parse("no quotes here").0.is_empty());
-        assert!(Phrases::parse("\"\"").0.is_empty());
-        // Unbalanced quotes: an odd count is ordinary text, not a phrase.
-        assert!(Phrases::parse("say \"hello").0.is_empty());
-        assert!(Phrases::parse("a \"b\" c\" d").0.is_empty());
-    }
-
-    #[test]
-    fn phrases_match_ignoring_case_and_whitespace() {
-        assert!(Phrases::contains(
-            "the FLOOD   Exclusion\napplies here",
-            "flood exclusion"
-        ));
-        assert!(!Phrases::contains("flood and exclusion", "flood exclusion"));
-        assert!(Phrases::contains(
-            "Flood Exclusion",
-            "  flood   exclusion  "
-        ));
-    }
-
-    #[test]
-    fn phrases_over_fetch_only_when_there_is_one() {
-        assert_eq!(Phrases::parse("plain words").fetch(10, 20), 10);
-        assert_eq!(Phrases::parse("\"a b\"").fetch(10, 20), 80);
-        assert_eq!(
-            Phrases::parse("\"a b\"").fetch(10, 1000),
-            PHRASE_CANDIDATE_CAP
-        );
-        assert_eq!(Phrases::parse("\"a b\"").fetch(900, 20), 900);
-    }
-
-    #[test]
-    fn quote_ident_wraps_and_escapes() {
-        assert_eq!(quote_ident("sales"), "\"sales\"");
-        assert_eq!(quote_ident("odd name"), "\"odd name\"");
-        assert_eq!(quote_ident("x\"y"), "\"x\"\"y\"");
-    }
-
-    #[test]
-    fn display_json_null() {
-        assert_eq!(display_json_value(&serde_json::Value::Null), "NULL");
-    }
-
-    #[test]
-    fn display_json_string() {
-        let val = serde_json::Value::String("hello".into());
-        assert_eq!(display_json_value(&val), "hello");
-    }
-
-    #[test]
-    fn display_json_number() {
-        let val = serde_json::Value::Number(42.into());
-        assert_eq!(display_json_value(&val), "42");
-    }
-
-    #[test]
-    fn display_json_bool_true() {
-        assert_eq!(display_json_value(&serde_json::Value::Bool(true)), "true");
-    }
-
-    #[test]
-    fn display_json_bool_false() {
-        assert_eq!(display_json_value(&serde_json::Value::Bool(false)), "false");
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts output format")]
-    fn write_table_empty_columns_prints_ok() {
-        let results = QueryResults {
-            columns: Vec::new(),
-            rows: Vec::new(),
-        };
-        let mut buf = Vec::new();
-        results.write_table(&mut buf).unwrap();
-        assert_eq!(String::from_utf8_lossy(&buf), "OK\n");
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts output format")]
-    fn write_table_renders_aligned_columns() {
-        let results = QueryResults {
-            columns: vec!["id".into(), "name".into()],
-            rows: vec![
-                vec![
-                    serde_json::Value::Number(1.into()),
-                    serde_json::Value::String("alice".into()),
-                ],
-                vec![
-                    serde_json::Value::Number(2.into()),
-                    serde_json::Value::String("bob".into()),
-                ],
-            ],
-        };
-        let mut buf = Vec::new();
-        results.write_table(&mut buf).unwrap();
-        let output = String::from_utf8_lossy(&buf);
-        assert!(output.contains("id"));
-        assert!(output.contains("name"));
-        assert!(output.contains("alice"));
-        assert!(output.contains("bob"));
-        assert!(output.contains("(2 rows)"));
-        assert!(output.contains("-+-"));
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts output format")]
-    fn write_json_produces_valid_array() {
-        let results = QueryResults {
-            columns: vec!["id".into(), "val".into()],
-            rows: vec![vec![
-                serde_json::Value::Number(1.into()),
-                serde_json::Value::String("x".into()),
-            ]],
-        };
-        let mut buf = Vec::new();
-        results.write_json(&mut buf).unwrap();
-        let output = String::from_utf8_lossy(&buf);
-        let parsed: Vec<serde_json::Map<String, serde_json::Value>> =
-            serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed.len(), 1);
-        let first = parsed.first().unwrap();
-        assert_eq!(first.get("id"), Some(&serde_json::Value::Number(1.into())));
-        assert_eq!(
-            first.get("val"),
-            Some(&serde_json::Value::String("x".into()))
-        );
-    }
-
-    #[test]
-    #[expect(clippy::unwrap_used, reason = "test asserts output format")]
-    fn write_json_empty_rows_produces_empty_array() {
-        let results = QueryResults {
-            columns: vec!["a".into()],
-            rows: Vec::new(),
-        };
-        let mut buf = Vec::new();
-        results.write_json(&mut buf).unwrap();
-        let output = String::from_utf8_lossy(&buf);
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
-        assert!(parsed.is_empty());
-    }
-
-    /// Up to `limit` items spread evenly over the groups: each group (one
-    /// document's chunks, in order) gets an equal quota, taken at evenly
-    /// spaced positions, so a sample covers every document and not just the
-    /// front matter of the first.
-    fn evenly_spaced<T>(groups: impl IntoIterator<Item = Vec<T>>, limit: usize) -> Vec<T> {
-        let groups: Vec<Vec<T>> = groups.into_iter().filter(|g| !g.is_empty()).collect();
-        if limit == 0 || groups.is_empty() {
-            return Vec::new();
-        }
-        let quota = limit.div_ceil(groups.len()).max(1);
-        let mut chosen = Vec::with_capacity(limit);
-        for group in groups {
-            let len = group.len();
-            let take = quota.min(len);
-            let mut positions: Vec<usize> = (0..take)
-                .map(|k| {
-                    k.saturating_mul(len)
-                        .checked_div(take)
-                        .unwrap_or(0)
-                        .min(len.saturating_sub(1))
-                })
-                .collect();
-            positions.dedup();
-            let mut positions = positions.into_iter().peekable();
-            for (index, item) in group.into_iter().enumerate() {
-                if positions.peek() == Some(&index) {
-                    positions.next();
-                    chosen.push(item);
-                }
-            }
-        }
-        chosen.truncate(limit);
-        chosen
-    }
-
-    #[test]
-    fn a_sample_spreads_across_every_group() {
-        let groups = vec![(0..10).collect::<Vec<u32>>(), vec![100, 101], vec![]];
-        assert_eq!(evenly_spaced(groups.clone(), 4), vec![0, 5, 100, 101]);
-        assert_eq!(evenly_spaced(groups.clone(), 3), vec![0, 5, 100]);
-        assert!(evenly_spaced(groups, 0).is_empty());
-        assert_eq!(evenly_spaced(vec![vec![1, 2, 3]], 10), vec![1, 2, 3]);
-    }
-
-    /// The SQL sampler picks exactly what `evenly_spaced` picks from the
-    /// same documents in the same order, for every limit, from both pools.
-    #[test]
-    fn the_sql_sample_matches_evenly_spaced() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        // Ids sort in insertion order, so ingest order and id order agree.
-        let sizes = [10_u32, 2, 7, 1, 13, 3];
-        let mut groups: Vec<Vec<String>> = Vec::new();
-        for (d, size) in sizes.iter().enumerate() {
-            let doc = format!("d{d}");
-            insert_ready_document(&db, &doc);
-            let mut group = Vec::new();
-            for i in 0..*size {
-                let id = format!("{doc}-c{i:02}");
-                insert_text_chunk(
-                    &db,
-                    &id,
-                    &doc,
-                    i,
-                    "a passage long enough to count as more than a line of text",
-                );
-                group.push(id);
-            }
-            groups.push(group);
-        }
-        for pool in [SamplePool::NotGraphExtracted, SamplePool::Substantive] {
-            assert_eq!(
-                db.pool_size(pool).unwrap_or_else(|e| fail(&e.to_string())),
-                36
-            );
-            for limit in 0..40_u32 {
-                let expected = evenly_spaced(groups.clone(), limit as usize);
-                let sampled = db
-                    .sample_chunk_ids(pool, limit)
-                    .unwrap_or_else(|e| fail(&e.to_string()));
-                let sampled: Vec<String> = sampled.into_iter().map(ChunkId::into_string).collect();
-                assert_eq!(sampled, expected, "{pool:?} limit {limit}");
-            }
-        }
-    }
-
-    /// A rebuild read a page at a time indexes every chunk, the last page
-    /// short, exactly as the inserts did.
-    #[test]
-    fn a_paged_reindex_restores_every_chunk() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        insert_ready_document(&db, "d0");
-        for i in 0..7 {
-            insert_text_chunk(&db, &format!("c{i}"), "d0", i, &format!("flood report {i}"));
-        }
-        let snapshot = |db: &WorkspaceDb| {
-            db.execute_query(
-                "SELECT (SELECT count(*) FROM _quack_terms), (SELECT sum(token_count) FROM _quack_chunks)",
-            )
-            .unwrap_or_else(|e| fail(&e.to_string()))
-            .rows
-        };
-        let indexed = snapshot(&db);
-        db.execute_statement("DELETE FROM _quack_terms")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        db.reindex_terms_by(3)
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(snapshot(&db), indexed);
-    }
-
-    /// Paging by id visits every chunk of the pool once, in id order.
-    #[test]
-    fn csv_quotes_only_what_needs_it_and_keeps_a_lone_empty_field() {
-        let written = |columns: &[&str], rows: Vec<Vec<serde_json::Value>>| {
-            let results = QueryResults {
-                columns: columns.iter().map(|c| (*c).to_owned()).collect(),
-                rows,
-            };
-            let mut out = Vec::new();
-            results.write_csv(&mut out).map_or_else(
-                |e| e.to_string(),
-                |()| String::from_utf8_lossy(&out).into_owned(),
-            )
-        };
-        assert_eq!(
-            written(
-                &["name", "note"],
-                vec![
-                    vec![serde_json::json!("x,y"), serde_json::json!("say \"hi\"")],
-                    vec![serde_json::json!(""), serde_json::Value::Null],
-                ]
-            ),
-            "name,note\n\"x,y\",\"say \"\"hi\"\"\"\n,\n"
-        );
-        // One empty field alone would be a blank line, which readers skip.
-        assert_eq!(
-            written(&["n"], vec![vec![serde_json::Value::Null]]),
-            "n\n\"\"\n"
-        );
-    }
-
-    #[test]
-    fn chunk_pages_visit_the_pool_once() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        insert_ready_document(&db, "d0");
-        for i in 0..7 {
-            insert_text_chunk(&db, &format!("c{i}"), "d0", i, "some text");
-        }
-        let mut seen = Vec::new();
-        let mut after: Option<ChunkId> = None;
-        loop {
-            let page = db
-                .chunk_page(SamplePool::NotGraphExtracted, after.as_ref(), 3)
-                .unwrap_or_else(|e| fail(&e.to_string()));
-            let Some(last) = page.last() else { break };
-            after = Some(last.id.clone());
-            seen.extend(page.into_iter().map(|c| c.id.into_string()));
-        }
-        assert_eq!(seen, ["c0", "c1", "c2", "c3", "c4", "c5", "c6"]);
-    }
-
-    fn insert_ready_document(db: &WorkspaceDb, id: &str) {
-        db.insert_document(
-            &NewDocument::new(&DocumentId::from(id), "doc.txt", "text/plain", 10)
-                .with_status(DocumentStatus::Ready),
-        )
-        .unwrap_or_else(|e| fail(&e.to_string()));
-    }
-
-    fn insert_text_chunk(
-        db: &WorkspaceDb,
-        id: &str,
-        document_id: &str,
-        chunk_index: u32,
-        content: &str,
-    ) {
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from(id),
-            document_id: &DocumentId::from(document_id),
-            chunk_index,
-            content,
-            heading: None,
-            page: None,
-            embedding: None,
-        })
-        .unwrap_or_else(|e| fail(&e.to_string()));
-    }
-
-    /// The joined identifier term must rank a chunk containing the exact
-    /// identifier above one that only contains its split pieces apart.
-    #[test]
-    fn search_keyword_chunks_ranks_the_exact_identifier_above_split_terms() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        insert_ready_document(&db, "doc1");
-        insert_text_chunk(&db, "c1", "doc1", 0, "Policy POL-8841 covers water damage.");
-        insert_text_chunk(
-            &db,
-            "c2",
-            "doc1",
-            1,
-            "The pol number appears here, and the 8841 total appears elsewhere in this paragraph.",
-        );
-
-        let results = db
-            .search_keyword_chunks("POL-8841", 10, &ChunkScope::all())
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(
-            results.first().map(|r| r.id.as_str()),
-            Some("c1"),
-            "the exact identifier should outrank its split pieces: {results:?}"
-        );
-    }
-
-    #[test]
-    fn search_keyword_chunks_filters_candidates_by_quoted_phrase() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        insert_ready_document(&db, "doc1");
-        insert_text_chunk(
-            &db,
-            "c1",
-            "doc1",
-            0,
-            "The flood exclusion applies to basements.",
-        );
-        // Same two words, not adjacent: matches the bag-of-words ranking but
-        // not the phrase.
-        insert_text_chunk(
-            &db,
-            "c2",
-            "doc1",
-            1,
-            "Exclusion of flood risk is handled in a separate clause.",
-        );
-
-        let results = db
-            .search_keyword_chunks("\"flood exclusion\"", 10, &ChunkScope::all())
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(results.len(), 1);
-        assert_eq!(results.first().map(|r| r.id.as_str()), Some("c1"));
-    }
-
-    #[test]
-    fn search_keyword_chunks_phrase_match_in_heading() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        insert_ready_document(&db, "doc1");
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c1"),
-            document_id: &DocumentId::from("doc1"),
-            chunk_index: 0,
-            content: "See below for what is not covered.",
-            heading: Some("Flood Exclusion"),
-            page: None,
-            embedding: None,
-        })
-        .unwrap_or_else(|e| fail(&e.to_string()));
-
-        let results = db
-            .search_keyword_chunks("\"flood exclusion\"", 10, &ChunkScope::all())
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(results.len(), 1);
-        assert_eq!(results.first().map(|r| r.id.as_str()), Some("c1"));
-    }
-
-    #[test]
-    fn search_keyword_chunks_phrase_with_no_match_returns_empty() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        insert_ready_document(&db, "doc1");
-        insert_text_chunk(
-            &db,
-            "c1",
-            "doc1",
-            0,
-            "Exclusion of flood risk is handled in a separate clause.",
-        );
-
-        let results = db
-            .search_keyword_chunks("\"flood exclusion\"", 10, &ChunkScope::all())
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert!(
-            results.is_empty(),
-            "a phrase with no exact match must not fall back to unfiltered candidates: {results:?}"
-        );
-    }
-
-    #[test]
-    fn search_keyword_chunks_unbalanced_quote_is_ordinary_text() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        insert_ready_document(&db, "doc1");
-        insert_text_chunk(
-            &db,
-            "c1",
-            "doc1",
-            0,
-            "Exclusion of flood risk is handled in a separate clause.",
-        );
-
-        let results = db
-            .search_keyword_chunks("\"flood exclusion", 10, &ChunkScope::all())
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        // No phrase requirement kicks in: ordinary bag-of-words matching
-        // still finds the chunk even though the words are not adjacent.
-        assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn search_hybrid_chunks_ranks_identifier_and_filters_phrase() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        insert_ready_document(&db, "doc1");
-        let embedding = Vector::from(vec![0.1_f32, 0.2, 0.3, 0.4]);
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c1"),
-            document_id: &DocumentId::from("doc1"),
-            chunk_index: 0,
-            content: "Policy POL-8841 covers water damage.",
-            heading: None,
-            page: None,
-            embedding: Some(&embedding),
-        })
-        .unwrap_or_else(|e| fail(&e.to_string()));
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c2"),
-            document_id: &DocumentId::from("doc1"),
-            chunk_index: 1,
-            content: "The pol number appears here, and the 8841 total appears elsewhere in this paragraph.",
-            heading: None,
-            page: None,
-            embedding: Some(&embedding),
-        })
-        .unwrap_or_else(|e| fail(&e.to_string()));
-
-        let results = db
-            .search_hybrid_chunks(
-                "POL-8841",
-                &embedding,
-                HybridLimits {
-                    top_k: 10,
-                    rrf_k: 60,
-                },
-                &ChunkScope::all(),
-            )
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(results.first().map(|r| r.id.as_str()), Some("c1"));
-    }
-
-    #[test]
-    fn search_hybrid_chunks_phrase_filters_to_matching_chunks() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        insert_ready_document(&db, "doc1");
-        let embedding = Vector::from(vec![0.1_f32, 0.2, 0.3, 0.4]);
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c1"),
-            document_id: &DocumentId::from("doc1"),
-            chunk_index: 0,
-            content: "The flood exclusion applies to basements.",
-            heading: None,
-            page: None,
-            embedding: Some(&embedding),
-        })
-        .unwrap_or_else(|e| fail(&e.to_string()));
-        db.insert_chunk(&NewChunk {
-            id: &ChunkId::from("c2"),
-            document_id: &DocumentId::from("doc1"),
-            chunk_index: 1,
-            content: "Exclusion of flood risk is handled in a separate clause.",
-            heading: None,
-            page: None,
-            embedding: Some(&embedding),
-        })
-        .unwrap_or_else(|e| fail(&e.to_string()));
-
-        let results = db
-            .search_hybrid_chunks(
-                "\"flood exclusion\"",
-                &embedding,
-                HybridLimits {
-                    top_k: 10,
-                    rrf_k: 60,
-                },
-                &ChunkScope::all(),
-            )
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(results.len(), 1);
-        assert_eq!(results.first().map(|r| r.id.as_str()), Some("c1"));
-    }
-
-    /// Version 10 stores whether an ontology version was reviewed; a
-    /// workspace from before it said so only in the note, so opening it
-    /// marks those versions auto-accepted and leaves the others reviewed.
-    #[test]
-    fn opening_an_older_workspace_reads_auto_acceptance_from_the_note() {
-        use crate::ontology::Ontology;
-        use crate::ontology::store::{self, Revision};
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let config = config_in(dir.path());
-        {
-            let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-            for note in ["seeded", "auto-accepted 3 candidate(s)"] {
-                store::save(
-                    &db,
-                    &Ontology::builtin_default(),
-                    Revision::reviewed(None, Some(note)),
-                )
-                .unwrap_or_else(|e| fail(&e.to_string()));
-            }
-            // A file from before version 10 has no acceptance column.
-            db.execute_statement("ALTER TABLE _quack_ontology_versions DROP COLUMN acceptance")
-                .unwrap_or_else(|e| fail(&e.to_string()));
-            db.set_meta(MetaKey::SchemaVersion, "9")
-                .unwrap_or_else(|e| fail(&e.to_string()));
-        }
-        // The second open runs while the first is still live, so it replays
-        // the first one's column change from the write-ahead log, as the next
-        // start does after a process dies before a checkpoint.
-        let upgraded = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        let reopened = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        drop(upgraded);
-        let acceptance: Vec<Acceptance> = store::versions(&reopened, 10)
-            .unwrap_or_else(|e| fail(&e.to_string()))
-            .into_iter()
-            .map(|v| v.acceptance)
-            .collect();
-        assert_eq!(acceptance, [Acceptance::Auto, Acceptance::Reviewed]);
-    }
-
-    /// Version 7 added joined identifier terms, so a workspace still
-    /// recorded at an older version must reindex `_quack_terms` on open
-    /// (`WorkspaceDb::create_internal_tables`).
-    #[test]
-    fn opening_an_older_workspace_reindexes_terms_for_identifier_search() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let config = config_in(dir.path());
-        {
-            let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-            insert_ready_document(&db, "doc1");
-            insert_text_chunk(&db, "c1", "doc1", 0, "Policy POL-8841 applies.");
-            // Simulate a workspace indexed before version 7: the joined
-            // identifier term is missing and the recorded version rolls back.
-            db.execute_statement("DELETE FROM _quack_terms WHERE term = 'pol8841'")
-                .unwrap_or_else(|e| fail(&e.to_string()));
-            db.set_meta(MetaKey::SchemaVersion, "6")
-                .unwrap_or_else(|e| fail(&e.to_string()));
-        }
-
-        let reopened = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(
-            reopened
-                .meta(MetaKey::SchemaVersion)
-                .unwrap_or_else(|e| fail(&e.to_string())),
-            Some(WORKSPACE_SCHEMA_VERSION.to_string())
-        );
-        let rows = reopened
-            .execute_query("SELECT count(*) FROM _quack_terms WHERE term = 'pol8841'")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(
-            rows.rows.first().and_then(|r| r.first()),
-            Some(&serde_json::Value::Number(1.into())),
-            "reopening should have rebuilt the term index with the joined form"
-        );
-    }
-
-    /// A workspace that, before symmetric dedup (`<` `MERGE_DEDUP`), picked up
-    /// opposing-orientation rows for the same merge pair collapses them on
-    /// open to a single row, keeping the more-decided one so a reviewer's
-    /// rejection is not lost; a single-orientation pair is untouched.
-    #[test]
-    fn opening_an_older_workspace_collapses_opposing_merge_duplicates() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-        let config = config_in(dir.path());
-        {
-            let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-            // The same pair, once rejected (keep=A, drop=B) and once a later
-            // pending duplicate in the flipped orientation (keep=B, drop=A).
-            db.execute_statement(
-                "INSERT INTO _quack_graph_merges \
-                 (id, keep_node_id, drop_node_id, distance, status, decided_at) \
-                 VALUES ('m1', 'A', 'B', 0.0, 'rejected', \
-                         TIMESTAMP '2026-01-01 00:00:00')",
-            )
-            .unwrap_or_else(|e| fail(&e.to_string()));
-            db.execute_statement(
-                "INSERT INTO _quack_graph_merges \
-                 (id, keep_node_id, drop_node_id, distance, status) \
-                 VALUES ('m2', 'B', 'A', 0.0, 'pending')",
-            )
-            .unwrap_or_else(|e| fail(&e.to_string()));
-            // An unrelated single-orientation pair stays as it is.
-            db.execute_statement(
-                "INSERT INTO _quack_graph_merges \
-                 (id, keep_node_id, drop_node_id, distance, status, decided_at) \
-                 VALUES ('m3', 'C', 'D', 0.0, 'rejected', \
-                         TIMESTAMP '2026-02-01 00:00:00')",
-            )
-            .unwrap_or_else(|e| fail(&e.to_string()));
-            // Pretend it was last recorded before the symmetric-dedup step.
-            db.set_meta(MetaKey::SchemaVersion, "10")
-                .unwrap_or_else(|e| fail(&e.to_string()));
-        }
-
-        let reopened = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(
-            reopened
-                .meta(MetaKey::SchemaVersion)
-                .unwrap_or_else(|e| fail(&e.to_string())),
-            Some(WORKSPACE_SCHEMA_VERSION.to_string())
-        );
-        // One row per pair: the rejected row survived, the pending duplicate
-        // was removed, the unrelated pair is still there.
-        let count = reopened
-            .execute_query("SELECT count(*) FROM _quack_graph_merges")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(
-            count.rows.first().and_then(|r| r.first()),
-            Some(&serde_json::json!(2)),
-            "one row per pair"
-        );
-        let kept = reopened
-            .execute_query("SELECT keep_node_id, status FROM _quack_graph_merges WHERE id = 'm1'")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        let row = kept
-            .rows
-            .first()
-            .unwrap_or_else(|| fail("the rejected row m1 should have survived"));
-        assert_eq!(row.first(), Some(&serde_json::json!("A")));
-        assert_eq!(row.get(1), Some(&serde_json::json!("rejected")));
-        let gone = reopened
-            .execute_query("SELECT count(*) FROM _quack_graph_merges WHERE id = 'm2'")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(
-            gone.rows.first().and_then(|r| r.first()),
-            Some(&serde_json::json!(0)),
-            "the pending duplicate in the flipped orientation must be gone"
-        );
-        let single = reopened
-            .execute_query("SELECT status FROM _quack_graph_merges WHERE id = 'm3'")
-            .unwrap_or_else(|e| fail(&e.to_string()));
-        assert_eq!(
-            single.rows.first().and_then(|r| r.first()),
-            Some(&serde_json::json!("rejected"))
-        );
-    }
-
-    /// Sample rows in the system prompt are cut per cell: nested values
-    /// too, which once put a 58,000-character JSON cell (and a header
-    /// padded to match) into every turn's prompt.
-    #[test]
-    fn cells_are_cut_whatever_their_type() {
-        let long = "x".repeat(100);
-        let results = QueryResults {
-            columns: vec![String::from("s"), String::from("j"), String::from("n")],
-            rows: vec![vec![
-                serde_json::Value::String(long.clone()),
-                serde_json::json!({ "a": [long.clone(), long] }),
-                serde_json::json!(12_345),
-            ]],
-        };
-        let cut = results.with_cells_cut(10);
-        let cells: Vec<String> = cut.rows.iter().flatten().map(display_json_value).collect();
-        assert_eq!(
-            cells,
-            vec![
-                format!("{}\u{2026}", "x".repeat(10)),
-                String::from("{\"a\":[\"xxx\u{2026}"),
-                String::from("12345"),
-            ]
-        );
-    }
-
-    /// A sort rewrites the statement's own `ORDER BY`, replacing any it
-    /// had and sitting before its `LIMIT`; the column is named when the
-    /// name resolves and given by position when it does not. Anything that
-    /// is not one `SELECT` has no rows of its own to reorder.
-    #[test]
-    fn sorting_rewrites_the_statements_own_order_by() {
-        let db =
-            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
-        db.execute_query(
-            "CREATE TABLE t AS SELECT * FROM (VALUES (2, 'b'), (NULL, 'n'), (1, 'a')) v(x, y)",
-        )
-        .unwrap_or_else(|e| fail(&e.to_string()));
-        let rewrite = |sql: &str, column: usize, direction: SortDirection| {
-            let sortable = db
-                .sortable(sql)
-                .unwrap_or_else(|e| fail(&e.to_string()))
-                .unwrap_or_else(|| fail(&format!("{sql} is not sortable")));
-            let column = std::num::NonZeroUsize::new(column).unwrap_or_else(|| fail("zero column"));
-            db.sort_statement(&sortable, ResultSort { column, direction })
-                .unwrap_or_else(|e| fail(&e.to_string()))
-        };
-        let ys = |sql: &str| -> Vec<String> {
-            db.execute_query(sql)
-                .unwrap_or_else(|e| fail(&format!("{sql}: {e}")))
-                .rows
-                .iter()
-                .filter_map(|r| {
-                    r.get(1)
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                })
-                .collect()
-        };
-
-        let sql = rewrite("SELECT x, y FROM t", 1, SortDirection::Asc);
-        assert_eq!(sql, "SELECT x, y FROM t ORDER BY x ASC NULLS LAST");
-        assert_eq!(ys(&sql), ["a", "b", "n"]);
-
-        // Sorting the rewritten statement again replaces its ORDER BY.
-        let again = rewrite(&sql, 2, SortDirection::Desc);
-        assert_eq!(again, "SELECT x, y FROM t ORDER BY y DESC NULLS LAST");
-        assert_eq!(ys(&again), ["n", "b", "a"]);
-
-        // Comments and the semicolon go; the sort comes before the LIMIT.
-        let limited = rewrite(
-            "-- note\nSELECT * FROM t /* all */ LIMIT 2;",
-            1,
-            SortDirection::Desc,
-        );
-        assert_eq!(
-            limited,
-            "SELECT * FROM t ORDER BY x DESC NULLS LAST LIMIT 2"
-        );
-        assert_eq!(ys(&limited), ["b", "a"]);
-
-        // An unnamed expression, or a name two columns share, sorts by position.
-        let counted = rewrite(
-            "SELECT y, count(*) FROM t GROUP BY y",
-            2,
-            SortDirection::Desc,
-        );
-        assert!(counted.ends_with("ORDER BY 2 DESC NULLS LAST"), "{counted}");
-        let shared = rewrite("SELECT x AS v, y AS v FROM t", 2, SortDirection::Asc);
-        assert!(shared.ends_with("ORDER BY 2 ASC NULLS LAST"), "{shared}");
-        assert!(db.execute_query(&shared).is_ok());
-
-        for unsortable in [
-            "CREATE TABLE u (x INT)",
-            "INSERT INTO t VALUES (3, 'c')",
-            "SELECT 1; SELECT 2",
-            "SELEC broken",
-            "",
-        ] {
-            assert!(
-                db.sortable(unsortable)
-                    .unwrap_or_else(|e| fail(&e.to_string()))
-                    .is_none(),
-                "{unsortable}"
-            );
-        }
-    }
-}
+mod tests;

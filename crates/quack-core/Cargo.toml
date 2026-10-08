@@ -29,16 +29,24 @@ duckdb        = { workspace = true, features = ["bundled", "json"] }
 ego-tree      = { workspace = true }
 futures       = { workspace = true, features = ["std"] }
 http          = { workspace = true, features = ["std"] }
+forwarded-header-value = { workspace = true }
+ipnet         = { workspace = true, features = ["std", "serde"] }
 http-body     = { workspace = true }
-jiff          = { workspace = true, features = ["std", "serde"] }
+hyper-util    = { workspace = true, features = ["client-proxy"] }
+jiff          = { workspace = true, features = ["std", "serde", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
 jsonwebtoken  = { workspace = true, features = ["aws_lc_rs"] }
 keyring-core  = { workspace = true }
+mail-parser   = { workspace = true }
+metrics       = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 oauth2        = { workspace = true }
 office_oxide  = { workspace = true }
 pdf_oxide     = { workspace = true, features = ["legacy-crypto"] }
+pulldown-cmark = { workspace = true }
 quick-xml     = { workspace = true }
 reqwest       = { workspace = true, features = ["rustls", "http2"] }
 rig           = { workspace = true, features = ["agent", "bedrock", "derive", "memory", "reqwest"] } # rig's transport takes its TLS from reqwest's features above
+rtf-parser    = { workspace = true }
 rust-stemmers = { workspace = true }
 rustls        = { workspace = true, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
 schemars      = { workspace = true, features = ["derive"] }
@@ -47,16 +55,20 @@ sea-query     = { workspace = true, features = ["backend-sqlite", "derive"] }
 secrecy       = { workspace = true }
 serde         = { workspace = true, features = ["derive", "std"] }
 serde_json    = { workspace = true, features = ["std"] }
-sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite", "postgres", "any", "migrate", "macros", "tls-rustls-aws-lc-rs"] }
+sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 strsim        = { workspace = true }
+subtp         = { workspace = true }
 tar           = { workspace = true }
+tempfile      = { workspace = true } # stages a CSV part in the workspace directory before it is archived
 thiserror     = { workspace = true, features = ["std"] }
 tiktoken      = { workspace = true, features = ["vocabs-all"] }
 tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
-tokio-util    = { workspace = true }
+tokio-util    = { workspace = true, features = ["rt"] }
 toml          = { workspace = true, features = ["std", "parse", "serde", "display"] }
 tracing       = { workspace = true, features = ["std"] }
+utoipa        = { workspace = true, features = ["macros", "uuid", "jiff_0_2"] }
 uuid          = { workspace = true, features = ["std", "v7"] }
+whatlang      = { workspace = true }
 zip           = { workspace = true, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -74,10 +86,10 @@ rustls                       = { workspace = true, features = ["fips"] }
 windows-native-keyring-store = { workspace = true }
 
 [dev-dependencies]
+axum      = { workspace = true, features = ["http1", "tokio"] } # the test endpoint a webhook posts to
 criterion = { workspace = true, features = ["cargo_bench_support"] }
 rig       = { workspace = true, features = ["test-utils"] } # rig's scripted model, for whole-turn tests
 sqlx      = { workspace = true, features = ["runtime-tokio", "sqlite"] }
-tempfile  = { workspace = true }
 zip       = { workspace = true, features = ["deflate-flate2-zlib-rs"] }
 
 [[bench]]

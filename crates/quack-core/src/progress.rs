@@ -9,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{Error, Result};
 
 /// One unit of work finished (a chunk; for an embeddings refresh, a batch of chunks
-/// or node labels), with the run's totals so far.
+/// or node labels), with the run's totals so far. Ingestion first reports none
+/// done, so the total shows while the first batch is embedded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkDone {
     /// Units finished, this one included.

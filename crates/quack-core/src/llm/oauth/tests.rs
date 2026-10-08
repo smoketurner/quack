@@ -998,7 +998,7 @@ async fn browser_login_rejects_bad_state_then_accepts_the_code() {
     let redirect = q.get("redirect_uri").cloned().unwrap_or_default();
     assert!(redirect.ends_with("/callback"));
 
-    let http = reqwest::Client::new();
+    let http = Proxies::from_env().client().build().unwrap_or_default();
     let probe = http.get(format!("{redirect}/../favicon.ico")).send().await;
     assert!(probe.is_ok_and(|r| r.status() == 404));
     let bad = http
@@ -1050,7 +1050,10 @@ async fn browser_login_reports_the_issuer_error() {
     let q: HashMap<_, _> = auth_url.query_pairs().into_owned().collect();
     let state = q.get("state").cloned().unwrap_or_default();
     let redirect = q.get("redirect_uri").cloned().unwrap_or_default();
-    let sent = reqwest::Client::new()
+    let sent = Proxies::from_env()
+        .client()
+        .build()
+        .unwrap_or_default()
         .get(format!(
             "{redirect}?error=access_denied&error_description=nope&state={state}"
         ))
@@ -1071,6 +1074,7 @@ async fn device_login_without_a_device_endpoint_is_an_error() {
         fail("manager build failed");
     };
     let endpoints = Endpoints {
+        claims_supported: None,
         issuer: None,
         authorization: String::from("http://127.0.0.1:9/a"),
         token: String::from("http://127.0.0.1:9/t"),
@@ -1319,6 +1323,7 @@ fn rfc_8414_metadata_goes_between_the_host_and_the_issuers_path() {
 #[test]
 fn a_redirects_issuer_must_match_and_is_required_when_promised() {
     let mut endpoints = Endpoints {
+        claims_supported: None,
         issuer: Some(String::from("https://i")),
         authorization: String::new(),
         token: String::new(),
@@ -1579,7 +1584,10 @@ async fn a_browser_login_pushes_its_request_and_signs_the_code_exchange() {
     assert!(form(pushed, "client_assertion").is_some());
     let state = form(pushed, "state").unwrap_or_default();
     let redirect = form(pushed, "redirect_uri").unwrap_or_default();
-    let back = reqwest::Client::new()
+    let back = Proxies::from_env()
+        .client()
+        .build()
+        .unwrap_or_default()
         .get(format!("{redirect}?code=the-code&state={state}"))
         .send()
         .await;

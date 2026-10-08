@@ -23,14 +23,14 @@ use crate::storage::writer::Writer;
 
 /// A change of vector width: the columns hold `stored`-wide vectors and the
 /// configured model makes `configured`-wide ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct Retype {
     pub stored: Dimension,
     pub configured: Dimension,
 }
 
 /// What a run will do, for the caller to show before starting it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct Plan {
     /// The profile the vectors will be made under; `None` without a model.
     pub profile: Option<Profile>,
