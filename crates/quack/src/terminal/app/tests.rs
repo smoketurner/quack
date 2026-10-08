@@ -1872,27 +1872,53 @@ async fn without_a_chat_model_a_line_that_starts_like_sql_reports_its_syntax_err
     assert!(app.jobs.list().is_empty());
 }
 
+/// A second session over `app`'s workspace, as the next `quack -w` sees it.
+fn next_session(app: &App) -> App {
+    let config = Config::clone(&app.config);
+    App::new(SessionSetup {
+        config,
+        workspace_name: app.workspace_name.clone(),
+        workspace_id: app.workspace_id.clone(),
+        db: Arc::clone(&app.db),
+        reader_db: app.reader_db.clone(),
+        session_id: app.session_id.clone(),
+        writes: WritePolicy::Ask,
+    })
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn typed_input_is_kept_across_sessions_and_browsed_with_up_and_down() {
+async fn typed_input_is_kept_in_the_workspace_and_browsed_with_up_and_down() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-    {
-        let mut app = app(dir.path());
-        app.set_input("/tables");
-        app.submit_message();
-        db_settle(&mut app).await;
+    let legacy = dir.path().join("terminal_history");
+    std::fs::write(&legacy, "SELECT secret\n").unwrap_or_else(|e| fail(&e.to_string()));
+    let mut first = app(dir.path());
+    first
+        .load_input_history()
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(first.history.lines.is_empty(), "the old file is not read");
+    assert!(!legacy.exists(), "the old file is deleted");
+    for line in ["/tables", "a\nb"] {
+        first.set_input(line);
+        first.submit_message();
+        db_settle(&mut first).await;
     }
-    // History is the data directory's, not the workspace's. Another
-    // workspace proves it: the first app's writer may still hold "ws",
-    // which Windows locks exclusively until the last handle closes.
-    let mut again = app_in(dir.path(), "ws2", Config::default());
-    assert_eq!(again.history.lines, vec![String::from("/tables")]);
+
+    let mut again = next_session(&first);
+    again
+        .load_input_history()
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        again.history.lines,
+        vec![String::from("/tables"), String::from("a\nb")]
+    );
 
     // Up recalls the newest, then older ones; Down comes back and past
     // the newest to an empty input.
-    again.history.push(String::from("SELECT 1"));
     let input = |app: &App| app.textarea.lines().join("\n");
     again.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
-    assert_eq!(input(&again), "SELECT 1");
+    assert_eq!(input(&again), "a\nb");
     again.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
     assert_eq!(input(&again), "/tables");
     again.handle_key_event(KeyCode::Up, KeyModifiers::NONE);
@@ -1902,18 +1928,19 @@ async fn typed_input_is_kept_across_sessions_and_browsed_with_up_and_down() {
         "no popup over a recalled line"
     );
     again.handle_key_event(KeyCode::Down, KeyModifiers::NONE);
-    assert_eq!(input(&again), "SELECT 1");
+    assert_eq!(input(&again), "a\nb");
     again.handle_key_event(KeyCode::Down, KeyModifiers::NONE);
     assert!(again.textarea.is_empty());
     assert!(!again.history.browsing());
 
-    // A line with a newline is kept for the session, not the file.
-    again.history.push(String::from("a\nb"));
-    assert_eq!(again.history.lines.len(), 3);
-    let saved = app(dir.path());
-    assert_eq!(
-        saved.history.lines,
-        vec![String::from("/tables"), String::from("SELECT 1")]
+    let mut other = app_in(dir.path(), "ws2", Config::default());
+    other
+        .load_input_history()
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(
+        other.history.lines.is_empty(),
+        "another workspace has its own history"
     );
 }
 

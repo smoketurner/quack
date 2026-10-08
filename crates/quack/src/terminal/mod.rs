@@ -41,6 +41,7 @@ pub(crate) struct SessionSetup {
 pub(crate) async fn run(setup: SessionSetup) -> Result<()> {
     let mut tui_app = app::App::new(setup);
     tui_app.load_current_session().await?;
+    tui_app.load_input_history().await?;
     tui_app.note_embedding_status().await?;
     tui_app.load_sql_schema().await?;
 

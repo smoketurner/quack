@@ -45,6 +45,7 @@ use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
 use quack_core::storage::control::{ControlPlane, ResourceKind};
+use quack_core::storage::input_history;
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, MessageRole, SessionRow, SessionViewer, Sharing, TitleSource,
@@ -79,9 +80,6 @@ const SPINNER_MS: u64 = 80;
 
 /// How long quitting waits for cancelled jobs to stop.
 const QUIT_GRACE: Duration = Duration::from_secs(3);
-
-/// Lines typed before, newest last; kept per data directory.
-const HISTORY_LINES: usize = 500;
 
 /// Sessions `/sessions` lists at most, newest first.
 const PICKER_SESSIONS: u32 = 200;
@@ -498,13 +496,13 @@ enum Popup {
     Hidden,
 }
 
-/// Lines typed before, newest last, kept across sessions in the data
-/// directory, and where Up and Down have got to in them.
+/// Lines typed before, newest last, kept across sessions in the workspace
+/// (`storage::input_history`), and where Up and Down have got to in them.
+#[derive(Default)]
 struct InputHistory {
     lines: Vec<String>,
     /// The line recalled, while browsing.
     cursor: Option<usize>,
-    path: PathBuf,
 }
 
 /// What Down recalls.
@@ -515,35 +513,10 @@ enum Recall {
 }
 
 impl InputHistory {
-    fn load(path: PathBuf) -> Self {
-        let lines = std::fs::read_to_string(&path)
-            .map(|text| text.lines().map(str::to_owned).collect())
-            .unwrap_or_default();
-        Self {
-            lines,
-            cursor: None,
-            path,
-        }
-    }
-
-    /// Keep a submitted line and save the newest [`HISTORY_LINES`]; a line
-    /// holding a newline is kept for this session only, since the file
-    /// has one line per entry.
+    /// Keep a submitted line for this session; the caller stores it.
     fn push(&mut self, line: String) {
         self.lines.push(line);
         self.cursor = None;
-        let start = self.lines.len().saturating_sub(HISTORY_LINES);
-        let text = self
-            .lines
-            .iter()
-            .skip(start)
-            .filter(|line| !line.contains('\n'))
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join("\n");
-        if let Err(e) = std::fs::write(&self.path, text) {
-            tracing::debug!(path = %self.path.display(), error = %e, "could not save the input history");
-        }
     }
 
     const fn browsing(&self) -> bool {
@@ -1059,7 +1032,7 @@ impl App {
             pending_db: 0,
             switching: None,
             last_sql: None,
-            history: InputHistory::load(config.data_dir().join("terminal_history")),
+            history: InputHistory::default(),
             popup: Popup::Open { selected: 0 },
             sql_schema: Arc::new(SqlSchema::default()),
             config: Arc::new(config),
@@ -1087,6 +1060,23 @@ impl App {
         let id = self.session_id.clone();
         let replay = self.db.run(move |db| Replay::load(db, &id)).await?;
         self.apply_replay(replay);
+        Ok(())
+    }
+
+    /// Load the workspace's input history at startup, and delete the data
+    /// directory's `terminal_history` that earlier releases kept for every
+    /// workspace outside any workspace file.
+    pub(crate) async fn load_input_history(&mut self) -> Result<()> {
+        self.history.lines = self.reader_db.with_db(input_history::recent).await?;
+        let legacy = self.config.data_dir().join("terminal_history");
+        match std::fs::remove_file(&legacy) {
+            Ok(()) => tracing::info!(path = %legacy.display(), "deleted the old input history"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => self.note(
+                MessageKind::Error,
+                format!("could not delete {}: {e}", legacy.display()),
+            ),
+        }
         Ok(())
     }
 
@@ -2842,6 +2832,16 @@ impl App {
             return;
         }
         self.history.push(trimmed.clone());
+        let line = trimmed.clone();
+        self.on_db(
+            Side::Write,
+            move |db| input_history::push(db, &line),
+            |_, result| {
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "could not save the input history");
+                }
+            },
+        );
         self.clear_input();
         self.scroll = Scroll::Latest;
         self.submit_text(trimmed);
