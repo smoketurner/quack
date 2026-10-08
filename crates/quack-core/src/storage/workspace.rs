@@ -26,6 +26,7 @@ use crate::ontology::store::{self as ontology_store, Acceptance};
 use crate::ontology::{Measure, Ontology, Property};
 use crate::saved;
 use crate::storage::control::ResourceKind;
+use crate::storage::input_history;
 use crate::storage::profile::{self, ColumnType, ColumnWarning, TableNote, TableProfile};
 use crate::text::OneLine;
 
@@ -1416,6 +1417,7 @@ impl WorkspaceDb {
         self.conn.execute_batch(DOCUMENTS_DDL)?;
         self.conn.execute_batch(&sql)?;
         self.conn.execute_batch(SESSION_SUMMARIES_DDL)?;
+        self.conn.execute_batch(input_history::DDL)?;
         self.conn.execute_batch(SAVED_IMPORTS_DDL)?;
         self.conn.execute_batch(saved::DDL)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;

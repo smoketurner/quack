@@ -2,6 +2,7 @@ pub mod audit;
 pub mod backup;
 pub mod context;
 pub mod control;
+pub mod input_history;
 pub mod profile;
 pub mod queries;
 pub mod sessions;

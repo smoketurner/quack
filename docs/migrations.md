@@ -49,7 +49,7 @@ on the same file.
 
 Each workspace's `data.duckdb` holds the `_quack_` tables beside the user's tables and
 views: documents, chunks, terms, ontology, graph, provenance, merges, sessions, messages,
-saved questions and their runs, context, and audit detail (design doc section 5.4). `WorkspaceDb::open()` creates what is
+saved questions and their runs, the terminal's input history, context, and audit detail (design doc section 5.4). `WorkspaceDb::open()` creates what is
 missing and records `_quack_meta.schema_version`. A version bump can trigger a rebuild on
 open:
 

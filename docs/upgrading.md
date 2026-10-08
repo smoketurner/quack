@@ -21,6 +21,14 @@ Two rules hold for every release:
 says which will be upgraded on their next open, and, once they are current, whether their
 vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
 
+## Unreleased
+
+- Changed: the terminal keeps typed input in each workspace's file (`_quack_input_history`,
+  the newest 500 lines) instead of `<data_dir>/terminal_history`, which held every
+  workspace's questions and SQL outside any workspace file. The first terminal session
+  deletes that file; its lines are not carried over, so Up starts empty in every workspace.
+  The table needs no backfill and the schema version does not change.
+
 ## v2026.10.4
 
 - Breaking: `-w NAME` no longer creates a workspace that does not exist; it exits 2 (#434).
