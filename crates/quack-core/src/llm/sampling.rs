@@ -24,18 +24,28 @@
 //! or on `[providers.NAME.models."ID"]` for one model, replace these
 //! defaults and `[analysis]`'s efforts (`config::ModelSettings`).
 //!
+//! Every request to an Ollama model also carries the context window to load
+//! it with and how long to keep it loaded ([`OllamaLoad`]), whichever call
+//! sends it: a chat turn, graph extraction, a session title, an image.
+//!
 //! [`Sampled`] wraps every chat model and applies [`Sampling`] for the model
 //! id and the API it is called through, so the rules hold on every provider
 //! that hosts the model: the Anthropic API, Bedrock's Converse and
 //! OpenAI-compatible APIs, `OpenAI` itself, and any OpenAI-compatible gateway.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock, PoisonError};
+
 use rig::driver::{Exchange, Opening, Transport};
 use rig::operation::Completion;
+use rig::providers::ollama::extension::{KeepAlive, OllamaOptions};
+use rig::providers::openai::extension::OpenAiOptions;
 use serde_json::{Map, Value, json};
 
-use super::ChatModel;
+use super::{ChatModel, OLLAMA_KEEP_ALIVE};
 use crate::config::{BedrockApi, Effort, ProviderConfig, ProviderType};
 use crate::error::{Error, Result};
+use crate::text::Tokens;
 
 /// The output budget of a Claude model. Thinking counts against it, so it
 /// is sized for a streamed turn rather than for the answer text alone.
@@ -174,6 +184,8 @@ pub fn check_tool_calls(model: &str, wire: Wire, effort: Option<Effort>) -> Resu
 /// What a request to one model carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sampling {
+    /// The API the model is called through.
+    wire: Wire,
     /// Whether the requested `temperature` is sent.
     temperature: bool,
     /// The `max_tokens` a request that sets none is given.
@@ -182,6 +194,8 @@ pub struct Sampling {
     effort: Option<Map<String, Value>>,
     /// Why a configured effort is not sent, when it is not.
     unsent_effort: Option<String>,
+    /// The window and lifetime an Ollama model is loaded with.
+    ollama: Option<OllamaLoad>,
 }
 
 impl Sampling {
@@ -213,10 +227,12 @@ impl Sampling {
         };
         let temperature = temperature.unwrap_or(wire == Wire::Ollama);
         Ok(Self {
+            wire,
             temperature,
             max_tokens: (family == Family::Claude).then_some(CLAUDE_MAX_TOKENS),
             effort,
             unsent_effort,
+            ollama: None,
         })
     }
 
@@ -258,7 +274,21 @@ impl Sampling {
             merge(&mut params, effort);
             request.additional_params = Some(Value::Object(params));
         }
-        request
+        if self.wire == Wire::Responses {
+            // Neither Bedrock nor `OpenAI` keeps a copy of the conversation
+            // (Bedrock keeps one for 30 days by default), so no workspace
+            // content is stored outside the workspace file (design doc
+            // section 5). quack replays history itself and never uses
+            // `previous_response_id`.
+            request = request.provider_option(OpenAiOptions::default().store(false));
+        }
+        match &self.ollama {
+            Some(load) => {
+                let options = load.options(&request);
+                request.provider_option(options)
+            }
+            None => request,
+        }
     }
 }
 
@@ -276,7 +306,100 @@ impl std::fmt::Display for Sampling {
         if let Some(max_tokens) = self.max_tokens {
             write!(f, ", max_tokens {max_tokens}")?;
         }
+        if let Some(load) = &self.ollama {
+            write!(f, ", num_ctx up to {}", load.cap)?;
+        }
         Ok(())
+    }
+}
+
+/// What every request to one Ollama model carries: the context window to
+/// load it with, and `keep_alive`.
+///
+/// `num_ctx` is a load option: asking Ollama for a different value than the
+/// one the model is already loaded with forces a full model reload, which
+/// measured 4-5 seconds for `gpt-oss:20b` on this machine (`ollama serve`,
+/// repeated `/api/generate` calls that only changed `num_ctx`) against
+/// single-digit milliseconds for a request that keeps the same value. So the
+/// window a request asks for never shrinks while quack runs: a short
+/// background call between turns keeps the window the last turn loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OllamaLoad {
+    /// The server and model, which together name one loaded window.
+    model: String,
+    /// `[analysis].max_context_tokens`.
+    cap: Tokens,
+}
+
+impl OllamaLoad {
+    #[must_use]
+    pub fn new(server: &str, model: &str, cap: Tokens) -> Self {
+        Self {
+            model: format!("{server} {model}"),
+            cap,
+        }
+    }
+
+    fn options(&self, request: &rig::completion::CompletionRequest) -> OllamaOptions {
+        OllamaOptions::default()
+            .num_ctx(self.window(request).0)
+            .keep_alive(KeepAlive::duration(OLLAMA_KEEP_ALIVE))
+    }
+
+    /// The window for `request`: sized for what it sends, and no smaller
+    /// than the largest this process has asked the server to load the model
+    /// with.
+    fn window(&self, request: &rig::completion::CompletionRequest) -> OllamaWindow {
+        let sent = serde_json::to_string(&request.messages_for_telemetry())
+            .map_or(0, |m| m.len())
+            .saturating_add(serde_json::to_string(&request.tools).map_or(0, |t| t.len()));
+        let prompt = Tokens::of_chars(sent);
+        if prompt > self.cap {
+            tracing::warn!(
+                prompt_tokens = %prompt,
+                cap = %self.cap,
+                "the prompt is larger than [analysis].max_context_tokens; Ollama will truncate it"
+            );
+        }
+        let sized = OllamaWindow::for_prompt(prompt, self.cap);
+        let mut loaded = Self::loaded()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let window = loaded.entry(self.model.clone()).or_insert(sized);
+        *window = (*window).max(sized);
+        *window
+    }
+
+    /// The window each server and model was last asked for.
+    fn loaded() -> &'static Mutex<HashMap<String, OllamaWindow>> {
+        static LOADED: OnceLock<Mutex<HashMap<String, OllamaWindow>>> = OnceLock::new();
+        LOADED.get_or_init(Mutex::default)
+    }
+}
+
+/// The `num_ctx` to ask Ollama for: the prompt's estimated tokens plus
+/// room for tool results and the answer, rounded up to 8,192, between
+/// 8,192 and the cap. Ollama's default of 4,096 truncates the front of
+/// most workspace prompts, which loses the tool guidance and the question.
+/// The step is deliberately coarse (four tiers instead of one every 2,048
+/// tokens), so a growing conversation crosses it, and pays the reload, at
+/// most three times instead of up to twelve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct OllamaWindow(u32);
+
+impl OllamaWindow {
+    const HEADROOM: u32 = 8_192;
+    const FLOOR: u32 = 8_192;
+    const STEP: u32 = 8_192;
+
+    /// The window for a prompt of `prompt` tokens under `cap`.
+    fn for_prompt(prompt: Tokens, cap: Tokens) -> Self {
+        let needed = prompt.get().saturating_add(Self::HEADROOM);
+        let rounded = needed
+            .div_ceil(Self::STEP)
+            .saturating_mul(Self::STEP)
+            .max(Self::FLOOR);
+        Self(rounded.min(cap.get().max(Self::FLOOR)))
     }
 }
 
@@ -336,9 +459,10 @@ pub struct Sampled<W> {
 
 impl<W: rig::wire::Wire<Op = Completion>> Sampled<W> {
     /// `model`, served as the model named `id` through `wire` at `effort`,
-    /// sent `temperature` as [`Sampling::new`] decides, with its type
-    /// erased. An effort that is not sent is logged as a warning, since the
-    /// setting then does nothing.
+    /// sent `temperature` as [`Sampling::new`] decides, and loaded as
+    /// `ollama` says when it is an Ollama model, with its type erased. An
+    /// effort that is not sent is logged as a warning, since the setting
+    /// then does nothing.
     ///
     /// # Errors
     ///
@@ -350,8 +474,10 @@ impl<W: rig::wire::Wire<Op = Completion>> Sampled<W> {
         wire: Wire,
         effort: Option<Effort>,
         temperature: Option<bool>,
+        ollama: Option<OllamaLoad>,
     ) -> Result<ChatModel> {
-        let sampling = Sampling::new(id, wire, effort, temperature)?;
+        let mut sampling = Sampling::new(id, wire, effort, temperature)?;
+        sampling.ollama = ollama;
         if let Some(why) = sampling.unsent_effort() {
             tracing::warn!("{why}");
         }
@@ -753,5 +879,33 @@ mod tests {
             ..ProviderConfig::new(ProviderType::BedrockMantle)
         };
         assert_eq!(Wire::of(&mantle), Wire::Responses);
+    }
+
+    #[test]
+    fn the_ollama_window_rounds_up_within_bounds() {
+        let window =
+            |tokens, cap| OllamaWindow::for_prompt(Tokens::new(tokens), Tokens::new(cap)).0;
+        assert_eq!(window(0, 32_768), 8_192);
+        assert_eq!(window(1_000, 32_768), 16_384);
+        // 12,875 prompt tokens plus headroom rounds to 24,576.
+        assert_eq!(window(12_875, 32_768), 24_576);
+        assert_eq!(window(100_000, 32_768), 32_768);
+        assert_eq!(window(100_000, 2_048), 8_192);
+    }
+
+    /// A short call after a long one keeps the window the long one loaded,
+    /// so Ollama does not reload the model for it; another model on the
+    /// same server sizes its own.
+    #[test]
+    fn the_ollama_window_never_shrinks_for_a_model() {
+        let load = |model| OllamaLoad::new("http://window.test", model, Tokens::new(32_768));
+        let short = || rig::completion::CompletionRequest::new(rig::completion::Message::user("q"));
+        let long = rig::completion::CompletionRequest::new(rig::completion::Message::user(
+            "x".repeat(60_000),
+        ));
+        assert_eq!(load("a").window(&short()), OllamaWindow(16_384));
+        assert_eq!(load("a").window(&long), OllamaWindow(24_576));
+        assert_eq!(load("a").window(&short()), OllamaWindow(24_576));
+        assert_eq!(load("b").window(&short()), OllamaWindow(16_384));
     }
 }

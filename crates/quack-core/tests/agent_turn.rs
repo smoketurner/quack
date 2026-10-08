@@ -12,17 +12,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use jiff::Timestamp;
-use quack_core::analysis::agent::{AgentResponse, Analysis};
+use quack_core::analysis::agent::{AgentResponse, Analysis, CANCELLED_NOTE};
 use quack_core::analysis::events::{self, AgentEvent, ToolName};
 use quack_core::analysis::policy::{Approver, Hold, WritePolicy};
 use quack_core::analysis::search::DocumentScope;
-use quack_core::analysis::text_to_sql::PromptOptions;
+use quack_core::analysis::text_to_sql::{PromptOptions, Window};
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::{AnalysisConfig, GraphConfig, RetrievalConfig};
 use quack_core::embedding::{Dimension, Embedder, EmbeddingModel};
 use quack_core::error::Result as TurnResult;
 use quack_core::ids::{ChunkId, DocumentId};
 use quack_core::ingestion::parser::SectionKind;
+use quack_core::llm::CancellationToken;
 use quack_core::storage::sessions::{self, ChatMode, MessageRole};
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, Pinning, WorkspaceDb};
 use quack_core::storage::writer::Writer;
@@ -114,6 +115,8 @@ struct Ran {
 enum Answer {
     Allow,
     Deny,
+    /// Leave the request unanswered and cancel the turn.
+    Cancel,
 }
 
 impl Ran {
@@ -156,6 +159,7 @@ async fn run_turn_answering(
     let analysis_config = AnalysisConfig::default();
     let retrieval_config = RetrievalConfig::default();
     let (sink, mut stream) = events::channel();
+    let cancel = CancellationToken::new();
     let analysis = Analysis::<NoEmbedding> {
         db: Arc::clone(db),
         reader_db: ReaderDb::new(Arc::clone(db)),
@@ -172,24 +176,30 @@ async fn run_turn_answering(
             pinned_token_budget: Tokens::new(1_000),
             context: None,
             context_max_tokens: Tokens::new(1_000),
-            ollama_context_cap: None,
+            window: Window::Provider,
             scope: DocumentScope::default(),
             question: None,
         },
         history,
         message,
         asked: Instant::now(),
+        cancel: cancel.clone(),
     };
     let run = analysis.run(model.clone().erase(), None, None, sink);
     tokio::pin!(run);
     let mut events = Vec::new();
     let mut asked = Vec::new();
+    let mut unanswered = Vec::new();
     let mut take = |event| match event {
         AgentEvent::PermissionRequired(request) => {
             asked.push((request.sql.clone(), request.hold));
             match answer {
                 Answer::Allow => drop(request.allow()),
                 Answer::Deny => request.deny(),
+                Answer::Cancel => {
+                    unanswered.push(request);
+                    cancel.cancel();
+                }
             }
         }
         other => events.push(other),
@@ -203,6 +213,8 @@ async fn run_turn_answering(
     while let Ok(event) = stream.try_recv() {
         take(event);
     }
+    // A cancelling answer held its request unanswered until the turn ended.
+    assert_eq!(unanswered.is_empty(), !matches!(answer, Answer::Cancel));
     Ran {
         response,
         events,
@@ -530,6 +542,77 @@ async fn a_tool_name_in_the_wrong_case_is_repaired() {
         ["started:list_tables", "finished:list_tables"]
     );
     assert_eq!(model.request_count(), 2, "repaired without another try");
+}
+
+/// A turn cancelled between model calls ends with what it has: the text
+/// the model streamed, the steps that ran, and the note, and the write it
+/// was waiting on never runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_turn_keeps_its_text_and_steps() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![call("t1", "list_tables", serde_json::json!({}))]),
+        turn(vec![
+            text("Clearing the sales table."),
+            call("t2", "run_sql", serde_json::json!({ "query": DICTATED })),
+        ]),
+        turn(vec![text("Done.")]),
+    ]);
+    // A turn that missed the cancellation would wait on the unanswered
+    // write for good.
+    let ran = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_turn_answering(
+            &db,
+            &model,
+            WritePolicy::Ask,
+            Vec::new(),
+            "clear sales",
+            Answer::Cancel,
+        ),
+    )
+    .await
+    .unwrap();
+    let answer = ran.answer();
+    assert!(answer.cancelled);
+    assert_eq!(
+        answer.content,
+        format!("Clearing the sales table.\n\n{CANCELLED_NOTE}")
+    );
+    assert_eq!(
+        answer.steps.first().map(|s| s.tool),
+        Some(ToolName::ListTables)
+    );
+    assert_eq!(sales_rows(&db).await, 2);
+    assert_eq!(model.request_count(), 2, "no model call after the cancel");
+}
+
+/// A statement that fails comes back to the model with `DuckDB`'s own text,
+/// so it can correct the column and run it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_statement_reaches_the_model_with_its_error() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![call(
+            "t1",
+            "run_sql",
+            serde_json::json!({ "query": "SELECT sum(revenu) FROM sales" }),
+        )]),
+        turn(vec![call(
+            "t2",
+            "run_sql",
+            serde_json::json!({ "query": "SELECT sum(revenue) AS total FROM sales" }),
+        )]),
+        turn(vec![text("Revenue totals 30.")]),
+    ]);
+    let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "revenue?").await;
+    assert_eq!(ran.answer().content, "Revenue totals 30.");
+    let retry = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
+    assert!(
+        retry.contains("SQL error: ") && retry.contains("revenue"),
+        "{retry}"
+    );
+    assert!(!retry.contains("the tool failed"), "{retry}");
 }
 
 /// The answer keeps what a call said before its tools ran and drops what

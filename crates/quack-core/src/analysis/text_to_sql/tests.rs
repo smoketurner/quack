@@ -53,7 +53,7 @@ fn options(mode: ChatMode, pinned: u32) -> PromptOptions {
         pinned_token_budget: Tokens::new(pinned),
         context: None,
         context_max_tokens: Tokens::new(4000),
-        ollama_context_cap: None,
+        window: Window::Provider,
         scope: DocumentScope::default(),
         question: None,
     }

@@ -18,7 +18,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::search::DocumentScope;
-use quack_core::analysis::text_to_sql::{self, PromptOptions};
+use quack_core::analysis::text_to_sql::{self, PromptOptions, Window};
 use quack_core::embedding::Dimension;
 use quack_core::ids::{ChunkId, DocumentId};
 use quack_core::ingestion::parser::SectionKind;
@@ -97,7 +97,7 @@ fn prompt(c: &mut Criterion) {
             "This workspace tracks insurance claims and their supporting policy documents.",
         )),
         context_max_tokens: Tokens::new(2_000),
-        ollama_context_cap: None,
+        window: Window::Provider,
         scope: DocumentScope::default(),
         question: None,
     };

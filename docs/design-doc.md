@@ -1518,7 +1518,7 @@ for `OpenAI` and unrecognized models on those APIs, `think` on Ollama). A level 
 lacks is refused before the call, and so is a GPT-5.6 model on Chat Completions, because it
 cannot call tools there. `temperature`, `effort`, and `background_effort` on a provider, or on
 one of its `models."ID"`, override the defaults and `[analysis]` (`docs/providers.md`). The turn races a
-`CancellationToken`; a cancelled turn keeps the text streamed so far, appends a note, reports `cancelled: true`, and is recorded.
+`CancellationToken`; a turn cancelled while the model is streaming keeps the text, steps, citations, and usage it has so far, appends a note, reports `cancelled: true`, and is recorded. One cancelled while its prompt is assembled, before any model call, records the note alone.
 
 `llm::TurnRequest::run` yields these events on a channel. The web UI turns them into HTML
 fragments over SSE; REST forwards them as typed SSE events or collects one JSON response;
@@ -1602,14 +1602,18 @@ The guidance always names the table, SQL, chart and document tools; only the gra
 are conditional. Mode changes no registration; query mode only drops provisional graph
 results.
 
-**Ollama.** Every request carries `num_ctx`, because Ollama otherwise loads the model with a
-4,096-token window and silently truncates the front of the prompt. It is the prompt's
-estimated tokens plus a fixed 8,192-token headroom for tool results and answer, rounded up
-to 8,192, capped by `[analysis].max_context_tokens`, never below 8,192. `num_ctx` is a load
-option: a changed value forces a full reload (measured: several seconds for a 20B model).
-The coarse step means a growing session's history crosses it a few times at most, not every
-2,048 tokens. Every request also carries `keep_alive` (30 minutes), since otherwise a gap
-between tool calls or turns pays the same reload once Ollama's default (5 minutes) lapses.
+**Ollama.** Every chat-model request carries `num_ctx`: a turn's model calls, graph
+extraction, the ontology's document pass, session titles, and image reading
+(`llm::sampling::OllamaLoad`, sent as rig's `OllamaOptions`). Ollama otherwise loads the
+model with a 4,096-token window and silently truncates the front of the prompt. It is the
+request's estimated tokens plus a fixed 8,192-token headroom for tool results and answer,
+rounded up to 8,192, capped by `[analysis].max_context_tokens`, never below 8,192. `num_ctx`
+is a load option: a changed value forces a full reload (measured: several seconds for a 20B
+model). So the window quack asks for never shrinks for a server and model while quack runs:
+a short background call between turns keeps the window the last turn loaded, and the coarse
+step means a growing session crosses it a few times at most, not every 2,048 tokens. Every
+request also carries `keep_alive` (30 minutes), since otherwise a gap between tool calls or
+turns pays the same reload once Ollama's default (5 minutes) lapses.
 
 Embedding requests go through quack's own `/api/embed` client (`llm::OllamaEmbedder`),
 because rig's sends neither option. They carry the same `keep_alive`, so the embedding model

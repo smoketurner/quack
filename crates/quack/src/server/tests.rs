@@ -7161,8 +7161,8 @@ async fn a_stopping_server_closes_its_runs_and_refuses_new_work_on_the_record() 
 /// turn is audited.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopping_server_cancels_an_mcp_query_turn_on_the_record() {
+    use quack_core::analysis::agent::CANCELLED_NOTE;
     use quack_core::config::Config;
-    use quack_core::llm::CANCELLED_NOTE;
 
     // A model that accepts the connection and never answers.
     let silent = tokio::net::TcpListener::bind("127.0.0.1:0")

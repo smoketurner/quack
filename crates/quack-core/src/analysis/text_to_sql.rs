@@ -67,15 +67,24 @@ pub struct PromptOptions {
     pub context: Option<String>,
     /// Budget for `context` (four characters per token).
     pub context_max_tokens: Tokens,
-    /// For Ollama, the cap on the context window the turn requests
-    /// (`[analysis].max_context_tokens`); `None` for providers that size
-    /// their own.
-    pub ollama_context_cap: Option<Tokens>,
+    /// Who sizes the model's context window.
+    pub window: Window,
     /// The documents the person limited the question to.
     pub scope: DocumentScope,
     /// The turn's question, which ranks the tables in a workspace with
     /// more than the prompt describes; `None` leaves the ranking out.
     pub question: Option<Question>,
+}
+
+/// Who sizes the model's context window, which decides what a cut-off turn
+/// tells the person to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// The provider sizes its own.
+    Provider,
+    /// Ollama, at a size quack asks for up to `[analysis].max_context_tokens`
+    /// (`llm::sampling::OllamaLoad`).
+    Ollama,
 }
 
 /// The question a turn asks, and its embedding when a model made one.
