@@ -610,6 +610,12 @@ CREATE TABLE _quack_session_summaries (
     summary TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT now()
 );
+-- the terminal's typed input, newest 500 kept (section 11)
+CREATE TABLE _quack_input_history (
+    id       TEXT PRIMARY KEY,                  -- UUID v7, so ids sort in typing order
+    line     TEXT NOT NULL,
+    typed_at TIMESTAMP DEFAULT now()
+);
 
 -- workspace audit detail (section 12): what was done, inside the boundary
 CREATE TABLE _quack_audit (
@@ -2579,7 +2585,7 @@ a job is active. Every waiting message is applied before the next draw.
 show a three-line preview until `/steps` expands them (print mode folds the same way without
 `--verbose`). An answer's chart is drawn in the transcript under its text and scrolls with it.
 Lines wrap to the terminal width before the scroll range is computed, so the end is always
-reachable. Typed input persists in `<data_dir>/terminal_history`. A relative path to an
+reachable. Typed input persists per workspace in `_quack_input_history` (the newest 500 lines). A relative path to an
 existing file ingests it. An embedding provider is optional (keyword search without one).
 
 | Key | Action |

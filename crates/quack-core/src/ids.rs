@@ -246,6 +246,11 @@ id_type!(
 );
 
 id_type!(
+    /// A line typed at the terminal prompt.
+    InputLineId
+);
+
+id_type!(
     /// A write a turn waits on a person to decide.
     PermissionId
 );
