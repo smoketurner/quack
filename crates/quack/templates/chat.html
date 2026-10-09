@@ -37,7 +37,7 @@
     <div id="empty" class="rounded border border-slate-800 bg-slate-900 p-4 text-sm text-slate-400 wrap-anywhere">
       <p>{% if let Some(current) = current %}This session has no messages yet.{% else %}Ask about what this workspace holds.{% endif %}</p>
       {% if !tables.is_empty() %}<p class="mt-2"><span class="font-medium text-slate-200">{{ tables.len() }} tables:</span> {{ tables.join(", ") }}</p>{% endif %}
-      {% if !documents.is_empty() %}<p class="mt-2"><span class="font-medium text-slate-200">{{ documents.len() }} documents:</span> {% for d in documents %}{% if !loop.first %}, {% endif %}{{ d.display_name() }}{% endfor %}</p>{% endif %}
+      {% if !documents.is_empty() %}<p class="mt-2"><span class="font-medium text-slate-200">{{ documents_total }} documents:</span> {% for d in documents %}{% if !loop.first %}, {% endif %}{{ d.display_name() }}{% endfor %}{% if documents_total > documents.len() %}, and {{ documents_total - documents.len() }} more{% endif %}</p>{% endif %}
       {% if tables.is_empty() && documents.is_empty() %}<p class="mt-2">Nothing yet: <a class="text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/documents">upload documents or tables</a> first.</p>{% endif %}
       <p class="mt-2 text-slate-400">Enter sends; Shift+Enter adds a line.</p>
     </div>

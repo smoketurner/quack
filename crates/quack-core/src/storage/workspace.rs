@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use aws_lc_rs::digest;
+use duckdb::OptionalExt as _;
 use jiff::civil::DateTime;
 
 use std::collections::BTreeMap;
@@ -28,7 +29,7 @@ use crate::saved;
 use crate::storage::control::ResourceKind;
 use crate::storage::input_history;
 use crate::storage::profile::{self, ColumnType, ColumnWarning, TableNote, TableProfile};
-use crate::text::OneLine;
+use crate::text::{OneLine, Tokens};
 
 mod terms;
 
@@ -801,11 +802,20 @@ impl Vectors {
     }
 }
 
-/// A pinned document with its full text, chunks joined in order.
+/// A pinned document and its text, if the text fit the budget.
 #[derive(Debug, Clone)]
 pub struct PinnedDocument {
     pub document: DocumentInfo,
-    pub text: String,
+    pub text: PinnedText,
+}
+
+/// What a pinned document brings to the prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinnedText {
+    /// Its full text, chunks joined in order.
+    Included(String),
+    /// Nothing: its text would pass the budget, so it was never read.
+    OverBudget,
 }
 
 /// Whether a document is sent to the model in full on every turn.
@@ -3150,28 +3160,45 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    /// Full text of every pinned document, in chunk order.
+    /// Every live pinned document, newest first, with its full text while
+    /// the texts fit `budget` in that order. The size of each text is
+    /// summed in SQL first, so a pinned text past the budget is never read.
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn pinned_documents(&self) -> Result<Vec<PinnedDocument>> {
-        let mut out = Vec::new();
-        for doc in self
-            .list_documents()?
-            .into_iter()
-            .filter(|d| d.pinning == Pinning::Pinned)
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT content FROM _quack_chunks WHERE document_id = ? ORDER BY chunk_index",
+    pub fn pinned_documents(&self, budget: Tokens) -> Result<Vec<PinnedDocument>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} AND COALESCE(pinned, false) \
+             ORDER BY ingested_at DESC, id DESC"
+        ))?;
+        let documents = stmt
+            .query_map([], |row| DocumentInfo::try_from(row))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        let mut used = Tokens::default();
+        let mut out = Vec::with_capacity(documents.len());
+        for document in documents {
+            // The chunks joined by line breaks, as `Tokens::estimate` counts them.
+            let bytes: u64 = self.conn.query_row(
+                "SELECT COALESCE(sum(strlen(content)) + count(*) - 1, 0) \
+                 FROM _quack_chunks WHERE document_id = ?",
+                duckdb::params![document.id],
+                |row| row.get(0),
             )?;
-            let parts = stmt
-                .query_map(duckdb::params![doc.id], |row| row.get::<_, String>(0))?
-                .collect::<duckdb::Result<Vec<_>>>()?;
-            out.push(PinnedDocument {
-                document: doc,
-                text: parts.join("\n"),
-            });
+            let cost = Tokens::of_chars(usize::try_from(bytes).unwrap_or(usize::MAX));
+            let text = if used.saturating_add(cost) > budget {
+                PinnedText::OverBudget
+            } else {
+                used = used.saturating_add(cost);
+                let mut stmt = self.conn.prepare(
+                    "SELECT content FROM _quack_chunks WHERE document_id = ? ORDER BY chunk_index",
+                )?;
+                let parts = stmt
+                    .query_map(duckdb::params![document.id], |row| row.get::<_, String>(0))?
+                    .collect::<duckdb::Result<Vec<_>>>()?;
+                PinnedText::Included(parts.join("\n"))
+            };
+            out.push(PinnedDocument { document, text });
         }
         Ok(out)
     }
@@ -3661,40 +3688,73 @@ impl WorkspaceDb {
         Ok((docs, usize::try_from(total).unwrap_or(usize::MAX)))
     }
 
-    /// Every document with its status, newest first, failed ones with
-    /// their reason: what the workspace holds now. A replaced document is
-    /// left out ([`Self::list_all_documents`] has it).
+    /// One page of the documents `listing` asks for, newest first, failed
+    /// ones with their reason, and how many there are across every page.
+    /// A page holds at most [`DocumentListing::MAX_PAGE`] rows, so a
+    /// listing costs the same in a workspace of any size.
     ///
     /// # Errors
     ///
-    /// Returns an error if the query fails.
-    pub fn list_documents(&self) -> Result<Vec<DocumentInfo>> {
-        let sql =
-            format!("{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} ORDER BY ingested_at DESC, id DESC");
-        let mut stmt = self.conn.prepare(&sql)?;
-        let docs = stmt.query_map([], |row| DocumentInfo::try_from(row))?;
-        Ok(docs.collect::<duckdb::Result<_>>()?)
-    }
-
-    /// The documents [`Self::list_documents`] lists that `filter` lets
-    /// through.
-    ///
-    /// # Errors
-    ///
-    /// An unknown file type, `since` after `until`, or a failed query.
-    pub fn list_documents_matching(&self, filter: &DocumentFilter) -> Result<Vec<DocumentInfo>> {
-        let clause = filter.clause()?;
-        let sql = format!(
-            "{DOCUMENT_SELECT} d WHERE {NOT_SUPERSEDED}{} ORDER BY ingested_at DESC, id DESC",
-            clause.sql
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
+    /// An unknown file type, `since` after `until`, an `after` that names
+    /// no document, or a failed query.
+    pub fn documents(&self, listing: &DocumentListing) -> Result<DocumentPage> {
+        let clause = listing.filter.clause()?;
+        let shown = listing.shown.condition();
         let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(clause.params.len());
         for param in &clause.params {
             params.push(param);
         }
-        let docs = stmt.query_map(params.as_slice(), |row| DocumentInfo::try_from(row))?;
-        Ok(docs.collect::<duckdb::Result<_>>()?)
+        let total: u64 = self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM _quack_documents d WHERE {shown}{}",
+                clause.sql
+            ),
+            params.as_slice(),
+            |row| row.get(0),
+        )?;
+        let cursor = match &listing.after {
+            None => None,
+            Some(after) => Some((
+                self.conn
+                    .query_row(
+                        "SELECT CAST(ingested_at AS VARCHAR) FROM _quack_documents WHERE id = ?",
+                        duckdb::params![after],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| ResourceKind::Document.missing(after.as_str()))?,
+                after,
+            )),
+        };
+        let mut sql = format!("{DOCUMENT_SELECT} d WHERE {shown}{}", clause.sql);
+        if let Some((at, after)) = &cursor {
+            sql.push_str(
+                " AND (d.ingested_at < ?::TIMESTAMP OR (d.ingested_at = ?::TIMESTAMP AND d.id < ?))",
+            );
+            params.push(at);
+            params.push(at);
+            params.push(after);
+        }
+        sql.push_str(" ORDER BY ingested_at DESC, id DESC LIMIT ?");
+        let limit = listing.limit.clamp(1, DocumentListing::MAX_PAGE);
+        let fetch = i64::from(limit).saturating_add(1);
+        params.push(&fetch);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut documents = stmt
+            .query_map(params.as_slice(), |row| DocumentInfo::try_from(row))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        let more = documents.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+        documents.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        let next = if more {
+            documents.last().map(|d| d.id.clone())
+        } else {
+            None
+        };
+        Ok(DocumentPage {
+            documents,
+            next,
+            total,
+        })
     }
 
     /// The live document a person or the model named: by id, exact file
@@ -3800,20 +3860,6 @@ impl WorkspaceDb {
             duckdb::params![want],
             |row| row.get(0),
         )?)
-    }
-
-    /// Every document row, replaced ones included, newest first: the
-    /// listing behind `quack docs --all` and the Documents page's
-    /// "show replaced" view.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the query fails.
-    pub fn list_all_documents(&self) -> Result<Vec<DocumentInfo>> {
-        let sql = format!("{DOCUMENT_SELECT} ORDER BY ingested_at DESC, id DESC");
-        let mut stmt = self.conn.prepare(&sql)?;
-        let docs = stmt.query_map([], |row| DocumentInfo::try_from(row))?;
-        Ok(docs.collect::<duckdb::Result<_>>()?)
     }
 
     /// Access the underlying `DuckDB` connection.
@@ -4887,6 +4933,76 @@ impl DocumentFilter {
         }
         Ok(clause)
     }
+}
+
+/// Which documents a listing shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Shown {
+    /// What the workspace holds now: a replaced document is left out.
+    #[default]
+    Live,
+    /// Replaced documents too, each naming its replacement.
+    All,
+}
+
+impl Shown {
+    /// The condition on `_quack_documents d` that keeps what it shows.
+    const fn condition(self) -> &'static str {
+        match self {
+            Self::Live => NOT_SUPERSEDED,
+            Self::All => "true",
+        }
+    }
+}
+
+/// What [`WorkspaceDb::documents`] lists: which documents, narrowed by a
+/// filter, one page after `after`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentListing {
+    pub shown: Shown,
+    pub filter: DocumentFilter,
+    /// The last document of the page before; `None` starts at the newest.
+    pub after: Option<DocumentId>,
+    /// Documents a page holds, within 1 and [`Self::MAX_PAGE`].
+    pub limit: u32,
+}
+
+impl DocumentListing {
+    /// Documents a page holds unless the caller asks for fewer or more.
+    pub const PAGE: u32 = 100;
+    /// Documents a page holds at most.
+    pub const MAX_PAGE: u32 = 500;
+
+    /// The first page of the live documents, `limit` long.
+    #[must_use]
+    pub fn first(limit: u32) -> Self {
+        Self {
+            limit,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for DocumentListing {
+    fn default() -> Self {
+        Self {
+            shown: Shown::Live,
+            filter: DocumentFilter::default(),
+            after: None,
+            limit: Self::PAGE,
+        }
+    }
+}
+
+/// One page of a document listing.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct DocumentPage {
+    pub documents: Vec<DocumentInfo>,
+    /// The `after` that asks for the next page; absent on the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<DocumentId>,
+    /// Documents the listing holds across every page.
+    pub total: u64,
 }
 
 /// A [`DocumentFilter`] as SQL: conditions on `_quack_documents d` and their

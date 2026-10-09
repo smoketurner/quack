@@ -1356,7 +1356,10 @@ fn page_counts_are_stored_on_the_document_and_cleared_with_none() {
             Some(String::from("3 of 40 pages unreadable, 2 without text"))
         ))
     );
-    let listed = db.list_documents().unwrap_or_else(|e| fail(&e.to_string()));
+    let listed = db
+        .documents(&DocumentListing::default())
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .documents;
     assert_eq!(listed.first().and_then(|doc| doc.pages), Some(counts));
 
     db.set_document_pages(&id, None)
@@ -2620,8 +2623,12 @@ fn a_document_filter_narrows_the_listing_and_both_search_legs() {
     filtered_documents(&db);
     let listed = |filter: DocumentFilter| -> Vec<String> {
         let mut ids: Vec<String> = db
-            .list_documents_matching(&filter)
+            .documents(&DocumentListing {
+                filter,
+                ..DocumentListing::default()
+            })
             .unwrap_or_else(|e| fail(&e.to_string()))
+            .documents
             .into_iter()
             .map(|d| d.id.into_string())
             .collect();
@@ -2701,9 +2708,12 @@ fn a_bad_document_filter_is_refused_with_the_reason() {
     let db =
         WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
     let unknown = db
-        .list_documents_matching(&DocumentFilter {
-            types: vec![String::from("klingon")],
-            ..DocumentFilter::default()
+        .documents(&DocumentListing {
+            filter: DocumentFilter {
+                types: vec![String::from("klingon")],
+                ..DocumentFilter::default()
+            },
+            ..DocumentListing::default()
         })
         .err()
         .map(|e| e.to_string());
@@ -2832,4 +2842,165 @@ fn forget_user_rewrites_every_table_that_names_a_person() {
             .unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(left, 0, "{table}.{column}");
     }
+}
+
+/// A listing pages newest first with the last document's id as the cursor,
+/// ties on the ingest time broken by id, and counts every page's documents.
+#[test]
+fn documents_page_by_cursor_and_count_them_all() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    // One transaction, so every row shares its ingest time.
+    db.write_transaction(|db| {
+        for i in 1..=5 {
+            db.insert_document(&NewDocument::new(
+                &DocumentId::from(format!("doc-{i}")),
+                &format!("f{i}.md"),
+                "text/markdown",
+                1,
+            ))?;
+        }
+        db.insert_document(
+            &NewDocument::new(&DocumentId::from("doc-0"), "old.md", "text/markdown", 1)
+                .with_status(DocumentStatus::Superseded),
+        )
+    })
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let pages = |shown: Shown| -> Vec<(Vec<String>, u64)> {
+        let mut listing = DocumentListing {
+            shown,
+            ..DocumentListing::first(2)
+        };
+        let mut pages = Vec::new();
+        loop {
+            let page = db
+                .documents(&listing)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            pages.push((
+                page.documents
+                    .into_iter()
+                    .map(|d| d.id.into_string())
+                    .collect(),
+                page.total,
+            ));
+            let Some(next) = page.next else {
+                return pages;
+            };
+            listing.after = Some(next);
+        }
+    };
+    let ids = |page: &[&str]| page.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        pages(Shown::Live),
+        [
+            (ids(&["doc-5", "doc-4"]), 5),
+            (ids(&["doc-3", "doc-2"]), 5),
+            (ids(&["doc-1"]), 5),
+        ]
+    );
+    assert_eq!(
+        pages(Shown::All).last(),
+        Some(&(ids(&["doc-1", "doc-0"]), 6))
+    );
+    // A page that ends the listing exactly has no next.
+    let whole = db
+        .documents(&DocumentListing::first(5))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!((whole.documents.len(), whole.next), (5, None));
+    // A zero limit still lists one; a huge one is held to the cap.
+    assert_eq!(
+        db.documents(&DocumentListing::first(0))
+            .map(|p| p.documents.len())
+            .ok(),
+        Some(1)
+    );
+    assert_eq!(
+        db.documents(&DocumentListing::first(u32::MAX))
+            .map(|p| p.documents.len())
+            .ok(),
+        Some(5)
+    );
+    let gone = db.documents(&DocumentListing {
+        after: Some(DocumentId::from("doc-x")),
+        ..DocumentListing::default()
+    });
+    assert!(matches!(gone, Err(Error::NotFound { .. })), "{gone:?}");
+}
+
+/// A filter narrows every page and the total alike.
+#[test]
+fn a_filtered_listing_pages_and_counts_only_what_matches() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    filtered_documents(&db);
+    let listing = DocumentListing {
+        filter: DocumentFilter {
+            types: vec![String::from("pdf"), String::from("md")],
+            ..DocumentFilter::default()
+        },
+        ..DocumentListing::first(1)
+    };
+    let first = db
+        .documents(&listing)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let second = db
+        .documents(&DocumentListing {
+            after: first.next.clone(),
+            ..listing
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let mut seen: Vec<String> = first
+        .documents
+        .iter()
+        .chain(&second.documents)
+        .map(|d| d.id.to_string())
+        .collect();
+    seen.sort();
+    assert_eq!(seen, ["md", "pdf"]);
+    assert_eq!((first.total, second.total, second.next), (2, 2, None));
+}
+
+/// Pinned texts come in newest first while they fit the budget; one past
+/// it is named but never read, and a smaller one after it still fits.
+#[test]
+fn pinned_text_past_the_budget_is_not_read() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    for (id, text) in [
+        ("small-old", "abcd"),
+        ("big", &"x".repeat(400)),
+        ("small-new", "efgh"),
+    ] {
+        let doc = DocumentId::from(id);
+        db.insert_document(
+            &NewDocument::new(&doc, &format!("{id}.md"), "text/markdown", 1)
+                .with_status(DocumentStatus::Ready),
+        )
+        .and_then(|()| db.set_document_pinning(&doc, Pinning::Pinned))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        insert_text_chunk(&db, &format!("{id}-c0"), id, 0, text);
+        insert_text_chunk(&db, &format!("{id}-c1"), id, 1, "z");
+    }
+    let pinned = db
+        .pinned_documents(Tokens::new(10))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let seen: Vec<(&str, &PinnedText)> = pinned
+        .iter()
+        .map(|p| (p.document.id.as_str(), &p.text))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("small-new", &PinnedText::Included(String::from("efgh\nz"))),
+            ("big", &PinnedText::OverBudget),
+            ("small-old", &PinnedText::Included(String::from("abcd\nz"))),
+        ]
+    );
+    // The SQL size matches the estimate of the joined text exactly: a
+    // budget one token short of a text leaves it out.
+    let exact = Tokens::estimate("efgh\nz");
+    let short = db
+        .pinned_documents(Tokens::new(exact.get().saturating_sub(1)))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(short.iter().all(|p| p.text == PinnedText::OverBudget));
 }

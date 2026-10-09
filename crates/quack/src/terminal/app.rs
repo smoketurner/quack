@@ -52,7 +52,7 @@ use quack_core::storage::sessions::{
     Transcript,
 };
 use quack_core::storage::workspace::{
-    Pinning, QueryCanceller, QueryResults, SqlSchema, StatementKind, WorkspaceDb,
+    DocumentListing, Pinning, QueryCanceller, QueryResults, SqlSchema, StatementKind, WorkspaceDb,
 };
 use quack_core::text::OneLine;
 use quack_core::vault::Vault;
@@ -2671,13 +2671,14 @@ impl App {
     }
 
     fn show_documents(&mut self) {
-        self.on_db_ok(Side::Read, WorkspaceDb::list_documents, |app, docs| {
-            if docs.is_empty() {
+        let read = |db: &WorkspaceDb| db.documents(&DocumentListing::default());
+        self.on_db_ok(Side::Read, read, |app, page| {
+            if page.documents.is_empty() {
                 app.note(MessageKind::System, "No documents yet.");
                 return;
             }
             let mut text = String::from("Documents:");
-            for doc in docs {
+            for doc in &page.documents {
                 let pages = doc
                     .pages
                     .and_then(PageCounts::note)
@@ -2694,6 +2695,14 @@ impl App {
                     doc.filename
                 );
                 text.push_str(&line);
+            }
+            if page.next.is_some() {
+                let more = format!(
+                    "\nThe newest {} of {}; `quack docs` lists them all.",
+                    page.documents.len(),
+                    page.total
+                );
+                text.push_str(&more);
             }
             text.push_str("\nUse /pin ID or /unpin ID.");
             app.note(MessageKind::System, text);

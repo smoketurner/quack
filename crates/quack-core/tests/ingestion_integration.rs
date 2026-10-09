@@ -24,10 +24,12 @@ use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::control::{ControlPlane, WorkspaceName};
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::workspace::{
-    ChunkScope, DocumentFields, DocumentSource, DocumentStatus, HybridLimits, MetaKey, NewChunk,
-    NewDocument, Pinning, StatementKind, WorkspaceDb,
+    ChunkScope, DocumentFields, DocumentInfo, DocumentListing, DocumentSource, DocumentStatus,
+    HybridLimits, MetaKey, NewChunk, NewDocument, PinnedText, Pinning, Shown, StatementKind,
+    WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
+use quack_core::text::Tokens;
 use quack_core::{import, ingestion};
 use rig::ProviderError;
 use rig::embeddings::Embedding;
@@ -605,8 +607,9 @@ async fn malformed_and_empty_delimited_files_are_refused() {
         "{empty:?}"
     );
     assert!(
-        db.list_documents()
+        db.documents(&DocumentListing::default())
             .unwrap()
+            .documents
             .iter()
             .all(|d| d.filename != "empty.csv")
     );
@@ -638,8 +641,9 @@ async fn ingest_and_persisted(
     );
     let err = result.unwrap_err();
     let doc = db
-        .list_documents()
+        .documents(&DocumentListing::default())
         .unwrap()
+        .documents
         .into_iter()
         .find(|d| d.filename == filename)
         .unwrap();
@@ -884,7 +888,12 @@ async fn ingest_empty_text_file_is_refused() {
         matches!(&result, Err(Error::EmptyFile(name)) if name == "empty.txt"),
         "{result:?}"
     );
-    assert!(db.list_documents().unwrap().is_empty());
+    assert!(
+        db.documents(&DocumentListing::default())
+            .unwrap()
+            .documents
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1661,7 +1670,7 @@ fn legacy_unprefixed_tables_are_renamed_on_open() {
         .unwrap();
     }
     let db = WorkspaceDb::open(&config, "ws-legacy").unwrap();
-    let docs = db.list_documents().unwrap();
+    let docs = db.documents(&DocumentListing::default()).unwrap().documents;
     assert_eq!(docs.len(), 1);
     let old = docs.first().unwrap();
     assert_eq!(old.filename, "old.txt");
@@ -2105,12 +2114,21 @@ async fn ingest_markdown_stores_headings_and_pinned_flag() {
         Some(Some("Claims"))
     );
 
-    let doc = db.list_documents().unwrap().into_iter().next().unwrap();
+    let doc = db
+        .documents(&DocumentListing::default())
+        .unwrap()
+        .documents
+        .into_iter()
+        .next()
+        .unwrap();
     assert_eq!(doc.pinning, Pinning::Unpinned);
     db.set_document_pinning(&doc.id, Pinning::Pinned).unwrap();
-    let pinned = db.pinned_documents().unwrap();
+    let pinned = db.pinned_documents(Tokens::new(u32::MAX)).unwrap();
     assert_eq!(pinned.len(), 1);
-    assert!(pinned.first().unwrap().text.contains("Flood is excluded."));
+    assert!(matches!(
+        &pinned.first().unwrap().text,
+        PinnedText::Included(text) if text.contains("Flood is excluded.")
+    ));
 }
 
 #[tokio::test]
@@ -2154,7 +2172,13 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
         ingestion::IngestOutcome::Ingested(_) => None,
     };
     assert_eq!(existing.map(|d| d.id), Some(first.document_id.clone()));
-    assert_eq!(db.list_documents().unwrap().len(), 1);
+    assert_eq!(
+        db.documents(&DocumentListing::default())
+            .unwrap()
+            .documents
+            .len(),
+        1
+    );
 
     // An explicit title wins over the parsed heading.
     let titled = ingestion::ingest_file(
@@ -2184,8 +2208,9 @@ async fn identical_bytes_are_skipped_and_a_failed_document_is_retried() {
     .await;
     assert!(failed.is_err());
     let errored = db
-        .list_documents()
+        .documents(&DocumentListing::default())
         .unwrap()
+        .documents
         .into_iter()
         .find(|d| d.filename == "scan.pdf")
         .unwrap();
@@ -2493,7 +2518,7 @@ async fn workbook_colliding_sheet_names_fail_instead_of_overwriting_a_sheet() {
 
     // The document row records the failure — not `ready` with a duplicated
     // `tables` list advertising a table that no longer holds its sheet's data.
-    let docs = db.list_documents().unwrap();
+    let docs = db.documents(&DocumentListing::default()).unwrap().documents;
     assert_eq!(docs.len(), 1, "one document row for the failed ingest");
     let doc = docs.first().unwrap();
     assert_eq!(doc.status, DocumentStatus::Error);
@@ -2515,7 +2540,12 @@ async fn workbook_colliding_sheet_names_fail_instead_of_overwriting_a_sheet() {
         db.delete_document(&doc.id).unwrap(),
         "the error document can be deleted"
     );
-    assert!(db.list_documents().unwrap().is_empty());
+    assert!(
+        db.documents(&DocumentListing::default())
+            .unwrap()
+            .documents
+            .is_empty()
+    );
     assert!(db.list_tables().unwrap().is_empty());
     assert_eq!(std::fs::read_dir(&files_dir).unwrap().count(), 0);
 }
@@ -2610,7 +2640,7 @@ async fn workbook_colliding_sheet_names_with_an_underscore_in_one_name_are_refus
         0,
         "no per-sheet CSVs should be written on a refused collision"
     );
-    let docs = db.list_documents().unwrap();
+    let docs = db.documents(&DocumentListing::default()).unwrap().documents;
     assert_eq!(docs.len(), 1);
     let doc = docs.first().unwrap();
     assert_eq!(doc.status, DocumentStatus::Error);
@@ -2660,8 +2690,9 @@ async fn office_and_html_documents_are_chunked_with_titles() {
     .await;
     assert!(failed.is_err());
     let errored = db
-        .list_documents()
+        .documents(&DocumentListing::default())
         .unwrap()
+        .documents
         .into_iter()
         .find(|d| d.filename == "deck.pptx")
         .unwrap();
@@ -2749,8 +2780,7 @@ async fn an_image_without_a_vision_model_is_refused() {
         "{refused:?}"
     );
     assert!(
-        !db.list_all_documents()
-            .unwrap()
+        !every_document(&db)
             .iter()
             .any(|d| d.filename == "chart.png")
     );
@@ -2781,9 +2811,7 @@ async fn an_image_the_model_cannot_read_leaves_no_file() {
     )
     .await;
     assert!(failed.is_err());
-    let document = db
-        .list_all_documents()
-        .unwrap()
+    let document = every_document(&db)
         .into_iter()
         .find(|d| d.filename == "chart.png")
         .unwrap();
@@ -2924,8 +2952,9 @@ async fn a_file_that_inflates_past_the_limit_ends_in_error_and_a_normal_one_load
         .unwrap();
         assert!(matches!(&err, Error::Ingestion(_)), "{filename}: {err}");
         let doc = db
-            .list_documents()
+            .documents(&DocumentListing::default())
             .unwrap()
+            .documents
             .into_iter()
             .find(|d| d.filename == *filename)
             .unwrap();
@@ -3187,8 +3216,9 @@ async fn failed_documents_are_not_searchable_and_leave_no_chunks() {
     .await;
     assert!(failed.is_err());
     let doc = db
-        .list_documents()
+        .documents(&DocumentListing::default())
         .unwrap()
+        .documents
         .into_iter()
         .find(|d| d.filename == "notes.md")
         .unwrap();
@@ -3255,7 +3285,10 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
     assert!(err.contains("belongs to document"), "{err}");
     assert!(err.contains(first.document_id.as_str()), "{err}");
     assert_eq!(
-        db.list_documents().unwrap().len(),
+        db.documents(&DocumentListing::default())
+            .unwrap()
+            .documents
+            .len(),
         1,
         "nothing was registered"
     );
@@ -3485,7 +3518,7 @@ async fn a_cancelled_ingest_stops_mid_embedding_and_leaves_no_chunks() {
         started.elapsed() < std::time::Duration::from_secs(10),
         "the request in flight was abandoned, not waited out"
     );
-    let documents = db.list_documents().unwrap();
+    let documents = db.documents(&DocumentListing::default()).unwrap().documents;
     let document = documents.first().unwrap();
     assert_eq!(document.status, DocumentStatus::Error);
     assert_eq!(document.error_message.as_deref(), Some("cancelled"));
@@ -3613,8 +3646,9 @@ async fn a_moved_file_is_followed_and_never_pruned() {
         ]
     );
     let live: Vec<String> = db
-        .list_documents()
+        .documents(&DocumentListing::default())
         .unwrap()
+        .documents
         .into_iter()
         .filter_map(|d| d.source_path)
         .collect();
@@ -3848,7 +3882,13 @@ async fn folders_sharing_a_relative_path_are_separate_documents() {
     );
     assert_eq!(db.documents_under(&east_root).unwrap().len(), 1);
     assert_eq!(db.documents_under(&west_root).unwrap().len(), 1);
-    assert_eq!(db.list_documents().unwrap().len(), 2);
+    assert_eq!(
+        db.documents(&DocumentListing::default())
+            .unwrap()
+            .documents
+            .len(),
+        2
+    );
 }
 
 /// `ingest_file` into `ws-replace` without an embedding model, for the
@@ -3912,14 +3952,15 @@ async fn a_changed_file_replaces_its_predecessor() {
         (DocumentStatus::Ready, Pinning::Pinned)
     );
     assert_eq!(
-        db.list_documents()
+        db.documents(&DocumentListing::default())
             .unwrap()
+            .documents
             .iter()
             .map(|d| &d.id)
             .collect::<Vec<_>>(),
         [&second.document_id]
     );
-    assert_eq!(db.list_all_documents().unwrap().len(), 2);
+    assert_eq!(every_document(&db).len(), 2);
     assert_eq!(db.recent_documents(10).unwrap().1, 1);
     assert_eq!(
         db.document_chunks(&first.document_id, 0, 10).unwrap().len(),
@@ -3932,7 +3973,7 @@ async fn a_changed_file_replaces_its_predecessor() {
         hits.iter().map(|h| &h.document_id).collect::<Vec<_>>(),
         [&second.document_id]
     );
-    assert_eq!(db.pinned_documents().unwrap().len(), 1);
+    assert_eq!(db.pinned_documents(Tokens::new(u32::MAX)).unwrap().len(), 1);
 
     // Identical bytes are a duplicate even as a replacement; a replaced
     // document, or a missing one, cannot be replaced.
@@ -3967,11 +4008,7 @@ async fn a_changed_file_replaces_its_predecessor() {
         matches!(missing, Err(Error::NotFound { .. })),
         "{missing:?}"
     );
-    assert_eq!(
-        db.list_all_documents().unwrap().len(),
-        2,
-        "nothing registered"
-    );
+    assert_eq!(every_document(&db).len(), 2, "nothing registered");
 }
 
 /// A table file takes over its predecessor's table; a failed replacement
@@ -4036,9 +4073,7 @@ async fn a_table_replacement_swaps_the_table_and_a_failed_one_changes_nothing() 
         (DocumentStatus::Ready, None)
     );
     assert_eq!(rows(), 2);
-    let failed = db
-        .list_all_documents()
-        .unwrap()
+    let failed = every_document(&db)
         .into_iter()
         .find(|d| d.status == DocumentStatus::Error)
         .unwrap();
@@ -4374,4 +4409,15 @@ fn an_older_workspace_is_profiled_on_open() {
     }
     let db = WorkspaceDb::open(&config, "ws-old").unwrap();
     assert!(TableProfile::current(&db, "t", 4).unwrap().is_some());
+}
+
+/// Every document row, replaced ones included.
+fn every_document(db: &WorkspaceDb) -> Vec<DocumentInfo> {
+    db.documents(&DocumentListing {
+        shown: Shown::All,
+        limit: DocumentListing::MAX_PAGE,
+        ..DocumentListing::default()
+    })
+    .unwrap()
+    .documents
 }

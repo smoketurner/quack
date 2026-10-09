@@ -217,7 +217,10 @@ async fn stdio_tools_gate_writes_and_serve_resources() {
         .unwrap_or_else(|e| fail(&e.message));
     assert!(error_text(&missing).contains("no table"));
     let documents = writer
-        .list_documents(Extensions::default())
+        .list_documents(
+            Parameters(ListDocumentsArgs::default()),
+            Extensions::default(),
+        )
         .await
         .unwrap_or_else(|e| fail(&e.message));
     assert_eq!(field(&documents, "documents"), serde_json::json!([]));

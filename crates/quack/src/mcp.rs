@@ -23,7 +23,7 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::search::{DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{FindPathArgs, ReaderDb, Rerank, SearchGraphArgs, SharedDb};
 use quack_core::config::Config;
-use quack_core::ids::{SessionId, UserId};
+use quack_core::ids::{DocumentId, SessionId, UserId};
 use quack_core::llm::acting::Acting;
 use quack_core::llm::egress::Egress;
 use quack_core::llm::{self, Embeddings};
@@ -35,7 +35,8 @@ use quack_core::storage::control::{
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{self, ChatMode, SessionViewer};
 use quack_core::storage::workspace::{
-    DocumentFilter, SearchMode, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
+    DocumentFilter, DocumentListing, SearchMode, TEMP_OBJECT_REFUSED, WorkspaceDb,
+    creates_temp_object,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -220,6 +221,14 @@ pub(crate) struct SearchArgs {
 pub(crate) struct SqlArgs {
     /// One `DuckDB` statement over the workspace tables.
     pub sql: String,
+}
+
+#[derive(Default, Deserialize, JsonSchema)]
+pub(crate) struct ListDocumentsArgs {
+    /// The `next` of the page before; leave it out for the newest.
+    pub after: Option<String>,
+    /// Documents a page holds: 100 unless given, at most 500.
+    pub limit: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -810,11 +819,19 @@ impl McpServer {
 
     #[tool(
         name = "list_documents",
-        description = "List the ingested documents with their status, title, and source."
+        description = "List the ingested documents, newest first and a page at a time, with their status, title, and source; `total` counts them all, and `next`, when present, is the `after` for the next page."
     )]
-    async fn list_documents(&self, extensions: Extensions) -> Result<CallToolResult, McpError> {
+    async fn list_documents(
+        &self,
+        Parameters(args): Parameters<ListDocumentsArgs>,
+        extensions: Extensions,
+    ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
-        let documents = self.reader_db(WorkspaceDb::list_documents).await;
+        let listing = DocumentListing {
+            after: args.after.map(DocumentId::from),
+            ..DocumentListing::first(args.limit.unwrap_or(DocumentListing::PAGE))
+        };
+        let documents = self.reader_db(move |db| db.documents(&listing)).await;
         caller
             .record(
                 AuditAction::List,
@@ -823,9 +840,9 @@ impl McpServer {
                 Some(serde_json::json!({ "what": "documents" })),
             )
             .await?;
-        let documents = documents?;
+        let page = documents?;
         Ok(CallToolResult::structured(
-            serde_json::json!({ "documents": documents }),
+            serde_json::to_value(&page).map_err(internal)?,
         ))
     }
 }
@@ -917,8 +934,10 @@ impl McpServer {
                 serde_json::json!({ "tables": tables }).to_string()
             }
             WorkspaceResource::Documents => {
-                let documents = self.reader_db(WorkspaceDb::list_documents).await?;
-                serde_json::json!({ "documents": documents }).to_string()
+                let page = self
+                    .reader_db(|db| db.documents(&DocumentListing::default()))
+                    .await?;
+                serde_json::to_string(&page).map_err(internal)?
             }
             WorkspaceResource::Ontology => match self.reader_db(ontology_store::current).await? {
                 Some(ontology) => ontology.to_json().map_err(internal)?,

@@ -1204,7 +1204,10 @@ async fn delete_asks_before_it_deletes_a_document() {
     settle(&mut app).await;
     let id = app
         .db
-        .run(WorkspaceDb::list_documents)
+        .run(|db| {
+            db.documents(&DocumentListing::default())
+                .map(|page| page.documents)
+        })
         .await
         .unwrap_or_else(|e| fail(&e.to_string()))
         .first()
@@ -1231,7 +1234,10 @@ async fn delete_asks_before_it_deletes_a_document() {
     );
     let left = app
         .db
-        .run(WorkspaceDb::list_documents)
+        .run(|db| {
+            db.documents(&DocumentListing::default())
+                .map(|page| page.documents)
+        })
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert!(left.is_empty());
@@ -1534,7 +1540,10 @@ async fn database_commands_run_in_order_off_the_loop_and_input_waits_for_a_switc
     // listing sees the pin.
     let id = app
         .db
-        .run(WorkspaceDb::list_documents)
+        .run(|db| {
+            db.documents(&DocumentListing::default())
+                .map(|page| page.documents)
+        })
         .await
         .unwrap_or_else(|e| fail(&e.to_string()))
         .first()

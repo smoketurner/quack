@@ -32,7 +32,7 @@ use crate::llm::{ChatClient, Embeddings, ProviderModels, RerankModel};
 use crate::oidc::SignIn;
 use crate::proxy::Proxies;
 use crate::storage::control::ControlPlane;
-use crate::storage::workspace::{MetaKey, WorkspaceDb};
+use crate::storage::workspace::{DocumentListing, MetaKey, WorkspaceDb};
 use crate::text::Count;
 use crate::vault::Vault;
 use rig::ProviderError;
@@ -639,7 +639,9 @@ async fn check_workspace(
     match WorkspaceDb::open(config, row.id.as_str()) {
         Ok(db) => {
             let tables = db.list_tables().map_or(0, |t| t.len());
-            let documents = db.list_documents().map_or(0, |d| d.len());
+            let documents = db
+                .documents(&DocumentListing::first(1))
+                .map_or(0, |page| usize::try_from(page.total).unwrap_or(usize::MAX));
             let opens = format!(
                 "'{name}' opens: {}, {}",
                 Count(tables, "table"),

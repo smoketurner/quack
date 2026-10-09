@@ -500,9 +500,12 @@ Documents row's Replace control). The old document keeps serving, marked `supers
 until the new one is `ready`; then it becomes `DocumentStatus::Superseded` and its pin moves
 over (`WorkspaceDb::finish_replacement`); a failure clears the mark (`mark_document_error`).
 A table file loads over its predecessor's table. A superseded document leaves search, the
-prompt, `list_documents`, and `read_document` (`WorkspaceDb::list_documents` is live rows;
-`list_all_documents` has them all for `quack docs --all` and the page's `?all=true`), but keeps
-its chunks so stored citations still open.
+prompt, `list_documents`, and `read_document`, but keeps its chunks so stored citations still
+open. Every listing is one page of `WorkspaceDb::documents` (`DocumentListing`: `Shown::Live` or
+`Shown::All` for `quack docs --all` and the page's `?all=true`, a `DocumentFilter`, and `after`,
+the last document's id; `DocumentPage` carries `next` and `total`), and a name resolves through
+`WorkspaceDb::find_document` (id, file name, title, id prefix) or `document_by_id_prefix`, each a
+bounded query, so no request reads every document row.
 
 The MCP server (`crates/quack/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `sql`,
 `list_tables`, `describe_table`, `list_documents` and the `quack://workspace/...` resources;

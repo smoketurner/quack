@@ -1641,7 +1641,7 @@ model (`test-utils`, a dev-dependency feature only).
 |------|------------|-------------|
 | `search_documents(query, top_k=8, document_ids?, entity?, filters?)` | none | Hybrid retrieval within the person's document scope; `filters` is a `DocumentFilter`; returns chunks with citation metadata and the entities each was the source of |
 | `read_document(document, from=0, limit?)` | none | One document's chunks in order from a position, numbered for citing like search hits, within `[retrieval].pinned_token_budget` (at most 50 chunks a call), with a trailer saying where to continue; a document that is not ready or holds tables is refused with the reason |
-| `list_documents()` | none | Registry with status and pinned flag |
+| `list_documents(after?)` | none | Registry with status and pinned flag, newest first and 50 a call, ending with the total and the `after` for the next 50 |
 | `run_sql(query)` | read: none; write: prompt | Execute SQL; result capped at `max_query_rows` with a trailer that says to narrow it in one statement, a note when the statement repeats an earlier one with only its literals changed (the one-query-per-group loop), and which tool call of `max_turns` this was |
 | `describe_table(table_name)` / `list_tables()` | none | Schema with column meanings, note, profile warnings, and measures; inventory |
 | `find_tables(query, top_k=10)` | none | Past 25 tables: ranks a card per table (name, columns with their ontology descriptions and synonyms, note, mapped class, common values) by BM25 over the document index's tokens and, with an embedding model, cosine over each card's stored vector (`_quack_table_cards`, made again when the card's digest or the embedding profile changes, 256 a turn at most), fused by reciprocal rank; returns each table's columns, note, warnings, and measures |
@@ -2347,6 +2347,8 @@ POST   /api/v1/workspaces/{id}/search         {query, top_k?, document_ids?, ent
                                                   `explain` adds both legs, the phrase note, and the rerank outcome
                                                   (the MCP `search` tool's names)
 GET    /api/v1/workspaces/{id}/documents          ?types=&sources=&tags= (comma-separated), since=, until=, author=
+                                                  one page newest first: ?limit= (100, at most 500), ?after={next};
+                                                  -> {documents, next, total}; an after naming no document is 404
 POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 202 {id}
                                                   ?replace={doc}: the one file takes that ready document's
                                                   place once ready (the old one becomes "superseded")
@@ -2482,11 +2484,11 @@ and returns its `session_id`; passing the id back continues it, and `document_id
 the question to documents. A turn that fails before recording anything leaves no session.
 `search` takes `document_ids`, `entity`, `filters`, `mode`, and `explain`, as REST does.
 
-Tools: `query`, `search`, `sql`, `list_tables`, `describe_table` (the REST describe shape: meanings, note, profile, warnings, measures), `list_documents`, and,
+Tools: `query`, `search`, `sql`, `list_tables`, `describe_table` (the REST describe shape: meanings, note, profile, warnings, measures), `list_documents` (REST's page: `after`, `limit`, and `{documents, next, total}`), and,
 once the graph has nodes, `search_graph` and `find_path`. Each answers with structured
 content plus text. Refusals (a write without permission, an internal table, a missing
 table) are tool errors the client model can read. Resources:
-`quack://workspace/tables`, `.../tables/{name}/schema`, `.../documents`, `.../ontology`
+`quack://workspace/tables`, `.../tables/{name}/schema`, `.../documents` (the first page, with `total` and `next`), `.../ontology`
 (JSON), `.../ontology/schema` (the interchange form's JSON Schema), `.../context` (Markdown).
 
 ```json

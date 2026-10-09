@@ -48,8 +48,8 @@ use quack_core::storage::sessions::{
     self, MessageHit, MessageRole, MessageRow, SessionRow, Sharing,
 };
 use quack_core::storage::workspace::{
-    Cell, ChunkSearchResult, ColumnMeaning, DocumentInfo, DocumentSource, DocumentStatus,
-    ExportFormat, Pinning, ResultSort, SortDirection, TableDescription,
+    Cell, ChunkSearchResult, ColumnMeaning, DocumentInfo, DocumentListing, DocumentSource,
+    DocumentStatus, ExportFormat, Pinning, ResultSort, Shown, SortDirection, TableDescription,
 };
 use rust_embed::Embed;
 use serde::Deserialize;
@@ -461,12 +461,18 @@ struct ChatPage {
     messages: Vec<MessageView>,
     /// What the workspace holds, for the empty state before any session.
     tables: Vec<String>,
+    /// The newest documents, up to [`EMPTY_CHAT_DOCUMENTS`].
     documents: Vec<DocumentInfo>,
+    /// How many documents there are in all.
+    documents_total: usize,
     /// The ready documents a question can be limited to.
     pickable: Vec<search::PickableDocument>,
     /// Why the last form the page sent back here failed (saving an answer).
     error: Option<String>,
 }
+
+/// Documents the chat's empty state names at most.
+const EMPTY_CHAT_DOCUMENTS: usize = 20;
 
 #[derive(Template)]
 #[template(path = "documents.html")]
@@ -570,6 +576,12 @@ struct DocumentRows {
     can_write: bool,
     documents: Vec<DocumentInfo>,
     pending: bool,
+    /// Documents the listing holds across every page.
+    total: u64,
+    /// The page after this one, when there is one.
+    next_href: Option<String>,
+    /// The first page, when this is not it.
+    first_href: Option<String>,
 }
 
 /// What the Documents page polls while something processes: each row's
@@ -1375,11 +1387,16 @@ async fn chat(
             .await?;
     }
     // The empty state says what there is to ask about.
-    let (tables, documents) = if messages.is_empty() {
-        app.read(&id, |db| Ok((db.list_tables()?, db.list_documents()?)))
-            .await?
+    let (tables, (documents, documents_total)) = if messages.is_empty() {
+        app.read(&id, |db| {
+            Ok((
+                db.list_tables()?,
+                db.recent_documents(EMPTY_CHAT_DOCUMENTS)?,
+            ))
+        })
+        .await?
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), (Vec::new(), 0))
     };
     let pickable = app.read(&id, search::PickableDocument::read).await?;
     html(&ChatPage {
@@ -1389,6 +1406,7 @@ async fn chat(
         messages: MessageView::transcript(&messages),
         tables,
         documents,
+        documents_total,
         pickable,
         error: flash.error(),
     })
@@ -1474,46 +1492,56 @@ async fn unshare_session(
     Ok(Redirect::to(&format!("/w/{id}/chat?session={sid}")).into_response())
 }
 
-/// Which documents the Documents page lists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Shown {
-    /// What the workspace holds now.
-    Live,
-    /// Replaced documents too, each naming its replacement.
-    All,
-}
-
-/// `?all=true` on the Documents page.
+/// `?all=true` and `?after=ID` on the Documents page.
 #[derive(Debug, Default, Deserialize)]
 struct DocumentsQuery {
     #[serde(default)]
     all: bool,
+    after: Option<DocumentId>,
 }
 
 impl DocumentsQuery {
-    const fn shown(&self) -> Shown {
-        if self.all { Shown::All } else { Shown::Live }
+    fn listing(&self) -> DocumentListing {
+        DocumentListing {
+            shown: if self.all { Shown::All } else { Shown::Live },
+            after: self.after.clone(),
+            ..DocumentListing::default()
+        }
     }
 }
 
 impl DocumentRows {
-    /// The workspace's documents as the caller may act on them.
-    async fn load(app: &App, access: &Access, shown: Shown) -> WebResult<Self> {
-        let documents = app
-            .read(
-                &access.membership.workspace.id,
-                match shown {
-                    Shown::Live => WorkspaceDb::list_documents,
-                    Shown::All => WorkspaceDb::list_all_documents,
-                },
+    /// One page of the workspace's documents as the caller may act on them.
+    async fn load(app: &App, access: &Access, listing: DocumentListing) -> WebResult<Self> {
+        let ws_id = access.membership.workspace.id.to_string();
+        let all = if listing.shown == Shown::All {
+            "all=true&"
+        } else {
+            ""
+        };
+        let first_href = listing.after.is_some().then(|| {
+            format!(
+                "/w/{ws_id}/documents{}",
+                if all.is_empty() { "" } else { "?all=true" }
             )
+        });
+        let page = app
+            .read(&access.membership.workspace.id, move |db| {
+                db.documents(&listing)
+            })
             .await?;
-        let pending = documents.iter().any(|d| d.status.is_in_flight());
+        let next_href = page
+            .next
+            .map(|next| format!("/w/{ws_id}/documents?{all}after={next}"));
+        let pending = page.documents.iter().any(|d| d.status.is_in_flight());
         Ok(Self {
-            ws_id: access.membership.workspace.id.to_string(),
+            ws_id,
             can_write: access.permits(Need::WRITE),
-            documents,
+            documents: page.documents,
             pending,
+            total: page.total,
+            next_href,
+            first_href,
         })
     }
 }
@@ -1611,7 +1639,7 @@ async fn documents(
     access
         .audit_read(&app, AuditAction::Page, "documents")
         .await?;
-    let rows = DocumentRows::load(&app, &access, query.shown())
+    let rows = DocumentRows::load(&app, &access, query.listing())
         .await?
         .render()?;
     let embeddings_note = app.read(&id, WorkspaceDb::embedding_status).await?.note();
@@ -1684,7 +1712,7 @@ async fn document_rows(
         .audit_read(&app, AuditAction::Page, "document_rows")
         .await?;
     Ok(Html(
-        DocumentRows::load(&app, &access, Shown::Live)
+        DocumentRows::load(&app, &access, DocumentListing::default())
             .await?
             .render()?,
     )
@@ -1702,7 +1730,7 @@ async fn document_status(
         .await?;
     let DocumentRows {
         documents, pending, ..
-    } = DocumentRows::load(&app, &access, Shown::Live).await?;
+    } = DocumentRows::load(&app, &access, DocumentListing::default()).await?;
     Ok(Html(DocumentStatuses { documents, pending }.render()?).into_response())
 }
 
@@ -1814,7 +1842,7 @@ async fn pin(
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, Pinning::Pinned).await?;
     Ok(Html(
-        DocumentRows::load(&app, &access, Shown::Live)
+        DocumentRows::load(&app, &access, DocumentListing::default())
             .await?
             .render()?,
     )
@@ -1829,7 +1857,7 @@ async fn unpin(
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::set_pinned(&app, &access, &doc, Pinning::Unpinned).await?;
     Ok(Html(
-        DocumentRows::load(&app, &access, Shown::Live)
+        DocumentRows::load(&app, &access, DocumentListing::default())
             .await?
             .render()?,
     )
@@ -1844,7 +1872,7 @@ async fn delete_doc(
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     docs_api::delete_document(&app, &access, &doc).await?;
     Ok(Html(
-        DocumentRows::load(&app, &access, Shown::Live)
+        DocumentRows::load(&app, &access, DocumentListing::default())
             .await?
             .render()?,
     )
