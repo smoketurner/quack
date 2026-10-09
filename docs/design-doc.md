@@ -2678,7 +2678,8 @@ dispatch, `/help`, and the completion popup. `SlashCommand::parse` reads the com
 verb words. A command taking free text (a statement, a path, an entity name, a job number)
 gets the rest of the line as typed; any other splits its arguments like a shell line
 (`shlex`), so `/import URL t --query "SELECT ..."` and `/export 'my file.md'` quote as in a
-shell. A typed line is classified once (`commands::Input`): a command, a file to load, a
+shell; a Windows path with backslashes goes in double quotes (`/classify t --text c --questions
+"C:\q\triage.json"`). A typed line is classified once (`commands::Input`): a command, a file to load, a
 statement, or a question.
 
 **Completion popup.** A line starting with `/` opens it above the input. It lists matching

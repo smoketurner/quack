@@ -2347,8 +2347,10 @@ async fn classify_is_a_job_that_labels_a_table_and_says_what_it_wrote() {
             })
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
+        // Double-quoted: the line is split like a shell line, and a Windows
+        // path's backslashes are not escapes inside double quotes.
         app.handle_slash_command(&format!(
-            "/classify tickets --text subject --questions {}",
+            "/classify tickets --text subject --questions \"{}\"",
             questions.display()
         ));
         settle(&mut app).await;
