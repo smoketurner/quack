@@ -9,12 +9,10 @@ mod doctor_cli;
 mod embeddings_cli;
 mod graph_cli;
 mod init_cli;
-mod mcp;
 mod ontology_cli;
 mod print;
 mod progress_line;
 mod saved_cli;
-mod server;
 mod stdio;
 mod tables_cli;
 mod terminal;
@@ -71,10 +69,10 @@ use std::time::Duration;
 
 use crate::confirm::Confirm;
 use crate::print::{AnswerTo, PrintTurn, TurnOutcome};
-use crate::server::state::ServeMode;
 use crate::stdio::{NamedInput, StdioPath};
 use crate::terminal::SessionSetup;
 use crate::text_or_json::TextOrJson;
+use quack_server::ServeMode;
 
 /// How a command ended when not plainly: the exit status scripts check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,8 +384,8 @@ struct ExportArgs {
 
 #[derive(clap::Args)]
 struct ReadyArgs {
-    /// The server's base URL; default: http://{[server].bind}, or
-    /// loopback when it binds every address
+    /// The server's base URL; default: `http://` and the `[server].bind`
+    /// address, or loopback when it binds every address
     #[arg(long)]
     url: Option<String>,
 }
@@ -1158,7 +1156,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             } else {
                 ServeMode::Login
             };
-            server::serve(config, args.bind, mode).await?;
+            quack_server::serve(config, args.bind, mode).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Ready(args) => args.run().await,
@@ -1762,7 +1760,7 @@ async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
         config, workspace, ..
     } = opened;
     let policy = WritePolicy::Deny.allowed_if(allow_write);
-    mcp::serve_stdio(config, db, reader_db, workspace, policy).await?;
+    quack_server::serve_stdio(config, db, reader_db, workspace, policy).await?;
     Ok(ExitCode::SUCCESS)
 }
 

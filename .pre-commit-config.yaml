@@ -14,7 +14,7 @@ repos:
       # Built and vendored web assets stay byte for byte as built or
       # downloaded (docs/web-ui.md): no whitespace fixes, no size limit.
       - id: trailing-whitespace
-        exclude: &web-assets ^crates/quack/static/(css/output\.css|js/(.+\.min\.js|redoc\.standalone\.js(\.LICENSE\.txt)?))$
+        exclude: &web-assets ^crates/quack-server/static/(css/output\.css|js/(.+\.min\.js|redoc\.standalone\.js(\.LICENSE\.txt)?))$
       - id: end-of-file-fixer
         exclude: *web-assets
       - id: check-merge-conflict

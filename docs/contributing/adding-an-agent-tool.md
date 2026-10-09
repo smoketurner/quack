@@ -22,12 +22,12 @@ A tool is a rig `Tool` the agent may call during a turn. `read_document`
 4. **`crates/quack-core/src/analysis/text_to_sql.rs`**: the prompt's tool guidance, a
    numbered step saying when to call it.
 5. **The `ToolName` matches**: `storage/sessions.rs` (how the step is stored and replayed),
-   `crates/quack/src/print.rs` (the step line on stderr), `server/web/mod.rs` (the chat
+   `crates/quack/src/print.rs` (the step line on stderr), `crates/quack-server/src/web/mod.rs` (the chat
    page's step view), and `terminal/app.rs` (the transcript's step message). The compiler
    lists every exhaustive match the new variant breaks.
 6. **`crates/quack-core/tests/agent_turn.rs`**: a whole turn through rig's scripted model
    that calls the tool and checks the step, its summary, and the response.
-7. **`crates/quack/src/mcp.rs`**, when the tool is also an MCP tool: its handler, audited
+7. **`crates/quack-server/src/mcp.rs`**, when the tool is also an MCP tool: its handler, audited
    with channel `mcp`.
 8. **`docs/design-doc.md`** section 7.3's tool table, and `CLAUDE.md` where it lists the
    tools.

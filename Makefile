@@ -18,7 +18,7 @@ EXAMPLE ?= storms
 WORKSPACE ?= storms
 
 # The crate whose templates Tailwind scans; its built CSS is committed.
-SERVER_CRATE ?= quack
+SERVER_CRATE ?= quack-server
 
 .PHONY: all build check clean setup doc changelog fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates image hooks css-dev css-build editor-build run run-server demo-data help
 

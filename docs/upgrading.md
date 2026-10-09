@@ -23,6 +23,10 @@ vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
 
 ## Unreleased
 
+- Changed: the server and MCP code moved into the `quack-server` crate, so its log targets
+  change from `quack::server::...` and `quack::mcp` to `quack_server::...`. Update `RUST_LOG`
+  filters and any collector rules that match the old targets. The access log keeps its
+  `quack::access` target.
 - Added: `quack init` finds a running Ollama and the API keys and AWS credentials in the
   environment, asks which chat and embedding models to use, and sets them in `config.toml`
   once `quack doctor` passes the result. It edits an existing file in place, keeping every

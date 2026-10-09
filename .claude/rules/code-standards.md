@@ -93,7 +93,7 @@ and code — this file is the gate, the doc is the detail.
       `[workspace.dependencies]`; members opt in with `{ workspace = true, features = [...] }`.
       New deps are added to the workspace menu (current version looked up), never inline.
 - [ ] Panics opt out narrowly in tests only: `#[expect(clippy::unwrap_used, reason = "...")]`.
-- [ ] `thiserror` for library crates, `anyhow` for binaries; `tracing` for logging, never
+- [ ] `thiserror` for `quack-core`, `anyhow` for the binary and its interface crates; `tracing` for logging, never
       `println!`/`eprintln!`.
 - [ ] Date/time uses `jiff`, not `chrono` or `time`, for direct handling.
 - [ ] A source file over 1,000 lines holds no inline `mod tests { ... }`: it declares

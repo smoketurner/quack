@@ -231,7 +231,7 @@ the old behavior it replaces, and every caller it did not touch.
 Look past the one interface the issue names. quack has five clients of one core
 (CLI and print mode, terminal, web UI, REST, MCP), so a fix in one handler
 usually has a sibling in another. When a fix changes who may do something, check
-every askama template under `crates/quack/templates/` that renders the action.
+every askama template under `crates/quack-server/templates/` that renders the action.
 When it changes what a stored record means, check every reader of the record:
 the web UI, the audit export, `AgentResponse::to_json`, `docs/`, and the
 "Interfaces today" section of `CLAUDE.md`.

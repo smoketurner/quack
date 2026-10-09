@@ -5,8 +5,9 @@ crates and modules that exist.
 
 ## Workspace
 
-quack is a virtual Cargo workspace (`Cargo.toml` has no `[package]`) with three members
-under `crates/`: `quack-core`, the library; `quack-testkit`, the scripted Ollama server the
+quack is a virtual Cargo workspace (`Cargo.toml` has no `[package]`) with four members
+under `crates/`: `quack-core`, the library; `quack-server`, `quack serve` and the MCP server;
+`quack-testkit`, the scripted Ollama server the
 interface tests run whole agent turns against; and `quack`, the one binary. The root sets:
 
 - `[workspace.package]`: edition 2024, the MSRV.
@@ -71,6 +72,19 @@ nothing in it knows about HTTP, terminals, or windows.
 | `jobs` | the work queue every interface submits background work to: ordered lanes, cancel, progress, a broadcast of job snapshots, and `shutdown(grace)`, the one way the terminal and `quack serve` stop their jobs | 4.1 |
 | `llm` | rig provider construction over `limit::LimitedHttp` (each provider's process-wide request limit), `TurnRequest` (one agent turn), `SchemaCall` (one tool-less prompt whose answer a JSON schema shapes, sent as the provider's structured output and parsed whole: graph extraction against `Ontology::extraction_schema`, the ontology's document pass, the model reranker, and history summaries), OAuth token management (`oauth`), the person an on-behalf-of provider acts for (`acting`, a task-local), the workspace's provider allow-list and its one check (`egress`, a task-local), Amazon Bedrock over the AWS SDK's credential chain with the same limits (`bedrock`) | 4.1, 10 |
 
+## `quack-server`
+
+`quack serve` and the MCP server, a library of the one binary: `quack_server::serve`,
+`serve_stdio`, and `ServeMode` are its whole public API. It does not depend on the terminal.
+
+| Module | Owns |
+|---|---|
+| `mcp` | the MCP server (rmcp) shared by `quack mcp` on stdio and `/mcp/v1/{workspace}` |
+| `lib` (the server) | `quack serve`: `auth` (identity and `Access::resolve`), `api` (REST handlers; `api::openapi` builds their OpenAPI 3.1 document, served at `/api/v1/openapi.json` and rendered at `/api/v1/docs`), `error` (`ApiError` and the stable `ErrorCode` every error body carries), `web` (askama pages calling the same `Access` operations as the API, [web-ui.md](web-ui.md)), `run` (the audited background runs: embeddings refresh, graph and ontology document passes), `queue` (uploads and cancel bookkeeping on the work queue), `api::jobs` (the jobs API and stream), `state`, `mcp_http` |
+
+The templates, static assets, stylesheet input, and the SQL editor's bundle sit beside its
+`src/`.
+
 ## `quack`
 
 | Module | Owns |
@@ -79,8 +93,6 @@ nothing in it knows about HTTP, terminals, or windows.
 | `print` | `-p`: one turn, answer to stdout, steps to stderr, text or JSON |
 | `terminal` | the interactive session (ratatui): every submission a job on the work queue, the job strip, streaming per turn, inline steps, queued permission prompts, slash commands, charts, mouse selection copied to the clipboard (`selection`, `clipboard`) |
 | `ontology_cli`, `graph_cli`, `embeddings_cli`, `saved_cli`, `admin` | `quack ontology`, `quack graph`, `quack embeddings`, `quack saved`, and the server administration commands |
-| `mcp` | the MCP server (rmcp) shared by `quack mcp` on stdio and `/mcp/v1/{workspace}` |
-| `server` | `quack serve`: `auth` (identity and `Access::resolve`), `api` (REST handlers; `api::openapi` builds their OpenAPI 3.1 document, served at `/api/v1/openapi.json` and rendered at `/api/v1/docs`), `error` (`ApiError` and the stable `ErrorCode` every error body carries), `web` (askama pages calling the same `Access` operations as the API, [web-ui.md](web-ui.md)), `run` (the audited background runs: embeddings refresh, graph and ontology document passes), `queue` (uploads and cancel bookkeeping on the work queue), `api::jobs` (the jobs API and stream), `state`, `mcp_http` |
 
 ## The storage boundary
 

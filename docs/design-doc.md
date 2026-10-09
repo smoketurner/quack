@@ -2295,7 +2295,7 @@ The API is JSON under `/api/v1`, authenticated by a bearer token (a login sessio
 token) or the `quack_session` cookie. Its contract is an OpenAPI 3.1 document at
 `GET /api/v1/openapi.json`, generated with `utoipa` from each handler's
 `#[utoipa::path]` annotation and the request and response types' schemas
-(`server/api/openapi.rs`), and rendered for people at `GET /api/v1/docs` by the vendored
+(`crates/quack-server/src/api/openapi.rs`), and rendered for people at `GET /api/v1/docs` by the vendored
 Redoc. Both sit beside `/healthz`: no sign-in, no audit row, no rate limit, and
 `Cache-Control: no-cache`, since the document describes the routes and reveals no workspace
 content. Every path the router registers is in the document, and a test fails when one is
@@ -3228,7 +3228,7 @@ properties explicitly.
 - `crypto`: the provider is FIPS exactly on Linux.
 
 **Integration.** The REST, role, audit, and queue suites live in
-`crates/quack/src/server/tests.rs`; the two files under `crates/quack-core/tests/` cover
+`crates/quack-server/src/tests.rs`; the two files under `crates/quack-core/tests/` cover
 ingestion and the graph.
 
 - Upload PDF -> ready -> a query-mode question returns an answer citing the right page.
