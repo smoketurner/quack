@@ -687,6 +687,41 @@ async fn fresh_cached_token_is_reused_without_the_network() {
     assert_eq!(idp.state.refresh_requests.load(Ordering::SeqCst), 0);
 }
 
+/// `quack auth status` compares the stored expiry with now and never
+/// reaches the issuer.
+#[tokio::test]
+async fn status_reports_an_expired_token_without_the_network() {
+    let idp = MockIdp::start().await;
+    let dir = temp();
+    let m = manager(dir.path(), &idp, Grant::AuthorizationCode);
+    let expired = seed(SignedDuration::from_hours(-2), Some("r"));
+    assert!(m.store.store(&expired).await.is_ok());
+    let status = m.status().await;
+    assert!(status.is_ok_and(|s| {
+        s.token
+            == Some(TokenStatus {
+                lifetime: Lifetime::Expired {
+                    expired_at: expired.expires_at,
+                },
+                renewal: Renewal::Refreshable,
+            })
+    }));
+    assert_eq!(idp.state.refresh_requests.load(Ordering::SeqCst), 0);
+
+    let valid = seed(SignedDuration::from_hours(1), None);
+    assert!(m.store.store(&valid).await.is_ok());
+    let status = m.status().await;
+    assert!(status.is_ok_and(|s| {
+        s.token
+            == Some(TokenStatus {
+                lifetime: Lifetime::Valid {
+                    expires_at: valid.expires_at,
+                },
+                renewal: Renewal::Relogin,
+            })
+    }));
+}
+
 #[tokio::test]
 async fn expiring_token_is_refreshed_once_under_concurrency() {
     let idp = MockIdp::start().await;
@@ -873,10 +908,9 @@ async fn device_code_login_polls_until_approved_and_caches() {
     ));
     assert_eq!(idp.state.pending_polls.load(Ordering::SeqCst), 0);
     let status = m.status().await;
-    assert!(
-        status.is_ok_and(|s| s.token.is_some_and(|t| t.renewal == Renewal::Relogin)
-            && s.key_location == KeyLocation::File)
-    );
+    assert!(status.is_ok_and(|s| s.token.is_some_and(
+        |t| t.renewal == Renewal::Relogin && matches!(t.lifetime, Lifetime::Valid { .. })
+    ) && s.key_location == KeyLocation::File));
     assert!(
         m.access_token()
             .await

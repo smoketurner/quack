@@ -240,7 +240,7 @@ scopes = ["model.use", "offline_access"]
 
 ```bash
 quack auth login gateway    # a browser, or a device code where none can open (--device-code forces it)
-quack auth status           # each OAuth provider: when its token expires and how it renews
+quack auth status           # each OAuth provider: whether its token is still valid, when it expires or expired, and how it renews
 quack auth logout gateway
 ```
 

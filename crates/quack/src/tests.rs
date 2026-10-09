@@ -2,7 +2,7 @@ use super::*;
 use quack_core::embedding::Dimension;
 use quack_core::error::AuthReason;
 use quack_core::ingestion::parser::PageCounts;
-use quack_core::llm::oauth::Renewal;
+use quack_core::llm::oauth::{Lifetime, Renewal};
 use quack_core::storage::workspace::{DocumentStatus, NewDocument};
 
 /// A closed reader surfaces as an `io::Error`, a `serde_json` or `csv`
@@ -237,7 +237,9 @@ async fn no_workspace_flag_creates_the_default_on_a_fresh_data_dir() {
 #[test]
 fn auth_status_names_the_actor_only_when_one_is_sent() {
     let token = TokenStatus {
-        expires_at: jiff::Timestamp::UNIX_EPOCH,
+        lifetime: Lifetime::Valid {
+            expires_at: jiff::Timestamp::UNIX_EPOCH,
+        },
         renewal: Renewal::Regrant,
     };
     let with_actor = token_state("gw", Some(token), Grant::OnBehalfOf, true);
@@ -248,6 +250,71 @@ fn auth_status_names_the_actor_only_when_one_is_sent() {
         assert!(vouch.contains("without an actor token"), "{vouch}");
     }
     assert!(token_state("p", None, Grant::AuthorizationCode, false).contains("quack auth login p"));
+}
+
+/// An expired token is reported as expired, with what renews it; a valid
+/// one with its expiry.
+#[test]
+fn auth_status_says_when_a_token_has_expired() {
+    let at = jiff::Timestamp::UNIX_EPOCH;
+    let status = |lifetime, renewal| Some(TokenStatus { lifetime, renewal });
+    let valid = Lifetime::Valid { expires_at: at };
+    let expired = Lifetime::Expired { expired_at: at };
+
+    let fresh = token_state(
+        "p",
+        status(valid, Renewal::Refreshable),
+        Grant::DeviceCode,
+        false,
+    );
+    assert!(
+        fresh.starts_with("logged in, token expires 1970"),
+        "{fresh}"
+    );
+    assert!(fresh.ends_with("refreshable"), "{fresh}");
+
+    let stale = token_state(
+        "p",
+        status(expired, Renewal::Refreshable),
+        Grant::DeviceCode,
+        false,
+    );
+    assert!(
+        stale.starts_with("logged in, token expired 1970"),
+        "{stale}"
+    );
+    assert!(stale.ends_with("refreshes on next use"), "{stale}");
+    assert!(!stale.contains("expires"), "{stale}");
+
+    let relogin = token_state(
+        "p",
+        status(expired, Renewal::Relogin),
+        Grant::AuthorizationCode,
+        false,
+    );
+    assert!(!relogin.contains("logged in"), "{relogin}");
+    assert!(
+        relogin.contains("no refresh token; run `quack auth login p`"),
+        "{relogin}"
+    );
+
+    let grant = token_state(
+        "p",
+        status(expired, Renewal::Regrant),
+        Grant::ClientCredentials,
+        false,
+    );
+    assert!(grant.contains("expired 1970"), "{grant}");
+    assert!(grant.ends_with("grant runs again on next use"), "{grant}");
+
+    let actor = token_state(
+        "p",
+        status(expired, Renewal::Regrant),
+        Grant::OnBehalfOf,
+        true,
+    );
+    assert!(actor.contains("(the actor) expired 1970"), "{actor}");
+    assert!(actor.ends_with("requested again on next use"), "{actor}");
 }
 
 /// `quack search` takes documents after `--in`, one mode at most, and
