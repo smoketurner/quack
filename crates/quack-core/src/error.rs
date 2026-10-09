@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::classify::ClassifyError;
+use crate::classify;
 use crate::llm::decision::QuestionSetError;
 use crate::llm::egress::Refusal;
 use crate::saved::Unsavable;
@@ -229,7 +229,7 @@ pub enum Error {
 
     /// A table's rows cannot be labelled as asked.
     #[error(transparent)]
-    Classify(#[from] ClassifyError),
+    Classify(#[from] classify::Error),
 
     /// A set of decision questions that cannot be asked.
     #[error("invalid question set: {0}")]

@@ -615,10 +615,12 @@ CREATE TABLE _quack_classifications (
     document_id  TEXT NOT NULL,                -- the document (source `classify`) that owns it
     source_table TEXT NOT NULL,
     key_column   TEXT NOT NULL,                -- the source's key, which the output joins back by
-    key_type     TEXT NOT NULL,                -- the key's DuckDB type; another type is a changed definition
+    key_type     TEXT NOT NULL,                -- the key's DuckDB type; another type labels every row again
+    key_reason   TEXT NOT NULL,                -- id_like | unique: why the key is the key
     text_columns JSON NOT NULL,
-    set_name     TEXT NOT NULL,
-    question_set JSON NOT NULL,                -- the QuestionSet the run asked
+    questions    JSON NOT NULL,                -- the questions the run asked
+    sentence     TEXT,                         -- what the person asked, when the questions were drafted from it
+    drafted_by_model TEXT,                     -- the chat model that drafted them
     model        TEXT NOT NULL,                -- provider/model
     model_digest TEXT NOT NULL,                -- the weights' digest from /api/tags
     rows_scope   TEXT NOT NULL,                -- missing | all; a first run on a missing output is `missing`
@@ -630,7 +632,8 @@ CREATE TABLE _quack_classifications (
     labelled UBIGINT NOT NULL DEFAULT 0,       -- rows the model labelled
     cut      UBIGINT NOT NULL DEFAULT 0,       -- of those, from text cut to fit the model
     empty    UBIGINT NOT NULL DEFAULT 0,       -- rows with no text, written with NULL labels
-    skipped  UBIGINT NOT NULL DEFAULT 0        -- rows the model refused at every length, not written
+    skipped  UBIGINT NOT NULL DEFAULT 0,       -- rows the model refused at every length, not written
+    ask_ms   UBIGINT NOT NULL DEFAULT 0        -- milliseconds spent on the requests to the decision model
 );
 -- [analysis].compact_history: summaries of the turns the history window leaves out
 CREATE TABLE _quack_session_summaries (
@@ -1543,8 +1546,10 @@ it through the provider's own `OllamaEndpoint` and `LimitedHttp`: the provider's
 description), `noul` (true or false), or `score` (a level on an ordered rubric of 2 to 26
 descriptions). A `Questions` holds 1 to 64 uniquely named questions (names compare without
 regard to case, since they become column names) and is checked once, when it is built, so a
-set that exists can be asked. A repeated key in a question file is refused, not overwritten.
-The file is JSON, quack's only interchange form: `{"name": ..., "questions": {...}}`.
+set that exists can be asked. A repeated key in a request is refused, not overwritten, and a set
+is read member by member and refused at the first member past the cap, so a large body costs no more
+than a small one. A person does not write questions: the chat model drafts them from a sentence, and a
+set sent back (`set` on REST and MCP) is the JSON of a `LabelSet`, quack's own output.
 
 **Fitting a row.** The model reads at most 512 tokens per question, instructions and options
 included, and Ollama refuses a longer state with a 400 instead of cutting it. quack has no
@@ -1561,11 +1566,31 @@ other refusal, a 5xx, or a transport failure fails the run; a row refused at eve
 while the set still passes a probe again, is `Unfit`: not written, counted `skipped`, and
 tried by the next run.
 
-**Labelling a table.** A `Classification` (table, one to eight text columns, an optional key,
-a `QuestionSet`, and `rows`: `missing` or `all`) is the one request every interface sends
-(`quack classify`, `/classify`, `POST .../tables/classify`, the Tables page's Label rows form,
-MCP `classify`, the agent's `classify_rows`). A run writes `<table>_<set name>`, one row per
-source row:
+**From a sentence to questions.** A person names a table and says in a sentence what they
+want to know about each row ("which department should handle each ticket, and how urgent it
+is"). One chat call (`classify::drafting`, built like the graph extractor: a
+`SchemaCall<DraftAnswer>` at `background_effort` under `[analysis].extraction_timeout_seconds`)
+turns it into a `LabelSet`: the key, the text columns to read, and the questions. The call is
+told the table's size and key, up to 24 candidate text columns (text that is at least half
+present, holds two values or more, does not read as numbers or dates, and is neither the key
+nor named like an id) with their distinct counts and, when there are 20 or fewer, their
+values, the sentence, and 20 rows sampled in SQL (seeded, 16,000 characters in all) in a
+`text::Fenced` block. Its schema holds the answer to the candidates, one to eight questions,
+and the three kinds. A draft takes 30 to 120 seconds, measured 42 to 49 with gpt-oss:20b. The
+answer then passes what any set passes (`Draft::given`: the columns exist, the key is
+different in every row, no two answer columns clash) and the decision model's two probes; a
+refusal is told back to the chat model once, and a second is `draft_refused`.
+
+**Approval.** Drafting stores nothing. A set is stored by the run that starts with it: the
+run's record in `_quack_classifications` is the approval, so the newest run on a table holds
+its last approved set. A preview, a no at the prompt, a write the agent was not allowed, and a
+run too large to wait for all leave nothing. Without a sentence a run uses the last approved
+set; the same sentence (trimmed, in any case) uses it with no chat call; another sentence
+revises it, the chat model being shown the current questions. A set the person sends back (the
+web editor's rows, `set` on REST and MCP) runs exactly as sent, with no draft, and its key
+reason is worked out again from the table.
+
+**Labelling a table.** A run writes `<table>_labels`, one row per source row:
 
 | Column | Type | Contents |
 |---|---|---|
@@ -1577,12 +1602,14 @@ source row:
 | `NAME` (noul) | `DOUBLE` | the probability of true |
 | `truncated` | `BOOLEAN` | the row's text was cut to fit the model |
 
-The key is `--key`, or an id column (`id`, a name ending in `_id` in any case, or ending in
-`Id` after a lowercase letter, as `TableProfile::is_id_name` says) whose values are all present
-and all different and read back from their text unchanged. Any other column is
-refused with the columns that could serve, never picked: a text key would copy the text into
-the output, and a timestamp that later repeats would leave the new row unlabelled for good.
-The output has a `PRIMARY KEY` on the key and rows go in with `ON CONFLICT DO NOTHING`, so a
+The key is the table's id column (`id`, a name ending in `_id` in any case, or ending in `Id`
+after a lowercase letter, as `TableProfile::is_id_name` says); failing that a column of whole
+numbers, then of short text (averaging 64 characters or fewer): each with every value present
+and all different, and reading back from its text unchanged. A float, a timestamp, or long text
+is never picked: a timestamp that later repeats would leave the new row unlabelled for good. The
+reason is stored (`key_reason`) and shown with the key whenever the name does not say it. With no
+candidate the table is refused with the columns that come closest and a `row_number()` column to
+add. The output has a `PRIMARY KEY` on the key and rows go in with `ON CONFLICT DO NOTHING`, so a
 key is never twice there. The output is a document with source `classify`, listed with the
 tables, deleted with the document, and not replaceable by a file.
 
@@ -1590,39 +1617,74 @@ The run reads the source a page of 256 by keyset on the key (never `OFFSET`) on 
 connection, asks the questions about each row, and writes the page in one transaction, so a
 cancel or a failure keeps every row already labelled. A run labels the rows whose key the
 output does not hold yet. Rows whose text changed after they were labelled are not labelled
-again; `--all` labels every row again into a hidden `_quack_stage_<output>` table that
+again. A run that labels every row again writes into a hidden `_quack_stage_<output>` table that
 replaces the output in one transaction when the run completes, so the old labels serve until
 then, and a cancel or failure drops the stage. One run labels into one output at a time
 (`Writer::claim`, since each workspace has one writer in the process and the file lock allows
 one process).
 
-Each run is recorded in `_quack_classifications` with the definition it ran under: source,
-key and its type, text columns, questions, and the model's weights digest (`/api/tags`, so `ollama pull`
-of a new version is a change and respelling the model is not). The definition in force for
-an output is the newest run for it, leaving out a run that labels everything again and did
-not complete. A run that adds rows to an output labelled under another definition is
-refused (`definition_changed`) and says to use `--all`; a first run on a missing output is
-recorded as `missing` even when `all` was asked, so a later run compares against it. The
-check is made only when the output exists. A run starts by marking `interrupted` every run
-recorded as running that no run in the process holds (the claims are the registry of live
-runs), so a process that died leaves nothing running for good.
+Each run is recorded in `_quack_classifications` with the set it ran under: the key and its
+type, the text columns, the questions, the sentence, the chat model that drafted them, and the
+decision model's weights digest (`/api/tags`, so `ollama pull` of a new version is a change and
+respelling the model is not). The set in force for an output is the newest run for it, leaving
+out a run that labels every row again and did not complete. A run whose questions or text
+columns, key or key type, or model weights differ from those in force labels every row again
+instead of adding rows, and says why before it asks (`RelabelReason`); `--all` is the other way to
+ask. A cancelled relabel leaves the old labels serving and its questions as the last approved,
+so the next run finds them different from those in force and labels every row again from the
+start. A first run on a missing output is recorded as `missing` even when `all` was asked, so
+a later run compares against it. A run starts by marking `interrupted` every run recorded as
+running that no run in the process holds (the claims are the registry of live runs), so a
+process that died leaves nothing running for good.
+
+**What it costs.** The time comes from the newest completed run of the same questions on the
+same weights that asked at least 100 rows (`ask_ms` over the rows asked, a number of questions
+changes the time a row takes), else from the preview's own requests; it is never divided by the
+request limit, because both measurements ran at it, and `-y` shows none where nothing measured
+one. It is said as "under a minute", "about N minutes", or "about N hours".
 
 **Where the meaning is.** `describe_table`, the Tables page, the prompt, and the REST and MCP
-descriptions give a labels table's columns a meaning from the definition in force ("expected
-level, 0 Not urgent, 1 Soon, 2 Blocking or deadline"), and the description carries
-`labelled_by`, the run. `quack classify list`, `/classify list`, and `GET
-.../tables/classify` list the runs.
+descriptions give a labels table's columns a meaning from the set in force ("expected level,
+0 Not urgent, 1 Soon, 2 Blocking or deadline"), and the description carries `labelled_by`, the
+run. The description of the source table carries `label_set`: the questions last approved and
+the columns they read, shown (with the columns that are gone named) without asking a model.
+`quack classify list`, `/classify list`, and `GET .../tables/classify` list the runs;
+`quack classify show TABLE` prints the last approved set.
+
+**The screens.** `quack classify TABLE "sentence"` prints the table's line, the questions, and a
+preview of 10 rows, then asks "Label all 104,233 rows into support_tickets_labels with 2
+questions? About 2 hours." (`Confirm::ask`: without a terminal it prints that no terminal can
+answer, answers no, says "Not labelled; these questions were not kept", and exits 0). A run that
+labels every row again says why first and asks as dropping data (`Confirm::ask_to_drop`: only
+`-y` or a typed yes goes ahead; with nobody to ask it fails, exit 1). `-y` runs without a preview
+or a question, `--preview N` stops after N rows, and a table the output already covers prints "Nothing
+to label". `/classify` in the terminal does the same as a job, asks in its own `y`/`n` prompt, and
+fills the input in with `/classify TABLE ` when a table has no questions yet. The Tables page's Label
+rows section is a sentence and a Draft button (htmx; the draft takes up to two minutes), an
+editor of the questions as name, kind, question, and options or levels one per line, a Preview
+button, and Label rows; a table with approved questions opens the editor filled with them.
+The MCP tool streams `notifications/progress` (drafting, previewing, labelling with the rows
+done) to a client that sent a progress token, and the REST route documents the wait.
 
 **Who waits.** A background job (the CLI, the terminal, REST) labels any size. The agent's
 `classify_rows` and MCP `classify` wait for the run, so they refuse one with more rows times
 questions than `[decision].interactive_budget` (1,500) answers: the refusal names the count,
-`quack classify`, and `POST .../tables/classify`. A preview (1 to 100 rows) writes nothing and
-needs only the read role; the interfaces that wait hold it to the same budget. The agent's run goes through `WritePolicy` like
-any write (`Turn::permit_write`), and its permission prompt shows the action as comment lines,
-the run and then each question with its instructions, each on one line: `-- label 104233 rows
-of support_tickets into support_tickets_ticket_triage (new table) with ollama/laya`, then
-`-- department: Which department should handle this ticket?`, with `(adds rows)` or
-`(replaces its labels)` for an existing output.
+`quack classify`, and `POST .../tables/classify`, and says nothing was kept. A preview (1 to
+100 rows) writes and keeps nothing and needs only the read role; the interfaces that wait hold it
+to the same budget. The agent's run goes through `WritePolicy` like any write
+(`Turn::permit_write`), and its permission prompt shows the action as comment lines:
+
+```
+-- label 2,340 rows of support_tickets into support_tickets_labels (new table) with ollama/laya, 2 questions, about 3 minutes
+-- key id; reads subject, body
+-- department (choice: billing, technical, sales, other): Which department should handle this ticket?
+-- urgency (score: not urgent, soon, blocking): How urgent is this ticket?
+-- preview: T-101: department=billing (0.94), urgency=1.84 | T-102: department=technical (0.71), urgency=0.40
+```
+
+with `(adds rows)` or `(replaces its labels: the questions changed)` for an existing output.
+The agent has no `rows = "all"`: a full relabel is too large for a conversation on any real
+table. The web, REST, and MCP take `all`.
 
 The runs of the agent and MCP are jobs of the process's queue (kind `classify`), so the Jobs
 page and `/jobs` list them, the queue's shutdown cancels them and waits for them, and they
@@ -1785,7 +1847,7 @@ model (`test-utils`, a dev-dependency feature only).
 | `find_path(from, to, max_hops=4)` | none | Shortest relation path between two entities |
 | `create_chart(sql, kind, x, y, title)` | none | Runs the SQL, emits a chart spec (section 9) |
 | `view_image(document, question)` | none | Sends one image document and the question to the chat model; returns its answer, citable as the document's first chunk, and counts as reading document text |
-| `classify_rows(table, text_columns, key?, question_set, rows?, preview?)` | preview: none; run: prompt | Labels a table's text with the decision model into `<table>_<set name>` (section 6.6); `preview` labels the first rows and writes nothing; a run goes through the write policy and is refused beyond `[decision].interactive_budget` answers |
+| `classify_rows(table, sentence?, preview?)` | preview: none; run: prompt | Drafts questions from the sentence (or uses the approved ones) and labels a table's text with the decision model into `<table>_labels` (section 6.6); `preview` shows the questions and the first rows' labels and keeps nothing; a run goes through the write policy and is refused beyond `[decision].interactive_budget` answers |
 
 `search_graph` and `find_path` register only when the graph has nodes; `describe_class`
 whenever an ontology exists, since the prompt's ontology block is capped, and it names the
@@ -2502,8 +2564,9 @@ POST   /api/v1/workspaces/{id}/tables/describe  {name}: columns with their meani
 GET    /api/v1/workspaces/{id}/tables/schema    every user table's columns, each name as SQL writes it (capped)
 PUT    /api/v1/workspaces/{id}/tables/note      {name, note}: set the table's note (blank removes it); member or owner
 POST   /api/v1/workspaces/{id}/tables/retype    {name, column, type}: give a column a type, every value converting (422 otherwise); member or owner
-POST   /api/v1/workspaces/{id}/tables/classify   {table, text_columns, key?, question_set, rows?}: label a table's text with the decision model (section 6.6) -> 202 {run, job, outline}; member or owner;
-                                                 ?preview=N (1 to 100) answers 200 with the first rows' labels and writes nothing, for a viewer too
+POST   /api/v1/workspaces/{id}/tables/classify   {table, sentence?, set?, rows?}: label a table's text with the decision model (section 6.6) -> 202 {run, job, draft, outline}; member or owner;
+                                                 ?preview=N (1 to 100) answers 200 {draft, outline, preview} with the questions and the first rows' labels, keeping nothing, for a viewer too;
+                                                 `set` (a preview's draft.set) runs exactly those questions, a sentence without it waits for the chat model's draft
 GET    /api/v1/workspaces/{id}/tables/classify   the runs that labelled tables, newest first (viewer)
 POST   /api/v1/workspaces/{id}/graph/search    {entity?, class?, relation?, hops?}
 POST   /api/v1/workspaces/{id}/graph/path      {from, to, max_hops?}
@@ -2579,7 +2642,7 @@ stable `snake_case` value (`ErrorCode` in `server/error.rs`, listed as an enum i
 document's components): a client branches on it, never on `error`, which is for a person
 and may change in any release. Core errors and failed turns map to specific codes
 (`auth_required`, `workspace_locked`, `no_chat_model`, `no_decision_model`, `table_taken`, `unknown_value`,
-`query_timeout`, `provider_refused`, `classify_refused`, `definition_changed`, `classify_running`, `too_large_to_wait`, ...); an error with only a status carries that
+`query_timeout`, `provider_refused`, `classify_refused`, `no_questions`, `draft_refused`, `set_columns_gone`, `classify_running`, `too_large_to_wait`, ...); an error with only a status carries that
 status's code (`bad_request`, `forbidden`, `not_found`, `conflict`, `busy`, ...). A user's
 own statement or import that fails is 422 with `sql_failed` or `import_failed` unless a
 more specific code applies. Errors the framework builds itself (a body that is not JSON, a
@@ -2658,7 +2721,7 @@ into text already typed it is inserted like any other paste.
 
 Slash commands: `/help`, `/tables [TABLE] [--note TEXT] [--retype COL=TYPE]` (`quack tables`'s
 arguments and output), `/sql`, `/ingest PATH` (`/attach`),
-`/import`, `/classify TABLE --text COLUMN[,COLUMN] --questions FILE [--key COLUMN] [--preview N] [--all]` (or `/classify list`; a job, as `quack classify`), `/docs`, `/search QUERY` (each hit's leg ranks, then both legs and the rerank
+`/import`, `/classify [--all] TABLE [SENTENCE]` (the rest of the line is the sentence; or `/classify list`, `/classify show TABLE`; a job, as `quack classify`, with its own `y`/`n` prompt), `/docs`, `/search QUERY` (each hit's leg ranks, then both legs and the rerank
 outcome), `/scope [DOCUMENT..]` (limits the next questions to those documents, as the web
 chat's document picker limits one, until `/scope` with none; the header shows it), `/pin`, `/unpin`, `/delete` (asks `y`/`n` first), `/ontology ...` and `/graph ...`, `/graph
 ENTITY`, `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/saved [list | add
@@ -2678,8 +2741,7 @@ dispatch, `/help`, and the completion popup. `SlashCommand::parse` reads the com
 verb words. A command taking free text (a statement, a path, an entity name, a job number)
 gets the rest of the line as typed; any other splits its arguments like a shell line
 (`shlex`), so `/import URL t --query "SELECT ..."` and `/export 'my file.md'` quote as in a
-shell; a Windows path with backslashes goes in double quotes (`/classify t --text c --questions
-"C:\q\triage.json"`). A typed line is classified once (`commands::Input`): a command, a file to load, a
+shell; a Windows path with backslashes goes in double quotes (`/export "C:\q\notes.md"`). A typed line is classified once (`commands::Input`): a command, a file to load, a
 statement, or a question.
 
 **Completion popup.** A line starting with `/` opens it above the input. It lists matching
@@ -2777,8 +2839,9 @@ quack saved list [--format text|json] | add NAME --from-session ID [--message N]
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N] [--types COL=TYPE]
             [-H 'NAME: VALUE'] [--bearer-env VAR] [--json-pointer /PATH] [--save NAME [--store-credential]]
 quack import list [--format text|json] | refresh NAME | remove NAME
-quack classify TABLE --text COLUMN[,COLUMN] --questions FILE [--key COLUMN] [--preview N] [--all] [--format text|json]
+quack classify TABLE ["SENTENCE"] [-y] [--all] [--preview N]
 quack classify list [--format text|json]
+quack classify show TABLE [--format text|json]
 quack okf export DIR|-
 quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
 quack auth jwks [PROVIDER] [--rotate [--activate]]

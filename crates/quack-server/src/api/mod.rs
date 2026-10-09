@@ -26,9 +26,12 @@ use axum::extract::DefaultBodyLimit;
 use axum::handler::Handler;
 use axum::response::sse::Event;
 use axum::routing::{MethodRouter, delete, get, patch, post, put};
-use quack_core::classify::MAX_QUESTION_SET_BYTES;
 
 use super::state::App;
+
+/// The most bytes a labelling request carries: far above the 16 KiB the
+/// questions of a set may take, and small enough to read in no time.
+const CLASSIFY_BODY_BYTES: usize = 64 * 1024;
 
 /// The event names the query and job streams send. Clients subscribe by
 /// these names, so they are a contract, written once.
@@ -163,7 +166,7 @@ pub(crate) fn router(app: &App) -> ApiRoutes {
         .route(
             "/workspaces/{id}/tables/classify",
             get(classify::runs)
-                .post(classify::classify.layer(DefaultBodyLimit::max(MAX_QUESTION_SET_BYTES))),
+                .post(classify::label.layer(DefaultBodyLimit::max(CLASSIFY_BODY_BYTES))),
         )
         .route(
             "/workspaces/{id}/context",

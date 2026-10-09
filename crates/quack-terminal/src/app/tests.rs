@@ -2315,49 +2315,108 @@ async fn sessions_are_renamed_and_found_by_title_and_by_what_they_say() {
     );
 }
 
+/// What the chat model drafts for the tickets.
+const TICKETS_DRAFT: &str = r#"{"text_columns": ["subject"], "questions": [
+    {"name": "department", "type": "choice", "instructions": "Which department?",
+     "options": [{"label": "billing", "description": ""}, {"label": "technical", "description": ""}],
+     "levels": []},
+    {"name": "churn", "type": "noul", "instructions": "Will they cancel?",
+     "options": [], "levels": []}]}"#;
+
+/// `/classify` drafts and previews as a job, asks in its own prompt, and
+/// labels on a yes; a no keeps nothing, and a sentence is not needed again.
 #[tokio::test(flavor = "multi_thread")]
-async fn classify_is_a_job_that_labels_a_table_and_says_what_it_wrote() {
+async fn classify_drafts_previews_asks_and_labels_on_a_yes() {
     use quack_core::llm::egress::Egress;
-    use quack_testkit::DecisionStub;
+    use quack_testkit::{DecisionStub, Reply, ScriptedOllama};
 
     let stub = DecisionStub::start().await;
+    let chat = ScriptedOllama::serve(vec![Reply::Text(TICKETS_DRAFT), Reply::Text(TICKETS_DRAFT)])
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-    let config = Config::parse(&format!(
-        "[providers.local]\ntype = \"ollama\"\nbase_url = \"{}\"\nmax_retries = 0\n\
-         [decision]\nmodel = \"local/laya\"\n",
-        stub.base_url()
-    ))
-    .unwrap_or_else(|e| fail(&e.to_string()));
-    let questions = dir.path().join("triage.json");
-    std::fs::write(
-        &questions,
-        r#"{"name": "triage", "questions": {
-            "department": {"type": "choice", "instructions": "Which department?",
-                           "criteria": {"billing": null, "technical": null}}}}"#,
-    )
-    .unwrap_or_else(|e| fail(&e.to_string()));
+    let config = chat
+        .config_with(&format!(
+            "[providers.local]\ntype = \"ollama\"\nbase_url = \"{}\"\nmax_retries = 0\n\
+             [decision]\nmodel = \"local/laya\"\n",
+            stub.base_url()
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
     Egress::scope(Some(Egress::NoWorkspace), async {
         let mut app = app_with(dir.path(), config);
         app.db
             .run(|db| {
                 db.execute_statement(
-                    "CREATE TABLE tickets AS SELECT range AS id, 'billing issue' AS subject \
-                     FROM range(3)",
+                    "CREATE TABLE tickets AS SELECT range AS id, \
+                     CASE WHEN range % 2 = 0 THEN 'billing' ELSE 'technical' END AS subject \
+                     FROM range(3); \
+                     CREATE TABLE notes AS SELECT range AS id, 'x' AS body FROM range(3)",
                 )
             })
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
-        // Double-quoted: the line is split like a shell line, and a Windows
-        // path's backslashes are not escapes inside double quotes.
-        app.handle_slash_command(&format!(
-            "/classify tickets --text subject --questions \"{}\"",
-            questions.display()
-        ));
+
+        // Drafted and previewed, then the prompt asks.
+        app.handle_slash_command("/classify tickets which department, and will they cancel");
+        settle(&mut app).await;
+        let shown = last(&app).content.clone();
+        assert!(
+            shown.contains("tickets: 3 rows, key id, text in subject."),
+            "{shown}"
+        );
+        assert!(shown.contains("Drafted from 3 sample rows:"), "{shown}");
+        assert!(shown.contains("Preview of 3 rows:"), "{shown}");
+        assert!(app.awaiting_permission());
+        assert_eq!(
+            app.pending_prompt().map(|p| p.heading),
+            Some(String::from(
+                "Label all 3 rows into tickets_labels with 2 questions? Under a minute."
+            ))
+        );
+
+        // No keeps nothing.
+        app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!app.awaiting_permission());
+        assert_eq!(
+            last(&app).content,
+            "Not labelled; these questions were not kept."
+        );
+        app.handle_slash_command("/classify list");
         settle(&mut app).await;
         assert!(
             last(&app)
                 .content
-                .contains("\nWrote tickets_triage: 3 rows labelled"),
+                .contains("No table has been labelled yet")
+        );
+
+        // Yes labels the rows the prompt showed.
+        app.handle_slash_command("/classify tickets which department, and will they cancel");
+        settle(&mut app).await;
+        app.handle_key_event(KeyCode::Char('y'), KeyModifiers::NONE);
+        settle(&mut app).await;
+        let wrote = last(&app).content.clone();
+        assert!(
+            wrote.contains("Wrote tickets_labels: 3 rows labelled"),
+            "{wrote}"
+        );
+
+        // The questions are approved: no sentence needed, and nothing is left.
+        app.handle_slash_command("/classify tickets");
+        settle(&mut app).await;
+        assert!(
+            last(&app)
+                .content
+                .contains("Nothing to label: tickets_labels has every row of tickets."),
+            "{}",
+            last(&app).content
+        );
+        assert!(!app.awaiting_permission());
+        app.handle_slash_command("/classify show tickets");
+        settle(&mut app).await;
+        assert!(
+            last(&app)
+                .content
+                .contains("Asked: \"which department, and will they cancel\""),
             "{}",
             last(&app).content
         );
@@ -2366,12 +2425,17 @@ async fn classify_is_a_job_that_labels_a_table_and_says_what_it_wrote() {
         assert!(
             last(&app)
                 .content
-                .contains("tickets -> tickets_triage  completed"),
+                .contains("tickets -> tickets_labels  completed"),
             "{}",
             last(&app).content
         );
-        app.handle_slash_command("/classify tickets");
-        assert_eq!(last(&app).kind, MessageKind::Error, "a usage error");
+
+        // A table with no questions says so and fills the input in.
+        app.handle_slash_command("/classify notes");
+        settle(&mut app).await;
+        assert_eq!(last(&app).kind, MessageKind::Error);
+        assert!(last(&app).content.contains("notes has no questions yet"));
+        assert_eq!(app.textarea.lines(), ["/classify notes "]);
     })
     .await;
 }

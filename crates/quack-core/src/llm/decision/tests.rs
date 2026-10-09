@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::{Value, json};
 
 use super::fixture::{config, model, scoped};
-use super::stub::{DecisionStub, Fault, too_long};
+use super::stub::{DecisionStub, Fault};
 use super::*;
 use crate::llm::egress::Egress;
 use crate::storage::control::AllowedProviders;
@@ -43,7 +43,7 @@ fn state(text: &str) -> State {
 
 fn choice(question: &str, options: usize) -> (QuestionName, Question) {
     let criteria = (0..options)
-        .map(|n| (Label::try_from(format!("option{n}")).unwrap(), None))
+        .map(|n| (OptionLabel::try_from(format!("option{n}")).unwrap(), None))
         .collect();
     (
         QuestionName::try_from(question.to_owned()).unwrap(),
@@ -170,11 +170,11 @@ fn a_question_set_over_16_kib_is_refused() {
         instructions: Instructions::try_from(String::from("Which?")).unwrap(),
         criteria: Unique::from_pairs(vec![
             (
-                Label::try_from(String::from("a")).unwrap(),
+                OptionLabel::try_from(String::from("a")).unwrap(),
                 Some("x".repeat(9000)),
             ),
             (
-                Label::try_from(String::from("b")).unwrap(),
+                OptionLabel::try_from(String::from("b")).unwrap(),
                 Some("y".repeat(9000)),
             ),
         ])
@@ -196,9 +196,9 @@ fn names_labels_and_instructions_are_checked_where_they_are_made() {
     for good in ["a", "dept_1", &"a".repeat(48)] {
         assert!(QuestionName::try_from(good.to_owned()).is_ok(), "{good:?}");
     }
-    assert!(Label::try_from(String::from("  ")).is_err());
-    assert!(Label::try_from("x".repeat(65)).is_err());
-    assert!(Label::try_from("x".repeat(64)).is_ok());
+    assert!(OptionLabel::try_from(String::from("  ")).is_err());
+    assert!(OptionLabel::try_from("x".repeat(65)).is_err());
+    assert!(OptionLabel::try_from("x".repeat(64)).is_ok());
     assert!(Instructions::try_from(String::new()).is_err());
     assert!(Instructions::try_from("x".repeat(1001)).is_err());
 }
@@ -259,7 +259,7 @@ async fn the_request_body_is_what_the_server_expects() {
             ]))
             .await
             .unwrap();
-        assert!(matches!(asked, Asked::Answered(_)));
+        assert!(matches!(asked, RowOutcome::Answered(_)));
         let body: Value = serde_json::from_str(stub.bodies().last().unwrap()).unwrap();
         assert_eq!(body.get("model"), Some(&json!("laya")));
         assert_eq!(body.get("keep_alive"), Some(&json!(1800)));
@@ -282,7 +282,7 @@ async fn each_answer_type_is_read_against_its_question() {
         let model = model(&stub).await;
         let questions = triage();
         let asker = model.asker(&questions).await.unwrap();
-        let Asked::Answered(answers) = asker
+        let RowOutcome::Answered(answers) = asker
             .ask(&state("a billing mistake! we will cancel"))
             .await
             .unwrap()
@@ -296,7 +296,7 @@ async fn each_answer_type_is_read_against_its_question() {
         assert_eq!(
             read.first().map(|(_, a)| a),
             Some(&Answer::Choice {
-                choice: Label::try_from(String::from("billing")).unwrap(),
+                choice: OptionLabel::try_from(String::from("billing")).unwrap(),
                 probability: 0.9,
                 confidence: 0.8
             })
@@ -367,7 +367,8 @@ async fn a_row_within_the_limit_goes_whole_and_is_not_cut() {
         let questions = triage();
         let asker = model.asker(&questions).await.unwrap();
         let before = stub.requests();
-        let Asked::Answered(answers) = asker.ask(&state(&"a".repeat(1000))).await.unwrap() else {
+        let RowOutcome::Answered(answers) = asker.ask(&state(&"a".repeat(1000))).await.unwrap()
+        else {
             panic!("expected answers");
         };
         assert!(!answers.truncated());
@@ -384,7 +385,8 @@ async fn a_row_over_the_limit_is_cut_to_within_64_characters_of_it() {
         let questions = triage();
         let asker = model.asker(&questions).await.unwrap();
         let before = stub.requests();
-        let Asked::Answered(answers) = asker.ask(&state(&"a".repeat(3000))).await.unwrap() else {
+        let RowOutcome::Answered(answers) = asker.ask(&state(&"a".repeat(3000))).await.unwrap()
+        else {
             panic!("expected answers");
         };
         assert!(answers.truncated());
@@ -409,7 +411,8 @@ async fn a_row_over_the_limit_is_cut_to_within_64_characters_of_it() {
 #[tokio::test]
 async fn a_413_is_a_length_refusal_too() {
     let stub = DecisionStub::with_rule(|seen| {
-        too_long(seen, 1000).map(|_| Fault::new(413, "text and schema must not exceed 64 KiB"))
+        seen.too_long(1000)
+            .map(|_| Fault::new(413, "text and schema must not exceed 64 KiB"))
     })
     .await;
     scoped(async {
@@ -417,7 +420,7 @@ async fn a_413_is_a_length_refusal_too() {
         let questions = triage();
         let asker = model.asker(&questions).await.unwrap();
         let asked = asker.ask(&state(&"a".repeat(3000))).await.unwrap();
-        assert!(matches!(asked, Asked::Answered(a) if a.truncated()));
+        assert!(matches!(asked, RowOutcome::Answered(a) if a.truncated()));
     })
     .await;
 }
@@ -438,7 +441,7 @@ async fn the_search_does_not_stop_before_some_prefix_was_accepted() {
         let asker = model.asker(&questions).await.unwrap();
         let asked = asker.ask(&state(&"a".repeat(50))).await.unwrap();
         assert!(
-            matches!(asked, Asked::Answered(ref a) if a.truncated()),
+            matches!(asked, RowOutcome::Answered(ref a) if a.truncated()),
             "{asked:?}"
         );
     })
@@ -462,7 +465,7 @@ async fn a_row_the_model_refuses_at_every_length_is_unfit_when_the_set_still_pas
             .ask(&state(&format!("zzz{}", "a".repeat(2000))))
             .await
             .unwrap();
-        assert_eq!(asked, Asked::Unfit);
+        assert_eq!(asked, RowOutcome::Unfit);
         assert_eq!(stub.requests() - before, 9, "8 attempts and the re-probe");
     })
     .await;

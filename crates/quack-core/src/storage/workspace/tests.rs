@@ -3048,6 +3048,6 @@ fn opening_a_version_14_workspace_creates_the_classification_runs() {
             .as_deref(),
         Some("15")
     );
-    let runs = ClassificationRun::list(&reopened, 10).unwrap_or_else(|e| fail(&e.to_string()));
+    let runs = classify::Run::list(&reopened, 10).unwrap_or_else(|e| fail(&e.to_string()));
     assert!(runs.runs.is_empty());
 }

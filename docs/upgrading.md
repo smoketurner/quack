@@ -23,14 +23,17 @@ vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
 
 ## Unreleased
 
-- Added: `quack classify` labels a table's text with a decision model (`[decision].model =
-  "ollama/laya"`, `ollama pull laya`, Ollama 0.40.0 or later) into a new table that joins
-  back by the table's key. `--preview N` shows the first rows and writes nothing. The same
-  request is `/classify` in the terminal, `POST /api/v1/workspaces/{id}/tables/classify`, a
-  form on the Tables page, the MCP tool `classify`, and the agent's `classify_rows`. Opening a
+- Added: `quack classify TABLE "what you want to know about each row"` labels a table's text
+  with a decision model (`[decision].model = "ollama/laya"`, `ollama pull laya`, Ollama 0.40.0 or
+  later). The chat model drafts the questions from the sentence, the labels of a preview show
+  how they read, and a yes labels the table into `<table>_labels`, which joins back by the
+  table's key. The same flow is `/classify` in the terminal, a Label rows section on the Tables page,
+  `POST /api/v1/workspaces/{id}/tables/classify`, the MCP tool `classify`, and the agent's
+  `classify_rows`. `quack init` offers a decision model when Ollama has one. Opening a
   workspace with this quack moves its schema version from 14 to 15 (a new table, no
   backfill); an older quack refuses the file afterwards. `quack doctor` checks the decision
-  model when one is set.
+  model when one is set. Workspaces opened by the pre-release builds of this feature (a
+  `_quack_classifications` table with a `set_name` column) must be recreated.
 - Changed: the server and MCP code moved into the `quack-server` crate, so its log targets
   change from `quack::server::...` and `quack::mcp` to `quack_server::...`. Update `RUST_LOG`
   filters and any collector rules that match the old targets. The access log keeps its

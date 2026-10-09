@@ -5,11 +5,12 @@ use duckdb::types::Value;
 use serde::Serialize;
 
 use super::plan::Plan;
-use super::{ClassificationRun, ClassifyError, Rows, RunStatus};
+use super::{Error, Rows, Run, RunStatus};
 use crate::crypto::sha256_hex;
-use crate::error::{Error, Result};
+use crate::error::{Error as CoreError, Result};
 use crate::ids::{DocumentId, RunId};
 use crate::ingestion::TableName;
+use crate::llm::decision::Questions;
 use crate::storage::control::ResourceKind;
 use crate::storage::workspace::{
     DocumentSource, DocumentStatus, NewDocument, WorkspaceDb, quote_ident,
@@ -18,7 +19,7 @@ use crate::storage::writer::Claims;
 
 /// One row per run. The definition columns say what the output's rows were
 /// labelled under; the newest that counts is the definition in force
-/// ([`ClassificationRun::in_force`]).
+/// ([`Run::in_force`]).
 pub(crate) const DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_classifications (
     id TEXT PRIMARY KEY,
     output_table TEXT NOT NULL,
@@ -26,9 +27,11 @@ pub(crate) const DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_classifications 
     source_table TEXT NOT NULL,
     key_column TEXT NOT NULL,
     key_type TEXT NOT NULL,
+    key_reason TEXT NOT NULL,
     text_columns JSON NOT NULL,
-    set_name TEXT NOT NULL,
-    question_set JSON NOT NULL,
+    questions JSON NOT NULL,
+    sentence TEXT,
+    drafted_by_model TEXT,
     model TEXT NOT NULL,
     model_digest TEXT NOT NULL,
     rows_scope TEXT NOT NULL,
@@ -40,27 +43,35 @@ pub(crate) const DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_classifications 
     labelled UBIGINT NOT NULL DEFAULT 0,
     cut UBIGINT NOT NULL DEFAULT 0,
     empty UBIGINT NOT NULL DEFAULT 0,
-    skipped UBIGINT NOT NULL DEFAULT 0
+    skipped UBIGINT NOT NULL DEFAULT 0,
+    ask_ms UBIGINT NOT NULL DEFAULT 0
 );";
 
+/// Rows a completed run asked before its speed is taken to be the speed of
+/// the next run.
+const MEASURED_ROWS: u64 = 100;
+/// Completed runs searched for one that measured these questions.
+const HISTORY_RUNS: u32 = 20;
+
 const COLUMNS: &str = "id, output_table, document_id, source_table, key_column, \
-     CAST(text_columns AS VARCHAR), CAST(question_set AS VARCHAR), model, model_digest, \
+     CAST(text_columns AS VARCHAR), CAST(questions AS VARCHAR), model, model_digest, \
      rows_scope, status, CAST(started_at AS VARCHAR), CAST(finished_at AS VARCHAR), \
-     labelled, cut, empty, skipped, error, key_type";
+     labelled, cut, empty, skipped, error, key_type, key_reason, sentence, drafted_by_model, \
+     ask_ms";
 
 /// The runs a workspace has recorded, newest first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
-pub struct ClassificationRuns {
-    pub runs: Vec<ClassificationRun>,
+pub struct Runs {
+    pub runs: Vec<Run>,
 }
 
 /// A row selected with `COLUMNS`.
-impl TryFrom<&duckdb::Row<'_>> for ClassificationRun {
-    type Error = Error;
+impl TryFrom<&duckdb::Row<'_>> for Run {
+    type Error = CoreError;
 
     fn try_from(row: &duckdb::Row<'_>) -> Result<Self> {
         let text_columns: String = row.get(5)?;
-        let question_set: String = row.get(6)?;
+        let questions: String = row.get(6)?;
         Ok(Self {
             id: row.get(0)?,
             output_table: row.get(1)?,
@@ -68,7 +79,7 @@ impl TryFrom<&duckdb::Row<'_>> for ClassificationRun {
             source_table: row.get(3)?,
             key_column: row.get(4)?,
             text_columns: serde_json::from_str(&text_columns)?,
-            question_set: serde_json::from_str(&question_set)?,
+            questions: serde_json::from_str(&questions)?,
             model: row.get(7)?,
             model_digest: row.get(8)?,
             rows: row.get(9)?,
@@ -81,11 +92,15 @@ impl TryFrom<&duckdb::Row<'_>> for ClassificationRun {
             skipped: row.get(16)?,
             error: row.get(17)?,
             key_type: row.get(18)?,
+            key_reason: row.get(19)?,
+            sentence: row.get(20)?,
+            drafted_by_model: row.get(21)?,
+            ask_ms: row.get(22)?,
         })
     }
 }
 
-impl ClassificationRun {
+impl Run {
     /// The run with this id.
     ///
     /// # Errors
@@ -106,7 +121,7 @@ impl ClassificationRun {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn list(db: &WorkspaceDb, limit: u32) -> Result<ClassificationRuns> {
+    pub fn list(db: &WorkspaceDb, limit: u32) -> Result<Runs> {
         let sql = format!("SELECT {COLUMNS} FROM _quack_classifications ORDER BY id DESC LIMIT ?");
         let mut stmt = db.connection().prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![limit])?;
@@ -114,7 +129,7 @@ impl ClassificationRun {
         while let Some(row) = rows.next()? {
             runs.push(Self::try_from(row)?);
         }
-        Ok(ClassificationRuns { runs })
+        Ok(Runs { runs })
     }
 
     /// The definition the rows of `output` were labelled under: the newest
@@ -150,35 +165,57 @@ impl ClassificationRun {
         rows.next()?.map(Self::try_from).transpose()
     }
 
-    /// What this run's definition and `plan`'s differ in, by name. Table,
-    /// column, and type names are compared without regard to case.
-    pub(super) fn differs(&self, plan: &Plan, digest: &str) -> Vec<&'static str> {
-        let mut differs = Vec::new();
-        if !self.source_table.eq_ignore_ascii_case(plan.source.as_str()) {
-            differs.push("source tables");
+    /// Whether asking for `sentence` is asking for this run's questions
+    /// again: no sentence, or the same one, without regard to case and
+    /// the space around it.
+    #[must_use]
+    pub fn repeats(&self, sentence: Option<&str>) -> bool {
+        match (sentence, self.sentence.as_deref()) {
+            (None, _) => true,
+            (Some(asked), Some(approved)) => asked.trim().eq_ignore_ascii_case(approved.trim()),
+            (Some(_), None) => false,
         }
-        if !self.key_column.eq_ignore_ascii_case(&plan.key.name) {
-            differs.push("keys");
+    }
+
+    /// The newest run on `table`, whatever became of it: its set is the one
+    /// a person last approved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn last_approved(db: &WorkspaceDb, table: &str) -> Result<Option<Self>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM _quack_classifications \
+             WHERE lower(source_table) = lower(?) ORDER BY id DESC LIMIT 1"
+        );
+        let mut stmt = db.connection().prepare(&sql)?;
+        let mut rows = stmt.query(duckdb::params![table])?;
+        rows.next()?.map(Self::try_from).transpose()
+    }
+
+    /// Milliseconds a row took to ask in the newest completed run of these
+    /// questions on the model weights `digest` that asked at least
+    /// `MEASURED_ROWS` rows. The time a row takes grows with the
+    /// questions, so a run of other questions does not count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn row_ms_of(db: &WorkspaceDb, digest: &str, questions: &Questions) -> Result<Option<u64>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM _quack_classifications \
+             WHERE status = ? AND model_digest = ? ORDER BY id DESC LIMIT {HISTORY_RUNS}"
+        );
+        let mut stmt = db.connection().prepare(&sql)?;
+        let mut rows = stmt.query(duckdb::params![RunStatus::Completed, digest])?;
+        while let Some(row) = rows.next()? {
+            let run = Self::try_from(row)?;
+            let asked = run.labelled.saturating_add(run.skipped);
+            if run.questions == *questions && asked >= MEASURED_ROWS {
+                return Ok(run.ask_ms.checked_div(asked));
+            }
         }
-        if !self.key_type.eq_ignore_ascii_case(&plan.key.duckdb_type) {
-            differs.push("key types");
-        }
-        let same_text = self.text_columns.len() == plan.text_columns.len()
-            && self
-                .text_columns
-                .iter()
-                .zip(&plan.text_columns)
-                .all(|(recorded, planned)| recorded.eq_ignore_ascii_case(planned));
-        if !same_text {
-            differs.push("text columns");
-        }
-        if self.question_set.questions != plan.set.questions {
-            differs.push("questions");
-        }
-        if self.model_digest != digest {
-            differs.push("model weights");
-        }
-        differs
+        Ok(None)
     }
 }
 
@@ -189,6 +226,8 @@ pub(super) struct Start<'a> {
     pub model: &'a str,
     pub digest: &'a str,
     pub started_by: Option<&'a str>,
+    /// The chat model that drafted the questions, when one did.
+    pub drafted_by_model: Option<&'a str>,
     /// The runs this process holds. Read inside the writer step that marks
     /// the dead ones, so a run that claims and starts in between is seen.
     pub claims: &'a Claims,
@@ -212,14 +251,12 @@ impl Start<'_> {
                 if plan.rows == Rows::All {
                     self.create_table(db, &plan.stage())?;
                 }
-                plan.document
-                    .clone()
-                    .ok_or_else(|| ClassifyError::OutputTaken {
-                        table: plan.output.to_string(),
-                    })?
+                plan.document.clone().ok_or_else(|| Error::OutputTaken {
+                    table: plan.output.to_string(),
+                })?
             } else {
                 if TableName::in_catalog(&db.list_tables()?, plan.output.as_str()).is_some() {
-                    return Err(ClassifyError::OutputTaken {
+                    return Err(Error::OutputTaken {
                         table: plan.output.to_string(),
                     }
                     .into());
@@ -264,12 +301,11 @@ impl Start<'_> {
     }
 
     /// An existing output must still be the plan's table of labels, with
-    /// its key constraint, and a run that adds rows to it must run under the
-    /// definition it was labelled under.
+    /// its key constraint.
     fn check_existing(&self, db: &WorkspaceDb) -> Result<()> {
         let plan = self.plan;
         if !plan.still_owns_output(db)? {
-            return Err(ClassifyError::OutputTaken {
+            return Err(Error::OutputTaken {
                 table: plan.output.to_string(),
             }
             .into());
@@ -281,14 +317,12 @@ impl Start<'_> {
             |row| row.get(0),
         )?;
         if keyed == 0 && plan.rows == Rows::Missing {
-            return Err(ClassifyError::KeyLost {
+            return Err(Error::KeyLost {
                 table: plan.output.to_string(),
                 column: plan.key.name.clone(),
             }
             .into());
         }
-        let in_force = ClassificationRun::in_force(db, plan.output.as_str())?;
-        plan.check_definition(in_force.as_ref(), self.digest)?;
         Ok(())
     }
 
@@ -313,8 +347,8 @@ impl Start<'_> {
     fn insert_document(&self, db: &WorkspaceDb) -> Result<DocumentId> {
         let plan = self.plan;
         let id = DocumentId::generate();
-        let definition = serde_json::to_string(&plan.set)?;
-        let title = format!("{} labelled by {}", plan.source, plan.set.name);
+        let definition = serde_json::to_string(&plan.set.questions)?;
+        let title = format!("{} labels", plan.source);
         db.insert_document(&NewDocument {
             id: &id,
             filename: plan.output.as_str(),
@@ -341,8 +375,9 @@ impl Start<'_> {
         };
         db.connection().execute(
             "INSERT INTO _quack_classifications (id, output_table, document_id, source_table, \
-             key_column, key_type, text_columns, set_name, question_set, model, model_digest, \
-             rows_scope, status, started_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             key_column, key_type, key_reason, text_columns, questions, sentence, \
+             drafted_by_model, model, model_digest, rows_scope, status, started_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             duckdb::params![
                 self.run_id,
                 plan.output.as_str(),
@@ -350,9 +385,11 @@ impl Start<'_> {
                 plan.source.as_str(),
                 plan.key.name,
                 plan.key.duckdb_type,
-                serde_json::to_string(&plan.text_columns)?,
-                plan.set.name.as_str(),
-                serde_json::to_string(&plan.set)?,
+                plan.set.key_reason,
+                serde_json::to_string(&plan.set.text_columns)?,
+                serde_json::to_string(&plan.set.questions)?,
+                plan.set.sentence,
+                self.drafted_by_model,
                 self.model,
                 self.digest,
                 scope,
@@ -378,6 +415,8 @@ pub(super) struct PageWrite {
     /// Each row's key as text and its label cells.
     pub rows: Vec<(String, Vec<Value>, Written)>,
     pub skipped: u64,
+    /// Milliseconds the requests for the page took.
+    pub ask_ms: u64,
 }
 
 impl PageWrite {
@@ -431,8 +470,8 @@ impl PageWrite {
             }
             db.connection().execute(
                 "UPDATE _quack_classifications SET labelled = labelled + ?, cut = cut + ?, \
-                 empty = empty + ?, skipped = skipped + ? WHERE id = ?",
-                duckdb::params![labelled, cut, empty, self.skipped, run],
+                 empty = empty + ?, skipped = skipped + ?, ask_ms = ask_ms + ? WHERE id = ?",
+                duckdb::params![labelled, cut, empty, self.skipped, self.ask_ms, run],
             )?;
             Ok(labelled.saturating_add(empty))
         })
@@ -450,12 +489,7 @@ impl Ended {
     /// Record the end in one transaction: a completed run that labelled
     /// every row again swaps its staging table in for the output, and a
     /// stopped one drops it, leaving the old labels and their definition.
-    pub(super) fn record(
-        self,
-        db: &WorkspaceDb,
-        plan: &Plan,
-        run: &RunId,
-    ) -> Result<ClassificationRun> {
+    pub(super) fn record(self, db: &WorkspaceDb, plan: &Plan, run: &RunId) -> Result<Run> {
         let staged = plan.rows == Rows::All && plan.output_exists;
         let (mut status, mut error) = match self {
             Self::Completed => (RunStatus::Completed, None),
@@ -484,14 +518,14 @@ impl Ended {
                         db.connection()
                             .execute_batch(&format!("DROP TABLE IF EXISTS {stage}"))?;
                         db.connection().execute(
-                            "UPDATE _quack_classifications SET labelled = 0, cut = 0, empty = 0 \
-                             WHERE id = ?",
+                            "UPDATE _quack_classifications SET labelled = 0, cut = 0, empty = 0, \
+                             skipped = 0, ask_ms = 0 WHERE id = ?",
                             duckdb::params![run],
                         )?;
                         if swap == Swap::Blocked {
                             status = RunStatus::Failed;
                             error = Some(
-                                ClassifyError::OutputTaken {
+                                Error::OutputTaken {
                                     table: plan.output.to_string(),
                                 }
                                 .to_string(),
@@ -505,10 +539,10 @@ impl Ended {
                  WHERE id = ?",
                 duckdb::params![status, error, run],
             )?;
-            Ok((ClassificationRun::get(db, run)?, swap))
+            Ok((Run::get(db, run)?, swap))
         })?;
         if swap == Swap::Blocked {
-            return Err(ClassifyError::OutputTaken {
+            return Err(Error::OutputTaken {
                 table: plan.output.to_string(),
             }
             .into());

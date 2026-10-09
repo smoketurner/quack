@@ -1,13 +1,13 @@
-//! What a classification will do, worked out by reading alone: the source
-//! table and its text columns, the key, the output table and its columns,
-//! and how many rows are left to label.
+//! What a run will do, worked out by reading alone: the source table, its
+//! key and text columns, the output table and its columns, why the run
+//! labels every row again, and how many rows are left to label.
 
 use super::columns::OutputColumns;
 use super::{
-    Classification, ClassificationOutline, ClassificationRun, ClassifyError, Effect, KeyCandidate,
-    KeyColumn, OutlineQuestion, QuestionSet, Rows, TEXT_COLUMNS,
+    DraftQuestion, Effect, Error, KeyCandidate, KeyColumn, KeyReason, LabelSet, Outline,
+    RelabelReason, Rows, Run, TEXT_COLUMNS,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error as CoreError, Result};
 use crate::ids::DocumentId;
 use crate::ingestion::TableName;
 use crate::llm::decision::STATE_CHARS;
@@ -17,18 +17,24 @@ use crate::storage::writer::Claimed;
 
 /// Closest-to-unique columns a refusal names.
 const CLOSEST: usize = 3;
+/// A text column serves as a key only when its values average at most this
+/// many characters.
+const SHORT_KEY_CHARS: f64 = 64.0;
 
-/// A classification checked against the workspace.
+/// A set checked against the workspace.
 #[derive(Debug, Clone)]
 pub(super) struct Plan {
     pub source: TableName,
     pub key: KeyColumn,
-    pub text_columns: Vec<String>,
-    pub set: QuestionSet,
+    /// The set as the catalog spells it, with the key's reason worked out
+    /// from the table.
+    pub set: LabelSet,
+    /// Which rows the run labels: those the output lacks, or every row.
     pub rows: Rows,
+    /// Why the run labels every row again, when it does.
+    pub because: Option<RelabelReason>,
     /// The labels table, spelled as the catalog spells it when it exists
-    /// and in lower case when it does not, so one output has one spelling
-    /// whatever the question set's name was typed as.
+    /// and in lower case when it does not, so one output has one spelling.
     pub output: TableName,
     pub output_exists: bool,
     /// The document that owns the output, when one does.
@@ -48,13 +54,17 @@ impl KeyColumn {
 
     /// `column` as the key of `source`, after checking that it is present
     /// and different in every row and reads back from text unchanged.
-    fn checked(db: &WorkspaceDb, source: &TableName, column: &ColumnInfo) -> Result<Self> {
+    pub(super) fn checked(
+        db: &WorkspaceDb,
+        source: &TableName,
+        column: &ColumnInfo,
+    ) -> Result<Self> {
         let key = Self {
             name: column.name.clone(),
             duckdb_type: column.column_type.clone(),
         };
         if !Self::allows(&key.duckdb_type) {
-            return Err(ClassifyError::KeyType {
+            return Err(Error::KeyType {
                 column: key.name,
                 duckdb_type: key.duckdb_type,
             }
@@ -72,7 +82,7 @@ impl KeyColumn {
         })?;
         let [rows, present, distinct, unreadable] = counts.map(|n| u64::try_from(n).unwrap_or(0));
         if present != rows || distinct != present {
-            return Err(ClassifyError::KeyNotUnique {
+            return Err(Error::KeyNotUnique {
                 table: source.to_string(),
                 column: key.name,
                 rows,
@@ -82,7 +92,7 @@ impl KeyColumn {
             .into());
         }
         if unreadable > 0 {
-            return Err(ClassifyError::KeyType {
+            return Err(Error::KeyType {
                 column: key.name,
                 duckdb_type: key.duckdb_type,
             }
@@ -91,38 +101,83 @@ impl KeyColumn {
         Ok(key)
     }
 
-    /// The key the request names, or the table's id column.
-    fn resolve(
+    /// The table's key: an id-like column first, then a column of whole
+    /// numbers, then one of short text, each with every value present and
+    /// different. Never a float, a date, or long text.
+    pub(super) fn resolve(
         db: &WorkspaceDb,
         source: &TableName,
         columns: &[ColumnInfo],
-        wanted: Option<&str>,
     ) -> Result<Self> {
-        if let Some(wanted) = wanted {
-            let column = Plan::column(source, columns, wanted)?;
-            return Self::checked(db, source, column);
-        }
         let mut candidates: Vec<&ColumnInfo> = columns
             .iter()
             .filter(|c| TableProfile::is_id_name(&c.name))
             .collect();
         candidates.sort_by_key(|c| !c.name.eq_ignore_ascii_case("id"));
         for column in candidates {
-            match Self::checked(db, source, column) {
-                Ok(key) => return Ok(key),
-                Err(Error::Classify(
-                    ClassifyError::KeyNotUnique { .. } | ClassifyError::KeyType { .. },
-                )) => {}
-                Err(other) => return Err(other),
+            if let Some(key) = Self::tried(db, source, column)? {
+                return Ok(key);
             }
         }
-        Err(Self::none_found(db, source)?)
+        let profile = TableProfile::compute(db, source.as_str())?;
+        let rows = profile.row_count;
+        let unique = |column: &&ColumnInfo| {
+            rows > 0
+                && profile
+                    .column(&column.name)
+                    .is_some_and(|p| p.non_null == rows && p.distinct == rows)
+        };
+        let whole: Vec<&ColumnInfo> = columns
+            .iter()
+            .filter(|c| ColumnKind::is_integer(&c.column_type))
+            .filter(unique)
+            .collect();
+        for column in whole {
+            if let Some(key) = Self::tried(db, source, column)? {
+                return Ok(key);
+            }
+        }
+        let short: Vec<&ColumnInfo> = columns
+            .iter()
+            .filter(|c| ColumnKind::of(&c.column_type) == ColumnKind::Text)
+            .filter(unique)
+            .collect();
+        for column in short {
+            if Self::averages_short(db, source, column)?
+                && let Some(key) = Self::tried(db, source, column)?
+            {
+                return Ok(key);
+            }
+        }
+        Err(Self::none_found(&profile, source))
     }
 
-    /// The refusal for a table with no id column, naming the columns that
-    /// could be the key and those that come closest.
-    fn none_found(db: &WorkspaceDb, source: &TableName) -> Result<Error> {
-        let profile = TableProfile::compute(db, source.as_str())?;
+    /// `column` as the key, or `None` when it does not qualify.
+    fn tried(db: &WorkspaceDb, source: &TableName, column: &ColumnInfo) -> Result<Option<Self>> {
+        match Self::checked(db, source, column) {
+            Ok(key) => Ok(Some(key)),
+            Err(CoreError::Classify(Error::KeyNotUnique { .. } | Error::KeyType { .. })) => {
+                Ok(None)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Whether the values of a text column average at most
+    /// [`SHORT_KEY_CHARS`] characters.
+    fn averages_short(db: &WorkspaceDb, source: &TableName, column: &ColumnInfo) -> Result<bool> {
+        let sql = format!(
+            "SELECT avg(length(CAST({} AS VARCHAR))) FROM {}",
+            quote_ident(&column.name),
+            quote_ident(source.as_str())
+        );
+        let average: Option<f64> = db.connection().query_row(&sql, [], |row| row.get(0))?;
+        Ok(average.is_some_and(|average| average <= SHORT_KEY_CHARS))
+    }
+
+    /// The refusal for a table with no usable key, naming the unique
+    /// columns of a type that cannot serve and those that come closest.
+    fn none_found(profile: &TableProfile, source: &TableName) -> CoreError {
         let rows = profile.row_count;
         let mut unique = Vec::new();
         let mut near = Vec::new();
@@ -146,52 +201,55 @@ impl KeyColumn {
             )
         });
         near.truncate(CLOSEST);
-        Ok(ClassifyError::NoKey {
+        Error::NoKey {
             table: source.to_string(),
             unique,
             closest: near,
         }
-        .into())
+        .into()
     }
 }
 
 impl Plan {
-    /// The column of `source` named `wanted`, without regard to case.
-    fn column<'a>(
-        source: &TableName,
-        columns: &'a [ColumnInfo],
-        wanted: &str,
-    ) -> Result<&'a ColumnInfo> {
+    /// The column of `columns` named `wanted`, without regard to case.
+    fn column<'a>(columns: &'a [ColumnInfo], wanted: &str) -> Option<&'a ColumnInfo> {
         columns
             .iter()
             .find(|c| c.name.eq_ignore_ascii_case(wanted.trim()))
-            .ok_or_else(|| {
-                ClassifyError::NoColumn {
-                    table: source.to_string(),
-                    column: wanted.to_owned(),
-                }
-                .into()
-            })
     }
 
-    /// The text columns the request names, as the catalog spells them.
+    /// The text columns the set names, as the catalog spells them.
     fn text_columns(
         source: &TableName,
         columns: &[ColumnInfo],
         wanted: &[String],
     ) -> Result<Vec<String>> {
-        if wanted.is_empty() || wanted.len() > TEXT_COLUMNS {
-            return Err(ClassifyError::TextColumns(wanted.len()).into());
-        }
         let mut resolved: Vec<String> = Vec::with_capacity(wanted.len());
+        let mut gone = Vec::new();
         for name in wanted {
-            let column = Self::column(source, columns, name)?;
-            if resolved.contains(&column.name) {
-                return Err(ClassifyError::DuplicateColumn(column.name.clone()).into());
+            match Self::column(columns, name) {
+                Some(column) if !resolved.contains(&column.name) => {
+                    resolved.push(column.name.clone());
+                }
+                Some(_) => {}
+                None => gone.push(name.clone()),
             }
-            resolved.push(column.name.clone());
         }
-        Ok(resolved)
+        if !gone.is_empty() {
+            return Err(Error::SetColumnsGone {
+                table: source.to_string(),
+                columns: gone,
+            }
+            .into());
+        }
+        match resolved.len() {
+            0 => Err(Error::NoText {
+                table: source.to_string(),
+            }
+            .into()),
+            n if n > TEXT_COLUMNS => Err(Error::TextColumns(n).into()),
+            _ => Ok(resolved),
+        }
     }
 
     /// The labels table for `wanted`, in the catalog's spelling when it
@@ -208,13 +266,13 @@ impl Plan {
         let document = match owner {
             Some(doc) if doc.source == DocumentSource::Classify => Some(doc.id),
             Some(_) => {
-                return Err(ClassifyError::OutputTaken {
+                return Err(Error::OutputTaken {
                     table: output.to_string(),
                 }
                 .into());
             }
             None if existing.is_some() => {
-                return Err(ClassifyError::OutputTaken {
+                return Err(Error::OutputTaken {
                     table: output.to_string(),
                 }
                 .into());
@@ -224,29 +282,49 @@ impl Plan {
         Ok((output, existing.is_some(), document))
     }
 
-    /// Check `request` against `db` and work out the rest.
+    /// The name the labels of `source` go to.
+    pub(super) fn output_name(source: &TableName) -> TableName {
+        TableName::sanitized(&format!("{source}_labels"))
+    }
+
+    /// Check the set for `table` against `db` and work out the rest. The
+    /// plan labels the rows the output lacks until [`Self::labelling`] says
+    /// otherwise.
     ///
     /// # Errors
     ///
-    /// Returns a [`ClassifyError`] naming what cannot be carried out, or a
+    /// Returns a [`Error`] naming what cannot be carried out, or a
     /// query error.
-    pub(super) fn resolve(db: &WorkspaceDb, request: &Classification) -> Result<Self> {
+    pub(super) fn resolve(db: &WorkspaceDb, table: &str, set: &LabelSet) -> Result<Self> {
         let catalog = db.list_tables()?;
-        let source = TableName::exact(&catalog, &request.table)?;
+        let source = TableName::exact(&catalog, table)?;
         let described = db.describe_columns(source.as_str())?;
-        let text_columns = Self::text_columns(&source, &described, &request.text_columns)?;
-        let key = KeyColumn::resolve(db, &source, &described, request.key.as_deref())?;
-        let set = request.question_set.clone();
-        let wanted = TableName::sanitized(&format!("{source}_{}", set.name));
+        let text_columns = Self::text_columns(&source, &described, &set.text_columns)?;
+        let Some(key_column) = Self::column(&described, &set.key_column) else {
+            return Err(Error::SetColumnsGone {
+                table: source.to_string(),
+                columns: vec![set.key_column.clone()],
+            }
+            .into());
+        };
+        let key = KeyColumn::checked(db, &source, key_column)?;
+        let wanted = Self::output_name(&source);
         wanted.check_unreserved()?;
         let (output, output_exists, document) = Self::output(db, &catalog, &wanted)?;
         let columns = OutputColumns::new(source.as_str(), &key.name, &set.questions)?;
+        let set = LabelSet {
+            key_reason: KeyReason::of(&key.name),
+            key_column: key.name.clone(),
+            text_columns,
+            questions: set.questions.clone(),
+            sentence: set.sentence.clone(),
+        };
         let mut plan = Self {
             source,
             key,
-            text_columns,
             set,
-            rows: request.rows,
+            rows: Rows::Missing,
+            because: None,
             output,
             output_exists,
             document,
@@ -255,6 +333,56 @@ impl Plan {
         };
         plan.remaining = plan.count_remaining(db)?;
         Ok(plan)
+    }
+
+    /// Why a run of this plan labels every row again: the set or the model
+    /// is not what the labels were made with, or `asked` says so. `None`
+    /// for a run that adds the rows the output lacks, or makes the output.
+    pub(super) fn why_relabel(
+        &self,
+        in_force: Option<&Run>,
+        digest: &str,
+        asked: Rows,
+    ) -> Option<RelabelReason> {
+        if !self.output_exists {
+            return None;
+        }
+        let changed = in_force.and_then(|run| {
+            if !run.key_column.eq_ignore_ascii_case(&self.key.name)
+                || !run.key_type.eq_ignore_ascii_case(&self.key.duckdb_type)
+                || !run.source_table.eq_ignore_ascii_case(self.source.as_str())
+            {
+                Some(RelabelReason::KeyChanged)
+            } else if run.questions != self.set.questions || !self.reads_columns(&run.text_columns)
+            {
+                Some(RelabelReason::QuestionsChanged)
+            } else if run.model_digest != digest {
+                Some(RelabelReason::ModelChanged)
+            } else {
+                None
+            }
+        });
+        changed.or_else(|| (asked == Rows::All).then_some(RelabelReason::Asked))
+    }
+
+    /// This plan, labelling the rows `asked` for, or every row for
+    /// `because`; the rows left to label are counted again.
+    pub(super) fn labelling(
+        mut self,
+        db: &WorkspaceDb,
+        asked: Rows,
+        because: Option<RelabelReason>,
+    ) -> Result<Self> {
+        self.rows = if self.output_exists && because.is_some() {
+            Rows::All
+        } else if self.output_exists {
+            asked
+        } else {
+            Rows::Missing
+        };
+        self.because = because.filter(|_| self.output_exists);
+        self.remaining = self.count_remaining(db)?;
+        Ok(self)
     }
 
     /// Rows a run labels now: the source rows whose key the output does
@@ -275,31 +403,46 @@ impl Plan {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
-    /// Refuse a run that adds rows to an output labelled under another
-    /// definition than this plan's and the model weights `digest`: a run
-    /// that labels everything again replaces the labels, so it never is.
-    pub(super) fn check_definition(
-        &self,
-        in_force: Option<&ClassificationRun>,
-        digest: &str,
-    ) -> std::result::Result<(), ClassifyError> {
-        let Some(run) = in_force.filter(|_| self.rows == Rows::Missing && self.output_exists)
-        else {
-            return Ok(());
+    /// What the plan would do, as an interface says it.
+    pub(super) fn outline(&self, estimate_seconds: Option<u64>) -> Outline {
+        let effect = match (self.output_exists, self.rows) {
+            (false, _) => Effect::NewTable,
+            (true, Rows::Missing) => Effect::AddsRows,
+            (true, Rows::All) => Effect::ReplacesLabels {
+                because: self.because.unwrap_or(RelabelReason::Asked),
+            },
         };
-        let differs = run.differs(self, digest);
-        if differs.is_empty() {
-            return Ok(());
+        Outline {
+            source_table: self.source.to_string(),
+            output_table: self.output.to_string(),
+            key_column: self.key.name.clone(),
+            key_reason: self.set.key_reason,
+            text_columns: self.set.text_columns.clone(),
+            remaining: self.remaining,
+            questions: self
+                .set
+                .questions
+                .iter()
+                .map(|(name, question)| DraftQuestion::of(name, question))
+                .collect(),
+            effect,
+            estimate_seconds,
         }
-        Err(ClassifyError::DefinitionChanged {
-            table: self.output.to_string(),
-            differs,
-        })
+    }
+
+    /// Whether the text columns a run read are those this plan reads, without
+    /// regard to case.
+    fn reads_columns(&self, recorded: &[String]) -> bool {
+        recorded.len() == self.set.text_columns.len()
+            && recorded
+                .iter()
+                .zip(&self.set.text_columns)
+                .all(|(recorded, planned)| recorded.eq_ignore_ascii_case(planned))
     }
 
     /// The claim a run into this plan's output takes.
     pub(super) fn claimed(&self) -> Claimed {
-        Claimed::Classify(self.output.as_str().to_ascii_lowercase())
+        Claimed(self.output.as_str().to_ascii_lowercase())
     }
 
     /// Whether the output is still the table of labels of the document the
@@ -308,31 +451,6 @@ impl Plan {
         Ok(db.table_owner(self.output.as_str())?.is_some_and(|owner| {
             owner.source == DocumentSource::Classify && self.document.as_ref() == Some(&owner.id)
         }))
-    }
-
-    /// What the plan would do, as an interface says it.
-    pub(super) fn outline(&self) -> ClassificationOutline {
-        let effect = match (self.output_exists, self.rows) {
-            (false, _) => Effect::NewTable,
-            (true, Rows::Missing) => Effect::AddsRows,
-            (true, Rows::All) => Effect::ReplacesLabels,
-        };
-        ClassificationOutline {
-            source_table: self.source.to_string(),
-            output_table: self.output.to_string(),
-            key_column: self.key.name.clone(),
-            remaining: self.remaining,
-            questions: self
-                .set
-                .questions
-                .iter()
-                .map(|(name, question)| OutlineQuestion {
-                    name: name.to_string(),
-                    instructions: question.instructions().as_str().to_owned(),
-                })
-                .collect(),
-            effect,
-        }
     }
 
     /// A condition on source rows `s` that holds when `target` has no row
@@ -365,7 +483,7 @@ impl Plan {
     pub(super) fn page_select(&self) -> String {
         let key = quote_ident(&self.key.name);
         let mut select = vec![format!("CAST(s.{key} AS VARCHAR)")];
-        for column in &self.text_columns {
+        for column in &self.set.text_columns {
             select.push(format!(
                 "left(CAST(s.{} AS VARCHAR), {})",
                 quote_ident(column),

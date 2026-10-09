@@ -107,6 +107,7 @@ async fn a_refused_ollama_is_absent_not_an_error() {
 async fn an_ollama_embedding_model_is_measured_with_one_call() {
     let base = ollama_stub().await;
     let plan = SetupPlan {
+        decision: None,
         ollama_base_url: Some(BaseUrl::try_from(base).unwrap()),
         ..SetupPlan::default()
     };
@@ -219,6 +220,7 @@ fn each_provider_type_writes_a_new_file_quack_loads() {
         SetupPlan {
             chat: Some(choice(ProviderKind::Ollama, "chat:8b")),
             embedding: Some(embedding(ProviderKind::Ollama, "embed:small", 1024)),
+            decision: None,
             ollama_base_url: Some(BaseUrl::try_from(String::from("http://gpu-box:11434")).unwrap()),
         },
         SetupPlan {
@@ -232,6 +234,7 @@ fn each_provider_type_writes_a_new_file_quack_loads() {
                 "text-embedding-3-small",
                 1536,
             )),
+            decision: None,
             ollama_base_url: None,
         },
         SetupPlan {
@@ -241,6 +244,7 @@ fn each_provider_type_writes_a_new_file_quack_loads() {
                 "amazon.titan-embed-text-v2:0",
                 1024,
             )),
+            decision: None,
             ollama_base_url: None,
         },
     ];
@@ -273,6 +277,7 @@ fn a_new_file_names_the_key_variable_and_only_the_providers_used() {
     let plan = SetupPlan {
         chat: Some(choice(ProviderKind::Anthropic, "claude-x")),
         embedding: Some(embedding(ProviderKind::Ollama, "embed:small", 1024)),
+        decision: None,
         ollama_base_url: None,
     };
     let (text, _) = plan.apply(None).unwrap();
@@ -318,6 +323,7 @@ fn editing_keeps_every_other_setting_and_comment_and_reuses_a_matching_provider(
     let plan = SetupPlan {
         chat: Some(choice(ProviderKind::Ollama, "chat:8b")),
         embedding: Some(embedding(ProviderKind::Ollama, "embed:small", 1024)),
+        decision: None,
         ollama_base_url: None,
     };
     let (text, changes) = plan.apply(Some(EXISTING)).unwrap();
@@ -354,6 +360,7 @@ fn editing_adds_a_missing_provider_and_leaves_what_it_does_not_choose() {
     let plan = SetupPlan {
         chat: Some(choice(ProviderKind::Anthropic, "claude-x")),
         embedding: None,
+        decision: None,
         ollama_base_url: None,
     };
     let (text, changes) = plan.apply(Some(EXISTING)).unwrap();
@@ -383,6 +390,7 @@ fn choosing_what_the_file_already_has_changes_nothing() {
     let plan = SetupPlan {
         chat: Some(choice(ProviderKind::Ollama, "old:7b")),
         embedding: Some(embedding(ProviderKind::Ollama, "nomic-embed-text", 768)),
+        decision: None,
         ollama_base_url: None,
     };
     let (text, changes) = plan.apply(Some(EXISTING)).unwrap();
@@ -426,7 +434,15 @@ fn current_reads_the_models_the_file_names() {
         Current {
             chat_model: Some(String::from("local/old:7b")),
             embedding_model: Some(String::from("local/nomic-embed-text")),
+            decision_model: None,
         }
+    );
+    assert_eq!(
+        Current::of("[decision]\nmodel = \"local/laya\"\n")
+            .unwrap()
+            .decision_model
+            .as_deref(),
+        Some("local/laya")
     );
     assert_eq!(Current::of("").unwrap(), Current::default());
 }
@@ -476,4 +492,39 @@ fn an_empty_or_blank_variable_counts_as_unset() {
             .as_deref(),
         Some("http://localhost:11434")
     );
+}
+
+#[test]
+#[expect(clippy::unwrap_used, reason = "test")]
+fn a_decision_model_is_written_beside_the_others_and_names_its_provider() {
+    let plan = SetupPlan {
+        decision: Some(choice(ProviderKind::Ollama, "laya")),
+        ..SetupPlan::default()
+    };
+    assert!(!plan.is_empty());
+    assert_eq!(plan.providers(), [ProviderKind::Ollama]);
+    let (text, changes) = plan.apply(None).unwrap();
+    assert!(text.contains("[decision]"), "{text}");
+    let config = Config::parse(&text).unwrap();
+    assert_eq!(
+        config
+            .decision
+            .model
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("ollama/laya")
+    );
+    assert!(
+        changes.iter().any(|c| c.contains("[decision].model")),
+        "{changes:?}"
+    );
+
+    let (kept, changes) = plan
+        .apply(Some(
+            "[decision]\nmodel = \"ollama/laya\"\n[providers.ollama]\ntype = \"ollama\"\n",
+        ))
+        .unwrap();
+    assert!(changes.is_empty(), "{changes:?}");
+    assert!(kept.contains("ollama/laya"));
 }

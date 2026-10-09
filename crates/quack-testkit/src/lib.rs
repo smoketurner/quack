@@ -4,7 +4,7 @@
 
 mod decision;
 
-pub use decision::{DecisionStub, Fault, Seen, too_long};
+pub use decision::{DecisionStub, Fault, Seen};
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};

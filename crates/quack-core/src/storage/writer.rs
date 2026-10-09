@@ -68,13 +68,10 @@ impl Lines {
     }
 }
 
-/// Work of which one run at a time may go on in a workspace.
+/// Work of which one run at a time may go on in a workspace: labelling
+/// rows into this output table, named in lower case.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Claimed {
-    /// Labelling the rows of a table into this output table, named in
-    /// lower case.
-    Classify(String),
-}
+pub struct Claimed(pub String);
 
 /// The right to do the [`Claimed`] work, held until dropped.
 pub struct Claim {
@@ -107,9 +104,7 @@ impl Claims {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .map(|claimed| match claimed {
-                Claimed::Classify(output) => output.clone(),
-            })
+            .map(|claimed| claimed.0.clone())
             .collect()
     }
 }

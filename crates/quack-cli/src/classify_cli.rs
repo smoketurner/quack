@@ -1,29 +1,36 @@
 //! `quack classify`: label a table's text with a decision model (issue
-//! #472), or list the runs that did. The command line and the terminal's
-//! `/classify` run the same arguments.
+//! #472). A person names a table and says in a sentence what they want to
+//! know about each row; the chat model drafts the questions, the decision
+//! model answers them for a preview, and a yes runs the labelling. The
+//! terminal's `/classify` runs the same steps, asking in its own prompt.
 
-use std::fs::File;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::Write;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Subcommand;
 use quack_core::classify::{
-    Classification, ClassificationPreview, ClassificationRun, Labelling, MAX_QUESTION_SET_BYTES,
-    QuestionSet, Rows, Waiting,
+    self, Draft, DraftContext, DraftOrigin, Drafter, Effect, Labelling, RelabelReason, Rows,
+    SAMPLE_ROWS, Waiting,
 };
 use quack_core::config::Config;
-use quack_core::error::Error;
+use quack_core::error::{Error, Result as CoreResult};
 use quack_core::ids::RunId;
+use quack_core::llm::ChatDrafter;
 use quack_core::llm::decision::DecisionModel;
 use quack_core::progress::RunControl;
+use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
+use quack_core::text::Thousands;
+use serde::Serialize;
 
 use crate::args::QueryFormat;
+use crate::confirm::Confirm;
 use crate::text_or_json::TextOrJson;
 
 /// Runs `list` shows at most.
 const LISTED_RUNS: u32 = 100;
+/// Rows an interactive run previews unless `--preview` says otherwise.
+const PREVIEW_ROWS: u32 = 10;
 
 /// What `quack classify` does besides labelling a table.
 #[derive(Subcommand)]
@@ -34,42 +41,42 @@ pub enum ClassifyAction {
         #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
         format: TextOrJson,
     },
+    /// Show the questions last approved for a table
+    Show {
+        /// The table whose questions are shown
+        table: String,
+        /// `json` prints the questions and the labels as one JSON document
+        #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+        format: TextOrJson,
+    },
 }
 
 /// The arguments of a labelling.
 #[derive(clap::Args)]
 pub struct ClassifyArgs {
-    /// The table whose rows are labelled (a table named `list` is labelled
-    /// through the API or the agent: `list` is the subcommand here)
+    /// The table whose rows are labelled (a table named `list` or `show`
+    /// is labelled through the API or the agent: those are the subcommands
+    /// here)
     #[arg(required = true)]
     table: Option<String>,
-    /// The columns whose text the model reads (one to eight), comma-separated
-    #[arg(
-        long = "text",
-        required = true,
-        value_delimiter = ',',
-        value_name = "COLUMN"
-    )]
-    text: Vec<String>,
-    /// The JSON file of questions: `{"name": ..., "questions": {...}}`
-    #[arg(long, required = true, value_name = "FILE")]
-    questions: Option<PathBuf>,
-    /// The column that identifies a row; without it an `id` column, or one
-    /// ending in `_id`, whose values are all different is used
-    #[arg(long, value_name = "COLUMN")]
-    key: Option<String>,
-    /// Label only the first N rows (1 to 100), show them, and write nothing
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100))]
-    preview: Option<u32>,
+    /// What you want to know about each row, in your words; the questions
+    /// are drafted from it. Leave it out to use the questions approved
+    /// before.
+    #[arg(value_name = "SENTENCE")]
+    sentence: Option<String>,
+    /// Label without previewing or asking
+    #[arg(short = 'y', long)]
+    yes: bool,
     /// Label every row again; the old labels serve until the run completes
     #[arg(long)]
     all: bool,
-    /// `json` prints the preview or the run as one JSON document
-    #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
-    format: TextOrJson,
+    /// Label only the first N rows (1 to 100), show them, and stop
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100))]
+    preview: Option<u32>,
 }
 
-/// `quack classify TABLE ...` or `quack classify list`.
+/// `quack classify TABLE [SENTENCE]`, `quack classify list`, or `quack
+/// classify show TABLE`.
 #[derive(clap::Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct ClassifyCommand {
@@ -79,75 +86,520 @@ pub struct ClassifyCommand {
     run: ClassifyArgs,
 }
 
-impl ClassifyArgs {
-    /// The request these arguments make, reading the question file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the file cannot be read or is not a question
-    /// set.
-    pub fn classification(&self) -> Result<Classification> {
-        let file = self
-            .questions
-            .as_deref()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        let mut text = String::new();
-        File::open(&file)
-            .and_then(|file| {
-                file.take(
-                    u64::try_from(MAX_QUESTION_SET_BYTES)
-                        .unwrap_or(u64::MAX)
-                        .saturating_add(1),
-                )
-                .read_to_string(&mut text)
-            })
-            .with_context(|| format!("cannot read {}", file.display()))?;
-        let question_set = QuestionSet::parse(&text)
-            .with_context(|| format!("{} is not a question set", file.display()))?;
-        Ok(Classification {
-            table: self.table.clone().unwrap_or_default(),
-            text_columns: self.text.clone(),
-            key: self.key.clone(),
-            question_set,
-            rows: if self.all { Rows::All } else { Rows::Missing },
-        })
-    }
-
-    /// A job's label.
-    #[must_use]
-    pub fn label(&self) -> String {
-        format!("classify {}", self.table.as_deref().unwrap_or_default())
-    }
+/// A labelling worked out and shown, waiting for a yes.
+pub struct Prepared {
+    draft: Draft,
+    outline: classify::Outline,
+    preview: Option<classify::Preview>,
+    rows: Rows,
+    /// The sentence the person typed, when they typed one.
+    asked: Option<String>,
+    /// Whether questions had been approved before this call.
+    earlier: bool,
+    /// The decision model, as `provider/model`.
+    decision: String,
 }
 
 impl ClassifyArgs {
-    /// The rows of a preview as a table under the key they join on, then how
-    /// they came out.
-    fn show(&self, preview: &ClassificationPreview, out: &mut impl Write) -> Result<()> {
-        match self.format {
-            TextOrJson::Json => writeln!(out, "{}", serde_json::to_string_pretty(preview)?)?,
-            TextOrJson::Text => {
-                writeln!(out, "Key: {}", preview.key_column)?;
-                QueryFormat::Table.write(&preview.result, out)?;
-                writeln!(out, "{preview}")?;
+    /// The sentence, when one was given.
+    #[must_use]
+    pub fn sentence(&self) -> Option<String> {
+        let sentence = self.sentence.as_deref()?.trim();
+        (!sentence.is_empty()).then(|| sentence.to_owned())
+    }
+
+    /// The table.
+    #[must_use]
+    pub fn table(&self) -> &str {
+        self.table.as_deref().unwrap_or_default()
+    }
+
+    /// Whether `-y` was given.
+    #[must_use]
+    pub const fn yes(&self) -> bool {
+        self.yes
+    }
+
+    /// Rows to preview and stop, when `--preview` was given.
+    #[must_use]
+    pub const fn preview_only(&self) -> Option<u32> {
+        self.preview
+    }
+
+    /// Whether the table has questions to draft or revise, so the chat
+    /// model will be asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database's error.
+    pub async fn drafting(&self, db: &Writer) -> Result<Option<DraftOrigin>> {
+        let (table, sentence) = (self.table().to_owned(), self.sentence());
+        Ok(db
+            .run(move |db| Draft::drafting(db, &table, sentence.as_deref()))
+            .await?)
+    }
+
+    /// Draft or find the questions, preview the labels, and work out what
+    /// the run would do; nothing is stored. Status lines go to `status`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal ([`quack_core::classify::Error`]), the
+    /// models' or the database's error.
+    pub async fn prepare(
+        &self,
+        config: &Config,
+        db: &Writer,
+        status: &mut impl Write,
+        control: RunControl<'_>,
+    ) -> Result<Prepared> {
+        let decision = DecisionModel::from_config(config)
+            .await?
+            .ok_or(Error::NoDecisionModel)?;
+        let drafter = ChatDrafter::from_config(config);
+        let (table, sentence) = (self.table().to_owned(), self.sentence());
+        let drafting = self.drafting(db).await?;
+        if let (Some(origin), Some(drafter)) = (drafting, &drafter) {
+            writeln!(
+                status,
+                "{} questions with {} from {SAMPLE_ROWS} sample rows; this can take a minute or \
+                 two...",
+                if origin == DraftOrigin::Revised {
+                    "Revising"
+                } else {
+                    "Drafting"
+                },
+                drafter.label()
+            )?;
+            status.flush()?;
+        }
+        let earlier = db
+            .run({
+                let table = table.clone();
+                move |db| Ok(Draft::approved(db, &table)?.is_some())
+            })
+            .await?;
+        let context = DraftContext {
+            db,
+            decision: &decision,
+            drafter: drafter.as_ref().map(|d| -> &dyn Drafter { d }),
+        };
+        let draft = Draft::prepare(&context, &table, sentence.as_deref()).await?;
+        let rows = if self.all { Rows::All } else { Rows::Missing };
+        let outline = draft.outline(db, &decision, rows).await?;
+        let wanted = self
+            .preview
+            .or_else(|| (!self.yes).then_some(PREVIEW_ROWS))
+            .filter(|_| outline.remaining > 0 || rows == Rows::All);
+        let preview = match wanted {
+            Some(n) => Some(
+                draft
+                    .preview(db, &decision, n, rows, Waiting::Job, control)
+                    .await?,
+            ),
+            None => None,
+        };
+        let outline = match &preview {
+            Some(preview) => outline.estimated_from(preview),
+            None => outline,
+        };
+        Ok(Prepared {
+            draft,
+            outline,
+            preview,
+            rows,
+            asked: sentence,
+            earlier,
+            decision: decision.label().to_owned(),
+        })
+    }
+}
+
+impl Prepared {
+    /// Whether the output already holds every row, and nothing was asked
+    /// to label again.
+    #[must_use]
+    pub fn nothing_to_label(&self) -> bool {
+        self.outline.remaining == 0 && self.outline.effect == Effect::AddsRows
+    }
+
+    /// Whether the run replaces the labels already there.
+    #[must_use]
+    pub fn relabels(&self) -> bool {
+        matches!(self.outline.effect, Effect::ReplacesLabels { .. })
+    }
+
+    /// What is said when there is nothing to label.
+    #[must_use]
+    pub fn nothing_to_label_note(&self) -> String {
+        format!(
+            "Nothing to label: {} has every row of {}. --all labels every row again.",
+            self.outline.output_table, self.outline.source_table
+        )
+    }
+
+    /// The draft that a yes runs.
+    #[must_use]
+    pub const fn draft(&self) -> &Draft {
+        &self.draft
+    }
+
+    /// The question a yes answers.
+    #[must_use]
+    pub fn question(&self) -> String {
+        let outline = &self.outline;
+        let count = Thousands(outline.remaining);
+        let questions = outline.questions.len();
+        let what = match outline.effect {
+            Effect::NewTable => format!(
+                "Label all {count} rows into {} with {questions} questions?",
+                outline.output_table
+            ),
+            Effect::AddsRows => format!(
+                "Label {count} new rows into {} with {questions} questions?",
+                outline.output_table
+            ),
+            Effect::ReplacesLabels { .. } => format!(
+                "Label all {count} rows into {} again with {questions} questions?",
+                outline.output_table
+            ),
+        };
+        match outline.estimate() {
+            Some(estimate) => format!("{what} {}.", estimate.sentence()),
+            None => what,
+        }
+    }
+
+    /// What is said when the answer is no.
+    #[must_use]
+    pub fn declined(&self) -> String {
+        let table = &self.outline.source_table;
+        if self.earlier {
+            format!(
+                "Not labelled; these questions were not kept. The same sentence drafts them \
+                 again; quack classify {table} uses the questions approved before."
+            )
+        } else {
+            String::from("Not labelled; these questions were not kept.")
+        }
+    }
+
+    /// The table, the questions, and the preview, as the screen shows them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from writing to `out`.
+    pub fn show(&self, out: &mut impl Write) -> Result<()> {
+        let draft = &self.draft;
+        writeln!(out, "{}", draft.header())?;
+        match draft.origin {
+            DraftOrigin::Drafted | DraftOrigin::Revised => {
+                let verb = if draft.origin == DraftOrigin::Drafted {
+                    "Drafted"
+                } else {
+                    "Revised"
+                };
+                writeln!(out, "{verb} from {} sample rows:\n", draft.sample_rows)?;
             }
+            DraftOrigin::Reused if self.asked.is_some() => {
+                writeln!(
+                    out,
+                    "Same question as last time; using the stored questions.\n"
+                )?;
+            }
+            DraftOrigin::Reused => writeln!(out, "{}", Self::approved_line(draft))?,
+            DraftOrigin::Given => {}
+        }
+        writeln!(out, "{}", draft.set.block(false))?;
+        if let Some(preview) = &self.preview {
+            writeln!(out, "\nPreview of {} rows:", preview.compact.rows.len())?;
+            QueryFormat::Table.write(&preview.compact, out)?;
+            writeln!(out, "{preview}")?;
+            if preview.cut > 0 {
+                writeln!(
+                    out,
+                    "{} of {} cut to fit the model (*)",
+                    preview.cut,
+                    preview.compact.rows.len()
+                )?;
+            }
+        }
+        if let Effect::ReplacesLabels { because } = self.outline.effect {
+            writeln!(out, "\n{}", Self::relabel_note(because))?;
+        }
+        Ok(())
+    }
+
+    /// `Questions approved 2026-10-09 ("the sentence"):`
+    fn approved_line(draft: &Draft) -> String {
+        let when = draft
+            .approved_at
+            .as_deref()
+            .map(|at| at.chars().take(10).collect::<String>())
+            .unwrap_or_default();
+        match &draft.set.sentence {
+            Some(sentence) => format!("Questions approved {when} (\"{sentence}\"):"),
+            None => format!("Questions approved {when}:"),
+        }
+    }
+
+    /// Why every row is labelled again, and that the labels serve meanwhile.
+    fn relabel_note(because: RelabelReason) -> String {
+        const SERVE: &str = "the current labels serve until the new ones are complete.";
+        match because {
+            RelabelReason::Asked => format!("Every row is labelled again, as asked; {SERVE}"),
+            RelabelReason::QuestionsChanged => {
+                format!("The questions changed, so every row is labelled again; {SERVE}")
+            }
+            RelabelReason::ModelChanged => format!(
+                "The decision model's weights changed (ollama pull), so every row is labelled \
+                 again; {SERVE}"
+            ),
+            RelabelReason::KeyChanged => {
+                format!("The key changed, so every row is labelled again; {SERVE}")
+            }
+        }
+    }
+
+    /// Label the rows, recording the questions as approved.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal, the model's or the database's error, or an I/O
+    /// error from `out`.
+    pub async fn run(
+        self,
+        config: &Config,
+        db: &Writer,
+        out: &mut impl Write,
+        control: RunControl<'_>,
+    ) -> Result<()> {
+        let decision = DecisionModel::from_config(config)
+            .await?
+            .ok_or(Error::NoDecisionModel)?;
+        writeln!(
+            out,
+            "Labelling {} rows of {} with {} ({} questions: {})",
+            Thousands(self.outline.remaining),
+            self.outline.source_table,
+            self.decision,
+            self.outline.questions.len(),
+            self.outline.question_names()
+        )?;
+        out.flush()?;
+        let run = self
+            .draft
+            .run(
+                Labelling {
+                    db,
+                    decision: &decision,
+                    started_by: None,
+                    run_id: RunId::generate(),
+                    waiting: Waiting::Job,
+                    control,
+                },
+                self.rows,
+            )
+            .await?;
+        writeln!(out, "{run}")?;
+        Ok(())
+    }
+}
+
+/// The questions last approved for a table, with the labels they made.
+#[derive(Serialize)]
+struct Shown {
+    draft: Draft,
+    labels: Option<Labels>,
+}
+
+/// The table of labels and the run that made it.
+#[derive(Serialize)]
+struct Labels {
+    table: String,
+    rows: u64,
+    last_run: classify::Run,
+    /// Whether the labels were made with other questions than the last
+    /// approved: a relabel was stopped.
+    earlier_questions: bool,
+}
+
+impl Shown {
+    /// Read what `table` has approved.
+    fn read(db: &WorkspaceDb, table: &str) -> CoreResult<Option<Self>> {
+        let Some(draft) = Draft::approved(db, table)? else {
+            return Ok(None);
+        };
+        let Some(last_run) = classify::Run::last_approved(db, &draft.table)? else {
+            return Ok(None);
+        };
+        let labels = if db
+            .list_tables()?
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(&draft.output_table))
+        {
+            let in_force = classify::Run::in_force(db, &draft.output_table)?;
+            Some(Labels {
+                table: draft.output_table.clone(),
+                rows: u64::try_from(db.count_rows(&draft.output_table)?).unwrap_or(0),
+                earlier_questions: in_force
+                    .as_ref()
+                    .is_some_and(|made| made.questions != last_run.questions),
+                last_run,
+            })
+        } else {
+            None
+        };
+        Ok(Some(Self { draft, labels }))
+    }
+
+    fn write(&self, out: &mut impl Write) -> Result<()> {
+        let draft = &self.draft;
+        writeln!(out, "{}", draft.header())?;
+        let when = draft
+            .approved_at
+            .as_deref()
+            .map(|at| at.chars().take(16).collect::<String>())
+            .unwrap_or_default();
+        let by = draft
+            .drafted_by_model
+            .as_deref()
+            .map(|model| format!("; drafted by {model}"))
+            .unwrap_or_default();
+        match &draft.set.sentence {
+            Some(sentence) => writeln!(out, "Asked: \"{sentence}\" (approved {when}{by})")?,
+            None => writeln!(out, "Approved {when}{by}")?,
+        }
+        writeln!(out, "\n{}", draft.set.block(true))?;
+        if !draft.columns_gone.is_empty() {
+            writeln!(
+                out,
+                "\nThe table no longer has {}; say a sentence to draft new questions.",
+                draft.columns_gone.join(", ")
+            )?;
+        }
+        if let Some(labels) = &self.labels {
+            writeln!(
+                out,
+                "\nLabels: {}, {} rows; last run {} {} with {}{}.",
+                labels.table,
+                Thousands(labels.rows),
+                labels
+                    .last_run
+                    .started_at
+                    .chars()
+                    .take(10)
+                    .collect::<String>(),
+                labels.last_run.status,
+                labels.last_run.model,
+                if labels.earlier_questions {
+                    "; made with earlier questions, so the next run labels every row again"
+                } else {
+                    ""
+                }
+            )?;
         }
         Ok(())
     }
 }
 
 impl ClassifyCommand {
+    /// What a job running it is called.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match &self.action {
+            Some(ClassifyAction::List { .. }) => String::from("classify list"),
+            Some(ClassifyAction::Show { table, .. }) => format!("classify show {table}"),
+            None => format!("classify {}", self.run.table()),
+        }
+    }
+
+    /// The arguments of a labelling, when this is one.
+    #[must_use]
+    pub fn labelling(&self) -> Option<&ClassifyArgs> {
+        self.action.is_none().then_some(&self.run)
+    }
+
+    /// List the runs, show a table's questions, or label the table:
+    /// draft, preview, ask, run. Status lines go to stderr; the report to
+    /// `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal, the model's or the database's error, or an I/O
+    /// error from `out`.
+    pub async fn run(
+        self,
+        config: &Config,
+        db: &Writer,
+        confirm: Confirm,
+        out: &mut impl Write,
+        control: RunControl<'_>,
+    ) -> Result<()> {
+        let args = match self.action {
+            Some(ClassifyAction::List { format }) => return Self::list(db, format, out).await,
+            Some(ClassifyAction::Show { table, format }) => {
+                return Self::show(db, &table, format, out).await;
+            }
+            None => self.run,
+        };
+        let prepared = args
+            .prepare(config, db, &mut std::io::stderr(), control)
+            .await?;
+        if prepared.nothing_to_label() {
+            writeln!(out, "{}", prepared.nothing_to_label_note())?;
+            return Ok(());
+        }
+        prepared.show(out)?;
+        if args.preview.is_some() {
+            return Ok(());
+        }
+        if !args.yes {
+            let question = prepared.question();
+            let go = if prepared.relabels() {
+                confirm.ask_to_drop(false, out, &question)?
+            } else {
+                confirm.ask(out, &question, Some("--yes"))?
+            };
+            if !go {
+                writeln!(out, "{}", prepared.declined())?;
+                return Ok(());
+            }
+        }
+        prepared.run(config, db, out, control).await
+    }
+
+    async fn show(
+        db: &Writer,
+        table: &str,
+        format: TextOrJson,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        let wanted = table.to_owned();
+        let shown = db.run(move |db| Shown::read(db, &wanted)).await?;
+        match (shown, format) {
+            (Some(shown), TextOrJson::Json) => {
+                writeln!(out, "{}", serde_json::to_string_pretty(&shown)?)?;
+            }
+            (Some(shown), TextOrJson::Text) => shown.write(out)?,
+            (None, TextOrJson::Json) => writeln!(out, "null")?,
+            (None, TextOrJson::Text) => {
+                writeln!(out, "{table} has no approved questions yet.")?;
+            }
+        }
+        Ok(())
+    }
+
     /// The runs that labelled tables, newest first, as text or JSON.
     async fn list(db: &Writer, format: TextOrJson, out: &mut impl Write) -> Result<()> {
         let runs = db
-            .run(|db| ClassificationRun::list(db, LISTED_RUNS))
+            .run(|db| classify::Run::list(db, LISTED_RUNS))
             .await?
             .runs;
         format.write_rows(
             out,
             &runs,
-            "No table has been labelled yet; label one with `quack classify TABLE --text COLUMN --questions FILE`.",
+            "No table has been labelled yet; label one with `quack classify TABLE \"what you want to know about each row\"`.",
             |out, run| {
                 writeln!(
                     out,
@@ -168,246 +620,7 @@ impl ClassifyCommand {
             },
         )
     }
-
-    /// What a job running it is called.
-    #[must_use]
-    pub fn label(&self) -> String {
-        match &self.action {
-            Some(ClassifyAction::List { .. }) => String::from("classify list"),
-            None => self.run.label(),
-        }
-    }
-
-    /// List the runs, preview the labels, or label the table, reporting to
-    /// `out`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the refusal, the model's or the database's error, or an I/O
-    /// error from `out`.
-    pub async fn run(
-        self,
-        config: &Config,
-        db: &Writer,
-        out: &mut impl Write,
-        control: RunControl<'_>,
-    ) -> Result<()> {
-        let args = match self.action {
-            Some(ClassifyAction::List { format }) => return Self::list(db, format, out).await,
-            None => self.run,
-        };
-        let request = args.classification()?;
-        let decision = DecisionModel::from_config(config)
-            .await?
-            .ok_or(Error::NoDecisionModel)?;
-        if let Some(n) = args.preview {
-            let preview = request
-                .preview(db, &decision, n, Waiting::Job, control)
-                .await?;
-            return args.show(&preview, out);
-        }
-        let outline = request.outline(db, &decision).await?;
-        if args.format == TextOrJson::Text {
-            writeln!(
-                out,
-                "Labelling {} rows of {} (key {}) with {} ({} questions: {})",
-                outline.remaining,
-                outline.source_table,
-                outline.key_column,
-                decision.label(),
-                outline.questions.len(),
-                outline.question_names()
-            )?;
-            out.flush()?;
-        }
-        let run = request
-            .run(Labelling {
-                db,
-                decision: &decision,
-                started_by: None,
-                run_id: RunId::generate(),
-                waiting: Waiting::Job,
-                control,
-            })
-            .await?;
-        args.format.write(out, &run)?;
-        if args.format == TextOrJson::Text {
-            writeln!(out)?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::unwrap_used,
-    reason = "tests assert on values they have just built"
-)]
-mod tests {
-    use clap::Parser;
-    use quack_core::embedding::Dimension;
-    use quack_core::llm::egress::Egress;
-    use quack_core::storage::workspace::WorkspaceDb;
-    use quack_testkit::DecisionStub;
-
-    use super::*;
-
-    #[derive(Parser)]
-    struct Line {
-        #[command(flatten)]
-        command: ClassifyCommand,
-    }
-
-    const QUESTIONS: &str = r#"{"name": "triage", "questions": {
-        "department": {"type": "choice", "instructions": "Which department?",
-                       "criteria": {"billing": "Invoices", "technical": null, "none": null}},
-        "churn": {"type": "noul", "instructions": "Will they cancel?"}}}"#;
-
-    fn parse(words: &[&str]) -> Result<ClassifyCommand, clap::Error> {
-        let mut line = vec!["classify"];
-        line.extend_from_slice(words);
-        Line::try_parse_from(line).map(|l| l.command)
-    }
-
-    #[test]
-    fn the_arguments_of_a_run_and_of_list_parse() {
-        let run = parse(&[
-            "tickets",
-            "--text",
-            "subject,body",
-            "--questions",
-            "q.json",
-            "--preview",
-            "20",
-            "--all",
-        ]);
-        assert!(run.is_ok_and(|c| c.action.is_none()
-            && c.run.text == ["subject", "body"]
-            && c.run.preview == Some(20)
-            && c.run.all));
-        assert!(parse(&["list"]).is_ok_and(|c| c.action.is_some()));
-        assert!(parse(&["list", "--format", "json"]).is_ok());
-    }
-
-    #[test]
-    fn a_run_needs_a_table_text_columns_and_questions_and_a_sane_preview() {
-        assert!(parse(&[]).is_err());
-        assert!(parse(&["tickets", "--questions", "q.json"]).is_err());
-        assert!(parse(&["tickets", "--text", "subject"]).is_err());
-        for n in ["0", "101"] {
-            let line = [
-                "tickets",
-                "--text",
-                "subject",
-                "--questions",
-                "q.json",
-                "--preview",
-                n,
-            ];
-            assert!(parse(&line).is_err(), "--preview {n}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_preview_a_run_and_the_listing_print_what_they_found() {
-        let stub = DecisionStub::start().await;
-        let config = Config::parse(&format!(
-            "[providers.local]\ntype = \"ollama\"\nbase_url = \"{}\"\nmax_retries = 0\n\
-             [decision]\nmodel = \"local/laya\"\n",
-            stub.base_url()
-        ))
-        .unwrap();
-        let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
-        db.execute_statement(
-            "CREATE TABLE tickets AS SELECT range AS id, \
-             CASE WHEN range % 2 = 0 THEN 'billing' ELSE 'technical' END AS subject, \
-             'we will cancel' AS body FROM range(5)",
-        )
-        .unwrap();
-        let db = Writer::spawn(db).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("triage.json");
-        std::fs::write(&file, QUESTIONS).unwrap();
-        let file = file.display().to_string();
-        let base = [
-            "tickets",
-            "--text",
-            "subject,body",
-            "--questions",
-            file.as_str(),
-        ];
-        let control = RunControl::unobserved;
-
-        Egress::scope(Some(Egress::NoWorkspace), async {
-            let mut out = Vec::new();
-            let preview = parse(&[base.as_slice(), &["--preview", "2"]].concat()).unwrap();
-            preview
-                .run(&config, &db, &mut out, control())
-                .await
-                .unwrap();
-            let printed = String::from_utf8_lossy(&out).into_owned();
-            assert!(printed.starts_with("Key: id\n"), "{printed}");
-            assert!(printed.contains("department_confidence"), "{printed}");
-            assert!(printed.contains("2 rows labelled"), "{printed}");
-            assert!(
-                printed.contains("Run without --preview to label 5 rows."),
-                "{printed}"
-            );
-
-            let mut out = Vec::new();
-            let run = parse(&base).unwrap();
-            run.run(&config, &db, &mut out, control()).await.unwrap();
-            assert_eq!(
-                String::from_utf8_lossy(&out),
-                "Labelling 5 rows of tickets (key id) with local/laya (2 questions: department, churn)\n\
-                 Wrote tickets_triage: 5 rows labelled, 0 cut to fit the model, 0 empty, 0 skipped.\n"
-            );
-
-            let mut out = Vec::new();
-            let again = parse(&[base.as_slice(), &["--format", "json"]].concat()).unwrap();
-            again.run(&config, &db, &mut out, control()).await.unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
-            assert_eq!(json.get("labelled"), Some(&serde_json::json!(0)));
-            assert_eq!(json.get("status"), Some(&serde_json::json!("completed")));
-
-            let mut out = Vec::new();
-            let list = parse(&["list"]).unwrap();
-            list.run(&config, &db, &mut out, control()).await.unwrap();
-            let listed = String::from_utf8_lossy(&out).into_owned();
-            assert_eq!(listed.lines().count(), 2, "{listed}");
-            assert!(
-                listed.contains("tickets -> tickets_triage  completed"),
-                "{listed}"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn without_a_decision_model_it_says_what_to_set() {
-        let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
-        let db = Writer::spawn(db).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("triage.json");
-        std::fs::write(&file, QUESTIONS).unwrap();
-        let file = file.display().to_string();
-        let command =
-            parse(&["tickets", "--text", "subject", "--questions", file.as_str()]).unwrap();
-        let refused = Egress::scope(Some(Egress::NoWorkspace), async {
-            command
-                .run(
-                    &Config::default(),
-                    &db,
-                    &mut Vec::new(),
-                    RunControl::unobserved(),
-                )
-                .await
-        })
-        .await
-        .unwrap_err();
-        assert!(
-            refused.to_string().contains("[decision].model"),
-            "{refused}"
-        );
-    }
-}
+mod tests;

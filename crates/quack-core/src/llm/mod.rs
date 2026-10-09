@@ -39,7 +39,7 @@ use crate::analysis::search::DocumentScope;
 use crate::analysis::text_to_sql::{PromptOptions, Window};
 use crate::analysis::tools::Rerank;
 use crate::analysis::tools::{Labeller, ReaderDb, SharedDb};
-use crate::classify::LabelJobs;
+use crate::classify::{DRAFT_PROMPT, DraftAnswer, Drafter, LabelJobs};
 use crate::config::{
     BaseUrl, BedrockApi, BedrockEndpoint, Config, Effort, ModelRef, ModelSettings, ProviderAuth,
     ProviderConfig, ProviderName, ProviderType, RerankMode, config_file_path,
@@ -911,6 +911,70 @@ pub async fn chat_extractor(config: &Config) -> Result<Box<dyn Extract<OpenExtra
         schema_for!(OpenExtraction),
     )?;
     Ok(Box::new(call))
+}
+
+/// The configured chat model as the drafter of a table's questions: its
+/// answer must name one of `candidates` as a text column.
+///
+/// # Errors
+///
+/// Returns an error when no chat model is configured or the provider
+/// cannot be built (a missing key, a needed login).
+pub async fn question_drafter(
+    config: &Config,
+    candidates: &[String],
+) -> Result<Box<dyn Extract<DraftAnswer>>> {
+    let chat = config.chat_model_ref()?;
+    let call: SchemaCall<DraftAnswer> = ChatClient::build(config, &chat).await?.schema_call(
+        chat.model,
+        config.model_settings(chat),
+        Task {
+            preamble: DRAFT_PROMPT,
+            timeout: config.analysis.extraction_timeout(),
+            label: "question drafting",
+        },
+        DraftAnswer::schema(candidates),
+    )?;
+    Ok(Box::new(call))
+}
+
+/// The configured chat model, drafting questions for the labelling of a
+/// table's text.
+#[derive(Clone)]
+pub struct ChatDrafter {
+    config: Config,
+    label: String,
+}
+
+impl ChatDrafter {
+    /// The drafter `config` describes, or `None` without a chat model.
+    #[must_use]
+    pub fn from_config(config: &Config) -> Option<Self> {
+        let chat = config.chat_model_ref().ok()?;
+        Some(Self {
+            label: chat.to_string(),
+            config: config.clone(),
+        })
+    }
+}
+
+impl Drafter for ChatDrafter {
+    fn answer<'a>(
+        &'a self,
+        candidates: &'a [String],
+        message: &'a str,
+    ) -> ExtractFuture<'a, DraftAnswer> {
+        Box::pin(async move {
+            question_drafter(&self.config, candidates)
+                .await?
+                .extract(message)
+                .await
+        })
+    }
+
+    fn label(&self) -> String {
+        self.label.clone()
+    }
 }
 
 impl ProviderAuth {

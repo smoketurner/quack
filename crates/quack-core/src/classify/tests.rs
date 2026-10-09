@@ -12,9 +12,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::embedding::Dimension;
-use crate::error::Error;
+use crate::error::Error as CoreError;
+use crate::extraction::ExtractFuture;
 use crate::ids::DocumentId;
+use crate::ingestion::TableName;
 use crate::jobs::JobState;
+use crate::llm::decision::QuestionSetError;
 use crate::llm::decision::fixture::{model, scoped};
 use crate::llm::decision::stub::{DecisionStub, Fault};
 use crate::llm::egress::Egress;
@@ -25,28 +28,66 @@ use crate::storage::writer::Claimed;
 use plan::Plan;
 use store::{Ended, PageWrite, Start};
 
-fn triage() -> QuestionSet {
-    named("triage")
-}
-
-fn named(name: &str) -> QuestionSet {
+fn questions() -> Questions {
     serde_json::from_value(json!({
-        "name": name,
-        "questions": {
-            "department": {
-                "type": "choice",
-                "instructions": "Which department should handle this ticket?",
-                "criteria": {"billing": null, "technical": "Bugs, outages", "none": null}
-            },
-            "urgency": {
-                "type": "score",
-                "instructions": "How urgent is this ticket?",
-                "criteria": ["Not urgent", "Soon", "Blocking"]
-            },
-            "churn": {"type": "noul", "instructions": "Does the customer threaten to cancel?"}
-        }
+        "department": {
+            "type": "choice",
+            "instructions": "Which department should handle this ticket?",
+            "criteria": {"billing": null, "technical": "Bugs, outages", "none": null}
+        },
+        "urgency": {
+            "type": "score",
+            "instructions": "How urgent is this ticket?",
+            "criteria": ["Not urgent", "Soon", "Blocking"]
+        },
+        "churn": {"type": "noul", "instructions": "Does the customer threaten to cancel?"}
     }))
     .unwrap()
+}
+
+fn other_questions() -> Questions {
+    serde_json::from_value(json!({
+        "churn": {"type": "noul", "instructions": "Will they leave?"}
+    }))
+    .unwrap()
+}
+
+/// What a test labels: a table, the columns the model reads, a key (the
+/// `id` column unless named), and the questions.
+#[derive(Clone)]
+struct Classification {
+    table: String,
+    text_columns: Vec<String>,
+    key: Option<String>,
+    questions: Questions,
+    rows: Rows,
+}
+
+impl Classification {
+    fn set(&self) -> LabelSet {
+        let key = self.key.clone().unwrap_or_else(|| String::from("id"));
+        LabelSet {
+            key_reason: KeyReason::of(&key),
+            key_column: key,
+            text_columns: self.text_columns.clone(),
+            questions: self.questions.clone(),
+            sentence: Some(String::from("which department, and how urgent")),
+        }
+    }
+
+    fn draft(&self) -> Draft {
+        Draft {
+            table: self.table.clone(),
+            output_table: String::new(),
+            set: self.set(),
+            rows: 0,
+            sample_rows: 0,
+            origin: DraftOrigin::Given,
+            drafted_by_model: Some(String::from("test/chat")),
+            approved_at: None,
+            columns_gone: Vec::new(),
+        }
+    }
 }
 
 fn request() -> Classification {
@@ -54,9 +95,16 @@ fn request() -> Classification {
         table: String::from("tickets"),
         text_columns: vec![String::from("subject"), String::from("body")],
         key: None,
-        question_set: triage(),
+        questions: questions(),
         rows: Rows::Missing,
     }
+}
+
+/// `request` checked against the workspace, labelling the rows it asks for.
+fn plan_of(db: &WorkspaceDb, request: &Classification) -> Plan {
+    let plan = Plan::resolve(db, &request.table, &request.set()).unwrap();
+    let because = (request.rows == Rows::All).then_some(RelabelReason::Asked);
+    plan.labelling(db, request.rows, because).unwrap()
 }
 
 /// A workspace with a `tickets` table of 600 rows, a writer over it, and
@@ -104,42 +152,51 @@ impl Fixture {
         request: &Classification,
         control: RunControl<'_>,
         waiting: Waiting,
-    ) -> Result<ClassificationRun> {
+    ) -> Result<Run> {
         let decision = model(&self.stub).await;
         request
-            .run(Labelling {
-                db: &self.writer,
-                decision: &decision,
-                started_by: Some("user"),
-                run_id: RunId::generate(),
-                waiting,
-                control,
-            })
+            .draft()
+            .run(
+                Labelling {
+                    db: &self.writer,
+                    decision: &decision,
+                    started_by: Some("user"),
+                    run_id: RunId::generate(),
+                    waiting,
+                    control,
+                },
+                request.rows,
+            )
             .await
     }
 
-    async fn run(&self, request: &Classification) -> ClassificationRun {
+    async fn outline(&self, request: &Classification) -> Outline {
+        let decision = model(&self.stub).await;
+        request
+            .draft()
+            .outline(&self.writer, &decision, request.rows)
+            .await
+            .unwrap()
+    }
+
+    async fn run(&self, request: &Classification) -> Run {
         self.try_run(request, RunControl::unobserved(), Waiting::Job)
             .await
             .unwrap()
     }
 
-    async fn refusal(&self, request: &Classification) -> ClassifyError {
+    async fn refusal(&self, request: &Classification) -> Error {
         match self
             .try_run(request, RunControl::unobserved(), Waiting::Job)
             .await
         {
-            Err(Error::Classify(refusal)) => refusal,
+            Err(CoreError::Classify(refusal)) => refusal,
             other => panic!("expected a classify refusal, got {other:?}"),
         }
     }
 
-    async fn runs(&self) -> Vec<ClassificationRun> {
-        self.writer
-            .run(|db| ClassificationRun::list(db, 100))
-            .await
-            .unwrap()
-            .runs
+    async fn runs(&self) -> Vec<Run> {
+        self.writer.run(|db| Run::list(db, 100)).await.unwrap().runs
     }
 
     /// The `subject` of each decision request after the two probes, in
@@ -180,7 +237,7 @@ async fn a_run_labels_every_row_in_key_order_one_page_at_a_time() {
             (600, 0, 0, 0)
         );
         assert_eq!(run.rows, Rows::Missing);
-        assert_eq!(run.output_table, "tickets_triage");
+        assert_eq!(run.output_table, "tickets_labels");
         assert_eq!(run.key_column, "id");
     })
     .await;
@@ -204,24 +261,24 @@ async fn a_run_labels_every_row_in_key_order_one_page_at_a_time() {
         "numeric key order across pages"
     );
     assert_eq!(
-        fixture.count("SELECT count(*) FROM tickets_triage").await,
+        fixture.count("SELECT count(*) FROM tickets_labels").await,
         600
     );
     assert_eq!(
         fixture
-            .count("SELECT count(*) FROM tickets_triage WHERE department = 'technical'")
+            .count("SELECT count(*) FROM tickets_labels WHERE department = 'technical'")
             .await,
         200
     );
     assert_eq!(
         fixture
-            .count("SELECT count(*) FROM tickets_triage WHERE urgency_level = 0 AND churn < 0.5")
+            .count("SELECT count(*) FROM tickets_labels WHERE urgency_level = 0 AND churn < 0.5")
             .await,
         600
     );
     assert_eq!(
         fixture
-            .count("SELECT count(*) FROM tickets t JOIN tickets_triage l USING (id)")
+            .count("SELECT count(*) FROM tickets t JOIN tickets_labels l USING (id)")
             .await,
         600
     );
@@ -235,8 +292,8 @@ async fn the_output_is_a_document_with_the_meaning_of_its_columns() {
         .writer
         .run(|db| {
             Ok((
-                db.table_owner("tickets_triage")?,
-                db.describe_table("tickets_triage")?,
+                db.table_owner("tickets_labels")?,
+                db.describe_table("tickets_labels")?,
             ))
         })
         .await
@@ -250,8 +307,8 @@ async fn the_output_is_a_document_with_the_meaning_of_its_columns() {
             .await,
         1
     );
-    assert_eq!(owner.tables, Some(vec![String::from("tickets_triage")]));
-    assert_eq!(owner.title.as_deref(), Some("tickets labelled by triage"));
+    assert_eq!(owner.tables, Some(vec![String::from("tickets_labels")]));
+    assert_eq!(owner.title.as_deref(), Some("tickets labels"));
     let meaning = |column: &str| {
         described
             .columns
@@ -294,7 +351,7 @@ async fn a_rerun_labels_only_the_keys_the_output_lacks() {
     })
     .await;
     assert_eq!(
-        fixture.count("SELECT count(*) FROM tickets_triage").await,
+        fixture.count("SELECT count(*) FROM tickets_labels").await,
         610
     );
 }
@@ -322,12 +379,12 @@ async fn labelling_every_row_again_replaces_the_labels_when_it_completes() {
     .await;
     assert_eq!(
         fixture
-            .count("SELECT count(*) FROM tickets_triage WHERE id = 0 AND department = 'none'")
+            .count("SELECT count(*) FROM tickets_labels WHERE id = 0 AND department = 'none'")
             .await,
         1
     );
     assert_eq!(
-        fixture.count("SELECT count(*) FROM tickets_triage").await,
+        fixture.count("SELECT count(*) FROM tickets_labels").await,
         600
     );
     assert_eq!(
@@ -338,7 +395,7 @@ async fn labelling_every_row_again_replaces_the_labels_when_it_completes() {
     );
     assert_eq!(
         fixture
-            .count("SELECT count(*) FROM duckdb_constraints() WHERE table_name = 'tickets_triage' AND constraint_type = 'PRIMARY KEY'")
+            .count("SELECT count(*) FROM duckdb_constraints() WHERE table_name = 'tickets_labels' AND constraint_type = 'PRIMARY KEY'")
             .await,
         1,
         "the swapped-in table keeps the key"
@@ -369,11 +426,11 @@ async fn a_cancelled_run_that_labels_everything_again_leaves_the_old_labels() {
                 Waiting::Job,
             )
             .await;
-        assert!(matches!(stopped, Err(Error::Cancelled)), "{stopped:?}");
+        assert!(matches!(stopped, Err(CoreError::Cancelled)), "{stopped:?}");
         assert_eq!(
             fixture
                 .count(
-                    "SELECT count(*) FROM tickets_triage WHERE id = 0 AND department = 'technical'"
+                    "SELECT count(*) FROM tickets_labels WHERE id = 0 AND department = 'technical'"
                 )
                 .await,
             1,
@@ -391,7 +448,7 @@ async fn a_cancelled_run_that_labels_everything_again_leaves_the_old_labels() {
         );
         let in_force = fixture
             .writer
-            .run(|db| ClassificationRun::in_force(db, "tickets_triage"))
+            .run(|db| Run::in_force(db, "tickets_labels"))
             .await
             .unwrap()
             .unwrap();
@@ -426,9 +483,9 @@ async fn a_cancel_keeps_the_rows_answered_and_a_rerun_finishes() {
                 Waiting::Job,
             )
             .await;
-        assert!(matches!(stopped, Err(Error::Cancelled)), "{stopped:?}");
+        assert!(matches!(stopped, Err(CoreError::Cancelled)), "{stopped:?}");
         assert_eq!(
-            fixture.count("SELECT count(*) FROM tickets_triage").await,
+            fixture.count("SELECT count(*) FROM tickets_labels").await,
             256
         );
         let runs = fixture.runs().await;
@@ -438,7 +495,7 @@ async fn a_cancel_keeps_the_rows_answered_and_a_rerun_finishes() {
         );
         let profiled = fixture
             .writer
-            .run(|db| TableProfile::current(db, "tickets_triage", 256))
+            .run(|db| TableProfile::current(db, "tickets_labels", 256))
             .await
             .unwrap();
         assert!(profiled.is_some(), "a stopped run refreshes the profile");
@@ -447,50 +504,58 @@ async fn a_cancel_keeps_the_rows_answered_and_a_rerun_finishes() {
     })
     .await;
     assert_eq!(
-        fixture.count("SELECT count(*) FROM tickets_triage").await,
+        fixture.count("SELECT count(*) FROM tickets_labels").await,
         600
     );
 }
 
 #[tokio::test]
-async fn other_questions_or_weights_need_everything_labelled_again() {
+async fn other_questions_or_weights_label_every_row_again() {
     let fixture = Fixture::new().await;
     scoped(Box::pin(async {
         let first = fixture.run(&request()).await;
-        let mut changed = request();
-        changed.question_set = serde_json::from_value(json!({
-            "name": "triage",
-            "questions": {"churn": {"type": "noul", "instructions": "Will they leave?"}}
-        }))
-        .unwrap();
-        let ClassifyError::DefinitionChanged { differs, .. } = fixture.refusal(&changed).await
-        else {
-            panic!("expected a changed definition");
+        assert_eq!(
+            fixture.outline(&request()).await.effect,
+            Effect::AddsRows,
+            "the same questions add rows"
+        );
+        let changed = Classification {
+            questions: other_questions(),
+            ..request()
         };
-        assert_eq!(differs, ["questions"]);
+        let outline = fixture.outline(&changed).await;
+        assert_eq!(
+            outline.effect,
+            Effect::ReplacesLabels {
+                because: RelabelReason::QuestionsChanged
+            }
+        );
+        assert_eq!(outline.remaining, 600);
 
         fixture.stub.set_digest("sha256:bbbb");
-        let ClassifyError::DefinitionChanged { differs, .. } = fixture.refusal(&request()).await
-        else {
-            panic!("expected a changed definition");
-        };
-        assert_eq!(differs, ["model weights"]);
-        let refused = fixture.refusal(&request()).await.to_string();
-        assert!(refused.contains("--all"), "{refused}");
-
-        let swapped = fixture
-            .run(&Classification {
-                rows: Rows::All,
-                ..changed.clone()
-            })
-            .await;
-        assert_eq!(swapped.status, RunStatus::Completed);
         assert_eq!(
-            fixture.count("SELECT count(*) FROM tickets_triage").await,
-            600
+            fixture.outline(&request()).await.effect,
+            Effect::ReplacesLabels {
+                because: RelabelReason::ModelChanged
+            }
         );
 
-        // A deleted output is not compared against the definition it had.
+        let swapped = fixture.run(&changed).await;
+        assert_eq!(swapped.status, RunStatus::Completed);
+        assert_eq!(swapped.rows, Rows::All, "the run labels every row again");
+        assert_eq!(
+            fixture.count("SELECT count(*) FROM tickets_labels").await,
+            600
+        );
+        assert_eq!(
+            fixture
+                .count("SELECT count(*) FROM duckdb_columns() WHERE table_name = 'tickets_labels' AND column_name = 'department'")
+                .await,
+            0,
+            "the labels of the old questions are gone"
+        );
+
+        // A deleted output is not compared against the set it had.
         let document = swapped.document_id;
         fixture
             .writer
@@ -525,61 +590,22 @@ async fn a_first_run_that_asked_for_everything_is_recorded_as_a_first_labelling(
                 Waiting::Job,
             )
             .await;
-        assert!(matches!(stopped, Err(Error::Cancelled)));
+        assert!(matches!(stopped, Err(CoreError::Cancelled)));
         let runs = fixture.runs().await;
         assert_eq!(runs.first().map(|r| r.rows), Some(Rows::Missing));
-        let mut changed = request();
-        changed.question_set = serde_json::from_value(json!({
-            "name": "triage",
-            "questions": {"churn": {"type": "noul", "instructions": "Will they leave?"}}
-        }))
-        .unwrap();
-        assert!(matches!(
-            fixture.refusal(&changed).await,
-            ClassifyError::DefinitionChanged { .. }
-        ));
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn a_set_named_in_another_case_labels_into_the_same_table() {
-    let fixture = Fixture::new().await;
-    scoped(async {
-        fixture.run(&request()).await;
-        let before = fixture.stub.requests();
-        let run = fixture
-            .run(&Classification {
-                question_set: named("Triage"),
-                ..request()
-            })
-            .await;
-        assert_eq!(run.output_table, "tickets_triage");
-        assert_eq!(run.labelled, 0);
-        assert_eq!(fixture.stub.requests() - before, 2, "only the probes");
-
-        let claim = fixture
-            .writer
-            .claim(Claimed::Classify(String::from("tickets_triage")));
-        assert!(claim.is_some());
-        let refused = fixture
-            .refusal(&Classification {
-                question_set: named("TRIAGE"),
-                ..request()
-            })
-            .await;
-        assert!(
-            matches!(refused, ClassifyError::Running { .. }),
-            "{refused}"
+        let changed = Classification {
+            questions: other_questions(),
+            ..request()
+        };
+        assert_eq!(
+            fixture.outline(&changed).await.effect,
+            Effect::ReplacesLabels {
+                because: RelabelReason::QuestionsChanged
+            },
+            "later questions are compared against the first run's"
         );
     })
     .await;
-    assert_eq!(
-        fixture
-            .count("SELECT count(*) FROM duckdb_tables() WHERE table_name ILIKE 'tickets_triage'")
-            .await,
-        1
-    );
 }
 
 #[tokio::test]
@@ -588,11 +614,11 @@ async fn an_output_that_lost_its_key_is_refused_until_everything_is_labelled_aga
     scoped(async {
         fixture.run(&request()).await;
         fixture
-            .sql("CREATE OR REPLACE TABLE tickets_triage AS SELECT * FROM tickets_triage")
+            .sql("CREATE OR REPLACE TABLE tickets_labels AS SELECT * FROM tickets_labels")
             .await;
         assert!(matches!(
             fixture.refusal(&request()).await,
-            ClassifyError::KeyLost { .. }
+            Error::KeyLost { .. }
         ));
         let all = fixture
             .run(&Classification {
@@ -608,51 +634,66 @@ async fn an_output_that_lost_its_key_is_refused_until_everything_is_labelled_aga
 }
 
 #[tokio::test]
-async fn a_table_without_an_id_column_names_the_columns_that_could_serve() {
+async fn a_table_without_an_id_column_falls_back_to_a_unique_number_then_short_text() {
     let fixture = Fixture::new().await;
     fixture
         .sql("CREATE TABLE notes AS SELECT 'row ' || range AS subject, 'x' AS body, range * 10 AS ref FROM range(5)")
         .await;
-    scoped(async {
-        let request = Classification {
-            table: String::from("notes"),
-            text_columns: vec![String::from("subject")],
-            ..request()
-        };
-        let said = fixture.refusal(&request).await.to_string();
-        assert!(said.contains("named id, or ending in _id or Id"), "{said}");
-        let ClassifyError::NoKey {
-            unique, closest, ..
-        } = fixture.refusal(&request).await
+    fixture
+        .sql("CREATE TABLE both_ids AS SELECT range AS ref, range + 100 AS ticket_id FROM range(5)")
+        .await;
+    fixture
+        .sql("CREATE TABLE words AS SELECT 'row ' || range AS subject, 'x' AS body FROM range(5)")
+        .await;
+    fixture
+        .sql("CREATE TABLE floaty AS SELECT range * 1.5 AS score, 'x' AS body FROM range(5)")
+        .await;
+    fixture
+        .sql("CREATE TABLE essays AS SELECT repeat('long ', 40) || range AS text, 'x' AS body FROM range(5)")
+        .await;
+    let key_of = |table: &'static str| {
+        let fixture = &fixture;
+        async move {
+            fixture
+                .writer
+                .run(move |db| {
+                    let source = TableName::exact(&db.list_tables()?, table)?;
+                    let columns = db.describe_columns(source.as_str())?;
+                    KeyColumn::resolve(db, &source, &columns).map(|key| key.name)
+                })
+                .await
+        }
+    };
+    assert_eq!(
+        key_of("notes").await.unwrap(),
+        "ref",
+        "a number before text"
+    );
+    assert_eq!(
+        key_of("both_ids").await.unwrap(),
+        "ticket_id",
+        "an id-like name before a number"
+    );
+    assert_eq!(key_of("words").await.unwrap(), "subject", "short text");
+    for table in ["floaty", "essays"] {
+        let refused = key_of(table).await;
+        let Err(CoreError::Classify(Error::NoKey {
+            table: named,
+            unique,
+            ..
+        })) = refused
         else {
-            panic!("expected no key");
+            panic!("{table}: expected no key, got {refused:?}");
         };
-        assert_eq!(unique, ["subject", "ref"]);
-        assert_eq!(
-            closest.first().map(|c| (c.column.as_str(), c.distinct)),
-            Some(("body", 1))
-        );
-
-        let chosen = fixture
-            .run(&Classification {
-                key: Some(String::from("REF")),
-                ..request.clone()
-            })
-            .await;
-        assert_eq!((chosen.key_column.as_str(), chosen.labelled), ("ref", 5));
-
-        let ClassifyError::KeyNotUnique { rows, distinct, .. } = fixture
-            .refusal(&Classification {
-                key: Some(String::from("body")),
-                ..request
-            })
-            .await
-        else {
-            panic!("expected a key that is not unique");
-        };
-        assert_eq!((rows, distinct), (5, 1));
-    })
-    .await;
+        assert_eq!(named, table);
+        assert_eq!(unique.len(), 1, "{table}: the unique column is named");
+    }
+    let said = key_of("floaty").await.unwrap_err().to_string();
+    assert!(said.contains("row_number()"), "{said}");
+    assert!(
+        said.contains("Unique columns of a type that cannot be a key: score"),
+        "{said}"
+    );
 }
 
 #[tokio::test]
@@ -668,7 +709,7 @@ async fn a_key_with_a_missing_value_is_not_a_key() {
             key: Some(String::from("id")),
             ..request()
         };
-        let ClassifyError::KeyNotUnique { missing, .. } = fixture.refusal(&request).await else {
+        let Error::KeyNotUnique { missing, .. } = fixture.refusal(&request).await else {
             panic!("expected a key with a missing value");
         };
         assert_eq!(missing, 1);
@@ -681,6 +722,9 @@ async fn names_quack_keeps_and_columns_that_do_not_exist_are_refused() {
     let fixture = Fixture::new().await;
     fixture
         .sql("CREATE TABLE graph_things AS SELECT 1 AS id, 'x' AS body")
+        .await;
+    fixture
+        .sql("CREATE TABLE wide AS SELECT range AS id, 'a' AS c0, 'a' AS c1, 'a' AS c2, 'a' AS c3, 'a' AS c4, 'a' AS c5, 'a' AS c6, 'a' AS c7, 'a' AS c8 FROM range(3)")
         .await;
     scoped(async {
         for table in ["graph_things", "_quack_documents"] {
@@ -695,7 +739,7 @@ async fn names_quack_keeps_and_columns_that_do_not_exist_are_refused() {
                 )
                 .await;
             assert!(
-                matches!(&refused, Err(Error::Ingestion(m)) if m.contains("reserves")),
+                matches!(&refused, Err(CoreError::Ingestion(m)) if m.contains("reserves")),
                 "{refused:?}"
             );
         }
@@ -706,17 +750,28 @@ async fn names_quack_keeps_and_columns_that_do_not_exist_are_refused() {
                     ..request()
                 })
                 .await,
-            ClassifyError::NoTable(_)
+            Error::NoTable(_)
         ));
-        assert!(matches!(
-            fixture
-                .refusal(&Classification {
-                    text_columns: vec![String::from("nope")],
-                    ..request()
-                })
-                .await,
-            ClassifyError::NoColumn { .. }
-        ));
+        let Error::SetColumnsGone { columns, .. } = fixture
+            .refusal(&Classification {
+                text_columns: vec![String::from("nope")],
+                ..request()
+            })
+            .await
+        else {
+            panic!("expected columns that are gone");
+        };
+        assert_eq!(columns, ["nope"]);
+        let Error::SetColumnsGone { columns, .. } = fixture
+            .refusal(&Classification {
+                key: Some(String::from("missing_key")),
+                ..request()
+            })
+            .await
+        else {
+            panic!("expected a key that is gone");
+        };
+        assert_eq!(columns, ["missing_key"]);
         assert!(matches!(
             fixture
                 .refusal(&Classification {
@@ -724,27 +779,30 @@ async fn names_quack_keeps_and_columns_that_do_not_exist_are_refused() {
                     ..request()
                 })
                 .await,
-            ClassifyError::TextColumns(0)
+            Error::NoText { .. }
         ));
         let nine: Vec<String> = (0..9).map(|n| format!("c{n}")).collect();
         assert!(matches!(
             fixture
                 .refusal(&Classification {
+                    table: String::from("wide"),
                     text_columns: nine,
                     ..request()
                 })
                 .await,
-            ClassifyError::TextColumns(9)
+            Error::TextColumns(9)
         ));
-        assert!(matches!(
-            fixture
-                .refusal(&Classification {
-                    text_columns: vec![String::from("subject"), String::from("SUBJECT")],
-                    ..request()
-                })
-                .await,
-            ClassifyError::DuplicateColumn(_)
-        ));
+        let twice = fixture
+            .outline(&Classification {
+                text_columns: vec![String::from("subject"), String::from("SUBJECT")],
+                ..request()
+            })
+            .await;
+        assert_eq!(
+            twice.text_columns,
+            ["subject"],
+            "a repeated column is read once"
+        );
     })
     .await;
     assert!(fixture.runs().await.is_empty(), "a refusal records nothing");
@@ -766,7 +824,7 @@ async fn a_source_named_with_a_dot_is_found_by_its_exact_name() {
             .await;
         assert_eq!(
             (run.source_table.as_str(), run.output_table.as_str()),
-            ("orders.v2", "orders_v2_triage")
+            ("orders.v2", "orders_v2_labels")
         );
     })
     .await;
@@ -778,10 +836,12 @@ async fn a_preview_labels_rows_and_writes_nothing() {
     scoped(async {
         let decision = model(&fixture.stub).await;
         let preview = request()
+            .draft()
             .preview(
                 &fixture.writer,
                 &decision,
                 5,
+                Rows::Missing,
                 Waiting::Job,
                 RunControl::unobserved(),
             )
@@ -817,11 +877,21 @@ async fn a_preview_labels_rows_and_writes_nothing() {
             ),
             (600, 5, "id")
         );
-        assert!(
-            preview
-                .to_string()
-                .contains("Run without --preview to label 600 rows.")
+        assert!(preview.to_string().starts_with("5 rows in "), "{preview}");
+        assert_eq!(
+            preview.compact.columns,
+            ["id", "department (p)", "urgency", "churn"]
         );
+        assert_eq!(
+            preview.compact.rows.first(),
+            Some(&vec![
+                json!("0"),
+                json!("technical (0.90)"),
+                json!("0.00"),
+                json!("0.10")
+            ])
+        );
+        assert!(preview.seconds_for(600).is_some());
         assert_eq!(fixture.stub.requests(), 7, "two probes and five rows");
     })
     .await;
@@ -832,7 +902,7 @@ async fn a_preview_labels_rows_and_writes_nothing() {
     assert_eq!(documents, 0);
     let claim = fixture
         .writer
-        .claim(Claimed::Classify(String::from("tickets_triage")));
+        .claim(Claimed(String::from("tickets_labels")));
     assert!(claim.is_some(), "a preview holds no claim");
 }
 
@@ -841,12 +911,12 @@ async fn a_second_run_into_the_same_output_is_refused_while_the_first_holds_it()
     let fixture = Fixture::new().await;
     let _held = fixture
         .writer
-        .claim(Claimed::Classify(String::from("tickets_triage")))
+        .claim(Claimed(String::from("tickets_labels")))
         .unwrap();
     scoped(async {
         let refused = fixture.refusal(&request()).await;
         assert!(
-            matches!(&refused, ClassifyError::Running { table } if table == "tickets_triage"),
+            matches!(&refused, Error::Running { table } if table == "tickets_labels"),
             "{refused}"
         );
     })
@@ -869,19 +939,20 @@ async fn a_key_the_output_holds_already_is_left_alone_and_not_counted() {
             store::Written::Empty,
         )],
         skipped: 0,
+        ask_ms: 0,
     };
     let reader = fixture
         .writer
         .run(WorkspaceDb::try_clone_reader)
         .await
         .unwrap();
-    let plan = Arc::new(Plan::resolve(&reader, &request()).unwrap());
+    let plan = Arc::new(plan_of(&reader, &request()));
     let run = fixture.runs().await.remove(0).id;
     let added = fixture
         .writer
         .run(move |db| {
-            let twice = page("1").write(db, &plan, &run, "tickets_triage")?;
-            let fresh = page("9999").write(db, &plan, &run, "tickets_triage")?;
+            let twice = page("1").write(db, &plan, &run, "tickets_labels")?;
+            let fresh = page("9999").write(db, &plan, &run, "tickets_labels")?;
             Ok((twice, fresh))
         })
         .await
@@ -927,7 +998,7 @@ async fn keys_of_every_supported_type_read_back_and_join() {
                 })
                 .await;
             assert_eq!(run.labelled, 3, "{ty}");
-            let join = format!("SELECT count(*) FROM {table} s JOIN {table}_triage l USING (id)");
+            let join = format!("SELECT count(*) FROM {table} s JOIN {table}_labels l USING (id)");
             let joined: i64 = fixture
                 .writer
                 .run(move |db| Ok(db.connection().query_row(&join, [], |r| r.get(0))?))
@@ -961,7 +1032,7 @@ async fn rows_without_text_are_written_with_null_labels_and_never_sent() {
     assert_eq!(fixture.stub.requests(), 2 + 601);
     assert_eq!(
         fixture
-            .count("SELECT count(*) FROM tickets_triage WHERE id = 900 AND department IS NULL AND churn IS NULL AND NOT truncated")
+            .count("SELECT count(*) FROM tickets_labels WHERE id = 900 AND department IS NULL AND churn IS NULL AND NOT truncated")
             .await,
         1
     );
@@ -985,7 +1056,7 @@ async fn text_the_model_must_be_given_in_part_is_counted_as_cut() {
     .await;
     assert_eq!(
         fixture
-            .count("SELECT count(*) FROM tickets_triage WHERE truncated")
+            .count("SELECT count(*) FROM tickets_labels WHERE truncated")
             .await,
         3
     );
@@ -1014,7 +1085,7 @@ async fn rows_the_model_refuses_are_skipped_and_tried_again_by_the_next_run() {
         );
         assert_eq!(
             fixture
-                .count("SELECT count(*) FROM tickets_triage WHERE id = 7")
+                .count("SELECT count(*) FROM tickets_labels WHERE id = 7")
                 .await,
             0
         );
@@ -1024,7 +1095,7 @@ async fn rows_the_model_refuses_are_skipped_and_tried_again_by_the_next_run() {
     })
     .await;
     assert_eq!(
-        fixture.count("SELECT count(*) FROM tickets_triage").await,
+        fixture.count("SELECT count(*) FROM tickets_labels").await,
         600
     );
 }
@@ -1044,7 +1115,7 @@ async fn a_refusal_in_the_middle_of_a_run_fails_it_and_keeps_the_rows_before() {
             .try_run(&request(), RunControl::unobserved(), Waiting::Job)
             .await;
         assert!(
-            matches!(&failed, Err(Error::DecisionRefused(m)) if m == "forbidden"),
+            matches!(&failed, Err(CoreError::DecisionRefused(m)) if m == "forbidden"),
             "{failed:?}"
         );
         let runs = fixture.runs().await;
@@ -1057,7 +1128,7 @@ async fn a_refusal_in_the_middle_of_a_run_fails_it_and_keeps_the_rows_before() {
     })
     .await;
     assert_eq!(
-        fixture.count("SELECT count(*) FROM tickets_triage").await,
+        fixture.count("SELECT count(*) FROM tickets_labels").await,
         100
     );
 }
@@ -1078,7 +1149,7 @@ async fn a_question_set_the_model_refuses_creates_nothing() {
             .try_run(&request(), RunControl::unobserved(), Waiting::Job)
             .await;
         assert!(
-            matches!(refused, Err(Error::DecisionRefused(_))),
+            matches!(refused, Err(CoreError::DecisionRefused(_))),
             "{refused:?}"
         );
     })
@@ -1101,7 +1172,7 @@ async fn a_caller_that_waits_is_refused_a_run_past_its_budget() {
                 Waiting::Caller { budget: 1500 },
             )
             .await;
-        let Err(Error::Classify(ClassifyError::TooLargeToWait {
+        let Err(CoreError::Classify(Error::TooLargeToWait {
             rows,
             questions,
             budget,
@@ -1137,7 +1208,7 @@ async fn the_key_of_a_table_of_labels_keeps_the_type_of_the_sources_key() {
         .writer
         .run(|db| {
             Retype {
-                table: "tickets_triage",
+                table: "tickets_labels",
                 column: "id",
                 to: ColumnType::Varchar,
             }
@@ -1145,7 +1216,7 @@ async fn the_key_of_a_table_of_labels_keeps_the_type_of_the_sources_key() {
         })
         .await;
     assert!(
-        matches!(&refused, Err(Error::Analysis(m)) if m.contains("keeps the type of the key in 'tickets'")),
+        matches!(&refused, Err(CoreError::Analysis(m)) if m.contains("keeps the type of the key in 'tickets'")),
         "{refused:?}"
     );
 }
@@ -1159,7 +1230,7 @@ async fn a_table_of_labels_is_not_replaced_by_a_file() {
         .run(move |db| db.begin_replacement(&run.document_id, &DocumentId::generate()))
         .await;
     assert!(
-        matches!(refused, Err(Error::Classify(ClassifyError::ReplaceRefused))),
+        matches!(refused, Err(CoreError::Classify(Error::ReplaceRefused))),
         "{refused:?}"
     );
 }
@@ -1167,11 +1238,11 @@ async fn a_table_of_labels_is_not_replaced_by_a_file() {
 #[tokio::test]
 async fn a_table_someone_else_made_is_not_overwritten() {
     let fixture = Fixture::new().await;
-    fixture.sql("CREATE TABLE tickets_triage (x INTEGER)").await;
+    fixture.sql("CREATE TABLE tickets_labels (x INTEGER)").await;
     scoped(async {
         assert!(matches!(
             fixture.refusal(&request()).await,
-            ClassifyError::OutputTaken { .. }
+            Error::OutputTaken { .. }
         ));
     })
     .await;
@@ -1181,49 +1252,31 @@ async fn a_table_someone_else_made_is_not_overwritten() {
 async fn two_columns_with_one_name_are_refused() {
     let fixture = Fixture::new().await;
     scoped(async {
-        let mut clashing = request();
-        clashing.question_set = serde_json::from_value(json!({
-            "name": "triage",
-            "questions": {
+        let clashing = |questions: Value| Classification {
+            questions: serde_json::from_value(questions).unwrap(),
+            ..request()
+        };
+        let refused = fixture
+            .refusal(&clashing(json!({
                 "dept": {"type": "choice", "instructions": "Which?", "criteria": {"a": null, "b": null}},
                 "DEPT_P": {"type": "noul", "instructions": "Is it?"}
-            }
-        }))
-        .unwrap();
-        assert!(matches!(fixture.refusal(&clashing).await, ClassifyError::ColumnClash(name) if name == "DEPT_P"));
-        clashing.question_set = serde_json::from_value(json!({
-            "name": "triage",
-            "questions": {"Truncated": {"type": "noul", "instructions": "Is it?"}}
-        }))
-        .unwrap();
-        assert!(matches!(fixture.refusal(&clashing).await, ClassifyError::ColumnClash(_)));
+            })))
+            .await;
+        assert!(matches!(refused, Error::ColumnClash(name) if name == "DEPT_P"));
+        let refused = fixture
+            .refusal(&clashing(json!({"Truncated": {"type": "noul", "instructions": "Is it?"}})))
+            .await;
+        assert!(matches!(refused, Error::ColumnClash(_)));
     })
     .await;
 }
 
 #[test]
 fn every_question_type_fills_the_columns_it_names() {
-    let columns = columns::OutputColumns::new("tickets", "id", &triage().questions).unwrap();
+    let columns = columns::OutputColumns::new("tickets", "id", &questions()).unwrap();
     assert_eq!(columns.column_names().len(), 8);
     assert_eq!(columns.cells(None).len(), 7, "every column after the key");
     assert_eq!(columns.meanings().len(), 8);
-}
-
-#[test]
-fn a_set_name_follows_the_rule_of_a_question_name() {
-    assert!(SetName::try_from(String::from("triage_v2")).is_ok());
-    assert!(SetName::try_from(String::from("2triage")).is_err());
-    assert!(SetName::try_from(String::from("a b")).is_err());
-}
-
-#[test]
-fn the_question_file_of_the_issue_reads_and_unknown_keys_are_refused() {
-    let file = r#"{"name": "ticket_triage", "questions": {
-        "department": {"type": "choice", "instructions": "Which department should handle this ticket?",
-                       "criteria": {"billing": "Invoices, payments, refunds", "none": null}}}}"#;
-    assert!(serde_json::from_str::<QuestionSet>(file).is_ok());
-    let misspelled = file.replace("\"name\"", "\"title\"");
-    assert!(serde_json::from_str::<QuestionSet>(&misspelled).is_err());
 }
 
 #[tokio::test]
@@ -1232,7 +1285,7 @@ async fn a_rerun_labels_every_key_the_output_lacks_wherever_it_sorts() {
     scoped(async {
         fixture.run(&request()).await;
         fixture
-            .sql("DELETE FROM tickets_triage WHERE id IN (100, 150)")
+            .sql("DELETE FROM tickets_labels WHERE id IN (100, 150)")
             .await;
         fixture
             .sql("INSERT INTO tickets SELECT -1 - range, 'billing t', 'x' FROM range(10)")
@@ -1248,7 +1301,7 @@ async fn a_rerun_labels_every_key_the_output_lacks_wherever_it_sorts() {
     })
     .await;
     assert_eq!(
-        fixture.count("SELECT count(*) FROM tickets_triage").await,
+        fixture.count("SELECT count(*) FROM tickets_labels").await,
         610
     );
 }
@@ -1293,7 +1346,7 @@ async fn keys_that_cross_pages_are_labelled_once_each() {
                 602,
                 "{ty}: every key once"
             );
-            let join = format!("SELECT count(*) FROM {table} s JOIN {table}_triage l USING (id)");
+            let join = format!("SELECT count(*) FROM {table} s JOIN {table}_labels l USING (id)");
             let joined: i64 = fixture
                 .writer
                 .run(move |db| Ok(db.connection().query_row(&join, [], |r| r.get(0))?))
@@ -1322,11 +1375,11 @@ async fn a_table_that_takes_a_deleted_outputs_name_gets_none_of_its_meanings() {
             .await
             .unwrap();
         fixture
-            .sql("CREATE TABLE tickets_triage AS SELECT 1 AS id, 'x' AS department")
+            .sql("CREATE TABLE tickets_labels AS SELECT 1 AS id, 'x' AS department")
             .await;
         let described = fixture
             .writer
-            .run(|db| db.describe_table("tickets_triage"))
+            .run(|db| db.describe_table("tickets_labels"))
             .await
             .unwrap();
         assert!(described.labelled_by.is_none());
@@ -1335,7 +1388,7 @@ async fn a_table_that_takes_a_deleted_outputs_name_gets_none_of_its_meanings() {
             .writer
             .run(|db| {
                 Retype {
-                    table: "tickets_triage",
+                    table: "tickets_labels",
                     column: "id",
                     to: ColumnType::Varchar,
                 }
@@ -1355,9 +1408,9 @@ async fn a_table_that_appears_before_the_run_starts_is_not_dropped() {
         .run(WorkspaceDb::try_clone_reader)
         .await
         .unwrap();
-    let plan = Plan::resolve(&reader, &request()).unwrap();
+    let plan = plan_of(&reader, &request());
     fixture
-        .sql("CREATE TABLE tickets_triage AS SELECT 7 AS x")
+        .sql("CREATE TABLE tickets_labels AS SELECT 7 AS x")
         .await;
     let run = RunId::generate();
     let claims = fixture.writer.claims();
@@ -1370,6 +1423,7 @@ async fn a_table_that_appears_before_the_run_starts_is_not_dropped() {
                 model: "m",
                 digest: "d",
                 started_by: None,
+                drafted_by_model: None,
                 claims: &claims,
             }
             .apply(db)
@@ -1378,11 +1432,11 @@ async fn a_table_that_appears_before_the_run_starts_is_not_dropped() {
     assert!(
         matches!(
             &refused,
-            Err(Error::Classify(ClassifyError::OutputTaken { .. }))
+            Err(CoreError::Classify(Error::OutputTaken { .. }))
         ),
         "{refused:?}"
     );
-    assert_eq!(fixture.count("SELECT x FROM tickets_triage").await, 7);
+    assert_eq!(fixture.count("SELECT x FROM tickets_labels").await, 7);
     assert_eq!(
         fixture.count("SELECT count(*) FROM _quack_documents").await,
         0
@@ -1399,14 +1453,13 @@ async fn staged(fixture: &Fixture) -> (Plan, RunId) {
         .run(WorkspaceDb::try_clone_reader)
         .await
         .unwrap();
-    let plan = Plan::resolve(
+    let plan = plan_of(
         &reader,
         &Classification {
             rows: Rows::All,
             ..request()
         },
-    )
-    .unwrap();
+    );
     let (run, started, owned) = (RunId::generate(), plan.clone(), plan.clone());
     let id = run.clone();
     let claims = fixture.writer.claims();
@@ -1419,6 +1472,7 @@ async fn staged(fixture: &Fixture) -> (Plan, RunId) {
                 model: "m",
                 digest: "sha256:aaaa",
                 started_by: None,
+                drafted_by_model: None,
                 claims: &claims,
             }
             .apply(db)
@@ -1426,7 +1480,7 @@ async fn staged(fixture: &Fixture) -> (Plan, RunId) {
         .await
         .unwrap();
     fixture
-        .sql("INSERT INTO _quack_stage_tickets_triage (id) VALUES (-1)")
+        .sql("INSERT INTO _quack_stage_tickets_labels (id) VALUES (-1)")
         .await;
     (owned, run)
 }
@@ -1437,21 +1491,18 @@ async fn the_swap_leaves_a_table_that_took_the_outputs_name_alone() {
     let (plan, run) = staged(&fixture).await;
     // Another document now owns the name.
     fixture
-        .sql("UPDATE _quack_documents SET source = 'upload' WHERE filename = 'tickets_triage'")
+        .sql("UPDATE _quack_documents SET source = 'upload' WHERE filename = 'tickets_labels'")
         .await;
     let ended = fixture
         .writer
         .run(move |db| Ended::Completed.record(db, &plan, &run))
         .await;
     assert!(
-        matches!(
-            &ended,
-            Err(Error::Classify(ClassifyError::OutputTaken { .. }))
-        ),
+        matches!(&ended, Err(CoreError::Classify(Error::OutputTaken { .. }))),
         "{ended:?}"
     );
     assert_eq!(
-        fixture.count("SELECT count(*) FROM tickets_triage").await,
+        fixture.count("SELECT count(*) FROM tickets_labels").await,
         600
     );
     assert_eq!(
@@ -1471,7 +1522,7 @@ async fn the_swap_leaves_a_table_that_took_the_outputs_name_alone() {
 async fn the_swap_installs_the_stage_when_the_output_is_gone() {
     let fixture = Fixture::new().await;
     let (plan, run) = staged(&fixture).await;
-    fixture.sql("DROP TABLE tickets_triage").await;
+    fixture.sql("DROP TABLE tickets_labels").await;
     let record = fixture
         .writer
         .run(move |db| Ended::Completed.record(db, &plan, &run))
@@ -1479,12 +1530,12 @@ async fn the_swap_installs_the_stage_when_the_output_is_gone() {
         .unwrap();
     assert_eq!(record.status, RunStatus::Completed);
     assert_eq!(
-        fixture.count("SELECT count(*) FROM tickets_triage").await,
+        fixture.count("SELECT count(*) FROM tickets_labels").await,
         1
     );
     assert_eq!(
         fixture
-            .count("SELECT count(*) FROM duckdb_constraints() WHERE table_name = 'tickets_triage' AND constraint_type = 'PRIMARY KEY'")
+            .count("SELECT count(*) FROM duckdb_constraints() WHERE table_name = 'tickets_labels' AND constraint_type = 'PRIMARY KEY'")
             .await,
         1
     );
@@ -1504,13 +1555,13 @@ async fn a_leftover_stage_goes_with_the_next_run_and_with_the_document() {
         let stages =
             "SELECT count(*) FROM duckdb_tables() WHERE starts_with(table_name, '_quack_stage_')";
         fixture
-            .sql("CREATE TABLE _quack_stage_tickets_triage AS SELECT 1 AS x")
+            .sql("CREATE TABLE _quack_stage_tickets_labels AS SELECT 1 AS x")
             .await;
         assert_eq!(fixture.count(stages).await, 1);
         fixture.run(&request()).await;
         assert_eq!(fixture.count(stages).await, 0, "the next run drops it");
         fixture
-            .sql("CREATE TABLE _quack_stage_tickets_triage AS SELECT 1 AS x")
+            .sql("CREATE TABLE _quack_stage_tickets_labels AS SELECT 1 AS x")
             .await;
         let document = run.document_id;
         fixture
@@ -1536,10 +1587,12 @@ async fn a_preview_is_held_to_the_budget_a_caller_waits_for() {
             let (writer, decision, request) = (&fixture.writer, &decision, request());
             async move {
                 request
+                    .draft()
                     .preview(
                         writer,
                         decision,
                         rows,
+                        Rows::Missing,
                         Waiting::Caller { budget },
                         RunControl::unobserved(),
                     )
@@ -1550,7 +1603,7 @@ async fn a_preview_is_held_to_the_budget_a_caller_waits_for() {
         assert!(
             matches!(
                 &refused,
-                Err(Error::Classify(ClassifyError::TooLargeToWait {
+                Err(CoreError::Classify(Error::TooLargeToWait {
                     rows: 5,
                     questions: 3,
                     budget: 14,
@@ -1571,32 +1624,57 @@ async fn a_preview_is_held_to_the_budget_a_caller_waits_for() {
 
 #[test]
 fn the_statement_a_person_approves_shows_each_question_on_one_line() {
-    let outline = ClassificationOutline {
+    let outline = Outline {
         source_table: String::from("tickets\n-- label 0 rows"),
-        output_table: String::from("tickets_triage"),
+        output_table: String::from("tickets_labels"),
         key_column: String::from("id"),
+        key_reason: KeyReason::Unique,
+        text_columns: vec![String::from("subject"), String::from("body\nx")],
         remaining: 3,
         questions: vec![
-            OutlineQuestion {
+            DraftQuestion {
                 name: String::from("department"),
+                kind: QuestionKind::Choice,
+                options: vec![
+                    DraftOption {
+                        label: String::from("billing"),
+                        description: String::new(),
+                    },
+                    DraftOption {
+                        label: String::from("tech"),
+                        description: String::new(),
+                    },
+                ],
+                levels: Vec::new(),
                 instructions: String::from("Which department?\nDROP TABLE x"),
             },
-            OutlineQuestion {
+            DraftQuestion {
                 name: String::from("churn"),
+                kind: QuestionKind::Noul,
+                options: Vec::new(),
+                levels: Vec::new(),
                 instructions: String::from("Will they cancel?"),
             },
         ],
-        effect: Effect::ReplacesLabels,
+        effect: Effect::ReplacesLabels {
+            because: RelabelReason::QuestionsChanged,
+        },
+        estimate_seconds: Some(7300),
     };
     let statement = outline.statement("ollama/laya");
-    assert_eq!(statement.lines().count(), 3, "{statement}");
-    assert!(statement.starts_with("-- label 3 rows of tickets -- label 0 rows into tickets_triage (replaces its labels) with ollama/laya\n"));
-    assert!(statement.contains("\n-- department: Which department? DROP TABLE x\n"));
-    assert!(statement.ends_with("\n-- churn: Will they cancel?"));
+    assert_eq!(statement.lines().count(), 4, "{statement}");
+    assert_eq!(
+        statement,
+        "-- label 3 rows of tickets -- label 0 rows into tickets_labels (replaces its labels: the \
+         questions changed) with ollama/laya, 2 questions, about 2 hours\n\
+         -- key id (all different; not named like an id); reads subject, body x\n\
+         -- department (choice: billing, tech): Which department? DROP TABLE x\n\
+         -- churn (yes/no): Will they cancel?"
+    );
 }
 
 #[tokio::test]
-async fn a_retyped_source_key_is_a_changed_definition() {
+async fn a_retyped_source_key_labels_every_row_again() {
     let fixture = Fixture::new().await;
     scoped(async {
         let first = fixture.run(&request()).await;
@@ -1604,18 +1682,17 @@ async fn a_retyped_source_key_is_a_changed_definition() {
         fixture
             .sql("ALTER TABLE tickets ALTER id SET DATA TYPE INTEGER")
             .await;
-        let ClassifyError::DefinitionChanged { differs, .. } = fixture.refusal(&request()).await
-        else {
-            panic!("expected a changed definition");
-        };
-        assert_eq!(differs, ["key types"]);
-        let all = fixture
-            .run(&Classification {
-                rows: Rows::All,
-                ..request()
-            })
-            .await;
-        assert_eq!(all.key_type, "INTEGER");
+        assert_eq!(
+            fixture.outline(&request()).await.effect,
+            Effect::ReplacesLabels {
+                because: RelabelReason::KeyChanged
+            }
+        );
+        let again = fixture.run(&request()).await;
+        assert_eq!(
+            (again.rows, again.key_type.as_str()),
+            (Rows::All, "INTEGER")
+        );
     })
     .await;
 }
@@ -1623,18 +1700,16 @@ async fn a_retyped_source_key_is_a_changed_definition() {
 /// Seed a run recorded as running for `output`, as a process that died
 /// leaves it.
 const STALE_RUNS: &str = "INSERT INTO _quack_classifications (id, output_table, document_id, \
-     source_table, key_column, key_type, text_columns, set_name, question_set, model, \
+     source_table, key_column, key_type, key_reason, text_columns, questions, model, \
      model_digest, rows_scope, status) VALUES \
-     ('dead', 'dead_output', 'd', 't', 'id', 'BIGINT', '[]', 's', '{}', 'm', 'd', 'missing', 'running'), \
-     ('live', 'live_output', 'd', 't', 'id', 'BIGINT', '[]', 's', '{}', 'm', 'd', 'missing', 'running')";
+     ('dead', 'dead_output', 'd', 't', 'id', 'BIGINT', 'unique', '[]', '{}', 'm', 'd', 'missing', 'running'), \
+     ('live', 'live_output', 'd', 't', 'id', 'BIGINT', 'unique', '[]', '{}', 'm', 'd', 'missing', 'running')";
 
 #[tokio::test]
 async fn a_run_marks_dead_runs_interrupted_and_spares_one_another_run_holds() {
     let fixture = Fixture::new().await;
     fixture.sql(STALE_RUNS).await;
-    let live = fixture
-        .writer
-        .claim(Claimed::Classify(String::from("live_output")));
+    let live = fixture.writer.claim(Claimed(String::from("live_output")));
     assert!(live.is_some());
     scoped(fixture.run(&request())).await;
     let status = |id: &'static str| {
@@ -1666,7 +1741,7 @@ async fn an_output_another_table_took_since_planning_is_not_written_into() {
         .run(WorkspaceDb::try_clone_reader)
         .await
         .unwrap();
-    let plan = Plan::resolve(&reader, &request()).unwrap();
+    let plan = plan_of(&reader, &request());
     assert!(plan.output_exists);
     let document = first.document_id;
     fixture
@@ -1675,7 +1750,7 @@ async fn an_output_another_table_took_since_planning_is_not_written_into() {
         .await
         .unwrap();
     fixture
-        .sql("CREATE TABLE tickets_triage AS SELECT 7 AS id")
+        .sql("CREATE TABLE tickets_labels AS SELECT 7 AS id")
         .await;
     let run = RunId::generate();
     let claims = fixture.writer.claims();
@@ -1688,6 +1763,7 @@ async fn an_output_another_table_took_since_planning_is_not_written_into() {
                 model: "m",
                 digest: "sha256:aaaa",
                 started_by: None,
+                drafted_by_model: None,
                 claims: &claims,
             }
             .apply(db)
@@ -1696,35 +1772,15 @@ async fn an_output_another_table_took_since_planning_is_not_written_into() {
     assert!(
         matches!(
             &refused,
-            Err(Error::Classify(ClassifyError::OutputTaken { .. }))
+            Err(CoreError::Classify(Error::OutputTaken { .. }))
         ),
         "{refused:?}"
     );
     assert_eq!(
-        fixture.count("SELECT count(*) FROM tickets_triage").await,
+        fixture.count("SELECT count(*) FROM tickets_labels").await,
         1,
         "the other table is untouched"
     );
-}
-
-#[test]
-fn a_question_set_is_read_from_text_within_the_cap() {
-    let text = serde_json::to_string(&triage()).unwrap();
-    assert_eq!(QuestionSet::parse(&text).unwrap(), triage());
-    assert!(matches!(
-        QuestionSet::parse("{"),
-        Err(QuestionSetError::Unreadable(_))
-    ));
-    assert!(matches!(
-        QuestionSet::parse(r#"{"name": "x", "questions": {}, "extra": 1}"#),
-        Err(QuestionSetError::Unreadable(_))
-    ));
-    let padded = format!("{text}{}", " ".repeat(MAX_QUESTION_SET_BYTES));
-    assert!(matches!(
-        QuestionSet::parse(&padded),
-        Err(QuestionSetError::SetTooLarge { bytes, max })
-            if bytes == padded.len() && max == MAX_QUESTION_SET_BYTES
-    ));
 }
 
 /// The runs a hook was told about.
@@ -1741,9 +1797,9 @@ fn recording() -> (OnEnd, Reported) {
 }
 
 /// A run for the user `user-1` of the labels the stub serves.
-async fn tracked_run(fixture: &Fixture, jobs: LabelJobs) -> (Tracked, RunId) {
+async fn tracked_run(fixture: &Fixture, jobs: LabelJobs) -> (LabellingJob, RunId) {
     let run_id = RunId::generate();
-    let tracked = Tracked {
+    let tracked = LabellingJob {
         db: Arc::clone(&fixture.writer),
         decision: scoped(model(&fixture.stub)).await,
         started_by: Some(UserId::from("user-1")),
@@ -1772,7 +1828,9 @@ async fn a_run_as_a_job_is_listed_returned_and_reported() {
         .workspace(WorkspaceId::from("ws"))
         .on_end(hook);
     let (tracked, run_id) = tracked_run(&fixture, jobs).await;
-    let run = scoped(request().run_as_job(tracked, |_| {})).await.unwrap();
+    let run = scoped(request().draft().run_as_job(tracked, Rows::Missing, |_| {}))
+        .await
+        .unwrap();
     assert_eq!(run.id, run_id);
     assert_eq!((run.status, run.labelled), (RunStatus::Completed, 600));
     let job = only(&queue.list());
@@ -1792,7 +1850,7 @@ async fn a_run_whose_caller_is_dropped_goes_on_to_its_end_and_is_reported() {
     let (hook, ended) = recording();
     let (tracked, _) = tracked_run(&fixture, LabelJobs::new(queue.clone()).on_end(hook)).await;
     scoped(async {
-        let waiting = request().run_as_job(tracked, |_| {});
+        let waiting = request().draft().run_as_job(tracked, Rows::Missing, |_| {});
         tokio::select! {
             biased;
             _ = waiting => panic!("the run cannot have ended yet"),
@@ -1820,13 +1878,15 @@ async fn the_queues_shutdown_cancels_a_run_and_waits_for_it_to_record() {
     let first_page = Arc::clone(&page);
     let caller = tokio::spawn(Egress::scope(
         Some(Egress::NoWorkspace),
-        request().run_as_job(tracked, move |_| first_page.notify_one()),
+        request()
+            .draft()
+            .run_as_job(tracked, Rows::Missing, move |_| first_page.notify_one()),
     ));
     page.notified().await;
     let left = queue.shutdown(Duration::from_secs(30)).await;
     assert!(left.is_empty(), "{left:?}");
     let result = caller.await.unwrap();
-    assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+    assert!(matches!(result, Err(CoreError::Cancelled)), "{result:?}");
     let reported = only(&ended.lock().unwrap());
     assert_eq!(reported.run.status, RunStatus::Cancelled);
     assert_eq!(reported.outcome, Outcome::Error);
@@ -1847,9 +1907,9 @@ async fn a_failed_run_is_reported_with_its_rows_and_a_refused_request_is_not() {
     let jobs = LabelJobs::new(queue.clone()).on_end(hook);
 
     let (tracked, _) = tracked_run(&fixture, jobs.clone()).await;
-    let failed = scoped(request().run_as_job(tracked, |_| {})).await;
+    let failed = scoped(request().draft().run_as_job(tracked, Rows::Missing, |_| {})).await;
     assert!(
-        matches!(failed, Err(Error::DecisionRefused(_))),
+        matches!(failed, Err(CoreError::DecisionRefused(_))),
         "{failed:?}"
     );
 
@@ -1858,14 +1918,14 @@ async fn a_failed_run_is_reported_with_its_rows_and_a_refused_request_is_not() {
         table: String::from("nothing"),
         ..request()
     };
-    let refused = scoped(missing.run_as_job(tracked, |_| {})).await;
+    let refused = scoped(missing.draft().run_as_job(tracked, Rows::Missing, |_| {})).await;
     assert!(
-        matches!(refused, Err(Error::Classify(ClassifyError::NoTable(_)))),
+        matches!(refused, Err(CoreError::Classify(Error::NoTable(_)))),
         "{refused:?}"
     );
     let recorded = fixture
         .writer
-        .run(move |db| ClassificationRun::get(db, &never_begun))
+        .run(move |db| Run::get(db, &never_begun))
         .await;
     assert!(recorded.is_err(), "a refused request records no run");
 
@@ -1890,6 +1950,7 @@ async fn start(fixture: &Fixture, plan: Plan) {
                 model: "m",
                 digest: "sha256:aaaa",
                 started_by: None,
+                drafted_by_model: None,
                 claims: &claims,
             }
             .apply(db)
@@ -1901,20 +1962,22 @@ async fn start(fixture: &Fixture, plan: Plan) {
 #[tokio::test]
 async fn a_run_that_started_and_claimed_before_another_starts_is_not_marked_interrupted() {
     let fixture = Fixture::new().await;
+    fixture
+        .sql("CREATE TABLE more AS SELECT * FROM tickets")
+        .await;
     let reader = fixture
         .writer
         .run(WorkspaceDb::try_clone_reader)
         .await
         .unwrap();
-    let first = Plan::resolve(&reader, &request()).unwrap();
-    let second = Plan::resolve(
+    let first = plan_of(&reader, &request());
+    let second = plan_of(
         &reader,
         &Classification {
-            question_set: named("other"),
+            table: String::from("more"),
             ..request()
         },
-    )
-    .unwrap();
+    );
     let held_first = fixture.writer.claim(first.claimed());
     let held_second = fixture.writer.claim(second.claimed());
     assert!(held_first.is_some() && held_second.is_some());
@@ -1928,4 +1991,681 @@ async fn a_run_that_started_and_claimed_before_another_starts_is_not_marked_inte
             .await,
         2
     );
+}
+
+/// A table the chat model can draft questions about: a key, a subject, a
+/// channel with three values, and a body.
+const SUPPORT: &str = "CREATE TABLE support AS SELECT range AS id, 'ticket ' || range AS subject, \
+     ['email', 'chat', 'phone'][1 + range % 3] AS channel, 'text ' || range || ' help' AS body \
+     FROM range(50)";
+
+/// A drafter that answers from a script and remembers what it was asked.
+struct Canned {
+    answers: Mutex<std::collections::VecDeque<DraftAnswer>>,
+    asked: Mutex<Vec<(Vec<String>, String)>>,
+}
+
+impl Canned {
+    fn new(answers: Vec<DraftAnswer>) -> Self {
+        Self {
+            answers: Mutex::new(answers.into()),
+            asked: Mutex::default(),
+        }
+    }
+
+    fn asked(&self) -> Vec<(Vec<String>, String)> {
+        self.asked.lock().unwrap().clone()
+    }
+
+    /// The message of the `at`th call.
+    fn message(&self, at: usize) -> String {
+        self.asked().into_iter().nth(at).unwrap().1
+    }
+}
+
+impl Drafter for Canned {
+    fn answer<'a>(
+        &'a self,
+        candidates: &'a [String],
+        message: &'a str,
+    ) -> ExtractFuture<'a, DraftAnswer> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((candidates.to_vec(), message.to_owned()));
+        let next = self.answers.lock().unwrap().pop_front();
+        Box::pin(async move {
+            next.ok_or_else(|| CoreError::Llm(String::from("no answer was scripted")))
+        })
+    }
+
+    fn label(&self) -> String {
+        String::from("test/chat")
+    }
+}
+
+/// The chat model's answer: these text columns and these questions.
+fn answer(columns: &[&str], questions: Value) -> DraftAnswer {
+    DraftAnswer {
+        text_columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+        questions: serde_json::from_value(questions).unwrap(),
+    }
+}
+
+fn channel_question() -> Value {
+    json!([
+        {"name": "topic", "type": "choice", "instructions": "What is the ticket about?",
+         "options": [{"label": "billing", "description": "Invoices"}, {"label": "other", "description": ""}],
+         "levels": []},
+        {"name": "angry", "type": "noul", "instructions": "Is the customer angry?",
+         "options": [], "levels": []}
+    ])
+}
+
+/// The draft of `sentence` for `table`.
+async fn drafted(
+    fixture: &Fixture,
+    drafter: Option<&dyn Drafter>,
+    table: &str,
+    sentence: Option<&str>,
+) -> Result<Draft> {
+    let decision = scoped(model(&fixture.stub)).await;
+    let ctx = DraftContext {
+        db: &fixture.writer,
+        decision: &decision,
+        drafter,
+    };
+    scoped(Draft::prepare(&ctx, table, sentence)).await
+}
+
+/// Run `draft`, approving its set.
+async fn approved(fixture: &Fixture, draft: &Draft) -> Run {
+    let decision = scoped(model(&fixture.stub)).await;
+    scoped(draft.run(
+        Labelling {
+            db: &fixture.writer,
+            decision: &decision,
+            started_by: Some("user"),
+            run_id: RunId::generate(),
+            waiting: Waiting::Job,
+            control: RunControl::unobserved(),
+        },
+        Rows::Missing,
+    ))
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_sentence_is_drafted_into_questions_and_nothing_is_stored() {
+    let fixture = Fixture::new().await;
+    fixture.sql(SUPPORT).await;
+    let canned = Canned::new(vec![answer(&["subject", "body"], channel_question())]);
+    let draft = drafted(
+        &fixture,
+        Some(&canned),
+        "support",
+        Some("what is each ticket about"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(draft.origin, DraftOrigin::Drafted);
+    assert_eq!(
+        (
+            draft.table.as_str(),
+            draft.output_table.as_str(),
+            draft.rows,
+            draft.sample_rows
+        ),
+        ("support", "support_labels", 50, 20)
+    );
+    assert_eq!(draft.drafted_by_model.as_deref(), Some("test/chat"));
+    assert_eq!(draft.set.key_column, "id");
+    assert_eq!(draft.set.key_reason, KeyReason::IdLike);
+    assert_eq!(draft.set.text_columns, ["subject", "body"]);
+    assert_eq!(
+        draft.set.sentence.as_deref(),
+        Some("what is each ticket about")
+    );
+    assert_eq!(draft.set.questions.count(), 2);
+    assert_eq!(
+        draft.header(),
+        "support: 50 rows, key id, text in subject and body."
+    );
+    assert_eq!(
+        fixture.stub.requests(),
+        2,
+        "the decision model's two probes"
+    );
+    assert!(fixture.runs().await.is_empty());
+    assert_eq!(
+        fixture.writer.run(WorkspaceDb::list_tables).await.unwrap(),
+        ["support", "tickets"]
+    );
+    assert_eq!(
+        fixture.count("SELECT count(*) FROM _quack_documents").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn the_same_sentence_reuses_the_approved_questions_and_another_revises_them() {
+    let fixture = Fixture::new().await;
+    fixture.sql(SUPPORT).await;
+    let canned = Canned::new(vec![
+        answer(&["subject"], channel_question()),
+        answer(&["subject", "channel"], channel_question()),
+    ]);
+    let first = drafted(
+        &fixture,
+        Some(&canned),
+        "support",
+        Some("What is each ticket about?"),
+    )
+    .await
+    .unwrap();
+    let run = approved(&fixture, &first).await;
+    assert_eq!(run.sentence.as_deref(), Some("What is each ticket about?"));
+    assert_eq!(run.drafted_by_model.as_deref(), Some("test/chat"));
+
+    for again in [Some("  what is each ticket ABOUT? "), None] {
+        let reused = drafted(&fixture, Some(&canned), "support", again)
+            .await
+            .unwrap();
+        assert_eq!(reused.origin, DraftOrigin::Reused);
+        assert_eq!(reused.set, first.set);
+        assert_eq!(reused.approved_at.as_deref(), Some(run.started_at.as_str()));
+    }
+    assert_eq!(canned.asked().len(), 1, "no chat call to reuse a set");
+
+    let revised = drafted(
+        &fixture,
+        Some(&canned),
+        "support",
+        Some("and the channel too"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(revised.origin, DraftOrigin::Revised);
+    assert_eq!(revised.set.text_columns, ["subject", "channel"]);
+    let asked = canned.asked();
+    assert_eq!(asked.len(), 2);
+    let message = &asked.last().unwrap().1;
+    assert!(
+        message.contains("Current questions, to revise: {\"text_columns\":[\"subject\"]"),
+        "{message}"
+    );
+    assert!(message.contains("\"name\":\"topic\""), "{message}");
+}
+
+#[tokio::test]
+async fn nothing_to_ask_and_nobody_to_ask_are_said() {
+    let fixture = Fixture::new().await;
+    fixture.sql(SUPPORT).await;
+    let canned = Canned::new(Vec::new());
+    let none = drafted(&fixture, Some(&canned), "support", None).await;
+    assert!(
+        matches!(&none, Err(CoreError::Classify(Error::NoQuestions { table })) if table == "support"),
+        "{none:?}"
+    );
+    let blank = drafted(&fixture, Some(&canned), "support", Some("   ")).await;
+    assert!(matches!(
+        blank,
+        Err(CoreError::Classify(Error::NoQuestions { .. }))
+    ));
+    let nobody = drafted(&fixture, None, "support", Some("what is it about")).await;
+    assert!(
+        matches!(&nobody, Err(CoreError::Classify(Error::NoDrafter { .. }))),
+        "{nobody:?}"
+    );
+    assert!(canned.asked().is_empty());
+    assert_eq!(fixture.stub.requests(), 0);
+}
+
+#[tokio::test]
+async fn a_refused_answer_is_asked_again_once_with_the_reason() {
+    let fixture = Fixture::new().await;
+    fixture.sql(SUPPORT).await;
+    let canned = Canned::new(vec![
+        answer(&["nope"], channel_question()),
+        answer(&["subject"], channel_question()),
+    ]);
+    let draft = drafted(&fixture, Some(&canned), "support", Some("what is it about"))
+        .await
+        .unwrap();
+    assert_eq!(draft.set.text_columns, ["subject"]);
+    let asked = canned.asked();
+    assert_eq!(asked.len(), 2);
+    assert!(!canned.message(0).contains("Your answer was refused"));
+    assert!(
+        canned.message(1).ends_with(
+            "Your answer was refused: 'nope' is not one of the columns offered. Answer again \
+             with that fixed."
+        ),
+        "{}",
+        canned.message(1)
+    );
+
+    let one_option = json!([{"name": "x", "type": "choice", "instructions": "Which?",
+        "options": [{"label": "only", "description": ""}], "levels": []}]);
+    let canned = Canned::new(vec![
+        answer(&["subject"], one_option.clone()),
+        answer(&["subject"], one_option),
+    ]);
+    let refused = drafted(&fixture, Some(&canned), "support", Some("what is it about")).await;
+    let Err(CoreError::Classify(Error::DraftRefused { table, reason })) = refused else {
+        panic!("expected a draft refused twice, got {refused:?}");
+    };
+    assert_eq!(table, "support");
+    assert!(reason.contains("has 1 options"), "{reason}");
+    assert_eq!(canned.asked().len(), 2, "one more try, no more");
+}
+
+#[tokio::test]
+async fn the_decision_models_refusal_is_fed_back_too() {
+    let fixture = Fixture::with(
+        DecisionStub::with_rule(|seen| {
+            seen.questions
+                .get("angry")
+                .map(|_| Fault::new(400, "decision options exceed the token budget"))
+        })
+        .await,
+    );
+    fixture.sql(SUPPORT).await;
+    let calm = json!([{"name": "topic", "type": "choice", "instructions": "About what?",
+        "options": [{"label": "a", "description": ""}, {"label": "b", "description": ""}],
+        "levels": []}]);
+    let canned = Canned::new(vec![
+        answer(&["subject"], channel_question()),
+        answer(&["subject"], calm),
+    ]);
+    let draft = drafted(&fixture, Some(&canned), "support", Some("what is it about"))
+        .await
+        .unwrap();
+    assert_eq!(draft.set.questions.count(), 1);
+    assert!(
+        canned
+            .message(1)
+            .contains("Your answer was refused: decision options exceed the token budget."),
+        "{}",
+        canned.message(1)
+    );
+}
+
+#[tokio::test]
+async fn the_chat_model_is_shown_the_columns_their_values_and_a_fenced_sample() {
+    let fixture = Fixture::new().await;
+    fixture.sql(SUPPORT).await;
+    let canned = Canned::new(vec![answer(&["subject"], channel_question())]);
+    drafted(
+        &fixture,
+        Some(&canned),
+        "support",
+        Some("what\nis it about"),
+    )
+    .await
+    .unwrap();
+    let (candidates, message) = canned.asked().remove(0);
+    assert_eq!(
+        candidates,
+        ["subject", "channel", "body"],
+        "table order, no key"
+    );
+    assert!(
+        message.starts_with("Table: support, 50 rows. Key column: id.\n"),
+        "{message}"
+    );
+    assert!(message.contains("\n- subject (50 distinct)\n"), "{message}");
+    assert!(
+        message.contains("\n- channel (3 distinct: chat, email, phone)\n"),
+        "{message}"
+    );
+    assert!(
+        message.contains("\nThe person wants to know: what is it about\n"),
+        "{message}"
+    );
+    assert!(
+        message.contains("\nSample rows (20 of 50), one JSON object per line:\n<<document "),
+        "{message}"
+    );
+    let sample: Vec<&str> = message
+        .lines()
+        .filter(|line| line.starts_with('{') && line.ends_with('}'))
+        .collect();
+    assert_eq!(sample.len(), 20);
+    assert!(sample.iter().map(|line| line.len()).sum::<usize>() <= 16_000);
+    assert!(
+        sample
+            .iter()
+            .all(|line| serde_json::from_str::<Value>(line).is_ok())
+    );
+    assert!(
+        !message.contains("Current questions"),
+        "a first draft has none"
+    );
+}
+
+#[tokio::test]
+async fn a_column_that_was_not_offered_is_refused_and_a_repeated_one_is_read_once() {
+    let fixture = Fixture::new().await;
+    fixture.sql(SUPPORT).await;
+    let canned = Canned::new(vec![
+        answer(&["id"], channel_question()),
+        answer(&["Subject", "subject", "BODY"], channel_question()),
+    ]);
+    let draft = drafted(&fixture, Some(&canned), "support", Some("what is it about"))
+        .await
+        .unwrap();
+    assert!(
+        canned
+            .message(1)
+            .contains("'id' is not one of the columns offered")
+    );
+    assert_eq!(draft.set.text_columns, ["subject", "body"]);
+}
+
+#[tokio::test]
+async fn a_table_with_no_text_to_read_is_said() {
+    let fixture = Fixture::new().await;
+    fixture
+        .sql("CREATE TABLE numbers AS SELECT range AS id, range * 2 AS twice FROM range(10)")
+        .await;
+    let canned = Canned::new(Vec::new());
+    let refused = drafted(&fixture, Some(&canned), "numbers", Some("what is it")).await;
+    assert!(
+        matches!(&refused, Err(CoreError::Classify(Error::NoText { table })) if table == "numbers"),
+        "{refused:?}"
+    );
+    assert!(canned.asked().is_empty(), "the chat model was not asked");
+}
+
+#[tokio::test]
+async fn a_set_sent_back_is_checked_and_its_key_reason_is_worked_out_again() {
+    let fixture = Fixture::new().await;
+    fixture.sql(SUPPORT).await;
+    let decision = scoped(model(&fixture.stub)).await;
+    let ctx = DraftContext {
+        db: &fixture.writer,
+        decision: &decision,
+        drafter: None,
+    };
+    let set = LabelSet {
+        key_column: String::from("SUBJECT"),
+        key_reason: KeyReason::IdLike,
+        text_columns: vec![String::from("body"), String::from("Channel")],
+        questions: serde_json::from_value(json!({
+            "topic": {"type": "noul", "instructions": "Is it about billing?"}
+        }))
+        .unwrap(),
+        sentence: None,
+    };
+    let given = scoped(Draft::given(&ctx, "SUPPORT", set.clone()))
+        .await
+        .unwrap();
+    assert_eq!(given.origin, DraftOrigin::Given);
+    assert_eq!(given.table, "support");
+    assert_eq!(
+        given.set.key_column, "subject",
+        "spelled as the table spells it"
+    );
+    assert_eq!(
+        given.set.key_reason,
+        KeyReason::Unique,
+        "worked out, not believed"
+    );
+    assert_eq!(given.set.text_columns, ["body", "channel"]);
+    assert_eq!(given.rows, 50);
+
+    let refuse = |set: LabelSet| {
+        let ctx = &ctx;
+        async move {
+            match scoped(Draft::given(ctx, "support", set)).await {
+                Err(CoreError::Classify(refusal)) => refusal,
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+    };
+    let gone = refuse(LabelSet {
+        text_columns: vec![String::from("body"), String::from("removed")],
+        ..set.clone()
+    })
+    .await;
+    assert!(
+        matches!(&gone, Error::SetColumnsGone { columns, .. } if columns == &["removed"]),
+        "{gone}"
+    );
+    let not_unique = refuse(LabelSet {
+        key_column: String::from("channel"),
+        ..set.clone()
+    })
+    .await;
+    assert!(matches!(
+        not_unique,
+        Error::KeyNotUnique { distinct: 3, .. }
+    ));
+    let clash = refuse(LabelSet {
+        questions: serde_json::from_value(json!({
+            "dept": {"type": "choice", "instructions": "Which?", "criteria": {"a": null, "b": null}},
+            "DEPT_P": {"type": "noul", "instructions": "Is it?"}
+        }))
+        .unwrap(),
+        ..set.clone()
+    })
+    .await;
+    assert!(matches!(clash, Error::ColumnClash(name) if name == "DEPT_P"));
+}
+
+#[tokio::test]
+async fn approved_questions_whose_columns_are_gone_are_not_reused() {
+    let fixture = Fixture::new().await;
+    fixture.sql(SUPPORT).await;
+    let canned = Canned::new(vec![answer(&["subject", "body"], channel_question())]);
+    let draft = drafted(&fixture, Some(&canned), "support", Some("what is it about"))
+        .await
+        .unwrap();
+    approved(&fixture, &draft).await;
+    fixture.sql("ALTER TABLE support DROP COLUMN body").await;
+    let refused = drafted(&fixture, Some(&canned), "support", None).await;
+    let Err(CoreError::Classify(Error::SetColumnsGone { columns, .. })) = refused else {
+        panic!("expected the columns to be gone, got {refused:?}");
+    };
+    assert_eq!(columns, ["body"]);
+}
+
+#[tokio::test]
+async fn a_cancelled_relabel_leaves_its_questions_to_be_the_next_run() {
+    let fixture = Fixture::new().await;
+    let token = CancellationToken::new();
+    let firing = token.clone();
+    let progress = move |_: ChunkDone| firing.cancel();
+    scoped(async {
+        fixture.run(&request()).await;
+        let changed = Classification {
+            questions: other_questions(),
+            rows: Rows::All,
+            ..request()
+        };
+        let stopped = fixture
+            .try_run(
+                &changed,
+                RunControl {
+                    progress: &progress,
+                    cancel: Some(&token),
+                },
+                Waiting::Job,
+            )
+            .await;
+        assert!(matches!(stopped, Err(CoreError::Cancelled)), "{stopped:?}");
+    })
+    .await;
+    let next = drafted(&fixture, None, "tickets", None).await.unwrap();
+    assert_eq!(next.origin, DraftOrigin::Reused);
+    assert_eq!(
+        next.set.questions,
+        other_questions(),
+        "the newest run's set"
+    );
+    let decision = scoped(model(&fixture.stub)).await;
+    let outline = scoped(next.outline(&fixture.writer, &decision, Rows::Missing))
+        .await
+        .unwrap();
+    assert_eq!(
+        outline.effect,
+        Effect::ReplacesLabels {
+            because: RelabelReason::QuestionsChanged
+        },
+        "the next run labels every row again from the start"
+    );
+}
+
+#[tokio::test]
+async fn an_outline_says_what_the_run_does_to_the_output() {
+    let fixture = Fixture::new().await;
+    scoped(async {
+        let first = fixture.outline(&request()).await;
+        assert_eq!(first.effect, Effect::NewTable);
+        assert_eq!((first.remaining, first.estimate_seconds), (600, None));
+        assert_eq!(first.output_table, "tickets_labels");
+        fixture.run(&request()).await;
+        fixture
+            .sql("INSERT INTO tickets SELECT 600 + range, 'billing t', 'x' FROM range(5)")
+            .await;
+        let adds = fixture.outline(&request()).await;
+        assert_eq!((adds.effect, adds.remaining), (Effect::AddsRows, 5));
+        assert!(
+            adds.estimate_seconds.is_some(),
+            "the earlier run measured the speed"
+        );
+        let other = fixture
+            .outline(&Classification {
+                questions: other_questions(),
+                ..request()
+            })
+            .await;
+        assert_eq!(
+            other.estimate_seconds, None,
+            "other questions have no history"
+        );
+        let all = fixture
+            .outline(&Classification {
+                rows: Rows::All,
+                ..request()
+            })
+            .await;
+        assert_eq!(
+            all.effect,
+            Effect::ReplacesLabels {
+                because: RelabelReason::Asked
+            }
+        );
+        fixture.run(&request()).await;
+        let nothing = fixture.outline(&request()).await;
+        assert_eq!((nothing.effect, nothing.remaining), (Effect::AddsRows, 0));
+    })
+    .await;
+}
+
+#[test]
+fn an_estimate_is_said_in_minutes_or_hours() {
+    let said = |seconds: u64| Estimate(seconds).to_string();
+    assert_eq!(said(0), "under a minute");
+    assert_eq!(said(44), "under a minute");
+    assert_eq!(said(45), "about 1 minute");
+    assert_eq!(said(89), "about 1 minute");
+    assert_eq!(said(90), "about 2 minutes");
+    assert_eq!(said(3600), "about 60 minutes");
+    assert_eq!(said(7200), "about 2 hours");
+    assert_eq!(said(7300), "about 2 hours");
+}
+
+#[test]
+fn a_preview_estimates_from_the_rows_it_asked() {
+    let preview = Preview {
+        key_column: String::from("id"),
+        output_table: String::from("t_labels"),
+        result: QueryResults {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        },
+        compact: QueryResults {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        },
+        labelled: 8,
+        cut: 0,
+        empty: 2,
+        skipped: 2,
+        took_ms: 9000,
+        ask_ms: 5000,
+        remaining: 1000,
+    };
+    assert_eq!(preview.seconds_for(1000), Some(500), "500 ms a row asked");
+    let none = Preview {
+        labelled: 0,
+        skipped: 0,
+        ..preview
+    };
+    assert_eq!(none.seconds_for(1000), None);
+}
+
+#[test]
+fn a_label_set_travels_as_json_and_its_options_as_lines() {
+    let set = request().set();
+    let text = serde_json::to_string(&set).unwrap();
+    assert_eq!(serde_json::from_str::<LabelSet>(&text).unwrap(), set);
+    let without_reason = text.replace("\"key_reason\":\"id_like\",", "");
+    assert!(serde_json::from_str::<LabelSet>(&without_reason).is_ok());
+    assert!(serde_json::from_str::<LabelSet>(&text.replace("key_column", "keyColumn")).is_err());
+
+    let choice = DraftQuestion::from_lines(
+        " topic ",
+        QuestionKind::Choice,
+        " What? ",
+        "billing: Invoices, refunds\nsales\n\n  other: Anything: else\nv2:1",
+    );
+    assert_eq!(choice.name, "topic");
+    assert_eq!(choice.instructions, "What?");
+    let labels: Vec<(&str, &str)> = choice
+        .options
+        .iter()
+        .map(|o| (o.label.as_str(), o.description.as_str()))
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            ("billing", "Invoices, refunds"),
+            ("sales", ""),
+            ("other", "Anything: else"),
+            ("v2:1", "")
+        ],
+        "split at the first colon and space only"
+    );
+    assert_eq!(
+        choice.to_lines(),
+        "billing: Invoices, refunds\nsales\nother: Anything: else\nv2:1"
+    );
+    let again =
+        DraftQuestion::from_lines("topic", QuestionKind::Choice, "What?", &choice.to_lines());
+    assert_eq!(again, choice);
+    let score = DraftQuestion::from_lines(
+        "urgent",
+        QuestionKind::Score,
+        "How?",
+        "not\nsoon\n\nnow: blocking",
+    );
+    assert_eq!(
+        score.levels,
+        ["not", "soon", "now: blocking"],
+        "a level is taken whole"
+    );
+    assert_eq!(score.to_lines(), "not\nsoon\nnow: blocking");
+    let flag = DraftQuestion::from_lines("angry", QuestionKind::Noul, "Angry?", "ignored");
+    assert!(flag.options.is_empty() && flag.levels.is_empty());
+    assert_eq!(flag.to_lines(), "");
+    assert!(choice.clone().into_question().is_ok());
+    let single = DraftQuestion::from_lines("x", QuestionKind::Choice, "Which?", "a\na");
+    assert!(matches!(
+        single.into_question(),
+        Err(QuestionSetError::Duplicate(_))
+    ));
 }

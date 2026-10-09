@@ -73,23 +73,31 @@ and `POST /api/v1/workspaces/{id}/imports/{import}/refresh` run one on demand.
 
 ## Labelling new rows
 
-`quack classify TABLE --text COLUMN --questions FILE` labels the rows its output table does
-not hold, so running it again after new rows arrive labels only those. quack has no
-scheduler; to label nightly, add a cron entry on the host that holds the data directory:
+`quack classify TABLE "what you want to know about each row"` drafts questions with the chat
+model, previews the labels, and labels the table on a yes. The questions are kept as approved
+by the run that labels with them, so later runs name only the table: `quack classify TABLE` labels the
+rows its output table does not hold, and running it again after new rows arrive labels only
+those. quack has no scheduler; to label nightly, add a cron entry on the host that holds the
+data directory, with `-y` because nobody is there to answer:
 
 ```
 # m h dom mon dow  command
-30 2 * * *  quack classify tickets --text subject,body --questions triage.json -w support
+30 2 * * *  quack classify tickets -y -w support
 ```
 
-Rows whose text changed after they were labelled keep their labels: `--all` labels every row
-again, into a staging table that replaces the output only when it completes. A run that
-stops (a cancel, a refusal from the model, a killed process) keeps the rows it wrote, and the
-next run finishes; a run killed by a signal is marked `interrupted` by the next. A run into
-an output labelled under other questions, or after `ollama pull` changed the model's weights,
-is refused until `--all`. `quack classify list` shows the runs. Each run's definition and
-counts are in `_quack_classifications` inside the workspace file, so deleting a user
-rewrites `started_by` there to `removed` like every other record of who did what.
+Name only the table in a cron line. A sentence that differs from the last approved one revises
+the questions and labels every row again, and `-y` goes ahead without asking. Rows whose text
+changed after they were labelled keep their labels: `--all` labels every row again, into a
+staging table that replaces the output only when it completes. A run that stops (a cancel, a
+refusal from the model, a killed process) keeps the rows it wrote, and the next run finishes;
+a stopped relabel leaves the old labels serving and starts again from the first row. A run
+killed by a signal is marked `interrupted` by the next. Questions, a key, or model weights that
+changed (`ollama pull`) since the labels were made label every row again, and the run says so.
+`quack classify show TABLE` prints the approved questions and `quack classify list` the
+runs. Each run's set and counts are in `_quack_classifications` inside the workspace file, so
+deleting a user rewrites `started_by` there to `removed` like every other record of who did
+what. A key chosen because its values are all different (not an id) can stop being so as rows
+arrive; the run then says which column and the remedy is a sentence after adding an id column.
 
 ## Hardware sizing
 

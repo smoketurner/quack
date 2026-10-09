@@ -19,7 +19,7 @@ use quack_core::analysis::search::DocumentScope;
 use quack_core::analysis::text_to_sql::{PromptOptions, Window};
 use quack_core::analysis::tools::{Labeller, ReaderDb, SharedDb};
 use quack_core::classify::LabelJobs;
-use quack_core::config::{AnalysisConfig, Config, GraphConfig, RetrievalConfig};
+use quack_core::config::{AnalysisConfig, GraphConfig, RetrievalConfig};
 use quack_core::embedding::{Dimension, Embedder, EmbeddingModel};
 use quack_core::error::Result as TurnResult;
 use quack_core::ids::{ChunkId, DocumentId, UserId};
@@ -32,6 +32,7 @@ use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, Pinn
 use quack_core::storage::writer::Writer;
 use quack_core::text::{Fenced, Tokens};
 use quack_testkit::DecisionStub;
+use quack_testkit::{Reply, ScriptedOllama};
 use rig::ProviderError;
 use rig::completion::Usage;
 use rig::embeddings::Embedding;
@@ -148,7 +149,15 @@ async fn run_turn(
     history: Vec<Message>,
     message: &str,
 ) -> Ran {
-    run_turn_answering(db, model, policy, history, message, Answer::Deny).await
+    Box::pin(run_turn_answering(
+        db,
+        model,
+        policy,
+        history,
+        message,
+        Answer::Deny,
+    ))
+    .await
 }
 
 /// The turn, with every write request answered with `answer` as it arrives.
@@ -160,7 +169,7 @@ async fn run_turn_answering(
     message: &str,
     answer: Answer,
 ) -> Ran {
-    run_turn_labelling(
+    Box::pin(run_turn_labelling(
         db,
         model,
         policy,
@@ -168,7 +177,7 @@ async fn run_turn_answering(
         message,
         answer,
         Wiring::default(),
-    )
+    ))
     .await
 }
 
@@ -770,25 +779,19 @@ async fn a_malformed_history_is_dropped_with_a_warning() {
     );
 }
 
-/// The questions every `classify_rows` call below asks of the `sales`
-/// regions: one choice and one true-or-false.
+/// What the person asks of the `sales` regions, and the questions the chat
+/// model drafts from it: one choice and one true-or-false.
+const SENTENCE: &str = "which region is each sale in, and is it cold";
+
+const DRAFT: &str = r#"{"text_columns": ["region"], "questions": [
+    {"name": "kind", "type": "choice", "instructions": "Which region is it?",
+     "options": [{"label": "north", "description": ""}, {"label": "south", "description": ""}],
+     "levels": []},
+    {"name": "cold", "type": "noul", "instructions": "Is it cold?",
+     "options": [], "levels": []}]}"#;
+
 fn labelling(preview: Option<u32>) -> serde_json::Value {
-    let mut args = serde_json::json!({
-        "table": "sales",
-        "text_columns": ["region"],
-        "key": "region",
-        "question_set": {
-            "name": "mood",
-            "questions": {
-                "kind": {
-                    "type": "choice",
-                    "instructions": "Which region is it?",
-                    "criteria": {"north": null, "south": null}
-                },
-                "cold": {"type": "noul", "instructions": "Is it cold?"}
-            }
-        }
-    });
+    let mut args = serde_json::json!({ "table": "sales", "sentence": SENTENCE });
     if let Some(rows) = preview {
         args["preview"] = serde_json::json!(rows);
     }
@@ -811,20 +814,31 @@ async fn labeller(stub: &DecisionStub, budget: u64) -> Labeller {
 
 /// [`labeller`], recording `user` on the runs it starts.
 async fn labeller_for(stub: &DecisionStub, budget: u64, user: Option<&UserId>) -> Labeller {
-    let config = Config::parse(&format!(
-        "[providers.local]\ntype = \"ollama\"\nbase_url = \"{}\"\nmax_retries = 0\n\
-         [decision]\nmodel = \"local/laya\"\ninteractive_budget = {budget}\n",
-        stub.base_url()
-    ))
+    let chat = ScriptedOllama::serve(vec![
+        Reply::Text(DRAFT),
+        Reply::Text(DRAFT),
+        Reply::Text(DRAFT),
+    ])
+    .await
     .unwrap();
+    let config = chat
+        .config_with(&format!(
+            "[providers.local]\ntype = \"ollama\"\nbase_url = \"{}\"\nmax_retries = 0\n\
+             [decision]\nmodel = \"local/laya\"\ninteractive_budget = {budget}\n",
+            stub.base_url()
+        ))
+        .unwrap();
     let jobs = LabelJobs::new(JobQueue::new(10));
-    Egress::scope(
+    let labeller = Egress::scope(
         Some(Egress::NoWorkspace),
         Labeller::from_config(&config, jobs, user),
     )
     .await
     .unwrap()
-    .unwrap()
+    .unwrap();
+    // The drafter reaches the scripted chat model for as long as the test.
+    Box::leak(Box::new(chat));
+    labeller
 }
 
 async fn label_turn(
@@ -834,14 +848,14 @@ async fn label_turn(
     answer: Answer,
     labeller: Labeller,
 ) -> Ran {
-    label_turn_cancelled_by(
+    Box::pin(label_turn_cancelled_by(
         db,
         model,
         policy,
         answer,
         labeller,
         CancellationToken::new(),
-    )
+    ))
     .await
 }
 
@@ -855,7 +869,7 @@ async fn label_turn_cancelled_by(
 ) -> Ran {
     Egress::scope(
         Some(Egress::NoWorkspace),
-        run_turn_labelling(
+        Box::pin(run_turn_labelling(
             db,
             model,
             policy,
@@ -866,7 +880,7 @@ async fn label_turn_cancelled_by(
                 labeller: Some(labeller),
                 cancel,
             },
-        ),
+        )),
     )
     .await
 }
@@ -875,7 +889,7 @@ async fn labelled_rows(db: &SharedDb) -> Option<i64> {
     db.run(|db| {
         Ok(db
             .connection()
-            .query_row("SELECT count(*) FROM sales_mood", [], |row| row.get(0))
+            .query_row("SELECT count(*) FROM sales_labels", [], |row| row.get(0))
             .ok())
     })
     .await
@@ -904,11 +918,28 @@ async fn a_preview_labels_the_first_rows_without_asking_or_writing() {
     assert_eq!(response.steps[0].summary, "2 rows");
     assert_eq!(labelled_rows(&db).await, None, "nothing was written");
     let history = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
-    assert!(history.contains("Key: region"), "{history}");
     assert!(
-        history.contains("Run without --preview to label 2 rows."),
+        history.contains(
+            "sales: 2 rows, key revenue (all different; not named like an id), text in region."
+        ),
         "{history}"
     );
+    assert!(
+        history.contains("Nothing is kept until the labelling runs."),
+        "{history}"
+    );
+    assert!(history.contains("kind (p)"), "{history}");
+    let kept: i64 = db
+        .run(|db| {
+            Ok(db.connection().query_row(
+                "SELECT count(*) FROM _quack_classifications",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(kept, 0, "the questions were kept by nothing");
 }
 
 /// A run creates a table, so it asks like any write, with the actual
@@ -916,7 +947,11 @@ async fn a_preview_labels_the_first_rows_without_asking_or_writing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_asks_the_person_and_labels_the_table_on_approval() {
     let stub = DecisionStub::start().await;
-    let statement = "-- label 2 rows of sales into sales_mood (new table) with local/laya\n-- kind: Which region is it?\n-- cold: Is it cold?";
+    let statement = "-- label 2 rows of sales into sales_labels (new table) with local/laya, 2 questions, under a minute\n\
+-- key revenue (all different; not named like an id); reads region\n\
+-- kind (choice: north, south): Which region is it?\n\
+-- cold (yes/no): Is it cold?\n\
+-- preview: 10: kind=north (0.90), cold=0.10 | 20: kind=south (0.90), cold=0.10";
 
     let db = workspace();
     let model = model_that_labels(None);
@@ -951,12 +986,12 @@ async fn a_run_asks_the_person_and_labels_the_table_on_approval() {
     assert!(!ran.answer().write_refused);
     assert_eq!(
         ran.answer().steps[0].summary,
-        "2 rows labelled into sales_mood"
+        "2 rows labelled into sales_labels"
     );
     assert_eq!(labelled_rows(&db).await, Some(2));
     let history = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
     assert!(
-        history.contains("Query it with SQL, joined to sales on region."),
+        history.contains("Query it with SQL, joined to sales on revenue."),
         "{history}"
     );
     assert!(
@@ -995,7 +1030,10 @@ async fn a_run_after_reading_documents_is_refused_when_nobody_can_approve() {
     assert_eq!(ran.answer().steps[1].tool, ToolName::ClassifyRows);
     assert_eq!(ran.answer().steps[1].summary, Hold::ReadDocuments.summary());
     assert_eq!(labelled_rows(&db).await, None);
-    assert_eq!(stub.requests(), 0, "the model was never asked");
+    assert!(
+        ran.answer().steps[1].run.is_none(),
+        "a refused run begins nothing"
+    );
 }
 
 /// A turn cannot wait for more than `[decision].interactive_budget`
@@ -1090,8 +1128,9 @@ async fn cancelling_the_turn_cancels_the_run() {
     let firing = cancel.clone();
     let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let stub = DecisionStub::with_rule(move |_| {
-        // The two probes, then the first row: cancel while it is asked.
-        if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 2 {
+        // Drafting probes twice, the approval card asks two probes and two
+        // rows; then the run's two probes and its first row: cancel there.
+        if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 8 {
             firing.cancel();
         }
         None
@@ -1128,8 +1167,9 @@ async fn a_failed_labelling_step_names_the_run_it_began() {
     let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = Arc::clone(&seen);
     let stub = DecisionStub::with_rule(move |_| {
-        // The two probes, then the first row is refused.
-        (counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2)
+        // Drafting and the approval card ask 6 times, the run's two probes
+        // 2 more; then its first row is refused.
+        (counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 8)
             .then(|| quack_testkit::Fault::new(403, "forbidden"))
     })
     .await;

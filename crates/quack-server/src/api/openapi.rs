@@ -103,7 +103,7 @@ const COOKIE: &str = "session";
         tables::schema,
         tables::note,
         tables::retype,
-        classify::classify,
+        classify::label,
         classify::runs,
         context::show,
         context::replace,

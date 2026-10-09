@@ -460,7 +460,9 @@ when the search already returns the right document in its first page.
 
 A decision model labels text: for a row's text and a fixed list of questions it returns each
 option's probability in tens of milliseconds, where the chat model takes a call per row
-(`quack classify`, design doc 6.6). Laya (`ollama pull laya`, 846 MB, English only) is the
+(`quack classify`, design doc 6.6). The questions come from the chat model, which drafts them
+from a sentence once per table (30 to 120 seconds), so `quack classify` needs `[general].chat_model`
+as well, unless the table's questions were approved before. Laya (`ollama pull laya`, 846 MB, English only) is the
 one quack has been run against. It needs Ollama 0.40.0 or later, whose `/v1/systemone` route
 rig has no client for, so only a `type = "ollama"` provider can serve it:
 

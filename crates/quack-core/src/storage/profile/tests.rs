@@ -219,3 +219,26 @@ fn only_id_names_qualify_as_a_key() {
         assert!(!TableProfile::is_id_name(no), "{no}");
     }
 }
+
+#[test]
+fn text_candidates_leave_out_the_key_ids_numbers_dates_sparse_and_constant_columns() {
+    let db = db();
+    db.execute_statement(
+        "CREATE TABLE t AS SELECT range AS id, 'ticket ' || range AS subject, \
+         'x' AS constant, CAST(range AS VARCHAR) AS number_text, \
+         CAST(DATE '2026-01-01' + CAST(range AS INTEGER) AS VARCHAR) AS date_text, \
+         CASE WHEN range < 2 THEN 'a b' || range ELSE NULL END AS sparse, \
+         'row ' || range AS ticket_id, 'body ' || range AS body FROM range(10)",
+    )
+    .unwrap();
+    let profile = TableProfile::compute(&db, "t").unwrap();
+    let names = |key: &str| -> Vec<&str> {
+        profile
+            .text_candidates(key)
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect()
+    };
+    assert_eq!(names("id"), ["subject", "body"], "in table order");
+    assert_eq!(names("SUBJECT"), ["body"], "the key is not read");
+}

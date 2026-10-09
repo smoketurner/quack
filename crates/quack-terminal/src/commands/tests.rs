@@ -504,18 +504,40 @@ fn quoted(path: &str) -> String {
     }
 }
 
-/// `/classify` takes what `quack classify` does: a table, its text columns,
-/// and a question file; or `list`.
+/// `/classify` takes a table and, after it, what you want to know about each
+/// row as typed; or `list`, or `show TABLE`.
 #[test]
-fn classify_takes_a_table_columns_and_a_question_file() {
-    assert!(parses(
-        "/classify tickets --text subject,body --questions q.json --preview 5 --all"
-    ));
+fn classify_takes_a_table_and_a_sentence_as_typed() {
+    assert!(parses("/classify tickets"));
+    assert!(parses("/classify tickets which department should it go to"));
     assert!(parses("/classify list"));
+    assert!(parses("/classify show tickets"));
+    assert!(parses(
+        "/classify --all --preview 5 tickets what is it about"
+    ));
+    assert!(parses("/classify tickets -y what is it about"));
+    // An apostrophe in the sentence does not open a quote.
+    assert!(parses(
+        "/classify tickets what's wrong with it, and isn't it urgent?"
+    ));
     assert!(!parses("/classify"));
-    assert!(!parses("/classify tickets"));
+    assert!(!parses("/classify tickets --preview 0"));
     assert!(!parses(
-        "/classify tickets --text subject --questions q.json --preview 0"
+        "/classify tickets --text subject --questions q.json"
     ));
     assert_eq!(words("/cla"), ["/classify"]);
+
+    let Ok(SlashCommand::Classify(command)) =
+        SlashCommand::parse("/classify tickets  what's   wrong, \"really\"?")
+    else {
+        fail("expected a labelling")
+    };
+    let args = command
+        .labelling()
+        .unwrap_or_else(|| fail("expected a labelling, not a listing"));
+    assert_eq!(args.table(), "tickets");
+    assert_eq!(
+        args.sentence().as_deref(),
+        Some("what's   wrong, \"really\"?")
+    );
 }

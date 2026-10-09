@@ -85,9 +85,9 @@ pub(crate) enum SlashCommand {
         #[arg(long, value_name = "POINTER")]
         json_pointer: Option<JsonPointer>,
     },
-    /// Label a table's text with a decision model into a new table
-    /// (`quack classify`): TABLE --text COLUMN[,COLUMN] --questions FILE
-    /// [--key COLUMN] [--preview N] [--all], or `list` for the runs
+    /// Label a table's text with a decision model (`quack classify`): TABLE
+    /// and, in your words, what you want to know about each row; or `list`
+    /// the runs, or `show TABLE` its questions
     #[command(name = "/classify", disable_help_flag = true)]
     Classify(ClassifyCommand),
     /// List ingested documents
@@ -323,6 +323,8 @@ impl SlashCommand {
             words.extend(rest.split_whitespace().map(str::to_owned));
         } else if takes_verbatim(command) {
             words.extend((!rest.is_empty()).then(|| rest.to_owned()));
+        } else if command.get_name() == "/classify" {
+            words.extend(classify_words(rest));
         } else {
             let split = shlex::split(rest).ok_or_else(|| {
                 SlashLine::command().error(ErrorKind::ValueValidation, "a quote is not closed")
@@ -346,6 +348,39 @@ impl SlashCommand {
         }
         Ok(command)
     }
+}
+
+/// The words of `/classify TABLE [FLAGS] SENTENCE`: the table and the flags
+/// before the sentence, then the rest of the line as typed as one word, so
+/// an apostrophe in the sentence does not open a quote.
+fn classify_words(rest: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut rest = rest;
+    let mut table_seen = false;
+    while let Some((word, after)) = next_word(rest) {
+        if word.starts_with('-') {
+            words.push(word.to_owned());
+            rest = after;
+            if word == "--preview"
+                && let Some((rows, after)) = next_word(rest)
+            {
+                words.push(rows.to_owned());
+                rest = after;
+            }
+        } else if !table_seen {
+            words.push(
+                shlex::split(word)
+                    .and_then(|mut w| w.pop())
+                    .unwrap_or_else(|| word.to_owned()),
+            );
+            table_seen = true;
+            rest = after;
+        } else {
+            break;
+        }
+    }
+    words.extend((!rest.is_empty()).then(|| rest.to_owned()));
+    words
 }
 
 /// The first word of `text` and what follows it, trimmed.

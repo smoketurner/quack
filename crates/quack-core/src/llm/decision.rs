@@ -154,9 +154,9 @@ impl fmt::Display for QuestionName {
 /// One option of a choice question: not blank, at most 64 characters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct Label(String);
+pub struct OptionLabel(String);
 
-impl Label {
+impl OptionLabel {
     const MAX_CHARS: usize = 64;
 
     /// The option as written.
@@ -166,7 +166,7 @@ impl Label {
     }
 }
 
-impl TryFrom<String> for Label {
+impl TryFrom<String> for OptionLabel {
     type Error = QuestionSetError;
 
     fn try_from(text: String) -> std::result::Result<Self, Self::Error> {
@@ -174,13 +174,13 @@ impl TryFrom<String> for Label {
     }
 }
 
-impl From<Label> for String {
-    fn from(label: Label) -> Self {
+impl From<OptionLabel> for String {
+    fn from(label: OptionLabel) -> Self {
         label.0
     }
 }
 
-impl fmt::Display for Label {
+impl fmt::Display for OptionLabel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -349,7 +349,7 @@ pub enum Question {
         /// The options and what each means, in order.
         #[schema(value_type = BTreeMap<String, Option<String>>)]
         #[schemars(with = "BTreeMap<String, Option<String>>")]
-        criteria: Unique<Label, Option<String>, MAX_OPTIONS>,
+        criteria: Unique<OptionLabel, Option<String>, MAX_OPTIONS>,
     },
     /// True or false.
     Noul {
@@ -588,7 +588,7 @@ pub enum Answer {
     /// The chosen option, its probability, and how concentrated the
     /// probabilities are (not the chance the choice is right).
     Choice {
-        choice: Label,
+        choice: OptionLabel,
         probability: f64,
         confidence: f64,
     },
@@ -728,7 +728,7 @@ impl Answers {
 
 /// What one row's ask came to.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Asked {
+pub enum RowOutcome {
     /// The model answered every question.
     Answered(Answers),
     /// The model refused the row's text at every length tried, while it
@@ -1003,10 +1003,10 @@ impl Asker<'_> {
     /// Returns [`Error::DecisionRefused`] for any other refusal, and for a
     /// set the server accepted at the start and now refuses; [`Error::Llm`]
     /// when the server fails or its answer is malformed.
-    pub async fn ask(&self, state: &State) -> Result<Asked> {
+    pub async fn ask(&self, state: &State) -> Result<RowOutcome> {
         match self.post(state).await? {
             Reply::Answered(wire) => {
-                return Ok(Asked::Answered(Answers::from_wire(
+                return Ok(RowOutcome::Answered(Answers::from_wire(
                     wire,
                     self.questions,
                     state.is_cut(),
@@ -1037,14 +1037,14 @@ impl Asker<'_> {
             }
         }
         if let Some(answers) = best {
-            return Ok(Asked::Answered(answers));
+            return Ok(RowOutcome::Answered(answers));
         }
         match self.post(&State::probe()).await? {
             Reply::Refused(r) => Err(Error::DecisionRefused(format!(
                 "the decision model now refuses the question set: {}",
                 r.message
             ))),
-            Reply::Answered(_) => Ok(Asked::Unfit),
+            Reply::Answered(_) => Ok(RowOutcome::Unfit),
         }
     }
 }

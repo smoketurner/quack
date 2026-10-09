@@ -114,7 +114,7 @@ cargo run --bin quack -- okf export DIR|-                                       
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
 cargo run --bin quack -- import sqlite:/path/src.db --table t --from orders [--types col=TYPE]   # snapshot a SQLite query, an http(s) data file (-H 'Name: value', --bearer-env VAR, --json-pointer /data), or s3://bucket/key as a table
 cargo run --bin quack -- import ... --save NAME [--store-credential] | import list | refresh NAME | remove NAME   # import::SavedImport in _quack_imports; a refresh replaces the table only when the source changed; cron schedules it
-cargo run --bin quack -- classify TABLE --text COL[,COL] --questions FILE [--key COL] [--preview N] [--all] | classify list   # a decision model labels each row's text into <table>_<set>, joined back by the key; a re-run labels only new keys, --all replaces the labels (design doc 6.6)
+cargo run --bin quack -- classify TABLE "SENTENCE" [-y] [--all] [--preview N] | classify list | classify show TABLE   # the chat model drafts questions from the sentence, a preview shows the labels, a yes has the decision model label each row's text into <table>_labels, joined back by the key; the run is the approval, so later runs name only the table (design doc 6.6)
 cargo run --bin quack -- auth login|status|logout PROVIDER ; auth jwks [PROVIDER] [--rotate [--activate]]  # OAuth tokens; a client's public key
 cargo run --bin quack -- auth register [--issuer URL] [--device-code|--token-env VAR|--open] [--replace] [--print] | unregister   # RFC 7591/7592 client registration
 cargo run --bin quack -- config [--changed] [--format json]                      # every recognized setting, its value and origin, the file's unknown keys, the env vars read
@@ -540,22 +540,28 @@ without generating any: `DecisionModel` posts questions about a `State` to Ollam
 the route), `Questions` is checked once when built, and `Asker::ask` sends a row's whole state
 first and searches for the longest prefix the model accepts only after a 400 or 413, so
 `Answers::truncated` is exact; `DecisionModel::asker` probes the set (and that it leaves room for
-text) before any row. `quack_core::classify` turns a `Classification` (table, text columns, key,
-`QuestionSet`, `Rows::Missing | All`) into `<table>_<set>` with the source's key as its
-`PRIMARY KEY`: pages of 256 by keyset on a reader clone, one transaction a page, a cancel or
-failure keeps the rows written, `--all` stages into `_quack_stage_<output>` and swaps, one run per
-output (`Writer::claim`), and `_quack_classifications` records each run's definition (the
-weights' digest included), which a run that adds rows must match. Only an id-like column is picked
-as the key (`TableProfile::is_id_name`). `describe_table` gives the output's columns their meaning
-and `labelled_by`. A job (CLI, terminal, REST) labels any size; the agent's `classify_rows`
-(a write through `Turn::permit_write`) and MCP `classify` wait, so they refuse more than
-`[decision].interactive_budget` answers (rows times questions). Their runs are jobs of the
-process's `JobQueue` (`Classification::run_as_job`, `LabelJobs` on the `TurnRequest`): listed
-with the other jobs, cancelled by the turn's token or the queue's shutdown, finished and
-recorded even when the turn or the MCP client is gone, and audited at their end under the run id
-by the `OnEnd` hook the server passes (`Access::run_audit`). `quack -p` and `quack mcp` have a
-queue of their own and wait for it before they exit. The decision tests share
-`quack-testkit`'s `DecisionStub`, which `quack-core` includes by path.
+text) before any row. `quack_core::classify` turns a person's sentence into a `LabelSet` (the key, the
+text columns, the `Questions`) with one chat call (`classify::drafting`, `llm::ChatDrafter`; checked as
+`Draft::given` checks a set sent back, and told back once if refused) and a `Draft` into
+`<table>_labels` with the source's key as its `PRIMARY KEY`: pages of 256 by keyset on a reader
+clone, one transaction a page, a cancel or failure keeps the rows written, a relabel stages into
+`_quack_stage_<output>` and swaps, one run per output (`Writer::claim`). Nothing is stored by drafting:
+the run's record in `_quack_classifications` (the set, the sentence, the weights' digest) is the
+approval, the newest run on a table is its last approved set (`Draft::approved`, which asks no model
+and is the `label_set` of `describe_table`), and a run whose set, key, or model weights differ from
+those in force labels every row again and says why (`RelabelReason`). A key is an id-like column, else a
+unique column of whole numbers or short text, with its reason stored. `describe_table` gives the
+output's columns their meaning and `labelled_by`. A job (CLI, terminal, REST) labels any size; the
+agent's `classify_rows` (drafting, a 3-row preview, then a write through `Turn::permit_write`) and MCP
+`classify` wait, so they refuse more than `[decision].interactive_budget` answers (rows times
+questions). Their runs are jobs of the process's `JobQueue` (`Draft::run_as_job`, `LabelJobs` on the
+`TurnRequest`): listed with the other jobs, cancelled by the turn's token or the queue's shutdown,
+finished and recorded even when the turn or the MCP client is gone, and audited at their end under
+the run id by the `OnEnd` hook the server passes (`Access::run_audit`). `quack -p` and `quack mcp`
+have a queue of their own and wait for it before they exit. The CLI and the terminal share
+`classify_cli::Prepared` (draft, outline, preview, the question); the web section is `web::label`
+with htmx fragments; MCP sends progress notifications to a client that sent a token. The decision
+tests share `quack-testkit`'s `DecisionStub`, which `quack-core` includes by path.
 
 `quack serve` (`crates/quack-server/`) is a thin axum client of core: `auth.rs` turns a
 bearer (login session or API token), the session cookie, or `--local` into an `Identity`

@@ -9,7 +9,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use quack_core::analysis::events::{FailureKind, TurnFailure};
-use quack_core::classify::ClassifyError;
+use quack_core::classify;
 use quack_core::error::Error as CoreError;
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -88,9 +88,12 @@ pub(crate) enum ErrorCode {
     /// The rows cannot be labelled as asked: no key, a bad column, a key
     /// that is not unique.
     ClassifyRefused,
-    /// The table of labels was made under other questions or another
-    /// model than the request's.
-    DefinitionChanged,
+    /// The table has no approved questions and the request gave none.
+    NoQuestions,
+    /// The chat model's questions were refused twice.
+    DraftRefused,
+    /// The approved questions read columns the table no longer has.
+    SetColumnsGone,
     /// Another run is labelling into the same table.
     ClassifyRunning,
     /// The run is too long for a caller that waits for it.
@@ -228,24 +231,28 @@ impl ErrorCode {
     }
 
     /// The code and status a refused labelling answers with.
-    fn of_classify(refusal: &ClassifyError) -> (Self, StatusCode) {
+    fn of_classify(refusal: &classify::Error) -> (Self, StatusCode) {
         match refusal {
-            ClassifyError::NoTable(_) => (Self::NotFound, StatusCode::NOT_FOUND),
-            ClassifyError::OutputTaken { .. } => (Self::TableTaken, StatusCode::CONFLICT),
-            ClassifyError::DefinitionChanged { .. } => {
-                (Self::DefinitionChanged, StatusCode::CONFLICT)
+            classify::Error::NoTable(_) => (Self::NotFound, StatusCode::NOT_FOUND),
+            classify::Error::OutputTaken { .. } => (Self::TableTaken, StatusCode::CONFLICT),
+            classify::Error::NoQuestions { .. } => (Self::NoQuestions, StatusCode::BAD_REQUEST),
+            classify::Error::NoDrafter { .. } => (Self::NoChatModel, StatusCode::BAD_REQUEST),
+            classify::Error::DraftRefused { .. } => {
+                (Self::DraftRefused, StatusCode::UNPROCESSABLE_ENTITY)
             }
-            ClassifyError::Running { .. } => (Self::ClassifyRunning, StatusCode::CONFLICT),
-            ClassifyError::TooLargeToWait { .. } => (Self::TooLargeToWait, StatusCode::BAD_REQUEST),
-            ClassifyError::NoColumn { .. }
-            | ClassifyError::TextColumns(_)
-            | ClassifyError::DuplicateColumn(_)
-            | ClassifyError::NoKey { .. }
-            | ClassifyError::KeyNotUnique { .. }
-            | ClassifyError::KeyType { .. }
-            | ClassifyError::KeyLost { .. }
-            | ClassifyError::ColumnClash(_)
-            | ClassifyError::ReplaceRefused => (Self::ClassifyRefused, StatusCode::BAD_REQUEST),
+            classify::Error::SetColumnsGone { .. } => (Self::SetColumnsGone, StatusCode::CONFLICT),
+            classify::Error::Running { .. } => (Self::ClassifyRunning, StatusCode::CONFLICT),
+            classify::Error::TooLargeToWait { .. } => {
+                (Self::TooLargeToWait, StatusCode::BAD_REQUEST)
+            }
+            classify::Error::NoText { .. }
+            | classify::Error::TextColumns(_)
+            | classify::Error::NoKey { .. }
+            | classify::Error::KeyNotUnique { .. }
+            | classify::Error::KeyType { .. }
+            | classify::Error::KeyLost { .. }
+            | classify::Error::ColumnClash(_)
+            | classify::Error::ReplaceRefused => (Self::ClassifyRefused, StatusCode::BAD_REQUEST),
         }
     }
 

@@ -23,16 +23,19 @@ use quack_core::analysis::events;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::search::{DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{FindPathArgs, ReaderDb, Rerank, SearchGraphArgs, SharedDb};
-use quack_core::classify::{ClassificationRun, ClassifyArgs, LabelJobs, Tracked, Waiting};
+use quack_core::classify::{
+    self, Draft, DraftContext, Drafter, LabelJobs, LabellingJob, Rows, Waiting,
+};
 use quack_core::config::Config;
 use quack_core::ids::{DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use quack_core::jobs::JobQueue;
+use quack_core::llm::ChatDrafter;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::decision::DecisionModel;
 use quack_core::llm::egress::Egress;
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::{Ontology, store as ontology_store};
-use quack_core::progress::RunControl;
+use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditAction, AuditResource, Outcome, ResourceKind, WorkspaceRow,
@@ -43,6 +46,7 @@ use quack_core::storage::workspace::{
     DocumentFilter, DocumentListing, SearchMode, TEMP_OBJECT_REFUSED, WorkspaceDb,
     creates_temp_object,
 };
+use quack_core::storage::writer::Writer;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, Extensions, Implementation, ListResourceTemplatesResult,
@@ -50,7 +54,8 @@ use rmcp::model::{
     ReadResourceResult, Resource, ResourceContents, ResourceTemplate, ServerCapabilities,
     ServerConfig,
 };
-use rmcp::service::RequestContext;
+use rmcp::model::{ProgressNotificationParam, ProgressToken};
+use rmcp::service::{Peer, RequestContext};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -211,6 +216,69 @@ pub(crate) struct McpSetup {
     pub auditor: Auditor,
     /// The queue the tables a turn or a call labels are labelled through.
     pub jobs: JobQueue,
+}
+
+/// What the `classify` tool takes: a labelling request, or with `preview`
+/// the questions and the first rows' labels.
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct ClassifyToolArgs {
+    #[serde(flatten)]
+    pub request: classify::Request,
+    /// Label only this many rows (1 to 100) and show them, writing and
+    /// keeping nothing
+    #[serde(default)]
+    pub preview: Option<u32>,
+}
+
+/// Progress notifications for a call whose client asked for them with a
+/// progress token: three steps, drafting, previewing, and labelling, the
+/// third with the rows done. Without a token nothing is sent.
+#[derive(Clone)]
+pub(crate) struct StepProgress(Option<(Peer<RoleServer>, ProgressToken)>);
+
+impl StepProgress {
+    fn of(context: &RequestContext<RoleServer>) -> Self {
+        Self(
+            context
+                .meta
+                .get_progress_token()
+                .map(|token| (context.peer.clone(), token)),
+        )
+    }
+
+    /// A call that asked for no notifications.
+    #[cfg(test)]
+    pub(crate) const fn none() -> Self {
+        Self(None)
+    }
+
+    /// Step `at` of 3 has begun.
+    async fn at(&self, at: f64, message: &str) {
+        let Some((peer, token)) = &self.0 else {
+            return;
+        };
+        let param = ProgressNotificationParam::new(token.clone(), at)
+            .with_total(3.0)
+            .with_message(message);
+        if let Err(e) = peer.notify_progress(param).await {
+            tracing::debug!(error = %e, "could not send a progress notification");
+        }
+    }
+
+    /// A page of the labelling is done; sent without waiting for the client.
+    fn rows(&self, done: ChunkDone) {
+        if self.0.is_none() || done.total == 0 {
+            return;
+        }
+        let fraction = f64::from(done.done) / f64::from(done.total);
+        let (progress, message) = (
+            self.clone(),
+            format!("labelled {} of {} rows", done.done, done.total),
+        );
+        tokio::spawn(async move {
+            progress.at(2.0 + fraction.min(0.99), &message).await;
+        });
+    }
 }
 
 /// One MCP server over one workspace. The tool router comes from the
@@ -726,29 +794,104 @@ impl McpServer {
     /// Label a table's text with the decision model.
     #[tool(
         name = "classify",
-        description = "Label the text of a table's rows with the workspace's decision model. It answers a fixed set of questions about each row (pick one of 2 to 26 options, true or false, or a level on a rubric) with probabilities, and the answers go to a new table named <table>_<set name> that joins back to the table by its key, so `sql` can GROUP BY and filter on them. Pass `preview` (1 to 100) to see the first rows' labels without writing anything. A run needs write permission on this connection, labels the rows the output lacks (or every row again with rows = \"all\"), and is refused beyond [decision].interactive_budget answers (rows times questions): run `quack classify` for larger tables."
+        description = "Label the text of a table's rows with the workspace's decision model. Say in `sentence`, in the person's words, what they want to know about each row; the chat model drafts the questions (pick one of several options, yes or no, or a level on a scale), and the answers, with probabilities, go to a table named <table>_labels that joins back to the table by its key, so `sql` can GROUP BY and filter on them. Pass `preview` (1 to 100) to see the questions and the labels of the first rows without writing or keeping anything; drafting takes 30 to 120 seconds, so preview first and send the returned `draft.set` back as `set` to run exactly those questions. A run needs write permission on this connection, labels the rows the table of labels lacks (or every row again with rows = \"all\"), and is refused beyond [decision].interactive_budget answers (rows times questions): run `quack classify` for larger tables. With neither `sentence` nor `set`, the questions approved before are used."
     )]
     async fn classify(
         &self,
-        Parameters(args): Parameters<ClassifyArgs>,
-        extensions: Extensions,
+        Parameters(args): Parameters<ClassifyToolArgs>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let caller = self.caller(&extensions)?;
-        // Boxed: building the model and the run make the future large.
-        Box::pin(self.as_caller(&caller, self.label(args, &caller))).await
+        self.classify_for(args, &context.extensions, StepProgress::of(&context))
+            .await
     }
 
-    /// `classify`, as its caller: asking the decision model is a model
-    /// request too.
-    async fn label(&self, args: ClassifyArgs, caller: &Caller) -> Result<CallToolResult, McpError> {
+    /// `classify`, for the caller the request's extensions name.
+    pub(crate) async fn classify_for(
+        &self,
+        args: ClassifyToolArgs,
+        extensions: &Extensions,
+        progress: StepProgress,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = self.caller(extensions)?;
+        // Boxed: building the model and the run make the future large.
+        Box::pin(self.as_caller(&caller, self.label(args, &caller, progress))).await
+    }
+
+    /// The draft a `classify` call names: the `set` sent back, checked; else
+    /// the chat model's questions for the `sentence`; else the last approved
+    /// ones. Nothing is stored.
+    async fn draft_for(
+        &self,
+        request: &classify::Request,
+        decision: &DecisionModel,
+    ) -> Result<Draft, CoreError> {
+        let drafter = ChatDrafter::from_config(&self.inner.config);
+        let context = DraftContext {
+            db: &self.inner.db,
+            decision,
+            drafter: drafter.as_ref().map(|d| -> &dyn Drafter { d }),
+        };
+        match &request.set {
+            Some(set) => Draft::given(&context, &request.table, set.clone()).await,
+            None => Draft::prepare(&context, &request.table, request.sentence.as_deref()).await,
+        }
+    }
+
+    /// The questions and the labels of the first `rows` rows, as the JSON of
+    /// a [`classify::Report`]; nothing is written or kept.
+    async fn preview_report(
+        &self,
+        draft: &Draft,
+        decision: &DecisionModel,
+        (rows, which): (u32, Rows),
+        waiting: Waiting,
+        cancel: &llm::CancellationToken,
+    ) -> Result<serde_json::Value, CoreError> {
+        let db = &*self.inner.db;
+        let control = RunControl {
+            progress: &|_| {},
+            cancel: Some(cancel),
+        };
+        let shown = draft
+            .preview(db, decision, rows, which, waiting, control)
+            .await?;
+        let outline = draft
+            .outline(db, decision, which)
+            .await?
+            .estimated_from(&shown);
+        Ok(serde_json::to_value(classify::Report {
+            draft: draft.clone(),
+            outline,
+            preview: Some(shown),
+            run: None,
+        })?)
+    }
+
+    /// What a run of `draft` would do, if a caller can wait for it.
+    async fn outline_within(
+        draft: &Draft,
+        db: &Writer,
+        decision: &DecisionModel,
+        rows: Rows,
+        waiting: Waiting,
+    ) -> Result<classify::Outline, CoreError> {
+        let outline = draft.outline(db, decision, rows).await?;
+        outline.within(waiting)?;
+        Ok(outline)
+    }
+
+    /// `classify`, as its caller: asking the models is a model request too.
+    async fn label(
+        &self,
+        args: ClassifyToolArgs,
+        caller: &Caller,
+        progress: StepProgress,
+    ) -> Result<CallToolResult, McpError> {
         let config = &self.inner.config;
-        let ClassifyArgs {
-            classification,
-            preview,
-        } = args;
+        let ClassifyToolArgs { request, preview } = args;
         let detail = serde_json::json!({
-            "table": classification.table,
-            "set": classification.question_set.name,
+            "table": request.table,
+            "sentence": request.sentence,
             "preview": preview,
         });
         let decision = match DecisionModel::from_config(config).await {
@@ -765,42 +908,45 @@ impl McpServer {
         let waiting = Waiting::Caller {
             budget: config.decision.interactive_budget,
         };
-        if let Some(rows) = preview {
-            let control = RunControl {
-                progress: &|_| {},
-                cancel: Some(&cancel),
-            };
-            let done = classification
-                .preview(db, &decision, rows, waiting, control)
-                .await
-                .and_then(|p| serde_json::to_value(p).map_err(CoreError::from));
-            return caller
-                .finish_label(AuditAction::Classify, detail, done)
-                .await;
-        }
-        if !self.inner.policy.allows_unasked() {
+        if preview.is_none() && !self.inner.policy.allows_unasked() {
             caller
                 .record(AuditAction::Classify, None, Outcome::Denied, Some(detail))
                 .await?;
             return Ok(failure(
                 "labelling writes a table and this connection cannot write; pass preview to see \
-                 the labels without writing",
+                 the questions and the labels without writing",
             ));
         }
-        let outline = match classification.outline(db, &decision).await {
-            Ok(outline) => outline
-                .within(waiting)
-                .map(|()| outline)
-                .map_err(CoreError::from),
-            Err(e) => Err(e),
+        progress.at(0.0, "drafting the questions").await;
+        let draft = match self.draft_for(&request, &decision).await {
+            Ok(draft) => draft,
+            Err(e) => {
+                return caller
+                    .finish_label(AuditAction::Classify, detail, Err(e))
+                    .await;
+            }
         };
-        if let Err(e) = outline {
+        if let Some(rows) = preview {
+            progress.at(1.0, "previewing the labels").await;
+            let report = self
+                .preview_report(&draft, &decision, (rows, request.rows), waiting, &cancel)
+                .await;
             return caller
-                .finish_label(AuditAction::Classify, detail, Err(e))
+                .finish_label(AuditAction::Classify, detail, report)
                 .await;
         }
+        let outline = match Self::outline_within(&draft, db, &decision, request.rows, waiting).await
+        {
+            Ok(outline) => outline,
+            Err(e) => {
+                return caller
+                    .finish_label(AuditAction::Classify, detail, Err(e))
+                    .await;
+            }
+        };
+        progress.at(2.0, "labelling").await;
         let run_id = RunId::generate();
-        let tracked = Tracked {
+        let tracked = LabellingJob {
             db: Arc::clone(&self.inner.db),
             decision,
             started_by: caller.user_id(),
@@ -809,18 +955,28 @@ impl McpServer {
             cancel,
             jobs: caller.label_jobs(&self.inner.jobs, &self.inner.workspace.id, None),
         };
-        let done = classification.run_as_job(tracked, |_| {}).await;
+        let shown = draft.clone();
+        let done = draft
+            .run_as_job(tracked, request.rows, move |done: ChunkDone| {
+                progress.rows(done);
+            })
+            .await;
         self.inner.reader.observe_write().await;
         // The run's end is audited by the job under the run's id; a call
         // refused before the run began has no run, and is audited here.
         let began = db
-            .run(move |db| ClassificationRun::get(db, &run_id))
+            .run(move |db| classify::Run::get(db, &run_id))
             .await
             .is_ok();
         match done {
             Ok(run) => Ok(CallToolResult::structured(
-                serde_json::to_value(run)
-                    .map_err(|e| internal(format!("cannot encode the run: {e}")))?,
+                serde_json::to_value(classify::Report {
+                    draft: shown,
+                    outline,
+                    preview: None,
+                    run: Some(run),
+                })
+                .map_err(|e| internal(format!("cannot encode the run: {e}")))?,
             )),
             Err(e) if began => Ok(failure(e.to_string())),
             Err(e) => {

@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::analysis::table_search;
 use crate::analysis::text_to_sql::ColumnLine;
-use crate::classify::{self, ClassificationRun};
+use crate::classify::{self, Draft};
 use crate::config::Config;
 use crate::crypto;
 use crate::embedding::{
@@ -1975,7 +1975,7 @@ impl WorkspaceDb {
             )));
         }
         if document.source == DocumentSource::Classify {
-            return Err(classify::ClassifyError::ReplaceRefused.into());
+            return Err(classify::Error::ReplaceRefused.into());
         }
         if let Some(pending) = document.superseded_by {
             return Err(Error::Ingestion(format!(
@@ -3645,7 +3645,7 @@ impl WorkspaceDb {
                     .and_then(ColumnMeaning::of);
             }
         }
-        let labelled_by = ClassificationRun::in_force(self, table_name)?;
+        let labelled_by = classify::Run::in_force(self, table_name)?;
         if let Some(run) = &labelled_by {
             for (name, description) in run.column_meanings() {
                 if let Some(column) = columns
@@ -3678,6 +3678,7 @@ impl WorkspaceDb {
                 .map(|o| o.measures_on(table_name).into_iter().cloned().collect())
                 .unwrap_or_default(),
             labelled_by,
+            label_set: Draft::approved(self, table_name)?,
         })
     }
 
@@ -4046,7 +4047,9 @@ pub struct TableDescription {
     pub measures: Vec<Measure>,
     /// The run whose definition the rows of this table were labelled
     /// under, when it is a table of labels.
-    pub labelled_by: Option<ClassificationRun>,
+    pub labelled_by: Option<classify::Run>,
+    /// The questions last approved for labelling this table's text.
+    pub label_set: Option<Draft>,
 }
 
 impl TableDescription {
@@ -4074,6 +4077,7 @@ impl TableDescription {
                 .collect(),
             measures: self.measures.clone(),
             labelled_by: self.labelled_by.clone(),
+            label_set: self.label_set.clone(),
             sample: self.sample_rows.clone(),
         }
     }
@@ -4095,7 +4099,10 @@ pub struct TableDescriptionBody {
     pub measures: Vec<Measure>,
     /// The run whose definition the rows were labelled under, when this is
     /// a table of labels.
-    pub labelled_by: Option<ClassificationRun>,
+    pub labelled_by: Option<classify::Run>,
+    /// The questions last approved for labelling this table's text, with
+    /// the columns they read; none when nothing was approved.
+    pub label_set: Option<Draft>,
     /// A few rows.
     pub sample: QueryResults,
 }
@@ -4137,6 +4144,22 @@ impl fmt::Display for TableDescription {
             for measure in &self.measures {
                 writeln!(f, "  - {measure}")?;
             }
+        }
+        if let Some(draft) = &self.label_set {
+            let names: Vec<String> = draft
+                .set
+                .questions
+                .iter()
+                .map(|(name, _)| name.to_string())
+                .collect();
+            writeln!(
+                f,
+                "Labelling: approved questions ({}) read {}; the labels are in {}. \
+                 classify_rows with no sentence uses them.",
+                names.join(", "),
+                draft.set.columns_in_words(),
+                OneLine(&draft.output_table)
+            )?;
         }
         if !self.sample_rows.rows.is_empty() {
             writeln!(f, "\nSample rows:")?;

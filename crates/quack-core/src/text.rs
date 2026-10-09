@@ -55,6 +55,23 @@ impl fmt::Display for Count<'_> {
     }
 }
 
+/// A count with its thousands separated: `104,233`.
+pub struct Thousands(pub u64);
+
+impl fmt::Display for Thousands {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let digits = self.0.to_string();
+        let first = digits.len() % 3;
+        for (at, digit) in digits.chars().enumerate() {
+            if at > 0 && at % 3 == first % 3 {
+                f.write_char(',')?;
+            }
+            f.write_char(digit)?;
+        }
+        Ok(())
+    }
+}
+
 /// A filename, title, heading, or entity label on the one line it is
 /// rendered into: every line break and control character becomes a space,
 /// so the text cannot start a line of its own in a prompt or a tool result.
@@ -169,6 +186,18 @@ impl fmt::Display for Tokens {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_have_their_thousands_separated() {
+        let said = |n: u64| Thousands(n).to_string();
+        assert_eq!(said(0), "0");
+        assert_eq!(said(999), "999");
+        assert_eq!(said(1000), "1,000");
+        assert_eq!(said(12_345), "12,345");
+        assert_eq!(said(104_233), "104,233");
+        assert_eq!(said(1_000_000), "1,000,000");
+        assert_eq!(said(u64::MAX), "18,446,744,073,709,551,615");
+    }
 
     #[test]
     fn blank_text_is_absent_and_the_rest_is_trimmed() {

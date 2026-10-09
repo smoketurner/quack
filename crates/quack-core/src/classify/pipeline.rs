@@ -9,13 +9,10 @@ use futures::StreamExt;
 use super::columns::OutputColumns;
 use super::plan::Plan;
 use super::store::{Ended, PageWrite, Start, Written};
-use super::{
-    Classification, ClassificationOutline, ClassificationPreview, ClassificationRun, ClassifyError,
-    Rows, RunStatus, Waiting,
-};
-use crate::error::{Error, Result};
+use super::{Draft, Error, Outline, Preview, Rows, Run, RunStatus, Waiting};
+use crate::error::{Error as CoreError, Result};
 use crate::ids::RunId;
-use crate::llm::decision::{Answers, Asked, Asker, DecisionModel, State};
+use crate::llm::decision::{Answers, Asker, DecisionModel, RowOutcome, State};
 use crate::progress::{ChunkDone, RunControl};
 use crate::storage::profile::TableProfile;
 use crate::storage::workspace::{QueryResults, WorkspaceDb, quote_ident};
@@ -45,24 +42,24 @@ struct SourceRow {
 
 /// A reader connection: a clone of the writer's, lent to one read at a
 /// time on the blocking pool, each in its own read-only transaction.
-struct Reader(Option<WorkspaceDb>);
+pub(super) struct Reader(Option<WorkspaceDb>);
 
 impl Reader {
-    async fn open(writer: &Writer) -> Result<Self> {
+    pub(super) async fn open(writer: &Writer) -> Result<Self> {
         Ok(Self(Some(writer.run(WorkspaceDb::try_clone_reader).await?)))
     }
 
-    async fn read<T: Send + 'static>(
+    pub(super) async fn read<T: Send + 'static>(
         &mut self,
         f: impl FnOnce(&WorkspaceDb) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let db = self.0.take().ok_or(Error::WriterStopped)?;
+        let db = self.0.take().ok_or(CoreError::WriterStopped)?;
         let (db, outcome) = tokio::task::spawn_blocking(move || {
             let outcome = db.read_only(f);
             (db, outcome)
         })
         .await
-        .map_err(|e| Error::Analysis(format!("the labelling read failed: {e}")))?;
+        .map_err(|e| CoreError::Analysis(format!("the labelling read failed: {e}")))?;
         self.0 = Some(db);
         outcome
     }
@@ -131,6 +128,18 @@ impl Plan {
         self.collect(db, &sql, duckdb::params![])
     }
 
+    /// The first `n` rows a run would label: those the output lacks when
+    /// it adds rows to one, else the first by key.
+    fn read_next(&self, db: &WorkspaceDb, n: u32) -> Result<Vec<SourceRow>> {
+        if self.rows == Rows::Missing && self.output_exists {
+            let mut page = self.read_page(db, self.output.as_str(), None)?;
+            page.truncate(usize::try_from(n).unwrap_or(usize::MAX));
+            Ok(page)
+        } else {
+            self.read_first(db, n)
+        }
+    }
+
     fn collect(
         &self,
         db: &WorkspaceDb,
@@ -141,7 +150,7 @@ impl Plan {
         let mut rows = stmt.query(params)?;
         let mut page = Vec::new();
         while let Some(row) = rows.next()? {
-            page.push(SourceRow::from_row(row, &self.text_columns)?);
+            page.push(SourceRow::from_row(row, &self.set.text_columns)?);
         }
         Ok(page)
     }
@@ -159,6 +168,14 @@ enum Outcome {
     Unfit,
 }
 
+/// The rows of a page answered before the first failure, the failure, if
+/// any, and how long the requests took.
+struct PageAnswers {
+    rows: Vec<Labelled>,
+    stopped: Option<CoreError>,
+    took: Duration,
+}
+
 /// Asks the questions about rows, a few at a time, in order.
 struct PageAsker<'a> {
     asker: Asker<'a>,
@@ -169,7 +186,8 @@ struct PageAsker<'a> {
 impl PageAsker<'_> {
     /// The rows answered before the first failure, and the failure, if
     /// any. A row with no text is not sent.
-    async fn label(&self, rows: Vec<SourceRow>) -> (Vec<Labelled>, Option<Error>) {
+    async fn label(&self, rows: Vec<SourceRow>) -> PageAnswers {
+        let began = Instant::now();
         let ask = |row: SourceRow| async move {
             let state = State::new(row.texts);
             let outcome = if state.is_empty() {
@@ -179,8 +197,8 @@ impl PageAsker<'_> {
                     .or_cancelled(self.asker.ask(&state))
                     .await
                     .map(|asked| match asked {
-                        Asked::Answered(answers) => Outcome::Answered(answers),
-                        Asked::Unfit => Outcome::Unfit,
+                        RowOutcome::Answered(answers) => Outcome::Answered(answers),
+                        RowOutcome::Unfit => Outcome::Unfit,
                     })
             };
             (row.key, outcome)
@@ -192,20 +210,31 @@ impl PageAsker<'_> {
         while let Some((key, outcome)) = results.next().await {
             match outcome {
                 Ok(outcome) => answered.push(Labelled { key, outcome }),
-                Err(error) => return (answered, Some(error)),
+                Err(error) => {
+                    return PageAnswers {
+                        rows: answered,
+                        stopped: Some(error),
+                        took: began.elapsed(),
+                    };
+                }
             }
         }
-        (answered, None)
+        PageAnswers {
+            rows: answered,
+            stopped: None,
+            took: began.elapsed(),
+        }
     }
 }
 
 impl Plan {
     /// The page to write for `labelled`: a row with an answer or no text
     /// is written, a row the model refused is counted.
-    fn page_write(&self, labelled: Vec<Labelled>) -> PageWrite {
+    fn page_write(&self, labelled: Vec<Labelled>, took: Duration) -> PageWrite {
         let mut write = PageWrite {
             rows: Vec::with_capacity(labelled.len()),
             skipped: 0,
+            ask_ms: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
         };
         for Labelled { key, outcome } in labelled {
             match outcome {
@@ -257,8 +286,12 @@ impl Pipeline<'_> {
                 return Ok(());
             };
             let page_started = Instant::now();
-            let (labelled, stopped) = self.labeller.label(page).await;
-            self.write(labelled).await?;
+            let PageAnswers {
+                rows,
+                stopped,
+                took,
+            } = self.labeller.label(page).await;
+            self.write(rows, took).await?;
             self.report(page_started.elapsed());
             if let Some(error) = stopped {
                 return Err(error);
@@ -267,8 +300,8 @@ impl Pipeline<'_> {
         }
     }
 
-    async fn write(&mut self, labelled: Vec<Labelled>) -> Result<()> {
-        let write = self.plan.page_write(labelled);
+    async fn write(&mut self, labelled: Vec<Labelled>, took: Duration) -> Result<()> {
+        let write = self.plan.page_write(labelled, took);
         self.skipped = self.skipped.saturating_add(write.skipped);
         let (plan, run, target) = (
             Arc::clone(&self.plan),
@@ -296,11 +329,50 @@ impl Pipeline<'_> {
     }
 }
 
-/// [`Classification::run`].
-pub(super) async fn run(
-    request: &Classification,
-    labelling: Labelling<'_>,
-) -> Result<ClassificationRun> {
+/// A plan settled against the labels in force: which rows it labels, why,
+/// the weights it ran under, and how long it takes if that is known.
+struct Settled {
+    plan: Plan,
+    digest: String,
+    estimate_seconds: Option<u64>,
+}
+
+impl Settled {
+    /// Settle `plan` for a run that `asked` for some rows: compare the set
+    /// and the model's weights with those the output was labelled under.
+    async fn of(
+        reader: &mut Reader,
+        plan: Plan,
+        decision: &DecisionModel,
+        asked: Rows,
+    ) -> Result<Self> {
+        let digest = decision.digest().await?;
+        let weights = digest.clone();
+        let (plan, row_ms) = reader
+            .read(move |db| {
+                let in_force = if plan.output_exists {
+                    Run::in_force(db, plan.output.as_str())?
+                } else {
+                    None
+                };
+                let because = plan.why_relabel(in_force.as_ref(), &weights, asked);
+                let plan = plan.labelling(db, asked, because)?;
+                let row_ms = Run::row_ms_of(db, &weights, &plan.set.questions)?;
+                Ok((plan, row_ms))
+            })
+            .await?;
+        let estimate_seconds =
+            row_ms.map(|ms| ms.saturating_mul(plan.remaining).saturating_div(1000));
+        Ok(Self {
+            plan,
+            digest,
+            estimate_seconds,
+        })
+    }
+}
+
+/// [`Draft::run`].
+pub(super) async fn run(draft: &Draft, labelling: Labelling<'_>, rows: Rows) -> Result<Run> {
     let Labelling {
         db,
         decision,
@@ -311,19 +383,25 @@ pub(super) async fn run(
     } = labelling;
     let mut reader = Reader::open(db).await?;
     let plan = {
-        let request = request.clone();
-        Arc::new(reader.read(move |db| Plan::resolve(db, &request)).await?)
+        let (table, set) = (draft.table.clone(), draft.set.clone());
+        reader
+            .read(move |db| Plan::resolve(db, &table, &set))
+            .await?
     };
-    let _claim = db
-        .claim(plan.claimed())
-        .ok_or_else(|| ClassifyError::Running {
-            table: plan.output.to_string(),
-        })?;
-    plan.outline().within(waiting)?;
+    let _claim = db.claim(plan.claimed()).ok_or_else(|| Error::Running {
+        table: plan.output.to_string(),
+    })?;
+    let Settled {
+        plan,
+        digest,
+        estimate_seconds,
+    } = Settled::of(&mut reader, plan, decision, rows).await?;
+    plan.outline(estimate_seconds).within(waiting)?;
+    let plan = Arc::new(plan);
     let asker = decision.asker(&plan.set.questions).await?;
-    let digest = decision.digest().await?;
     let (start_plan, start_run) = (Arc::clone(&plan), run_id.clone());
     let (model, started_by) = (decision.label().to_owned(), started_by.map(str::to_owned));
+    let drafted_by = draft.drafted_by_model.clone();
     let claims = db.claims();
     db.run(move |db| {
         Start {
@@ -332,6 +410,7 @@ pub(super) async fn run(
             model: &model,
             digest: &digest,
             started_by: started_by.as_deref(),
+            drafted_by_model: drafted_by.as_deref(),
             claims: &claims,
         }
         .apply(db)
@@ -355,9 +434,9 @@ pub(super) async fn run(
     let outcome = pipeline.drive().await;
     let ended = match &outcome {
         Ok(()) => Ended::Completed,
-        Err(Error::Cancelled) => Ended::Stopped {
+        Err(CoreError::Cancelled) => Ended::Stopped {
             status: RunStatus::Cancelled,
-            error: Error::Cancelled.to_string(),
+            error: CoreError::Cancelled.to_string(),
         },
         Err(other) => Ended::Stopped {
             status: RunStatus::Failed,
@@ -373,102 +452,118 @@ pub(super) async fn run(
     recorded
 }
 
-/// [`Classification::outline`].
+/// [`Draft::outline`].
 pub(super) async fn outline(
-    request: &Classification,
+    draft: &Draft,
     writer: &Writer,
     decision: &DecisionModel,
-) -> Result<ClassificationOutline> {
+    rows: Rows,
+) -> Result<Outline> {
     let mut reader = Reader::open(writer).await?;
-    let request = request.clone();
-    let plan = reader.read(move |db| Plan::resolve(db, &request)).await?;
+    let (table, set) = (draft.table.clone(), draft.set.clone());
+    let plan = reader
+        .read(move |db| Plan::resolve(db, &table, &set))
+        .await?;
     // Not held here: the run takes it. Another run holding it is refused now.
     let free = writer.claim(plan.claimed());
     if free.is_none() {
-        return Err(ClassifyError::Running {
+        return Err(Error::Running {
             table: plan.output.to_string(),
         }
         .into());
     }
     drop(free);
-    if plan.output_exists && plan.rows == Rows::Missing {
-        let digest = decision.digest().await?;
-        let output = plan.output.to_string();
-        let in_force = reader
-            .read(move |db| ClassificationRun::in_force(db, &output))
-            .await?;
-        plan.check_definition(in_force.as_ref(), &digest)?;
-    }
-    Ok(plan.outline())
+    let settled = Settled::of(&mut reader, plan, decision, rows).await?;
+    Ok(settled.plan.outline(settled.estimate_seconds))
 }
 
-/// [`Classification::preview`].
+/// [`Draft::preview`].
 pub(super) async fn preview(
-    request: &Classification,
+    draft: &Draft,
     writer: &Writer,
     decision: &DecisionModel,
     n: u32,
+    rows: Rows,
     waiting: Waiting,
     control: RunControl<'_>,
-) -> Result<ClassificationPreview> {
+) -> Result<Preview> {
     let started = Instant::now();
     let mut reader = Reader::open(writer).await?;
     let plan = {
-        let request = request.clone();
-        Arc::new(reader.read(move |db| Plan::resolve(db, &request)).await?)
+        let (table, set) = (draft.table.clone(), draft.set.clone());
+        reader
+            .read(move |db| Plan::resolve(db, &table, &set))
+            .await?
     };
-    let mut asked = plan.outline();
-    asked.remaining = u64::from(n.clamp(1, PREVIEW_ROWS));
+    let plan = Arc::new(Settled::of(&mut reader, plan, decision, rows).await?.plan);
+    let n = n.clamp(1, PREVIEW_ROWS);
+    let mut asked = plan.outline(None);
+    asked.remaining = u64::from(n);
     asked.within(waiting)?;
     let asker = decision.asker(&plan.set.questions).await?;
-    let rows = {
+    let source_rows = {
         let plan = Arc::clone(&plan);
-        let n = n.clamp(1, PREVIEW_ROWS);
-        reader.read(move |db| plan.read_first(db, n)).await?
+        reader.read(move |db| plan.read_next(db, n)).await?
     };
     let labeller = PageAsker {
         asker,
         control,
         concurrency: decision.concurrency(),
     };
-    let (labelled, stopped) = labeller.label(rows).await;
+    let PageAnswers {
+        rows: labelled,
+        stopped,
+        took,
+    } = labeller.label(source_rows).await;
     if let Some(error) = stopped {
         return Err(error);
     }
     let (mut shown, mut cut, mut empty, mut skipped) = (0_u32, 0_u32, 0_u32, 0_u32);
     let mut table = Vec::with_capacity(labelled.len());
+    let mut compact = Vec::with_capacity(labelled.len());
     for Labelled { key, outcome } in labelled {
-        let cells = match &outcome {
+        let (cells, answers) = match &outcome {
             Outcome::Answered(answers) => {
                 shown = shown.saturating_add(1);
                 if answers.truncated() {
                     cut = cut.saturating_add(1);
                 }
-                plan.columns.cells(Some(answers))
+                (plan.columns.cells(Some(answers)), Some(answers))
             }
             Outcome::Empty => {
                 empty = empty.saturating_add(1);
-                plan.columns.cells(None)
+                (plan.columns.cells(None), None)
             }
             Outcome::Unfit => {
                 skipped = skipped.saturating_add(1);
                 continue;
             }
         };
+        compact.push(
+            OutputColumns::compact_row(&key, answers)
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        );
         table.push(OutputColumns::json_row(&key, cells));
     }
-    Ok(ClassificationPreview {
+    Ok(Preview {
         key_column: plan.key.name.clone(),
         output_table: plan.output.to_string(),
         result: QueryResults {
             columns: plan.columns.column_names(),
             rows: table,
         },
+        compact: QueryResults {
+            columns: plan.columns.compact_header(&plan.set.questions),
+            rows: compact,
+        },
         labelled: shown,
         cut,
         empty,
         skipped,
         took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        ask_ms: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
         remaining: plan.remaining,
     })
 }

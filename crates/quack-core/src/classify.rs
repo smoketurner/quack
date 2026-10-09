@@ -1,24 +1,30 @@
 //! Labelling a table's text with a decision model (issue #472).
 //!
-//! A [`Classification`] names a table, the text columns of its rows, and a
-//! [`QuestionSet`]. A run asks the decision model the questions about every
-//! row and writes the answers to a new table with one row per source row,
+//! A person names a table and says in a sentence what they want to know
+//! about each row. The chat model drafts the questions ([`Draft`]); a person
+//! approves them by starting a run, and the run records them as the labels'
+//! [`LabelSet`]. A run asks the decision model the questions about every row
+//! and writes the answers to a new table with one row per source row,
 //! joined back by the source's key, so a person can `GROUP BY` and filter
 //! on them.
 //!
 //! Rows are read a page at a time by keyset on the key, never by `OFFSET`,
 //! and the answers are written one page per transaction, so a cancel or a
 //! failure keeps every row already labelled. A run labels the rows whose
-//! key the output does not hold yet; [`Rows::All`] labels every row again
-//! into a hidden staging table that replaces the output once it is
-//! complete, so the old labels serve until then. Rows whose text changed
-//! after they were labelled are not relabelled by a plain run.
+//! key the output does not hold yet; a run that labels every row again
+//! writes into a hidden staging table that replaces the output once it is
+//! complete, so the old labels serve until then. A run does that by itself
+//! when the questions, the key, or the model's weights are not those the
+//! labels were made with. Rows whose text changed after they were labelled
+//! are not relabelled by a plain run.
 //!
-//! Each run is recorded in `_quack_classifications` with the definition it
-//! ran under; the definition in force for an output decides whether a later
-//! run may add rows to it.
+//! Each run is recorded in `_quack_classifications` with the set it ran
+//! under; the set in force for an output decides whether a later run adds
+//! rows to it or labels every row again.
 
 mod columns;
+mod draft;
+mod drafting;
 mod pipeline;
 mod plan;
 mod store;
@@ -36,93 +42,27 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+pub use draft::{
+    Draft, DraftAnswer, DraftOption, DraftOrigin, DraftQuestion, KeyReason, LabelSet, QuestionKind,
+};
+pub use drafting::{DraftContext, Drafter, PROMPT as DRAFT_PROMPT, SAMPLE_ROWS};
 pub use pipeline::Labelling;
-pub use store::ClassificationRuns;
 pub(crate) use store::DDL;
+pub use store::Runs;
 
-use crate::error::{Error, Result};
+use crate::error::{Error as CoreError, Result};
 use crate::ids::{DocumentId, RunId, UserId, WorkspaceId};
 use crate::jobs::{JobKind, JobQueue, JobSpec};
-use crate::llm::decision::{DecisionModel, QuestionName, QuestionSetError, Questions};
+use crate::llm::decision::{DecisionModel, Questions};
 use crate::priority::Priority;
 use crate::progress::{ChunkDone, RunControl};
 use crate::storage::control::Outcome;
 use crate::storage::workspace::QueryResults;
 use crate::storage::writer::Writer;
-use crate::text::OneLine;
+use crate::text::{OneLine, Thousands};
 
-/// The most bytes of a question set a request carries: far above what 64
-/// questions of 26 options need, and small enough to read in no time.
-pub const MAX_QUESTION_SET_BYTES: usize = 64 * 1024;
-
-/// Text columns one classification reads.
-const TEXT_COLUMNS: usize = 8;
-
-/// The name of a question set. It becomes part of the output table's name,
-/// so it follows the rule of a question's name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct SetName(QuestionName);
-
-impl SetName {
-    /// The name as written.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-}
-
-impl TryFrom<String> for SetName {
-    type Error = QuestionSetError;
-
-    fn try_from(name: String) -> std::result::Result<Self, Self::Error> {
-        QuestionName::try_from(name).map(Self)
-    }
-}
-
-impl From<SetName> for String {
-    fn from(name: SetName) -> Self {
-        name.0.into()
-    }
-}
-
-impl fmt::Display for SetName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// A named list of decision questions: the JSON file `quack classify
-/// --questions` reads, and the form the REST route and the MCP tool take.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct QuestionSet {
-    #[schema(value_type = String)]
-    #[schemars(with = "String")]
-    pub name: SetName,
-    pub questions: Questions,
-}
-
-impl QuestionSet {
-    /// Read a question set from JSON text: the file `quack classify
-    /// --questions` takes and the Tables page's field.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`QuestionSetError::SetTooLarge`] for text past
-    /// [`MAX_QUESTION_SET_BYTES`], which is refused before it is parsed,
-    /// and [`QuestionSetError::Unreadable`] or the error of the set for
-    /// text that is not a valid set.
-    pub fn parse(text: &str) -> std::result::Result<Self, QuestionSetError> {
-        if text.len() > MAX_QUESTION_SET_BYTES {
-            return Err(QuestionSetError::SetTooLarge {
-                bytes: text.len(),
-                max: MAX_QUESTION_SET_BYTES,
-            });
-        }
-        serde_json::from_str(text).map_err(|e| QuestionSetError::Unreadable(e.to_string()))
-    }
-}
+/// Text columns one set reads.
+pub(crate) const TEXT_COLUMNS: usize = 8;
 
 /// Which rows a run labels.
 #[derive(
@@ -143,20 +83,20 @@ text_enum!(Rows, "rows", {
 });
 text_enum_sql!(Rows);
 
-/// What to label and how: the one request every interface sends.
+/// What to label and how: the request REST and MCP take.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, JsonSchema)]
-pub struct Classification {
+pub struct Request {
     /// The table whose rows are labelled, by its exact name.
     pub table: String,
-    /// The columns whose text the model reads, one to eight.
-    pub text_columns: Vec<String>,
-    /// The column that identifies a row, joining the output back to the
-    /// table. Unset, an `id` column or one ending in `_id` whose values are
-    /// all present and different is used.
+    /// What the person wants to know about each row. The chat model drafts
+    /// questions from it, or revises the last approved ones; the same
+    /// sentence as last time uses the last approved questions.
     #[serde(default)]
-    pub key: Option<String>,
-    /// The questions asked about every row.
-    pub question_set: QuestionSet,
+    pub sentence: Option<String>,
+    /// The questions to ask, as a preview returned them. They win over a
+    /// sentence; with neither, the last approved questions are used.
+    #[serde(default)]
+    pub set: Option<LabelSet>,
     /// Which rows to label; unset, those the output lacks.
     #[serde(default)]
     pub rows: Rows,
@@ -173,57 +113,122 @@ pub enum Waiting {
     Caller { budget: u64 },
 }
 
-/// What a run would do to the output table.
+/// Why a run labels every row again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum RelabelReason {
+    /// The person asked for it.
+    Asked,
+    /// The questions, or the text columns they read, are not those the
+    /// labels were made with.
+    QuestionsChanged,
+    /// The decision model's weights changed (`ollama pull`).
+    ModelChanged,
+    /// The key, or its type, changed.
+    KeyChanged,
+}
+
+impl fmt::Display for RelabelReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Asked => "every row was asked for",
+            Self::QuestionsChanged => "the questions changed",
+            Self::ModelChanged => "the decision model's weights changed (ollama pull)",
+            Self::KeyChanged => "the key changed",
+        })
+    }
+}
+
+/// What a run would do to the output table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Effect {
     /// The output does not exist yet.
     NewTable,
     /// The output exists and the run adds the rows it lacks.
     AddsRows,
     /// The output exists and the run replaces its labels when it completes.
-    ReplacesLabels,
+    ReplacesLabels { because: RelabelReason },
 }
 
 impl fmt::Display for Effect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::NewTable => "new table",
-            Self::AddsRows => "adds rows",
-            Self::ReplacesLabels => "replaces its labels",
-        })
+        match self {
+            Self::NewTable => f.write_str("new table"),
+            Self::AddsRows => f.write_str("adds rows"),
+            Self::ReplacesLabels { because } => {
+                write!(f, "replaces its labels: {because}")
+            }
+        }
+    }
+}
+
+/// How long a run takes, in words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Estimate(pub u64);
+
+impl Estimate {
+    /// The words with a capital first letter, to start a sentence.
+    #[must_use]
+    pub fn sentence(self) -> String {
+        let words = self.to_string();
+        let mut chars = words.chars();
+        chars
+            .next()
+            .map(|first| first.to_uppercase().chain(chars).collect())
+            .unwrap_or_default()
+    }
+}
+
+impl fmt::Display for Estimate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let minutes = self.0.saturating_add(30).saturating_div(60);
+        if self.0 < 45 {
+            f.write_str("under a minute")
+        } else if minutes < 120 {
+            write!(
+                f,
+                "about {} minute{}",
+                minutes.max(1),
+                if minutes.max(1) == 1 { "" } else { "s" }
+            )
+        } else {
+            write!(
+                f,
+                "about {} hours",
+                minutes.saturating_add(30).saturating_div(60)
+            )
+        }
     }
 }
 
 /// What a run would do, worked out before it starts: how much it labels,
 /// where, and with which questions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
-pub struct ClassificationOutline {
+pub struct Outline {
     pub source_table: String,
     pub output_table: String,
     pub key_column: String,
+    pub key_reason: KeyReason,
+    pub text_columns: Vec<String>,
     /// Rows a run would label now.
     pub remaining: u64,
     /// The questions, in order.
-    pub questions: Vec<OutlineQuestion>,
+    pub questions: Vec<DraftQuestion>,
     pub effect: Effect,
+    /// About how long the run takes, from earlier runs of these questions
+    /// or from the preview; none where nothing measured it.
+    pub estimate_seconds: Option<u64>,
 }
 
-/// One question of an outline: its name and what it asks.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
-pub struct OutlineQuestion {
-    pub name: String,
-    pub instructions: String,
-}
-
-impl ClassificationOutline {
+impl Outline {
     /// Whether a caller that `waiting` allows may wait for the run.
     ///
     /// # Errors
     ///
-    /// Returns [`ClassifyError::TooLargeToWait`] when the rows times the
+    /// Returns [`Error::TooLargeToWait`] when the rows times the
     /// questions are more answers than the caller waits for.
-    pub fn within(&self, waiting: Waiting) -> std::result::Result<(), ClassifyError> {
+    pub fn within(&self, waiting: Waiting) -> std::result::Result<(), Error> {
         let Waiting::Caller { budget } = waiting else {
             return Ok(());
         };
@@ -231,7 +236,7 @@ impl ClassificationOutline {
             .remaining
             .saturating_mul(u64::try_from(self.questions.len()).unwrap_or(u64::MAX));
         if answers > budget {
-            return Err(ClassifyError::TooLargeToWait {
+            return Err(Error::TooLargeToWait {
                 source_table: self.source_table.clone(),
                 rows: self.remaining,
                 questions: self.questions.len(),
@@ -251,36 +256,67 @@ impl ClassificationOutline {
             .join(", ")
     }
 
+    /// The estimate in words, when there is one.
+    #[must_use]
+    pub fn estimate(&self) -> Option<Estimate> {
+        self.estimate_seconds.map(Estimate)
+    }
+
+    /// The outline with an estimate worked out from a preview of `rows`
+    /// rows that took `ask_ms` to ask, when nothing measured one before.
+    #[must_use]
+    pub fn estimated_from(mut self, preview: &Preview) -> Self {
+        if self.estimate_seconds.is_none() {
+            self.estimate_seconds = preview.seconds_for(self.remaining);
+        }
+        self
+    }
+
     /// The statement a person is asked to allow: comment lines saying what
-    /// the run does and what each question asks, as the permission prompt
-    /// shows them. Each name and instruction is one line, so text a table
-    /// or a question file supplied cannot add lines of its own.
+    /// the run does, which columns it reads, and what each question asks,
+    /// as the permission prompt shows them. Each name and instruction is
+    /// one line, so text a table or a person supplied cannot add lines of
+    /// its own.
     #[must_use]
     pub fn statement(&self, model: &str) -> String {
-        let mut lines = vec![format!(
-            "-- label {} rows of {} into {} ({}) with {model}",
-            self.remaining,
-            OneLine(&self.source_table),
-            OneLine(&self.output_table),
-            self.effect,
-        )];
-        for question in &self.questions {
-            lines.push(format!(
-                "-- {}: {}",
-                OneLine(&question.name),
-                OneLine(&question.instructions)
-            ));
-        }
+        let estimate = self
+            .estimate()
+            .map(|estimate| format!(", {estimate}"))
+            .unwrap_or_default();
+        let mut lines = vec![
+            format!(
+                "-- label {} rows of {} into {} ({}) with {model}, {} questions{estimate}",
+                Thousands(self.remaining),
+                OneLine(&self.source_table),
+                OneLine(&self.output_table),
+                self.effect,
+                self.questions.len(),
+            ),
+            format!(
+                "-- key {}{}; reads {}",
+                OneLine(&self.key_column),
+                self.key_reason
+                    .note()
+                    .map(|note| format!(" ({note})"))
+                    .unwrap_or_default(),
+                self.text_columns
+                    .iter()
+                    .map(|c| OneLine(c).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ];
+        lines.extend(self.questions.iter().map(DraftQuestion::card_line));
         lines.join("\n")
     }
 }
 
-impl fmt::Display for ClassificationOutline {
+impl fmt::Display for Outline {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{} rows of {} (key {}) into {} ({}); {} questions: {}",
-            self.remaining,
+            Thousands(self.remaining),
             self.source_table,
             self.key_column,
             self.output_table,
@@ -289,18 +325,6 @@ impl fmt::Display for ClassificationOutline {
             self.question_names()
         )
     }
-}
-
-/// The arguments of the agent's `classify_rows` tool and of the MCP
-/// `classify` tool: a labelling, or with `preview` its first rows.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-pub struct ClassifyArgs {
-    /// What to label and how.
-    #[serde(flatten)]
-    pub classification: Classification,
-    /// Label only this many rows (1 to 100) and show them, writing nothing
-    #[serde(default)]
-    pub preview: Option<u32>,
 }
 
 /// A column that identifies a row of the source table.
@@ -331,15 +355,39 @@ impl fmt::Display for KeyCandidate {
 
 /// Why a table's rows cannot be labelled as asked.
 #[derive(Debug, thiserror::Error)]
-pub enum ClassifyError {
+pub enum Error {
     #[error("no table named '{0}'")]
     NoTable(String),
-    #[error("table '{table}' has no column '{column}'")]
-    NoColumn { table: String, column: String },
-    #[error("a classification reads one to {TEXT_COLUMNS} text columns, not {0}")]
+    #[error(
+        "{table} has no questions yet; say what you want to know about each row: quack classify \
+         {table} \"which department should handle each ticket\""
+    )]
+    NoQuestions { table: String },
+    #[error(
+        "drafting questions from a sentence needs a chat model; set [general].chat_model = \
+         \"PROVIDER/MODEL\" (quack init sets one up). A table with approved questions is labelled \
+         again without one: quack classify {table}"
+    )]
+    NoDrafter { table: String },
+    #[error(
+        "{table} has no text column to read (columns of numbers, dates, ids, or mostly empty \
+         values are left out)"
+    )]
+    NoText { table: String },
+    #[error(
+        "the chat model's questions were refused twice ({reason}); say it another way, or name \
+         the answers you want: quack classify {table} \"department: billing, technical, sales, \
+         or other\""
+    )]
+    DraftRefused { table: String, reason: String },
+    #[error(
+        "the questions read {}, which {table} no longer has; say a sentence to draft new \
+         questions",
+        .columns.join(", ")
+    )]
+    SetColumnsGone { table: String, columns: Vec<String> },
+    #[error("a set reads one to {TEXT_COLUMNS} text columns, not {0}")]
     TextColumns(usize),
-    #[error("the text column '{0}' is named twice")]
-    DuplicateColumn(String),
     #[error("{}", NoKey(.table, .unique, .closest))]
     NoKey {
         table: String,
@@ -373,18 +421,8 @@ pub enum ClassifyError {
          to case); rename a question"
     )]
     ColumnClash(String),
-    #[error(
-        "'{table}' exists and is not a table of labels; choose another name for the question set"
-    )]
+    #[error("'{table}' exists and is not a table of labels")]
     OutputTaken { table: String },
-    #[error(
-        "{table} was labelled with other {}; label every row again with --all (\"rows\": \"all\")",
-        .differs.join(" and ")
-    )]
-    DefinitionChanged {
-        table: String,
-        differs: Vec<&'static str>,
-    },
     #[error(
         "{table} is being labelled by another run; wait for it or cancel it (quack jobs, /jobs, or \
          the Jobs page)"
@@ -394,7 +432,8 @@ pub enum ClassifyError {
         "labelling {rows} rows of {source_table} with {questions} questions is too long to wait \
          for here (at most {budget} answers, rows times questions, [decision].interactive_budget); \
          run it as a job with quack classify or POST /api/v1/workspaces/{{id}}/tables/classify, \
-         or preview fewer rows here"
+         or preview fewer rows here. Nothing was labelled, and questions drafted in this call \
+         were not kept"
     )]
     TooLargeToWait {
         source_table: String,
@@ -406,7 +445,7 @@ pub enum ClassifyError {
     ReplaceRefused,
 }
 
-/// The text of [`ClassifyError::NoKey`].
+/// The text of [`Error::NoKey`].
 struct NoKey<'a>(&'a str, &'a [String], &'a [KeyCandidate]);
 
 impl fmt::Display for NoKey<'_> {
@@ -414,13 +453,13 @@ impl fmt::Display for NoKey<'_> {
         let Self(table, unique, closest) = self;
         write!(
             f,
-            "{table} has no id column (named id, or ending in _id or Id) whose values are all \
-             present and all different, so a label cannot be joined back to its row."
+            "{table} has no column whose values are all present and all different (an id, a \
+             number, or short text), so a label cannot be joined back to its row."
         )?;
         if !unique.is_empty() {
             write!(
                 f,
-                " Unique columns that could serve: {}.",
+                " Unique columns of a type that cannot be a key: {}.",
                 unique.join(", ")
             )?;
         }
@@ -430,8 +469,8 @@ impl fmt::Display for NoKey<'_> {
         }
         write!(
             f,
-            " Choose the key (--key on the command line), or add one: CREATE TABLE {table}_keyed \
-             AS SELECT row_number() OVER () AS row_id, * FROM {table}"
+            " Add one: CREATE TABLE {table}_keyed AS SELECT row_number() OVER () AS row_id, * \
+             FROM {table}"
         )
     }
 }
@@ -459,9 +498,10 @@ text_enum!(RunStatus, "classification status", {
 });
 text_enum_sql!(RunStatus);
 
-/// One run of a [`Classification`], as `_quack_classifications` records it.
+/// One run, as `_quack_classifications` records it. The set it ran under
+/// is the approval: the newest run for a table is the last approved set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
-pub struct ClassificationRun {
+pub struct Run {
     pub id: RunId,
     /// The table of labels.
     pub output_table: String,
@@ -472,9 +512,14 @@ pub struct ClassificationRun {
     /// The key's `DuckDB` type when the run began: an output labelled under
     /// another type is labelled again, not added to.
     pub key_type: String,
+    pub key_reason: KeyReason,
     pub text_columns: Vec<String>,
-    pub question_set: QuestionSet,
-    /// The model, as `provider/model`.
+    pub questions: Questions,
+    /// What the person asked for, when the questions came from a sentence.
+    pub sentence: Option<String>,
+    /// The chat model that drafted the questions, when one did.
+    pub drafted_by_model: Option<String>,
+    /// The decision model, as `provider/model`.
     pub model: String,
     /// The digest of the model's weights when the run began.
     pub model_digest: String,
@@ -491,12 +536,14 @@ pub struct ClassificationRun {
     /// Rows the model refused at every length, not written; the next run
     /// tries them again.
     pub skipped: u64,
+    /// Milliseconds spent on the requests to the decision model.
+    pub ask_ms: u64,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub error: Option<String>,
 }
 
-impl fmt::Display for ClassificationRun {
+impl fmt::Display for Run {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             output_table,
@@ -516,8 +563,11 @@ impl fmt::Display for ClassificationRun {
         }
         write!(
             f,
-            "{labelled} rows labelled, {cut} cut to fit the model, {empty} empty, {skipped} \
-             skipped"
+            "{} rows labelled, {} cut to fit the model, {} empty, {} skipped",
+            Thousands(*labelled),
+            Thousands(*cut),
+            Thousands(*empty),
+            Thousands(*skipped)
         )?;
         if *skipped > 0 {
             f.write_str(
@@ -530,56 +580,90 @@ impl fmt::Display for ClassificationRun {
 
 /// The first rows of a run, labelled and not written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
-pub struct ClassificationPreview {
+pub struct Preview {
     pub key_column: String,
     pub output_table: String,
+    /// The rows as the table of labels would hold them.
     pub result: QueryResults,
+    /// The same rows as a screen shows them: a choice as `label (p)`, a
+    /// score as its level, a yes/no as its probability, and a `*` after the
+    /// key of a row whose text was cut.
+    pub compact: QueryResults,
     pub labelled: u32,
     pub cut: u32,
     pub empty: u32,
     pub skipped: u32,
     pub took_ms: u64,
+    /// Milliseconds spent on the requests to the decision model alone.
+    pub ask_ms: u64,
     /// Rows a run would label now.
     pub remaining: u64,
 }
 
-impl fmt::Display for ClassificationPreview {
+impl Preview {
+    /// About how many seconds `rows` rows take, at the rate this preview
+    /// asked its own; none when it asked nothing.
+    #[must_use]
+    pub fn seconds_for(&self, rows: u64) -> Option<u64> {
+        let asked = u64::from(self.labelled).saturating_add(u64::from(self.skipped));
+        let per_row_ms = self.ask_ms.checked_div(asked)?;
+        Some(per_row_ms.saturating_mul(rows).saturating_div(1000))
+    }
+}
+
+impl fmt::Display for Preview {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let took = Duration::from_millis(self.took_ms);
         write!(
             f,
-            "{} rows labelled in {:.1} s; {} cut to fit the model, {} empty, {} skipped. Run \
-             without --preview to label {} rows.",
+            "{} rows in {:.1} s; {} cut to fit the model, {} empty, {} skipped.",
             self.labelled.saturating_add(self.empty),
             took.as_secs_f64(),
             self.cut,
             self.empty,
             self.skipped,
-            self.remaining
         )
     }
 }
 
-impl ClassificationRun {
+impl Run {
     /// What each column of the output means, the key first: the sentences
     /// `describe_table` gives the agent and the Tables page.
     #[must_use]
     pub fn column_meanings(&self) -> Vec<(String, String)> {
-        columns::OutputColumns::new(
-            &self.source_table,
-            &self.key_column,
-            &self.question_set.questions,
-        )
-        .map(|columns| columns.meanings())
-        .unwrap_or_default()
+        columns::OutputColumns::new(&self.source_table, &self.key_column, &self.questions)
+            .map(|columns| columns.meanings())
+            .unwrap_or_default()
     }
+
+    /// The set this run ran under.
+    #[must_use]
+    pub fn label_set(&self) -> LabelSet {
+        LabelSet {
+            key_column: self.key_column.clone(),
+            key_reason: self.key_reason,
+            text_columns: self.text_columns.clone(),
+            questions: self.questions.clone(),
+            sentence: self.sentence.clone(),
+        }
+    }
+}
+
+/// What a draft, its outline, and what came of it look like together: the
+/// one answer REST, MCP, and the agent give.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub struct Report {
+    pub draft: Draft,
+    pub outline: Outline,
+    pub preview: Option<Preview>,
+    pub run: Option<Run>,
 }
 
 /// How a run that started ended, as an interface audits it.
 #[derive(Debug, Clone)]
 pub struct RunEnded {
     /// The run, as `_quack_classifications` holds it after the end.
-    pub run: ClassificationRun,
+    pub run: Run,
     /// `Allowed` when the run completed, and why not otherwise.
     pub outcome: Outcome,
 }
@@ -601,12 +685,12 @@ impl OnEnd {
 
     /// Report how the run `id` ended with `result`. A run that never began
     /// (its request was refused) has no record, and nothing to report.
-    async fn report(&self, db: &Writer, id: &RunId, result: &Result<ClassificationRun>) {
+    async fn report(&self, db: &Writer, id: &RunId, result: &Result<Run>) {
         let run = if let Ok(run) = result {
             Some(run.clone())
         } else {
             let id = id.clone();
-            db.run(move |db| ClassificationRun::get(db, &id)).await.ok()
+            db.run(move |db| Run::get(db, &id)).await.ok()
         };
         let Some(run) = run else {
             return;
@@ -655,7 +739,7 @@ impl LabelJobs {
 }
 
 /// A run for a caller that waits (an agent turn, an MCP call).
-pub struct Tracked {
+pub struct LabellingJob {
     /// The workspace's writer.
     pub db: Arc<Writer>,
     /// The model that labels.
@@ -673,13 +757,14 @@ pub struct Tracked {
     pub jobs: LabelJobs,
 }
 
-impl Tracked {
-    /// Submit the run of `request` and wait for its result.
+impl LabellingJob {
+    /// Submit the run of `draft` and wait for its result.
     async fn submit(
         self,
-        request: Classification,
+        draft: Draft,
+        rows: Rows,
         progress: impl Fn(ChunkDone) + Send + Sync + 'static,
-    ) -> Result<ClassificationRun> {
+    ) -> Result<Run> {
         let Self {
             db,
             decision,
@@ -694,7 +779,7 @@ impl Tracked {
             workspace,
             on_end,
         } = jobs;
-        let label = format!("label {} by {}", request.table, request.question_set.name);
+        let label = format!("label {}", draft.table);
         let mut spec = JobSpec::new(JobKind::Classify, label).owner(started_by.clone());
         if let Some(workspace) = workspace {
             spec = spec.workspace(workspace);
@@ -711,17 +796,20 @@ impl Tracked {
                 Waiting::Caller { .. } => Priority::Interactive,
                 Waiting::Job => Priority::current(),
             };
-            let mut run = Box::pin(priority.scope(request.run(Labelling {
-                db: &db,
-                decision: &decision,
-                started_by: started_by_text.as_deref(),
-                run_id: run_id.clone(),
-                waiting,
-                control: RunControl {
-                    progress: &report,
-                    cancel: Some(&run_cancel),
+            let mut run = Box::pin(priority.scope(draft.run(
+                Labelling {
+                    db: &db,
+                    decision: &decision,
+                    started_by: started_by_text.as_deref(),
+                    run_id: run_id.clone(),
+                    waiting,
+                    control: RunControl {
+                        progress: &report,
+                        cancel: Some(&run_cancel),
+                    },
                 },
-            })));
+                rows,
+            )));
             let result = loop {
                 tokio::select! {
                     result = &mut run => break result,
@@ -741,14 +829,14 @@ impl Tracked {
             summary
         });
         receiver.await.map_err(|_| {
-            Error::Analysis(String::from(
+            CoreError::Analysis(String::from(
                 "the labelling job did not run to its end (the server is stopping)",
             ))
         })?
     }
 }
 
-impl Classification {
+impl Draft {
     /// [`Self::run`] as a job of the queue, awaited by the caller. If the
     /// caller is dropped (a cancelled turn, an MCP client that left) the job
     /// goes on to its end and records it, and the queue's shutdown waits
@@ -756,59 +844,65 @@ impl Classification {
     ///
     /// # Errors
     ///
-    /// As [`Self::run`], or [`Error::Analysis`] when the job did not run to
+    /// As [`Self::run`], or [`CoreError::Analysis`] when the job did not run to
     /// its end (the queue was shutting down).
     pub async fn run_as_job(
         self,
-        tracked: Tracked,
+        tracked: LabellingJob,
+        rows: Rows,
         progress: impl Fn(ChunkDone) + Send + Sync + 'static,
-    ) -> Result<ClassificationRun> {
-        tracked.submit(self, progress).await
+    ) -> Result<Run> {
+        tracked.submit(self, rows, progress).await
     }
 
-    /// What a run would do, without doing it: the checks of a run, even
-    /// that of the definition an existing output was labelled under, and
-    /// its row count, read from the workspace.
+    /// What a run would do, without doing it: the checks of a run and its
+    /// row count, read from the workspace.
     ///
     /// # Errors
     ///
-    /// Returns a [`ClassifyError`] when the request cannot be carried out,
-    /// or the error of the model's server asked for its weights' digest.
+    /// Returns a [`Error`] when the set cannot be run, or the error
+    /// of the model's server asked for its weights' digest.
     pub async fn outline(
         &self,
         writer: &Writer,
         decision: &DecisionModel,
-    ) -> Result<ClassificationOutline> {
-        pipeline::outline(self, writer, decision).await
+        rows: Rows,
+    ) -> Result<Outline> {
+        pipeline::outline(self, writer, decision, rows).await
     }
 
     /// Label the first `n` rows (1 to 100) by key and return them, writing
-    /// nothing: no table, no record, no claim.
+    /// nothing: no table, no record, no claim. With `Rows::Missing` they
+    /// are the first rows the output lacks.
     ///
     /// # Errors
     ///
-    /// Returns a [`ClassifyError`] when the request cannot be carried out,
+    /// Returns a [`Error`] when the set cannot be run,
     /// [`crate::error::Error::DecisionRefused`] when the model refuses the
-    /// question set, or the model's or the database's error.
+    /// questions, or the model's or the database's error.
     pub async fn preview(
         &self,
         writer: &Writer,
         decision: &DecisionModel,
         n: u32,
+        rows: Rows,
         waiting: Waiting,
         control: RunControl<'_>,
-    ) -> Result<ClassificationPreview> {
-        pipeline::preview(self, writer, decision, n, waiting, control).await
+    ) -> Result<Preview> {
+        Box::pin(pipeline::preview(
+            self, writer, decision, n, rows, waiting, control,
+        ))
+        .await
     }
 
-    /// Label the table's rows.
+    /// Label the table's rows, recording this draft's set as approved.
     ///
     /// # Errors
     ///
-    /// Returns a [`ClassifyError`] when the request cannot be carried out,
+    /// Returns a [`Error`] when the set cannot be run,
     /// [`crate::error::Error::Cancelled`] after a cancel, or the model's or
     /// the database's error. The rows labelled before a stop stay.
-    pub async fn run(&self, labelling: Labelling<'_>) -> Result<ClassificationRun> {
-        pipeline::run(self, labelling).await
+    pub async fn run(&self, labelling: Labelling<'_>, rows: Rows) -> Result<Run> {
+        Box::pin(pipeline::run(self, labelling, rows)).await
     }
 }

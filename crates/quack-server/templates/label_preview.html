@@ -1,0 +1,9 @@
+<h3 class="text-sm font-semibold uppercase text-slate-400">Preview</h3>
+<div class="mt-1 overflow-x-auto rounded border border-slate-800 bg-slate-900">
+  <table class="min-w-full text-sm">
+    <thead><tr class="border-b border-slate-700 text-left">{% for c in columns %}<th scope="col" class="px-3 py-2 font-mono whitespace-nowrap">{{ c }}</th>{% endfor %}</tr></thead>
+    <tbody>{% for r in rows %}<tr class="border-b border-slate-800">{% for v in r %}<td class="px-3 py-1"><div class="max-w-xs truncate" title="{{ v }}">{{ v }}</div></td>{% endfor %}</tr>{% endfor %}</tbody>
+  </table>
+</div>
+<p class="mt-1 text-xs text-slate-400">{{ summary }}</p>
+{% if let Some(note) = relabel %}<p class="mt-1 text-xs text-slate-300">{{ note }}</p>{% endif %}

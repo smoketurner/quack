@@ -4,7 +4,7 @@
 
 use duckdb::types::Value;
 
-use super::ClassifyError;
+use super::Error;
 use crate::llm::decision::{Answer, Answers, Question, QuestionName, Questions};
 use crate::storage::workspace::quote_ident;
 use crate::text::OneLine;
@@ -47,14 +47,10 @@ impl OutputColumns {
     ///
     /// # Errors
     ///
-    /// Returns [`ClassifyError::ColumnClash`] when two columns are named
+    /// Returns [`Error::ColumnClash`] when two columns are named
     /// alike, without regard to case: the key, a question's, a derived
     /// `_p`, `_confidence`, or `_level`, or `truncated`.
-    pub(super) fn new(
-        source: &str,
-        key: &str,
-        questions: &Questions,
-    ) -> Result<Self, ClassifyError> {
+    pub(super) fn new(source: &str, key: &str, questions: &Questions) -> Result<Self, Error> {
         let mut labels = Vec::new();
         for (name, question) in questions.iter() {
             labels.extend(Self::of_question(name, question));
@@ -73,12 +69,12 @@ impl OutputColumns {
         Ok(columns)
     }
 
-    fn check_distinct(&self) -> Result<(), ClassifyError> {
+    fn check_distinct(&self) -> Result<(), Error> {
         let mut seen: Vec<String> = Vec::new();
         for name in self.names() {
             let lower = name.to_ascii_lowercase();
             if seen.contains(&lower) {
-                return Err(ClassifyError::ColumnClash(name.to_owned()));
+                return Err(Error::ColumnClash(name.to_owned()));
             }
             seen.push(lower);
         }
@@ -194,6 +190,41 @@ impl OutputColumns {
                 }
             }))
             .collect()
+    }
+
+    /// The header of a preview as a screen shows it: the key, then each
+    /// question's name, a choice's with `(p)` after it.
+    pub(super) fn compact_header(&self, questions: &Questions) -> Vec<String> {
+        std::iter::once(self.key.clone())
+            .chain(questions.iter().map(|(name, question)| match question {
+                Question::Choice { .. } => format!("{name} (p)"),
+                Question::Noul { .. } | Question::Score { .. } => name.to_string(),
+            }))
+            .collect()
+    }
+
+    /// A row of the preview as a screen shows it: a choice as `label (p)`, a
+    /// score as its level, a yes/no as its probability of yes, and a `*`
+    /// after the key of a row whose text was cut.
+    pub(super) fn compact_row(key: &str, answers: Option<&Answers>) -> Vec<String> {
+        let cut = answers.is_some_and(Answers::truncated);
+        let mut row = vec![if cut {
+            format!("{key}*")
+        } else {
+            key.to_owned()
+        }];
+        if let Some(answers) = answers {
+            row.extend(answers.iter().map(|(_, answer)| match answer {
+                Answer::Choice {
+                    choice,
+                    probability,
+                    ..
+                } => format!("{choice} ({probability:.2})"),
+                Answer::Noul { probability } => format!("{probability:.2}"),
+                Answer::Score { score, .. } => format!("{score:.2}"),
+            }));
+        }
+        row
     }
 
     /// The values to insert for `answers` after the key, in column order;

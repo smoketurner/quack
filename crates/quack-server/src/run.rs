@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quack_core::analysis::tools::SharedDb;
-use quack_core::classify::ClassificationRun;
+use quack_core::classify;
 use quack_core::embedding::refresh;
 use quack_core::graph::extract;
 use quack_core::graph::follow_up::{FollowUp, FollowUpSummary};
@@ -36,7 +36,12 @@ pub(crate) struct RunKind {
     action: AuditAction,
     resource: ResourceKind,
     label: &'static str,
+    /// What the closing row says of a run cancelled before it started.
+    unstarted: &'static str,
 }
+
+/// What the closing row says of a run cancelled before it started.
+const UNSTARTED: &str = "cancelled before it started";
 
 impl RunKind {
     pub(crate) const EMBEDDINGS: Self = Self {
@@ -44,12 +49,14 @@ impl RunKind {
         action: AuditAction::EmbeddingsRefresh,
         resource: ResourceKind::EmbeddingsRun,
         label: "embeddings refresh",
+        unstarted: UNSTARTED,
     };
     pub(crate) const GRAPH: Self = Self {
         job: JobKind::Graph,
         action: AuditAction::GraphExtract,
         resource: ResourceKind::GraphRun,
         label: "graph extraction",
+        unstarted: UNSTARTED,
     };
     /// The extraction that follows an ingest under `[graph].follow_ingest`.
     pub(crate) const FOLLOW_UP: Self = Self {
@@ -57,6 +64,7 @@ impl RunKind {
         action: AuditAction::GraphExtract,
         resource: ResourceKind::GraphRun,
         label: "graph follow-up",
+        unstarted: UNSTARTED,
     };
     /// A saved import run again (`POST .../imports/{id}/refresh`).
     pub(crate) const IMPORT_REFRESH: Self = Self {
@@ -64,6 +72,7 @@ impl RunKind {
         action: AuditAction::Import,
         resource: ResourceKind::SavedImport,
         label: "import refresh",
+        unstarted: UNSTARTED,
     };
     /// A table's text labelled by the decision model.
     pub(crate) const CLASSIFY: Self = Self {
@@ -71,12 +80,14 @@ impl RunKind {
         action: AuditAction::Classify,
         resource: ResourceKind::ClassificationRun,
         label: "classify",
+        unstarted: "cancelled before it started; the questions were not kept",
     };
     pub(crate) const ONTOLOGY: Self = Self {
         job: JobKind::Ontology,
         action: AuditAction::Propose,
         resource: ResourceKind::InductionRun,
         label: "ontology document pass",
+        unstarted: UNSTARTED,
     };
 }
 
@@ -113,7 +124,7 @@ impl RunReport for ImportSummary {
     }
 }
 
-impl RunReport for ClassificationRun {
+impl RunReport for classify::Run {
     fn detail(&self) -> Value {
         serde_json::json!({ "summary": self })
     }
@@ -224,6 +235,7 @@ impl BackgroundRun {
             )));
         let jobs = self.app.jobs.clone();
         let unstarted = self.clone();
+        let unstarted_note = self.kind.unstarted;
         let id = jobs.submit(spec, move |ctx| async move {
             let result = work(ctx).await;
             match result {
@@ -251,7 +263,7 @@ impl BackgroundRun {
                 unstarted
                     .finish(
                         Outcome::Error,
-                        serde_json::json!({ "finished": true, "error": "cancelled before it started" }),
+                        serde_json::json!({ "finished": true, "error": unstarted_note }),
                     )
                     .await;
             }

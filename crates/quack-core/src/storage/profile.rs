@@ -11,7 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::classify::ClassificationRun;
+use crate::classify;
 use crate::error::{Error, Result};
 use crate::storage::workspace::{INTERNAL_PREFIX, WorkspaceDb, quote_ident};
 use crate::storage::writer::Writer;
@@ -86,6 +86,25 @@ impl ColumnKind {
         } else {
             Self::Other
         }
+    }
+}
+
+impl ColumnKind {
+    /// Whether `duckdb_type` holds whole numbers.
+    #[must_use]
+    pub fn is_integer(duckdb_type: &str) -> bool {
+        const INTEGERS: [&str; 9] = [
+            "TINYINT",
+            "SMALLINT",
+            "INTEGER",
+            "BIGINT",
+            "HUGEINT",
+            "UTINYINT",
+            "USMALLINT",
+            "UINTEGER",
+            "UBIGINT",
+        ];
+        INTEGERS.contains(&duckdb_type.trim().to_ascii_uppercase().as_str())
     }
 }
 
@@ -289,7 +308,7 @@ impl Retype<'_> {
                 self.table, self.column
             )));
         }
-        if let Some(labels) = ClassificationRun::in_force(db, self.table)?
+        if let Some(labels) = classify::Run::in_force(db, self.table)?
             && labels.key_column.eq_ignore_ascii_case(self.column)
         {
             return Err(Error::Analysis(format!(
@@ -704,6 +723,28 @@ impl TableProfile {
             );
         }
         Ok(out)
+    }
+
+    /// The columns a decision model can read, in table order: text that is
+    /// at least half present, holds at least two different values, does not
+    /// read as numbers or dates, and is neither the key nor named like an
+    /// id.
+    #[must_use]
+    pub fn text_candidates(&self, key: &str) -> Vec<&ColumnProfile> {
+        let rows = self.row_count;
+        self.columns
+            .iter()
+            .filter(|c| {
+                c.kind() == ColumnKind::Text
+                    && rows > 0
+                    && c.non_null.saturating_mul(2) >= rows
+                    && c.distinct >= 2
+                    && c.number_share < MISTYPED_SHARE
+                    && c.date_share < MISTYPED_SHARE
+                    && !c.name.eq_ignore_ascii_case(key)
+                    && !Self::is_id_name(&c.name)
+            })
+            .collect()
     }
 
     #[must_use]

@@ -55,18 +55,20 @@ impl Fault {
 
 type Rule = dyn Fn(&Seen) -> Option<Fault> + Send + Sync;
 
-/// The reply to a state longer than `limit` characters, as Ollama words it.
-#[must_use]
-pub fn too_long(seen: &Seen, limit: usize) -> Option<Fault> {
-    (seen.chars > limit).then(|| {
-        Fault::new(
-            400,
-            &format!(
-                "question 0: state has {} tokens; limit is {limit} with this question",
-                seen.chars
-            ),
-        )
-    })
+impl Seen {
+    /// The reply to a state longer than `limit` characters, as Ollama words it.
+    #[must_use]
+    pub fn too_long(&self, limit: usize) -> Option<Fault> {
+        (self.chars > limit).then(|| {
+            Fault::new(
+                400,
+                &format!(
+                    "question 0: state has {} tokens; limit is {limit} with this question",
+                    self.chars
+                ),
+            )
+        })
+    }
 }
 
 /// The server; it stops when dropped.
@@ -98,7 +100,7 @@ impl DecisionStub {
 
     /// A stub that refuses a state longer than `limit` characters with a 400.
     pub async fn limited(limit: usize) -> Self {
-        Self::with_rule(move |seen| too_long(seen, limit)).await
+        Self::with_rule(move |seen| seen.too_long(limit)).await
     }
 
     /// A stub that replies `rule`'s fault to a request, or answers it.
@@ -206,54 +208,59 @@ async fn systemone(State(shared): State<Shared>, body: String) -> (StatusCode, J
     }
     (
         StatusCode::OK,
-        Json(json!({"model": "laya", "answers": answers(&seen)})),
+        Json(json!({"model": "laya", "answers": seen.answers()})),
     )
 }
 
-fn answers(seen: &Seen) -> Value {
-    let mut out = serde_json::Map::new();
-    let questions = seen.questions.as_object().cloned().unwrap_or_default();
-    let lower = seen.text.to_lowercase();
-    for (name, question) in questions {
-        let criteria = question.get("criteria").cloned().unwrap_or(Value::Null);
-        let answer = match question.get("type").and_then(Value::as_str) {
-            Some("choice") => {
-                let options: Vec<String> = criteria
-                    .as_object()
-                    .map(|o| o.keys().cloned().collect())
-                    .unwrap_or_default();
-                let chosen = options
-                    .iter()
-                    .find(|o| lower.contains(&o.to_lowercase()))
-                    .or_else(|| options.last())
-                    .cloned()
-                    .unwrap_or_default();
-                let mut probabilities = serde_json::Map::new();
-                for option in &options {
-                    let p = if *option == chosen { 0.9 } else { 0.1 };
-                    probabilities.insert(option.clone(), json!(p));
-                }
-                json!({"type": "choice", "choice": chosen,
+impl Seen {
+    /// The stub's answer to every question: the option the text names (else
+    /// the last), a level per exclamation mark, a yes when the text says
+    /// cancel.
+    fn answers(&self) -> Value {
+        let mut out = serde_json::Map::new();
+        let questions = self.questions.as_object().cloned().unwrap_or_default();
+        let lower = self.text.to_lowercase();
+        for (name, question) in questions {
+            let criteria = question.get("criteria").cloned().unwrap_or(Value::Null);
+            let answer = match question.get("type").and_then(Value::as_str) {
+                Some("choice") => {
+                    let options: Vec<String> = criteria
+                        .as_object()
+                        .map(|o| o.keys().cloned().collect())
+                        .unwrap_or_default();
+                    let chosen = options
+                        .iter()
+                        .find(|o| lower.contains(&o.to_lowercase()))
+                        .or_else(|| options.last())
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut probabilities = serde_json::Map::new();
+                    for option in &options {
+                        let p = if *option == chosen { 0.9 } else { 0.1 };
+                        probabilities.insert(option.clone(), json!(p));
+                    }
+                    json!({"type": "choice", "choice": chosen,
                        "probabilities": probabilities, "confidence": 0.8})
-            }
-            Some("score") => {
-                let levels = criteria.as_array().map_or(0, Vec::len);
-                let exclaimed = seen.text.matches('!').count();
-                let level = exclaimed.min(levels.saturating_sub(1));
-                let mut probabilities = serde_json::Map::new();
-                for at in 0..levels {
-                    let p = if at == level { 0.8 } else { 0.05 };
-                    probabilities.insert(at.to_string(), json!(p));
                 }
-                json!({"type": "score", "score": f64::from(u32::try_from(level).unwrap_or(0)),
+                Some("score") => {
+                    let levels = criteria.as_array().map_or(0, Vec::len);
+                    let exclaimed = self.text.matches('!').count();
+                    let level = exclaimed.min(levels.saturating_sub(1));
+                    let mut probabilities = serde_json::Map::new();
+                    for at in 0..levels {
+                        let p = if at == level { 0.8 } else { 0.05 };
+                        probabilities.insert(at.to_string(), json!(p));
+                    }
+                    json!({"type": "score", "score": f64::from(u32::try_from(level).unwrap_or(0)),
                        "probabilities": probabilities, "confidence": 0.7})
-            }
-            _ => {
-                let p = if lower.contains("cancel") { 0.9 } else { 0.1 };
-                json!({"type": "noul", "noul": p})
-            }
-        };
-        out.insert(name, answer);
+                }
+                _ => {
+                    let p = if lower.contains("cancel") { 0.9 } else { 0.1 };
+                    json!({"type": "noul", "noul": p})
+                }
+            };
+            out.insert(name, answer);
+        }
+        Value::Object(out)
     }
-    Value::Object(out)
 }

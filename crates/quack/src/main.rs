@@ -1288,7 +1288,7 @@ impl WriterCommand for ClassifyCommand {
         out: &mut impl Write,
         control: RunControl<'_>,
     ) -> Result<()> {
-        self.run(config, db, out, control).await
+        self.run(config, db, Confirm::Ask, out, control).await
     }
 }
 

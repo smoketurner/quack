@@ -1,72 +1,51 @@
-//! The Tables page's "Label rows" form and "Labelled by" block (issue
-//! #472): a decision model labels a table's text into a new table, from
-//! the same `Access` methods the API uses.
+//! The Tables page's "Label rows" section and "Labelled by" block (issue
+//! #472): a person says what they want to know about each row, the chat
+//! model drafts the questions into an editor, a preview shows the labels
+//! of the first rows, and Label rows starts the run with the questions as
+//! edited. All of it goes through the same `Access` methods the API uses.
 
+use std::collections::HashMap;
+
+use askama::Template;
 use axum::Form;
 use axum::extract::{Path, State};
+use axum::http::HeaderValue;
 use axum::response::{IntoResponse, Response};
 use quack_core::classify::{
-    Classification, ClassificationPreview, ClassificationRun, QuestionSet, Rows,
+    self, Draft, DraftOrigin, DraftQuestion, Effect, KeyReason, LabelSet, QuestionKind, Rows,
 };
 use quack_core::ids::WorkspaceId;
-use quack_core::llm::decision::DecisionModel;
-use quack_core::storage::profile::TableProfile;
+use quack_core::ingestion::TableName;
+use quack_core::llm::decision::{DecisionModel, Questions};
 use quack_core::storage::workspace::Cell;
-use serde::Deserialize;
+use quack_core::text::Thousands;
 
 use super::flash::Flash;
-use super::{TableView, TablesPage, WebResult, WebUser};
+use super::{WebResult, WebUser};
 use crate::auth::{Access, Need};
 use crate::state::App;
 
-/// What the form offers when no run has used the table yet: the questions
-/// of the issue's support-ticket example.
-const EXAMPLE_SET: &str = r#"{
-  "name": "ticket_triage",
-  "questions": {
-    "department": {
-      "type": "choice",
-      "instructions": "Which department should handle this ticket?",
-      "criteria": {
-        "billing": "Invoices, payments, refunds",
-        "technical": "Bugs, outages",
-        "sales": "Pricing, contracts",
-        "none": null
-      }
-    },
-    "urgency": {
-      "type": "score",
-      "instructions": "How urgent is this ticket?",
-      "criteria": ["Not urgent", "Soon", "Blocking or deadline"]
-    },
-    "churn_risk": {
-      "type": "noul",
-      "instructions": "Does the customer threaten to cancel?"
-    }
-  }
-}"#;
+/// Rows the Preview button labels.
+const PREVIEW_ROWS: u32 = 10;
+/// Question rows the editor reads back; more are ignored.
+const MOST_ROWS: usize = 16;
 
-/// Rows the form previews unless it says otherwise.
-const PREVIEW_ROWS: u32 = 20;
-/// The most rows a preview labels.
-const MOST_PREVIEW_ROWS: u32 = 100;
-
-/// Whether the form is offered: the workspace has a decision model its
-/// provider list allows. A setting that cannot be used hides the form and
-/// is logged, not raised on a page about something else.
-pub(super) async fn offered(app: &App) -> bool {
+/// The decision model's name when the form is offered: the workspace has a
+/// decision model its provider list allows. A setting that cannot be used
+/// hides the form and is logged, not raised on a page about something else.
+pub(super) async fn offered(app: &App) -> Option<String> {
     match DecisionModel::offered(&app.config).await {
-        Ok(model) => model.is_some(),
+        Ok(model) => model.map(|model| model.label().to_owned()),
         Err(e) => {
             tracing::warn!(error = %e, "the Label rows form is not offered");
-            false
+            None
         }
     }
 }
 
 /// The run a labels table was made by, as the page says it.
 pub(super) struct LabelledView {
-    pub set: String,
+    pub sentence: Option<String>,
     pub source: String,
     pub key: String,
     pub model: String,
@@ -76,214 +55,379 @@ pub(super) struct LabelledView {
 }
 
 impl LabelledView {
-    pub(super) fn of(run: &ClassificationRun) -> Self {
+    pub(super) fn of(run: &classify::Run) -> Self {
         Self {
-            set: run.question_set.name.to_string(),
+            sentence: run.sentence.clone(),
             source: run.source_table.clone(),
             key: run.key_column.clone(),
             model: run.model.clone(),
             status: run.status.to_string(),
             counts: format!(
                 "{} labelled, {} cut to fit the model, {} empty, {} skipped",
-                run.labelled, run.cut, run.empty, run.skipped
+                Thousands(run.labelled),
+                Thousands(run.cut),
+                Thousands(run.empty),
+                Thousands(run.skipped)
             ),
             started_at: run.started_at.clone(),
         }
     }
 }
 
-/// The fields of the "Label rows" form.
-#[derive(Clone)]
-pub(super) struct LabelForm {
-    pub text: String,
-    pub key: String,
-    pub questions: String,
-    pub preview_rows: String,
-    pub all: bool,
+/// One question as the editor shows it.
+struct QuestionRow {
+    name: String,
+    /// `choice`, `noul`, or `score`: the value of the select.
+    kind: &'static str,
+    ask: String,
+    lines: String,
 }
 
-impl LabelForm {
-    /// What the form holds for `table`: its text columns, its id column,
-    /// and the questions the newest run on it used, or the example.
-    pub(super) fn for_table(
-        table: &TableView,
-        profile: Option<&TableProfile>,
-        runs: &[ClassificationRun],
-    ) -> Self {
-        let text = table
-            .columns
-            .iter()
-            .filter(|c| c.kind == "VARCHAR")
-            .map(|c| c.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let key = profile
-            .and_then(TableProfile::key_column)
-            .filter(|name| TableProfile::is_id_name(name))
-            .unwrap_or_default()
-            .to_owned();
-        let questions = runs
-            .iter()
-            .find(|run| run.source_table == table.name)
-            .and_then(|run| serde_json::to_string_pretty(&run.question_set).ok())
-            .unwrap_or_else(|| String::from(EXAMPLE_SET));
+impl QuestionRow {
+    fn of(question: &DraftQuestion) -> Self {
         Self {
-            text,
-            key,
-            questions,
-            preview_rows: PREVIEW_ROWS.to_string(),
-            all: false,
+            name: question.name.clone(),
+            kind: question.kind.as_str(),
+            ask: question.instructions.clone(),
+            lines: question.to_lines(),
         }
     }
 
-    /// The rows to preview: 1 to 100, or the default when the field is
-    /// empty.
-    fn preview_count(&self) -> Result<u32, String> {
-        let text = self.preview_rows.trim();
-        if text.is_empty() {
-            return Ok(PREVIEW_ROWS);
+    fn blank() -> Self {
+        Self {
+            name: String::new(),
+            kind: QuestionKind::Choice.as_str(),
+            ask: String::new(),
+            lines: String::new(),
         }
-        text.parse::<u32>()
-            .ok()
-            .filter(|rows| (1..=MOST_PREVIEW_ROWS).contains(rows))
-            .ok_or_else(|| {
-                format!(
-                    "rows to preview is a whole number from 1 to {MOST_PREVIEW_ROWS}, not '{text}'"
-                )
-            })
     }
+}
 
-    /// The request the form makes of `table`.
-    fn classification(&self, table: &str) -> Result<Classification, String> {
-        let question_set = QuestionSet::parse(&self.questions).map_err(|e| e.to_string())?;
-        let key = self.key.trim();
-        Ok(Classification {
+/// The "Label rows" section of a selected table.
+#[derive(Template)]
+#[template(path = "label_section.html")]
+pub(super) struct LabelSection {
+    ws_id: String,
+    table: String,
+    output: String,
+    model: String,
+    sentence: String,
+    /// The editor, rendered.
+    editor: Option<String>,
+}
+
+impl LabelSection {
+    /// The section for `table`, with the editor filled from the questions
+    /// last approved for it, when there are any.
+    ///
+    /// # Errors
+    ///
+    /// Returns the template's error.
+    pub(super) fn of(
+        ws_id: &WorkspaceId,
+        table: &str,
+        model: String,
+        approved: Option<&Draft>,
+    ) -> Result<Self, askama::Error> {
+        let editor = approved
+            .map(|draft| LabelEditor::of(ws_id, draft, true).render())
+            .transpose()?;
+        Ok(Self {
+            ws_id: ws_id.to_string(),
             table: table.to_owned(),
-            text_columns: self
-                .text
-                .split(',')
-                .map(str::trim)
-                .filter(|c| !c.is_empty())
-                .map(str::to_owned)
-                .collect(),
-            key: (!key.is_empty()).then(|| key.to_owned()),
-            question_set,
-            rows: if self.all { Rows::All } else { Rows::Missing },
+            output: approved.map_or_else(
+                || TableName::sanitized(&format!("{table}_labels")).to_string(),
+                |draft| draft.output_table.clone(),
+            ),
+            model,
+            sentence: approved
+                .and_then(|draft| draft.set.sentence.clone())
+                .unwrap_or_default(),
+            editor,
         })
     }
 }
 
-/// A preview's rows, as the page shows them.
-pub(super) struct PreviewView {
-    pub key: String,
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<String>>,
-    pub summary: String,
+/// The editor: the questions of a draft, one row each, and a blank row.
+#[derive(Template)]
+#[template(path = "label_editor.html")]
+struct LabelEditor {
+    ws_id: String,
+    table: String,
+    key: String,
+    text: String,
+    sentence: String,
+    /// Where the questions came from.
+    note: String,
+    rows: Vec<QuestionRow>,
+    /// The line under the rows: what is read, the key, the table's size.
+    reads: String,
+    /// Whether the table of labels exists, so every row can be labelled
+    /// again.
+    can_relabel: bool,
 }
 
-impl PreviewView {
-    fn of(preview: &ClassificationPreview) -> Self {
+impl LabelEditor {
+    fn of(ws_id: &WorkspaceId, draft: &Draft, approved: bool) -> Self {
+        let mut rows: Vec<QuestionRow> = draft
+            .set
+            .questions
+            .iter()
+            .map(|(name, question)| QuestionRow::of(&DraftQuestion::of(name, question)))
+            .collect();
+        rows.push(QuestionRow::blank());
+        let note = match draft.origin {
+            DraftOrigin::Drafted => format!(
+                "Questions drafted from {} sample rows. Edit them, then preview.",
+                draft.sample_rows
+            ),
+            DraftOrigin::Revised => format!(
+                "Questions revised from {} sample rows. Edit them, then preview.",
+                draft.sample_rows
+            ),
+            DraftOrigin::Reused | DraftOrigin::Given => {
+                String::from("The questions approved before. Edit them, then preview.")
+            }
+        };
+        let gone = if draft.columns_gone.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " The table no longer has {}; draft new questions.",
+                draft.columns_gone.join(", ")
+            )
+        };
+        let key_note = draft
+            .set
+            .key_reason
+            .note()
+            .map(|note| format!(" ({note})"))
+            .unwrap_or_default();
         Self {
-            key: preview.key_column.clone(),
-            columns: preview.result.columns.clone(),
+            ws_id: ws_id.to_string(),
+            table: draft.table.clone(),
+            key: draft.set.key_column.clone(),
+            text: draft.set.text_columns.join(", "),
+            sentence: draft.set.sentence.clone().unwrap_or_default(),
+            note: format!("{note}{gone}"),
+            reads: format!(
+                "Reads {} · key {}{key_note} · {} rows · {} questions. A row without a name is \
+                 left out.",
+                draft.set.columns_in_words(),
+                draft.set.key_column,
+                Thousands(draft.rows),
+                draft.set.questions.count()
+            ),
+            rows,
+            can_relabel: approved,
+        }
+    }
+}
+
+/// A preview's rows, as the page shows them.
+#[derive(Template)]
+#[template(path = "label_preview.html")]
+struct LabelPreview {
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+    summary: String,
+    /// Why every row is labelled again, when the run would.
+    relabel: Option<String>,
+}
+
+impl LabelPreview {
+    fn of(report: &classify::Report, preview: &classify::Preview) -> Self {
+        let outline = &report.outline;
+        let labelling = match (outline.effect, outline.estimate()) {
+            (Effect::AddsRows, Some(estimate)) => format!(
+                " Labelling {} new rows takes {estimate}.",
+                Thousands(outline.remaining)
+            ),
+            (_, Some(estimate)) => format!(
+                " Labelling all {} rows takes {estimate}.",
+                Thousands(outline.remaining)
+            ),
+            (_, None) => String::new(),
+        };
+        Self {
+            columns: preview.compact.columns.clone(),
             rows: preview
-                .result
+                .compact
                 .rows
                 .iter()
                 .map(|row| row.iter().map(|value| Cell(value).text()).collect())
                 .collect(),
-            summary: preview.to_string(),
+            summary: format!("{preview}{labelling}"),
+            relabel: match outline.effect {
+                Effect::ReplacesLabels { because } => Some(format!(
+                    "Labels every row again: {because}. The current labels serve until then."
+                )),
+                Effect::NewTable | Effect::AddsRows => None,
+            },
         }
     }
 }
 
-/// The form as the page shows it again after a preview: the values typed
-/// and the preview below them.
-pub(super) struct Labelling {
-    pub form: LabelForm,
-    pub preview: Option<PreviewView>,
+/// A message in place of a fragment, shown where the section keeps its
+/// status.
+#[derive(Template)]
+#[template(path = "label_status.html")]
+struct LabelStatus {
+    message: String,
 }
 
-/// The submitted "Label rows" form: the table, its fields, and which
-/// button was pressed.
-#[derive(Deserialize)]
-pub(super) struct LabelSubmission {
-    name: String,
-    #[serde(default)]
-    text: String,
-    #[serde(default)]
-    key: String,
-    #[serde(default)]
-    questions: String,
-    #[serde(default)]
-    preview_rows: String,
-    #[serde(default)]
-    all: Option<String>,
-    action: String,
-}
-
-impl LabelSubmission {
-    fn form(&self) -> LabelForm {
-        LabelForm {
-            text: self.text.clone(),
-            key: self.key.clone(),
-            questions: self.questions.clone(),
-            preview_rows: self.preview_rows.clone(),
-            all: self.all.is_some(),
-        }
+impl LabelStatus {
+    /// The status area instead of the fragment's own target: the editor the
+    /// person is working in stays, and this says why it did not change.
+    fn refused(message: String) -> WebResult<Response> {
+        let mut response = super::html(&Self { message })?;
+        let headers = response.headers_mut();
+        headers.insert("HX-Retarget", HeaderValue::from_static("#label-status"));
+        headers.insert("HX-Reswap", HeaderValue::from_static("innerHTML"));
+        Ok(response)
     }
 }
 
-/// `POST /w/{id}/tables/classify`: preview the labels on the page, or start
-/// the run as a job.
-pub(super) async fn table_classify(
+/// The fields the section's forms post.
+struct LabelForm(HashMap<String, String>);
+
+impl LabelForm {
+    /// One field, trimmed; empty when absent.
+    fn field(&self, name: &str) -> &str {
+        self.0.get(name).map_or("", |value| value.trim())
+    }
+
+    /// The questions the editor's rows hold, a row without a name left out.
+    fn questions(&self) -> Result<Questions, String> {
+        let mut pairs = Vec::new();
+        for at in 0..MOST_ROWS {
+            let name = self.field(&format!("n{at}_name"));
+            if name.is_empty() {
+                continue;
+            }
+            let spelled = self.field(&format!("n{at}_kind"));
+            let Some(kind) = QuestionKind::parse(spelled) else {
+                return Err(format!("'{spelled}' is not a kind of question"));
+            };
+            let question = DraftQuestion::from_lines(
+                name,
+                kind,
+                self.field(&format!("n{at}_ask")),
+                self.0
+                    .get(&format!("n{at}_opts"))
+                    .map_or("", String::as_str),
+            );
+            pairs.push(question.into_question().map_err(|e| e.to_string())?);
+        }
+        Questions::new(pairs).map_err(|e| e.to_string())
+    }
+
+    /// The request a posted editor makes: the questions as edited, the key
+    /// and the text columns that rode along, and every row again when asked.
+    fn request(&self) -> Result<classify::Request, String> {
+        let questions = self.questions()?;
+        let sentence = self.field("sentence");
+        Ok(classify::Request {
+            table: self.field("table").to_owned(),
+            sentence: None,
+            set: Some(LabelSet {
+                key_column: self.field("key").to_owned(),
+                key_reason: KeyReason::default(),
+                text_columns: self
+                    .field("text")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                questions,
+                sentence: (!sentence.is_empty()).then(|| sentence.to_owned()),
+            }),
+            rows: if self.0.contains_key("all") {
+                Rows::All
+            } else {
+                Rows::Missing
+            },
+        })
+    }
+}
+
+/// `POST /w/{id}/tables/label/draft`: the chat model's questions for a
+/// sentence, or the approved ones revised, as the editor.
+pub(super) async fn draft(
     State(app): State<App>,
     WebUser(identity): WebUser,
     Path(id): Path<WorkspaceId>,
-    Form(submitted): Form<LabelSubmission>,
+    Form(form): Form<HashMap<String, String>>,
 ) -> WebResult<Response> {
-    let previewing = submitted.action == "preview";
-    let need = if previewing { Need::READ } else { Need::WRITE };
-    let access = Access::resolve(&app, identity, &id, need).await?;
-    let back = format!("/w/{id}/tables");
-    let form = submitted.form();
-    let request = match form.classification(&submitted.name) {
-        Ok(request) => request,
-        Err(message) => {
-            return Ok(Flash::error(back, message)
-                .opening(submitted.name)
-                .into_response());
-        }
-    };
-    if previewing {
-        let outcome = match form.preview_count() {
-            Ok(rows) => access
-                .preview_classification(&app, &request, rows)
-                .await
-                .map_err(|e| e.message),
-            Err(message) => Err(message),
-        };
-        let (error, preview) = match outcome {
-            Ok(preview) => (None, Some(PreviewView::of(&preview))),
-            Err(message) => (Some(message), None),
-        };
-        return TablesPage::render(
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let form = LabelForm(form);
+    let sentence = form.field("sentence");
+    let drafted = access
+        .draft_questions(
             &app,
-            access.identity.clone(),
-            &id,
-            Some(submitted.name),
-            (error, None),
-            Some(Labelling { form, preview }),
+            form.field("table"),
+            (!sentence.is_empty()).then_some(sentence),
         )
         .await;
+    match drafted {
+        Ok(draft) => super::html(&LabelEditor::of(&id, &draft, draft.approved_at.is_some())),
+        Err(e) => LabelStatus::refused(e.message),
     }
-    let table = submitted.name;
+}
+
+/// `POST /w/{id}/tables/label/preview`: the labels of the first rows under
+/// the questions as edited.
+pub(super) async fn preview(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    let form = LabelForm(form);
+    let request = match form.request() {
+        Ok(request) => request,
+        Err(message) => return LabelStatus::refused(message),
+    };
+    match access
+        .preview_classification(&app, &request, PREVIEW_ROWS)
+        .await
+    {
+        Ok(report) => match &report.preview {
+            Some(preview) => super::html(&LabelPreview::of(&report, preview)),
+            None => LabelStatus::refused(String::from("the preview came back empty")),
+        },
+        Err(e) => LabelStatus::refused(e.message),
+    }
+}
+
+/// `POST /w/{id}/tables/label/run`: start the run with the questions as
+/// edited; they become the table's approved questions.
+pub(super) async fn run(
+    State(app): State<App>,
+    WebUser(identity): WebUser,
+    Path(id): Path<WorkspaceId>,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult<Response> {
+    let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
+    let form = LabelForm(form);
+    let back = format!("/w/{id}/tables");
+    let table = form.field("table").to_owned();
+    let request = match form.request() {
+        Ok(request) => request,
+        Err(message) => {
+            return Ok(Flash::error(back, message).opening(table).into_response());
+        }
+    };
     Ok(match access.classify(&app, request).await {
         Ok(started) => Flash::notice(
             back,
             format!(
                 "Labelling {} rows of {} as job {}; the job strip shows its progress.",
-                started.outline.remaining, started.outline.source_table, started.job
+                Thousands(started.outline.remaining),
+                started.outline.source_table,
+                started.job
             ),
         ),
         Err(e) => Flash::error(back, e.message),
