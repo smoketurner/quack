@@ -26,7 +26,8 @@ use quack_core::okf::{self, Bundle};
 use quack_core::ontology::OntologyVersion;
 use quack_core::ontology::store::Revision;
 use quack_core::storage::workspace::{
-    ChunkSearchResult, DocumentFields, DocumentFilter, DocumentInfo, DocumentSource, Pinning,
+    ChunkSearchResult, DocumentFields, DocumentFilter, DocumentInfo, DocumentListing, DocumentPage,
+    DocumentSource, Pinning, Shown,
 };
 use utoipa::ToSchema;
 
@@ -45,6 +46,10 @@ pub(crate) struct ListFilter {
     /// Written on or before this date.
     until: Option<jiff::civil::Date>,
     author: Option<String>,
+    /// The `next` of the page before; leave it out for the newest.
+    after: Option<DocumentId>,
+    /// Documents a page holds: 100 unless given, at most 500.
+    limit: Option<u32>,
 }
 
 impl ListFilter {
@@ -55,6 +60,16 @@ impl ListFilter {
             .filter(|item| !item.is_empty())
             .map(str::to_owned)
             .collect()
+    }
+
+    /// The page it asks for.
+    fn listing(&self) -> ApiResult<DocumentListing> {
+        Ok(DocumentListing {
+            shown: Shown::Live,
+            filter: self.filter()?,
+            after: self.after.clone(),
+            limit: self.limit.unwrap_or(DocumentListing::PAGE),
+        })
     }
 
     /// The filter it asks for.
@@ -78,35 +93,27 @@ impl ListFilter {
     }
 }
 
-/// The workspace's live documents.
-#[derive(Serialize, ToSchema)]
-pub(crate) struct DocumentList {
-    pub documents: Vec<DocumentInfo>,
-}
-
-/// The live documents, narrowed by the filter.
+/// One page of the live documents, newest first, narrowed by the filter.
 #[utoipa::path(
     get,
     path = "/workspaces/{id}/documents",
     tag = "documents",
     params(WorkspaceId, ListFilter),
-    responses((status = 200, description = "The documents", body = DocumentList)),
+    responses((status = 200, description = "One page of the documents", body = DocumentPage)),
 )]
 pub(crate) async fn list(
     State(app): State<App>,
     identity: Identity,
     Path(id): Path<WorkspaceId>,
     Query(q): Query<ListFilter>,
-) -> ApiResult<Json<DocumentList>> {
+) -> ApiResult<Json<DocumentPage>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
-    let filter = q.filter()?;
+    let listing = q.listing()?;
     access
         .audit_read(&app, AuditAction::List, "documents")
         .await?;
-    let docs = app
-        .read(&id, move |db| db.list_documents_matching(&filter))
-        .await?;
-    Ok(Json(DocumentList { documents: docs }))
+    let page = app.read(&id, move |db| db.documents(&listing)).await?;
+    Ok(Json(page))
 }
 
 /// One document, superseded or not.

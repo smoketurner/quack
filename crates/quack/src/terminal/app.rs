@@ -44,7 +44,7 @@ use quack_core::prefix::PrefixMatch;
 use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
-use quack_core::storage::control::{ControlPlane, ResourceKind};
+use quack_core::storage::control::ControlPlane;
 use quack_core::storage::input_history;
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{
@@ -52,7 +52,7 @@ use quack_core::storage::sessions::{
     Transcript,
 };
 use quack_core::storage::workspace::{
-    Pinning, QueryCanceller, QueryResults, SqlSchema, StatementKind, WorkspaceDb,
+    DocumentListing, Pinning, QueryCanceller, QueryResults, SqlSchema, StatementKind, WorkspaceDb,
 };
 use quack_core::text::OneLine;
 use quack_core::vault::Vault;
@@ -788,10 +788,6 @@ impl CliJob {
 
     /// A file as a table or tables, or as chunks.
     async fn ingest(env: &JobEnv, path: &Path, control: RunControl<'_>) -> Result<String> {
-        let read = path.to_owned();
-        let data = tokio::task::spawn_blocking(move || std::fs::read(read))
-            .await?
-            .map_err(|e| anyhow!("failed to read {}: {e}", path.display()))?;
         let filename = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -802,7 +798,7 @@ impl CliJob {
             &env.config,
             &env.db,
             env.workspace_id.as_str(),
-            &NewFile::new(&filename, &data).control(control),
+            &NewFile::at_path(&filename, path).control(control),
             embedding_model.as_ref(),
         )
         .await
@@ -2511,10 +2507,7 @@ impl App {
     fn delete_document(&mut self, prefix: String) {
         self.on_db_ok(
             Side::Read,
-            move |db| {
-                PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
-                    .one(ResourceKind::Document, &prefix)
-            },
+            move |db| db.document_by_id_prefix(&prefix),
             |app, doc| {
                 app.prompts.push_back(Prompt::Delete(Deletion::Document {
                     id: doc.id,
@@ -2674,13 +2667,14 @@ impl App {
     }
 
     fn show_documents(&mut self) {
-        self.on_db_ok(Side::Read, WorkspaceDb::list_documents, |app, docs| {
-            if docs.is_empty() {
+        let read = |db: &WorkspaceDb| db.documents(&DocumentListing::default());
+        self.on_db_ok(Side::Read, read, |app, page| {
+            if page.documents.is_empty() {
                 app.note(MessageKind::System, "No documents yet.");
                 return;
             }
             let mut text = String::from("Documents:");
-            for doc in docs {
+            for doc in &page.documents {
                 let pages = doc
                     .pages
                     .and_then(PageCounts::note)
@@ -2698,6 +2692,14 @@ impl App {
                 );
                 text.push_str(&line);
             }
+            if page.next.is_some() {
+                let more = format!(
+                    "\nThe newest {} of {}; `quack docs` lists them all.",
+                    page.documents.len(),
+                    page.total
+                );
+                text.push_str(&more);
+            }
             text.push_str("\nUse /pin ID or /unpin ID.");
             app.note(MessageKind::System, text);
         });
@@ -2707,8 +2709,7 @@ impl App {
         self.on_db_ok(
             Side::Write,
             move |db| {
-                let doc = PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
-                    .one(ResourceKind::Document, &prefix)?;
+                let doc = db.document_by_id_prefix(&prefix)?;
                 db.set_document_pinning(&doc.id, pinning).map(|()| doc.id)
             },
             move |app, id| {

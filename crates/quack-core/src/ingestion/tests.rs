@@ -103,3 +103,20 @@ fn reserved_table_names_are_refused() {
         );
     }
 }
+
+/// A file streamed through the hash gives the size and digest its bytes
+/// give in memory, across buffer boundaries and when it is empty.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test")]
+fn a_streamed_hash_matches_the_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let past_buffer = (0..Measured::BUFFER * 2 + 7)
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect::<Vec<u8>>();
+    for bytes in [Vec::new(), b"a,b\n1,2\n".to_vec(), past_buffer] {
+        let path = dir.path().join("f");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Measured::of_file(&path).unwrap(), Measured::of(&bytes));
+    }
+    assert!(Measured::of_file(&dir.path().join("missing")).is_err());
+}

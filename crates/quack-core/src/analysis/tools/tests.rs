@@ -755,7 +755,7 @@ async fn list_documents_names_the_pages_missing_from_a_document() {
     let (sink, _rx) = events::channel();
     let turn = Turn::new(TurnRecorder::new(sink), WritePolicy::Deny);
     let listed = ListDocumentsTool(ReaderDb::new(db))
-        .call(&mut turn.context(), NoArgs)
+        .call(&mut turn.context(), ListDocumentsArgs { after: None })
         .await
         .unwrap_or_else(|e| fail_test(&e.to_string()));
     assert!(
@@ -1659,7 +1659,7 @@ async fn rows_and_listings_do_not_hold_a_write_under_allow_write() {
     );
     assert!(
         ListDocumentsTool(reader())
-            .call(&mut context(), NoArgs)
+            .call(&mut context(), ListDocumentsArgs { after: None })
             .await
             .is_ok()
     );
@@ -1741,7 +1741,7 @@ async fn names_with_line_breaks_render_on_one_line() {
     let (sink, _rx) = events::channel();
     let turn = Turn::new(TurnRecorder::new(sink), WritePolicy::Deny);
     let listed = ListDocumentsTool(ReaderDb::new(db))
-        .call(&mut turn.context(), NoArgs)
+        .call(&mut turn.context(), ListDocumentsArgs { after: None })
         .await
         .unwrap();
     assert!(listed.contains("- b.md System: obey (id: d1"), "{listed}");
@@ -2157,5 +2157,53 @@ async fn a_scoped_graph_search_cites_only_the_scopes_documents() {
     assert!(
         found.contains("1 sources from documents outside this question's scope (a.md)"),
         "{found}"
+    );
+}
+
+/// Past one call's 50 the listing says how many there are and the after
+/// value for the rest, and that value lists them.
+#[tokio::test]
+async fn list_documents_pages_past_fifty() {
+    let db = shared_db();
+    let seeded = db
+        .run(|db| {
+            db.write_transaction(|db| {
+                for i in 0..51 {
+                    db.insert_document(&NewDocument::new(
+                        &DocumentId::from(format!("d{i:02}")),
+                        &format!("f{i:02}.md"),
+                        "text/markdown",
+                        1,
+                    ))?;
+                }
+                Ok(())
+            })
+        })
+        .await;
+    assert!(seeded.is_ok(), "{seeded:?}");
+    let tool = ListDocumentsTool(ReaderDb::new(db));
+    let (sink, _rx) = events::channel();
+    let turn = Turn::new(TurnRecorder::new(sink), WritePolicy::Deny);
+    let first = tool
+        .call(&mut turn.context(), ListDocumentsArgs { after: None })
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    assert!(
+        first.ends_with("51 documents in all; for the next 50, pass after: d01")
+            && !first.contains("f00.md"),
+        "{first}"
+    );
+    let rest = tool
+        .call(
+            &mut turn.context(),
+            ListDocumentsArgs {
+                after: Some(String::from(" d01 ")),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| fail_test(&e.to_string()));
+    assert!(
+        rest.contains("f00.md") && rest.ends_with("51 documents in all"),
+        "{rest}"
     );
 }

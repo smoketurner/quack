@@ -28,7 +28,7 @@ use crate::saved;
 use crate::storage::control::ResourceKind;
 use crate::storage::input_history;
 use crate::storage::profile::{self, ColumnType, ColumnWarning, TableNote, TableProfile};
-use crate::text::OneLine;
+use crate::text::{OneLine, Tokens};
 
 mod terms;
 
@@ -801,11 +801,20 @@ impl Vectors {
     }
 }
 
-/// A pinned document with its full text, chunks joined in order.
+/// A pinned document and its text, if the text fit the budget.
 #[derive(Debug, Clone)]
 pub struct PinnedDocument {
     pub document: DocumentInfo,
-    pub text: String,
+    pub text: PinnedText,
+}
+
+/// What a pinned document brings to the prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinnedText {
+    /// Its full text, chunks joined in order.
+    Included(String),
+    /// Nothing: its text would pass the budget, so it was never read.
+    OverBudget,
 }
 
 /// Whether a document is sent to the model in full on every turn.
@@ -1831,9 +1840,8 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the query fails.
     pub fn document_by_sha256(&self, sha256: &str) -> Result<Option<DocumentInfo>> {
-        let sql = format!(
-            "{DOCUMENT_SELECT} WHERE sha256 = ? AND {LIVE_STATUS} ORDER BY ingested_at, id LIMIT 1"
-        );
+        let sql =
+            format!("{DOCUMENT_SELECT} WHERE sha256 = ? AND {LIVE_STATUS} ORDER BY id LIMIT 1");
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![sha256])?;
         match rows.next()? {
@@ -1851,7 +1859,7 @@ impl WorkspaceDb {
     pub fn table_owner(&self, table: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
             "{DOCUMENT_SELECT} WHERE {LIVE_STATUS} AND tables IS NOT NULL \
-             AND list_contains(CAST(tables AS VARCHAR[]), ?) ORDER BY ingested_at, id LIMIT 1"
+             AND list_contains(CAST(tables AS VARCHAR[]), ?) ORDER BY id LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![table])?;
@@ -1870,7 +1878,7 @@ impl WorkspaceDb {
     pub fn newest_document_named(&self, filename: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
             "{DOCUMENT_SELECT} WHERE filename = ? AND status = ? \
-             ORDER BY ingested_at DESC, id DESC LIMIT 1"
+             ORDER BY id DESC LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![filename, DocumentStatus::Ready])?;
@@ -1895,7 +1903,7 @@ impl WorkspaceDb {
     ) -> Result<Option<DocumentInfo>> {
         let sql = format!(
             "{DOCUMENT_SELECT} WHERE source_root = ? AND source_path = ? AND status = ? \
-             ORDER BY ingested_at DESC, id DESC LIMIT 1"
+             ORDER BY id DESC LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![
@@ -1934,7 +1942,7 @@ impl WorkspaceDb {
     pub fn documents_under(&self, source_root: &str) -> Result<Vec<DocumentInfo>> {
         let sql = format!(
             "{DOCUMENT_SELECT} WHERE source_root = ? AND source_path IS NOT NULL AND status = ? \
-             ORDER BY source_path, ingested_at DESC, id DESC"
+             ORDER BY source_path, id DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let docs = stmt.query_map(duckdb::params![source_root, DocumentStatus::Ready], |row| {
@@ -3040,7 +3048,7 @@ impl WorkspaceDb {
         }
         let sql = format!(
             "WITH pool AS ( \
-                 SELECT c.id, c.document_id, c.chunk_index, d.ingested_at, d.id AS doc, \
+                 SELECT c.id, c.document_id, c.chunk_index, \
                         row_number() OVER (PARTITION BY c.document_id ORDER BY c.chunk_index) - 1 AS pos, \
                         count(*) OVER (PARTITION BY c.document_id) AS len \
                  FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
@@ -3054,10 +3062,9 @@ impl WorkspaceDb {
              SELECT id FROM placed \
              WHERE (pos * take + len - 1) // len < take \
                AND (((pos * take + len - 1) // len) * len) // take = pos \
-             ORDER BY {order}, chunk_index \
+             ORDER BY document_id, chunk_index \
              LIMIT ?",
             filter = pool.filter(),
-            order = pool.document_order(),
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let ids = stmt.query_map(
@@ -3162,28 +3169,45 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    /// Full text of every pinned document, in chunk order.
+    /// Every live pinned document, newest first, with its full text while
+    /// the texts fit `budget` in that order. The size of each text is
+    /// summed in SQL first, so a pinned text past the budget is never read.
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn pinned_documents(&self) -> Result<Vec<PinnedDocument>> {
-        let mut out = Vec::new();
-        for doc in self
-            .list_documents()?
-            .into_iter()
-            .filter(|d| d.pinning == Pinning::Pinned)
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT content FROM _quack_chunks WHERE document_id = ? ORDER BY chunk_index",
+    pub fn pinned_documents(&self, budget: Tokens) -> Result<Vec<PinnedDocument>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} AND COALESCE(pinned, false) \
+             ORDER BY id DESC"
+        ))?;
+        let documents = stmt
+            .query_map([], |row| DocumentInfo::try_from(row))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        let mut used = Tokens::default();
+        let mut out = Vec::with_capacity(documents.len());
+        for document in documents {
+            // The chunks joined by line breaks, as `Tokens::estimate` counts them.
+            let bytes: u64 = self.conn.query_row(
+                "SELECT COALESCE(sum(strlen(content)) + count(*) - 1, 0) \
+                 FROM _quack_chunks WHERE document_id = ?",
+                duckdb::params![document.id],
+                |row| row.get(0),
             )?;
-            let parts = stmt
-                .query_map(duckdb::params![doc.id], |row| row.get::<_, String>(0))?
-                .collect::<duckdb::Result<Vec<_>>>()?;
-            out.push(PinnedDocument {
-                document: doc,
-                text: parts.join("\n"),
-            });
+            let cost = Tokens::of_chars(usize::try_from(bytes).unwrap_or(usize::MAX));
+            let text = if used.saturating_add(cost) > budget {
+                PinnedText::OverBudget
+            } else {
+                used = used.saturating_add(cost);
+                let mut stmt = self.conn.prepare(
+                    "SELECT content FROM _quack_chunks WHERE document_id = ? ORDER BY chunk_index",
+                )?;
+                let parts = stmt
+                    .query_map(duckdb::params![document.id], |row| row.get::<_, String>(0))?
+                    .collect::<duckdb::Result<Vec<_>>>()?;
+                PinnedText::Included(parts.join("\n"))
+            };
+            out.push(PinnedDocument { document, text });
         }
         Ok(out)
     }
@@ -3684,9 +3708,7 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the query fails.
     pub fn recent_documents(&self, limit: usize) -> Result<(Vec<DocumentInfo>, usize)> {
-        let sql = format!(
-            "{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} ORDER BY ingested_at DESC, id DESC LIMIT ?"
-        );
+        let sql = format!("{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} ORDER BY id DESC LIMIT ?");
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(&sql)?;
         let docs = stmt
@@ -3700,54 +3722,159 @@ impl WorkspaceDb {
         Ok((docs, usize::try_from(total).unwrap_or(usize::MAX)))
     }
 
-    /// Every document with its status, newest first, failed ones with
-    /// their reason: what the workspace holds now. A replaced document is
-    /// left out ([`Self::list_all_documents`] has it).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the query fails.
-    pub fn list_documents(&self) -> Result<Vec<DocumentInfo>> {
-        let sql =
-            format!("{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} ORDER BY ingested_at DESC, id DESC");
-        let mut stmt = self.conn.prepare(&sql)?;
-        let docs = stmt.query_map([], |row| DocumentInfo::try_from(row))?;
-        Ok(docs.collect::<duckdb::Result<_>>()?)
-    }
-
-    /// The documents [`Self::list_documents`] lists that `filter` lets
-    /// through.
+    /// One page of the documents `listing` asks for, newest first, failed
+    /// ones with their reason, and how many there are across every page.
+    /// A page holds at most [`DocumentListing::MAX_PAGE`] rows, so a
+    /// listing costs the same in a workspace of any size.
     ///
     /// # Errors
     ///
     /// An unknown file type, `since` after `until`, or a failed query.
-    pub fn list_documents_matching(&self, filter: &DocumentFilter) -> Result<Vec<DocumentInfo>> {
-        let clause = filter.clause()?;
-        let sql = format!(
-            "{DOCUMENT_SELECT} d WHERE {NOT_SUPERSEDED}{} ORDER BY ingested_at DESC, id DESC",
-            clause.sql
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
+    pub fn documents(&self, listing: &DocumentListing) -> Result<DocumentPage> {
+        let clause = listing.filter.clause()?;
+        let shown = listing.shown.condition();
         let mut params: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(clause.params.len());
         for param in &clause.params {
             params.push(param);
         }
-        let docs = stmt.query_map(params.as_slice(), |row| DocumentInfo::try_from(row))?;
-        Ok(docs.collect::<duckdb::Result<_>>()?)
+        let total: u64 = self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM _quack_documents d WHERE {shown}{}",
+                clause.sql
+            ),
+            params.as_slice(),
+            |row| row.get(0),
+        )?;
+        let mut sql = format!("{DOCUMENT_SELECT} d WHERE {shown}{}", clause.sql);
+        if let Some(after) = &listing.after {
+            sql.push_str(" AND d.id < ?");
+            params.push(after);
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        let limit = listing.limit.clamp(1, DocumentListing::MAX_PAGE);
+        let fetch = i64::from(limit).saturating_add(1);
+        params.push(&fetch);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut documents = stmt
+            .query_map(params.as_slice(), |row| DocumentInfo::try_from(row))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        let more = documents.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+        documents.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        let next = if more {
+            documents.last().map(|d| d.id.clone())
+        } else {
+            None
+        };
+        Ok(DocumentPage {
+            documents,
+            next,
+            total,
+        })
     }
 
-    /// Every document row, replaced ones included, newest first: the
-    /// listing behind `quack docs --all` and the Documents page's
-    /// "show replaced" view.
+    /// The live document a person or the model named: by id, exact file
+    /// name, exact title (the name the prompt's inventory shows), or id
+    /// prefix, tried in that order. Each way is one query that reads at
+    /// most 20 rows, so the lookup costs the same in a workspace of any
+    /// size.
     ///
     /// # Errors
     ///
-    /// Returns an error if the query fails.
-    pub fn list_all_documents(&self) -> Result<Vec<DocumentInfo>> {
-        let sql = format!("{DOCUMENT_SELECT} ORDER BY ingested_at DESC, id DESC");
+    /// A name that matches several documents the same way is an error
+    /// naming them, never a pick. A name that matches none is an error
+    /// listing the newest documents there are, so the caller corrects it
+    /// rather than reading an empty result as "the workspace has nothing on
+    /// this".
+    pub fn find_document(&self, want: &str) -> Result<DocumentInfo> {
+        let want = want.trim();
+        if want.is_empty() {
+            return Err(Error::Analysis(String::from(
+                "no document named; pass an id, a file name, or a title from list_documents",
+            )));
+        }
+        for way in NameMatch::IN_ORDER {
+            let found = self.documents_named(way, want, NamedDocuments::LISTED)?;
+            match found.as_slice() {
+                [] => {}
+                [one] => return Ok(one.clone()),
+                [_, _, ..] => {
+                    let total = self.count_documents_named(way, want)?;
+                    return Err(Error::Analysis(format!(
+                        "{total} documents {} '{want}'; pass one's full id: {}",
+                        way.phrase(),
+                        NamedDocuments {
+                            found: &found,
+                            total
+                        }
+                    )));
+                }
+            }
+        }
+        let (found, total) = self.recent_documents(NamedDocuments::LISTED)?;
+        let total = u64::try_from(total).unwrap_or(u64::MAX);
+        Err(Error::Analysis(format!(
+            "no document matches '{want}'; pass an id (a prefix is enough), an exact file name, \
+             or an exact title from list_documents. Documents: {}",
+            NamedDocuments {
+                found: &found,
+                total
+            }
+        )))
+    }
+
+    /// The live document whose id is `prefix` or starts with it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when none does and [`Error::Ambiguous`] when
+    /// several do, both naming documents.
+    pub fn document_by_id_prefix(&self, prefix: &str) -> Result<DocumentInfo> {
+        if let Some(exact) = self.documents_named(NameMatch::Id, prefix, 1)?.pop() {
+            return Ok(exact);
+        }
+        let mut found = self.documents_named(NameMatch::IdPrefix, prefix, 2)?;
+        match (found.pop(), found.is_empty()) {
+            (None, _) => Err(ResourceKind::Document.missing(prefix)),
+            (Some(one), true) => Ok(one),
+            (Some(_), false) => Err(Error::Ambiguous {
+                kind: ResourceKind::Document,
+                prefix: prefix.to_owned(),
+                count: usize::try_from(self.count_documents_named(NameMatch::IdPrefix, prefix)?)
+                    .unwrap_or(usize::MAX),
+            }),
+        }
+    }
+
+    /// Up to `limit` live documents `want` names `way`, newest first.
+    fn documents_named(
+        &self,
+        way: NameMatch,
+        want: &str,
+        limit: usize,
+    ) -> Result<Vec<DocumentInfo>> {
+        let sql = format!(
+            "{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} AND {} \
+             ORDER BY id DESC LIMIT ?",
+            way.condition()
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(&sql)?;
-        let docs = stmt.query_map([], |row| DocumentInfo::try_from(row))?;
+        let docs = stmt.query_map(duckdb::params![want, limit], |row| {
+            DocumentInfo::try_from(row)
+        })?;
         Ok(docs.collect::<duckdb::Result<_>>()?)
+    }
+
+    /// How many live documents `want` names `way`.
+    fn count_documents_named(&self, way: NameMatch, want: &str) -> Result<u64> {
+        Ok(self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM _quack_documents WHERE {NOT_SUPERSEDED} AND {}",
+                way.condition()
+            ),
+            duckdb::params![want],
+            |row| row.get(0),
+        )?)
     }
 
     /// Access the underlying `DuckDB` connection.
@@ -4084,8 +4211,8 @@ pub struct DocumentInfo {
     pub language: Option<String>,
 }
 
-/// One way a name can name a document, in the order `DocumentInfo::find`
-/// tries them.
+/// One way a name can name a document, in the order
+/// `WorkspaceDb::find_document` tries them.
 #[derive(Debug, Clone, Copy)]
 enum NameMatch {
     Id,
@@ -4097,12 +4224,13 @@ enum NameMatch {
 impl NameMatch {
     const IN_ORDER: [Self; 4] = [Self::Id, Self::FileName, Self::Title, Self::IdPrefix];
 
-    fn matches(self, document: &DocumentInfo, want: &str) -> bool {
+    /// The `WHERE` condition, with one parameter for the name.
+    const fn condition(self) -> &'static str {
         match self {
-            Self::Id => document.id.as_str() == want,
-            Self::FileName => document.filename == want,
-            Self::Title => document.title.as_deref().map(str::trim) == Some(want),
-            Self::IdPrefix => document.id.as_str().starts_with(want),
+            Self::Id => "id = ?",
+            Self::FileName => "filename = ?",
+            Self::Title => "trim(title) = ?",
+            Self::IdPrefix => "starts_with(id, ?)",
         }
     }
 
@@ -4117,76 +4245,52 @@ impl NameMatch {
     }
 }
 
+/// Some of the documents a name matched, or of the workspace's, and how
+/// many there are: the listing a lookup error names.
+struct NamedDocuments<'a> {
+    found: &'a [DocumentInfo],
+    total: u64,
+}
+
+impl NamedDocuments<'_> {
+    /// Documents a listing names at most.
+    const LISTED: usize = 20;
+}
+
+impl fmt::Display for NamedDocuments<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, d) in self.found.iter().take(Self::LISTED).enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            match d.title.as_deref() {
+                Some(title) => write!(
+                    f,
+                    "{} ({}, \"{}\")",
+                    d.id,
+                    OneLine(&d.filename),
+                    OneLine(title)
+                )?,
+                None => write!(f, "{} ({})", d.id, OneLine(&d.filename))?,
+            }
+        }
+        let shown = u64::try_from(self.found.len().min(Self::LISTED)).unwrap_or(u64::MAX);
+        if self.total > shown {
+            write!(
+                f,
+                ", and {} more; list_documents names them all",
+                self.total.saturating_sub(shown)
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl DocumentInfo {
     /// The title when one exists, else the filename.
     #[must_use]
     pub fn display_name(&self) -> &str {
         self.title.as_deref().unwrap_or(&self.filename)
-    }
-
-    /// The document in `documents` a person or the model named: by id,
-    /// exact file name, exact title (the name the prompt's inventory
-    /// shows), or id prefix, tried in that order.
-    ///
-    /// # Errors
-    ///
-    /// A name that matches several documents the same way is an error
-    /// naming them, never a pick. A name that matches none is an error
-    /// listing some of the documents there are, so the caller corrects it
-    /// rather than reading an empty result as "the workspace has nothing on
-    /// this".
-    pub fn find<'a>(documents: &'a [Self], want: &str) -> Result<&'a Self> {
-        /// Documents a listing in an error names at most.
-        const LISTED: usize = 20;
-        let want = want.trim();
-        let listed = |matches: &[&Self]| -> String {
-            let mut names: Vec<String> = matches
-                .iter()
-                .take(LISTED)
-                .map(|d| match d.title.as_deref() {
-                    Some(title) => format!(
-                        "{} ({}, \"{}\")",
-                        d.id,
-                        OneLine(&d.filename),
-                        OneLine(title)
-                    ),
-                    None => format!("{} ({})", d.id, OneLine(&d.filename)),
-                })
-                .collect();
-            if matches.len() > LISTED {
-                names.push(format!(
-                    "and {} more; list_documents names them all",
-                    matches.len().saturating_sub(LISTED)
-                ));
-            }
-            names.join(", ")
-        };
-        if want.is_empty() {
-            return Err(Error::Analysis(String::from(
-                "no document named; pass an id, a file name, or a title from list_documents",
-            )));
-        }
-        for way in NameMatch::IN_ORDER {
-            let found: Vec<&Self> = documents.iter().filter(|d| way.matches(d, want)).collect();
-            match found.as_slice() {
-                [] => {}
-                [one] => return Ok(one),
-                several => {
-                    return Err(Error::Analysis(format!(
-                        "{} documents {} '{want}'; pass one's full id: {}",
-                        several.len(),
-                        way.phrase(),
-                        listed(several)
-                    )));
-                }
-            }
-        }
-        let all: Vec<&Self> = documents.iter().collect();
-        Err(Error::Analysis(format!(
-            "no document matches '{want}'; pass an id (a prefix is enough), an exact file name, \
-             or an exact title from list_documents. Documents: {}",
-            listed(&all)
-        )))
     }
 
     /// The tables a row from before `tables` was recorded loaded into: the
@@ -4665,7 +4769,8 @@ impl Phrases {
 /// its documents come in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SamplePool {
-    /// Chunks the graph has not extracted yet, documents in ingest order.
+    /// Chunks the graph has not extracted yet, documents by id: the order
+    /// they were registered in.
     NotGraphExtracted,
     /// Chunks with more than a line of text, documents by id: what the
     /// ontology's document evidence reads.
@@ -4680,15 +4785,6 @@ impl SamplePool {
                 "NOT EXISTS (SELECT 1 FROM _quack_graph_extracted x WHERE x.chunk_id = c.id)"
             }
             Self::Substantive => "length(c.content) > 40",
-        }
-    }
-
-    /// How the documents are ordered, in the sampler's own columns: when
-    /// the document was ingested, and its id.
-    const fn document_order(self) -> &'static str {
-        match self {
-            Self::NotGraphExtracted => "ingested_at, doc",
-            Self::Substantive => "doc",
         }
     }
 }
@@ -4846,6 +4942,76 @@ impl DocumentFilter {
     }
 }
 
+/// Which documents a listing shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Shown {
+    /// What the workspace holds now: a replaced document is left out.
+    #[default]
+    Live,
+    /// Replaced documents too, each naming its replacement.
+    All,
+}
+
+impl Shown {
+    /// The condition on `_quack_documents d` that keeps what it shows.
+    const fn condition(self) -> &'static str {
+        match self {
+            Self::Live => NOT_SUPERSEDED,
+            Self::All => "true",
+        }
+    }
+}
+
+/// What [`WorkspaceDb::documents`] lists: which documents, narrowed by a
+/// filter, one page after `after`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentListing {
+    pub shown: Shown,
+    pub filter: DocumentFilter,
+    /// The last document of the page before; `None` starts at the newest.
+    pub after: Option<DocumentId>,
+    /// Documents a page holds, within 1 and [`Self::MAX_PAGE`].
+    pub limit: u32,
+}
+
+impl DocumentListing {
+    /// Documents a page holds unless the caller asks for fewer or more.
+    pub const PAGE: u32 = 100;
+    /// Documents a page holds at most.
+    pub const MAX_PAGE: u32 = 500;
+
+    /// The first page of the live documents, `limit` long.
+    #[must_use]
+    pub fn first(limit: u32) -> Self {
+        Self {
+            limit,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for DocumentListing {
+    fn default() -> Self {
+        Self {
+            shown: Shown::Live,
+            filter: DocumentFilter::default(),
+            after: None,
+            limit: Self::PAGE,
+        }
+    }
+}
+
+/// One page of a document listing.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct DocumentPage {
+    pub documents: Vec<DocumentInfo>,
+    /// The `after` that asks for the next page; absent on the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<DocumentId>,
+    /// Documents the listing holds across every page.
+    pub total: u64,
+}
+
 /// A [`DocumentFilter`] as SQL: conditions on `_quack_documents d` and their
 /// text parameters, in order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4914,10 +5080,9 @@ impl ChunkScope {
         if wanted.is_empty() {
             return Ok(Self::all());
         }
-        let documents = db.list_documents()?;
         let mut resolved = Vec::with_capacity(wanted.len());
         for want in wanted {
-            resolved.push(DocumentInfo::find(&documents, want)?.id.clone());
+            resolved.push(db.find_document(want)?.id);
         }
         Ok(Self::documents(resolved))
     }

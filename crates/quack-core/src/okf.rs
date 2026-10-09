@@ -24,7 +24,7 @@ use crate::ontology::{
     store as ontology_store,
 };
 use crate::storage::context;
-use crate::storage::workspace::{DocumentInfo, WorkspaceDb};
+use crate::storage::workspace::{DocumentInfo, DocumentListing, WorkspaceDb};
 
 /// One file of a bundle: a path relative to its root and the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -562,7 +562,7 @@ pub fn export(
     if let Some(ontology) = &ontology {
         exporter.ontology(ontology)?;
     }
-    exporter.documents(&db.list_documents()?)?;
+    exporter.documents()?;
     exporter.entities()?;
     exporter.log()?;
     let index = std::mem::take(&mut exporter.index);
@@ -668,13 +668,30 @@ impl<S: BundleSink> Exporter<'_, S> {
         Ok(())
     }
 
-    fn documents(&mut self, documents: &[DocumentInfo]) -> Result<()> {
+    /// Every live document, a page at a time.
+    fn documents(&mut self) -> Result<()> {
         let paths: HashMap<String, String> = self
             .db
             .connection()
             .prepare(DOCUMENT_PATH_QUERY)?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<duckdb::Result<_>>()?;
+        let mut listing = DocumentListing::first(DocumentListing::MAX_PAGE);
+        loop {
+            let page = self.db.documents(&listing)?;
+            self.document_page(&paths, &page.documents)?;
+            let Some(next) = page.next else {
+                return Ok(());
+            };
+            listing.after = Some(next);
+        }
+    }
+
+    fn document_page(
+        &mut self,
+        paths: &HashMap<String, String>,
+        documents: &[DocumentInfo],
+    ) -> Result<()> {
         for document in documents {
             let Some(path) = paths.get(&document.id.to_string()) else {
                 continue;

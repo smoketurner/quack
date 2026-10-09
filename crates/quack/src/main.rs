@@ -58,7 +58,8 @@ use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, SessionViewer, Sharing, Transcript,
 };
 use quack_core::storage::workspace::{
-    DocumentFields, Pinning, QueryResults, SearchMode, StatementKind, WorkspaceDb,
+    DocumentFields, DocumentInfo, DocumentListing, Pinning, QueryResults, SearchMode, Shown,
+    StatementKind, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use quack_core::vault::Vault;
@@ -2226,72 +2227,72 @@ fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
 
 /// Resolve a full document id or a unique prefix.
 fn find_document(db: &WorkspaceDb, prefix: &str) -> CoreResult<DocumentId> {
-    let document = PrefixMatch::of(db.list_documents()?, prefix, |d| d.id.as_str())
-        .one(ResourceKind::Document, prefix)?;
-    Ok(document.id)
+    Ok(db.document_by_id_prefix(prefix)?.id)
 }
 
-/// Which documents `quack docs` lists.
-#[derive(Debug, Clone, Copy)]
-enum Shown {
-    /// What the workspace holds now.
-    Live,
-    /// Replaced documents too (`--all`).
-    All,
-}
-
+/// Every document `shown` covers, a page at a time.
 fn list_documents(
     db: &WorkspaceDb,
     format: TextOrJson,
     shown: Shown,
     out: &mut impl Write,
 ) -> Result<()> {
-    let docs = match shown {
-        Shown::Live => db.list_documents()?,
-        Shown::All => db.list_all_documents()?,
+    let mut listing = DocumentListing {
+        shown,
+        ..DocumentListing::first(DocumentListing::MAX_PAGE)
     };
-    format.write_rows(out, &docs, "No documents yet.", |out, doc| {
-        let title = doc
-            .title
-            .as_deref()
-            .map_or(String::new(), |t| format!("  ({t})"));
-        let pages = doc
-            .pages
-            .and_then(PageCounts::note)
-            .map_or(String::new(), |note| format!("  [{note}]"));
-        let replaced = doc
-            .superseded_by
-            .as_ref()
-            .map_or(String::new(), |by| format!("  -> {by}"));
-        let about = match (&doc.author, &doc.authored_at, doc.tags.is_empty()) {
-            (None, None, true) => String::new(),
-            (author, authored, _) => format!(
-                "  [{}]",
-                author
-                    .iter()
-                    .map(String::as_str)
-                    .chain(authored.iter().filter_map(|d| d.get(..10)))
-                    .chain(doc.tags.iter().map(String::as_str))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+    loop {
+        let page = db.documents(&listing)?;
+        format.write_rows(out, &page.documents, "No documents yet.", document_line)?;
+        let Some(next) = page.next else {
+            break;
         };
-        writeln!(
-            out,
-            "{}  {:<10}  {:<6}  {}  {}{title}{about}{pages}{replaced}",
-            doc.id,
-            doc.status,
-            doc.source,
-            if doc.pinning == Pinning::Pinned {
-                "pinned  "
-            } else {
-                "        "
-            },
-            doc.filename
-        )
-    })?;
+        listing.after = Some(next);
+    }
     out.flush()?;
     Ok(())
+}
+
+/// One document as `quack docs` prints it.
+fn document_line<W: Write>(out: &mut W, doc: &DocumentInfo) -> std::io::Result<()> {
+    let title = doc
+        .title
+        .as_deref()
+        .map_or(String::new(), |t| format!("  ({t})"));
+    let pages = doc
+        .pages
+        .and_then(PageCounts::note)
+        .map_or(String::new(), |note| format!("  [{note}]"));
+    let replaced = doc
+        .superseded_by
+        .as_ref()
+        .map_or(String::new(), |by| format!("  -> {by}"));
+    let about = match (&doc.author, &doc.authored_at, doc.tags.is_empty()) {
+        (None, None, true) => String::new(),
+        (author, authored, _) => format!(
+            "  [{}]",
+            author
+                .iter()
+                .map(String::as_str)
+                .chain(authored.iter().filter_map(|d| d.get(..10)))
+                .chain(doc.tags.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    writeln!(
+        out,
+        "{}  {:<10}  {:<6}  {}  {}{title}{about}{pages}{replaced}",
+        doc.id,
+        doc.status,
+        doc.source,
+        if doc.pinning == Pinning::Pinned {
+            "pinned  "
+        } else {
+            "        "
+        },
+        doc.filename
+    )
 }
 
 /// Resolve a full id or a unique prefix to a session.
@@ -2759,7 +2760,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     let NamedInput {
         name: effective_filename,
         data,
-    } = file.read_named(filename.as_deref())?;
+    } = file.named(filename.as_deref())?;
 
     let ws_db = opened.writer()?;
     let replaces = match replace {
@@ -2779,7 +2780,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         config,
         &ws_db,
         opened.workspace.id.as_str(),
-        &NewFile::new(&effective_filename, &data)
+        &NewFile::of(&effective_filename, data.file_data())
             .source(file.document_source())
             .title(title.as_deref())
             .replaces(replaces.as_ref())

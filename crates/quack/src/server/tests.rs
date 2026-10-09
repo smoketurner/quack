@@ -1160,6 +1160,82 @@ async fn a_documents_chunks_page_through_the_api_and_open_on_the_passage_page() 
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// `GET .../documents` and the Documents page list a page at a time: the
+/// API's `next` asks for the rest, `total` counts every page, and the page
+/// after the first links back to the newest.
+#[tokio::test(flavor = "multi_thread")]
+async fn documents_list_a_page_at_a_time() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("docs", &owner).await;
+    let token = h.login("owner").await;
+    let base = format!("/api/v1/workspaces/{ws}/documents");
+    let mut ids = Vec::new();
+    for text in ["First note.", "Second note.", "Third note."] {
+        let (status, body) = h
+            .post(
+                &base,
+                &token,
+                serde_json::json!({ "text": text, "title": text }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["documents"][0]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(h.wait_ready(&ws, &id, &token).await["status"], "ready");
+        ids.push(id);
+    }
+    let listed = |page: &serde_json::Value| -> Vec<String> {
+        page["documents"]
+            .as_array()
+            .map(|d| {
+                d.iter()
+                    .filter_map(|d| d["id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (status, first) = h.get(&format!("{base}?limit=2"), &token).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let newest: Vec<String> = ids.iter().rev().take(2).cloned().collect();
+    assert_eq!(listed(&first), newest, "{first}");
+    assert_eq!(first["total"], 3, "{first}");
+    let next = first["next"].as_str().unwrap_or_default().to_owned();
+    let (_, rest) = h.get(&format!("{base}?limit=2&after={next}"), &token).await;
+    assert_eq!(
+        listed(&rest),
+        ids.first().cloned().into_iter().collect::<Vec<_>>()
+    );
+    assert!(rest.get("next").is_none(), "{rest}");
+    // A cursor is a position, not a row: one older than every id ends the
+    // listing.
+    let (status, past) = h
+        .get(
+            &format!("{base}?after=00000000-0000-7000-8000-000000000000"),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{past}");
+    assert_eq!(
+        (listed(&past).len(), &past["total"]),
+        (0, &serde_json::json!(3))
+    );
+
+    let cookie = h.web_session("owner").await;
+    let (status, html, _) = h
+        .page(&format!("/w/{ws}/documents?after={next}"), Some(&cookie))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("1 of 3 documents"), "{html}");
+    assert!(
+        html.contains(&format!("href=\"/w/{ws}/documents\">Newest")),
+        "{html}"
+    );
+    assert!(!html.contains(">Older<"), "{html}");
+}
+
 /// `POST .../documents?replace={doc}` queues one file that takes the
 /// document's place once ready: the old one is `superseded`, out of the
 /// listing, and named by the new one's audit row; the request refuses

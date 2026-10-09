@@ -11,10 +11,10 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::ids::ChunkId;
+use crate::ids::{ChunkId, DocumentId};
 use crate::storage::profile::TableProfile;
 use crate::storage::workspace::{
-    ChunkSearchResult, DocumentFilter, DocumentInfo, DocumentStatus, HybridLimits, SearchMode,
+    ChunkSearchResult, DocumentFilter, DocumentListing, DocumentStatus, HybridLimits, SearchMode,
     StatementKind, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object, quote_ident,
 };
 use crate::storage::writer::Writer;
@@ -1187,8 +1187,7 @@ impl Tool for ReadDocumentTool {
         let read = self
             .db
             .with_db(move |db| {
-                let documents = db.list_documents()?;
-                let document = DocumentInfo::find(&documents, &wanted)?.clone();
+                let document = db.find_document(&wanted)?;
                 // The person's scope bounds whole-document reads as it does search.
                 within.narrow(vec![document.id.clone()])?;
                 if document.status != DocumentStatus::Ready {
@@ -1322,8 +1321,7 @@ impl Tool for ViewImageTool {
         let found = self
             .db
             .with_db(move |db| {
-                let documents = db.list_documents()?;
-                let document = DocumentInfo::find(&documents, &wanted)?.clone();
+                let document = db.find_document(&wanted)?;
                 within.narrow(vec![document.id.clone()])?;
                 if document.status != DocumentStatus::Ready {
                     return Err(Error::Analysis(format!(
@@ -1667,40 +1665,56 @@ pub struct ListDocumentsTool(pub ReaderDb);
 impl Tool for ListDocumentsTool {
     const NAME: &'static str = ToolName::ListDocuments.as_str();
     type Error = ToolExecutionError;
-    type Args = NoArgs;
+    type Args = ListDocumentsArgs;
     type Output = String;
 
     fn description(&self) -> String {
         String::from(
-            "List every ingested document with its id, file name, status (queued, processing, \
+            "List the ingested documents, newest first and 50 at a time, with each one's id, file name, status (queued, processing, \
              ready, or error), MIME type, source, title, author, authored date, and tags when it \
              has them. A document's text is \
              searchable once its status is ready; a tabular file is loaded as a table instead. A \
              document marked with unreadable pages or pages without text was only partly read: \
              those pages are not searchable. To \
              search within particular documents, pass their ids (a prefix is enough), exact \
-             file names, or exact titles as search_documents' document_ids. Takes no arguments.",
+             file names, or exact titles as search_documents' document_ids. The listing ends \
+             by saying how many there are and, when more remain, the after value for the next \
+             50.",
         )
     }
 
     fn parameters(&self) -> serde_json::Value {
-        NoArgs::schema()
+        ListDocumentsArgs::schema()
     }
 
     async fn call(
         &self,
         context: &mut ToolContext,
-        _args: Self::Args,
+        args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let turn = Turn::of(context)?;
-        let step = turn.recorder.start(ToolName::ListDocuments, "");
-        let docs = self.0.with_db(WorkspaceDb::list_documents).await?;
-        step.finish(format!("{} documents", docs.len()));
-        if docs.is_empty() {
+        let after = args
+            .after
+            .map(|a| a.trim().to_owned())
+            .filter(|a| !a.is_empty());
+        let step = turn
+            .recorder
+            .start(ToolName::ListDocuments, after.as_deref().unwrap_or(""));
+        let listing = DocumentListing {
+            after: after.map(DocumentId::from),
+            ..DocumentListing::first(LISTED_DOCUMENTS)
+        };
+        let page = self.0.with_db(move |db| db.documents(&listing)).await?;
+        step.finish(format!(
+            "{} of {} documents",
+            page.documents.len(),
+            page.total
+        ));
+        if page.total == 0 {
             return Ok(String::from("No documents found in this workspace."));
         }
         let mut output = String::from("Documents:\n");
-        for doc in &docs {
+        for doc in &page.documents {
             let title = doc
                 .title
                 .as_deref()
@@ -1729,8 +1743,26 @@ impl Tool for ListDocumentsTool {
                 doc.source,
             ).map_err(format_failed)?;
         }
+        write!(output, "{} documents in all", page.total).map_err(format_failed)?;
+        if let Some(next) = &page.next {
+            write!(
+                output,
+                "; for the next {LISTED_DOCUMENTS}, pass after: {next}"
+            )
+            .map_err(format_failed)?;
+        }
         Ok(output)
     }
+}
+
+/// Documents one `list_documents` call lists.
+const LISTED_DOCUMENTS: u32 = 50;
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ListDocumentsArgs {
+    /// The after value the previous listing ended with, for the documents
+    /// after it; leave it out for the newest
+    pub after: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

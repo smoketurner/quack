@@ -8,7 +8,9 @@ use crate::graph::{GraphSize, store as graph_store};
 use crate::ingestion::parser::PageCounts;
 use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
-use crate::storage::workspace::{ColumnInfo, PinnedDocument, TableDescription, WorkspaceDb};
+use crate::storage::workspace::{
+    ColumnInfo, PinnedDocument, PinnedText, TableDescription, WorkspaceDb,
+};
 use crate::text::{Fenced, OneLine, Tokens};
 use jiff::civil::Date;
 use std::collections::HashMap;
@@ -695,12 +697,10 @@ impl SystemPrompt {
     /// skipping any that would push the total past `pinned_token_budget`
     /// (four characters per token).
     fn pinned_documents(&mut self, db: &WorkspaceDb, pinned_token_budget: Tokens) -> Result<()> {
-        let pinned = db.pinned_documents()?;
+        let pinned = db.pinned_documents(pinned_token_budget)?;
         if pinned.is_empty() {
             return Ok(());
         }
-        let budget = pinned_token_budget;
-        let mut used = Tokens::default();
         writeln!(
             self.text,
             "Pinned documents (full text, always included for reference; cite them by filename). {}",
@@ -711,18 +711,17 @@ impl SystemPrompt {
             text,
         } in &pinned
         {
-            let cost = Tokens::estimate(text);
-            if used.saturating_add(cost) > budget {
-                writeln!(
+            match text {
+                PinnedText::OverBudget => writeln!(
                     self.text,
                     "{} (omitted: pinned text exceeds the {pinned_token_budget}-token budget)",
                     OneLine(&doc.filename)
-                )?;
-                continue;
+                )?,
+                PinnedText::Included(text) => {
+                    writeln!(self.text, "{}:", OneLine(&doc.filename))?;
+                    writeln!(self.text, "{}", Fenced(text))?;
+                }
             }
-            used = used.saturating_add(cost);
-            writeln!(self.text, "{}:", OneLine(&doc.filename))?;
-            writeln!(self.text, "{}", Fenced(text))?;
         }
         writeln!(self.text)?;
         Ok(())

@@ -19,7 +19,8 @@ use quack_core::ingestion::parser::SectionKind;
 use quack_core::ingestion::{self, NewFile};
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::workspace::{
-    ChunkScope, DocumentStatus, HybridLimits, MetaKey, NewChunk, NewDocument, WorkspaceDb,
+    ChunkScope, DocumentListing, DocumentStatus, HybridLimits, MetaKey, NewChunk, NewDocument,
+    WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use rig::ProviderError;
@@ -462,7 +463,7 @@ async fn a_model_answering_with_the_wrong_width_fails_the_document_with_the_fix(
             && err.contains("dimension = 6 under [embedding]"),
         "{err}"
     );
-    let documents = db.list_documents().unwrap();
+    let documents = db.documents(&DocumentListing::default()).unwrap().documents;
     assert_eq!(documents.first().map(|d| d.status.as_str()), Some("error"));
 }
 

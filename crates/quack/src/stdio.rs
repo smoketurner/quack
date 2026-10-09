@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
+use quack_core::ingestion::FileData;
 use quack_core::storage::workspace::DocumentSource;
 
 /// A file to read or write, or `-` for standard input or output.
@@ -16,10 +17,27 @@ pub(crate) enum StdioPath {
     Path(PathBuf),
 }
 
-/// Bytes read for ingestion, and the file name they go in under.
+/// An input for ingestion, and the file name it goes in under.
 pub(crate) struct NamedInput {
     pub name: String,
-    pub data: Vec<u8>,
+    pub data: InputData,
+}
+
+/// Where an input's bytes are.
+pub(crate) enum InputData {
+    /// Standard input, read whole.
+    Read(Vec<u8>),
+    /// A file, left on disk for ingestion to read as far as it needs.
+    File(PathBuf),
+}
+
+impl InputData {
+    pub(crate) fn file_data(&self) -> FileData<'_> {
+        match self {
+            Self::Read(bytes) => FileData::Bytes(bytes),
+            Self::File(path) => FileData::Path(path),
+        }
+    }
 }
 
 impl StdioPath {
@@ -31,14 +49,15 @@ impl StdioPath {
         }
     }
 
-    /// The whole input under a file name: `name` when given, else the
-    /// file's own name; standard input has none, so it needs `name`.
+    /// The input under a file name: `name` when given, else the file's own
+    /// name; standard input has none, so it needs `name`. Standard input is
+    /// read whole; a file only has to exist.
     ///
     /// # Errors
     ///
-    /// Returns an error when the input cannot be read, or standard input
-    /// comes without `name`.
-    pub(crate) fn read_named(&self, name: Option<&str>) -> Result<NamedInput> {
+    /// Returns an error when standard input cannot be read or comes without
+    /// `name`, or the file cannot be read.
+    pub(crate) fn named(&self, name: Option<&str>) -> Result<NamedInput> {
         match self {
             Self::Stdio => {
                 let name = name
@@ -50,15 +69,21 @@ impl StdioPath {
                 std::io::stdin()
                     .read_to_end(&mut data)
                     .context("failed to read from stdin")?;
-                Ok(NamedInput { name, data })
+                Ok(NamedInput {
+                    name,
+                    data: InputData::Read(data),
+                })
             }
             Self::Path(path) => {
-                let data = std::fs::read(path).context("failed to read input file")?;
+                std::fs::File::open(path).context("failed to read input file")?;
                 let name = name
                     .map(String::from)
                     .or_else(|| path.file_name().and_then(|n| n.to_str()).map(String::from))
                     .unwrap_or_else(|| String::from("unknown"));
-                Ok(NamedInput { name, data })
+                Ok(NamedInput {
+                    name,
+                    data: InputData::File(path.clone()),
+                })
             }
         }
     }

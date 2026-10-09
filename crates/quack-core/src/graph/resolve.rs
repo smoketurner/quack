@@ -242,6 +242,7 @@ struct MergePair {
 }
 
 /// What one proposal pass did.
+#[derive(Default)]
 struct MergeCounts {
     auto_merged: u32,
     proposed: u32,
@@ -256,75 +257,105 @@ struct MergeCounts {
 /// with one keyed side is only ever proposed; auto-merge is reserved for
 /// two model-extracted nodes.
 fn propose_merges(db: &WorkspaceDb, options: &GraphConfig) -> Result<MergeCounts> {
-    // The keyed flag is computed per node before the join: a correlated
-    // EXISTS per pair row, or a window over the pairs, made DuckDB run
-    // out of its 256 MiB on 3,667 nodes, while this streams in seconds.
-    // The per-node cap is applied below, in candidate order.
-    let mut stmt = db.connection().prepare(
-        "WITH n AS ( \
-           SELECT id, label, class_id, embedding, \
-                  EXISTS (SELECT 1 FROM _quack_provenance p \
-                          WHERE p.subject_id = _quack_graph_nodes.id AND p.table_name <> '') AS keyed \
-           FROM _quack_graph_nodes \
-           WHERE embedding IS NOT NULL AND embedding_profile IS NOT DISTINCT FROM ?) \
-         SELECT a.id, a.label, b.id, b.label, \
-                array_cosine_distance(a.embedding, b.embedding) AS d, a.keyed, b.keyed \
-         FROM n a JOIN n b ON a.class_id = b.class_id AND a.id < b.id \
-         WHERE NOT (a.keyed AND b.keyed) \
-           AND array_cosine_distance(a.embedding, b.embedding) <= ? \
-         ORDER BY d, a.id, b.id",
-    )?;
-    let mut rows = stmt.query(duckdb::params![
-        db.embedding_fingerprint(),
-        options.merge_threshold
-    ])?;
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let mut seen: BTreeMap<NodeId, u32> = BTreeMap::new();
-    while let Some(row) = rows.next()? {
-        let a_id: NodeId = row.get(0)?;
-        let b_id: NodeId = row.get(2)?;
-        // Each node keeps its NEIGHBOURS_PER_NODE closest candidates.
-        let a_seen = seen.get(&a_id).copied().unwrap_or(0);
-        let b_seen = seen.get(&b_id).copied().unwrap_or(0);
-        if a_seen >= NEIGHBOURS_PER_NODE || b_seen >= NEIGHBOURS_PER_NODE {
-            continue;
+    // The pairs stream from a reader's snapshot while the merges go through
+    // `db`, so no list of pairs is ever held: only the ids the cap and the
+    // merges have seen. The snapshot is the graph as the pass began, the
+    // order the pass always took; `gone` skips what a merge removed since.
+    let reader = db.try_clone_reader()?;
+    reader.read_only(|reader| {
+        // The keyed flag is computed per node before the join: a correlated
+        // EXISTS per pair row, or a window over the pairs, made DuckDB run
+        // out of its 256 MiB on 3,667 nodes, while this streams in seconds.
+        // The per-node cap is applied below, in candidate order.
+        let mut stmt = reader.connection().prepare(
+            "WITH n AS ( \
+               SELECT id, label, class_id, embedding, \
+                      EXISTS (SELECT 1 FROM _quack_provenance p \
+                              WHERE p.subject_id = _quack_graph_nodes.id AND p.table_name <> '') AS keyed \
+               FROM _quack_graph_nodes \
+               WHERE embedding IS NOT NULL AND embedding_profile IS NOT DISTINCT FROM ?) \
+             SELECT a.id, a.label, b.id, b.label, \
+                    array_cosine_distance(a.embedding, b.embedding) AS d, a.keyed, b.keyed \
+             FROM n a JOIN n b ON a.class_id = b.class_id AND a.id < b.id \
+             WHERE NOT (a.keyed AND b.keyed) \
+               AND array_cosine_distance(a.embedding, b.embedding) <= ? \
+             ORDER BY d, a.id, b.id",
+        )?;
+        let mut rows = stmt.query(duckdb::params![
+            reader.embedding_fingerprint(),
+            options.merge_threshold
+        ])?;
+        let mut pass = MergePass::default();
+        while let Some(row) = rows.next()? {
+            let a_id: NodeId = row.get(0)?;
+            let b_id: NodeId = row.get(2)?;
+            if !pass.admit(&a_id, &b_id) {
+                continue;
+            }
+            let candidate = Candidate {
+                a: Side {
+                    id: a_id,
+                    label: row.get(1)?,
+                    keyed: row.get(5)?,
+                },
+                b: Side {
+                    id: b_id,
+                    label: row.get(3)?,
+                    keyed: row.get(6)?,
+                },
+                distance: row.get(4)?,
+            };
+            pass.decide(db, candidate, options)?;
         }
-        seen.insert(a_id.clone(), a_seen.saturating_add(1));
-        seen.insert(b_id.clone(), b_seen.saturating_add(1));
-        candidates.push(Candidate {
-            a: Side {
-                id: a_id,
-                label: row.get(1)?,
-                keyed: row.get(5)?,
-            },
-            b: Side {
-                id: b_id,
-                label: row.get(3)?,
-                keyed: row.get(6)?,
-            },
-            distance: row.get(4)?,
-        });
+        Ok(pass.counts)
+    })
+}
+
+/// What a merge pass has seen so far.
+#[derive(Default)]
+struct MergePass {
+    /// Candidates admitted per node, up to [`NEIGHBOURS_PER_NODE`].
+    seen: BTreeMap<NodeId, u32>,
+    /// Nodes merged into another this pass.
+    gone: BTreeSet<NodeId>,
+    counts: MergeCounts,
+}
+
+impl MergePass {
+    /// Whether a pair is among both nodes' closest candidates, counting it
+    /// when it is: each node keeps its `NEIGHBOURS_PER_NODE` closest.
+    fn admit(&mut self, a: &NodeId, b: &NodeId) -> bool {
+        let a_seen = self.seen.get(a).copied().unwrap_or(0);
+        let b_seen = self.seen.get(b).copied().unwrap_or(0);
+        if a_seen >= NEIGHBOURS_PER_NODE || b_seen >= NEIGHBOURS_PER_NODE {
+            return false;
+        }
+        self.seen.insert(a.clone(), a_seen.saturating_add(1));
+        self.seen.insert(b.clone(), b_seen.saturating_add(1));
+        true
     }
-    drop(rows);
-    drop(stmt);
-    let mut auto = 0u32;
-    let mut proposed = 0u32;
-    let mut gone: BTreeSet<NodeId> = BTreeSet::new();
-    for candidate in candidates {
-        if gone.contains(&candidate.a.id)
-            || gone.contains(&candidate.b.id)
+
+    /// Merge an admitted pair, propose it, or pass over it.
+    fn decide(
+        &mut self,
+        db: &WorkspaceDb,
+        candidate: Candidate,
+        options: &GraphConfig,
+    ) -> Result<()> {
+        if self.gone.contains(&candidate.a.id)
+            || self.gone.contains(&candidate.b.id)
             || !share_token(&candidate.a.label, &candidate.b.label)
         {
-            continue;
+            return Ok(());
         }
         let distance = candidate.distance;
         let auto_merge = candidate.extracted_only() && distance <= options.auto_merge_threshold;
         let MergePair { keep, drop } = candidate.keep_and_drop(db)?;
         if auto_merge {
             merge_nodes(db, &keep, &drop)?;
-            gone.insert(drop);
-            auto = auto.saturating_add(1);
-            continue;
+            self.gone.insert(drop);
+            self.counts.auto_merged = self.counts.auto_merged.saturating_add(1);
+            return Ok(());
         }
         // The pair, not the orientation: `keep`/`drop` is derived from the
         // current provenance counts (`keep_and_drop`), which ingestion and
@@ -339,18 +370,15 @@ fn propose_merges(db: &WorkspaceDb, options: &GraphConfig) -> Result<MergeCounts
             |r| r.get(0),
         )?;
         if already > 0 {
-            continue;
+            return Ok(());
         }
         db.connection().execute(
             "INSERT INTO _quack_graph_merges (id, keep_node_id, drop_node_id, distance) VALUES (?, ?, ?, ?)",
             duckdb::params![MergeId::generate(), keep, drop, distance],
         )?;
-        proposed = proposed.saturating_add(1);
+        self.counts.proposed = self.counts.proposed.saturating_add(1);
+        Ok(())
     }
-    Ok(MergeCounts {
-        auto_merged: auto,
-        proposed,
-    })
 }
 
 /// `DuckDB`'s own account of its memory, at debug level, for the moments

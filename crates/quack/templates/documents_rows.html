@@ -36,5 +36,6 @@
   </tbody>
 </table>
 </div>
+<p class="mt-2 text-xs text-slate-400">{{ documents.len() }} of {{ total }} documents{% if let Some(href) = first_href %} · <a class="text-blue-400 hover:underline" href="{{ href }}">Newest</a>{% endif %}{% if let Some(href) = next_href %} · <a class="text-blue-400 hover:underline" href="{{ href }}">Older</a>{% endif %}</p>
 {% include "documents_pending.html" %}
 {% endif %}

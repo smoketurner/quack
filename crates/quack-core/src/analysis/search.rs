@@ -12,8 +12,8 @@ use crate::graph;
 use crate::graph::query::UnknownEntity;
 use crate::ids::{ChunkId, DocumentId, NodeId};
 use crate::storage::workspace::{
-    ChunkScope, ChunkSearchResult, DocumentFilter, DocumentInfo, DocumentStatus, HybridLimits,
-    SearchExplanation, SearchMode, WorkspaceDb,
+    ChunkScope, ChunkSearchResult, DocumentFilter, DocumentStatus, HybridLimits, SearchExplanation,
+    SearchMode, WorkspaceDb,
 };
 use crate::text::OneLine;
 
@@ -431,10 +431,9 @@ impl DocumentScope {
         if names.is_empty() {
             return Ok(Self::default());
         }
-        let documents = db.list_documents()?;
         let mut scoped: Vec<ScopedDocument> = Vec::with_capacity(names.len());
         for name in names {
-            let document = DocumentInfo::find(&documents, name)?;
+            let document = db.find_document(name)?;
             if document.status != DocumentStatus::Ready {
                 return Err(Error::Analysis(format!(
                     "{} is {}, not ready, so a question cannot be limited to it",
@@ -444,8 +443,8 @@ impl DocumentScope {
             }
             if !scoped.iter().any(|d| d.id == document.id) {
                 scoped.push(ScopedDocument {
-                    id: document.id.clone(),
-                    filename: document.filename.clone(),
+                    id: document.id,
+                    filename: document.filename,
                 });
             }
         }
