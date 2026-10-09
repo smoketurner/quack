@@ -1,0 +1,71 @@
+//! The interactive terminal session (ratatui).
+
+mod app;
+mod chart;
+mod clipboard;
+mod commands;
+mod markdown;
+mod picker;
+mod selection;
+mod sql;
+mod ui;
+
+use anyhow::{Context, Result};
+use quack_core::analysis::policy::WritePolicy;
+use quack_core::analysis::tools::{ReaderDb, SharedDb};
+use quack_core::config::Config;
+use quack_core::ids::{SessionId, WorkspaceId};
+
+/// Everything a terminal session starts from: the resolved workspace, its
+/// writer and reader pool, and the session to open.
+pub struct SessionSetup {
+    pub config: Config,
+    pub workspace_name: String,
+    pub workspace_id: WorkspaceId,
+    pub db: SharedDb,
+    pub reader_db: ReaderDb,
+    pub session_id: SessionId,
+    /// `Allow` with `--allow-write`, else `Ask`.
+    pub writes: WritePolicy,
+}
+
+/// Run the terminal session against a resolved workspace until the user quits.
+///
+/// # Errors
+///
+/// Returns an error if the terminal cannot be initialized. Neither model
+/// is required: without a chat model the session still runs SQL, ingests,
+/// and every slash command, and a question says how to configure one;
+/// without an embedding model document search is keyword-only, as in print
+/// mode and the web.
+pub async fn run(setup: SessionSetup) -> Result<()> {
+    let mut tui_app = app::App::new(setup);
+    tui_app.load_current_session().await?;
+    tui_app.load_input_history().await?;
+    tui_app.note_embedding_status().await?;
+    tui_app.load_sql_schema().await?;
+
+    let mut terminal = ratatui::try_init().context("failed to initialize terminal")?;
+    // Mouse capture for wheel scrolling, bracketed paste so a dropped
+    // file's path arrives as one event; ratatui's restore undoes neither,
+    // so both are released by hand either way.
+    let mouse =
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).is_ok();
+    let paste =
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste).is_ok();
+    let result = tui_app.run(&mut terminal).await;
+    if paste {
+        drop(crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableBracketedPaste
+        ));
+    }
+    if mouse {
+        drop(crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture
+        ));
+    }
+    drop(ratatui::try_restore());
+    result
+}

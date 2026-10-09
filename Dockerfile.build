@@ -56,7 +56,7 @@ COPY . .
 ARG SOURCE_DATE_EPOCH=0
 ARG GENERATE_SBOM=false
 
-RUN touch -d "@${SOURCE_DATE_EPOCH}" crates/quack-core/src/lib.rs crates/quack/src/main.rs
+RUN touch -d "@${SOURCE_DATE_EPOCH}" crates/quack-core/src/lib.rs crates/quack-cli/src/lib.rs crates/quack-server/src/lib.rs crates/quack-terminal/src/lib.rs crates/quack/src/main.rs
 
 RUN cargo build --release --locked --target "${TARGET}" --package quack
 

@@ -15,7 +15,7 @@ use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt};
 use quack_core::storage::control::RegistrationRow;
 use secrecy::SecretString;
 
-use crate::confirm::Confirm;
+use quack_cli::Confirm;
 
 /// One configured OAuth client, as the file names it.
 struct Client {

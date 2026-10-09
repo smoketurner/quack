@@ -4,8 +4,8 @@ How `quack serve` renders its web UI (design doc sections 11.1, 11.2, and 12): a
 the routes, rust-embed bakes the assets into the executable, askama renders the templates,
 htmx refreshes the document list and the SQL grid, a small script streams the chat over SSE
 and draws the charts and the graph, and Tailwind's standalone binary builds the CSS. The
-code lives in `crates/quack/src/server/web/`, the templates in
-`crates/quack/templates/`, and the assets in `crates/quack/static/`. Localization via
+code lives in `crates/quack-server/src/web/`, the templates in
+`crates/quack-server/templates/`, and the assets in `crates/quack-server/static/`. Localization via
 fluent is deferred (design doc section 18).
 
 The web UI is a client of `quack-core` behind the API's checks. Every page handler calls
@@ -250,6 +250,6 @@ other response `Cache-Control: no-cache, no-store, must-revalidate`, `Expires: 0
 Tailwind v4 is CSS-first: `styles/input.css` is one `@import "tailwindcss";`. Build with:
 
 ```bash
-make css-build     # minified, into crates/quack/static/css/output.css
+make css-build     # minified, into crates/quack-server/static/css/output.css
 make css-dev       # watch mode while editing templates
 ```

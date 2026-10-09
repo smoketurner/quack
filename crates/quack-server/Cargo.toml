@@ -1,0 +1,45 @@
+[package]
+name                   = "quack-server"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish                = false
+
+[lints]
+workspace = true
+
+[dependencies]
+quack-core         = { path = "../quack-core" }
+anyhow             = { workspace = true, features = ["std"] }
+askama             = { workspace = true, features = ["derive", "std", "config"] }
+axum               = { workspace = true, features = ["http1", "json", "query", "form", "tokio", "multipart", "matched-path"] }
+axum-extra         = { workspace = true, features = ["cookie", "form"] }
+base64             = { workspace = true, features = ["std"] }
+futures            = { workspace = true, features = ["std"] }
+jiff               = { workspace = true, features = ["serde", "std"] }
+mime_guess         = { workspace = true }
+pulldown-cmark     = { workspace = true, features = ["html"] }
+rmcp               = { workspace = true, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rust-embed         = { workspace = true, features = ["deterministic-timestamps"] }
+schemars           = { workspace = true, features = ["derive"] }
+secrecy            = { workspace = true }
+serde              = { workspace = true, features = ["derive", "std"] }
+serde_json         = { workspace = true, features = ["std"] }
+tempfile           = { workspace = true }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time", "fs"] }
+tokio-util         = { workspace = true }
+tower              = { workspace = true, features = ["util"] }
+tower-http         = { workspace = true, features = ["timeout", "request-id", "limit", "trace"] }
+tower_governor     = { workspace = true, features = ["axum"] }
+tracing            = { workspace = true, features = ["std"] }
+utoipa             = { workspace = true, features = ["macros", "axum_extras", "preserve_order"] }
+uuid               = { workspace = true, features = ["std", "v7"] }
+
+[dev-dependencies]
+quack-testkit = { path = "../quack-testkit" }
+aws-lc-rs     = { workspace = true, features = ["aws-lc-sys"] }
+duckdb        = { workspace = true, features = ["bundled"] }
+ipnet         = { workspace = true, features = ["std"] }
+jsonwebtoken  = { workspace = true, features = ["aws_lc_rs"] }
+sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite"] }

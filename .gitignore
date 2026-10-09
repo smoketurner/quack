@@ -15,12 +15,12 @@
 !.env.example
 
 # Tailwind CSS is built from styles/input.css with `make css-build` and committed
-# (crates/quack/static/css/output.css) because rust-embed needs it at compile time
+# (crates/quack-server/static/css/output.css) because rust-embed needs it at compile time
 # and CI has no Tailwind binary.
 
 # The SQL editor bundle's packages; the built bundle is committed
-# (crates/quack/static/js/sql-editor.min.js, `make editor-build`).
-crates/quack/editor/node_modules/
+# (crates/quack-server/static/js/sql-editor.min.js, `make editor-build`).
+crates/quack-server/editor/node_modules/
 
 # Editor / OS
 .idea/

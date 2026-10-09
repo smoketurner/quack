@@ -1,0 +1,16 @@
+[package]
+name                   = "quack-testkit"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish                = false
+
+[lints]
+workspace = true
+
+[dependencies]
+quack-core = { path = "../quack-core" }
+axum       = { workspace = true, features = ["http1", "json", "tokio"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio      = { workspace = true, features = ["rt-multi-thread", "net"] }

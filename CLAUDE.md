@@ -40,7 +40,7 @@ Cargo.toml            # virtual workspace: deps menu + strict lints + profiles
 deny.toml             # advisories, license allow-list, OpenSSL/ring bans
 rust-toolchain.toml   # pinned 1.99.0 + rustfmt + clippy
 Makefile              # build / fmt / lint / test / deny
-crates/               # quack-core (engine), quack (the binary) — see crates/README.md
+crates/               # quack-core (engine), quack-cli (shared command verbs), quack-server (REST, web UI, MCP), quack-terminal (the session), quack-testkit, quack (the binary) — see crates/README.md
 docs/                 # design-doc.md (the product), architecture, migrations, crypto, web-ui, ci-cd, authentication, providers
 .claude/rules/        # code-standards and development-discipline gates; branching, commits, continuous-improvement conventions
 ```
@@ -53,14 +53,14 @@ docs/                 # design-doc.md (the product), architecture, migrations, c
   tests, opt out narrowly: `#[expect(clippy::unwrap_used, reason = "...")]`; `#[allow]` is
   denied, so every opt-out is an `#[expect]` with a reason.
 - **Import, don't spell paths.** `clippy::absolute_paths` denies any `crate::` or
-  `quack_core::` path longer than two segments outside a `use`: import the type, or import
+  workspace-crate path (`quack_core::`, `quack_cli::`, `quack_server::`, `quack_terminal::`, ...) longer than two segments outside a `use`: import the type, or import
   a function's parent module and call `module::function`. External crates are exempt
   through `absolute-paths-allowed-crates` in `.clippy.toml`; a new dependency named by a
   full path goes on that list.
 - **Dependencies are pinned** to exact versions in `[workspace.dependencies]` with
   `default-features = false`. Crates opt into features explicitly. When adding a dependency,
   look up the current version and add it there, not in the member crate.
-- **Errors:** `thiserror` for library crates, `anyhow` for binaries.
+- **Errors:** `thiserror` for `quack-core`, `anyhow` for the binary and its interface crates.
 - **Logging:** `tracing` (`error!`/`warn!`/`info!`/`debug!`), never `println!`.
 - **Date/time:** `jiff`, not `chrono` or `time`.
 - **Database IDs:** UUID v7, client-generated (`uuid::Uuid::now_v7()`) — never v4.
@@ -136,10 +136,10 @@ sum of every row's SHA-256, since parallel DuckDB returns unordered rows in vary
 (`--refresh` asks the model again as a `PrintTurn`, writes denied, and pins the new answer's
 statements). There is no scheduler: cron runs it, and `--exit-code` exits 5 on a change;
 `-f` takes `-q`'s `QueryFormat` and default. The terminal's `/saved` verbs run as jobs
-through `saved_cli` (`add` pins the session's last answer; `--refresh` and `--exit-code` are
-parse errors there), and the REST routes under `.../saved` (`server/api/saved.rs`) list, save,
+through `quack-cli`'s `saved_cli` (`add` pins the session's last answer; `--refresh` and `--exit-code` are
+parse errors there), and the REST routes under `.../saved` (`quack-server`'s `api/saved.rs`) list, save,
 show, run, and remove, audited as `save`, `saved_run`, `open`, `list`, and `delete`; a run
-answers directly, no job. The web Saved page (`server/web/saved.rs`) and the chat page's Save
+answers directly, no job. The web Saved page (`web/saved.rs`) and the chat page's Save
 form go through the same `Access` methods (`list_saved`, `save_answer`, `run_saved`,
 `remove_saved`).
 
@@ -225,9 +225,9 @@ The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`,
 statement, file, import, and ontology or graph verb as a job, so it never blocks its input:
 a strip above the prompt shows active jobs, `/jobs` lists them, `/cancel N` stops one, and
 write prompts from concurrent work queue up. A left-button drag over the transcript
-selects text in transcript lines (`terminal::selection`), and releasing copies it without row
+selects text in transcript lines (`quack-terminal`'s `selection`), and releasing copies it without row
 markers or wrap breaks to the system clipboard (`arboard`) and the terminal's (OSC 52;
-`terminal::clipboard`). Its commands' database steps run in the order
+`clipboard`). Its commands' database steps run in the order
 typed on one worker task (`App::on_db`: reads on the reader pool, writes in the writer's
 interactive line), never on the loop's thread; input typed during `/new`, `/resume`, or
 `/mode` waits for the switch. `SharedDb` is `Arc<storage::writer::Writer>`, an actor: one
@@ -513,9 +513,9 @@ which as a UUID v7 is registration order), and a name resolves through
 `WorkspaceDb::find_document` (id, file name, title, id prefix) or `document_by_id_prefix`, each a
 bounded query, so no request reads every document row.
 
-The MCP server (`crates/quack/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `sql`,
+The MCP server (`crates/quack-server/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `sql`,
 `list_tables`, `describe_table`, `list_documents` and the `quack://workspace/...` resources;
-`quack mcp` serves it on stdio (unaudited, like the CLI) and `server/mcp_http.rs` serves it
+`quack mcp` serves it on stdio (unaudited, like the CLI) and `mcp_http.rs` serves it
 at `/mcp/v1/{workspace}` behind `Access::resolve`, one transport per workspace, user, and write
 permission, audited with channel `mcp`. With `[server.oidc].audience` set, the API and MCP also
 accept the issuer's access tokens (`SignIn::verify_bearer`, `jsonwebtoken` on aws-lc-rs), publish
@@ -533,7 +533,7 @@ redacted URL as title. S3 and `--bearer-env` use the server's own credentials, s
 with logins refuses them (`Error::ServerCredentials`, 403) unless
 `[import].allow_server_credentials`. No `ATTACH`: the workspace never reaches out at query time.
 
-`quack serve` (`crates/quack/src/server/`) is a thin axum client of core: `auth.rs` turns a
+`quack serve` (`crates/quack-server/`) is a thin axum client of core: `auth.rs` turns a
 bearer (login session or API token), the session cookie, or `--local` into an `Identity`
 (with `[server.oidc]`, people can also sign in through the organization's issuer:
 `quack_core::oidc::SignIn`, `server::oidc`, and `web::sign_in`; a first sign-in creates a
@@ -567,12 +567,12 @@ and run on the work queue in a lane of `[server].workers_per_workspace` per work
 serves `GET .../jobs`, `.../jobs/stream` (SSE), `.../jobs/{job}`, and `POST .../cancel`,
 and `/w/{id}/jobs` is the web console's Jobs page; every workspace page carries a job strip
 (`/w/{id}/jobs/strip`) over one `jobs/stream`, with a toast when a background job finishes, and
-`[server.webhooks]` POSTs finished jobs, content-free and HMAC-signed (`jobs::webhook`). The web UI (`server/web/`, `templates/`, `static/`) is askama pages over
+`[server.webhooks]` POSTs finished jobs, content-free and HMAC-signed (`jobs::webhook`). The web UI (`web/`, `templates/`, `static/` in `quack-server`) is askama pages over
 the same `Access::resolve` checks and the API's `Access` operations; `WebUser` redirects to `/login` instead
 of a 401; the built Tailwind CSS is committed (`make css-build` after template edits),
 htmx, ECharts, and Redoc are vendored, and the SQL page's CodeMirror editor is bundled from
-`crates/quack/editor/` (`make editor-build`, bundle committed; `docs/web-ui.md`). The API's
-contract is `server/api/openapi.rs`: an OpenAPI 3.1 document generated with `utoipa` from a
+`crates/quack-server/editor/` (`make editor-build`, bundle committed; `docs/web-ui.md`). The API's
+contract is `api/openapi.rs`: an OpenAPI 3.1 document generated with `utoipa` from a
 `#[utoipa::path]` on every handler and `ToSchema` on every request and response type (core
 types included), served at `/api/v1/openapi.json` and rendered by Redoc at `/api/v1/docs`,
 both beside `/healthz` (no sign-in, no audit, no limiter). A new route goes through

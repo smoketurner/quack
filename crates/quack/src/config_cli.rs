@@ -15,7 +15,7 @@ use anyhow::Result;
 use quack_core::config::inspect::{FileState, Inspection, Origin, Setting, SettingFilter};
 use quack_core::text::Count;
 
-use crate::text_or_json::TextOrJson;
+use quack_cli::TextOrJson;
 
 /// Print the report. Returns whether the configuration is one the binary
 /// would start on, which the caller turns into the exit status.

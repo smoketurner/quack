@@ -6,7 +6,7 @@ use std::io::Write;
 use anyhow::Result;
 use quack_core::doctor::{Report, Status};
 
-use crate::text_or_json::TextOrJson;
+use quack_cli::TextOrJson;
 
 pub(crate) fn write(out: &mut impl Write, report: &Report, format: TextOrJson) -> Result<()> {
     if format == TextOrJson::Json {

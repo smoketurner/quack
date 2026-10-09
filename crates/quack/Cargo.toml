@@ -14,57 +14,23 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+quack-cli          = { path = "../quack-cli" }
 quack-core         = { path = "../quack-core" }
+quack-server       = { path = "../quack-server" }
+quack-terminal     = { path = "../quack-terminal" }
 anyhow             = { workspace = true, features = ["std"] }
-arboard            = { workspace = true }
-askama             = { workspace = true, features = ["derive", "std", "config"] }
-axum               = { workspace = true, features = ["http1", "json", "query", "form", "tokio", "multipart", "matched-path"] }
-axum-extra         = { workspace = true, features = ["cookie", "form"] }
-base64             = { workspace = true, features = ["std"] }
 clap               = { workspace = true, features = ["derive", "error-context", "help", "std", "usage"] }
-crossterm          = { workspace = true, features = ["events", "event-stream", "bracketed-paste", "osc52"] }
+crossterm          = { workspace = true, features = ["events"] }
 csv                = { workspace = true }
-dirs               = { workspace = true }
-futures            = { workspace = true, features = ["std"] }
 inquire            = { workspace = true, features = ["crossterm"] }
 jiff               = { workspace = true, features = ["serde", "std"] }
 mimalloc           = { workspace = true, features = ["secure"] }
-mime_guess         = { workspace = true }
-pulldown-cmark     = { workspace = true, features = ["html"] }
-ratatui            = { workspace = true, features = ["crossterm"] }
-rmcp               = { workspace = true, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
-ratatui-textarea   = { workspace = true, features = ["crossterm"] }
-rust-embed         = { workspace = true, features = ["deterministic-timestamps"] }
-serde              = { workspace = true, features = ["derive", "std"] }
-schemars           = { workspace = true, features = ["derive"] }
 secrecy            = { workspace = true }
 serde_json         = { workspace = true, features = ["std"] }
-shlex              = { workspace = true, features = ["std"] }
-sqlparser          = { workspace = true, features = ["std"] }
 tempfile           = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time", "fs"] }
-tokio-util         = { workspace = true }
-tower              = { workspace = true, features = ["util"] }
-tower-http         = { workspace = true, features = ["timeout", "request-id", "limit", "trace"] }
-tower_governor     = { workspace = true, features = ["axum"] }
 tracing            = { workspace = true, features = ["std"] }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json", "std"] }
-utoipa             = { workspace = true, features = ["macros", "axum_extras", "preserve_order"] }
-uuid               = { workspace = true, features = ["std", "v7"] }
-
-# Windows terminals quote a dropped path but never escape it, so its
-# backslashes must not go through the POSIX split.
-[target.'cfg(windows)'.dependencies]
-winsplit = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
-# Tests sign access tokens the way an issuer would; the binary itself signs
-# nothing and gets its crypto through quack-core.
-aws-lc-rs    = { workspace = true, features = ["aws-lc-sys"] }
-# A test opens a workspace file from a child process, as another program
-# would, to show a snapshot closes it.
-duckdb       = { workspace = true, features = ["bundled"] }
-ipnet        = { workspace = true, features = ["std"] }
-jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
-proptest     = { workspace = true, features = ["std"] }
-sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+axum          = { workspace = true, features = ["http1", "json", "tokio"] }

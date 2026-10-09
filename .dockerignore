@@ -9,16 +9,24 @@
 
 # Workspace crate manifests (the dependency caching layer)
 !crates/quack-core/Cargo.toml
+!crates/quack-cli/Cargo.toml
+!crates/quack-server/Cargo.toml
+!crates/quack-terminal/Cargo.toml
+!crates/quack-testkit/Cargo.toml
 !crates/quack/Cargo.toml
 
 # Source and compile-time assets
 !crates/quack-core/src/
+!crates/quack-cli/src/
+!crates/quack-server/src/
+!crates/quack-terminal/src/
+!crates/quack-testkit/src/
 # sqlx::migrate!("./migrations") reads these at compile time (docs/migrations.md)
 !crates/quack-core/migrations/
 !crates/quack/src/
-!crates/quack/templates/
-!crates/quack/static/
-!crates/quack/styles/
+!crates/quack-server/templates/
+!crates/quack-server/static/
+!crates/quack-server/styles/
 
 # Prebuilt binaries for Dockerfile.release
 !dist/linux-amd64/quack

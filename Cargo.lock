@@ -4377,49 +4377,39 @@ name = "quack"
 version = "2026.10.5"
 dependencies = [
  "anyhow",
- "arboard",
- "askama",
- "aws-lc-rs",
  "axum",
- "axum-extra",
- "base64 0.23.1",
  "clap",
  "crossterm 0.29.0",
  "csv",
- "dirs",
- "duckdb",
- "futures",
  "inquire",
- "ipnet",
  "jiff",
- "jsonwebtoken",
  "mimalloc",
- "mime_guess",
- "proptest",
- "pulldown-cmark",
+ "quack-cli",
  "quack-core",
- "ratatui",
- "ratatui-textarea",
- "rmcp",
- "rust-embed",
- "schemars",
+ "quack-server",
+ "quack-terminal",
  "secrecy",
- "serde",
  "serde_json",
- "shlex 2.0.1",
- "sqlparser",
- "sqlx",
  "tempfile",
  "tokio",
- "tokio-util",
- "tower",
- "tower-http 0.7.1",
- "tower_governor",
  "tracing",
  "tracing-subscriber",
- "utoipa",
- "uuid",
- "winsplit",
+]
+
+[[package]]
+name = "quack-cli"
+version = "2026.10.5"
+dependencies = [
+ "anyhow",
+ "clap",
+ "jiff",
+ "quack-core",
+ "quack-testkit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4492,6 +4482,80 @@ dependencies = [
  "whatlang",
  "windows-native-keyring-store",
  "zip 8.6.0",
+]
+
+[[package]]
+name = "quack-server"
+version = "2026.10.5"
+dependencies = [
+ "anyhow",
+ "askama",
+ "aws-lc-rs",
+ "axum",
+ "axum-extra",
+ "base64 0.23.1",
+ "duckdb",
+ "futures",
+ "ipnet",
+ "jiff",
+ "jsonwebtoken",
+ "mime_guess",
+ "pulldown-cmark",
+ "quack-core",
+ "quack-testkit",
+ "rmcp",
+ "rust-embed",
+ "schemars",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http 0.7.1",
+ "tower_governor",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "quack-terminal"
+version = "2026.10.5"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "base64 0.23.1",
+ "clap",
+ "crossterm 0.29.0",
+ "dirs",
+ "futures",
+ "jiff",
+ "proptest",
+ "pulldown-cmark",
+ "quack-cli",
+ "quack-core",
+ "ratatui",
+ "ratatui-textarea",
+ "serde_json",
+ "shlex 2.0.1",
+ "sqlparser",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "winsplit",
+]
+
+[[package]]
+name = "quack-testkit"
+version = "2026.10.5"
+dependencies = [
+ "axum",
+ "quack-core",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -62,8 +62,8 @@ to cross-compile for the static musl build, and one certain rustls backend at ru
   `aws_lc_rs` feature (never `rust_crypto`), so its signature checks run on the same
   aws-lc-rs, the FIPS module on Linux. With one backend it selects its provider itself.
   Its `signature` dependency is RustCrypto's trait crate and holds no algorithms.
-- `crates/quack` declares neither `aws-lc-rs` nor `rustls` at runtime: it installs the
-  provider through `quack_core::crypto` and uses no rustls API of its own. Its tests sign
+- `crates/quack` and `crates/quack-server` declare neither `aws-lc-rs` nor `rustls` at runtime: it installs the
+  provider through `quack_core::crypto` and use no rustls API of their own. The server's tests sign
   access tokens the way an issuer would, with `aws-lc-rs` and `jsonwebtoken` as
   dev-dependencies only.
 - `rustls` carries `prefer-post-quantum`, so `X25519MLKEM768` leads the key exchange list.
