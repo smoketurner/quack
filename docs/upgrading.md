@@ -46,6 +46,9 @@ vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
 - Changed: `quack ontology propose --auto-accept` exits 0 when every candidate has low support,
   as with a single document. It accepts nothing and points to
   `quack ontology review --low-support`. It used to exit 1 with "no pending candidates for run".
+- Changed: in `quack config --format json`, each unrecognized key carries `hint` in place of
+  `suggestion`: `{"did_you_mean": "top_k"}`, or `{"removed": "..."}` for a key an earlier
+  release read, with what took its place.
 
 ## v2026.10.4
 

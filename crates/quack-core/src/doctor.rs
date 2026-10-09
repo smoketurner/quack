@@ -389,8 +389,8 @@ fn check_config(report: &mut Report, inspection: &Inspection) {
             Status::Fail,
             format!("unknown key {}", unknown.path),
         );
-        report.push(match &unknown.suggestion {
-            Some(suggestion) => check.fix(format!("did you mean {suggestion}?")),
+        report.push(match &unknown.hint {
+            Some(hint) => check.fix(hint.to_string()),
             None => check.fix("remove it; `quack config` lists the keys this binary reads"),
         });
     }
