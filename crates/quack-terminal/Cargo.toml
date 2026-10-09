@@ -1,0 +1,37 @@
+[package]
+name                   = "quack-terminal"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish                = false
+
+[lints]
+workspace = true
+
+[dependencies]
+quack-cli        = { path = "../quack-cli" }
+quack-core       = { path = "../quack-core" }
+anyhow           = { workspace = true, features = ["std"] }
+arboard          = { workspace = true }
+base64           = { workspace = true, features = ["std"] }
+clap             = { workspace = true, features = ["derive", "error-context", "help", "std", "usage"] }
+crossterm        = { workspace = true, features = ["events", "event-stream", "bracketed-paste", "osc52"] }
+dirs             = { workspace = true }
+futures          = { workspace = true, features = ["std"] }
+jiff             = { workspace = true, features = ["serde", "std"] }
+pulldown-cmark   = { workspace = true, features = ["html"] }
+ratatui          = { workspace = true, features = ["crossterm"] }
+ratatui-textarea = { workspace = true, features = ["crossterm"] }
+serde_json       = { workspace = true, features = ["std"] }
+shlex            = { workspace = true, features = ["std"] }
+sqlparser        = { workspace = true, features = ["std"] }
+tokio            = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time", "fs"] }
+tracing          = { workspace = true, features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+winsplit = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+proptest = { workspace = true, features = ["std"] }
+tempfile = { workspace = true }

@@ -18,15 +18,15 @@ use quack_core::ids::{SessionId, WorkspaceId};
 
 /// Everything a terminal session starts from: the resolved workspace, its
 /// writer and reader pool, and the session to open.
-pub(crate) struct SessionSetup {
-    pub(crate) config: Config,
-    pub(crate) workspace_name: String,
-    pub(crate) workspace_id: WorkspaceId,
-    pub(crate) db: SharedDb,
-    pub(crate) reader_db: ReaderDb,
-    pub(crate) session_id: SessionId,
+pub struct SessionSetup {
+    pub config: Config,
+    pub workspace_name: String,
+    pub workspace_id: WorkspaceId,
+    pub db: SharedDb,
+    pub reader_db: ReaderDb,
+    pub session_id: SessionId,
     /// `Allow` with `--allow-write`, else `Ask`.
-    pub(crate) writes: WritePolicy,
+    pub writes: WritePolicy,
 }
 
 /// Run the terminal session against a resolved workspace until the user quits.
@@ -38,7 +38,7 @@ pub(crate) struct SessionSetup {
 /// and every slash command, and a question says how to configure one;
 /// without an embedding model document search is keyword-only, as in print
 /// mode and the web.
-pub(crate) async fn run(setup: SessionSetup) -> Result<()> {
+pub async fn run(setup: SessionSetup) -> Result<()> {
     let mut tui_app = app::App::new(setup);
     tui_app.load_current_session().await?;
     tui_app.load_input_history().await?;

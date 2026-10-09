@@ -12,7 +12,7 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, HighlightSpacing, Row, StatefulWidget, Table, TableState, Widget,
 };
 
-use crate::terminal::ui::one_line;
+use crate::ui::one_line;
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 

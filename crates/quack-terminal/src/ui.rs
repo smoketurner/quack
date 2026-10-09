@@ -14,11 +14,11 @@ use ratatui::widgets::{
     Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
 };
 
-use crate::terminal::app::{App, Message, MessageKind, PendingPrompt};
-use crate::terminal::clipboard::CopyStatus;
-use crate::terminal::commands::Suggestion;
-use crate::terminal::markdown;
-use crate::terminal::selection::{Row, TranscriptView, Wrap};
+use crate::app::{App, Message, MessageKind, PendingPrompt};
+use crate::clipboard::CopyStatus;
+use crate::commands::Suggestion;
+use crate::markdown;
+use crate::selection::{Row, TranscriptView, Wrap};
 use quack_core::analysis::events::DetailPreview;
 use quack_core::jobs::{JobCounts, JobInfo, JobState};
 

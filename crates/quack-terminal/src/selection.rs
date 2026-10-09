@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, StyledGrapheme};
 
-use crate::terminal::ui::wrap;
+use crate::ui::wrap;
 
 /// The columns every transcript row gives to its marker.
 pub(crate) const PREFIX_WIDTH: usize = 3;

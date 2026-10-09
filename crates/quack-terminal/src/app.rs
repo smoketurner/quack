@@ -57,15 +57,13 @@ use quack_core::storage::workspace::{
 use quack_core::text::OneLine;
 use quack_core::vault::Vault;
 
-use crate::terminal::SessionSetup;
-use crate::terminal::chart::ChartData;
-use crate::terminal::clipboard::{Clipboard, CopyStatus};
-use crate::terminal::commands::{
-    Completion, ContextAction, FileLine, GraphWalk, Input, Route, SlashCommand,
-};
-use crate::terminal::picker::{Picked, Picker};
-use crate::terminal::selection::{Edge, Located, Selection, TranscriptView};
-use crate::terminal::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
+use crate::SessionSetup;
+use crate::chart::ChartData;
+use crate::clipboard::{Clipboard, CopyStatus};
+use crate::commands::{Completion, ContextAction, FileLine, GraphWalk, Input, Route, SlashCommand};
+use crate::picker::{Picked, Picker};
+use crate::selection::{Edge, Located, Selection, TranscriptView};
+use crate::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
 use quack_cli::args::ModeArg;
 use quack_cli::confirm::Confirm;
 use quack_cli::embeddings_cli::{self, EmbeddingsAction};

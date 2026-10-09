@@ -40,7 +40,7 @@ Cargo.toml            # virtual workspace: deps menu + strict lints + profiles
 deny.toml             # advisories, license allow-list, OpenSSL/ring bans
 rust-toolchain.toml   # pinned 1.99.0 + rustfmt + clippy
 Makefile              # build / fmt / lint / test / deny
-crates/               # quack-core (engine), quack-cli (shared command verbs), quack-server (REST, web UI, MCP), quack-testkit, quack (the binary) — see crates/README.md
+crates/               # quack-core (engine), quack-cli (shared command verbs), quack-server (REST, web UI, MCP), quack-terminal (the session), quack-testkit, quack (the binary) — see crates/README.md
 docs/                 # design-doc.md (the product), architecture, migrations, crypto, web-ui, ci-cd, authentication, providers
 .claude/rules/        # code-standards and development-discipline gates; branching, commits, continuous-improvement conventions
 ```
@@ -53,7 +53,7 @@ docs/                 # design-doc.md (the product), architecture, migrations, c
   tests, opt out narrowly: `#[expect(clippy::unwrap_used, reason = "...")]`; `#[allow]` is
   denied, so every opt-out is an `#[expect]` with a reason.
 - **Import, don't spell paths.** `clippy::absolute_paths` denies any `crate::` or
-  workspace-crate path (`quack_core::`, `quack_cli::`, `quack_server::`, ...) longer than two segments outside a `use`: import the type, or import
+  workspace-crate path (`quack_core::`, `quack_cli::`, `quack_server::`, `quack_terminal::`, ...) longer than two segments outside a `use`: import the type, or import
   a function's parent module and call `module::function`. External crates are exempt
   through `absolute-paths-allowed-crates` in `.clippy.toml`; a new dependency named by a
   full path goes on that list.
@@ -225,9 +225,9 @@ The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`,
 statement, file, import, and ontology or graph verb as a job, so it never blocks its input:
 a strip above the prompt shows active jobs, `/jobs` lists them, `/cancel N` stops one, and
 write prompts from concurrent work queue up. A left-button drag over the transcript
-selects text in transcript lines (`terminal::selection`), and releasing copies it without row
+selects text in transcript lines (`quack-terminal`'s `selection`), and releasing copies it without row
 markers or wrap breaks to the system clipboard (`arboard`) and the terminal's (OSC 52;
-`terminal::clipboard`). Its commands' database steps run in the order
+`clipboard`). Its commands' database steps run in the order
 typed on one worker task (`App::on_db`: reads on the reader pool, writes in the writer's
 interactive line), never on the loop's thread; input typed during `/new`, `/resume`, or
 `/mode` waits for the switch. `SharedDb` is `Arc<storage::writer::Writer>`, an actor: one

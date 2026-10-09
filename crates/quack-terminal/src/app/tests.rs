@@ -8,8 +8,8 @@ use quack_core::ingestion::parser::SectionKind;
 use quack_core::storage::profile::{TableNote, TableProfile};
 
 use super::*;
-use crate::terminal::commands::Suggestion;
-use crate::terminal::selection::{Position, Row};
+use crate::commands::Suggestion;
+use crate::selection::{Position, Row};
 use quack_core::ids::{ChunkId, DocumentId};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;

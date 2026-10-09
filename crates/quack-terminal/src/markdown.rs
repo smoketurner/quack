@@ -8,7 +8,7 @@ use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-use crate::terminal::ui::wrap;
+use crate::ui::wrap;
 
 type Row = Vec<Span<'static>>;
 

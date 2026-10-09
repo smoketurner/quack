@@ -45,7 +45,7 @@ fn wrapping_counts_columns_and_keeps_graphemes_whole() {
 
 #[test]
 fn chart_fingerprint_covers_the_plot_not_just_the_title() {
-    use crate::terminal::chart::ChartData;
+    use crate::chart::ChartData;
     use quack_core::analysis::chart::{Axis as SpecAxis, ChartKind, ChartSpec, Series};
 
     fn spec(kind: ChartKind) -> ChartSpec {

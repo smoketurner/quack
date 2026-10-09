@@ -5,9 +5,10 @@ crates and modules that exist.
 
 ## Workspace
 
-quack is a virtual Cargo workspace (`Cargo.toml` has no `[package]`) with five members
+quack is a virtual Cargo workspace (`Cargo.toml` has no `[package]`) with six members
 under `crates/`: `quack-core`, the library; `quack-cli`, the command verbs the binary and
-the terminal share; `quack-server`, `quack serve` and the MCP server;
+the terminal share; `quack-server`, `quack serve` and the MCP server; `quack-terminal`, the
+interactive session;
 `quack-testkit`, the scripted Ollama server the
 interface tests run whole agent turns against; and `quack`, the one binary. The root sets:
 
@@ -99,12 +100,24 @@ depends on `quack-core` alone.
 The templates, static assets, stylesheet input, and the SQL editor's bundle sit beside its
 `src/`.
 
+## `quack-terminal`
+
+The interactive session, a library of the one binary: `quack_terminal::run` and
+`SessionSetup` are its whole public API. It depends on `quack-core` and `quack-cli`, not on
+the server.
+
+| Module | Owns |
+|---|---|
+| `app` | the session: every submission a job on the work queue, the job strip, streaming per turn, inline steps, queued permission prompts |
+| `commands` | slash commands and their completion |
+| `ui`, `chart`, `markdown`, `picker`, `sql` | rendering, charts, Markdown, the pickers, and the SQL editor's parsing |
+| `selection`, `clipboard` | mouse selection copied to the system clipboard and the terminal's |
+
 ## `quack`
 
 | Module | Owns |
 |---|---|
 | `main` | the clap command tree, print mode entry, the workspace-local subcommands (`ingest`, `docs`, `sessions`, `export`, `context`, `import`, `okf`, `auth`) |
-| `terminal` | the interactive session (ratatui): every submission a job on the work queue, the job strip, streaming per turn, inline steps, queued permission prompts, slash commands, charts, mouse selection copied to the clipboard (`selection`, `clipboard`) |
 | `admin` | the server administration commands |
 
 ## The storage boundary

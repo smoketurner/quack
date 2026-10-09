@@ -128,6 +128,7 @@ crates/
     src/
       print.rs         one-shot mode and output formats
       graph_cli.rs, ontology_cli.rs   the `graph` and `ontology` subcommands
+  quack-terminal/  the interactive session (ratatui)
   quack-server/    `quack serve` and the MCP server
     src/
       lib.rs           axum router, REST, SSE
@@ -138,11 +139,10 @@ crates/
                    print mode, admin (`quack desktop` is planned, section 11.6)
     src/
       main.rs          clap surface, crypto provider install, logging
-      terminal/        ratatui session
       admin.rs         user, token, member, and audit subcommands
 ```
 
-Five crates, no Cargo features. Surfaces are subcommands, not build variants.
+Six crates, no Cargo features. Surfaces are subcommands, not build variants.
 
 Every interface calls the same core entry points:
 

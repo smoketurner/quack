@@ -7,7 +7,6 @@ mod config_cli;
 mod doctor_cli;
 mod init_cli;
 mod progress_line;
-mod terminal;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -61,8 +60,8 @@ use quack_cli::stdio::{NamedInput, StdioPath};
 use quack_cli::text_or_json::TextOrJson;
 use quack_cli::{embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
 
-use crate::terminal::SessionSetup;
 use quack_server::ServeMode;
+use quack_terminal::SessionSetup;
 
 /// How a command ended when not plainly: the exit status scripts check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1665,7 +1664,7 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
         workspace,
         name,
     } = opened;
-    terminal::run(SessionSetup {
+    quack_terminal::run(SessionSetup {
         config,
         workspace_name: name,
         workspace_id: workspace.id,

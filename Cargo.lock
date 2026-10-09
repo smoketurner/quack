@@ -4377,33 +4377,23 @@ name = "quack"
 version = "2026.10.5"
 dependencies = [
  "anyhow",
- "arboard",
  "axum",
- "base64 0.23.1",
  "clap",
  "crossterm 0.29.0",
  "csv",
- "dirs",
- "futures",
  "inquire",
  "jiff",
  "mimalloc",
- "proptest",
- "pulldown-cmark",
  "quack-cli",
  "quack-core",
  "quack-server",
- "ratatui",
- "ratatui-textarea",
+ "quack-terminal",
  "secrecy",
  "serde_json",
- "shlex 2.0.1",
- "sqlparser",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "winsplit",
 ]
 
 [[package]]
@@ -4529,6 +4519,33 @@ dependencies = [
  "tracing",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "quack-terminal"
+version = "2026.10.5"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "base64 0.23.1",
+ "clap",
+ "crossterm 0.29.0",
+ "dirs",
+ "futures",
+ "jiff",
+ "proptest",
+ "pulldown-cmark",
+ "quack-cli",
+ "quack-core",
+ "ratatui",
+ "ratatui-textarea",
+ "serde_json",
+ "shlex 2.0.1",
+ "sqlparser",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "winsplit",
 ]
 
 [[package]]
