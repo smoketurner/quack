@@ -481,8 +481,31 @@ pub struct AuthStatus {
 /// A cached token's lifetime, as `quack auth status` shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenStatus {
-    pub expires_at: Timestamp,
+    pub lifetime: Lifetime,
     pub renewal: Renewal,
+}
+
+/// Whether a stored token is still usable as is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifetime {
+    /// Still valid until the issuer's expiry.
+    Valid { expires_at: Timestamp },
+    /// Past its expiry; nothing uses it until it is renewed.
+    Expired { expired_at: Timestamp },
+}
+
+impl Lifetime {
+    fn of(token: &CachedToken, now: Timestamp) -> Self {
+        if token.is_fresh(now, SignedDuration::ZERO) {
+            Self::Valid {
+                expires_at: token.expires_at,
+            }
+        } else {
+            Self::Expired {
+                expired_at: token.expires_at,
+            }
+        }
+    }
 }
 
 /// What happens when a cached token expires.
@@ -986,17 +1009,19 @@ impl TokenManager {
         Ok(CachedToken::from_response(&response))
     }
 
-    /// Whether a token is stored, and its lifetime, without any network use.
+    /// Whether a token is stored, whether it is still valid, and how it
+    /// renews, without any network use.
     ///
     /// # Errors
     ///
     /// Returns an error when the stored token cannot be read.
     pub async fn status(&self) -> Result<AuthStatus> {
         let cached = self.store.load().await?;
+        let now = Timestamp::now();
         Ok(AuthStatus {
             provider: self.provider.to_string(),
             token: cached.map(|t| TokenStatus {
-                expires_at: t.expires_at,
+                lifetime: Lifetime::of(&t, now),
                 renewal: match (self.config.grant, t.refresh_token.is_some()) {
                     (Grant::ClientCredentials | Grant::OnBehalfOf, _) => Renewal::Regrant,
                     (Grant::AuthorizationCode | Grant::DeviceCode, true) => Renewal::Refreshable,

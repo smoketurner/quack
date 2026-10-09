@@ -27,7 +27,9 @@ use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile};
 use quack_core::llm::Embeddings;
 use quack_core::llm::after_turn::AfterTurn;
 use quack_core::llm::egress::Egress;
-use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt, TokenManager, TokenStatus};
+use quack_core::llm::oauth::{
+    KeySource, Lifetime, LoginFlow, LoginPrompt, Renewal, TokenManager, TokenStatus,
+};
 use quack_core::okf::{self, Bundle, DirSink, TarSink};
 use quack_core::ontology::store::Revision;
 use quack_core::progress::RunControl;
@@ -1544,23 +1546,41 @@ fn token_state(name: &str, token: Option<TokenStatus>, grant: Grant, sends_actor
         (_, Grant::OnBehalfOf) if !sends_actor => String::from(
             "acts on behalf of each person signed in to quack serve, without an actor token; nothing to log in to",
         ),
-        (Some(token), Grant::ClientCredentials) => {
-            format!("token expires {}, {}", token.expires_at, token.renewal)
+        (Some(token), Grant::ClientCredentials) => match token.lifetime {
+            Lifetime::Valid { expires_at } => {
+                format!("token expires {expires_at}, {}", token.renewal)
+            }
+            Lifetime::Expired { expired_at } => format!(
+                "token expired {expired_at}; the client-credentials grant runs again on next use"
+            ),
+        },
+        (Some(token), Grant::AuthorizationCode | Grant::DeviceCode) => {
+            match (token.lifetime, token.renewal) {
+                (Lifetime::Valid { expires_at }, renewal) => {
+                    format!("logged in, token expires {expires_at}, {renewal}")
+                }
+                (Lifetime::Expired { expired_at }, Renewal::Refreshable | Renewal::Regrant) => {
+                    format!("logged in, token expired {expired_at}, refreshes on next use")
+                }
+                (Lifetime::Expired { expired_at }, Renewal::Relogin) => format!(
+                    "token expired {expired_at}, no refresh token; run `quack auth login {name}`"
+                ),
+            }
         }
-        (Some(token), Grant::AuthorizationCode | Grant::DeviceCode) => format!(
-            "logged in, token expires {}, {}",
-            token.expires_at, token.renewal
-        ),
         (None, Grant::ClientCredentials) => {
             String::from("no token yet; one is requested on first use")
         }
         (None, Grant::AuthorizationCode | Grant::DeviceCode) => {
             format!("not logged in; run `quack auth login {name}`")
         }
-        (Some(token), Grant::OnBehalfOf) => format!(
-            "acts on behalf of each signed-in person; quack's own token (the actor) expires {}",
-            token.expires_at
-        ),
+        (Some(token), Grant::OnBehalfOf) => match token.lifetime {
+            Lifetime::Valid { expires_at } => format!(
+                "acts on behalf of each signed-in person; quack's own token (the actor) expires {expires_at}"
+            ),
+            Lifetime::Expired { expired_at } => format!(
+                "acts on behalf of each signed-in person; quack's own token (the actor) expired {expired_at} and is requested again on next use"
+            ),
+        },
         (None, Grant::OnBehalfOf) => String::from(
             "acts on behalf of each person signed in to quack serve; nothing to log in to",
         ),
