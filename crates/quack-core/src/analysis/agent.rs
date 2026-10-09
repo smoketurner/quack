@@ -429,11 +429,16 @@ impl Cutoff {
 
     /// Why a one-shot call's answer cannot be used: a cut-off answer is
     /// not one to parse.
-    pub(crate) fn refusal(self, what: &str) -> Error {
+    pub(crate) fn refusal(self, what: &str, window: Window) -> Error {
         Error::Llm(match self {
             Self::Length => format!(
-                "the {what} answer was cut off at the model's output limit (with Ollama, the \
-                 context window: OLLAMA_CONTEXT_LENGTH on the server)"
+                "the {what} answer was cut off at the model's output limit{}",
+                match window {
+                    Window::Ollama =>
+                        " (with Ollama, the context window: OLLAMA_CONTEXT_LENGTH \
+                                       on the server)",
+                    Window::Provider => "",
+                }
             ),
             Self::Filtered => {
                 format!("the {what} answer was stopped by the provider's content filter")

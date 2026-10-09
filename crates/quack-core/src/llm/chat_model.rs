@@ -29,6 +29,7 @@ use rig::driver::Transport;
 use rig::operation::Completion;
 use rig::providers::openai::extension::OpenAiOptions;
 
+use crate::analysis::text_to_sql::Window;
 use crate::config::{BedrockApi, Effort, ProviderConfig, ProviderType};
 use crate::error::{Error, Result};
 
@@ -52,6 +53,18 @@ pub enum Wire {
 }
 
 impl Wire {
+    /// Who sizes the context window of a model called through this API,
+    /// which decides what a cut-off answer tells the person to change.
+    #[must_use]
+    pub const fn window(self) -> Window {
+        match self {
+            Self::Ollama => Window::Ollama,
+            Self::ChatCompletions | Self::Responses | Self::Anthropic | Self::Converse => {
+                Window::Provider
+            }
+        }
+    }
+
     /// The API `provider`'s chat model is called through.
     #[must_use]
     pub fn of(provider: &ProviderConfig) -> Self {
@@ -197,6 +210,12 @@ impl ChatModel {
             model: model.erase(),
             settings,
         })
+    }
+
+    /// Who sizes the model's context window.
+    #[must_use]
+    pub const fn window(&self) -> Window {
+        self.settings.wire.window()
     }
 
     /// A rig agent on the model with its settings applied; `temperature` is

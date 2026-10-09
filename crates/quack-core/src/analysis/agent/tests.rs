@@ -4,6 +4,17 @@ use crate::analysis::citations::CitationRegistry;
 use crate::ids::{ChunkId, DocumentId};
 
 #[test]
+fn only_an_ollama_cutoff_names_the_ollama_window() {
+    let ollama = Cutoff::Length.refusal("rerank", Window::Ollama).to_string();
+    assert!(ollama.contains("OLLAMA_CONTEXT_LENGTH"), "{ollama}");
+    let provider = Cutoff::Length
+        .refusal("rerank", Window::Provider)
+        .to_string();
+    assert!(provider.contains("output limit"), "{provider}");
+    assert!(!provider.contains("Ollama"), "{provider}");
+}
+
+#[test]
 fn stream_errors_are_explained_for_the_user() {
     let config = AnalysisConfig::default();
     let unknown = PromptError::UnknownToolCall {

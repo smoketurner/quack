@@ -738,13 +738,16 @@ pub(crate) struct PlainCall {
     agent: Agent,
     timeout: Duration,
     label: &'static str,
+    window: Window,
 }
 
 impl<A> SchemaCall<A> {
     #[must_use]
     pub fn new(model: ChatModel, task: Task<'_>, schema: Schema) -> Self {
+        let window = model.window();
         Self {
             call: PlainCall {
+                window,
                 agent: model
                     .agent(0.0)
                     .preamble(task.preamble)
@@ -784,6 +787,7 @@ impl PlainCall {
     /// A call to `model` with `task`'s preamble that answers in text.
     pub(crate) fn new(model: ChatModel, task: Task<'_>) -> Self {
         Self {
+            window: model.window(),
             agent: model.agent(0.0).preamble(task.preamble).build(),
             timeout: task.timeout,
             label: task.label,
@@ -802,7 +806,7 @@ impl PlainCall {
             while let Some(item) = stream.next().await {
                 let item = match item {
                     Ok(item) => item,
-                    Err(_) if let Some(cut) = cutoff => return Err(cut.refusal(what)),
+                    Err(_) if let Some(cut) = cutoff => return Err(cut.refusal(what, self.window)),
                     Err(e) => return Err(Error::Llm(format!("{what} call failed: {e}"))),
                 };
                 match item {
@@ -832,7 +836,7 @@ impl PlainCall {
             // A cut-off answer is not one to parse: say so, rather than let
             // the caller fail on half a JSON document.
             if let Some(cut) = cutoff {
-                return Err(cut.refusal(what));
+                return Err(cut.refusal(what, self.window));
             }
             Ok::<String, Error>(match final_text {
                 Some(t) if answer.trim().is_empty() => t,
@@ -1425,13 +1429,7 @@ async fn start_turn<'c>(
     let session_id = session_id.to_owned();
     let pinned_token_budget = config.retrieval.pinned_token_budget;
     let context_max_tokens = config.context.max_tokens;
-    let window = match chat.provider.provider_type {
-        ProviderType::Ollama => Window::Ollama,
-        ProviderType::Openai
-        | ProviderType::Anthropic
-        | ProviderType::Bedrock
-        | ProviderType::BedrockMantle => Window::Provider,
-    };
+    let window = Wire::of(chat.provider).window();
     let read = session_id.clone();
     let documents = documents.to_vec();
     let prompt = db
