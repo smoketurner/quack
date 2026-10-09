@@ -270,10 +270,10 @@ enum Commands {
     /// over the network), and the server's bind address
     Doctor(DoctorArgs),
 
-    /// Set up config.toml: find the model providers this machine can reach,
-    /// ask which models to use, and write the file once `quack doctor`
-    /// passes it
-    Init(init_cli::InitArgs),
+    /// Set up or edit config.toml: find the model providers this machine
+    /// can reach, ask which models to use, and write the file once `quack
+    /// doctor` passes it
+    Init,
 
     /// List ingested documents, or pin and unpin one
     Docs(DocsArgs),
@@ -1171,9 +1171,9 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         }
         Commands::Config(args) => run_config(&args).await,
         Commands::Doctor(args) => run_doctor(cli, &args).await,
-        Commands::Init(args) => {
+        Commands::Init => {
             init_logging();
-            args.run().await
+            init_cli::run_init().await
         }
         Commands::Docs(args) => {
             let ws_db = open_workspace(cli).await?;
@@ -1998,6 +1998,9 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
             "the interactive session needs a terminal; use `quack -p PROMPT` or `quack -q SQL` in pipelines"
         );
         return Ok(ExitCode::from(Exit::Usage));
+    }
+    if let Some(code) = init_cli::offer_on_first_run().await? {
+        return Ok(code);
     }
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
     let ws_db = opened.open_db()?;

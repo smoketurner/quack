@@ -89,6 +89,7 @@ absolute-paths-allowed-crates = [
     "tokio",
     "tokio_util",
     "toml",
+    "toml_edit",
     "tower",
     "tower_governor",
     "tower_http",

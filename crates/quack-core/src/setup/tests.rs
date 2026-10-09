@@ -198,50 +198,59 @@ async fn hosted_providers_are_found_by_their_credentials_alone() {
     );
 }
 
-#[expect(clippy::unwrap_used, reason = "test")]
-fn model(spec: &str) -> ModelSpec {
-    spec.parse().unwrap()
+fn choice(kind: ProviderKind, model: &str) -> Choice {
+    Choice {
+        kind,
+        model: model.to_owned(),
+    }
+}
+
+fn embedding(kind: ProviderKind, model: &str, width: u32) -> EmbeddingChoice {
+    EmbeddingChoice {
+        choice: choice(kind, model),
+        dimension: Dimension::new(width),
+    }
 }
 
 #[test]
 #[expect(clippy::unwrap_used, reason = "test")]
-fn each_provider_type_writes_a_file_quack_loads() {
+fn each_provider_type_writes_a_new_file_quack_loads() {
     let plans = [
         SetupPlan {
-            chat_model: Some(model("ollama/chat:8b")),
-            embedding: Some(EmbeddingChoice {
-                model: model("ollama/embed:small"),
-                dimension: Dimension::new(1024),
-            }),
+            chat: Some(choice(ProviderKind::Ollama, "chat:8b")),
+            embedding: Some(embedding(ProviderKind::Ollama, "embed:small", 1024)),
             ollama_base_url: Some(BaseUrl::try_from(String::from("http://gpu-box:11434")).unwrap()),
         },
         SetupPlan {
-            chat_model: Some(model("anthropic/claude-x")),
+            chat: Some(choice(ProviderKind::Anthropic, "claude-x")),
             ..SetupPlan::default()
         },
         SetupPlan {
-            chat_model: Some(model("openai/gpt-x")),
-            embedding: Some(EmbeddingChoice {
-                model: model("openai/text-embedding-3-small"),
-                dimension: Dimension::new(1536),
-            }),
+            chat: Some(choice(ProviderKind::OpenAi, "gpt-x")),
+            embedding: Some(embedding(
+                ProviderKind::OpenAi,
+                "text-embedding-3-small",
+                1536,
+            )),
             ollama_base_url: None,
         },
         SetupPlan {
-            chat_model: Some(model("bedrock/us.anthropic.claude-x")),
-            embedding: Some(EmbeddingChoice {
-                model: model("bedrock/amazon.titan-embed-text-v2:0"),
-                dimension: Dimension::new(1024),
-            }),
+            chat: Some(choice(ProviderKind::Bedrock, "us.anthropic.claude-x")),
+            embedding: Some(embedding(
+                ProviderKind::Bedrock,
+                "amazon.titan-embed-text-v2:0",
+                1024,
+            )),
             ollama_base_url: None,
         },
     ];
     for plan in plans {
-        let text = plan.toml().unwrap();
+        let (text, changes) = plan.apply(None).unwrap();
         let config = Config::parse(&text).unwrap();
+        let chat = plan.chat.as_ref().unwrap();
         assert_eq!(
-            config.general.chat_model.as_ref().map(ToString::to_string),
-            plan.chat_model.as_ref().map(ToString::to_string),
+            config.general.chat_model.map(|m| m.to_string()),
+            Some(format!("{}/{}", chat.kind.name(), chat.model)),
             "{text}"
         );
         assert_eq!(
@@ -249,26 +258,24 @@ fn each_provider_type_writes_a_file_quack_loads() {
             plan.embedding.as_ref().map(|e| e.dimension),
             "{text}"
         );
-        assert_eq!(
-            config.providers.len(),
-            plan.providers().unwrap().len(),
-            "{text}"
+        assert_eq!(config.providers.len(), plan.providers().len(), "{text}");
+        assert!(text.starts_with("# Written by `quack init`"), "{text}");
+        assert!(
+            changes.iter().any(|c| c.starts_with("adds [providers.")),
+            "{changes:?}"
         );
     }
 }
 
 #[test]
 #[expect(clippy::unwrap_used, reason = "test")]
-fn the_file_names_the_key_variable_and_only_the_providers_used() {
+fn a_new_file_names_the_key_variable_and_only_the_providers_used() {
     let plan = SetupPlan {
-        chat_model: Some(model("anthropic/claude-x")),
-        embedding: Some(EmbeddingChoice {
-            model: model("ollama/embed:small"),
-            dimension: Dimension::new(1024),
-        }),
+        chat: Some(choice(ProviderKind::Anthropic, "claude-x")),
+        embedding: Some(embedding(ProviderKind::Ollama, "embed:small", 1024)),
         ollama_base_url: None,
     };
-    let text = plan.toml().unwrap();
+    let (text, _) = plan.apply(None).unwrap();
     assert!(
         text.contains("api_key_env = \"ANTHROPIC_API_KEY\""),
         "{text}"
@@ -280,27 +287,148 @@ fn the_file_names_the_key_variable_and_only_the_providers_used() {
     // The default Ollama address is left to the default.
     assert!(!text.contains("base_url"), "{text}");
     assert_eq!(
-        plan.providers().unwrap(),
+        plan.providers(),
         [ProviderKind::Ollama, ProviderKind::Anthropic]
     );
 }
 
+/// A file someone wrote by hand, with comments, other settings, and a
+/// provider under its own name.
+const EXISTING: &str = r#"# my quack setup
+[general]
+chat_model = "local/old:7b"   # the small one
+default_workspace = "research"
+
+[embedding]
+model = "local/nomic-embed-text"
+dimension = 768
+query_prefix = "search_query: "
+
+[providers.local]
+type = "ollama"
+max_concurrent_requests = 2
+
+[analysis]
+effort = "high"
+"#;
+
 #[test]
-fn a_model_on_another_provider_is_refused() {
+#[expect(clippy::unwrap_used, reason = "test")]
+fn editing_keeps_every_other_setting_and_comment_and_reuses_a_matching_provider() {
     let plan = SetupPlan {
-        chat_model: Some(model("gateway/x")),
+        chat: Some(choice(ProviderKind::Ollama, "chat:8b")),
+        embedding: Some(embedding(ProviderKind::Ollama, "embed:small", 1024)),
+        ollama_base_url: None,
+    };
+    let (text, changes) = plan.apply(Some(EXISTING)).unwrap();
+    let config = Config::parse(&text).unwrap();
+    assert_eq!(
+        config.general.chat_model.map(|m| m.to_string()).as_deref(),
+        Some("local/chat:8b"),
+        "{text}"
+    );
+    assert!(text.starts_with("# my quack setup\n"), "{text}");
+    assert!(
+        text.contains("chat_model = \"local/chat:8b\"   # the small one"),
+        "{text}"
+    );
+    assert!(text.contains("default_workspace = \"research\""), "{text}");
+    assert!(text.contains("query_prefix = \"search_query: \""), "{text}");
+    assert!(text.contains("max_concurrent_requests = 2"), "{text}");
+    assert!(text.contains("effort = \"high\""), "{text}");
+    assert!(text.contains("dimension = 1024"), "{text}");
+    assert!(!text.contains("[providers.ollama]"), "{text}");
+    assert_eq!(
+        changes,
+        [
+            "[general].chat_model = \"local/chat:8b\" (was \"local/old:7b\")",
+            "[embedding].model = \"local/embed:small\" (was \"local/nomic-embed-text\")",
+            "[embedding].dimension = 1024 (was 768)",
+        ]
+    );
+}
+
+#[test]
+#[expect(clippy::unwrap_used, reason = "test")]
+fn editing_adds_a_missing_provider_and_leaves_what_it_does_not_choose() {
+    let plan = SetupPlan {
+        chat: Some(choice(ProviderKind::Anthropic, "claude-x")),
+        embedding: None,
+        ollama_base_url: None,
+    };
+    let (text, changes) = plan.apply(Some(EXISTING)).unwrap();
+    let config = Config::parse(&text).unwrap();
+    assert_eq!(
+        config.general.chat_model.map(|m| m.to_string()).as_deref(),
+        Some("anthropic/claude-x")
+    );
+    assert_eq!(
+        config.embedding.model.map(|m| m.to_string()).as_deref(),
+        Some("local/nomic-embed-text")
+    );
+    assert!(config.providers.contains_key("local"), "{text}");
+    assert!(config.providers.contains_key("anthropic"), "{text}");
+    assert_eq!(
+        changes,
+        [
+            "[general].chat_model = \"anthropic/claude-x\" (was \"local/old:7b\")",
+            "adds [providers.anthropic]",
+        ]
+    );
+}
+
+#[test]
+#[expect(clippy::unwrap_used, reason = "test")]
+fn choosing_what_the_file_already_has_changes_nothing() {
+    let plan = SetupPlan {
+        chat: Some(choice(ProviderKind::Ollama, "old:7b")),
+        embedding: Some(embedding(ProviderKind::Ollama, "nomic-embed-text", 768)),
+        ollama_base_url: None,
+    };
+    let (text, changes) = plan.apply(Some(EXISTING)).unwrap();
+    assert!(changes.is_empty(), "{changes:?}");
+    assert_eq!(text, EXISTING);
+}
+
+#[test]
+fn a_section_of_the_same_name_for_another_provider_is_refused() {
+    let existing = "[providers.anthropic]\ntype = \"openai\"\nbase_url = \"https://gateway.example.com/v1\"\nauth = \"api-key\"\napi_key_env = \"GATEWAY_KEY\"\n";
+    let plan = SetupPlan {
+        chat: Some(choice(ProviderKind::Anthropic, "claude-x")),
         ..SetupPlan::default()
     };
     let error = plan
-        .toml()
-        .map(|_| ())
+        .apply(Some(existing))
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
     assert!(
-        error.contains("quack init sets up ollama, anthropic, openai, bedrock"),
+        error.contains("[providers.anthropic] is already a different provider"),
         "{error}"
     );
+}
+
+#[test]
+fn a_file_that_is_not_toml_is_not_edited() {
+    let plan = SetupPlan {
+        chat: Some(choice(ProviderKind::Ollama, "chat:8b")),
+        ..SetupPlan::default()
+    };
+    assert!(plan.apply(Some("[general\nchat_model = 1")).is_err());
+    assert!(Current::of("[general").is_err());
+}
+
+#[test]
+#[expect(clippy::unwrap_used, reason = "test")]
+fn current_reads_the_models_the_file_names() {
+    assert_eq!(
+        Current::of(EXISTING).unwrap(),
+        Current {
+            chat_model: Some(String::from("local/old:7b")),
+            embedding_model: Some(String::from("local/nomic-embed-text")),
+        }
+    );
+    assert_eq!(Current::of("").unwrap(), Current::default());
 }
 
 #[test]

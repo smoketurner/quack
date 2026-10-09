@@ -1,14 +1,9 @@
-//! Tests for `quack init`'s menus, flags, and file write.
+//! Tests for `quack init`'s menus and the checked write.
 
 use super::*;
 
 use quack_core::config::BaseUrl;
-use quack_core::setup::Found;
-
-#[expect(clippy::unwrap_used, reason = "test")]
-fn model(spec: &str) -> ModelSpec {
-    spec.parse().unwrap()
-}
+use quack_core::doctor::Probing;
 
 fn ollama_model(name: &str, capabilities: Vec<OllamaCapability>) -> OllamaModel {
     OllamaModel {
@@ -26,61 +21,28 @@ fn ollama_found(models: Vec<OllamaModel>) -> Found {
     }
 }
 
-#[test]
-#[expect(clippy::unwrap_used, reason = "test")]
-fn the_embedding_flag_takes_a_model_or_none() {
-    assert!(matches!(
-        "none".parse::<EmbeddingFlag>().unwrap(),
-        EmbeddingFlag::None
-    ));
-    assert!(matches!(
-        "ollama/embed:small".parse::<EmbeddingFlag>().unwrap(),
-        EmbeddingFlag::Model(_)
-    ));
-    assert!("no-slash".parse::<EmbeddingFlag>().is_err());
+fn chat_on(kind: ProviderKind) -> SetupPlan {
+    SetupPlan {
+        chat: Some(Choice {
+            kind,
+            model: String::from("m"),
+        }),
+        ..SetupPlan::default()
+    }
 }
 
 #[test]
-#[expect(clippy::unwrap_used, reason = "test")]
-fn an_embedding_flag_needs_a_width_quack_knows() {
-    assert_eq!(
-        EmbeddingOption::from_flag(&model("ollama/embed:small")).unwrap(),
-        EmbeddingOption::Ollama(String::from("embed:small"))
-    );
-    assert_eq!(
-        EmbeddingOption::from_flag(&model("openai/text-embedding-3-small")).unwrap(),
-        EmbeddingOption::Hosted(
-            ProviderKind::OpenAi,
-            "text-embedding-3-small",
-            Dimension::new(1536)
-        )
-    );
-    let refused = |spec: &str| {
-        EmbeddingOption::from_flag(&model(spec))
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default()
-    };
-    assert!(
-        refused("openai/text-embedding-3-large")
-            .contains("knows the width of openai/text-embedding-3-small")
-    );
-    assert!(refused("anthropic/claude-x").contains("serves no embedding models"));
-    assert!(refused("gateway/embed").contains("sets up ollama, openai, and bedrock"));
-}
-
-#[test]
-fn ollama_embedding_models_come_first_and_none_last() {
+fn a_new_file_offers_ollama_then_the_chat_providers_model_then_none() {
     let discovery = Discovery(vec![ollama_found(vec![
         ollama_model("chat:8b", vec![OllamaCapability::Tools]),
         ollama_model("embed:small", vec![OllamaCapability::Embedding]),
     ])]);
-    let plan = SetupPlan {
-        chat_model: Some(model("bedrock/us.anthropic.claude-x")),
-        ..SetupPlan::default()
-    };
     assert_eq!(
-        EmbeddingOption::offered(&discovery, &plan),
+        EmbeddingOption::offered(
+            &discovery,
+            &chat_on(ProviderKind::Bedrock),
+            &Current::default()
+        ),
         [
             EmbeddingOption::Ollama(String::from("embed:small")),
             EmbeddingOption::Hosted(
@@ -92,13 +54,36 @@ fn ollama_embedding_models_come_first_and_none_last() {
         ]
     );
     // Anthropic serves no embeddings, and nothing else was found.
-    let plan = SetupPlan {
-        chat_model: Some(model("anthropic/claude-x")),
-        ..SetupPlan::default()
-    };
     assert_eq!(
-        EmbeddingOption::offered(&Discovery(Vec::new()), &plan),
+        EmbeddingOption::offered(
+            &Discovery(Vec::new()),
+            &chat_on(ProviderKind::Anthropic),
+            &Current::default()
+        ),
         [EmbeddingOption::None]
+    );
+}
+
+#[test]
+fn an_existing_model_is_offered_first_and_never_dropped_for_none() {
+    let current = Current {
+        chat_model: None,
+        embedding_model: Some(String::from("local/nomic-embed-text")),
+    };
+    let discovery = Discovery(vec![ollama_found(vec![ollama_model(
+        "embed:small",
+        vec![OllamaCapability::Embedding],
+    )])]);
+    assert_eq!(
+        EmbeddingOption::offered(&discovery, &SetupPlan::default(), &current),
+        [
+            EmbeddingOption::Keep(String::from("local/nomic-embed-text")),
+            EmbeddingOption::Ollama(String::from("embed:small")),
+        ]
+    );
+    assert_eq!(
+        EmbeddingOption::Keep(String::from("local/nomic-embed-text")).to_string(),
+        "Keep local/nomic-embed-text"
     );
 }
 
@@ -115,18 +100,106 @@ fn a_model_menu_line_shows_size_and_capabilities() {
 }
 
 #[test]
+#[cfg(unix)]
 #[expect(clippy::unwrap_used, reason = "test")]
-fn a_new_file_is_written_whole_and_an_existing_one_is_never_replaced() {
+fn replace_writes_a_new_file_and_replaces_one_whole_with_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("quack").join("config.toml");
-    write_new(&path, "[general]\n").unwrap();
+    replace(&path, "[general]\n").unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "[general]\n");
 
-    assert!(write_new(&path, "[embedding]\n").is_err());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "[general]\n");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    replace(&path, "[embedding]\n").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "[embedding]\n");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o640);
     // The staged file did not stay behind.
     assert_eq!(
         std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
         1
     );
+}
+
+#[test]
+#[cfg(unix)]
+#[expect(clippy::unwrap_used, reason = "test")]
+fn replace_writes_through_a_symlink_and_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("dotfiles").join("quack.toml");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, "[general]\n").unwrap();
+    let link = dir.path().join("config.toml");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    replace(&link, "[embedding]\n").unwrap();
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "[embedding]\n");
+}
+
+/// A loopback address nothing listens on.
+#[expect(clippy::unwrap_used, reason = "test")]
+fn refused() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{address}")
+}
+
+#[tokio::test]
+#[expect(clippy::unwrap_used, reason = "test")]
+async fn a_config_that_fails_doctor_leaves_the_old_file_byte_for_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let old = "# mine\n[general]\ndefault_workspace = \"research\"\n";
+    std::fs::write(&path, old).unwrap();
+    let candidate = format!(
+        "[general]\ndata_dir = \"{}\"\nchat_model = \"o/chat:8b\"\n\n[providers.o]\ntype = \
+         \"ollama\"\nbase_url = \"{}\"\nmax_retries = 0\n",
+        dir.path().join("data").display(),
+        refused()
+    );
+    let options = Options {
+        workspace: None,
+        probing: Probing::Online {
+            timeout: std::time::Duration::from_secs(2),
+        },
+    };
+    let mut talk = Vec::new();
+    let code = check_and_write(&path, &candidate, &options, &mut talk)
+        .await
+        .unwrap();
+    let said = String::from_utf8(talk).unwrap();
+    assert_eq!(code, ExitCode::FAILURE, "{said}");
+    assert!(said.contains("fail  chat model  o/chat:8b"), "{said}");
+    assert!(said.contains("Nothing was written"), "{said}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+}
+
+#[tokio::test]
+#[expect(clippy::unwrap_used, reason = "test")]
+async fn a_config_that_passes_doctor_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let candidate = format!(
+        "[general]\ndata_dir = \"{}\"\n",
+        dir.path().join("data").display()
+    );
+    let options = Options {
+        workspace: None,
+        probing: Probing::Offline,
+    };
+    let mut talk = Vec::new();
+    let code = check_and_write(&path, &candidate, &options, &mut talk)
+        .await
+        .unwrap();
+    let said = String::from_utf8(talk).unwrap();
+    assert_eq!(code, ExitCode::SUCCESS, "{said}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), candidate);
 }

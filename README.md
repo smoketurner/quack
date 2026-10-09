@@ -76,18 +76,13 @@ What it will not do:
 
 ## Configure
 
-Run `quack init`. It finds a running Ollama and the API keys and AWS credentials in your
-environment, asks which chat and embedding models to use, and checks the result with
+Run `quack init`, or just `quack`: with no config file it offers to run `quack init` first.
+It finds a running Ollama and the API keys and AWS credentials in your environment, and asks
+which chat and embedding models to use. It shows the changes and checks the result with
 `quack doctor` before it writes `~/.config/quack/config.toml`. If a check fails, it writes
-nothing. It never changes a config file that already exists. The file names the variable that
-holds an API key (`api_key_env`), never the key.
-
-```bash
-quack init                     # ask
-quack init --yes               # take the defaults: the first Ollama models that can do each job; no terminal needed
-quack init --print             # print the config instead of writing it
-quack init --yes --chat-model anthropic/claude-opus-5-5 --embedding-model none
-```
+nothing. Run it again to change models: it edits the file in place and keeps every other
+setting and comment. The file names the variable that holds an API key (`api_key_env`), never
+the key.
 
 To write the file yourself, name your models in `~/.config/quack/config.toml`. The smallest
 working setup, with Ollama:

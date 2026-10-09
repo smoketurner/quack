@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::config::{BaseUrl, Config, ModelSpec, ProviderName, ProviderType};
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value, value};
+
+use crate::config::{BaseUrl, Config, ProviderName, ProviderType};
 use crate::embedding::Dimension;
 use crate::error::{Error, Result};
 use crate::llm::egress::Egress;
@@ -391,113 +393,211 @@ impl std::fmt::Display for ByteSize {
     }
 }
 
+/// A model on one of the providers `quack init` sets up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub kind: ProviderKind,
+    pub model: String,
+}
+
 /// The embedding model chosen, with its width.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingChoice {
-    pub model: ModelSpec,
+    pub choice: Choice,
     pub dimension: Dimension,
 }
 
+/// The chat and embedding models a config file names now, as written.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Current {
+    pub chat_model: Option<String>,
+    pub embedding_model: Option<String>,
+}
+
+impl Current {
+    /// What `text` names.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `text` is not TOML, which `quack init` will
+    /// not edit.
+    pub fn of(text: &str) -> Result<Self> {
+        let doc = Self::parse(text)?;
+        let read = |section: &str, key: &str| {
+            doc.get(section)
+                .and_then(|section| section.get(key))
+                .and_then(Item::as_str)
+                .map(str::to_owned)
+        };
+        Ok(Self {
+            chat_model: read("general", "chat_model"),
+            embedding_model: read("embedding", "model"),
+        })
+    }
+
+    fn parse(text: &str) -> Result<DocumentMut> {
+        text.parse::<DocumentMut>()
+            .map_err(|e| Error::Config(format!("not valid TOML: {e}")))
+    }
+}
+
 /// What `quack init` writes: a chat model, an embedding model, and the
-/// providers they name.
+/// providers they name. A model left `None` keeps what the file has.
 #[derive(Debug, Clone, Default)]
 pub struct SetupPlan {
-    pub chat_model: Option<ModelSpec>,
+    pub chat: Option<Choice>,
     pub embedding: Option<EmbeddingChoice>,
     /// Ollama's address, when it is not the default.
     pub ollama_base_url: Option<BaseUrl>,
 }
 
+/// The text a new config file starts from.
+const NEW_FILE: &str = "# Written by `quack init`. `quack config` lists every other setting.\n";
+
 impl SetupPlan {
-    /// The provider kinds the plan's models name, each once, in
-    /// [`ProviderKind::ALL`]'s order.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a model names a provider `quack init` does not
-    /// set up.
-    pub fn providers(&self) -> Result<Vec<ProviderKind>> {
-        let mut named = Vec::new();
-        let models = [
-            self.chat_model.as_ref(),
-            self.embedding.as_ref().map(|e| &e.model),
-        ];
-        for model in models.into_iter().flatten() {
-            let provider = model.provider();
-            let Some(kind) = ProviderKind::ALL
-                .into_iter()
-                .find(|kind| *provider == kind.name())
-            else {
-                return Err(Error::Config(format!(
-                    "{model}: quack init sets up {}; edit config.toml for other providers",
-                    ProviderKind::ALL.map(ProviderKind::name).join(", ")
-                )));
-            };
-            named.push(kind);
-        }
-        Ok(ProviderKind::ALL
-            .into_iter()
-            .filter(|kind| named.contains(kind))
-            .collect())
+    /// Whether the plan changes anything.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.chat.is_none() && self.embedding.is_none()
     }
 
-    fn provider_table(&self, kind: ProviderKind) -> toml::Table {
-        let mut table = toml::Table::new();
-        table.insert("type".into(), kind.name().into());
+    /// The provider kinds the plan's models name, each once, in
+    /// [`ProviderKind::ALL`]'s order.
+    #[must_use]
+    pub fn providers(&self) -> Vec<ProviderKind> {
+        let named = [
+            self.chat.as_ref().map(|c| c.kind),
+            self.embedding.as_ref().map(|e| e.choice.kind),
+        ];
+        ProviderKind::ALL
+            .into_iter()
+            .filter(|kind| named.contains(&Some(*kind)))
+            .collect()
+    }
+
+    fn provider_table(&self, kind: ProviderKind) -> Table {
+        let mut table = Table::new();
+        table.insert("type", value(kind.name()));
         if let Some(env) = kind.key_env() {
-            table.insert("auth".into(), "api-key".into());
-            table.insert("api_key_env".into(), env.into());
+            table.insert("auth", value("api-key"));
+            table.insert("api_key_env", value(env));
         }
         if let (ProviderKind::Ollama, Some(base_url)) = (kind, &self.ollama_base_url) {
-            table.insert("base_url".into(), base_url.to_string().into());
+            table.insert("base_url", value(base_url.to_string()));
         }
         table
     }
 
-    /// The config file's text.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a model names a provider `quack init` does not
-    /// set up.
-    pub fn toml(&self) -> Result<String> {
-        let mut file = toml::Table::new();
-        if let Some(chat) = &self.chat_model {
-            let mut general = toml::Table::new();
-            general.insert("chat_model".into(), chat.to_string().into());
-            file.insert("general".into(), general.into());
+    /// Whether the provider section `table` is the one `kind` would be: the
+    /// same type at the same address. Its other settings are the file's.
+    fn reuses(&self, kind: ProviderKind, table: &dyn TableLike) -> bool {
+        let text = |key: &str| table.get(key).and_then(Item::as_str);
+        if text("type") != Some(kind.name()) {
+            return false;
         }
-        if let Some(embedding) = &self.embedding {
-            let mut section = toml::Table::new();
-            section.insert("model".into(), embedding.model.to_string().into());
-            section.insert(
-                "dimension".into(),
-                i64::from(embedding.dimension.get()).into(),
-            );
-            file.insert("embedding".into(), section.into());
+        let base_url = text("base_url").map(|url| url.trim_end_matches('/'));
+        match kind {
+            ProviderKind::Ollama => {
+                let wanted = self
+                    .ollama_base_url
+                    .clone()
+                    .unwrap_or(ProviderType::OLLAMA_BASE_URL);
+                base_url.unwrap_or(ProviderType::OLLAMA_BASE_URL.as_str())
+                    == wanted.as_str().trim_end_matches('/')
+            }
+            ProviderKind::Anthropic | ProviderKind::OpenAi => base_url.is_none(),
+            ProviderKind::Bedrock => true,
         }
-        let mut providers = toml::Table::new();
-        for kind in self.providers()? {
-            providers.insert(kind.name().into(), self.provider_table(kind).into());
-        }
-        if !providers.is_empty() {
-            file.insert("providers".into(), providers.into());
-        }
-        let body = toml::to_string(&file)
-            .map_err(|e| Error::Config(format!("cannot write the config: {e}")))?;
-        Ok(format!(
-            "# Written by `quack init`. `quack config` lists every other setting.\n\n{body}"
-        ))
     }
 
-    /// The configuration [`Self::toml`] describes, checked as `quack` reads
-    /// a file.
+    /// `existing` (a config file's text, or `None` for no file) with the
+    /// plan's models set, and a section added for each provider they name
+    /// that the file lacks. Every other key, value, and comment stays.
+    /// Also returns one line per change, for the person to confirm.
     ///
     /// # Errors
     ///
-    /// Returns the error any other command would give for the file.
-    pub fn config(&self) -> Result<Config> {
-        Config::parse(&self.toml()?)
+    /// Returns an error when `existing` is not TOML, or when a section
+    /// `quack init` would add already exists for another provider.
+    pub fn apply(&self, existing: Option<&str>) -> Result<(String, Vec<String>)> {
+        let mut doc = Current::parse(existing.unwrap_or_default())?;
+        let mut names = Vec::new();
+        let mut added = Vec::new();
+        let providers = doc.get("providers").and_then(Item::as_table_like);
+        for kind in self.providers() {
+            let reused = providers.and_then(|providers| {
+                providers
+                    .iter()
+                    .find(|(_, item)| {
+                        item.as_table_like()
+                            .is_some_and(|table| self.reuses(kind, table))
+                    })
+                    .map(|(name, _)| name.to_owned())
+            });
+            let name = if let Some(name) = reused {
+                name
+            } else if providers.is_some_and(|providers| providers.contains_key(kind.name())) {
+                return Err(Error::Config(format!(
+                    "[providers.{}] is already a different provider; rename it, or set the \
+                     model in config.toml yourself",
+                    kind.name()
+                )));
+            } else {
+                added.push(kind);
+                kind.name().to_owned()
+            };
+            names.push((kind, name));
+        }
+
+        let mut changes = Vec::new();
+        let model = |choice: &Choice| {
+            let name = names
+                .iter()
+                .find(|(kind, _)| *kind == choice.kind)
+                .map_or_else(|| choice.kind.name(), |(_, name)| name.as_str());
+            format!("{name}/{}", choice.model)
+        };
+        if let Some(chat) = &self.chat {
+            set(
+                &mut doc,
+                &mut changes,
+                "general",
+                "chat_model",
+                model(chat).into(),
+            )?;
+        }
+        if let Some(embedding) = &self.embedding {
+            let width = i64::from(embedding.dimension.get());
+            set(
+                &mut doc,
+                &mut changes,
+                "embedding",
+                "model",
+                model(&embedding.choice).into(),
+            )?;
+            set(
+                &mut doc,
+                &mut changes,
+                "embedding",
+                "dimension",
+                width.into(),
+            )?;
+        }
+        if !added.is_empty() {
+            let providers = section(&mut doc, "providers")?;
+            for kind in added {
+                providers.insert(kind.name(), Item::Table(self.provider_table(kind)));
+                changes.push(format!("adds [providers.{}]", kind.name()));
+            }
+        }
+        if let Some(table) = doc.get_mut("providers").and_then(Item::as_table_mut) {
+            table.set_implicit(true);
+        }
+        let text = match existing {
+            Some(_) => doc.to_string(),
+            None => format!("{NEW_FILE}\n{doc}"),
+        };
+        Ok((text, changes))
     }
 
     /// A configuration holding only `kind`'s provider, for the requests
@@ -509,14 +609,10 @@ impl SetupPlan {
     /// Returns an error when the provider section does not validate.
     pub fn provider_config(&self, kind: ProviderKind) -> Result<Config> {
         let mut table = self.provider_table(kind);
-        table.insert("max_retries".into(), 0.into());
-        let mut providers = toml::Table::new();
-        providers.insert(kind.name().into(), table.into());
-        let mut file = toml::Table::new();
-        file.insert("providers".into(), providers.into());
-        let text = toml::to_string(&file)
-            .map_err(|e| Error::Config(format!("cannot write the config: {e}")))?;
-        Config::parse(&text)
+        table.insert("max_retries", value(0));
+        let mut doc = DocumentMut::new();
+        section(&mut doc, "providers")?.insert(kind.name(), Item::Table(table));
+        Config::parse(&doc.to_string())
     }
 
     /// The chat models a hosted provider lists. This sends the provider's
@@ -558,6 +654,44 @@ impl SetupPlan {
             .map(Dimension::new)
             .map_err(|e| Error::Embedding(format!("{model}: width {width}: {e}")))
     }
+}
+
+/// The section `key` of `doc`, made when the file has none.
+fn section<'a>(doc: &'a mut DocumentMut, key: &str) -> Result<&'a mut dyn TableLike> {
+    doc.entry(key)
+        .or_insert_with(toml_edit::table)
+        .as_table_like_mut()
+        .ok_or_else(|| Error::Config(format!("[{key}] in config.toml is not a table")))
+}
+
+/// Set `key` in section `name` to `new`, keeping the comment on the
+/// line it replaces, and note the change against what was there.
+fn set(
+    doc: &mut DocumentMut,
+    changes: &mut Vec<String>,
+    name: &str,
+    key: &str,
+    mut new: Value,
+) -> Result<()> {
+    let table = section(doc, name)?;
+    let bare = |value: &Value| {
+        let mut value = value.clone();
+        value.decor_mut().clear();
+        value.to_string()
+    };
+    let shown = bare(&new);
+    let Some(old) = table.get_mut(key).and_then(Item::as_value_mut) else {
+        table.insert(key, Item::Value(new));
+        changes.push(format!("[{name}].{key} = {shown}"));
+        return Ok(());
+    };
+    let was = bare(old);
+    if was != shown {
+        *new.decor_mut() = old.decor().clone();
+        *old = new;
+        changes.push(format!("[{name}].{key} = {shown} (was {was})"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

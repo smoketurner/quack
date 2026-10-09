@@ -24,24 +24,27 @@ Design doc section 10 explains the mechanisms.
 
 ## Setting up with `quack init`
 
-`quack init` writes a first `config.toml` for Ollama, Anthropic, OpenAI, or Amazon Bedrock:
+`quack init` sets the chat and embedding models in `config.toml` for Ollama, Anthropic, OpenAI,
+or Amazon Bedrock. `quack` offers to run it when there is no config file:
 
 - **Ollama:** it lists the models a running server has pulled (`OLLAMA_HOST`, else
   `localhost:11434`) and what each can do. Only a model that calls tools is offered as the
   chat model, and only one that embeds as the embedding model. It measures the embedding
   model's width with one request.
-- **Anthropic and OpenAI:** found when `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set. Their
-  models are listed only when you choose the provider at the prompt, since that sends the
-  key. `--yes` never lists them; name the model with `--chat-model`.
+- **Anthropic and OpenAI:** found when `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set (an
+  empty value counts as unset). Their models are listed only when you choose the provider at
+  the prompt, since that sends the key.
 - **Amazon Bedrock:** found from `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, or `~/.aws/config`.
   Bedrock lists no models, so it asks for the model id.
 - **Embeddings on a hosted provider:** `openai/text-embedding-3-small` (1,536 dimensions) or
   `bedrock/amazon.titan-embed-text-v2:0` (1,024), the widths each provider documents.
 
-It runs `quack doctor` on the new file before writing it, and writes nothing when a check
-fails. It never changes an existing file; `quack init --print` prints a fresh one to compare.
-For a gateway, OAuth, `bedrock-mantle`, or any other setting, edit the file as the rest of
-this guide shows.
+With a config file already there, it offers the models the file names first ("Keep ..."),
+reuses a provider section of the same type and address under whatever name it has, and adds a
+section only for a provider the file lacks. Every other key and comment stays. It lists the
+changes, asks before writing, and runs `quack doctor` on the result first; when a check
+fails, the file is left as it was. For a gateway, OAuth, `bedrock-mantle`, or any other
+setting, edit the file as the rest of this guide shows.
 
 ## Choosing a provider type
 
