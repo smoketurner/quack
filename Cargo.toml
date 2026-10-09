@@ -322,6 +322,9 @@ codegen-units = 1 # Maximize size reduction optimizations
 panic = "abort"   # Terminate process upon panic
 opt-level = "z"   # Optimize for size (more aggressive than "s")
 
+[profile.release.package.libduckdb-sys]
+opt-level = 3
+
 # Dependencies at opt-level 1 keep the debug binary's __eh_frame under the
 # 16 MB the macOS linker allows, and make debug tests faster.
 [profile.dev.package."*"]
