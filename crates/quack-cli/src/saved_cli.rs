@@ -18,14 +18,15 @@ use quack_core::storage::sessions;
 use quack_core::storage::workspace::QueryResults;
 use quack_core::storage::writer::Writer;
 
-use crate::FOLLOW_UP_GRACE;
-use crate::QueryFormat;
+use crate::args::QueryFormat;
+use crate::print::FOLLOW_UP_GRACE;
 use crate::print::{AnswerTo, PrintTurn};
+use crate::session::find_session;
 use crate::text_or_json::TextOrJson;
 use quack_core::llm::after_turn::AfterTurn;
 
 #[derive(Debug, Clone, Subcommand)]
-pub(crate) enum SavedAction {
+pub enum SavedAction {
     /// List the saved questions
     List {
         /// `json` prints one JSON object per saved question
@@ -75,7 +76,7 @@ pub(crate) enum SavedAction {
 /// What `--refresh` needs beyond the writer: the handles a print-mode
 /// turn takes. The command line has them; the terminal refreshes through
 /// its own chat instead.
-pub(crate) struct Model {
+pub struct Model {
     pub db: SharedDb,
     pub reader_db: ReaderDb,
     /// Full tool inputs on stderr.
@@ -90,7 +91,7 @@ pub(crate) struct Model {
 ///
 /// Returns an error when the saved question, session, or message does
 /// not exist, the answer cannot be saved, or a refresh fails.
-pub(crate) async fn run(
+pub async fn run(
     config: &Config,
     db: &Writer,
     action: SavedAction,
@@ -119,7 +120,7 @@ pub(crate) async fn run(
             message,
         } => {
             let session = match (from_session, session) {
-                (Some(prefix), _) => db.run(move |db| crate::find_session(db, &prefix)).await?.id,
+                (Some(prefix), _) => db.run(move |db| find_session(db, &prefix)).await?.id,
                 (None, Some(current)) => current.clone(),
                 (None, None) => return Err(anyhow!("give --from-session SESSION_ID")),
             };
@@ -361,7 +362,8 @@ fn write_run(out: &mut impl Write, run: &SavedRun, format: QueryFormat) -> Resul
 }
 
 /// Whether a run should end the command with an error: a statement failed.
-pub(crate) fn failure(run: &SavedRun) -> Option<anyhow::Error> {
+#[must_use]
+pub fn failure(run: &SavedRun) -> Option<anyhow::Error> {
     if run.status != RunStatus::Failed {
         return None;
     }

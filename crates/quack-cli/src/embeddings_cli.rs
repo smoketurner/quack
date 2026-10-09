@@ -17,7 +17,7 @@ use quack_core::storage::writer::Writer;
 use crate::confirm::Confirm;
 
 #[derive(Debug, Clone, Subcommand)]
-pub(crate) enum EmbeddingsAction {
+pub enum EmbeddingsAction {
     /// Embed again the chunks and graph labels whose vectors were made
     /// with another embedding model, width, or input prefixes, or have
     /// none; until then they are found by keyword search only
@@ -34,7 +34,7 @@ pub(crate) enum EmbeddingsAction {
 ///
 /// Returns an error when no embedding model is configured, or the run
 /// fails.
-pub(crate) async fn run(
+pub async fn run(
     config: &Config,
     db: &Writer,
     action: EmbeddingsAction,

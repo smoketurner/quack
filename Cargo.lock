@@ -4390,13 +4390,12 @@ dependencies = [
  "mimalloc",
  "proptest",
  "pulldown-cmark",
+ "quack-cli",
  "quack-core",
  "quack-server",
- "quack-testkit",
  "ratatui",
  "ratatui-textarea",
  "secrecy",
- "serde",
  "serde_json",
  "shlex 2.0.1",
  "sqlparser",
@@ -4405,6 +4404,22 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "winsplit",
+]
+
+[[package]]
+name = "quack-cli"
+version = "2026.10.5"
+dependencies = [
+ "anyhow",
+ "clap",
+ "jiff",
+ "quack-core",
+ "quack-testkit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

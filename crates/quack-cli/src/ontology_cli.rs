@@ -26,7 +26,7 @@ use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
 
 #[derive(Subcommand)]
-pub(crate) enum OntologyAction {
+pub enum OntologyAction {
     /// Print the current ontology: classes, relations, properties, mappings
     Show {
         /// `json` prints the JSON interchange form
@@ -80,7 +80,7 @@ pub(crate) enum OntologyAction {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct ProposeArgs {
+pub struct ProposeArgs {
     /// Accept every proposal at once and write the version
     #[arg(long)]
     auto_accept: bool,
@@ -92,7 +92,7 @@ pub(crate) struct ProposeArgs {
     sample: Option<u32>,
     /// Do not ask before spending the model calls
     #[arg(long, short = 'y')]
-    pub(crate) yes: bool,
+    pub yes: bool,
     /// Seed from a JSON ontology first (stored as a new version), then
     /// propose only what it lacks
     #[arg(long, value_name = "FILE")]
@@ -100,7 +100,7 @@ pub(crate) struct ProposeArgs {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct AcceptArgs {
+pub struct AcceptArgs {
     ids: Vec<String>,
     /// Accept under this id (one candidate only)
     #[arg(long, conflicts_with_all = ["merge_into", "reparent"])]
@@ -145,7 +145,11 @@ impl AcceptArgs {
 
 /// `quack ontology schema`: the interchange form's JSON Schema, which needs
 /// no workspace.
-pub(crate) fn write_schema(out: &mut impl Write) -> Result<()> {
+///
+/// # Errors
+///
+/// Returns the I/O error from writing to `out`.
+pub fn write_schema(out: &mut impl Write) -> Result<()> {
     writeln!(
         out,
         "{}",
@@ -159,7 +163,11 @@ pub(crate) fn write_schema(out: &mut impl Write) -> Result<()> {
 ///
 /// Each database step goes to the workspace writer on its own, never
 /// spanning a model call; `control` hears about every chunk of a document pass and can stop it.
-pub(crate) async fn run(
+///
+/// # Errors
+///
+/// Returns the database, model, or I/O error the command meets.
+pub async fn run(
     config: &Config,
     db: &Writer,
     action: OntologyAction,

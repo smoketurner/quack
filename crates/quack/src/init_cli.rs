@@ -22,7 +22,7 @@ use quack_core::setup::{
 
 use crate::Exit;
 use crate::doctor_cli;
-use crate::text_or_json::TextOrJson;
+use quack_cli::text_or_json::TextOrJson;
 
 /// What to pull when Ollama runs but lacks a model for a role.
 const OLLAMA_CHAT_SUGGESTION: &str = "ollama pull gpt-oss:20b";

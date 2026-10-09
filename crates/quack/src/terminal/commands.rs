@@ -13,12 +13,13 @@ use quack_core::ingestion::parser::FileType;
 use quack_core::jobs::JobNumber;
 use quack_core::storage::workspace::{SqlName, looks_like_direct_sql};
 
-use crate::embeddings_cli::EmbeddingsAction;
-use crate::graph_cli::GraphAction;
-use crate::ontology_cli::OntologyAction;
-use crate::saved_cli::SavedAction;
-use crate::tables_cli::TablesArgs;
-use crate::{ExportFlags, ImportAction, ModeArg};
+use quack_cli::args::{ExportFlags, ModeArg};
+use quack_cli::embeddings_cli::EmbeddingsAction;
+use quack_cli::graph_cli::GraphAction;
+use quack_cli::import_cli::ImportAction;
+use quack_cli::ontology_cli::OntologyAction;
+use quack_cli::saved_cli::SavedAction;
+use quack_cli::tables_cli::TablesArgs;
 
 /// The argument id of a command that takes the rest of the line as typed
 /// (a statement, a path, an entity name), so quotes and spacing survive.

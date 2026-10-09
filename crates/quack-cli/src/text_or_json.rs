@@ -11,7 +11,7 @@ use serde::Serialize;
 /// or JSON: one pretty document for a single value, one object per line
 /// for a listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum TextOrJson {
+pub enum TextOrJson {
     /// For a person
     Text,
     /// For a program
@@ -20,11 +20,11 @@ pub(crate) enum TextOrJson {
 
 impl TextOrJson {
     /// `value` as its text rendering, or as one pretty JSON document.
-    pub(crate) fn write<T: Serialize + fmt::Display>(
-        self,
-        out: &mut impl Write,
-        value: &T,
-    ) -> Result<()> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from serializing `value` or writing to `out`.
+    pub fn write<T: Serialize + fmt::Display>(self, out: &mut impl Write, value: &T) -> Result<()> {
         match self {
             Self::Json => writeln!(out, "{}", serde_json::to_string_pretty(value)?)?,
             Self::Text => write!(out, "{value}")?,
@@ -34,7 +34,11 @@ impl TextOrJson {
 
     /// A listing: `line` for each row, or `empty` when there are none; or
     /// one JSON object per row.
-    pub(crate) fn write_rows<T: Serialize, W: Write>(
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from serializing a row or writing to `out`.
+    pub fn write_rows<T: Serialize, W: Write>(
         self,
         out: &mut W,
         rows: &[T],

@@ -10,7 +10,7 @@ use anyhow::Result;
 
 /// Whether to ask before going ahead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Confirm {
+pub enum Confirm {
     /// Ask on the terminal; without one, the answer is no.
     Ask,
     /// Go ahead: `--yes`, or a terminal-session job, which may not read stdin.
@@ -20,18 +20,18 @@ pub(crate) enum Confirm {
 impl Confirm {
     /// `Assume` when the command's `--yes` was given, else this: the
     /// command line passes `Ask`, a terminal-session job `Assume`.
-    pub(crate) const fn or_yes(self, yes: bool) -> Self {
+    #[must_use]
+    pub const fn or_yes(self, yes: bool) -> Self {
         if yes { Self::Assume } else { self }
     }
 
     /// Put `question` and read the answer. Without a terminal on stdin the
     /// answer is no, said on `out` with `flag` when the command has one.
-    pub(crate) fn ask(
-        self,
-        out: &mut impl Write,
-        question: &str,
-        flag: Option<&str>,
-    ) -> Result<bool> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error from writing the question or reading the answer.
+    pub fn ask(self, out: &mut impl Write, question: &str, flag: Option<&str>) -> Result<bool> {
         if self == Self::Assume {
             return Ok(true);
         }
@@ -59,12 +59,11 @@ impl Confirm {
     /// skips the question: a terminal-session job's `Assume` covers
     /// spending, not deletion. With nobody to ask, the command fails with
     /// the question, so a script cannot take silence for work done.
-    pub(crate) fn ask_to_drop(
-        self,
-        yes: bool,
-        out: &mut impl Write,
-        question: &str,
-    ) -> Result<bool> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error from the question, or an error naming the question when there is nobody to ask.
+    pub fn ask_to_drop(self, yes: bool, out: &mut impl Write, question: &str) -> Result<bool> {
         if yes {
             return Ok(true);
         }

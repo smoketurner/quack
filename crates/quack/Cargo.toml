@@ -14,6 +14,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+quack-cli          = { path = "../quack-cli" }
 quack-core         = { path = "../quack-core" }
 quack-server       = { path = "../quack-server" }
 anyhow             = { workspace = true, features = ["std"] }
@@ -30,7 +31,6 @@ mimalloc           = { workspace = true, features = ["secure"] }
 pulldown-cmark     = { workspace = true, features = ["html"] }
 ratatui            = { workspace = true, features = ["crossterm"] }
 ratatui-textarea   = { workspace = true, features = ["crossterm"] }
-serde              = { workspace = true, features = ["derive", "std"] }
 secrecy            = { workspace = true }
 serde_json         = { workspace = true, features = ["std"] }
 shlex              = { workspace = true, features = ["std"] }
@@ -46,6 +46,5 @@ tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"
 winsplit = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
-quack-testkit = { path = "../quack-testkit" }
 axum          = { workspace = true, features = ["http1", "json", "tokio"] }
 proptest      = { workspace = true, features = ["std"] }

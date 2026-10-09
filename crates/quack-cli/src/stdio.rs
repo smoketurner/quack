@@ -12,19 +12,19 @@ use quack_core::storage::workspace::DocumentSource;
 
 /// A file to read or write, or `-` for standard input or output.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StdioPath {
+pub enum StdioPath {
     Stdio,
     Path(PathBuf),
 }
 
 /// An input for ingestion, and the file name it goes in under.
-pub(crate) struct NamedInput {
+pub struct NamedInput {
     pub name: String,
     pub data: InputData,
 }
 
 /// Where an input's bytes are.
-pub(crate) enum InputData {
+pub enum InputData {
     /// Standard input, read whole.
     Read(Vec<u8>),
     /// A file, left on disk for ingestion to read as far as it needs.
@@ -32,7 +32,8 @@ pub(crate) enum InputData {
 }
 
 impl InputData {
-    pub(crate) fn file_data(&self) -> FileData<'_> {
+    #[must_use]
+    pub fn file_data(&self) -> FileData<'_> {
         match self {
             Self::Read(bytes) => FileData::Bytes(bytes),
             Self::File(path) => FileData::Path(path),
@@ -42,7 +43,8 @@ impl InputData {
 
 impl StdioPath {
     /// How a document ingested from here records where it came from.
-    pub(crate) fn document_source(&self) -> DocumentSource {
+    #[must_use]
+    pub fn document_source(&self) -> DocumentSource {
         match self {
             Self::Stdio => DocumentSource::Stdin,
             Self::Path(_) => DocumentSource::Path,
@@ -57,7 +59,7 @@ impl StdioPath {
     ///
     /// Returns an error when standard input cannot be read or comes without
     /// `name`, or the file cannot be read.
-    pub(crate) fn named(&self, name: Option<&str>) -> Result<NamedInput> {
+    pub fn named(&self, name: Option<&str>) -> Result<NamedInput> {
         match self {
             Self::Stdio => {
                 let name = name
@@ -93,7 +95,7 @@ impl StdioPath {
     /// # Errors
     ///
     /// Returns an error when the input cannot be read or is not UTF-8.
-    pub(crate) fn read_to_string(&self) -> Result<String> {
+    pub fn read_to_string(&self) -> Result<String> {
         match self {
             Self::Stdio => {
                 let mut text = String::new();

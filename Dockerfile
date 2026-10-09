@@ -61,11 +61,12 @@ WORKDIR /app
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates/quack-core/Cargo.toml crates/quack-core/
+COPY crates/quack-cli/Cargo.toml crates/quack-cli/
 COPY crates/quack-server/Cargo.toml crates/quack-server/
 COPY crates/quack-testkit/Cargo.toml crates/quack-testkit/
 COPY crates/quack/Cargo.toml crates/quack/
-RUN mkdir -p crates/quack-core/src crates/quack-server/src crates/quack-testkit/src crates/quack/src \
-    && touch crates/quack-core/src/lib.rs crates/quack-server/src/lib.rs crates/quack-testkit/src/lib.rs crates/quack/src/main.rs
+RUN mkdir -p crates/quack-core/src crates/quack-cli/src crates/quack-server/src crates/quack-testkit/src crates/quack/src \
+    && touch crates/quack-core/src/lib.rs crates/quack-cli/src/lib.rs crates/quack-server/src/lib.rs crates/quack-testkit/src/lib.rs crates/quack/src/main.rs
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Builder: the musl static build.
@@ -94,12 +95,14 @@ RUN cargo chef cook --release --locked --package quack --recipe-path recipe.json
 # Restore the real manifests (cook leaves stubs).
 COPY Cargo.toml Cargo.lock ./
 COPY crates/quack-core/Cargo.toml crates/quack-core/
+COPY crates/quack-cli/Cargo.toml crates/quack-cli/
 COPY crates/quack-server/Cargo.toml crates/quack-server/
 COPY crates/quack-testkit/Cargo.toml crates/quack-testkit/
 COPY crates/quack/Cargo.toml crates/quack/
 
 # The source and the compile-time assets.
 COPY crates/quack-core/src crates/quack-core/src
+COPY crates/quack-cli/src crates/quack-cli/src
 COPY crates/quack-server/src crates/quack-server/src
 COPY crates/quack-server/templates crates/quack-server/templates
 COPY --from=css-builder /app/crates/quack-server/static crates/quack-server/static
@@ -107,7 +110,7 @@ COPY crates/quack-testkit/src crates/quack-testkit/src
 COPY crates/quack/src crates/quack/src
 
 # Deterministic timestamps on the entry points for reproducible builds.
-RUN touch -d "@${SOURCE_DATE_EPOCH}" crates/quack-core/src/lib.rs crates/quack-server/src/lib.rs crates/quack/src/main.rs
+RUN touch -d "@${SOURCE_DATE_EPOCH}" crates/quack-core/src/lib.rs crates/quack-cli/src/lib.rs crates/quack-server/src/lib.rs crates/quack/src/main.rs
 
 RUN cargo build --release --locked --package quack
 

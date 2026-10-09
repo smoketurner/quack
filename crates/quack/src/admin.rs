@@ -21,8 +21,8 @@ use quack_core::storage::control::{
 };
 use quack_core::storage::workspace::WorkspaceDb;
 
-use crate::confirm::Confirm;
-use crate::text_or_json::TextOrJson;
+use quack_cli::confirm::Confirm;
+use quack_cli::text_or_json::TextOrJson;
 
 /// Server administration: workspaces, users, tokens, membership, and the
 /// audit log.

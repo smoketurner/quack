@@ -29,7 +29,7 @@ use crate::stdio::StdioPath;
 use crate::text_or_json::TextOrJson;
 
 #[derive(Subcommand)]
-pub(crate) enum GraphAction {
+pub enum GraphAction {
     /// Print an entity's neighbourhood as a tree, or every entity of a class
     Search(SearchArgs),
     /// The shortest chain of relations between two entities
@@ -77,7 +77,7 @@ pub(crate) enum GraphAction {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct ExportArgs {
+pub struct ExportArgs {
     /// Directory to write (created), or - for stdout: a tar of the CSV
     /// bundle, or the `GraphML` or JSON-LD document
     dir: StdioPath,
@@ -92,11 +92,13 @@ pub(crate) struct ExportArgs {
 impl ExportArgs {
     /// Whether the export goes to standard output, which only the command
     /// line writes (`run_graph_export`).
-    pub(crate) fn to_stdout(&self) -> bool {
+    #[must_use]
+    pub fn to_stdout(&self) -> bool {
         self.dir == StdioPath::Stdio
     }
 
-    pub(crate) fn export(&self) -> GraphExport {
+    #[must_use]
+    pub fn export(&self) -> GraphExport {
         GraphExport {
             format: self.format,
             provisional: ProvisionalExport::from(self.include_provisional),
@@ -129,7 +131,7 @@ impl ExportArgs {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum AddWhat {
+pub enum AddWhat {
     /// A node of a class; one with the same label and class takes the
     /// properties instead
     Node {
@@ -158,7 +160,7 @@ pub(crate) enum AddWhat {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct SetArgs {
+pub struct SetArgs {
     /// The node, by id or exact label
     node: String,
     /// Only a node of this class, when the label names several
@@ -181,7 +183,7 @@ pub(crate) struct SetArgs {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum DeleteWhat {
+pub enum DeleteWhat {
     /// A node by id or exact label, with every edge at it
     Node {
         node: String,
@@ -193,7 +195,7 @@ pub(crate) enum DeleteWhat {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct SearchArgs {
+pub struct SearchArgs {
     /// The entity's name as it appears in the data
     entity: Option<String>,
     /// Only this class (with its subclasses when listing)
@@ -211,7 +213,7 @@ pub(crate) struct SearchArgs {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct PathArgs {
+pub struct PathArgs {
     from: String,
     to: String,
     #[arg(long, default_value_t = Hops::PATH.get())]
@@ -222,7 +224,7 @@ pub(crate) struct PathArgs {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct ExtractArgs {
+pub struct ExtractArgs {
     /// What to extract from: all, tables (no model calls), or documents
     #[arg(long, default_value = "all")]
     source: ExtractSource,
@@ -238,7 +240,7 @@ pub(crate) struct ExtractArgs {
     all: bool,
     /// Do not ask before clearing the graph or spending the model calls
     #[arg(long, short = 'y')]
-    pub(crate) yes: bool,
+    pub yes: bool,
 }
 
 /// A command step that runs on the workspace writer's thread: it renders
@@ -276,7 +278,11 @@ impl GraphAction {
     /// Each database step goes to the workspace writer on its own, never
     /// spanning a model call, so the terminal's other work keeps going during
     /// an extraction; `control` hears about every extracted chunk and can stop it.
-    pub(crate) async fn run(
+    ///
+    /// # Errors
+    ///
+    /// Returns the database, model, or I/O error the command meets.
+    pub async fn run(
         self,
         config: &Config,
         db: &Writer,
@@ -385,7 +391,12 @@ impl GraphAction {
 }
 
 impl AddWhat {
-    pub(crate) async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
+    /// Create the node or edge and report it on `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database, model, or I/O error the command meets.
+    pub async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
         match self {
             Self::Node {
                 label,
@@ -465,7 +476,12 @@ impl AddWhat {
 }
 
 impl SetArgs {
-    pub(crate) async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
+    /// Change a node and report it on `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database, model, or I/O error the command meets.
+    pub async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
         let Self {
             node,
             class,
@@ -499,7 +515,12 @@ impl SetArgs {
 }
 
 impl DeleteWhat {
-    pub(crate) async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
+    /// Delete a node or edge and report it on `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database, model, or I/O error the command meets.
+    pub async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
         match self {
             Self::Node { node, class } => {
                 db.render(out, move |db, out| {
@@ -527,12 +548,12 @@ impl DeleteWhat {
 }
 
 impl SearchArgs {
-    pub(crate) async fn run(
-        self,
-        config: &Config,
-        db: &Writer,
-        out: &mut impl Write,
-    ) -> Result<()> {
+    /// Search the graph from an entity or a class and print the result on `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database, model, or I/O error the command meets.
+    pub async fn run(self, config: &Config, db: &Writer, out: &mut impl Write) -> Result<()> {
         let Self {
             entity,
             class,
@@ -568,12 +589,12 @@ impl SearchArgs {
 }
 
 impl PathArgs {
-    pub(crate) async fn run(
-        self,
-        config: &Config,
-        db: &Writer,
-        out: &mut impl Write,
-    ) -> Result<()> {
+    /// Print the shortest path between two entities on `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database, model, or I/O error the command meets.
+    pub async fn run(self, config: &Config, db: &Writer, out: &mut impl Write) -> Result<()> {
         let Self {
             from,
             to,
@@ -637,7 +658,12 @@ impl ExtractArgs {
         Ok(true)
     }
 
-    pub(crate) async fn run(
+    /// Extract the documents and tables into the graph, or reset the graph first.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database, model, or I/O error the command meets.
+    pub async fn run(
         &self,
         config: &Config,
         db: &Writer,

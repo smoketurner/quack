@@ -4,19 +4,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod admin;
 mod auth_cli;
 mod config_cli;
-mod confirm;
 mod doctor_cli;
-mod embeddings_cli;
-mod graph_cli;
 mod init_cli;
-mod ontology_cli;
-mod print;
 mod progress_line;
-mod saved_cli;
-mod stdio;
-mod tables_cli;
 mod terminal;
-mod text_or_json;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -30,11 +21,7 @@ use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::export::Destination;
 use quack_core::graph::follow_up::FollowUp;
-use quack_core::ids::{DocumentId, SessionId, WorkspaceId};
-use quack_core::import::{
-    self, ImportPolicy, ImportRequest, ImportSecrets, JsonPointer, KeepSecret, LoadStatus,
-    RefreshWith, SavedImport, SourceHeader,
-};
+use quack_core::ids::{DocumentId, SessionId};
 use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::tree::{FileResult, Folder, Outcome, Prune};
 use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile};
@@ -44,34 +31,37 @@ use quack_core::llm::egress::Egress;
 use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt, TokenManager, TokenStatus};
 use quack_core::okf::{self, Bundle, DirSink, TarSink};
 use quack_core::ontology::store::Revision;
-use quack_core::prefix::PrefixMatch;
 use quack_core::progress::RunControl;
 use quack_core::proxy::Proxies;
 use quack_core::storage::context;
-use quack_core::storage::control::{ControlPlane, ResourceKind, WorkspaceRow};
+use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::profile::{ColumnTypes, TableProfile};
 use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, SessionViewer, Sharing, Transcript,
 };
 use quack_core::storage::workspace::{
-    DocumentFields, DocumentInfo, DocumentListing, Pinning, QueryResults, SearchMode, Shown,
-    StatementKind, WorkspaceDb,
+    DocumentFields, DocumentInfo, DocumentListing, Pinning, SearchMode, Shown, StatementKind,
+    WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use quack_core::vault::Vault;
 use quack_core::{config, doctor};
-use std::fmt;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::confirm::Confirm;
-use crate::print::{AnswerTo, PrintTurn, TurnOutcome};
-use crate::stdio::{NamedInput, StdioPath};
+use quack_cli::args::{ExportFlags, ModeArg, QueryFormat};
+use quack_cli::confirm::Confirm;
+use quack_cli::import_cli::{ImportAction, ImportArgs, ImportContext};
+use quack_cli::print::{AnswerTo, FOLLOW_UP_GRACE, PrintTurn, TurnOutcome};
+use quack_cli::session::find_session;
+use quack_cli::stdio::{NamedInput, StdioPath};
+use quack_cli::text_or_json::TextOrJson;
+use quack_cli::{embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
+
 use crate::terminal::SessionSetup;
-use crate::text_or_json::TextOrJson;
 use quack_server::ServeMode;
 
 /// How a command ended when not plainly: the exit status scripts check.
@@ -582,87 +572,6 @@ struct ImportCommand {
     run: ImportArgs,
 }
 
-#[derive(Subcommand)]
-pub(crate) enum ImportAction {
-    /// List the imports saved with `--save`, with how each last ran
-    List {
-        /// `json` prints one JSON object per saved import
-        #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
-        format: TextOrJson,
-    },
-    /// Run a saved import again; its table is replaced only when the
-    /// source changed (cron schedules this)
-    Refresh {
-        /// The saved import's name or id
-        name: String,
-    },
-    /// Remove a saved import and any secret sealed for it; its table stays
-    Remove {
-        /// The saved import's name or id
-        name: String,
-    },
-}
-
-#[derive(clap::Args)]
-struct ImportArgs {
-    /// A SQLite path as `sqlite:PATH`, an http(s) URL of a data file, or
-    /// `s3://BUCKET/KEY` (the AWS CLI's credentials and region)
-    #[arg(required = true)]
-    url: Option<String>,
-    /// The workspace table to create (replaced when it exists)
-    #[arg(long, required = true)]
-    table: Option<String>,
-    /// A query to run on the source
-    #[arg(long, conflicts_with = "from")]
-    query: Option<String>,
-    /// Pull a whole source table instead of a query
-    #[arg(long, value_name = "SOURCE_TABLE")]
-    from: Option<String>,
-    /// Rows to pull at most (capped by `[import].max_rows`)
-    #[arg(long)]
-    limit: Option<u64>,
-    /// Give columns of the table a type, as COLUMN=TYPE, comma-separated
-    /// or repeated; every value must convert
-    #[arg(long, value_name = "COLUMN=TYPE")]
-    types: Vec<ColumnTypes>,
-    /// Send a header with an http(s) download, as `NAME: VALUE`; repeat
-    /// for more. Used once and never stored
-    #[arg(long = "header", short = 'H', value_name = "NAME: VALUE")]
-    headers: Vec<SourceHeader>,
-    /// Send `Authorization: Bearer` with the token in this environment
-    /// variable, read when the download starts
-    #[arg(long, value_name = "VAR")]
-    bearer_env: Option<String>,
-    /// Load the array of rows at this RFC 6901 pointer inside a JSON
-    /// download, as `/data/items`
-    #[arg(long, value_name = "POINTER")]
-    json_pointer: Option<JsonPointer>,
-    /// Save the import under this name, so `quack import refresh NAME`
-    /// runs it again
-    #[arg(long, value_name = "NAME")]
-    save: Option<String>,
-    /// Keep the URL's password and the header values with the saved
-    /// import, sealed under the vault key, so a refresh can send them
-    #[arg(long, requires = "save")]
-    store_credential: bool,
-}
-
-impl From<ImportArgs> for ImportRequest {
-    fn from(args: ImportArgs) -> Self {
-        let mut headers = args.headers;
-        headers.extend(args.bearer_env.map(SourceHeader::BearerEnv));
-        Self {
-            query: args.query,
-            source_table: args.from,
-            limit: args.limit,
-            types: ColumnTypes::joined(args.types),
-            headers,
-            json_pointer: args.json_pointer,
-            ..Self::new(args.url.unwrap_or_default(), args.table.unwrap_or_default())
-        }
-    }
-}
-
 #[derive(clap::Args)]
 struct ConfigArgs {
     /// Only the settings the file or the environment has a say in
@@ -904,46 +813,6 @@ enum ContextAction {
     },
 }
 
-/// The answer mode as a command-line or slash-command argument.
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum ModeArg {
-    /// General knowledge allowed; cite when a source was used
-    Chat,
-    /// Every claim must come from a retrieved source
-    Query,
-}
-
-/// `--sql` or `--markdown`: how `export` writes a session.
-#[derive(clap::Args)]
-pub(crate) struct ExportFlags {
-    /// Every executed statement, each preceded by its question
-    #[arg(long, conflicts_with = "markdown")]
-    sql: bool,
-
-    /// Questions, steps, and answers as Markdown (the default)
-    #[arg(long)]
-    markdown: bool,
-}
-
-impl ExportFlags {
-    pub(crate) const fn format(&self) -> ExportFormat {
-        if self.sql {
-            ExportFormat::Sql
-        } else {
-            ExportFormat::Markdown
-        }
-    }
-}
-
-impl From<ModeArg> for ChatMode {
-    fn from(mode: ModeArg) -> Self {
-        match mode {
-            ModeArg::Chat => Self::Chat,
-            ModeArg::Query => Self::Query,
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum OutputFormat {
     /// Aligned text table (SQL) or plain answer text (`-p`)
@@ -979,44 +848,6 @@ impl OutputFormat {
             Self::Csv => Some(QueryFormat::Csv),
             Self::Markdown => Some(QueryFormat::Markdown),
             Self::Text => None,
-        }
-    }
-}
-
-/// How `-q` and `saved run` print a result set: [`OutputFormat`] without
-/// `text`, which prints an answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum QueryFormat {
-    /// Aligned text table
-    Table,
-    /// One JSON document
-    Json,
-    /// One JSON object per line
-    Ndjson,
-    /// Comma-separated values with a header row
-    Csv,
-    /// GitHub-flavored Markdown table
-    Markdown,
-}
-
-impl QueryFormat {
-    /// Without `--format`: a table on a terminal, ndjson into a pipe.
-    pub(crate) fn default_for(stdout_is_tty: bool) -> Self {
-        if stdout_is_tty {
-            Self::Table
-        } else {
-            Self::Ndjson
-        }
-    }
-
-    /// Print `results` in this format.
-    pub(crate) fn write(self, results: &QueryResults, out: &mut impl Write) -> CoreResult<()> {
-        match self {
-            Self::Table => results.write_table(out),
-            Self::Json => results.write_json(out),
-            Self::Ndjson => results.write_ndjson(out),
-            Self::Csv => results.write_csv(out),
-            Self::Markdown => results.write_markdown(out),
         }
     }
 }
@@ -1341,10 +1172,6 @@ async fn load_piped_stdin(
 /// How long a non-terminal stdin has to deliver a byte or close.
 const STDIN_GRACE: Duration = Duration::from_secs(1);
 
-/// How long a command that answers one question waits, after printing, for
-/// the session title and history summary its turn started.
-pub(crate) const FOLLOW_UP_GRACE: Duration = Duration::from_secs(30);
-
 /// Whether stdin is worth reading: a pipe or socket is when it becomes
 /// readable (data or end of file) within [`STDIN_GRACE`]; anything else
 /// (a regular file, `/dev/null`) answers a read at once.
@@ -1539,181 +1366,6 @@ impl ImportCommand {
             None => self.run.run(&context).await?,
         }
         Ok(ExitCode::SUCCESS)
-    }
-}
-
-/// What every `quack import` form works with, in the CLI and the terminal:
-/// the workspace, its writer, and where saved imports keep their sealed
-/// secrets.
-pub(crate) struct ImportContext<'a> {
-    pub(crate) config: &'a Config,
-    pub(crate) workspace: &'a WorkspaceId,
-    pub(crate) control: &'a ControlPlane,
-    pub(crate) vault: &'a Vault,
-    pub(crate) db: &'a Writer,
-}
-
-impl ImportContext<'_> {
-    fn secrets(&self) -> ImportSecrets<'_> {
-        ImportSecrets {
-            control: self.control,
-            vault: self.vault,
-            workspace: self.workspace,
-        }
-    }
-}
-
-impl ImportAction {
-    /// What a job running it is called.
-    pub(crate) fn label(&self) -> String {
-        match self {
-            Self::List { .. } => String::from("import list"),
-            Self::Refresh { name } => format!("import refresh {name}"),
-            Self::Remove { name } => format!("import remove {name}"),
-        }
-    }
-
-    /// List, refresh, or remove a saved import, reporting to `out`.
-    pub(crate) async fn run(self, context: &ImportContext<'_>, out: &mut impl Write) -> Result<()> {
-        let db = context.db;
-        match self {
-            Self::List { format } => {
-                let saved = db.run(SavedImport::list).await?;
-                for import in &saved {
-                    match format {
-                        TextOrJson::Json => writeln!(out, "{}", serde_json::to_string(import)?)?,
-                        TextOrJson::Text => writeln!(out, "{}", SavedLine(import))?,
-                    }
-                }
-                if saved.is_empty() && format == TextOrJson::Text {
-                    writeln!(
-                        out,
-                        "No saved imports; save one with `quack import ... --save NAME`."
-                    )?;
-                }
-            }
-            Self::Refresh { name } => {
-                let saved = db.run(move |db| SavedImport::named(db, &name)).await?;
-                let config = context.config;
-                let embedder = Embeddings::from_config(config).await?;
-                let summary = context
-                    .secrets()
-                    .refresh(
-                        &saved,
-                        RefreshWith {
-                            config,
-                            db,
-                            policy: ImportPolicy::owner(),
-                            embedder: embedder.as_ref(),
-                            control: RunControl::unobserved(),
-                        },
-                    )
-                    .await
-                    .with_context(|| format!("refreshing '{}' failed", saved.name))?;
-                match (summary.status, saved.last_rows) {
-                    (LoadStatus::Unchanged, _) => {
-                        writeln!(out, "{}: source unchanged", saved.name)?;
-                    }
-                    (LoadStatus::Loaded, Some(before)) => writeln!(
-                        out,
-                        "{}: {} rows (was {before}), replaced",
-                        saved.name, summary.rows
-                    )?,
-                    (LoadStatus::Loaded, None) => {
-                        writeln!(out, "{}: {} rows, loaded", saved.name, summary.rows)?;
-                    }
-                }
-            }
-            Self::Remove { name } => {
-                let saved = db.run(move |db| SavedImport::named(db, &name)).await?;
-                context.secrets().remove(db, &saved).await?;
-                writeln!(
-                    out,
-                    "Removed saved import {}; table \"{}\" stays.",
-                    saved.name, saved.table
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl ImportArgs {
-    /// Import once; with `--save`, keep it under a name for refreshing.
-    async fn run(self, context: &ImportContext<'_>) -> Result<()> {
-        let save = self.save.clone();
-        let keep = if self.store_credential {
-            KeepSecret::Sealed
-        } else {
-            KeepSecret::No
-        };
-        let request = ImportRequest::from(self);
-        if let Some(name) = &save {
-            request.check_saveable(keep)?;
-            let name = name.clone();
-            context
-                .db
-                .run(move |db| SavedImport::check_name(db, &name))
-                .await?;
-        }
-        let config = context.config;
-        let embedder = Embeddings::from_config(config).await?;
-        let summary = import::Importing {
-            config,
-            db: context.db,
-            workspace_id: context.workspace.as_str(),
-            request: &request,
-            policy: ImportPolicy::owner(),
-            embedder: embedder.as_ref(),
-            control: RunControl::unobserved(),
-        }
-        .run()
-        .await
-        .context("import failed")?;
-        let saved = match save {
-            Some(name) => Some(
-                context
-                    .secrets()
-                    .save(context.db, &name, &request, &summary, keep, None)
-                    .await?,
-            ),
-            None => None,
-        };
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        writeln!(
-            out,
-            "Imported {} rows from {} as table \"{}\" ({} columns: {}).",
-            summary.rows,
-            summary.source,
-            summary.table,
-            summary.columns.len(),
-            summary.columns.join(", ")
-        )?;
-        if let Some(saved) = saved {
-            writeln!(
-                out,
-                "Saved as \"{}\"; `quack import refresh {}` runs it again.",
-                saved.name, saved.name
-            )?;
-        }
-        Ok(())
-    }
-}
-
-/// A saved import as `quack import list` prints it: name, table, source,
-/// and how it last ran.
-struct SavedLine<'a>(&'a SavedImport);
-
-impl fmt::Display for SavedLine<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let import = self.0;
-        write!(f, "{}  -> {}  {}", import.name, import.table, import.source)?;
-        match (&import.last_error, import.last_rows, &import.last_run_at) {
-            (Some(error), _, Some(at)) => write!(f, "  failed at {at}: {error}"),
-            (None, Some(rows), Some(at)) => write!(f, "  {rows} rows at {at}"),
-            _ => Ok(()),
-        }
     }
 }
 
@@ -2289,17 +1941,6 @@ fn document_line<W: Write>(out: &mut W, doc: &DocumentInfo) -> std::io::Result<(
         },
         doc.filename
     )
-}
-
-/// Resolve a full id or a unique prefix to a session.
-pub(crate) fn find_session(db: &WorkspaceDb, prefix: &str) -> CoreResult<sessions::SessionRow> {
-    if let Some(exact) = sessions::get_session(db, &SessionId::from(prefix))? {
-        return Ok(exact);
-    }
-    PrefixMatch::of(sessions::list_sessions(db, 1000)?, prefix, |s| {
-        s.id.as_str()
-    })
-    .one(ResourceKind::Session, prefix)
 }
 
 fn list_sessions(db: &WorkspaceDb, format: TextOrJson, limit: u32) -> Result<()> {

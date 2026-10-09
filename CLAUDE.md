@@ -40,7 +40,7 @@ Cargo.toml            # virtual workspace: deps menu + strict lints + profiles
 deny.toml             # advisories, license allow-list, OpenSSL/ring bans
 rust-toolchain.toml   # pinned 1.99.0 + rustfmt + clippy
 Makefile              # build / fmt / lint / test / deny
-crates/               # quack-core (engine), quack-server (REST, web UI, MCP), quack-testkit, quack (the binary) — see crates/README.md
+crates/               # quack-core (engine), quack-cli (shared command verbs), quack-server (REST, web UI, MCP), quack-testkit, quack (the binary) — see crates/README.md
 docs/                 # design-doc.md (the product), architecture, migrations, crypto, web-ui, ci-cd, authentication, providers
 .claude/rules/        # code-standards and development-discipline gates; branching, commits, continuous-improvement conventions
 ```
@@ -53,7 +53,7 @@ docs/                 # design-doc.md (the product), architecture, migrations, c
   tests, opt out narrowly: `#[expect(clippy::unwrap_used, reason = "...")]`; `#[allow]` is
   denied, so every opt-out is an `#[expect]` with a reason.
 - **Import, don't spell paths.** `clippy::absolute_paths` denies any `crate::` or
-  workspace-crate path (`quack_core::`, `quack_server::`, ...) longer than two segments outside a `use`: import the type, or import
+  workspace-crate path (`quack_core::`, `quack_cli::`, `quack_server::`, ...) longer than two segments outside a `use`: import the type, or import
   a function's parent module and call `module::function`. External crates are exempt
   through `absolute-paths-allowed-crates` in `.clippy.toml`; a new dependency named by a
   full path goes on that list.
@@ -136,7 +136,7 @@ sum of every row's SHA-256, since parallel DuckDB returns unordered rows in vary
 (`--refresh` asks the model again as a `PrintTurn`, writes denied, and pins the new answer's
 statements). There is no scheduler: cron runs it, and `--exit-code` exits 5 on a change;
 `-f` takes `-q`'s `QueryFormat` and default. The terminal's `/saved` verbs run as jobs
-through `saved_cli` (`add` pins the session's last answer; `--refresh` and `--exit-code` are
+through `quack-cli`'s `saved_cli` (`add` pins the session's last answer; `--refresh` and `--exit-code` are
 parse errors there), and the REST routes under `.../saved` (`quack-server`'s `api/saved.rs`) list, save,
 show, run, and remove, audited as `save`, `saved_run`, `open`, `list`, and `delete`; a run
 answers directly, no job. The web Saved page (`web/saved.rs`) and the chat page's Save

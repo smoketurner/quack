@@ -12,7 +12,7 @@ use quack_core::storage::workspace::WorkspaceDb;
 use crate::text_or_json::TextOrJson;
 
 #[derive(clap::Args)]
-pub(crate) struct TablesArgs {
+pub struct TablesArgs {
     /// One table to show in full; without it, every table in a line
     table: Option<String>,
 
@@ -33,11 +33,17 @@ pub(crate) struct TablesArgs {
 
 impl TablesArgs {
     /// Whether it sets a note or retypes a column.
-    pub(crate) fn writes(&self) -> bool {
+    #[must_use]
+    pub fn writes(&self) -> bool {
         self.note.is_some() || !self.retype.is_empty()
     }
 
-    pub(crate) fn run(self, db: &WorkspaceDb, out: &mut impl Write) -> Result<()> {
+    /// Show a table, or set its note or retype columns first, and print it on `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the database, model, or I/O error the command meets.
+    pub fn run(self, db: &WorkspaceDb, out: &mut impl Write) -> Result<()> {
         let Some(table) = self.table else {
             return Self::list(db, self.format, out);
         };

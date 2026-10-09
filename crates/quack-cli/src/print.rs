@@ -20,6 +20,10 @@ use quack_core::llm::egress::Egress;
 
 use crate::text_or_json::TextOrJson;
 
+/// How long a command that answers one question waits, after printing, for
+/// the session title and history summary its turn started.
+pub const FOLLOW_UP_GRACE: Duration = Duration::from_secs(30);
+
 /// A cancellation token that Ctrl+C trips, for as long as the guard
 /// lives: the turn is then recorded as cancelled with whatever streamed,
 /// and a second Ctrl+C is left to the runtime. Dropping the guard stops
@@ -52,7 +56,7 @@ impl Drop for CtrlCGuard {
 
 /// How a printed turn ended, for the exit status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TurnOutcome {
+pub enum TurnOutcome {
     Answered,
     /// The agent needed a write the policy did not permit.
     WriteRefused,
@@ -60,7 +64,7 @@ pub(crate) enum TurnOutcome {
 
 /// One print-mode turn: the workspace, the session, the write policy, the
 /// prompt, and how to print it.
-pub(crate) struct PrintTurn<'a> {
+pub struct PrintTurn<'a> {
     pub config: &'a Config,
     pub db: SharedDb,
     pub reader_db: ReaderDb,
@@ -80,7 +84,7 @@ pub(crate) struct PrintTurn<'a> {
 /// output; stderr when the command's own result owns stdout, as `saved run
 /// --refresh` prints the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AnswerTo {
+pub enum AnswerTo {
     Stdout,
     Stderr,
 }
@@ -127,7 +131,11 @@ impl Write for AnswerStream {
 
 impl PrintTurn<'_> {
     /// Run the turn and print it.
-    pub(crate) async fn run(self) -> Result<TurnOutcome> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from the turn, the database, or writing the answer.
+    pub async fn run(self) -> Result<TurnOutcome> {
         let (config, db, reader_db, session_id) =
             (self.config, self.db, self.reader_db, self.session_id);
         let (policy, prompt, format, verbose) =

@@ -57,12 +57,6 @@ use quack_core::storage::workspace::{
 use quack_core::text::OneLine;
 use quack_core::vault::Vault;
 
-use crate::confirm::Confirm;
-use crate::embeddings_cli::{self, EmbeddingsAction};
-use crate::graph_cli::GraphAction;
-use crate::ontology_cli::{self, OntologyAction};
-use crate::saved_cli::{self, SavedAction};
-use crate::tables_cli::TablesArgs;
 use crate::terminal::SessionSetup;
 use crate::terminal::chart::ChartData;
 use crate::terminal::clipboard::{Clipboard, CopyStatus};
@@ -72,8 +66,15 @@ use crate::terminal::commands::{
 use crate::terminal::picker::{Picked, Picker};
 use crate::terminal::selection::{Edge, Located, Selection, TranscriptView};
 use crate::terminal::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
-use crate::text_or_json::TextOrJson;
-use crate::{ImportAction, ImportContext, ModeArg};
+use quack_cli::args::ModeArg;
+use quack_cli::confirm::Confirm;
+use quack_cli::embeddings_cli::{self, EmbeddingsAction};
+use quack_cli::graph_cli::GraphAction;
+use quack_cli::import_cli::{ImportAction, ImportContext};
+use quack_cli::ontology_cli::{self, OntologyAction};
+use quack_cli::saved_cli::{self, SavedAction};
+use quack_cli::tables_cli::TablesArgs;
+use quack_cli::text_or_json::TextOrJson;
 
 /// The spinner's frame interval; it ticks only while a job is active.
 const SPINNER_MS: u64 = 80;
