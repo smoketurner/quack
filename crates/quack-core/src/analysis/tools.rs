@@ -14,8 +14,8 @@ use serde_json::json;
 use crate::ids::ChunkId;
 use crate::storage::profile::TableProfile;
 use crate::storage::workspace::{
-    ChunkSearchResult, DocumentFilter, DocumentInfo, DocumentStatus, HybridLimits, SearchMode,
-    StatementKind, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object, quote_ident,
+    ChunkSearchResult, DocumentFilter, DocumentStatus, HybridLimits, SearchMode, StatementKind,
+    TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object, quote_ident,
 };
 use crate::storage::writer::Writer;
 
@@ -1183,8 +1183,7 @@ impl Tool for ReadDocumentTool {
         let read = self
             .db
             .with_db(move |db| {
-                let documents = db.list_documents()?;
-                let document = DocumentInfo::find(&documents, &wanted)?.clone();
+                let document = db.find_document(&wanted)?;
                 // The person's scope bounds whole-document reads as it does search.
                 within.narrow(vec![document.id.clone()])?;
                 if document.status != DocumentStatus::Ready {
@@ -1318,8 +1317,7 @@ impl Tool for ViewImageTool {
         let found = self
             .db
             .with_db(move |db| {
-                let documents = db.list_documents()?;
-                let document = DocumentInfo::find(&documents, &wanted)?.clone();
+                let document = db.find_document(&wanted)?;
                 within.narrow(vec![document.id.clone()])?;
                 if document.status != DocumentStatus::Ready {
                     return Err(Error::Analysis(format!(

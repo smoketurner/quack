@@ -3697,6 +3697,111 @@ impl WorkspaceDb {
         Ok(docs.collect::<duckdb::Result<_>>()?)
     }
 
+    /// The live document a person or the model named: by id, exact file
+    /// name, exact title (the name the prompt's inventory shows), or id
+    /// prefix, tried in that order. Each way is one query that reads at
+    /// most [`NamedDocuments::LISTED`] rows, so the lookup costs the same in
+    /// a workspace of any size.
+    ///
+    /// # Errors
+    ///
+    /// A name that matches several documents the same way is an error
+    /// naming them, never a pick. A name that matches none is an error
+    /// listing the newest documents there are, so the caller corrects it
+    /// rather than reading an empty result as "the workspace has nothing on
+    /// this".
+    pub fn find_document(&self, want: &str) -> Result<DocumentInfo> {
+        let want = want.trim();
+        if want.is_empty() {
+            return Err(Error::Analysis(String::from(
+                "no document named; pass an id, a file name, or a title from list_documents",
+            )));
+        }
+        for way in NameMatch::IN_ORDER {
+            let found = self.documents_named(way, want, NamedDocuments::LISTED)?;
+            match found.as_slice() {
+                [] => {}
+                [one] => return Ok(one.clone()),
+                [_, _, ..] => {
+                    let total = self.count_documents_named(way, want)?;
+                    return Err(Error::Analysis(format!(
+                        "{total} documents {} '{want}'; pass one's full id: {}",
+                        way.phrase(),
+                        NamedDocuments {
+                            found: &found,
+                            total
+                        }
+                    )));
+                }
+            }
+        }
+        let (found, total) = self.recent_documents(NamedDocuments::LISTED)?;
+        let total = u64::try_from(total).unwrap_or(u64::MAX);
+        Err(Error::Analysis(format!(
+            "no document matches '{want}'; pass an id (a prefix is enough), an exact file name, \
+             or an exact title from list_documents. Documents: {}",
+            NamedDocuments {
+                found: &found,
+                total
+            }
+        )))
+    }
+
+    /// The live document whose id is `prefix` or starts with it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when none does and [`Error::Ambiguous`] when
+    /// several do, both naming documents.
+    pub fn document_by_id_prefix(&self, prefix: &str) -> Result<DocumentInfo> {
+        if let Some(exact) = self.documents_named(NameMatch::Id, prefix, 1)?.pop() {
+            return Ok(exact);
+        }
+        let mut found = self.documents_named(NameMatch::IdPrefix, prefix, 2)?;
+        match (found.pop(), found.is_empty()) {
+            (None, _) => Err(ResourceKind::Document.missing(prefix)),
+            (Some(one), true) => Ok(one),
+            (Some(_), false) => Err(Error::Ambiguous {
+                kind: ResourceKind::Document,
+                prefix: prefix.to_owned(),
+                count: usize::try_from(self.count_documents_named(NameMatch::IdPrefix, prefix)?)
+                    .unwrap_or(usize::MAX),
+            }),
+        }
+    }
+
+    /// Up to `limit` live documents `want` names `way`, newest first.
+    fn documents_named(
+        &self,
+        way: NameMatch,
+        want: &str,
+        limit: usize,
+    ) -> Result<Vec<DocumentInfo>> {
+        let sql = format!(
+            "{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} AND {} \
+             ORDER BY ingested_at DESC, id DESC LIMIT ?",
+            way.condition()
+        );
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let docs = stmt.query_map(duckdb::params![want, limit], |row| {
+            DocumentInfo::try_from(row)
+        })?;
+        Ok(docs.collect::<duckdb::Result<_>>()?)
+    }
+
+    /// How many live documents `want` names `way`.
+    fn count_documents_named(&self, way: NameMatch, want: &str) -> Result<u64> {
+        Ok(self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM _quack_documents WHERE {NOT_SUPERSEDED} AND {}",
+                way.condition()
+            ),
+            duckdb::params![want],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Every document row, replaced ones included, newest first: the
     /// listing behind `quack docs --all` and the Documents page's
     /// "show replaced" view.
@@ -4045,8 +4150,8 @@ pub struct DocumentInfo {
     pub language: Option<String>,
 }
 
-/// One way a name can name a document, in the order `DocumentInfo::find`
-/// tries them.
+/// One way a name can name a document, in the order
+/// `WorkspaceDb::find_document` tries them.
 #[derive(Debug, Clone, Copy)]
 enum NameMatch {
     Id,
@@ -4058,12 +4163,13 @@ enum NameMatch {
 impl NameMatch {
     const IN_ORDER: [Self; 4] = [Self::Id, Self::FileName, Self::Title, Self::IdPrefix];
 
-    fn matches(self, document: &DocumentInfo, want: &str) -> bool {
+    /// The `WHERE` condition, with one parameter for the name.
+    const fn condition(self) -> &'static str {
         match self {
-            Self::Id => document.id.as_str() == want,
-            Self::FileName => document.filename == want,
-            Self::Title => document.title.as_deref().map(str::trim) == Some(want),
-            Self::IdPrefix => document.id.as_str().starts_with(want),
+            Self::Id => "id = ?",
+            Self::FileName => "filename = ?",
+            Self::Title => "trim(title) = ?",
+            Self::IdPrefix => "starts_with(id, ?)",
         }
     }
 
@@ -4078,76 +4184,52 @@ impl NameMatch {
     }
 }
 
+/// Some of the documents a name matched, or of the workspace's, and how
+/// many there are: the listing a lookup error names.
+struct NamedDocuments<'a> {
+    found: &'a [DocumentInfo],
+    total: u64,
+}
+
+impl NamedDocuments<'_> {
+    /// Documents a listing names at most.
+    const LISTED: usize = 20;
+}
+
+impl fmt::Display for NamedDocuments<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, d) in self.found.iter().take(Self::LISTED).enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            match d.title.as_deref() {
+                Some(title) => write!(
+                    f,
+                    "{} ({}, \"{}\")",
+                    d.id,
+                    OneLine(&d.filename),
+                    OneLine(title)
+                )?,
+                None => write!(f, "{} ({})", d.id, OneLine(&d.filename))?,
+            }
+        }
+        let shown = u64::try_from(self.found.len().min(Self::LISTED)).unwrap_or(u64::MAX);
+        if self.total > shown {
+            write!(
+                f,
+                ", and {} more; list_documents names them all",
+                self.total.saturating_sub(shown)
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl DocumentInfo {
     /// The title when one exists, else the filename.
     #[must_use]
     pub fn display_name(&self) -> &str {
         self.title.as_deref().unwrap_or(&self.filename)
-    }
-
-    /// The document in `documents` a person or the model named: by id,
-    /// exact file name, exact title (the name the prompt's inventory
-    /// shows), or id prefix, tried in that order.
-    ///
-    /// # Errors
-    ///
-    /// A name that matches several documents the same way is an error
-    /// naming them, never a pick. A name that matches none is an error
-    /// listing some of the documents there are, so the caller corrects it
-    /// rather than reading an empty result as "the workspace has nothing on
-    /// this".
-    pub fn find<'a>(documents: &'a [Self], want: &str) -> Result<&'a Self> {
-        /// Documents a listing in an error names at most.
-        const LISTED: usize = 20;
-        let want = want.trim();
-        let listed = |matches: &[&Self]| -> String {
-            let mut names: Vec<String> = matches
-                .iter()
-                .take(LISTED)
-                .map(|d| match d.title.as_deref() {
-                    Some(title) => format!(
-                        "{} ({}, \"{}\")",
-                        d.id,
-                        OneLine(&d.filename),
-                        OneLine(title)
-                    ),
-                    None => format!("{} ({})", d.id, OneLine(&d.filename)),
-                })
-                .collect();
-            if matches.len() > LISTED {
-                names.push(format!(
-                    "and {} more; list_documents names them all",
-                    matches.len().saturating_sub(LISTED)
-                ));
-            }
-            names.join(", ")
-        };
-        if want.is_empty() {
-            return Err(Error::Analysis(String::from(
-                "no document named; pass an id, a file name, or a title from list_documents",
-            )));
-        }
-        for way in NameMatch::IN_ORDER {
-            let found: Vec<&Self> = documents.iter().filter(|d| way.matches(d, want)).collect();
-            match found.as_slice() {
-                [] => {}
-                [one] => return Ok(one),
-                several => {
-                    return Err(Error::Analysis(format!(
-                        "{} documents {} '{want}'; pass one's full id: {}",
-                        several.len(),
-                        way.phrase(),
-                        listed(several)
-                    )));
-                }
-            }
-        }
-        let all: Vec<&Self> = documents.iter().collect();
-        Err(Error::Analysis(format!(
-            "no document matches '{want}'; pass an id (a prefix is enough), an exact file name, \
-             or an exact title from list_documents. Documents: {}",
-            listed(&all)
-        )))
     }
 
     /// The tables a row from before `tables` was recorded loaded into: the
@@ -4875,10 +4957,9 @@ impl ChunkScope {
         if wanted.is_empty() {
             return Ok(Self::all());
         }
-        let documents = db.list_documents()?;
         let mut resolved = Vec::with_capacity(wanted.len());
         for want in wanted {
-            resolved.push(DocumentInfo::find(&documents, want)?.id.clone());
+            resolved.push(db.find_document(want)?.id);
         }
         Ok(Self::documents(resolved))
     }

@@ -2111,10 +2111,9 @@ fn sorting_rewrites_the_statements_own_order_by() {
 }
 
 /// A document's chunks page in document order from any position, whatever
-/// its status, and the model's name for a document resolves by id, exact
-/// file name, or id prefix, else errors with the documents there are.
+/// its status.
 #[test]
-fn document_chunks_page_in_order_and_documents_resolve_by_id_name_or_prefix() {
+fn document_chunks_page_in_order() {
     let db =
         WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
     let id = DocumentId::from("doc-aaaa");
@@ -2157,25 +2156,39 @@ fn document_chunks_page_in_order_and_documents_resolve_by_id_name_or_prefix() {
             .map(|c| (c.content.as_str(), c.page, c.filename.as_str())),
         Some(("part 2", Some(3), "policy.md"))
     );
+}
 
-    let documents = db.list_documents().unwrap_or_else(|e| fail(&e.to_string()));
+/// The model's name for a document resolves by id, exact file name, exact
+/// title, or id prefix, whatever its status, else errors with the
+/// documents there are.
+#[test]
+fn documents_resolve_by_id_name_title_or_prefix() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    let id = DocumentId::from("doc-aaaa");
+    db.insert_document(
+        &NewDocument::new(&id, "policy.md", "text/markdown", 1).with_status(DocumentStatus::Error),
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
     for want in ["doc-aaaa", "policy.md", "doc-a", " doc-aaaa "] {
         assert_eq!(
-            DocumentInfo::find(&documents, want)
-                .map(|d| d.id.as_str())
-                .ok(),
+            db.find_document(want)
+                .map(|d| d.id.into_string())
+                .ok()
+                .as_deref(),
             Some("doc-aaaa"),
             "{want}"
         );
     }
     assert!(
-        DocumentInfo::find(&documents, " ")
+        db.find_document(" ")
             .err()
             .is_some_and(|e| e.to_string().contains("no document named"))
     );
     for want in ["pol", "doc-b"] {
-        let error = DocumentInfo::find(&documents, want)
-            .map(|d| d.id.clone())
+        let error = db
+            .find_document(want)
+            .map(|d| d.id)
             .map_err(|e| e.to_string());
         let Err(error) = error else {
             fail(&format!("'{want}' matched a document"))
@@ -2187,25 +2200,28 @@ fn document_chunks_page_in_order_and_documents_resolve_by_id_name_or_prefix() {
         );
     }
     // An exact title names a document too; one several share is refused.
-    let mut titled = documents;
-    for (doc, title) in titled.iter_mut().zip(["Returns policy"]) {
-        doc.title = Some(String::from(title));
-    }
+    db.set_document_title_if_empty(&id, "Returns policy")
+        .unwrap_or_else(|e| fail(&e.to_string()));
     assert_eq!(
-        DocumentInfo::find(&titled, "Returns policy")
-            .map(|d| d.id.as_str())
-            .ok(),
+        db.find_document("Returns policy")
+            .map(|d| d.id.into_string())
+            .ok()
+            .as_deref(),
         Some("doc-aaaa")
     );
-    assert!(DocumentInfo::find(&titled, "returns policy").is_err());
-    let mut twice = titled.clone();
-    twice.extend(titled.iter().cloned().map(|mut d| {
-        d.id = DocumentId::from("doc-bbbb");
-        d.filename = String::from("policy-2.md");
-        d
-    }));
-    let shared = DocumentInfo::find(&twice, "Returns policy")
-        .map(|d| d.id.clone())
+    assert!(db.find_document("returns policy").is_err());
+    let second = DocumentId::from("doc-bbbb");
+    db.insert_document(&NewDocument::new(
+        &second,
+        "policy-2.md",
+        "text/markdown",
+        1,
+    ))
+    .and_then(|()| db.set_document_title_if_empty(&second, "Returns policy"))
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let shared = db
+        .find_document("Returns policy")
+        .map(|d| d.id)
         .map_err(|e| e.to_string());
     assert!(
         shared
@@ -2720,24 +2736,37 @@ fn ambiguous_document_names_are_refused_and_misses_are_capped() {
         ))
         .unwrap_or_else(|e| fail(&e.to_string()));
     }
-    let twice = db.list_documents().unwrap_or_else(|e| fail(&e.to_string()));
-    let titled = twice.clone();
-    let prefix = DocumentInfo::find(&twice, "doc-")
-        .err()
-        .map(|e| e.to_string());
+    let prefix = db.find_document("doc-").err().map(|e| e.to_string());
     assert!(
         prefix
             .as_deref()
             .is_some_and(|e| e.contains("2 documents have ids starting with 'doc-'")),
         "{prefix:?}"
     );
-    let mut same_name = twice;
-    for document in &mut same_name {
-        document.filename = String::from("policy.md");
-    }
-    let named = DocumentInfo::find(&same_name, "policy.md")
-        .err()
-        .map(|e| e.to_string());
+    let by_prefix = db.document_by_id_prefix("doc-").err();
+    assert!(
+        matches!(by_prefix, Some(Error::Ambiguous { count: 2, .. })),
+        "{by_prefix:?}"
+    );
+    assert!(matches!(
+        db.document_by_id_prefix("doc-x"),
+        Err(Error::NotFound { .. })
+    ));
+    assert_eq!(
+        db.document_by_id_prefix("doc-b")
+            .map(|d| d.id.into_string())
+            .ok()
+            .as_deref(),
+        Some("doc-bbbb")
+    );
+    db.insert_document(&NewDocument::new(
+        &DocumentId::from("doc-cccc"),
+        "policy.md",
+        "text/markdown",
+        1,
+    ))
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let named = db.find_document("policy.md").err().map(|e| e.to_string());
     assert!(
         named
             .as_deref()
@@ -2745,23 +2774,19 @@ fn ambiguous_document_names_are_refused_and_misses_are_capped() {
         "{named:?}"
     );
     // A miss in a large workspace lists 20 documents and counts the rest.
-    let many: Vec<DocumentInfo> = (0..25)
-        .map(|i| {
-            let mut d = titled
-                .first()
-                .cloned()
-                .unwrap_or_else(|| fail("a document"));
-            d.id = DocumentId::from(format!("id-{i:02}"));
-            d
-        })
-        .collect();
-    let miss = DocumentInfo::find(&many, "nothing")
-        .err()
-        .map(|e| e.to_string());
+    for i in 0..22 {
+        db.insert_document(&NewDocument::new(
+            &DocumentId::from(format!("id-{i:02}")),
+            "other.md",
+            "text/markdown",
+            1,
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let miss = db.find_document("nothing").err().map(|e| e.to_string());
     assert!(
-        miss.as_deref().is_some_and(|e| e.contains("id-19")
-            && !e.contains("id-20")
-            && e.contains("and 5 more")),
+        miss.as_deref()
+            .is_some_and(|e| e.matches(".md)").count() == 20 && e.contains("and 5 more")),
         "{miss:?}"
     );
 }

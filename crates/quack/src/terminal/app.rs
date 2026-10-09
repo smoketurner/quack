@@ -44,7 +44,7 @@ use quack_core::prefix::PrefixMatch;
 use quack_core::priority::Priority;
 use quack_core::progress::{ChunkDone, RunControl};
 use quack_core::storage::context;
-use quack_core::storage::control::{ControlPlane, ResourceKind};
+use quack_core::storage::control::ControlPlane;
 use quack_core::storage::input_history;
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{
@@ -2511,10 +2511,7 @@ impl App {
     fn delete_document(&mut self, prefix: String) {
         self.on_db_ok(
             Side::Read,
-            move |db| {
-                PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
-                    .one(ResourceKind::Document, &prefix)
-            },
+            move |db| db.document_by_id_prefix(&prefix),
             |app, doc| {
                 app.prompts.push_back(Prompt::Delete(Deletion::Document {
                     id: doc.id,
@@ -2707,8 +2704,7 @@ impl App {
         self.on_db_ok(
             Side::Write,
             move |db| {
-                let doc = PrefixMatch::of(db.list_documents()?, &prefix, |d| d.id.as_str())
-                    .one(ResourceKind::Document, &prefix)?;
+                let doc = db.document_by_id_prefix(&prefix)?;
                 db.set_document_pinning(&doc.id, pinning).map(|()| doc.id)
             },
             move |app, id| {

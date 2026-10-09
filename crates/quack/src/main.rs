@@ -2226,9 +2226,7 @@ fn run_docs(db: &WorkspaceDb, args: &DocsArgs) -> Result<()> {
 
 /// Resolve a full document id or a unique prefix.
 fn find_document(db: &WorkspaceDb, prefix: &str) -> CoreResult<DocumentId> {
-    let document = PrefixMatch::of(db.list_documents()?, prefix, |d| d.id.as_str())
-        .one(ResourceKind::Document, prefix)?;
-    Ok(document.id)
+    Ok(db.document_by_id_prefix(prefix)?.id)
 }
 
 /// Which documents `quack docs` lists.
