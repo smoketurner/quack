@@ -1048,11 +1048,15 @@ where
         let chunk_ids: Vec<ChunkId> = results.iter().map(|r| r.id.clone()).collect();
         // Best effort: the annotation is extra context, so a graph that
         // cannot be read must not fail a search that already succeeded.
-        let entities = self
-            .db
-            .with_db(move |db| graph::store::entities_of_chunks(db, &chunk_ids, CHUNK_ENTITIES))
-            .await
-            .unwrap_or_default();
+        // An empty graph names nothing, so it is not asked.
+        let entities = if self.modeled.has_graph() {
+            self.db
+                .with_db(move |db| graph::store::entities_of_chunks(db, &chunk_ids, CHUNK_ENTITIES))
+                .await
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
         let markers = turn.cite(&results);
         format_search_results(&results, markers, &entities).map_err(format_failed)
     }
