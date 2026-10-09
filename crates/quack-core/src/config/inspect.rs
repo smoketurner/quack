@@ -391,7 +391,6 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "threads",
             "max_turns",
             "history_token_budget",
-            "max_context_tokens",
             "extraction_timeout_seconds",
             "extraction_concurrency",
             "reader_pool_size",
@@ -828,11 +827,6 @@ fn analysis(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "history_token_budget",
         analysis.history_token_budget,
         default.history_token_budget,
-    );
-    s.literal(
-        "max_context_tokens",
-        analysis.max_context_tokens,
-        default.max_context_tokens,
     );
     s.literal(
         "extraction_timeout_seconds",

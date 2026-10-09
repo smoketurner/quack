@@ -82,8 +82,7 @@ pub struct PromptOptions {
 pub enum Window {
     /// The provider sizes its own.
     Provider,
-    /// Ollama, at a size quack asks for up to `[analysis].max_context_tokens`
-    /// (`llm::sampling::OllamaLoad`).
+    /// Ollama, whose server sizes it (`OLLAMA_CONTEXT_LENGTH`).
     Ollama,
 }
 

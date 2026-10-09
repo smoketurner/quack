@@ -33,6 +33,16 @@ vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
   workspace's questions and SQL outside any workspace file. The first terminal session
   deletes that file; its lines are not carried over, so Up starts empty in every workspace.
   The table needs no backfill and the schema version does not change.
+- Breaking: `[analysis].max_context_tokens` is removed. Delete it from `config.toml` before
+  starting the new binary. Ollama chat requests no longer carry `num_ctx` or `keep_alive`, so
+  set the window and the load time on the Ollama server: `OLLAMA_CONTEXT_LENGTH=32768` keeps
+  the old default window, and `OLLAMA_KEEP_ALIVE=30m` keeps the old load time.
+- Changed: `effort` and `background_effort` go out as rig's reasoning option, and rig's model
+  catalog decides which levels a model takes. A level the model lacks fails when the model is
+  built, and `quack doctor` reports it as a failure, where quack used to send nothing and warn
+  (an OpenAI model on Converse, for example). Any Ollama model is now sent `think`, not only
+  gpt-oss. `effort = "none"` on Claude turns thinking off where the model allows it. Adaptive
+  Claude models are also sent `thinking: adaptive` with the effort.
 
 ## v2026.10.4
 

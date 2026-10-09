@@ -214,7 +214,7 @@ async fn the_model_reranker_uses_background_effort_not_turn_effort() {
          auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\nbase_url = \"{root}\"\n"
         ));
         // Build the rerank one-shot the way `dispatch` does: through
-        // `schema_call`, which samples the model at `background_effort`.
+        // `schema_call`, which builds the model at `background_effort`.
         let call = {
             let chat = config
                 .chat_model_ref()
@@ -360,7 +360,7 @@ async fn a_one_shot_answer_cut_at_the_output_limit_is_refused() {
         assert!(
             message.contains(
                 "the graph extraction answer was cut off at the model's output limit"
-            ) && message.contains("[analysis].max_context_tokens")
+            ) && message.contains("OLLAMA_CONTEXT_LENGTH")
                 && !message.contains("max_tokens for this request"),
             "{message}"
         );
@@ -415,7 +415,7 @@ async fn a_turn_cut_at_the_output_limit_says_so() {
         assert!(
             response.content.starts_with(kept)
                 && response.content.contains(note)
-                && response.content.contains("[analysis].max_context_tokens")
+                && response.content.contains("OLLAMA_CONTEXT_LENGTH")
                 && !response.content.contains("max_tokens for this request"),
             "{}",
             response.content
@@ -621,23 +621,20 @@ async fn anthropic_sends_an_oauth_token_as_a_bearer() {
 }
 
 /// A background call carries what its API is asked on every request: the
-/// Responses API stores nothing, and Ollama loads the model with a sized
-/// window and keeps it loaded, as a chat turn does.
+/// Responses API stores nothing, and Ollama gets no load options, so its
+/// server sizes the window and decides how long the model stays loaded.
 #[tokio::test]
-async fn background_calls_carry_store_and_the_ollama_load() {
+async fn background_calls_carry_store_and_no_ollama_load() {
     Egress::scope(Some(Egress::NoWorkspace), async {
         let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
-        for (provider, auth, sent) in [
+        for (provider, auth, sent, unsent) in [
             (
                 "type = \"openai\"\napi = \"responses\"\n",
                 keyed,
                 vec![r#""store":false"#],
+                vec![],
             ),
-            (
-                "type = \"ollama\"\n",
-                "",
-                vec![r#""num_ctx":16384"#, r#""keep_alive":"30m""#],
-            ),
+            ("type = \"ollama\"\n", "", vec![], vec!["num_ctx", "keep_alive"]),
         ] {
             let (root, seen) = capture_one().await;
             let config = parse(&format!(
@@ -651,9 +648,106 @@ async fn background_calls_carry_store_and_the_ollama_load() {
             for field in sent {
                 assert!(request.contains(field), "{provider}: {field} in {request}");
             }
+            for field in unsent {
+                assert!(!request.contains(field), "{provider}: {field} in {request}");
+            }
         }
     })
     .await;
+}
+
+/// The configured effort reaches each API as the field rig writes for it.
+#[tokio::test]
+async fn effort_goes_out_as_each_api_s_field() {
+    Egress::scope(Some(Egress::NoWorkspace), async {
+        let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
+        for (provider, model, effort, fields) in [
+            (
+                "type = \"anthropic\"\n",
+                "claude-opus-5-5",
+                "high",
+                vec![r#""effort":"high""#, r#""thinking":{"type":"adaptive""#],
+            ),
+            (
+                "type = \"openai\"\napi = \"responses\"\n",
+                "gpt-5.6-sol",
+                "max",
+                vec![r#""effort":"max""#],
+            ),
+            (
+                "type = \"openai\"\napi = \"chat-completions\"\n",
+                "corp-reasoner",
+                "medium",
+                vec![r#""reasoning_effort":"medium""#],
+            ),
+            ("type = \"ollama\"\n", "gpt-oss:20b", "low", vec![r#""think":"low""#]),
+            ("type = \"ollama\"\n", "qwen3:8b", "none", vec![r#""think":false"#]),
+        ] {
+            let (root, seen) = capture_one().await;
+            let auth = if provider.contains("ollama") { "" } else { keyed };
+            let config = parse(&format!(
+                "[general]\nchat_model = \"p/{model}\"\n[analysis]\nbackground_effort = \"{effort}\"\n\
+                 [providers.p]\n{provider}{auth}base_url = \"{root}\"\n"
+            ));
+            let extractor = graph_extractor(&config, &Ontology::default())
+                .await
+                .unwrap_or_else(|e| fail(&format!("{model}: {e}")));
+            assert!(extractor.extract("Orgenics ships to Kenya.").await.is_err());
+            let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
+            for field in fields {
+                assert!(request.contains(field), "{model}: {field} in {request}");
+            }
+        }
+    })
+    .await;
+}
+
+/// A level rig refuses for the model fails when the chat model is built,
+/// before any request, with rig's reason; one it takes builds.
+#[tokio::test]
+async fn an_effort_rig_refuses_fails_when_the_model_is_built() {
+    let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
+    let built = |provider: &str, model: &str, effort: Effort| {
+        let config = parse(&format!(
+            "[general]\nchat_model = \"p/{model}\"\n[providers.p]\n{provider}"
+        ));
+        async move {
+            let chat = config
+                .chat_model_ref()
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            ChatClient::without_credential(chat.provider_name, chat.provider)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .chat_model(chat.model, Some(effort), None)
+                .map(drop)
+        }
+    };
+    let anthropic = format!("type = \"anthropic\"\n{keyed}");
+    for (provider, model, effort) in [
+        (anthropic.as_str(), "claude-opus-5-5", Effort::None),
+        (anthropic.as_str(), "claude-opus-5-5", Effort::Minimal),
+        ("type = \"ollama\"\n", "gpt-oss:20b", Effort::Minimal),
+        ("type = \"ollama\"\n", "gpt-oss:20b", Effort::Xhigh),
+    ] {
+        let Err(e) = built(provider, model, effort).await else {
+            fail(&format!("{model} took {effort}"))
+        };
+        let message = e.to_string();
+        assert!(
+            message.contains(&format!("effort \"{effort}\"")),
+            "{message}"
+        );
+        assert!(message.contains(model), "{message}");
+    }
+    for (provider, model, effort) in [
+        (anthropic.as_str(), "claude-opus-5-5", Effort::Max),
+        ("type = \"ollama\"\n", "gpt-oss:20b", Effort::High),
+    ] {
+        assert!(
+            built(provider, model, effort).await.is_ok(),
+            "{model} {effort}"
+        );
+    }
 }
 
 #[test]

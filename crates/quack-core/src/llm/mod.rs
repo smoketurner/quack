@@ -6,10 +6,10 @@
 
 pub mod acting;
 pub mod bedrock;
+pub mod chat_model;
 pub mod egress;
 pub mod memory;
 pub mod oauth;
-pub mod sampling;
 mod slot;
 pub mod titles;
 pub mod vision;
@@ -38,8 +38,8 @@ use crate::analysis::text_to_sql::{PromptOptions, Window};
 use crate::analysis::tools::Rerank;
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::{
-    AnalysisConfig, BaseUrl, BedrockApi, BedrockEndpoint, Config, Effort, ModelRef, ModelSettings,
-    ProviderAuth, ProviderConfig, ProviderName, ProviderType, RerankMode, config_file_path,
+    BaseUrl, BedrockApi, BedrockEndpoint, Config, Effort, ModelRef, ModelSettings, ProviderAuth,
+    ProviderConfig, ProviderName, ProviderType, RerankMode, config_file_path,
 };
 use crate::embedding::{Embedder, EmbeddingModel, Profile};
 use crate::error::{Error, Result};
@@ -51,9 +51,9 @@ use crate::ontology::documents::{self, OpenExtraction};
 use crate::priority::Priority;
 use crate::storage::control::ResourceKind;
 use crate::storage::{context, sessions};
-use crate::text::Tokens;
+pub use chat_model::ChatModel;
+use chat_model::{ChatSettings, Wire};
 use egress::Egress;
-use sampling::{OllamaLoad, Sampled, Wire};
 pub use tokio_util::sync::CancellationToken;
 use vision::ImageReader;
 
@@ -73,12 +73,6 @@ impl ModelRef<'_> {
         )
     }
 }
-
-/// A chat model with its wire and transport erased: what the agent and the
-/// one-shot calls run on. Every one quack builds is [`Sampled`], and every
-/// HTTP one sends through [`LimitedHttp`], so each provider's
-/// `max_concurrent_requests` bounds the model requests in flight.
-pub type ChatModel = DynModel<operation::Completion>;
 
 /// A dedicated rerank model with its wire and transport erased, sending
 /// through [`LimitedHttp`] like every model quack builds.
@@ -139,10 +133,9 @@ impl RerankModel {
 /// One of rig's embedding models with its wire and transport erased.
 type RigEmbeddingModel = DynModel<operation::Embedding>;
 
-/// How long every Ollama request asks the server to keep the model loaded.
-/// Ollama's own default is 5 minutes (`OLLAMA_KEEP_ALIVE`), which a gap
-/// between tool calls or turns can exceed, and a reload of a 20B model
-/// costs several seconds (measured live in the perf handoff).
+/// How long an embedding request asks Ollama to keep the embedding model
+/// loaded. Ollama's own default is 5 minutes (`OLLAMA_KEEP_ALIVE`), which a
+/// gap between turns can exceed, and a reload costs several seconds.
 pub const OLLAMA_KEEP_ALIVE: &str = "30m";
 
 /// The smallest context window the embedding model is loaded with. Ollama
@@ -157,9 +150,6 @@ const OLLAMA_EMBED_MIN_CTX: u32 = 2048;
 pub struct OllamaEndpoint {
     settings: ollama::OllamaConfig,
     http: LimitedHttp,
-    /// The largest context window a chat model is loaded with
-    /// (`[analysis].max_context_tokens`).
-    context_cap: Tokens,
 }
 
 impl OllamaEndpoint {
@@ -187,13 +177,7 @@ impl OllamaEndpoint {
         Ok(Self {
             settings,
             http: LimitedHttp::for_provider(name, provider).with_headers(provider.header_map()?),
-            context_cap: AnalysisConfig::default().max_context_tokens,
         })
-    }
-
-    /// How every request to `model` loads it.
-    fn load(&self, model: &str) -> OllamaLoad {
-        OllamaLoad::new(&self.settings.base_url, model, self.context_cap)
     }
 
     /// rig's client for the server.
@@ -465,6 +449,23 @@ impl ChatClient {
         Self::for_provider(config, chat.provider_name, chat.provider).await
     }
 
+    /// The client for `provider` with a placeholder in place of its
+    /// credential, to check what its requests would carry without sending
+    /// any. Bedrock still loads its AWS session, which names the endpoint.
+    pub(crate) async fn without_credential(
+        name: &ProviderName,
+        provider: &ProviderConfig,
+    ) -> Result<Self> {
+        match provider.provider_type {
+            ProviderType::Bedrock | ProviderType::BedrockMantle => {
+                Self::bedrock(&*bedrock::session(name, provider).await?, name, provider)
+            }
+            ProviderType::Ollama | ProviderType::Openai | ProviderType::Anthropic => {
+                Self::connect(name, provider, Some(UNSENT_KEY))
+            }
+        }
+    }
+
     /// The client for `provider`, its credential resolved the way a turn
     /// resolves it.
     pub(crate) async fn for_provider(
@@ -482,13 +483,7 @@ impl ChatClient {
                     provider,
                     provider.auth.credential(config, name).await?.as_deref(),
                 )?;
-                Ok(match client {
-                    Self::Ollama(endpoint) => Self::Ollama(OllamaEndpoint {
-                        context_cap: config.analysis.max_context_tokens,
-                        ..endpoint
-                    }),
-                    other => other,
-                })
+                Ok(client)
             }
         }
     }
@@ -606,51 +601,25 @@ impl ChatClient {
         }
     }
 
-    /// The chat model `model`, [`Sampled`] for its API at `effort`.
-    fn chat_model(
+    /// The chat model `model` at `effort`, with the settings its API takes.
+    /// Every HTTP one sends through [`LimitedHttp`], so each provider's
+    /// `max_concurrent_requests` bounds the model requests in flight.
+    pub(crate) fn chat_model(
         &self,
         model: &str,
         effort: Option<Effort>,
         temperature: Option<bool>,
     ) -> Result<ChatModel> {
-        let wire = self.wire();
-        Ok(match self {
-            Self::Ollama(endpoint) => Sampled::model(
-                endpoint.client().native_completion(model),
-                model,
-                wire,
-                effort,
-                temperature,
-                Some(endpoint.load(model)),
-            )?,
-            Self::OpenAi(client) => {
-                Sampled::model(client.chat(model), model, wire, effort, temperature, None)?
+        let settings = ChatSettings::new(model, self.wire(), effort, temperature);
+        match self {
+            Self::Ollama(endpoint) => {
+                ChatModel::new(endpoint.client().native_completion(model), model, settings)
             }
-            Self::Anthropic(client) => Sampled::model(
-                client.completion(model),
-                model,
-                wire,
-                effort,
-                temperature,
-                None,
-            )?,
-            Self::Bedrock(client) => Sampled::model(
-                client.completion(model),
-                model,
-                wire,
-                effort,
-                temperature,
-                None,
-            )?,
-            Self::Responses(client) => Sampled::model(
-                client.responses(model),
-                model,
-                wire,
-                effort,
-                temperature,
-                None,
-            )?,
-        })
+            Self::OpenAi(client) => ChatModel::new(client.chat(model), model, settings),
+            Self::Anthropic(client) => ChatModel::new(client.completion(model), model, settings),
+            Self::Bedrock(client) => ChatModel::new(client.completion(model), model, settings),
+            Self::Responses(client) => ChatModel::new(client.responses(model), model, settings),
+        }
     }
 
     /// A background call to `model` whose answer `schema` shapes.
@@ -739,6 +708,9 @@ impl Rerank {
 /// replaces their `Authorization` header with a `SigV4` one.
 const SIGNED_PLACEHOLDER_KEY: &str = "sigv4";
 
+/// The key of a client that never sends a request.
+const UNSENT_KEY: &str = "unsent";
+
 /// What one background call is for: its preamble, how long it may take,
 /// and the name errors and logs give it.
 #[derive(Clone, Copy)]
@@ -773,9 +745,9 @@ impl<A> SchemaCall<A> {
     pub fn new(model: ChatModel, task: Task<'_>, schema: Schema) -> Self {
         Self {
             call: PlainCall {
-                agent: AgentBuilder::new(model)
+                agent: model
+                    .agent(0.0)
                     .preamble(task.preamble)
-                    .temperature(0.0)
                     .output_schema_raw(schema)
                     .output_mode(OutputMode::Native)
                     .build(),
@@ -812,10 +784,7 @@ impl PlainCall {
     /// A call to `model` with `task`'s preamble that answers in text.
     pub(crate) fn new(model: ChatModel, task: Task<'_>) -> Self {
         Self {
-            agent: AgentBuilder::new(model)
-                .preamble(task.preamble)
-                .temperature(0.0)
-                .build(),
+            agent: model.agent(0.0).preamble(task.preamble).build(),
             timeout: task.timeout,
             label: task.label,
         }
@@ -1506,7 +1475,7 @@ async fn dispatch(
 ) -> Result<AgentResponse> {
     let client = ChatClient::build(config, &chat).await?;
     let (wire, settings) = (client.wire(), config.model_settings(chat));
-    sampling::check_tool_calls(chat.model, wire, settings.effort)?;
+    chat_model::check_tool_calls(chat.model, wire, settings.effort)?;
     if let ChatClient::Ollama(endpoint) = &client {
         // A first request after idle loads the model, which took 5
         // seconds for a 12 GB model measured live and shows the user
@@ -1522,8 +1491,7 @@ async fn dispatch(
         };
         if !resident {
             drop(sink.send(AgentEvent::Status(format!(
-                "loading {}, then thinking; Ollama loads a model on its first request and keeps it \
-                 for {OLLAMA_KEEP_ALIVE}",
+                "loading {}, then thinking; Ollama loads a model on its first request",
                 chat.model
             ))));
         }

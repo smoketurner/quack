@@ -221,7 +221,7 @@ pub struct ModelReranker {
     call: SchemaCall<RerankAnswer>,
 }
 
-/// The `SchemaCall` owns its model (sampled once, at construction), so the
+/// The `SchemaCall` owns its model (its effort set once, at construction), so the
 /// caller hands one built through `schema_call` rather than the turn's
 /// model, or the rerank call inherits the turn's `effort`.
 impl ModelReranker {

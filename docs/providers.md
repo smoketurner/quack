@@ -127,13 +127,18 @@ configured provider whatever any workspace allows.
 quack sends `temperature` only through Ollama's own API (`type = "ollama"`). Current Claude
 and OpenAI reasoning models reject it with a 400, and every API accepts a request without it.
 
-`[analysis].effort` and `background_effort` go out as the field each API takes:
-`output_config.effort` for Claude, `reasoning.effort` on Responses, `reasoning_effort` on Chat
-Completions, `think` on Ollama. quack knows which levels Claude, OpenAI's reasoning models, and
-gpt-oss take, and refuses any other level before sending a request. A model it does not
-recognize, such as a gateway alias or an open-weight model on vLLM, gets the effort on Chat
-Completions and Responses, and the server decides whether it accepts that level.
-Elsewhere, quack sends no effort and logs a warning; `quack doctor` shows the same warning.
+`[analysis].effort` and `background_effort` go out as rig's reasoning option. rig writes the
+field each API takes: `output_config.effort` with adaptive thinking for Claude,
+`reasoning.effort` on Responses, `reasoning_effort` on Chat Completions, `think` on Ollama.
+rig's model catalog says which levels a listed model takes, and a level it lacks is refused
+when the model is built, before any request. `none` turns reasoning off where the model
+allows it. A model the catalog does not list, such as a gateway alias or an open-weight model
+on vLLM, is sent the level as asked, and the server decides whether it accepts it. On Ollama,
+any model is sent `think`; a model that does not think answers with Ollama's own error.
+
+Ollama sizes each model's context window and decides how long it stays loaded. quack sends
+neither, so set them on the Ollama server: `OLLAMA_CONTEXT_LENGTH` (Ollama's own default
+truncates most quack prompts) and `OLLAMA_KEEP_ALIVE`.
 
 `temperature`, `effort`, and `background_effort` can be set on a provider for all its models,
 or under `models."ID"` for one model. quack takes each key from the model first, then the

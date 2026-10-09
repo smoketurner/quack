@@ -769,7 +769,7 @@ impl Default for RetryPolicy {
 }
 
 /// What requests to a model carry. A key left unset falls back to the
-/// provider's, then to `[analysis]`'s efforts and `llm::sampling`'s
+/// provider's, then to `[analysis]`'s efforts and `llm::chat_model`'s
 /// temperature rule.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1768,8 +1768,8 @@ text_enum!(RerankMode, "rerank mode", {
 });
 
 /// How long a reasoning model thinks before it answers (`[analysis].effort`
-/// and `background_effort`). `llm::sampling` sends it in the form each
-/// provider and model family takes, and refuses a level the model lacks.
+/// and `background_effort`), sent as rig's typed reasoning option: rig
+/// writes the field each API takes and refuses a level the model lacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
@@ -1792,6 +1792,21 @@ text_enum!(Effort, "effort", {
     Max => "max",
 });
 
+impl From<Effort> for rig::completion::Reasoning {
+    fn from(effort: Effort) -> Self {
+        use rig::completion::Effort as Level;
+        match effort {
+            Effort::None => Self::Off,
+            Effort::Minimal => Self::Effort(Level::Minimal),
+            Effort::Low => Self::Effort(Level::Low),
+            Effort::Medium => Self::Effort(Level::Medium),
+            Effort::High => Self::Effort(Level::High),
+            Effort::Xhigh => Self::Effort(Level::XHigh),
+            Effort::Max => Self::Effort(Level::Max),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnalysisConfig {
@@ -1806,11 +1821,6 @@ pub struct AnalysisConfig {
     pub max_turns: u32,
     /// Approximate token budget for prior messages replayed to the model.
     pub history_token_budget: Tokens,
-    /// The largest context window quack asks Ollama for (`num_ctx`). Each
-    /// turn requests what its prompt needs, rounded up, no more than this;
-    /// Ollama's own default is 4,096 and it truncates silently past it.
-    /// Other providers size their own window.
-    pub max_context_tokens: Tokens,
     /// How long one extraction call (ontology document evidence, graph
     /// extraction) may run before the chunk is skipped.
     pub extraction_timeout_seconds: u32,
@@ -1861,7 +1871,6 @@ impl Default for AnalysisConfig {
             threads: 4,
             max_turns: 15,
             history_token_budget: Tokens::new(32_000),
-            max_context_tokens: Tokens::new(32_768),
             extraction_timeout_seconds: 120,
             extraction_concurrency: 1,
             reader_pool_size: 4,

@@ -282,10 +282,12 @@ after a fixed sentence that it is data; an `always_retrieve` chunk is fenced too
 string of the JSON object rig prints, with no sentence before it; the system prompt's trust
 paragraph precedes the permission rules; filenames, titles, headings, labels, and graph property
 values render through `text::OneLine`. Provider construction lives in `quack_core::llm`; interfaces never build rig
-clients themselves. Every chat model is wrapped in `llm::sampling::Sampled`: only Ollama's API
-gets a `temperature`, Claude gets `max_tokens` 64,000, and `[analysis].effort` /
-`background_effort` go out as each API's field (an unrecognized model id gets it on Chat
-Completions and Responses); `temperature`, `effort`, and `background_effort` on
+clients themselves. Every chat model is an `llm::ChatModel`, whose `ChatSettings`
+`ChatModel::agent` applies to rig's `AgentBuilder`: only Ollama's API gets a `temperature`,
+Claude gets `max_tokens` 64,000, and `[analysis].effort` / `background_effort` go out as rig's
+`Reasoning` option, whose field rig writes per API and whose level rig's catalog checks when the
+model is built; Ollama chat requests carry no `num_ctx` or `keep_alive` (the server's
+`OLLAMA_CONTEXT_LENGTH` and `OLLAMA_KEEP_ALIVE` decide); `temperature`, `effort`, and `background_effort` on
 `[providers.NAME]` or `[providers.NAME.models."ID"]` (`config::ModelSettings`, resolved by
 `Config::model_settings`: model, then provider, then `[analysis]`) override that. `type = "openai"` takes
 `api = "responses"` or `"chat-completions"`; unset, `OpenAI` itself gets Responses and a `base_url`

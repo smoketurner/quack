@@ -16,18 +16,18 @@ use std::time::Duration;
 
 use crate::config::inspect::{FileState, Inspection};
 use crate::config::{
-    BaseUrl, BedrockEndpoint, Config, Grant, ModelRef, OAuthConfig, ProviderAuth, ProviderName,
-    ProviderType,
+    BaseUrl, BedrockEndpoint, Config, Effort, Grant, ModelRef, OAuthConfig, ProviderAuth,
+    ProviderName, ProviderType,
 };
 use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::{Error, Result as CoreResult};
 use crate::llm::bedrock;
+use crate::llm::chat_model::{ChatSettings, Wire, check_tool_calls};
 use crate::llm::egress::Egress;
 use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
-use crate::llm::sampling::{Sampling, Wire, check_tool_calls};
 use crate::llm::{ChatClient, Embeddings, ProviderModels, RerankModel};
 use crate::oidc::SignIn;
 use crate::proxy::Proxies;
@@ -713,8 +713,8 @@ async fn check_chat_model(report: &mut Report, config: &Config, probing: Probing
     match config.chat_model_ref() {
         Ok(model) => {
             check_model(report, Area::ChatModel, config, model, probing).await;
-            report.push(sampling_check(config, model));
-            if let Some(check) = background_check(config, model) {
+            report.push(chat_settings_check(config, model).await);
+            if let Some(check) = background_check(config, model).await {
                 report.push(check);
             }
         }
@@ -726,20 +726,18 @@ async fn check_chat_model(report: &mut Report, config: &Config, probing: Probing
     }
 }
 
-/// What a chat turn sends the model: temperature, and the reasoning effort
-/// if it reaches the model at all. A config every turn refuses fails here too.
-fn sampling_check(config: &Config, model: ModelRef<'_>) -> Check {
+/// What a chat turn sends the model: temperature, and the reasoning effort.
+/// A config every turn refuses fails here too.
+async fn chat_settings_check(config: &Config, model: ModelRef<'_>) -> Check {
     let settings = config.model_settings(model);
     let wire = Wire::of(model.provider);
     if let Err(e) = check_tool_calls(model.model, wire, settings.effort) {
         return Check::new(Area::ChatModel, Status::Fail, format!("{model}: {e}"));
     }
-    match Sampling::new(model.model, wire, settings.effort, settings.temperature) {
-        Ok(sampling) => match sampling.unsent_effort() {
-            Some(why) => Check::new(Area::ChatModel, Status::Warn, format!("{model}: {why}")),
-            None => Check::new(Area::ChatModel, Status::Ok, format!("{model}: {sampling}")),
-        },
-        Err(e) => Check::new(Area::ChatModel, Status::Fail, format!("{model}: {e}")).fix(format!(
+    let chat = ChatSettings::new(model.model, wire, settings.effort, settings.temperature);
+    match effort_refusal(model, settings.effort).await {
+        None => Check::new(Area::ChatModel, Status::Ok, format!("{model}: {chat}")),
+        Some(e) => Check::new(Area::ChatModel, Status::Fail, format!("{model}: {e}")).fix(format!(
             "set effort to a level it takes under [providers.{}.models.\"{}\"], \
              [providers.{}], or [analysis]",
             model.provider_name, model.model, model.provider_name
@@ -749,44 +747,50 @@ fn sampling_check(config: &Config, model: ModelRef<'_>) -> Check {
 
 /// What a background call (reranking, history summaries, graph extraction,
 /// the ontology's document pass) sends, when its effort is not the turn's.
-fn background_check(config: &Config, model: ModelRef<'_>) -> Option<Check> {
+async fn background_check(config: &Config, model: ModelRef<'_>) -> Option<Check> {
     let settings = config.model_settings(model);
     if settings.background_effort == settings.effort {
         return None;
     }
-    let sampling = Sampling::new(
+    let chat = ChatSettings::new(
         model.model,
         Wire::of(model.provider),
         settings.background_effort,
         settings.temperature,
     );
-    Some(match sampling {
-        Ok(sampling) => match sampling.unsent_effort() {
-            Some(why) => Check::new(
-                Area::ChatModel,
-                Status::Warn,
-                format!("{model}, background calls: {why}"),
-            ),
+    Some(
+        match effort_refusal(model, settings.background_effort).await {
             None => Check::new(
                 Area::ChatModel,
                 Status::Ok,
-                format!("{model}, background calls: {sampling}"),
+                format!("{model}, background calls: {chat}"),
             ),
-        },
-        Err(e) => Check::new(
-            Area::ChatModel,
-            Status::Fail,
-            format!(
-                "{model}, background calls: {e}; graph extraction and the ontology's document \
+            Some(e) => Check::new(
+                Area::ChatModel,
+                Status::Fail,
+                format!(
+                    "{model}, background calls: {e}; graph extraction and the ontology's document \
                  pass fail, and chat turns run without model reranking and history summaries"
-            ),
-        )
-        .fix(format!(
-            "set background_effort to a level it takes under [providers.{}.models.\"{}\"], \
+                ),
+            )
+            .fix(format!(
+                "set background_effort to a level it takes under [providers.{}.models.\"{}\"], \
              [providers.{}], or [analysis]",
-            model.provider_name, model.model, model.provider_name
-        )),
-    })
+                model.provider_name, model.model, model.provider_name
+            )),
+        },
+    )
+}
+
+/// Why building `model`'s chat model at `effort` fails, sending nothing: rig
+/// refuses a level the model does not take on its provider's API. A provider
+/// whose client cannot be built here is reported by its own check.
+async fn effort_refusal(model: ModelRef<'_>, effort: Option<Effort>) -> Option<Error> {
+    effort?;
+    let client = ChatClient::without_credential(model.provider_name, model.provider)
+        .await
+        .ok()?;
+    client.chat_model(model.model, effort, None).err()
 }
 
 async fn check_embedding_model(report: &mut Report, config: &Config, probing: Probing) {

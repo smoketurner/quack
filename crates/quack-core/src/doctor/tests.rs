@@ -217,9 +217,9 @@ fn the_prompts_check_says_where_the_prefixes_come_from() {
     }
 }
 
-#[test]
+#[tokio::test]
 #[expect(clippy::unwrap_used, reason = "test")]
-fn the_chat_model_check_says_what_a_turn_sends() {
+async fn the_chat_model_check_says_what_a_turn_sends() {
     let gateway = "[providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n\
                    api = \"responses\"\n";
     for (chat, extra, status, words) in [
@@ -227,33 +227,39 @@ fn the_chat_model_check_says_what_a_turn_sends() {
             "gw/corp-reasoner",
             "[analysis]\neffort = \"medium\"\n",
             Status::Ok,
-            "sends no temperature, reasoning effort as {\"reasoning\":{\"effort\":\"medium\"}}",
+            "sends no temperature, reasoning effort medium",
         ),
         (
-            "gw/gpt-oss-120b",
-            "[analysis]\neffort = \"medium\"\n[providers.gw.models.\"gpt-oss-120b\"]\n\
-             effort = \"xhigh\"\n",
+            "gw/gpt-5.6-sol",
+            "[analysis]\neffort = \"medium\"\n[providers.gw.models.\"gpt-5.6-sol\"]\n\
+             effort = \"minimal\"\n",
             Status::Fail,
-            "effort \"xhigh\" is not a level",
+            "effort \"minimal\" for gpt-5.6-sol",
         ),
         (
             "ol/llama3.1:8b",
             "[analysis]\neffort = \"high\"\n[providers.ol]\ntype = \"ollama\"\n",
-            Status::Warn,
-            "is not sent",
+            Status::Ok,
+            "sends temperature, reasoning effort high",
+        ),
+        (
+            "ol/gpt-oss:20b",
+            "[analysis]\neffort = \"xhigh\"\n[providers.ol]\ntype = \"ollama\"\n",
+            Status::Fail,
+            "Ollama has no `xhigh` thinking level",
         ),
     ] {
         let toml = format!("[general]\nchat_model = \"{chat}\"\n{gateway}{extra}");
         let config = Config::parse(&toml).unwrap();
-        let check = sampling_check(&config, config.chat_model_ref().unwrap());
+        let check = chat_settings_check(&config, config.chat_model_ref().unwrap()).await;
         assert_eq!(check.status, status, "{chat}: {}", check.summary);
         assert!(check.summary.contains(words), "{}", check.summary);
     }
 }
 
-#[test]
+#[tokio::test]
 #[expect(clippy::unwrap_used, reason = "test")]
-fn the_chat_model_check_fails_what_every_turn_refuses() {
+async fn the_chat_model_check_fails_what_every_turn_refuses() {
     let gateway = "[providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n";
     for (chat, extra, status) in [
         ("gw/gpt-5.6-sol", "", Status::Fail),
@@ -272,20 +278,20 @@ fn the_chat_model_check_fails_what_every_turn_refuses() {
     ] {
         let toml = format!("[general]\nchat_model = \"{chat}\"\n{gateway}{extra}");
         let config = Config::parse(&toml).unwrap();
-        let check = sampling_check(&config, config.chat_model_ref().unwrap());
+        let check = chat_settings_check(&config, config.chat_model_ref().unwrap()).await;
         assert_eq!(check.status, status, "{toml}: {}", check.summary);
     }
 }
 
-#[test]
+#[tokio::test]
 #[expect(clippy::unwrap_used, reason = "test")]
-fn the_background_effort_is_checked_when_it_is_not_the_turns() {
+async fn the_background_effort_is_checked_when_it_is_not_the_turns() {
     let gateway = "[providers.gw]\ntype = \"openai\"\nbase_url = \"https://gw.example\"\n";
     for (analysis, status) in [
         ("effort = \"none\"\n", Some(Status::Ok)),
         ("effort = \"none\"\nbackground_effort = \"none\"\n", None),
         (
-            "effort = \"none\"\nbackground_effort = \"max\"\n",
+            "effort = \"none\"\nbackground_effort = \"minimal\"\n",
             Some(Status::Fail),
         ),
     ] {
@@ -293,8 +299,12 @@ fn the_background_effort_is_checked_when_it_is_not_the_turns() {
             format!("[general]\nchat_model = \"gw/gpt-5.6-sol\"\n{gateway}[analysis]\n{analysis}");
         let config = Config::parse(&toml).unwrap();
         let model = config.chat_model_ref().unwrap();
-        assert_eq!(sampling_check(&config, model).status, Status::Ok, "{toml}");
-        let check = background_check(&config, model);
+        assert_eq!(
+            chat_settings_check(&config, model).await.status,
+            Status::Ok,
+            "{toml}"
+        );
+        let check = background_check(&config, model).await;
         assert_eq!(check.as_ref().map(|c| c.status), status, "{toml}");
         if let Some(check) = check {
             assert!(
@@ -303,7 +313,7 @@ fn the_background_effort_is_checked_when_it_is_not_the_turns() {
                 check.summary
             );
             assert_eq!(
-                check.summary.contains("\"max\""),
+                check.summary.contains("\"minimal\""),
                 check.status == Status::Fail,
                 "{}",
                 check.summary
@@ -315,7 +325,9 @@ fn the_background_effort_is_checked_when_it_is_not_the_turns() {
          [analysis]\nbackground_effort = \"low\"\n"
     );
     let config = Config::parse(&toml).unwrap();
-    let check = background_check(&config, config.chat_model_ref().unwrap()).unwrap();
+    let check = background_check(&config, config.chat_model_ref().unwrap())
+        .await
+        .unwrap();
     assert_eq!(check.status, Status::Ok, "{}", check.summary);
 }
 
