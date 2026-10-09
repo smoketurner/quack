@@ -211,12 +211,17 @@ impl LabelEditor {
             sentence: draft.set.sentence.clone().unwrap_or_default(),
             note: format!("{note}{gone}"),
             reads: format!(
-                "Reads {} · key {}{key_note} · {} rows · {} questions. A row without a name is \
+                "Reads {} · key {}{key_note} · {} rows · {} question{}. A row without a name is \
                  left out.",
                 draft.set.columns_in_words(),
                 draft.set.key_column,
                 Thousands(draft.rows),
-                draft.set.questions.count()
+                draft.set.questions.count(),
+                if draft.set.questions.count() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ),
             rows,
             can_relabel: approved,
