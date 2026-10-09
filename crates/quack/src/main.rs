@@ -2760,7 +2760,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     let NamedInput {
         name: effective_filename,
         data,
-    } = file.read_named(filename.as_deref())?;
+    } = file.named(filename.as_deref())?;
 
     let ws_db = opened.writer()?;
     let replaces = match replace {
@@ -2780,7 +2780,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         config,
         &ws_db,
         opened.workspace.id.as_str(),
-        &NewFile::new(&effective_filename, &data)
+        &NewFile::of(&effective_filename, data.file_data())
             .source(file.document_source())
             .title(title.as_deref())
             .replaces(replaces.as_ref())

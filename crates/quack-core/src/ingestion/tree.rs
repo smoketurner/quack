@@ -12,7 +12,7 @@ use crate::embedding::{Embedder, EmbeddingModel};
 use crate::error::{Error, Result};
 use crate::ids::DocumentId;
 use crate::ingestion::parser::FileType;
-use crate::ingestion::{IngestOutcome, NewFile, ingest_file, parse_off_runtime};
+use crate::ingestion::{IngestOutcome, NewFile, ingest_file};
 use crate::progress::{ChunkDone, RunControl};
 use crate::storage::workspace::{DocumentInfo, DocumentSource};
 use crate::storage::writer::Writer;
@@ -259,8 +259,6 @@ impl<M: EmbeddingModel> Folder<'_, M> {
         file: &TreeFile,
         present: &BTreeSet<String>,
     ) -> Result<Outcome> {
-        let path = file.path.clone();
-        let data = parse_off_runtime(move || Ok(std::fs::read(path)?)).await?;
         let (root, relative) = (source_root.to_owned(), file.relative.clone());
         let predecessor = self
             .db
@@ -272,7 +270,7 @@ impl<M: EmbeddingModel> Folder<'_, M> {
             progress: &|_| {},
             cancel: self.control.cancel,
         };
-        let new_file = NewFile::new(file.name(), &data)
+        let new_file = NewFile::at_path(file.name(), &file.path)
             .source(DocumentSource::Path)
             .in_folder(source_root, &file.relative)
             .replaces(predecessor.as_ref().map(|d| &d.id))

@@ -493,7 +493,9 @@ bytes' SHA-256 already belong to a non-failed document whose table or chunks sti
 (`processing` to `ready` or `error`, recording `chunk_count`, the parsed title, and a PDF's
 `parser::PageCounts`: pages in the file, pages whose extraction failed, pages without text;
 `PageCounts::note` is the one wording every interface shows, as `3 of 40 pages unreadable`);
-`ingest_file` does both and takes a `NewFile` (name, bytes, `DocumentSource`, optional
+`ingest_file` does both and takes a `NewFile` (name, `FileData`: bytes, or a path that is
+hashed as it streams and copied into `files/` for a table without being read, as `quack
+ingest`, a folder, the terminal, and the server's spooled uploads pass it; `DocumentSource`, optional
 title and uploader, its `RunControl`, and `replaces`, the ready document this file takes
 the place of: `quack ingest --replace [ID]`, `POST .../documents?replace={doc}`, the
 Documents row's Replace control). The old document keeps serving, marked `superseded_by`,

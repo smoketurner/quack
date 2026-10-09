@@ -788,10 +788,6 @@ impl CliJob {
 
     /// A file as a table or tables, or as chunks.
     async fn ingest(env: &JobEnv, path: &Path, control: RunControl<'_>) -> Result<String> {
-        let read = path.to_owned();
-        let data = tokio::task::spawn_blocking(move || std::fs::read(read))
-            .await?
-            .map_err(|e| anyhow!("failed to read {}: {e}", path.display()))?;
         let filename = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -802,7 +798,7 @@ impl CliJob {
             &env.config,
             &env.db,
             env.workspace_id.as_str(),
-            &NewFile::new(&filename, &data).control(control),
+            &NewFile::at_path(&filename, path).control(control),
             embedding_model.as_ref(),
         )
         .await

@@ -477,6 +477,86 @@ async fn ingest_csv_structured() {
     assert_eq!(count, &serde_json::Value::Number(3.into()));
 }
 
+/// A file named by its path loads without being read into memory: a table
+/// copies into `files/`, a text document chunks, the same bytes in memory
+/// are a duplicate of it, a file already in `files/` keeps its contents,
+/// and an empty file is refused.
+#[tokio::test]
+async fn a_file_on_disk_ingests_from_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let count = |table: &str| {
+        db.execute_query(&format!("SELECT count(*) FROM {table}"))
+            .unwrap()
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .cloned()
+    };
+    let csv = b"name,age\nAlice,30\nBob,25\n";
+    let source = dir.path().join("people.csv");
+    std::fs::write(&source, csv).unwrap();
+    let loaded = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::at_path("people.csv", &source),
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(loaded.tables, ["people"]);
+    assert_eq!(count("people"), Some(serde_json::json!(2)));
+    let files = config.workspace_files_dir("ws-replace");
+    assert_eq!(std::fs::read(files.join("people.csv")).unwrap(), csv);
+    let again = ingest(&config, &writer, ingestion::NewFile::new("people.csv", csv))
+        .await
+        .unwrap();
+    assert!(
+        matches!(again, ingestion::IngestOutcome::Duplicate(_)),
+        "{again:?}"
+    );
+
+    // A file ingested from `files/` itself is not truncated by the copy.
+    let towns = b"town\nOslo\nLima\nPune\n";
+    let inside = files.join("towns.csv");
+    std::fs::write(&inside, towns).unwrap();
+    ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::at_path("towns.csv", &inside),
+    )
+    .await
+    .unwrap();
+    assert_eq!(count("towns"), Some(serde_json::json!(3)));
+    assert_eq!(std::fs::read(&inside).unwrap(), towns);
+
+    let note = dir.path().join("note.md");
+    std::fs::write(&note, b"# Flood\n\nFlood is excluded.\n").unwrap();
+    let chunked = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::at_path("note.md", &note),
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert!(chunked.chunks_stored > 0);
+
+    let empty = dir.path().join("empty.csv");
+    std::fs::write(&empty, b"").unwrap();
+    let refused = ingest(
+        &config,
+        &writer,
+        ingestion::NewFile::at_path("empty.csv", &empty),
+    )
+    .await;
+    assert!(matches!(refused, Err(Error::EmptyFile(_))), "{refused:?}");
+}
+
 /// Delimited files load with their sniffed dialect, and a one-column sniff
 /// is checked against the type's own separator: a genuine one-column file
 /// loads, in either type.

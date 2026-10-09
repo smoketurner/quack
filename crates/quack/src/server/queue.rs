@@ -43,8 +43,9 @@ impl Spooled {
         Ok(Self(path))
     }
 
-    async fn read(&self) -> std::io::Result<Vec<u8>> {
-        tokio::fs::read(&self.0).await
+    /// Whether the spooled file is still there to be read.
+    async fn check(&self) -> std::io::Result<()> {
+        tokio::fs::File::open(&self.0).await.map(drop)
     }
 
     async fn remove(&self) {
@@ -195,16 +196,13 @@ impl UploadJob {
         embedder: Option<&Embeddings>,
         control: RunControl<'_>,
     ) -> JobResult {
-        let data = match self.spool.read().await {
-            Ok(data) => data,
-            Err(e) => {
-                let message = format!("the spooled upload could not be read: {e}");
-                tracing::warn!(document = %self.document_id, error = %e, "upload fails: spool unreadable");
-                Self::mark_error(db, &self.document_id, &message).await;
-                return Err(message);
-            }
-        };
-        let file = NewFile::new(&self.filename, &data).control(control);
+        if let Err(e) = self.spool.check().await {
+            let message = format!("the spooled upload could not be read: {e}");
+            tracing::warn!(document = %self.document_id, error = %e, "upload fails: spool unreadable");
+            Self::mark_error(db, &self.document_id, &message).await;
+            return Err(message);
+        }
+        let file = NewFile::at_path(&self.filename, &self.spool.0).control(control);
         let result = Processing {
             config,
             db,

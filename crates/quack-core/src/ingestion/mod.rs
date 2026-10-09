@@ -16,14 +16,18 @@ pub mod tree;
 pub mod xlsx;
 pub mod zipped;
 
+use std::borrow::Cow;
 use std::fmt;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::embedding::EmbeddingModel;
 
 use crate::config::Config;
-use crate::crypto::sha256_hex;
+use aws_lc_rs::digest;
+
+use crate::crypto::{hex_lower, sha256_hex};
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
 use crate::graph::views;
@@ -98,12 +102,95 @@ impl IngestOutcome {
     }
 }
 
+/// Where a file's bytes are.
+#[derive(Debug, Clone, Copy)]
+pub enum FileData<'a> {
+    /// Already in memory.
+    Bytes(&'a [u8]),
+    /// On disk: hashed as it streams, copied as is when it loads as a
+    /// table, and read whole only for a type whose parser takes bytes.
+    Path(&'a Path),
+}
+
+impl<'a> FileData<'a> {
+    /// The bytes, read from disk on the blocking pool when they are there.
+    async fn bytes(self) -> Result<Cow<'a, [u8]>> {
+        match self {
+            Self::Bytes(bytes) => Ok(Cow::Borrowed(bytes)),
+            Self::Path(path) => {
+                let path = path.to_owned();
+                Ok(Cow::Owned(
+                    parse_off_runtime(move || Ok(std::fs::read(path)?)).await?,
+                ))
+            }
+        }
+    }
+
+    /// The size and SHA-256, a path's off the runtime.
+    async fn measured(self) -> Result<Measured> {
+        match self {
+            Self::Bytes(bytes) => Ok(Measured::of(bytes)),
+            Self::Path(path) => {
+                let path = path.to_owned();
+                parse_off_runtime(move || Measured::of_file(&path)).await
+            }
+        }
+    }
+
+    /// The size and SHA-256, reading a path here.
+    fn measured_here(self) -> Result<Measured> {
+        match self {
+            Self::Bytes(bytes) => Ok(Measured::of(bytes)),
+            Self::Path(path) => Measured::of_file(path),
+        }
+    }
+}
+
+/// A file's size and the SHA-256 that names its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Measured {
+    size_bytes: usize,
+    sha256: String,
+}
+
+impl Measured {
+    /// Bytes read a buffer at a time when hashing a file.
+    const BUFFER: usize = 1 << 16;
+
+    fn of(bytes: &[u8]) -> Self {
+        Self {
+            size_bytes: bytes.len(),
+            sha256: sha256_hex(bytes),
+        }
+    }
+
+    /// The file at `path`, streamed through the hash.
+    fn of_file(path: &Path) -> Result<Self> {
+        let mut file = std::fs::File::open(path)?;
+        let mut digest = digest::Context::new(&digest::SHA256);
+        let mut buffer = vec![0u8; Self::BUFFER];
+        let mut size_bytes = 0usize;
+        loop {
+            let read = file.read(&mut buffer)?;
+            let Some(chunk) = buffer.get(..read).filter(|c| !c.is_empty()) else {
+                break;
+            };
+            digest.update(chunk);
+            size_bytes = size_bytes.saturating_add(read);
+        }
+        Ok(Self {
+            size_bytes,
+            sha256: hex_lower(digest.finish().as_ref()),
+        })
+    }
+}
+
 /// A file to ingest: its name and bytes, where it came from, an optional
 /// title (else parsed from the content), and the server user uploading it.
 #[derive(Debug, Clone)]
 pub struct NewFile<'a> {
     pub filename: &'a str,
-    pub data: &'a [u8],
+    pub data: FileData<'a>,
     pub source: DocumentSource,
     pub title: Option<&'a str>,
     pub ingested_by: Option<&'a str>,
@@ -127,9 +214,21 @@ pub struct NewFile<'a> {
 }
 
 impl<'a> NewFile<'a> {
-    /// A file read from a path with no title or uploader.
+    /// A file already in memory, with no title or uploader.
     #[must_use]
     pub fn new(filename: &'a str, data: &'a [u8]) -> Self {
+        Self::of(filename, FileData::Bytes(data))
+    }
+
+    /// The file at `path`, read only as far as its type needs.
+    #[must_use]
+    pub fn at_path(filename: &'a str, path: &'a Path) -> Self {
+        Self::of(filename, FileData::Path(path))
+    }
+
+    /// A file wherever its bytes are, with no title or uploader.
+    #[must_use]
+    pub fn of(filename: &'a str, data: FileData<'a>) -> Self {
         Self {
             filename,
             data,
@@ -225,7 +324,9 @@ pub async fn ingest_file<M: EmbeddingModel>(
     file: &NewFile<'_>,
     embedder: Option<&Embedder<M>>,
 ) -> Result<IngestOutcome> {
-    let pending = Pending::of(config, file)?;
+    Pending::file_type(config, file)?;
+    let measured = file.data.measured().await?;
+    let pending = Pending::of(config, file, measured)?;
     let doc_id = match db.run(move |db| pending.register(db)).await? {
         Registration::New(id) => id,
         Registration::Duplicate(existing) => return Ok(IngestOutcome::Duplicate(existing)),
@@ -328,7 +429,8 @@ pub fn register_document(
     config: &Config,
     file: &NewFile<'_>,
 ) -> Result<Registration> {
-    Pending::of(config, file)?.register(db)
+    Pending::file_type(config, file)?;
+    Pending::of(config, file, file.data.measured_here()?)?.register(db)
 }
 
 /// What registering a file writes, owned and without its bytes, so the
@@ -347,16 +449,23 @@ struct Pending {
 }
 
 impl Pending {
-    /// Hash the bytes and refuse an empty file, a type nothing can parse,
-    /// or an image with no vision model to read it, before any write.
-    fn of(config: &Config, file: &NewFile<'_>) -> Result<Self> {
+    /// The file's type, refusing a type nothing can parse or an image
+    /// with no vision model to read it: checked before the bytes are
+    /// hashed, so a file that cannot load is never read.
+    fn file_type(config: &Config, file: &NewFile<'_>) -> Result<FileType> {
         let Some(file_type) = FileType::of(file.filename) else {
             return Err(Error::UnsupportedFileType(file.filename.to_owned()));
         };
         if matches!(file_type.load(), Load::Image(_)) && config.ingestion.vision_model.is_none() {
             return Err(Error::NoVisionModel(file.filename.to_owned()));
         }
-        if file.data.is_empty() {
+        Ok(file_type)
+    }
+
+    /// Refuse an empty file or one `file_type` refuses, before any write.
+    fn of(config: &Config, file: &NewFile<'_>, measured: Measured) -> Result<Self> {
+        let file_type = Self::file_type(config, file)?;
+        if measured.size_bytes == 0 {
             return Err(Error::EmptyFile(file.filename.to_owned()));
         }
         Ok(Self {
@@ -364,8 +473,8 @@ impl Pending {
             title: file.title.and_then(str::non_blank).map(str::to_owned),
             ingested_by: file.ingested_by.map(str::to_owned),
             source: file.source,
-            size_bytes: file.data.len(),
-            sha256: sha256_hex(file.data),
+            size_bytes: measured.size_bytes,
+            sha256: measured.sha256,
             file_type,
             replaces: file.replaces.cloned(),
             source_root: file.source_root.map(str::to_owned),
@@ -489,7 +598,10 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     workspace_id: workspace_id.to_owned(),
                     doc_id: doc_id.clone(),
                     filename: filename.to_owned(),
-                    data: data.to_vec(),
+                    data: match data {
+                        FileData::Bytes(bytes) => Original::Bytes(bytes.to_vec()),
+                        FileData::Path(path) => Original::Path(path.to_owned()),
+                    },
                     reader,
                 };
                 let types = self.file.types.clone();
@@ -508,7 +620,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
             Load::Workbook => {
                 // Parsing the workbook is the slow part: off the runtime's
                 // workers, and not on the writer.
-                let bytes = data.to_vec();
+                let bytes = data.bytes().await?.into_owned();
                 let budget = config.ingestion.decompression_budget();
                 let sheets = parse_off_runtime(move || xlsx::sheets(&bytes, budget)).await?;
                 let load = WorkbookLoad {
@@ -531,7 +643,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                     ..IngestResult::of(doc_id, filename, file_type)
                 })
             }
-            Load::Chunks(format) => self.chunk(format, file_type, self.file.data).await,
+            Load::Chunks(format) => self.chunk(format, file_type, &data.bytes().await?).await,
             Load::Image(format) => self.image(format, file_type).await,
         }
     }
@@ -544,10 +656,11 @@ impl<M: EmbeddingModel> Processing<'_, M> {
         let reader = ImageReader::for_ingest(config)
             .await?
             .ok_or_else(|| Error::NoVisionModel(filename.to_owned()))?;
+        let bytes = self.file.data.bytes().await?;
         let text = self
             .file
             .control
-            .or_cancelled(reader.read(self.file.data, format, "Read this image."))
+            .or_cancelled(reader.read(&bytes, format, "Read this image."))
             .await?;
         let markdown = format!("# {}\n\n{text}\n", OneLine(filename));
         let result = self
@@ -555,7 +668,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
             .await?;
         // Kept last: a read or a chunking step that fails leaves no file.
         StoredImage::of(config, self.workspace_id, self.document_id, format)
-            .write(self.file.data)
+            .write(&bytes)
             .await?;
         Ok(result)
     }
@@ -801,8 +914,15 @@ struct StructuredLoad {
     workspace_id: String,
     doc_id: DocumentId,
     filename: String,
-    data: Vec<u8>,
+    data: Original,
     reader: Reader,
+}
+
+/// The original a structured file's table loads from.
+enum Original {
+    Bytes(Vec<u8>),
+    /// Copied into `files/` by the file system, never read here.
+    Path(PathBuf),
 }
 
 impl StructuredLoad {
@@ -818,7 +938,16 @@ impl StructuredLoad {
             files_dir.join(Path::new(&self.filename).file_name().ok_or_else(|| {
                 Error::Ingestion(format!("'{}' is not a file name", self.filename))
             })?);
-        std::fs::write(&dest, &self.data)?;
+        match &self.data {
+            Original::Bytes(bytes) => std::fs::write(&dest, bytes)?,
+            // A file already at `dest` stays: copying a file onto itself
+            // truncates it.
+            Original::Path(from) => {
+                if !dest.exists() || std::fs::canonicalize(from)? != std::fs::canonicalize(&dest)? {
+                    std::fs::copy(from, &dest)?;
+                }
+            }
+        }
         let path = dest.to_string_lossy();
         TableLoad {
             reader: self.reader,
