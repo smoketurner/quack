@@ -782,6 +782,7 @@ fn asking(text: &str) -> PromptOptions {
             text: text.to_owned(),
             vector: None,
             rrf_k: 60,
+            cards: None,
         }),
         context: Some(String::from("Fiscal years start in April.")),
         ..options(ChatMode::Chat, 0)

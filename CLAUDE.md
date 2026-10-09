@@ -434,8 +434,8 @@ The ontology's `Property` carries `description`, `unit`, `synonyms`, and `Ontolo
 returns all of it on `TableDescription` (`TableDescription::body`, a `TableDescriptionBody`, is the one REST, MCP, and CLI shape). Past
 `table_search::DETAILED_TABLES` (25) user tables, `find_tables` registers and the prompt ranks
 tables against the question after the workspace context (`analysis::table_search`: a card per
-table, BM25 with `tokenize`, plus cosine over card vectors in `_quack_table_cards` refreshed at
-turn start, fused by RRF). The graph is readable in SQL through `graph::views` (issue #406):
+table, BM25 with `tokenize`, plus cosine over card vectors in `_quack_table_cards`, scored in SQL and
+refreshed at turn start, which hands its cards to the ranking, fused by RRF). The graph is readable in SQL through `graph::views` (issue #406):
 `graph_<class>` with one typed column per property and `graph_edges`, made by `views::ensure` at
 every ontology save and open, marked by a comment; `table_search::user_tables` is
 `list_tables` without them. A write naming `graph_` is refused (`views::write_names_reserved`),

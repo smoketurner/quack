@@ -25,7 +25,7 @@ use super::events::{DetailPreview, ToolName, TurnRecorder};
 use super::policy::{Exposure, Hold, RefusalFlag, WriteDecision, WritePolicy};
 use super::rerank::{RerankAnswer, Reranker};
 use super::search::{DocumentScope, DocumentSearch, SearchOutcome, SearchVectors};
-use super::table_search::TableCards;
+use super::table_search::{TableCards, user_tables};
 use super::text_to_sql::{ColumnLine, Modeled};
 use crate::config::{GraphConfig, RerankMode, RetrievalConfig};
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
@@ -1603,7 +1603,8 @@ where
             .db
             .with_db(move |db| {
                 let ontology = ontology_store::current(db)?;
-                let ranked = TableCards::read(db, ontology.as_ref())?.rank(
+                let tables = user_tables(db)?;
+                let ranked = TableCards::read(db, &tables, ontology.as_ref())?.rank(
                     db,
                     &query,
                     query_vec.as_ref(),

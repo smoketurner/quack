@@ -66,7 +66,8 @@ fn workspace(extra: usize) -> WorkspaceDb {
 }
 
 fn ranked(db: &WorkspaceDb, query: &str, vector: Option<&Vector>) -> Vec<String> {
-    TableCards::read(db, ontology_store::current(db).unwrap().as_ref())
+    let tables = user_tables(db).unwrap();
+    TableCards::read(db, &tables, ontology_store::current(db).unwrap().as_ref())
         .unwrap()
         .rank(db, query, vector, 5, 60)
         .unwrap()
@@ -145,12 +146,14 @@ async fn card_vectors_are_made_once_and_rank_without_shared_words() {
     let reader = ReaderDb::new(Arc::clone(&writer));
     let made = TableCards::refresh_vectors(&reader, &writer, &embedder())
         .await
-        .unwrap();
+        .unwrap()
+        .made();
     assert_eq!(made, 32);
     assert_eq!(
         TableCards::refresh_vectors(&reader, &writer, &embedder())
             .await
-            .unwrap(),
+            .unwrap()
+            .made(),
         0,
         "unchanged cards keep their vectors"
     );
@@ -181,7 +184,8 @@ async fn card_vectors_are_made_once_and_rank_without_shared_words() {
     assert_eq!(
         TableCards::refresh_vectors(&reader, &writer, &embedder())
             .await
-            .unwrap(),
+            .unwrap()
+            .made(),
         1,
         "only the changed card is embedded again"
     );
@@ -204,7 +208,44 @@ async fn a_narrow_workspace_makes_no_card_vectors() {
     assert_eq!(
         TableCards::refresh_vectors(&reader, &writer, &embedder())
             .await
-            .unwrap(),
+            .unwrap()
+            .made(),
         0
+    );
+}
+
+/// The vector leg scores in SQL by cosine, and leaves out a vector made
+/// from older card text or of another width.
+#[test]
+fn the_vector_leg_ranks_current_vectors_by_cosine() {
+    let db = workspace(30);
+    let tables = user_tables(&db).unwrap();
+    let cards = TableCards::read(&db, &tables, None).unwrap();
+    let fingerprint = db.embedding_fingerprint().unwrap().as_str().to_owned();
+    let digest = |table: &str| {
+        cards
+            .cards()
+            .iter()
+            .find(|c| c.table == table)
+            .unwrap()
+            .digest()
+    };
+    for (table, digest, vector) in [
+        ("produce", digest("produce"), "[0.6, 0.8, 0, 0]"),
+        ("zz_orders", digest("zz_orders"), "[1, 0, 0, 0]"),
+        ("filler_00", String::from("older text"), "[1, 0, 0, 0]"),
+        ("filler_01", digest("filler_01"), "[1, 0, 0]"),
+    ] {
+        db.connection()
+            .execute(
+                "INSERT INTO _quack_table_cards VALUES (?, ?, ?::FLOAT[], ?)",
+                duckdb::params![table, digest, vector, fingerprint],
+            )
+            .unwrap();
+    }
+    let query = Vector::from(vec![1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(
+        cards.vector_ranking(&db, &query).unwrap(),
+        ["zz_orders", "produce"]
     );
 }

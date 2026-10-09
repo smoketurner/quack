@@ -20,7 +20,7 @@ use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls};
 use super::policy::WritePolicy;
 use super::rerank::RerankAnswer;
 use super::search::DocumentScope;
-use super::table_search::{TableCards, TableLayout, user_tables};
+use super::table_search::{CardRefresh, TableCards, TableLayout};
 use super::text_to_sql::{BuiltPrompt, Modeled, PromptOptions, Question, SystemPrompt, Window};
 use super::tools::{
     CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, FindTablesTool,
@@ -320,23 +320,17 @@ impl Question {
             text: text.to_owned(),
             vector: None,
             rrf_k,
+            cards: None,
         };
         let Some(embedder) = embedder else {
             return question;
         };
-        let layout = reader
-            .with_db(|db| Ok(TableLayout::of(user_tables(db)?.len())))
-            .await;
-        match layout {
-            Ok(TableLayout::Ranked) => {}
-            Ok(TableLayout::AllDescribed) => return question,
-            Err(e) => {
-                tracing::warn!(error = %e, "could not count the tables; ranking tables by keyword");
-                return question;
-            }
-        }
         match TableCards::refresh_vectors(reader, writer, embedder).await {
-            Ok(made) => tracing::debug!(tables = made, "embedded table cards"),
+            Ok(CardRefresh::AllDescribed) => return question,
+            Ok(CardRefresh::Ranked { cards, made }) => {
+                tracing::debug!(tables = made, "embedded table cards");
+                question.cards = Some(cards);
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "could not embed the table cards; ranking tables by keyword");
                 return question;

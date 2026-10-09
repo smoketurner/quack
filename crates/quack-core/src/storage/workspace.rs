@@ -8,7 +8,7 @@ use std::time::Duration;
 use aws_lc_rs::digest;
 use jiff::civil::DateTime;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::analysis::table_search;
 use crate::analysis::text_to_sql::ColumnLine;
@@ -3621,6 +3621,33 @@ impl WorkspaceDb {
         let sql = format!("SELECT count(*) FROM {}", quote_ident(table_name));
         let count: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
         Ok(count)
+    }
+
+    /// Exact row counts of `tables`, by name, in one statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a table does not exist or the query fails.
+    pub fn count_rows_of(&self, tables: &[String]) -> Result<HashMap<String, i64>> {
+        if tables.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let sql = tables
+            .iter()
+            .enumerate()
+            .map(|(i, table)| format!("SELECT {i} AS i, count(*) AS n FROM {}", quote_ident(table)))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        let mut counts = HashMap::with_capacity(tables.len());
+        while let Some(row) = rows.next()? {
+            let i: usize = row.get(0)?;
+            if let Some(table) = tables.get(i) {
+                counts.insert(table.clone(), row.get(1)?);
+            }
+        }
+        Ok(counts)
     }
 
     /// The version of the `DuckDB` library compiled into this binary, such as
