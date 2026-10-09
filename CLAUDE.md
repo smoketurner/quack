@@ -151,7 +151,7 @@ rig's token window over `[analysis].history_token_budget`), and with
 `_quack_session_summaries`, written after the turn by `llm::after_turn::AfterTurn` (with the
 session title), so loading the history calls no model. Retrieval is hybrid (exact cosine scan plus quack's own
 BM25 over `_quack_terms`, each document's chunks stemmed under the language
-`WorkspaceDb::chunk_writer` detects once for it, reciprocal rank fusion in `WorkspaceDb::explain_search`;
+`WorkspaceDb::chunk_writer` detects once for it, reciprocal rank fusion in `WorkspaceDb::explain_search`, whose vector leg runs on a reader clone beside the keyword leg;
 no DuckDB extension is ever loaded, see design doc section 14), then an optional reranker
 (`analysis::rerank`, `[retrieval].rerank = "none" | "model" | "reranker"`; `model` over-fetches
 `rerank_candidates` and has the chat model order them, `reranker` has the dedicated rerank

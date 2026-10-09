@@ -2918,8 +2918,20 @@ impl WorkspaceDb {
         let phrases = Phrases::parse(query_text);
         let candidates = limits.top_k.saturating_mul(2).max(1);
         let fuse_k = phrases.fetch(limits.top_k, candidates);
-        let vector = self.search_similar_chunks(query_embedding, fuse_k, scope)?;
-        let keyword = self.search_keyword_chunks(query_text, fuse_k, scope)?;
+        // The legs are independent scans, so the vector leg runs on a
+        // reader clone beside the keyword leg on this connection.
+        let reader = self.try_clone_reader()?;
+        let (vector, keyword) = std::thread::scope(|threads| {
+            let vector = threads.spawn(move || {
+                reader.read_only(|db| db.search_similar_chunks(query_embedding, fuse_k, scope))
+            });
+            let keyword = self.search_keyword_chunks(query_text, fuse_k, scope);
+            let vector = vector.join().unwrap_or_else(|_| {
+                Err(Error::Analysis(String::from("the vector search stopped")))
+            });
+            (vector, keyword)
+        });
+        let (vector, keyword) = (vector?, keyword?);
         let mut fused = limits.fuse(vector.clone(), keyword.clone(), fuse_k);
         phrases.retain_matching(&mut fused, limits.top_k);
         Ok(SearchExplanation {
