@@ -99,10 +99,8 @@ fn write_text(out: &mut impl Write, inspection: &Inspection, filter: SettingFilt
             .max()
             .unwrap_or(0);
         for unknown in &inspection.unknown {
-            match &unknown.suggestion {
-                Some(suggestion) => {
-                    writeln!(out, "  {:width$}  did you mean {suggestion}?", unknown.path)?;
-                }
+            match &unknown.hint {
+                Some(hint) => writeln!(out, "  {:width$}  {hint}", unknown.path)?,
                 None => writeln!(out, "  {}", unknown.path)?,
             }
         }

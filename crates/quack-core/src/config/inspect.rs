@@ -118,10 +118,35 @@ impl Setting {
 pub struct UnknownKey {
     /// Dotted path as the file writes it: `retrieval.topk`.
     pub path: String,
-    /// The recognized key it most resembles, when one is close enough to
-    /// name.
-    pub suggestion: Option<String>,
+    /// What to do about it, when quack can say.
+    pub hint: Option<KeyHint>,
 }
+
+/// What quack can say about a key it does not recognize.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyHint {
+    /// The recognized key it most resembles: a typo, or a setting written
+    /// under another section (`[retrieval].top_k`).
+    DidYouMean(String),
+    /// A key an earlier release read, and what took its place.
+    Removed(&'static str),
+}
+
+impl fmt::Display for KeyHint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DidYouMean(key) => write!(f, "did you mean {key}?"),
+            Self::Removed(instead) => write!(f, "removed: {instead}; delete it"),
+        }
+    }
+}
+
+/// Keys earlier releases read, each with what took its place.
+const REMOVED_KEYS: [(&str, &str); 1] = [(
+    "analysis.max_context_tokens",
+    "the Ollama server sizes the context window (OLLAMA_CONTEXT_LENGTH)",
+)];
 
 /// An environment variable this binary reads, and whether it is set. The
 /// value is never recorded: some of these hold credentials.
@@ -391,7 +416,6 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "threads",
             "max_turns",
             "history_token_budget",
-            "max_context_tokens",
             "extraction_timeout_seconds",
             "extraction_concurrency",
             "reader_pool_size",
@@ -830,11 +854,6 @@ fn analysis(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         default.history_token_budget,
     );
     s.literal(
-        "max_context_tokens",
-        analysis.max_context_tokens,
-        default.max_context_tokens,
-    );
-    s.literal(
         "extraction_timeout_seconds",
         analysis.extraction_timeout_seconds,
         default.extraction_timeout_seconds,
@@ -1201,7 +1220,7 @@ impl UnknownKey {
             let Some((_, keys)) = SECTIONS.iter().find(|(section, _)| *section == name) else {
                 unknown.push(Self {
                     path: name.clone(),
-                    suggestion: Self::closest(name, &Self::section_names()),
+                    hint: Self::closest(name, &Self::section_names()).map(KeyHint::DidYouMean),
                 });
                 continue;
             };
@@ -1234,14 +1253,18 @@ impl UnknownKey {
         unknown
     }
 
-    /// `key` in `section`, which accepts `keys`, with the section that
-    /// accepts it exactly, else the closest key here.
+    /// `key` in `section`, which accepts `keys`: what replaced it when an
+    /// earlier release read it, else the section that accepts it exactly,
+    /// else the closest key here.
     fn new(section: &str, key: &str, keys: &[&str]) -> Self {
-        let suggestion = Self::elsewhere(section, key).or_else(|| Self::closest(key, keys));
-        Self {
-            path: format!("{section}.{key}"),
-            suggestion,
-        }
+        let path = format!("{section}.{key}");
+        let hint = match REMOVED_KEYS.iter().find(|(removed, _)| *removed == path) {
+            Some((_, instead)) => Some(KeyHint::Removed(instead)),
+            None => Self::elsewhere(section, key)
+                .or_else(|| Self::closest(key, keys))
+                .map(KeyHint::DidYouMean),
+        };
+        Self { path, hint }
     }
 
     /// Another section that accepts this exact key, for a setting written

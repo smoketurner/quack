@@ -278,7 +278,7 @@ mod tests {
             compactor: Some(SessionCompactor {
                 db: Arc::clone(db),
                 summarizer: Arc::new(SchemaCall::new(
-                    model.clone().erase(),
+                    model.clone().erase().into(),
                     Task {
                         preamble: SUMMARY_PROMPT,
                         timeout: SUMMARY_TIMEOUT,
@@ -481,7 +481,7 @@ mod tests {
     async fn a_summary_call_the_model_refuses_leaves_the_window_alone() {
         Egress::scope(Some(Egress::NoWorkspace), async {
             let (db, _id) = session().await;
-            for (background_effort, compacts) in [("none", true), ("max", false)] {
+            for (background_effort, compacts) in [("none", true), ("minimal", false)] {
                 let config = Config::parse(&format!(
                     "[general]\nchat_model = \"p/gpt-5.6-sol\"\n\
                  [analysis]\ncompact_history = true\neffort = \"none\"\n\

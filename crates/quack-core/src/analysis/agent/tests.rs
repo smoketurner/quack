@@ -4,6 +4,17 @@ use crate::analysis::citations::CitationRegistry;
 use crate::ids::{ChunkId, DocumentId};
 
 #[test]
+fn only_an_ollama_cutoff_names_the_ollama_window() {
+    let ollama = Cutoff::Length.refusal("rerank", Window::Ollama).to_string();
+    assert!(ollama.contains("OLLAMA_CONTEXT_LENGTH"), "{ollama}");
+    let provider = Cutoff::Length
+        .refusal("rerank", Window::Provider)
+        .to_string();
+    assert!(provider.contains("output limit"), "{provider}");
+    assert!(!provider.contains("Ollama"), "{provider}");
+}
+
+#[test]
 fn stream_errors_are_explained_for_the_user() {
     let config = AnalysisConfig::default();
     let unknown = PromptError::UnknownToolCall {
@@ -15,7 +26,7 @@ fn stream_errors_are_explained_for_the_user() {
     assert!(StreamStop(&unknown).by_agent_loop());
     let text = StreamStop(&unknown).explain(config.max_turns, Window::Ollama);
     assert!(text.contains("container.exec"), "{text}");
-    assert!(text.contains("max_context_tokens"), "{text}");
+    assert!(text.contains("OLLAMA_CONTEXT_LENGTH"), "{text}");
     let text = StreamStop(&unknown).explain(config.max_turns, Window::Provider);
     assert!(!text.contains("Ollama"), "{text}");
 
@@ -157,7 +168,7 @@ fn turn_text_keeps_streamed_text_and_notes_early_stops() {
     );
     assert_eq!(text("", Some("final"), None, Window::Provider), "final");
     let empty = text("", Some(""), None, Window::Ollama);
-    assert!(empty.contains("[analysis].max_context_tokens"), "{empty}");
+    assert!(empty.contains("OLLAMA_CONTEXT_LENGTH"), "{empty}");
     let empty = text("", None, None, Window::Provider);
     assert!(!empty.contains("Ollama"), "{empty}");
 }
@@ -172,7 +183,7 @@ fn notes_are_added_after_the_citation_check() {
     let answer = turn_text(String::from("[7]"), None, None, Window::Ollama, check);
     assert!(
         answer.text.starts_with("(The model returned no text.")
-            && answer.text.contains("raise [analysis].max_context_tokens"),
+            && answer.text.contains("raise OLLAMA_CONTEXT_LENGTH"),
         "{}",
         answer.text
     );

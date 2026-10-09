@@ -40,6 +40,11 @@ services:
 
   ollama:
     image: ollama/ollama:0.12.3
+    # quack sends no load options, so the server sizes the context window and
+    # how long a model stays loaded.
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "32768"
+      OLLAMA_KEEP_ALIVE: 30m
     volumes:
       - ollama:/root/.ollama
     restart: unless-stopped

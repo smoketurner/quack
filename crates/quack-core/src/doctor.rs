@@ -16,18 +16,18 @@ use std::time::Duration;
 
 use crate::config::inspect::{FileState, Inspection};
 use crate::config::{
-    BaseUrl, BedrockEndpoint, Config, Grant, ModelRef, OAuthConfig, ProviderAuth, ProviderName,
-    ProviderType,
+    BaseUrl, BedrockEndpoint, Config, Effort, Grant, ModelRef, OAuthConfig, ProviderAuth,
+    ProviderName, ProviderType,
 };
 use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::{Error, Result as CoreResult};
 use crate::llm::bedrock;
+use crate::llm::chat_model::{ChatSettings, Wire, check_tool_calls};
 use crate::llm::egress::Egress;
 use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
-use crate::llm::sampling::{Sampling, Wire, check_tool_calls};
 use crate::llm::{ChatClient, Embeddings, ProviderModels, RerankModel};
 use crate::oidc::SignIn;
 use crate::proxy::Proxies;
@@ -389,8 +389,8 @@ fn check_config(report: &mut Report, inspection: &Inspection) {
             Status::Fail,
             format!("unknown key {}", unknown.path),
         );
-        report.push(match &unknown.suggestion {
-            Some(suggestion) => check.fix(format!("did you mean {suggestion}?")),
+        report.push(match &unknown.hint {
+            Some(hint) => check.fix(hint.to_string()),
             None => check.fix("remove it; `quack config` lists the keys this binary reads"),
         });
     }
@@ -713,8 +713,8 @@ async fn check_chat_model(report: &mut Report, config: &Config, probing: Probing
     match config.chat_model_ref() {
         Ok(model) => {
             check_model(report, Area::ChatModel, config, model, probing).await;
-            report.push(sampling_check(config, model));
-            if let Some(check) = background_check(config, model) {
+            report.push(chat_settings_check(config, model).await);
+            if let Some(check) = background_check(config, model).await {
                 report.push(check);
             }
         }
@@ -726,67 +726,97 @@ async fn check_chat_model(report: &mut Report, config: &Config, probing: Probing
     }
 }
 
-/// What a chat turn sends the model: temperature, and the reasoning effort
-/// if it reaches the model at all. A config every turn refuses fails here too.
-fn sampling_check(config: &Config, model: ModelRef<'_>) -> Check {
+/// What a chat turn sends the model: temperature, and the reasoning effort.
+/// A config every turn refuses fails here too.
+async fn chat_settings_check(config: &Config, model: ModelRef<'_>) -> Check {
     let settings = config.model_settings(model);
     let wire = Wire::of(model.provider);
     if let Err(e) = check_tool_calls(model.model, wire, settings.effort) {
         return Check::new(Area::ChatModel, Status::Fail, format!("{model}: {e}"));
     }
-    match Sampling::new(model.model, wire, settings.effort, settings.temperature) {
-        Ok(sampling) => match sampling.unsent_effort() {
-            Some(why) => Check::new(Area::ChatModel, Status::Warn, format!("{model}: {why}")),
-            None => Check::new(Area::ChatModel, Status::Ok, format!("{model}: {sampling}")),
-        },
-        Err(e) => Check::new(Area::ChatModel, Status::Fail, format!("{model}: {e}")).fix(format!(
+    let chat = ChatSettings::new(model.model, wire, settings.effort, settings.temperature);
+    EffortCheck::run(model, settings.effort).await.check(
+        &model.to_string(),
+        chat,
+        "",
+        format!(
             "set effort to a level it takes under [providers.{}.models.\"{}\"], \
              [providers.{}], or [analysis]",
             model.provider_name, model.model, model.provider_name
-        )),
-    }
+        ),
+    )
 }
 
 /// What a background call (reranking, history summaries, graph extraction,
 /// the ontology's document pass) sends, when its effort is not the turn's.
-fn background_check(config: &Config, model: ModelRef<'_>) -> Option<Check> {
+async fn background_check(config: &Config, model: ModelRef<'_>) -> Option<Check> {
     let settings = config.model_settings(model);
     if settings.background_effort == settings.effort {
         return None;
     }
-    let sampling = Sampling::new(
+    let chat = ChatSettings::new(
         model.model,
         Wire::of(model.provider),
         settings.background_effort,
         settings.temperature,
     );
-    Some(match sampling {
-        Ok(sampling) => match sampling.unsent_effort() {
-            Some(why) => Check::new(
-                Area::ChatModel,
-                Status::Warn,
-                format!("{model}, background calls: {why}"),
-            ),
-            None => Check::new(
-                Area::ChatModel,
-                Status::Ok,
-                format!("{model}, background calls: {sampling}"),
-            ),
-        },
-        Err(e) => Check::new(
-            Area::ChatModel,
-            Status::Fail,
-            format!(
-                "{model}, background calls: {e}; graph extraction and the ontology's document \
-                 pass fail, and chat turns run without model reranking and history summaries"
-            ),
-        )
-        .fix(format!(
+    Some(EffortCheck::run(model, settings.background_effort).await.check(
+        &format!("{model}, background calls"),
+        chat,
+        "; graph extraction and the ontology's document pass fail, and chat turns run without \
+         model reranking and history summaries",
+        format!(
             "set background_effort to a level it takes under [providers.{}.models.\"{}\"], \
              [providers.{}], or [analysis]",
             model.provider_name, model.model, model.provider_name
-        )),
-    })
+        ),
+    ))
+}
+
+/// What building a chat model at an effort says, sending nothing: rig
+/// refuses a level the model does not take on its provider's API.
+enum EffortCheck {
+    /// No effort is set, or rig accepts the level for this model.
+    Accepted,
+    /// rig refuses the level; every request would fail.
+    Refused(Error),
+    /// The provider's client cannot be built here (a Bedrock provider with
+    /// no AWS region, say), so the level is not checked.
+    Unchecked(Error),
+}
+
+impl EffortCheck {
+    /// The check for `subject`, sent `chat`: a refusal says what else it
+    /// costs (`refused_costs`) and how to `fix` it.
+    fn check(self, subject: &str, chat: ChatSettings, refused_costs: &str, fix: String) -> Check {
+        match self {
+            Self::Accepted => Check::new(Area::ChatModel, Status::Ok, format!("{subject}: {chat}")),
+            Self::Unchecked(e) => Check::new(
+                Area::ChatModel,
+                Status::Warn,
+                format!("{subject}: {chat}; the effort is not checked here: {e}"),
+            ),
+            Self::Refused(e) => Check::new(
+                Area::ChatModel,
+                Status::Fail,
+                format!("{subject}: {e}{refused_costs}"),
+            )
+            .fix(fix),
+        }
+    }
+
+    async fn run(model: ModelRef<'_>, effort: Option<Effort>) -> Self {
+        if effort.is_none() {
+            return Self::Accepted;
+        }
+        match ChatClient::without_credential(model.provider_name, model.provider).await {
+            Err(e) => Self::Unchecked(e),
+            Ok(client) => match client.chat_model(model.model, effort, None) {
+                Ok(_) => Self::Accepted,
+                Err(e) => Self::Refused(e),
+            },
+        }
+    }
 }
 
 async fn check_embedding_model(report: &mut Report, config: &Config, probing: Probing) {

@@ -137,7 +137,7 @@ fn a_rejected_file_reports_the_error_and_falls_back_to_defaults() {
         inspection.unknown,
         vec![UnknownKey {
             path: String::from("retrieval.topk"),
-            suggestion: Some(String::from("top_k")),
+            hint: Some(KeyHint::DidYouMean(String::from("top_k"))),
         }]
     );
 }
@@ -163,7 +163,13 @@ fn unknown_sections_keys_and_misplaced_settings_are_named() {
     let found: Vec<(&str, Option<&str>)> = inspection
         .unknown
         .iter()
-        .map(|u| (u.path.as_str(), u.suggestion.as_deref()))
+        .map(|u| {
+            let hint = match &u.hint {
+                Some(KeyHint::DidYouMean(key)) => Some(key.as_str()),
+                Some(KeyHint::Removed(_)) | None => None,
+            };
+            (u.path.as_str(), hint)
+        })
         .collect();
     assert!(found.contains(&("genral", Some("general"))), "{found:?}");
     assert!(
@@ -335,7 +341,26 @@ fn model_settings_are_listed_under_the_quoted_model_id() {
         .iter()
         .find(|u| u.path == "providers.p.models.\"m\".temp")
         .unwrap_or_else(|| panic!("{:?}", unknown.iter().map(|u| &u.path).collect::<Vec<_>>()));
-    assert_eq!(found.suggestion.as_deref(), Some("temperature"));
+    assert_eq!(
+        found.hint,
+        Some(KeyHint::DidYouMean(String::from("temperature")))
+    );
+}
+
+#[test]
+fn a_removed_key_says_what_replaced_it() {
+    let inspection = inspect("[analysis]\nmax_context_tokens = 32768\n");
+    let found = inspection
+        .unknown
+        .iter()
+        .find(|u| u.path == "analysis.max_context_tokens")
+        .unwrap_or_else(|| panic!("{:?}", inspection.unknown));
+    let Some(hint @ KeyHint::Removed(_)) = &found.hint else {
+        panic!("{:?}", found.hint)
+    };
+    let text = hint.to_string();
+    assert!(text.contains("OLLAMA_CONTEXT_LENGTH"), "{text}");
+    assert!(!text.contains("did you mean"), "{text}");
 }
 
 #[test]

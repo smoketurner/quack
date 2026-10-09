@@ -1515,14 +1515,14 @@ drift, propose again.
 0. Before 2, when the model has to be loaded first (Ollama, cold): emit Status { line }
 ```
 
-`max_turns` 15, temperature 0.1. `llm::sampling` adjusts that per model. Only Ollama's own API
+`max_turns` 15, temperature 0.1. `llm::chat_model` adjusts that per model. Only Ollama's own API
 is sent the temperature, because Claude and `OpenAI`'s reasoning models (GPT-5.x, GPT-6,
 o-series) reject a non-default one and a gateway's model name need not say which model it is.
 Claude gets `max_tokens` 64,000, since thinking counts against it. `[analysis].effort` goes out
-as each API's field (`output_config.effort` for Claude, `reasoning_effort` or `reasoning.effort`
-for `OpenAI` and unrecognized models on those APIs, `think` on Ollama). A level a known family
-lacks is refused before the call, and so is a GPT-5.6 model on Chat Completions, because it
-cannot call tools there. `temperature`, `effort`, and `background_effort` on a provider, or on
+as rig's `Reasoning` option, and rig writes each API's field (`output_config.effort` with adaptive
+thinking for Claude, `reasoning_effort` or `reasoning.effort` on `OpenAI`'s APIs, `think` on
+Ollama). A level rig's model catalog says the model lacks is refused when the model is built,
+and so is a GPT-5.6 model on Chat Completions, because it cannot call tools there. `temperature`, `effort`, and `background_effort` on a provider, or on
 one of its `models."ID"`, override the defaults and `[analysis]` (`docs/providers.md`). The turn races a
 `CancellationToken`; a turn cancelled while the model is streaming keeps the text, steps, citations, and usage it has so far, appends a note, reports `cancelled: true`, and is recorded. One cancelled while its prompt is assembled, before any model call, records the note alone.
 
@@ -1608,22 +1608,14 @@ The guidance always names the table, SQL, chart and document tools; only the gra
 are conditional. Mode changes no registration; query mode only drops provisional graph
 results.
 
-**Ollama.** Every chat-model request carries `num_ctx`: a turn's model calls, graph
-extraction, the ontology's document pass, session titles, and image reading
-(`llm::sampling::OllamaLoad`, sent as rig's `OllamaOptions`). Ollama otherwise loads the
-model with a 4,096-token window and silently truncates the front of the prompt. It is the
-request's estimated tokens plus a fixed 8,192-token headroom for tool results and answer,
-rounded up to 8,192, capped by `[analysis].max_context_tokens`, never below 8,192. `num_ctx`
-is a load option: a changed value forces a full reload (measured: several seconds for a 20B
-model). So the window quack asks for never shrinks for a server and model while quack runs:
-a short background call between turns keeps the window the last turn loaded, and the coarse
-step means a growing session crosses it a few times at most, not every 2,048 tokens. Every
-request also carries `keep_alive` (30 minutes), since otherwise a gap between tool calls or
-turns pays the same reload once Ollama's default (5 minutes) lapses.
+**Ollama.** Chat-model requests carry no load options, as rig sends them: the Ollama server
+sizes the context window (`OLLAMA_CONTEXT_LENGTH`) and decides how long a model stays loaded
+(`OLLAMA_KEEP_ALIVE`). Ollama's default window truncates the front of most quack prompts, so
+a turn cut short on Ollama names `OLLAMA_CONTEXT_LENGTH`.
 
 Embedding requests go through quack's own `/api/embed` client (`llm::OllamaEmbedder`),
-because rig's sends neither option. They carry the same `keep_alive`, so the embedding model
-stays loaded between a turn's query embedding and its chat call. Their `num_ctx` fits a
+because rig's sends no load options. They carry `keep_alive` (30 minutes), so the embedding
+model stays loaded between a turn's query embedding and its chat call. Their `num_ctx` fits a
 chunk: twice `[ingestion].chunk_size_tokens`, rounded up to a power of two, at least 2,048.
 Otherwise Ollama loads the model at full length (measured: 32k for qwen3-embedding, 5.8 GB
 of cache against 2.1 GB, same throughput). On a host that cannot fit both models at full
@@ -1762,7 +1754,7 @@ reaches a provider.
 per-request counts when the turn derailed before a final response. It is `null`, not zeroes,
 when the provider reported nothing, as local models often do. The counts also go on the
 assistant message's metadata in `_quack_messages`, so session exports carry them. They are a
-record, not an input: the history trim and Ollama's `num_ctx` estimate before the call.
+record, not an input: the history trim estimates before the call.
 
 `duration_ms` is the turn's wall-clock time, from the question's arrival (prompt assembly
 included) to the answer, cancelled turns too. It goes on the assistant message's metadata
@@ -3038,7 +3030,6 @@ threads = 4
 max_turns = 15
 history_token_budget = 32000
 compact_history = false                 # summarize the turns the budget leaves out instead of dropping them
-max_context_tokens = 32768              # Ollama num_ctx cap; each turn asks for what its prompt needs
 extraction_timeout_seconds = 120        # one chunk's extraction call (ontology evidence, graph extract)
 extraction_concurrency = 1              # chunks extracted at once; Ollama serves one unless OLLAMA_NUM_PARALLEL
 reader_pool_size = 4                    # reader connections per workspace handle, round-robined

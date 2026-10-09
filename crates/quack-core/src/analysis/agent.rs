@@ -406,8 +406,8 @@ impl Cutoff {
         let advice = match window {
             Window::Ollama => {
                 " With Ollama the answer shares the context window with the prompt and the \
-                 model's reasoning; raise [analysis].max_context_tokens or ask a narrower \
-                 question."
+                 model's reasoning; raise OLLAMA_CONTEXT_LENGTH on the Ollama server or ask a \
+                 narrower question."
             }
             Window::Provider => " Ask a narrower question.",
         };
@@ -429,11 +429,16 @@ impl Cutoff {
 
     /// Why a one-shot call's answer cannot be used: a cut-off answer is
     /// not one to parse.
-    pub(crate) fn refusal(self, what: &str) -> Error {
+    pub(crate) fn refusal(self, what: &str, window: Window) -> Error {
         Error::Llm(match self {
             Self::Length => format!(
-                "the {what} answer was cut off at the model's output limit (with Ollama, the \
-                 context window: [analysis].max_context_tokens)"
+                "the {what} answer was cut off at the model's output limit{}",
+                match window {
+                    Window::Ollama =>
+                        " (with Ollama, the context window: OLLAMA_CONTEXT_LENGTH \
+                                       on the server)",
+                    Window::Provider => "",
+                }
             ),
             Self::Filtered => {
                 format!("the {what} answer was stopped by the provider's content filter")
@@ -684,8 +689,8 @@ fn turn_text(
         answer.text.trim().is_empty().then(|| {
             String::from(if window == Window::Ollama {
                 "The model returned no text. With Ollama this usually means the answer or the \
-                 prompt did not fit the context window; raise [analysis].max_context_tokens or \
-                 ask a narrower question."
+                 prompt did not fit the context window; raise OLLAMA_CONTEXT_LENGTH on the Ollama \
+                 server or ask a narrower question."
             } else {
                 "The model returned no text; ask again or narrow the question."
             })
@@ -788,8 +793,8 @@ impl StreamStop<'_> {
                 match window {
                     Window::Ollama => {
                         " With Ollama this usually means the prompt was cut to the context \
-                         window; check [analysis].max_context_tokens and the model's own \
-                         limit."
+                         window; check OLLAMA_CONTEXT_LENGTH on the Ollama server and the \
+                         model's own limit."
                     }
                     Window::Provider => "",
                 }
@@ -847,7 +852,7 @@ struct BuildContext<'a> {
     tables: TableLayout,
     mode: ChatMode,
     rerank_model: Option<RerankModel>,
-    /// The model reranker's one-shot, sampled with `background_effort` by
+    /// The model reranker's one-shot, built at `background_effort` by
     /// `dispatch`'s `schema_call`. `Some` only when `rerank = "model"`; the
     /// search tool wires it in, the other rerank modes ignore it.
     reranker_call: Option<SchemaCall<RerankAnswer>>,
@@ -880,7 +885,8 @@ impl BuildContext<'_> {
         )
         .with_model(ctx.modeled);
         let reader = || ctx.reader_db.clone();
-        let mut builder = AgentBuilder::new(completion_model)
+        let mut builder = completion_model
+            .agent(0.1)
             .preamble(system_prompt)
             .tool(search)
             .tool(ReadDocumentTool::new(reader(), ctx.retrieval_config))
@@ -900,7 +906,6 @@ impl BuildContext<'_> {
             .tool(CreateChartTool::new(reader()).with_step_rows(
                 usize::try_from(ctx.analysis_config.step_result_rows).unwrap_or(usize::MAX),
             ))
-            .temperature(0.1)
             .add_hook(InvalidToolCalls)
             .add_hook(EmptyAnswer);
 

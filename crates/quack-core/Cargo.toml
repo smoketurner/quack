@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 argon2        = { workspace = true, features = ["alloc", "password-hash", "getrandom"] }
-aws-config    = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest", "sso"] }
+aws-config    = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest", "credentials-process", "sso"] }
 aws-credential-types = { workspace = true }
 aws-lc-rs     = { workspace = true, features = ["aws-lc-sys"] }
 aws-sdk-bedrockruntime = { workspace = true, features = ["rt-tokio", "default-https-client"] }
