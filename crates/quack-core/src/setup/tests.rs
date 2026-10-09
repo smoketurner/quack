@@ -319,3 +319,33 @@ fn provider_kinds_round_trip_their_names() {
     }
     assert_eq!(ProviderKind::named("gateway"), None);
 }
+
+#[test]
+fn an_empty_or_blank_variable_counts_as_unset() {
+    let env = Environment::from_lookup(
+        |name| match name {
+            "ANTHROPIC_API_KEY" => Some(String::new()),
+            "OPENAI_API_KEY" => Some(String::from("  \t")),
+            "OLLAMA_HOST" => Some(String::from(" ")),
+            "AWS_PROFILE" => Some(String::from(" dev ")),
+            _ => None,
+        },
+        None,
+    );
+    assert_eq!(env.anthropic_key, None);
+    assert_eq!(env.openai_key, None);
+    assert_eq!(env.ollama_host, None);
+    assert_eq!(env.aws_access_key, None);
+    assert_eq!(env.aws_profile.as_deref(), Some("dev"));
+    assert_eq!(
+        env.hosted(ProviderKind::Anthropic).to_string(),
+        "✗ Anthropic: ANTHROPIC_API_KEY is not set"
+    );
+    assert_eq!(
+        env.ollama_base_url()
+            .map(|url| url.to_string())
+            .ok()
+            .as_deref(),
+        Some("http://localhost:11434")
+    );
+}

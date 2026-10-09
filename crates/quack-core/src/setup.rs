@@ -162,13 +162,27 @@ pub struct Environment {
 impl Environment {
     #[must_use]
     pub fn from_env() -> Self {
-        let set = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
         let aws_files = dirs::home_dir().and_then(|home| {
             ["config", "credentials"]
                 .into_iter()
                 .map(|file| home.join(".aws").join(file))
                 .find(|path| path.is_file())
         });
+        Self::from_lookup(|name| std::env::var(name).ok(), aws_files)
+    }
+
+    /// The environment `lookup` reports. A variable that is empty or only
+    /// whitespace counts as unset, as `export ANTHROPIC_API_KEY=` leaves it.
+    #[must_use]
+    pub fn from_lookup(
+        lookup: impl Fn(&str) -> Option<String>,
+        aws_files: Option<PathBuf>,
+    ) -> Self {
+        let set = |name: &str| {
+            lookup(name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
         Self {
             ollama_host: set("OLLAMA_HOST"),
             anthropic_key: set("ANTHROPIC_API_KEY"),
