@@ -50,6 +50,18 @@ vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
   `suggestion`: `{"did_you_mean": "top_k"}`, or `{"removed": "..."}` for a key an earlier
   release read, with what took its place.
 
+- Breaking: `GET /api/v1/workspaces/{id}/documents` and MCP `list_documents` return one page,
+  newest first: 100 documents unless `limit` asks for more (500 at most), with `total` and,
+  when more remain, `next`. Pass `next` as `after` for the following page. A client that read
+  `documents` as the whole list must follow `next`. The `quack://workspace/.../documents`
+  resource is the first page.
+- Changed: the agent's `list_documents` lists 50 documents a call and ends with the total and
+  the `after` for the next 50. The web Documents page shows 100 at a time, with Older and
+  Newest links.
+- Changed: every document listing is ordered by document id (a UUID v7, the order documents
+  were registered in) instead of `ingested_at`. The two orders agree for documents quack
+  registered.
+
 ## v2026.10.4
 
 - Breaking: `-w NAME` no longer creates a workspace that does not exist; it exits 2 (#434).
