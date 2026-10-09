@@ -160,7 +160,7 @@ async fn a_config_that_fails_doctor_leaves_the_old_file_byte_for_byte() {
     let old = "# mine\n[general]\ndefault_workspace = \"research\"\n";
     std::fs::write(&path, old).unwrap();
     let candidate = format!(
-        "[general]\ndata_dir = \"{}\"\nchat_model = \"o/chat:8b\"\n\n[providers.o]\ntype = \
+        "[general]\ndata_dir = '{}'\nchat_model = \"o/chat:8b\"\n\n[providers.o]\ntype = \
          \"ollama\"\nbase_url = \"{}\"\nmax_retries = 0\n",
         dir.path().join("data").display(),
         refused()
@@ -188,7 +188,7 @@ async fn a_config_that_passes_doctor_is_written() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let candidate = format!(
-        "[general]\ndata_dir = \"{}\"\n",
+        "[general]\ndata_dir = '{}'\n",
         dir.path().join("data").display()
     );
     let options = Options {
