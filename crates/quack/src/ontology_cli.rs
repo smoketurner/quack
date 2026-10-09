@@ -16,7 +16,7 @@ use crate::stdio::StdioPath;
 use crate::text_or_json::TextOrJson;
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::OntologyVersion;
-use quack_core::ontology::candidates::Queue;
+use quack_core::ontology::candidates::{AutoAcceptance, Queue};
 use quack_core::ontology::documents::{self, DocumentProposal};
 use quack_core::ontology::induction::{Candidate, Decision, ItemKind, propose_from_tables};
 use quack_core::ontology::store::Revision;
@@ -479,18 +479,27 @@ async fn propose(
     if proposals.is_empty() {
         writeln!(out, "Nothing to propose: the tables are already covered.")?;
     } else if auto_accept {
-        let stored = db
+        let outcome = db
             .run(move |db| {
                 let run = candidates::store_run(db, &proposals)?;
                 candidates::accept_run(db, &run, None)
             })
             .await?;
-        writeln!(
-            out,
-            "accepted {} proposals; ontology is now version {}",
-            stored.accepted,
-            stored.ontology.saved_version()?
-        )?;
+        match outcome {
+            AutoAcceptance::Accepted(stored) => writeln!(
+                out,
+                "accepted {} proposals; ontology is now version {}",
+                stored.accepted,
+                stored.ontology.saved_version()?
+            )?,
+            AutoAcceptance::KeptAside { low_support } => writeln!(
+                out,
+                "accepted nothing: all {low_support} proposals were seen in fewer than {} \
+                 documents ([ontology].min_support_documents), so they are kept aside. Run \
+                 `quack ontology review --low-support` to accept them by hand.",
+                config.ontology.min_support_documents
+            )?,
+        }
     } else {
         let run = proposals.clone();
         db.run(move |db| candidates::store_run(db, &run)).await?;

@@ -10,7 +10,7 @@ use quack_core::extraction::ExtractionRun;
 use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::jobs::JobId;
 use quack_core::ontology::OntologyDiff;
-use quack_core::ontology::candidates::{CandidateAction, CandidateRow, Queue};
+use quack_core::ontology::candidates::{AutoAcceptance, CandidateAction, CandidateRow, Queue};
 use quack_core::ontology::induction::{Decision, ItemKind, propose_from_tables};
 use quack_core::ontology::store::VersionRow;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -503,9 +503,10 @@ impl Access {
             }
             let run = candidates::store_run(db, &proposals)?;
             let version = if auto_accept {
-                candidates::accept_run(db, &run, Some(&author))?
-                    .ontology
-                    .version
+                match candidates::accept_run(db, &run, Some(&author))? {
+                    AutoAcceptance::Accepted(stored) => stored.ontology.version,
+                    AutoAcceptance::KeptAside { .. } => None,
+                }
             } else {
                 None
             };

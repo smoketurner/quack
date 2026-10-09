@@ -401,6 +401,19 @@ pub struct AutoAccepted {
     pub accepted: usize,
 }
 
+/// What auto-accepting one run did ([`accept_run`]).
+#[derive(Debug, Clone)]
+pub enum AutoAcceptance {
+    /// A new version holding the run's pending candidates.
+    Accepted(AutoAccepted),
+    /// Every candidate the run queued has low support, so it waits in the
+    /// low-support queue for a person and no version was made.
+    KeptAside {
+        /// How many candidates were kept aside.
+        low_support: usize,
+    },
+}
+
 /// Reject candidates: nothing changes in the ontology.
 ///
 /// # Errors
@@ -492,24 +505,38 @@ fn accept_as(
 /// over a single run). Other runs' undecided candidates stay pending, so
 /// an auto-accepted version contains only the candidates the caller
 /// proposed this run and the reported count matches the version's
-/// contents.
+/// contents. Low-support candidates are never auto-accepted: a run that
+/// queued only those makes no version and says how many it kept aside.
 ///
 /// # Errors
 ///
-/// Returns an error when the run has nothing pending or the result is invalid.
-pub fn accept_run(db: &WorkspaceDb, run: &RunId, decided_by: Option<&str>) -> Result<AutoAccepted> {
+/// Returns an error when the run queued nothing or the result is invalid.
+pub fn accept_run(
+    db: &WorkspaceDb,
+    run: &RunId,
+    decided_by: Option<&str>,
+) -> Result<AutoAcceptance> {
     let ids: Vec<(String, Decision)> = pending_for_run(db, run)?
         .into_iter()
         .map(|c| (c.id.into_string(), Decision::Accept))
         .collect();
     if ids.is_empty() {
-        return Err(Error::Ontology(String::from(
-            "no pending candidates for run",
-        )));
+        let low_support: usize = db.connection().query_row(
+            "SELECT count(*) FROM _quack_ontology_candidates WHERE status = ? AND proposed_by = ?",
+            duckdb::params![Queue::LowSupport.status(), run.as_str()],
+            |row| row.get(0),
+        )?;
+        if low_support == 0 {
+            return Err(Error::Ontology(String::from("no candidates for run")));
+        }
+        return Ok(AutoAcceptance::KeptAside { low_support });
     }
     let accepted = ids.len();
     let ontology = accept_as(db, &ids, decided_by, Acceptance::Auto)?;
-    Ok(AutoAccepted { ontology, accepted })
+    Ok(AutoAcceptance::Accepted(AutoAccepted {
+        ontology,
+        accepted,
+    }))
 }
 
 #[cfg(test)]
@@ -691,7 +718,9 @@ mod tests {
         let before = queue(&db, Queue::Pending).unwrap_or_else(|e| fail(&e.to_string()));
         assert_eq!(before.len(), 2, "both runs' candidates are pending");
 
-        let accepted = accept_run(&db, &run_b, None).unwrap_or_else(|e| fail(&e.to_string()));
+        let Ok(AutoAcceptance::Accepted(accepted)) = accept_run(&db, &run_b, None) else {
+            fail("the run's pending candidate is accepted")
+        };
         assert_eq!(
             accepted.accepted, 1,
             "only this run's candidate was accepted"
@@ -726,12 +755,11 @@ mod tests {
         assert_eq!(accepted.accepted, in_version, "count matches the version");
     }
 
-    /// `accept_run` errors when the run has no pending candidates, so an
-    /// empty run never silently produces a version. A run whose only
-    /// candidate was kept aside as low support has nothing pending, and a
-    /// run that stored nothing has nothing pending either.
+    /// An empty run never silently produces a version: a run whose only
+    /// candidate was kept aside as low support makes none and says so, and
+    /// a run that stored nothing is an error.
     #[test]
-    fn accept_run_errors_when_the_run_has_nothing_pending() {
+    fn accept_run_makes_no_version_when_the_run_has_nothing_pending() {
         let db =
             WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
         let low = Candidate {
@@ -751,9 +779,13 @@ mod tests {
             store_run(&db, std::slice::from_ref(&low)).unwrap_or_else(|e| fail(&e.to_string()));
         assert!(queue(&db, Queue::Pending).is_ok_and(|p| p.is_empty()));
         assert!(
-            accept_run(&db, &run, None).is_err(),
-            "a run with only low-support candidates has nothing pending"
+            matches!(
+                accept_run(&db, &run, None),
+                Ok(AutoAcceptance::KeptAside { low_support: 1 })
+            ),
+            "a run with only low-support candidates keeps them aside"
         );
+        assert!(store::current(&db).is_ok_and(|o| o.is_none()), "no version");
         let other = RunId::generate();
         assert!(
             accept_run(&db, &other, None).is_err(),

@@ -43,6 +43,9 @@ vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
   (an OpenAI model on Converse, for example). Any Ollama model is now sent `think`, not only
   gpt-oss. `effort = "none"` on Claude turns thinking off where the model allows it. Adaptive
   Claude models are also sent `thinking: adaptive` with the effort.
+- Changed: `quack ontology propose --auto-accept` exits 0 when every candidate has low support,
+  as with a single document. It accepts nothing and points to
+  `quack ontology review --low-support`. It used to exit 1 with "no pending candidates for run".
 
 ## v2026.10.4
 
