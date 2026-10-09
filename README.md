@@ -76,8 +76,16 @@ What it will not do:
 
 ## Configure
 
-Name your models in `~/.config/quack/config.toml`. The smallest working setup, with
-Ollama:
+Run `quack init`, or just `quack`: with no config file it offers to run `quack init` first.
+It finds a running Ollama and the API keys and AWS credentials in your environment, and asks
+which chat and embedding models to use. It shows the changes and checks the result with
+`quack doctor` before it writes `~/.config/quack/config.toml`. If a check fails, it writes
+nothing. Run it again to change models: it edits the file in place and keeps every other
+setting and comment. The file names the variable that holds an API key (`api_key_env`), never
+the key.
+
+To write the file yourself, name your models in `~/.config/quack/config.toml`. The smallest
+working setup, with Ollama:
 
 ```toml
 [general]

@@ -1801,7 +1801,7 @@ async fn without_a_chat_model_questions_say_how_to_set_one_and_sql_still_runs() 
     app.set_input("how many orders shipped late?");
     app.submit_message();
     assert!(app.turns.is_empty());
-    assert!(last(&app).content.contains("quack doctor"));
+    assert!(last(&app).content.contains("quack init"));
 
     app.set_input("SELECT 41 + 1 AS answer");
     app.submit_message();

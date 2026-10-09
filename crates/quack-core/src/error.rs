@@ -95,8 +95,8 @@ pub enum Error {
     /// No `[general].chat_model` (nor `QUACK_MODEL`) is set, so nothing can
     /// answer a question.
     #[error(
-        "no chat model configured — set [general].chat_model = \"PROVIDER/MODEL\" in {} or \
-         QUACK_MODEL; `quack doctor` checks the setup and suggests one (SQL with `quack -q` \
+        "no chat model configured — run `quack init` to set up a provider, or set \
+         [general].chat_model = \"PROVIDER/MODEL\" in {} or QUACK_MODEL (SQL with `quack -q` \
          needs no model)",
         config_file.display()
     )]

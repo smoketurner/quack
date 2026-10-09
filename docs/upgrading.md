@@ -23,6 +23,11 @@ vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
 
 ## Unreleased
 
+- Added: `quack init` finds a running Ollama and the API keys and AWS credentials in the
+  environment, asks which chat and embedding models to use, and sets them in `config.toml`
+  once `quack doctor` passes the result. It edits an existing file in place, keeping every
+  other setting and comment. `quack` with no config file offers to run it. The "no chat model"
+  error, the terminal's first-run note, and `quack doctor`'s chat model fix now point to it.
 - Changed: the terminal keeps typed input in each workspace's file (`_quack_input_history`,
   the newest 500 lines) instead of `<data_dir>/terminal_history`, which held every
   workspace's questions and SQL outside any workspace file. The first terminal session

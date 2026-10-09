@@ -14,11 +14,10 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::config;
 use crate::config::inspect::{FileState, Inspection};
 use crate::config::{
-    BaseUrl, BedrockEndpoint, Config, Grant, ModelRef, OAuthConfig, ProviderAuth, ProviderConfig,
-    ProviderName, ProviderType,
+    BaseUrl, BedrockEndpoint, Config, Grant, ModelRef, OAuthConfig, ProviderAuth, ProviderName,
+    ProviderType,
 };
 use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
@@ -699,7 +698,6 @@ async fn check_workspace(
 
 async fn check_chat_model(report: &mut Report, config: &Config, probing: Probing) {
     let Some(spec) = config.general.chat_model.as_ref() else {
-        let suggestion = suggest_chat_model(probing).await;
         report.push(
             Check::new(
                 Area::ChatModel,
@@ -708,7 +706,7 @@ async fn check_chat_model(report: &mut Report, config: &Config, probing: Probing
                  import work; questions, `ontology propose --documents`, and \
                  `graph extract` need one",
             )
-            .fix(suggestion),
+            .fix("`quack init` finds the providers this machine can reach and sets one up"),
         );
         return;
     };
@@ -1309,43 +1307,6 @@ async fn oauth_token(
         .await
         .map(|token| OAuthProbe::Token(token.expose_secret().to_owned()))
         .map_err(|e| format!("provider '{name}': {e}"))
-}
-
-/// A config snippet for a chat model: a local Ollama's own models when one
-/// answers, otherwise the general shape.
-async fn suggest_chat_model(probing: Probing) -> String {
-    let local = (probing.timeout(), "ollama".parse::<ProviderName>());
-    let pulled = match local {
-        (Some(timeout), Ok(name)) => {
-            let client =
-                ChatClient::connect(&name, &ProviderConfig::new(ProviderType::Ollama), None);
-            Probe::listing(client, timeout).await.map_or_else(
-                |_| Vec::new(),
-                |models| models.as_slice().iter().map(|m| m.id.clone()).collect(),
-            )
-        }
-        (None, _) | (_, Err(_)) => Vec::new(),
-    };
-    let snippet = |model: &str| {
-        format!(
-            "add to {}:\n[general]\nchat_model = \"ollama/{model}\"\n\n[providers.ollama]\ntype = \"ollama\"",
-            config::config_file_path().display()
-        )
-    };
-    match pulled.first() {
-        Some(first) => format!(
-            "Ollama is running at {} with {}; {}",
-            ProviderType::OLLAMA_BASE_URL,
-            pulled.join(", "),
-            snippet(first)
-        ),
-        None => format!(
-            "install Ollama and `ollama pull llama3.1:8b`, then {}\n\
-             (or use an OpenAI-compatible or Anthropic provider with auth = \"api-key\"; \
-             QUACK_MODEL overrides chat_model for one run)",
-            snippet("llama3.1:8b")
-        ),
-    }
 }
 
 async fn check_server(report: &mut Report, config: &Config, control: Option<&ControlPlane>) {
