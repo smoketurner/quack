@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use aws_lc_rs::digest;
-use duckdb::OptionalExt as _;
 use jiff::civil::DateTime;
 
 use std::collections::BTreeMap;
@@ -1841,9 +1840,8 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the query fails.
     pub fn document_by_sha256(&self, sha256: &str) -> Result<Option<DocumentInfo>> {
-        let sql = format!(
-            "{DOCUMENT_SELECT} WHERE sha256 = ? AND {LIVE_STATUS} ORDER BY ingested_at, id LIMIT 1"
-        );
+        let sql =
+            format!("{DOCUMENT_SELECT} WHERE sha256 = ? AND {LIVE_STATUS} ORDER BY id LIMIT 1");
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![sha256])?;
         match rows.next()? {
@@ -1861,7 +1859,7 @@ impl WorkspaceDb {
     pub fn table_owner(&self, table: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
             "{DOCUMENT_SELECT} WHERE {LIVE_STATUS} AND tables IS NOT NULL \
-             AND list_contains(CAST(tables AS VARCHAR[]), ?) ORDER BY ingested_at, id LIMIT 1"
+             AND list_contains(CAST(tables AS VARCHAR[]), ?) ORDER BY id LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![table])?;
@@ -1880,7 +1878,7 @@ impl WorkspaceDb {
     pub fn newest_document_named(&self, filename: &str) -> Result<Option<DocumentInfo>> {
         let sql = format!(
             "{DOCUMENT_SELECT} WHERE filename = ? AND status = ? \
-             ORDER BY ingested_at DESC, id DESC LIMIT 1"
+             ORDER BY id DESC LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![filename, DocumentStatus::Ready])?;
@@ -1905,7 +1903,7 @@ impl WorkspaceDb {
     ) -> Result<Option<DocumentInfo>> {
         let sql = format!(
             "{DOCUMENT_SELECT} WHERE source_root = ? AND source_path = ? AND status = ? \
-             ORDER BY ingested_at DESC, id DESC LIMIT 1"
+             ORDER BY id DESC LIMIT 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params![
@@ -1944,7 +1942,7 @@ impl WorkspaceDb {
     pub fn documents_under(&self, source_root: &str) -> Result<Vec<DocumentInfo>> {
         let sql = format!(
             "{DOCUMENT_SELECT} WHERE source_root = ? AND source_path IS NOT NULL AND status = ? \
-             ORDER BY source_path, ingested_at DESC, id DESC"
+             ORDER BY source_path, id DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let docs = stmt.query_map(duckdb::params![source_root, DocumentStatus::Ready], |row| {
@@ -3038,7 +3036,7 @@ impl WorkspaceDb {
         }
         let sql = format!(
             "WITH pool AS ( \
-                 SELECT c.id, c.document_id, c.chunk_index, d.ingested_at, d.id AS doc, \
+                 SELECT c.id, c.document_id, c.chunk_index, \
                         row_number() OVER (PARTITION BY c.document_id ORDER BY c.chunk_index) - 1 AS pos, \
                         count(*) OVER (PARTITION BY c.document_id) AS len \
                  FROM _quack_chunks c JOIN _quack_documents d ON d.id = c.document_id \
@@ -3052,10 +3050,9 @@ impl WorkspaceDb {
              SELECT id FROM placed \
              WHERE (pos * take + len - 1) // len < take \
                AND (((pos * take + len - 1) // len) * len) // take = pos \
-             ORDER BY {order}, chunk_index \
+             ORDER BY document_id, chunk_index \
              LIMIT ?",
             filter = pool.filter(),
-            order = pool.document_order(),
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let ids = stmt.query_map(
@@ -3170,7 +3167,7 @@ impl WorkspaceDb {
     pub fn pinned_documents(&self, budget: Tokens) -> Result<Vec<PinnedDocument>> {
         let mut stmt = self.conn.prepare(&format!(
             "{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} AND COALESCE(pinned, false) \
-             ORDER BY ingested_at DESC, id DESC"
+             ORDER BY id DESC"
         ))?;
         let documents = stmt
             .query_map([], |row| DocumentInfo::try_from(row))?
@@ -3672,9 +3669,7 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the query fails.
     pub fn recent_documents(&self, limit: usize) -> Result<(Vec<DocumentInfo>, usize)> {
-        let sql = format!(
-            "{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} ORDER BY ingested_at DESC, id DESC LIMIT ?"
-        );
+        let sql = format!("{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} ORDER BY id DESC LIMIT ?");
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(&sql)?;
         let docs = stmt
@@ -3695,8 +3690,7 @@ impl WorkspaceDb {
     ///
     /// # Errors
     ///
-    /// An unknown file type, `since` after `until`, an `after` that names
-    /// no document, or a failed query.
+    /// An unknown file type, `since` after `until`, or a failed query.
     pub fn documents(&self, listing: &DocumentListing) -> Result<DocumentPage> {
         let clause = listing.filter.clause()?;
         let shown = listing.shown.condition();
@@ -3712,30 +3706,12 @@ impl WorkspaceDb {
             params.as_slice(),
             |row| row.get(0),
         )?;
-        let cursor = match &listing.after {
-            None => None,
-            Some(after) => Some((
-                self.conn
-                    .query_row(
-                        "SELECT CAST(ingested_at AS VARCHAR) FROM _quack_documents WHERE id = ?",
-                        duckdb::params![after],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?
-                    .ok_or_else(|| ResourceKind::Document.missing(after.as_str()))?,
-                after,
-            )),
-        };
         let mut sql = format!("{DOCUMENT_SELECT} d WHERE {shown}{}", clause.sql);
-        if let Some((at, after)) = &cursor {
-            sql.push_str(
-                " AND (d.ingested_at < ?::TIMESTAMP OR (d.ingested_at = ?::TIMESTAMP AND d.id < ?))",
-            );
-            params.push(at);
-            params.push(at);
+        if let Some(after) = &listing.after {
+            sql.push_str(" AND d.id < ?");
             params.push(after);
         }
-        sql.push_str(" ORDER BY ingested_at DESC, id DESC LIMIT ?");
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
         let limit = listing.limit.clamp(1, DocumentListing::MAX_PAGE);
         let fetch = i64::from(limit).saturating_add(1);
         params.push(&fetch);
@@ -3839,7 +3815,7 @@ impl WorkspaceDb {
     ) -> Result<Vec<DocumentInfo>> {
         let sql = format!(
             "{DOCUMENT_SELECT} WHERE {NOT_SUPERSEDED} AND {} \
-             ORDER BY ingested_at DESC, id DESC LIMIT ?",
+             ORDER BY id DESC LIMIT ?",
             way.condition()
         );
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -4754,7 +4730,8 @@ impl Phrases {
 /// its documents come in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SamplePool {
-    /// Chunks the graph has not extracted yet, documents in ingest order.
+    /// Chunks the graph has not extracted yet, documents by id: the order
+    /// they were registered in.
     NotGraphExtracted,
     /// Chunks with more than a line of text, documents by id: what the
     /// ontology's document evidence reads.
@@ -4769,15 +4746,6 @@ impl SamplePool {
                 "NOT EXISTS (SELECT 1 FROM _quack_graph_extracted x WHERE x.chunk_id = c.id)"
             }
             Self::Substantive => "length(c.content) > 40",
-        }
-    }
-
-    /// How the documents are ordered, in the sampler's own columns: when
-    /// the document was ingested, and its id.
-    const fn document_order(self) -> &'static str {
-        match self {
-            Self::NotGraphExtracted => "ingested_at, doc",
-            Self::Substantive => "doc",
         }
     }
 }

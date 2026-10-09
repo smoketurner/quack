@@ -2348,7 +2348,8 @@ POST   /api/v1/workspaces/{id}/search         {query, top_k?, document_ids?, ent
                                                   (the MCP `search` tool's names)
 GET    /api/v1/workspaces/{id}/documents          ?types=&sources=&tags= (comma-separated), since=, until=, author=
                                                   one page newest first: ?limit= (100, at most 500), ?after={next};
-                                                  -> {documents, next, total}; an after naming no document is 404
+                                                  -> {documents, next, total}; ordered by id (UUID v7, the order they
+                                                  were registered in), so `after` needs no row and outlives a delete
 POST   /api/v1/workspaces/{id}/documents          multipart or {text,title} -> 202 {id}
                                                   ?replace={doc}: the one file takes that ready document's
                                                   place once ready (the old one becomes "superseded")

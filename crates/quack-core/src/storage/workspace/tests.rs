@@ -2844,8 +2844,9 @@ fn forget_user_rewrites_every_table_that_names_a_person() {
     }
 }
 
-/// A listing pages newest first with the last document's id as the cursor,
-/// ties on the ingest time broken by id, and counts every page's documents.
+/// A listing pages by id, newest first, with the last document's id as the
+/// cursor, whatever the ingest times, counts every page's documents, and
+/// goes on from a cursor whose document was deleted.
 #[test]
 fn documents_page_by_cursor_and_count_them_all() {
     let db =
@@ -2920,11 +2921,24 @@ fn documents_page_by_cursor_and_count_them_all() {
             .ok(),
         Some(5)
     );
-    let gone = db.documents(&DocumentListing {
-        after: Some(DocumentId::from("doc-x")),
-        ..DocumentListing::default()
-    });
-    assert!(matches!(gone, Err(Error::NotFound { .. })), "{gone:?}");
+    assert!(
+        db.delete_document(&DocumentId::from("doc-4"))
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    );
+    let after_gone = db
+        .documents(&DocumentListing {
+            after: Some(DocumentId::from("doc-4")),
+            ..DocumentListing::first(2)
+        })
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        after_gone
+            .documents
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect::<Vec<_>>(),
+        ["doc-3", "doc-2"]
+    );
 }
 
 /// A filter narrows every page and the total alike.
@@ -2967,9 +2981,9 @@ fn pinned_text_past_the_budget_is_not_read() {
     let db =
         WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
     for (id, text) in [
-        ("small-old", "abcd"),
-        ("big", &"x".repeat(400)),
-        ("small-new", "efgh"),
+        ("p1-small", "abcd"),
+        ("p2-big", &"x".repeat(400)),
+        ("p3-small", "efgh"),
     ] {
         let doc = DocumentId::from(id);
         db.insert_document(
@@ -2991,9 +3005,9 @@ fn pinned_text_past_the_budget_is_not_read() {
     assert_eq!(
         seen,
         [
-            ("small-new", &PinnedText::Included(String::from("efgh\nz"))),
-            ("big", &PinnedText::OverBudget),
-            ("small-old", &PinnedText::Included(String::from("abcd\nz"))),
+            ("p3-small", &PinnedText::Included(String::from("efgh\nz"))),
+            ("p2-big", &PinnedText::OverBudget),
+            ("p1-small", &PinnedText::Included(String::from("abcd\nz"))),
         ]
     );
     // The SQL size matches the estimate of the joined text exactly: a

@@ -505,7 +505,8 @@ A table file loads over its predecessor's table. A superseded document leaves se
 prompt, `list_documents`, and `read_document`, but keeps its chunks so stored citations still
 open. Every listing is one page of `WorkspaceDb::documents` (`DocumentListing`: `Shown::Live` or
 `Shown::All` for `quack docs --all` and the page's `?all=true`, a `DocumentFilter`, and `after`,
-the last document's id; `DocumentPage` carries `next` and `total`), and a name resolves through
+the last document's id; `DocumentPage` carries `next` and `total`; every document order is by id,
+which as a UUID v7 is registration order), and a name resolves through
 `WorkspaceDb::find_document` (id, file name, title, id prefix) or `document_by_id_prefix`, each a
 bounded query, so no request reads every document row.
 

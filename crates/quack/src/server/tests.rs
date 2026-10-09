@@ -1209,13 +1209,19 @@ async fn documents_list_a_page_at_a_time() {
         ids.first().cloned().into_iter().collect::<Vec<_>>()
     );
     assert!(rest.get("next").is_none(), "{rest}");
-    let (status, gone) = h
+    // A cursor is a position, not a row: one older than every id ends the
+    // listing.
+    let (status, past) = h
         .get(
             &format!("{base}?after=00000000-0000-7000-8000-000000000000"),
             &token,
         )
         .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{gone}");
+    assert_eq!(status, StatusCode::OK, "{past}");
+    assert_eq!(
+        (listed(&past).len(), &past["total"]),
+        (0, &serde_json::json!(3))
+    );
 
     let cookie = h.web_session("owner").await;
     let (status, html, _) = h
