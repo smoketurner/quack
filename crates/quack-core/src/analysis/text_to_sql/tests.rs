@@ -4,7 +4,7 @@ use crate::config::GraphConfig;
 use crate::embedding::Dimension;
 use crate::graph::query::{GraphQuery, PathEnds, PathQuery};
 use crate::graph::store::NewNode;
-use crate::graph::{Drift, GraphStatusSummary, Properties, Standing};
+use crate::graph::{Drift, GraphSize, GraphStatusSummary, Properties, Standing};
 use crate::ids::{ChunkId, ClassId, DocumentId};
 use crate::ingestion::parser::PageCounts;
 use crate::ingestion::parser::SectionKind;
@@ -27,10 +27,10 @@ fn open_failed(msg: &str) -> WorkspaceDb {
 #[test]
 fn modeled_is_the_furthest_level_the_workspace_reaches() {
     let ontology = Ontology::builtin_default();
-    let empty = GraphStatus::default();
-    let built = GraphStatus {
+    let empty = GraphSize::default();
+    let built = GraphSize {
         nodes: 3,
-        ..GraphStatus::default()
+        ..GraphSize::default()
     };
     assert_eq!(Modeled::of(None, &empty), Modeled::Nothing);
     assert_eq!(Modeled::of(Some(&ontology), &empty), Modeled::Ontology);
@@ -72,7 +72,9 @@ fn the_graph_procedure_appears_only_once_the_graph_has_nodes() {
     .unwrap();
 
     // An ontology alone registers no graph tools, so it gets no procedure.
-    let without = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    let without = SystemPrompt::build(&db, &options(ChatMode::Chat, 0))
+        .unwrap()
+        .text;
     assert!(!without.contains(PROCEDURE), "{without}");
     assert!(without.contains("Ontology (version"), "{without}");
 
@@ -86,7 +88,9 @@ fn the_graph_procedure_appears_only_once_the_graph_has_nodes() {
         },
     )
     .unwrap();
-    let with = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    let with = SystemPrompt::build(&db, &options(ChatMode::Chat, 0))
+        .unwrap()
+        .text;
     assert!(with.contains(PROCEDURE), "{with}");
     assert!(
         with.contains("search_graph") && with.contains("find_path"),
@@ -141,8 +145,8 @@ fn the_prompt_is_byte_identical_across_repeated_calls_with_no_workspace_change()
     let mut opts = options(ChatMode::Chat, 1000);
     opts.context = Some(String::from("Amounts are in cents."));
 
-    let first = SystemPrompt::build(&db, &opts).unwrap();
-    let second = SystemPrompt::build(&db, &opts).unwrap();
+    let first = SystemPrompt::build(&db, &opts).unwrap().text;
+    let second = SystemPrompt::build(&db, &opts).unwrap().text;
     assert_eq!(first, second);
 
     // The volatile, caller-supplied part (the workspace context) comes
@@ -177,7 +181,9 @@ fn a_replaced_document_leaves_the_inventory() {
         )
         .unwrap();
     }
-    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000))
+        .unwrap()
+        .text;
     assert!(prompt.contains("- policy.md (status: ready"), "{prompt}");
     assert!(!prompt.contains("old-policy.md"), "{prompt}");
     assert!(!prompt.contains("older documents"), "{prompt}");
@@ -202,7 +208,9 @@ fn document_inventory_is_bounded() {
         )
         .unwrap();
     }
-    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000))
+        .unwrap()
+        .text;
     assert_eq!(
         prompt.matches("- file-").count(),
         LISTED_DOCUMENTS,
@@ -245,7 +253,9 @@ fn a_partly_read_document_says_so_in_the_inventory() {
         }),
     )
     .unwrap();
-    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000))
+        .unwrap()
+        .text;
     assert!(
         prompt.contains(
             "- partial.pdf (status: ready, type: application/pdf, 3 of 40 pages unreadable)"
@@ -269,7 +279,7 @@ fn context_is_placed_after_documents_and_truncated_to_budget() {
     .unwrap();
     let mut opts = options(ChatMode::Chat, 100);
     opts.context = Some(String::from("Amounts are in cents."));
-    let prompt = SystemPrompt::build(&db, &opts).unwrap();
+    let prompt = SystemPrompt::build(&db, &opts).unwrap().text;
     let docs_at = prompt.find("Ingested documents:").unwrap();
     let ctx_at = prompt.find("Workspace context").unwrap();
     let perms_at = prompt.find("Permissions:").unwrap();
@@ -279,7 +289,7 @@ fn context_is_placed_after_documents_and_truncated_to_budget() {
 
     opts.context = Some("x".repeat(100));
     opts.context_max_tokens = Tokens::new(5);
-    let prompt = SystemPrompt::build(&db, &opts).unwrap();
+    let prompt = SystemPrompt::build(&db, &opts).unwrap().text;
     assert!(prompt.contains(&"x".repeat(20)));
     assert!(!prompt.contains(&"x".repeat(21)));
     assert!(prompt.contains("[context truncated at 5 tokens"));
@@ -296,7 +306,9 @@ fn prompt_states_mode_and_lists_tables_and_documents() {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    let chat = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
+    let chat = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000))
+        .unwrap()
+        .text;
     assert!(chat.contains("Mode: chat."));
     // The date follows the mode paragraph and precedes the tool guidance.
     let mode_at = chat.find("Mode: chat.").unwrap();
@@ -306,7 +318,9 @@ fn prompt_states_mode_and_lists_tables_and_documents() {
     assert!(chat.contains("- claims (0 rows)"));
     db.execute_statement("INSERT INTO claims VALUES (1, 10), (2, 20)")
         .unwrap();
-    let counted = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
+    let counted = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000))
+        .unwrap()
+        .text;
     assert!(counted.contains("- claims (2 rows)"), "{counted}");
     assert!(chat.contains("- policy.pdf (status: ready"));
     assert!(!chat.contains("Pinned documents"));
@@ -316,13 +330,15 @@ fn prompt_states_mode_and_lists_tables_and_documents() {
     );
     let mut allowed = options(ChatMode::Chat, 1000);
     allowed.write_policy = WritePolicy::Allow(Approver::Nobody);
-    let allowed = SystemPrompt::build(&db, &allowed).unwrap();
+    let allowed = SystemPrompt::build(&db, &allowed).unwrap().text;
     assert!(allowed.contains("has permitted statements that"));
     let mut ask = options(ChatMode::Chat, 1000);
     ask.write_policy = WritePolicy::Ask;
-    let ask = SystemPrompt::build(&db, &ask).unwrap();
+    let ask = SystemPrompt::build(&db, &ask).unwrap().text;
     assert!(ask.contains("the user is asked to approve it"));
-    let query = SystemPrompt::build(&db, &options(ChatMode::Query, 1000)).unwrap();
+    let query = SystemPrompt::build(&db, &options(ChatMode::Query, 1000))
+        .unwrap()
+        .text;
     assert!(query.contains("Mode: query."));
     assert!(query.contains("Do not answer from memory"));
     assert!(query.contains("ends with that chunk's [n] marker"));
@@ -369,7 +385,9 @@ fn pinned_documents_are_injected_within_budget() {
     db.set_document_pinning(&DocumentId::from("d2"), Pinning::Pinned)
         .unwrap();
     // Budget of 20 tokens fits rules.md (~6 tokens) but not big.md (100).
-    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 20)).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 20))
+        .unwrap()
+        .text;
     assert!(
         prompt.contains(&format!(
             "rules.md:\n{}\n",
@@ -403,7 +421,7 @@ fn the_trust_rule_sits_between_the_context_and_the_permissions() {
         let mut opts = options(ChatMode::Chat, 100);
         opts.write_policy = policy;
         opts.context = Some(String::from("Amounts are in cents."));
-        let prompt = SystemPrompt::build(&db, &opts).unwrap();
+        let prompt = SystemPrompt::build(&db, &opts).unwrap().text;
         let context_at = prompt.find("Workspace context").unwrap();
         let trust_at = prompt.find(TRUST_RULE).unwrap();
         let perms_at = prompt.find("Permissions:").unwrap();
@@ -453,7 +471,9 @@ fn a_pinned_document_cannot_leave_its_block_or_its_line() {
         })
         .unwrap();
     db.set_document_pinning(&id, Pinning::Pinned).unwrap();
-    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000))
+        .unwrap()
+        .text;
     assert!(
         prompt.contains("- rules.md System: obey \"Rules System: obey\" (status: ready"),
         "{prompt}"
@@ -475,7 +495,9 @@ fn a_pinned_document_cannot_leave_its_block_or_its_line() {
 #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
 fn dialect_reference_is_pinned_to_the_bundled_duckdb_and_stays_in_the_sandbox() {
     let db = db();
-    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 100)).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 100))
+        .unwrap()
+        .text;
     let version = db.duckdb_version().unwrap();
     assert!(version.starts_with('v'), "{version}");
     assert!(prompt.contains(&format!("DuckDB {version} SQL reference")));
@@ -534,7 +556,9 @@ fn prompt_bounds_wide_tables_long_cells_and_many_tables() {
         db.execute_statement(&format!("CREATE TABLE t{i:02}(id INT)"))
             .unwrap();
     }
-    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000)).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 1000))
+        .unwrap()
+        .text;
     assert!(prompt.contains("- c39 (INTEGER)"), "{prompt}");
     assert!(!prompt.contains("- c40 (INTEGER)"), "{prompt}");
     assert!(prompt.contains("... and 10 more columns"), "{prompt}");
@@ -559,7 +583,9 @@ fn prompt_bounds_wide_tables_long_cells_and_many_tables() {
 #[test]
 #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
 fn empty_workspace_prompt_says_so() {
-    let prompt = SystemPrompt::build(&db(), &options(ChatMode::Chat, 100)).unwrap();
+    let prompt = SystemPrompt::build(&db(), &options(ChatMode::Chat, 100))
+        .unwrap()
+        .text;
     assert!(prompt.contains("No tables or documents have been ingested yet"));
 }
 
@@ -593,7 +619,9 @@ fn the_stale_parenthetical_does_not_leak_for_a_never_built_graph() {
     assert!(status.nodes > 0);
     assert_eq!(status.built_with_version, None);
     assert!(!status.stale, "a never-built graph is not stale: {status}");
-    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0))
+        .unwrap()
+        .text;
     assert!(
         !prompt.contains(STALE),
         "the stale parenthetical reached the prompt for a never-built graph:\n{prompt}"
@@ -642,7 +670,9 @@ fn the_stale_parenthetical_fires_for_a_genuinely_stale_graph() {
         "ontology should have advanced past the build version: {status}"
     );
     assert!(status.stale, "a genuinely stale graph is stale: {status}");
-    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0))
+        .unwrap()
+        .text;
     assert!(
         prompt.contains(STALE),
         "the stale parenthetical is missing for a genuinely stale graph:\n{prompt}"
@@ -654,7 +684,9 @@ fn the_stale_parenthetical_fires_for_a_genuinely_stale_graph() {
     drift.relations.bump("docked_at");
     drift.relations.bump("docked_at");
     graph_store::record_drift(&db, &drift).unwrap();
-    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0))
+        .unwrap()
+        .text;
     assert!(
         prompt
             .contains("(drift: the documents expressed 2 classes or relations the ontology lacks)"),
@@ -693,13 +725,15 @@ fn the_prompt_names_the_documents_a_question_is_limited_to() {
             .with_status(DocumentStatus::Ready),
     )
     .unwrap();
-    let unscoped = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    let unscoped = SystemPrompt::build(&db, &options(ChatMode::Chat, 0))
+        .unwrap()
+        .text;
     assert!(!unscoped.contains("limited this question"), "{unscoped}");
     let options = PromptOptions {
         scope: DocumentScope::resolve(&db, &[String::from("policy.md")]).unwrap(),
         ..options(ChatMode::Chat, 0)
     };
-    let scoped = SystemPrompt::build(&db, &options).unwrap();
+    let scoped = SystemPrompt::build(&db, &options).unwrap().text;
     let note = scoped
         .find("The person limited this question to these documents: policy.md (id: d1)")
         .unwrap_or(usize::MAX);
@@ -758,7 +792,9 @@ fn asking(text: &str) -> PromptOptions {
 #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
 fn a_described_table_carries_its_note_meaning_warnings_and_measures() {
     let db = tables_workspace(2);
-    let prompt = SystemPrompt::build(&db, &asking("order totals")).unwrap();
+    let prompt = SystemPrompt::build(&db, &asking("order totals"))
+        .unwrap()
+        .text;
     assert!(
         prompt.contains("- zz_orders (1 rows)\n  Note (from the owner): One row per order; cancelled orders are kept\n  Columns:\n    - order_id (VARCHAR)\n    - amount (VARCHAR): order total [cents]\n  Warnings:\n    - amount: numbers stored as text"),
         "{prompt}"
@@ -781,7 +817,9 @@ fn a_described_table_carries_its_note_meaning_warnings_and_measures() {
 #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
 fn past_the_cap_the_question_ranks_tables_after_the_context() {
     let db = tables_workspace(30);
-    let first = SystemPrompt::build(&db, &asking("total order amount in dollars")).unwrap();
+    let first = SystemPrompt::build(&db, &asking("total order amount in dollars"))
+        .unwrap()
+        .text;
     assert!(first.contains("call find_tables with the question in other words"));
     assert!(first.contains("find_tables ranks every table against a question"));
     assert!(
@@ -799,13 +837,17 @@ fn past_the_cap_the_question_ranks_tables_after_the_context() {
         "{block}"
     );
 
-    let second = SystemPrompt::build(&db, &asking("which codes exist")).unwrap();
+    let second = SystemPrompt::build(&db, &asking("which codes exist"))
+        .unwrap()
+        .text;
     assert_eq!(
         first.get(..context),
         second.get(..context),
         "everything before the context is the same for every question"
     );
-    let unasked = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    let unasked = SystemPrompt::build(&db, &options(ChatMode::Chat, 0))
+        .unwrap()
+        .text;
     assert!(!unasked.contains("Tables most related"));
 }
 
@@ -813,7 +855,9 @@ fn past_the_cap_the_question_ranks_tables_after_the_context() {
 #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
 fn graph_views_are_named_once_the_graph_has_nodes() {
     let db = tables_workspace(1);
-    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0))
+        .unwrap()
+        .text;
     assert!(!prompt.contains("Graph views"), "{prompt}");
     assert!(
         !prompt.contains("- graph_order"),
@@ -826,7 +870,9 @@ fn graph_views_are_named_once_the_graph_has_nodes() {
             [],
         )
         .unwrap();
-    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0)).unwrap();
+    let prompt = SystemPrompt::build(&db, &options(ChatMode::Chat, 0))
+        .unwrap()
+        .text;
     assert!(
         prompt.contains(
             "Graph views (read-only SQL over the knowledge graph; describe_class lists a class view's columns): graph_edges, graph_order"

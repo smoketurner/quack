@@ -58,6 +58,8 @@ fn main() {
         scope: DocumentScope::default(),
         question: None,
     };
-    let prompt = text_to_sql::SystemPrompt::build(&db, &options).unwrap();
+    let prompt = text_to_sql::SystemPrompt::build(&db, &options)
+        .unwrap()
+        .text;
     println!("{}", serde_json::to_string(&prompt).unwrap());
 }

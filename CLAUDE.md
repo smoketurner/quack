@@ -383,6 +383,8 @@ was auto-accepted), `stale` (`graph_built_with_ontology_version` lags), pending 
 drift, `pending_chunks` (chunks no extraction read), and `pending_tables` (mapped tables
 whose fingerprint in `_quack_graph_tables_built`, written by each mapping's last batch,
 no longer matches: owning document, keyed row count, hash over the mapped columns);
+a turn reads only `store::size` (node and edge counts and `store::summary`), once, in
+`SystemPrompt::build`, whose `BuiltPrompt` also carries the `Modeled` level and `TableLayout`;
 `[graph].follow_ingest` (`off`, `tables`, `all`) has `graph::follow_up::after_documents`
 extract a document into the graph as it becomes ready (the server queues it as an audited
 graph run after an upload or import; the CLI and terminal run it after their ingest). A

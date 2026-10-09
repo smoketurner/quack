@@ -21,17 +21,16 @@ use super::policy::WritePolicy;
 use super::rerank::RerankAnswer;
 use super::search::DocumentScope;
 use super::table_search::{TableCards, TableLayout, user_tables};
-use super::text_to_sql::{Modeled, PromptOptions, Question, SystemPrompt, Window};
+use super::text_to_sql::{BuiltPrompt, Modeled, PromptOptions, Question, SystemPrompt, Window};
 use super::tools::{
     CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, FindTablesTool,
     GraphTools, ListDocumentsTool, ListTablesTool, ReadDocumentTool, ReaderDb, RunSqlTool,
     SearchDocumentsTool, SearchGraphTool, SharedDb, Turn, ViewImageTool,
 };
 use super::vector_index::DuckDbVectorIndex;
-use crate::graph::{GraphResult, store as graph_store};
+use crate::graph::GraphResult;
 use crate::llm::vision::ImageReader;
 use crate::llm::{ChatModel, RerankModel, SchemaCall};
-use crate::ontology::store as ontology_store;
 use crate::storage::sessions::ChatMode;
 
 /// What the provider charged for a turn. Every budget quack computes
@@ -299,9 +298,7 @@ where
 /// The system prompt and what the workspace models, read through the
 /// turn's reader connection: the two decide which tools register.
 struct PromptAndModel {
-    system_prompt: String,
-    modeled: Modeled,
-    tables: TableLayout,
+    prompt: BuiltPrompt,
     /// Whether a ready document is an image, for `view_image` to look at.
     has_images: bool,
 }
@@ -364,12 +361,7 @@ impl PromptAndModel {
         reader_db
             .with_db(move |db| {
                 Ok(Self {
-                    system_prompt: SystemPrompt::build(db, &prompt)?,
-                    modeled: Modeled::of(
-                        ontology_store::current(db)?.as_ref(),
-                        &graph_store::status(db)?,
-                    ),
-                    tables: TableLayout::of(user_tables(db)?.len()),
+                    prompt: SystemPrompt::build(db, &prompt)?,
                     has_images: db.has_images()?,
                 })
             })
@@ -483,15 +475,15 @@ where
             analysis_config,
             retrieval_config,
             graph_options,
-            modeled: read.modeled,
-            tables: read.tables,
+            modeled: read.prompt.modeled,
+            tables: read.prompt.tables,
             mode: prompt.mode,
             rerank_model,
             reranker_call,
             images: images.filter(|_| read.has_images),
             turn: turn.clone(),
         }
-        .build_agent(completion_model, embedding_model, &read.system_prompt)?;
+        .build_agent(completion_model, embedding_model, &read.prompt.text)?;
         let max_turns = usize::try_from(analysis_config.max_turns)
             .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
 

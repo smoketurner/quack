@@ -4,7 +4,7 @@ use crate::analysis::search::DocumentScope;
 use crate::embedding::Vector;
 use crate::error::Result;
 use crate::graph::views as graph_views;
-use crate::graph::{GraphStatus, store as graph_store};
+use crate::graph::{GraphSize, store as graph_store};
 use crate::ingestion::parser::PageCounts;
 use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
@@ -165,7 +165,7 @@ pub enum Modeled {
 
 impl Modeled {
     #[must_use]
-    pub fn of(ontology: Option<&Ontology>, graph: &GraphStatus) -> Self {
+    pub fn of(ontology: Option<&Ontology>, graph: &GraphSize) -> Self {
         if graph.enabled() {
             Self::Graph
         } else if ontology.is_some() {
@@ -192,13 +192,22 @@ impl Modeled {
     }
 }
 
+/// The assembled prompt, and the workspace facts it was built from that
+/// decide which tools a turn registers.
+#[derive(Debug, Clone)]
+pub struct BuiltPrompt {
+    pub text: String,
+    pub modeled: Modeled,
+    pub tables: TableLayout,
+}
+
 impl SystemPrompt {
     /// The prompt for `db` under `options`.
     ///
     /// # Errors
     ///
     /// Returns an error if schema introspection fails.
-    pub fn build(db: &WorkspaceDb, options: &PromptOptions) -> Result<String> {
+    pub fn build(db: &WorkspaceDb, options: &PromptOptions) -> Result<BuiltPrompt> {
         let mut prompt = Self::default();
         prompt.text.push_str(
             "You are a data analysis assistant working inside one workspace that holds tables, \
@@ -226,11 +235,10 @@ impl SystemPrompt {
         writeln!(prompt.text)?;
 
         let ontology = ontology_store::current(db)?;
-        let graph = graph_store::status(db)?;
-        prompt.tool_guidance(
-            Modeled::of(ontology.as_ref(), &graph),
-            TableLayout::of(user_tables(db)?.len()),
-        );
+        let graph = graph_store::size(db)?;
+        let modeled = Modeled::of(ontology.as_ref(), &graph);
+        let layout = TableLayout::of(user_tables(db)?.len());
+        prompt.tool_guidance(modeled, layout);
 
         let version = db.duckdb_version()?;
         writeln!(
@@ -241,7 +249,6 @@ impl SystemPrompt {
         prompt.text.push_str(DIALECT_REFERENCE);
         prompt.text.push('\n');
 
-        let modeled = Modeled::of(ontology.as_ref(), &graph);
         let tables = prompt.tables(db, ontology.as_ref(), modeled)?;
         let documents = prompt.documents(db)?;
         if let Some(note) = options.scope.prompt_note() {
@@ -266,12 +273,12 @@ impl SystemPrompt {
                     } else {
                         ""
                     },
-                    if graph.stale {
+                    if graph.summary.stale {
                         " (stale: the ontology changed since it was built)"
                     } else {
                         ""
                     },
-                    match graph.drift.total() {
+                    match graph.summary.drift_total {
                         0 => String::new(),
                         drift => format!(
                             " (drift: the documents expressed {drift} classes or relations the \
@@ -299,7 +306,11 @@ impl SystemPrompt {
             .text
             .push_str(options.write_policy.prompt_paragraph());
 
-        Ok(prompt.text)
+        Ok(BuiltPrompt {
+            text: prompt.text,
+            modeled,
+            tables: layout,
+        })
     }
 
     /// The numbered procedures, one per substrate. The table, SQL, chart
