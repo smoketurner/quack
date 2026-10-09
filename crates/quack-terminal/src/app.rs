@@ -64,15 +64,15 @@ use crate::commands::{Completion, ContextAction, FileLine, GraphWalk, Input, Rou
 use crate::picker::{Picked, Picker};
 use crate::selection::{Edge, Located, Selection, TranscriptView};
 use crate::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
-use quack_cli::args::ModeArg;
-use quack_cli::confirm::Confirm;
+use quack_cli::Confirm;
+use quack_cli::ModeArg;
+use quack_cli::TextOrJson;
 use quack_cli::embeddings_cli::{self, EmbeddingsAction};
 use quack_cli::graph_cli::GraphAction;
-use quack_cli::import_cli::{ImportAction, ImportContext};
 use quack_cli::ontology_cli::{self, OntologyAction};
 use quack_cli::saved_cli::{self, SavedAction};
 use quack_cli::tables_cli::TablesArgs;
-use quack_cli::text_or_json::TextOrJson;
+use quack_cli::{ImportAction, ImportContext};
 
 /// The spinner's frame interval; it ticks only while a job is active.
 const SPINNER_MS: u64 = 80;

@@ -2,15 +2,23 @@
 //! saved questions, the graph, ontology, tables, and embeddings commands,
 //! and the arguments they take. Design doc section 11.
 
-pub mod args;
-pub mod confirm;
+mod args;
+mod confirm;
 pub mod embeddings_cli;
 pub mod graph_cli;
-pub mod import_cli;
+mod import_cli;
 pub mod ontology_cli;
-pub mod print;
+mod print;
 pub mod saved_cli;
-pub mod session;
-pub mod stdio;
+mod session;
+mod stdio;
 pub mod tables_cli;
-pub mod text_or_json;
+mod text_or_json;
+
+pub use args::{ExportFlags, ModeArg, QueryFormat};
+pub use confirm::Confirm;
+pub use import_cli::{ImportAction, ImportArgs, ImportContext};
+pub use print::{AnswerTo, FOLLOW_UP_GRACE, PrintTurn, TurnOutcome};
+pub use session::find_session;
+pub use stdio::{NamedInput, StdioPath};
+pub use text_or_json::TextOrJson;

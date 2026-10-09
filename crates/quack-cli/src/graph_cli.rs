@@ -396,7 +396,7 @@ impl AddWhat {
     /// # Errors
     ///
     /// Returns the database, model, or I/O error the command meets.
-    pub async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
+    pub(crate) async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
         match self {
             Self::Node {
                 label,
@@ -481,7 +481,7 @@ impl SetArgs {
     /// # Errors
     ///
     /// Returns the database, model, or I/O error the command meets.
-    pub async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
+    pub(crate) async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
         let Self {
             node,
             class,
@@ -520,7 +520,7 @@ impl DeleteWhat {
     /// # Errors
     ///
     /// Returns the database, model, or I/O error the command meets.
-    pub async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
+    pub(crate) async fn run(self, db: &Writer, out: &mut impl Write) -> Result<()> {
         match self {
             Self::Node { node, class } => {
                 db.render(out, move |db, out| {
@@ -553,7 +553,12 @@ impl SearchArgs {
     /// # Errors
     ///
     /// Returns the database, model, or I/O error the command meets.
-    pub async fn run(self, config: &Config, db: &Writer, out: &mut impl Write) -> Result<()> {
+    pub(crate) async fn run(
+        self,
+        config: &Config,
+        db: &Writer,
+        out: &mut impl Write,
+    ) -> Result<()> {
         let Self {
             entity,
             class,
@@ -594,7 +599,12 @@ impl PathArgs {
     /// # Errors
     ///
     /// Returns the database, model, or I/O error the command meets.
-    pub async fn run(self, config: &Config, db: &Writer, out: &mut impl Write) -> Result<()> {
+    pub(crate) async fn run(
+        self,
+        config: &Config,
+        db: &Writer,
+        out: &mut impl Write,
+    ) -> Result<()> {
         let Self {
             from,
             to,
@@ -663,7 +673,7 @@ impl ExtractArgs {
     /// # Errors
     ///
     /// Returns the database, model, or I/O error the command meets.
-    pub async fn run(
+    pub(crate) async fn run(
         &self,
         config: &Config,
         db: &Writer,
