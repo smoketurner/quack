@@ -406,6 +406,51 @@ async fn resolution_never_merges_keyed_rows_and_only_auto_merges_extracted_nodes
     assert_eq!(ugandas, 1);
 }
 
+/// Three extracted look-alikes fold into one in a single pass: a node a
+/// merge removed is passed over in the pairs still streaming from the
+/// pass's snapshot, never merged a second time.
+#[tokio::test]
+async fn a_node_merged_away_is_skipped_by_the_rest_of_the_pass() {
+    let db = workspace();
+    let writer = writer_of(&db);
+    let doc = |chunk: &str| {
+        graph_store::Source::chunk(&DocumentId::from("doc-1"), &ChunkId::from(chunk), 0.9)
+    };
+    let mut ids = Vec::new();
+    for (label, chunk) in [
+        ("Uganda North", "c1"),
+        ("Uganda South", "c2"),
+        ("Uganda Upper", "c3"),
+    ] {
+        let id = graph_store::upsert_node(
+            &db,
+            &NewNode {
+                label: label.to_owned(),
+                class_id: ClassId::from("country"),
+                properties: Properties::default(),
+                standing: Standing::Reviewed,
+            },
+        )
+        .unwrap();
+        graph_store::add_provenance(&db, &id, &doc(chunk)).unwrap();
+        ids.push(id);
+    }
+    let options = GraphConfig {
+        merge_threshold: 0.5,
+        auto_merge_threshold: 0.05,
+        ..GraphConfig::default()
+    };
+    let resolved = resolve::resolve(&writer, Some(&letters()), &options)
+        .await
+        .unwrap();
+    assert_eq!(resolved.auto_merged, 2, "{resolved:?}");
+    let left = ids
+        .iter()
+        .filter(|id| graph_store::node(&db, id).unwrap().is_some())
+        .count();
+    assert_eq!(left, 1);
+}
+
 /// A rejected merge is not proposed again when a later resolution pass
 /// flips its keep/drop orientation (provenance tilt): the dedup must
 /// recognize the pair in either orientation (`MergeStatus::Rejected`'s
