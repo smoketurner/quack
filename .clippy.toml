@@ -54,6 +54,7 @@ absolute-paths-allowed-crates = [
     "http",
     "http_body",
     "hyper_util",
+    "inquire",
     "jiff",
     "jsonwebtoken",
     "keyring_core",

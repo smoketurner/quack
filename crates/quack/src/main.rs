@@ -8,6 +8,7 @@ mod confirm;
 mod doctor_cli;
 mod embeddings_cli;
 mod graph_cli;
+mod init_cli;
 mod mcp;
 mod ontology_cli;
 mod print;
@@ -268,6 +269,11 @@ enum Commands {
     /// the data directory, the workspace, each model's provider (reached
     /// over the network), and the server's bind address
     Doctor(DoctorArgs),
+
+    /// Set up config.toml: find the model providers this machine can reach,
+    /// ask which models to use, and write the file once `quack doctor`
+    /// passes it
+    Init(init_cli::InitArgs),
 
     /// List ingested documents, or pin and unpin one
     Docs(DocsArgs),
@@ -1165,6 +1171,10 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         }
         Commands::Config(args) => run_config(&args).await,
         Commands::Doctor(args) => run_doctor(cli, &args).await,
+        Commands::Init(args) => {
+            init_logging();
+            args.run().await
+        }
         Commands::Docs(args) => {
             let ws_db = open_workspace(cli).await?;
             run_docs(&ws_db, &args)?;

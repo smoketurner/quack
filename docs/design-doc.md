@@ -2647,6 +2647,9 @@ quack auth register [--issuer URL] [--device-code | --token-env VAR | --open]
                     [--name NAME] [--replace] [--print] [--yes]
 quack auth unregister [--issuer URL] [--yes]
 quack config [--changed] [--format json]
+quack init [--yes] [--print] [--chat-model PROVIDER/MODEL] [--embedding-model PROVIDER/MODEL|none]
+           finds Ollama, API keys, and AWS credentials; writes a new config.toml only after
+           doctor passes it, never over an existing one; no terminal without --yes is exit 2
 quack doctor [-w NAME] [--offline] [--format json]
 quack serve [--bind ADDR] [--local]
 quack ready [--url URL]    GET /readyz on the server (the default URL from [server].bind), exit 0 or 1; the image's health check

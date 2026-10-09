@@ -72,6 +72,7 @@ hyper-util           = { version = "=0.1.21", default-features = false } # the p
 http-body            = { version = "=1.1.0", default-features = false } # a Bedrock response body that holds its request permit
 i18n-embed           = { version = "=0.16.0", default-features = false }
 i18n-embed-fl        = { version = "=0.10.1", default-features = false }
+inquire              = { version = "=0.9.4", default-features = false }
 forwarded-header-value = { version = "=0.1.1", default-features = false } # X-Forwarded-For entries, from [server].trusted_proxies only
 ipnet                = { version = "=2.12.2", default-features = false } # [server].trusted_proxies ranges
 jiff                 = { version = "=0.2.38", default-features = false } # date/time — preferred over chrono/time

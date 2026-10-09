@@ -96,8 +96,8 @@ Markdown, text as documents). Type /help for commands.";
 /// is unset: everything but the agent still works.
 const NO_CHAT_MODEL_TEXT: &str = "\
 No chat model is configured, so questions cannot be answered yet. SQL, file
-loading, and every /command work without one. Set [general].chat_model (or
-QUACK_MODEL) to PROVIDER/MODEL; `quack doctor` checks the setup and suggests one.";
+loading, and every /command work without one. Run `quack init` to set up a
+provider, or set [general].chat_model (or QUACK_MODEL) to PROVIDER/MODEL.";
 
 /// The key that gives each answer at a write prompt.
 pub(crate) const fn answer_key(decision: Decision) -> char {

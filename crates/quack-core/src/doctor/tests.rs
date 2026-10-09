@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::ProviderConfig;
 use crate::proxy::{Environment, Variable};
 use crate::storage::control::{AuditAction, AuditEntry, Channel, Outcome};
 
@@ -514,7 +515,7 @@ async fn a_fresh_install_has_no_failures_and_says_what_needs_a_model() {
             .fix
             .as_deref()
             .unwrap()
-            .contains("chat_model")
+            .contains("quack init")
     );
     assert_eq!(
         find(&report, Area::Embeddings).first().unwrap().status,

@@ -22,6 +22,27 @@ Design doc section 10 explains the mechanisms.
 | AWS SDK | The Amazon Web Services software development kit. quack uses it to find AWS credentials and sign Bedrock requests. |
 | SigV4 | The AWS request-signing scheme. |
 
+## Setting up with `quack init`
+
+`quack init` writes a first `config.toml` for Ollama, Anthropic, OpenAI, or Amazon Bedrock:
+
+- **Ollama:** it lists the models a running server has pulled (`OLLAMA_HOST`, else
+  `localhost:11434`) and what each can do. Only a model that calls tools is offered as the
+  chat model, and only one that embeds as the embedding model. It measures the embedding
+  model's width with one request.
+- **Anthropic and OpenAI:** found when `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set. Their
+  models are listed only when you choose the provider at the prompt, since that sends the
+  key. `--yes` never lists them; name the model with `--chat-model`.
+- **Amazon Bedrock:** found from `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, or `~/.aws/config`.
+  Bedrock lists no models, so it asks for the model id.
+- **Embeddings on a hosted provider:** `openai/text-embedding-3-small` (1,536 dimensions) or
+  `bedrock/amazon.titan-embed-text-v2:0` (1,024), the widths each provider documents.
+
+It runs `quack doctor` on the new file before writing it, and writes nothing when a check
+fails. It never changes an existing file; `quack init --print` prints a fresh one to compare.
+For a gateway, OAuth, `bedrock-mantle`, or any other setting, edit the file as the rest of
+this guide shows.
+
 ## Choosing a provider type
 
 Each provider entry names one of five types. A model reference is `PROVIDER/MODEL`, such as

@@ -979,21 +979,34 @@ pub(crate) struct OllamaRunningModel {
     pub(crate) name: String,
     #[serde(default)]
     model: String,
+    /// Bytes on disk (`/api/tags`) or in memory (`/api/ps`).
+    #[serde(default)]
+    size: u64,
+}
+
+type OllamaCallError = Box<dyn std::error::Error + Send + Sync>;
+
+impl OllamaEndpoint {
+    /// `method` on `path` with a JSON `body`, the reply parsed as `T`.
+    async fn call<T: DeserializeOwned>(
+        &self,
+        method: http::Method,
+        path: &str,
+        body: Vec<u8>,
+    ) -> std::result::Result<T, OllamaCallError> {
+        use rig::http_client::HttpClientExt;
+
+        let request = self.request(method, path).body(body)?;
+        let response = self.http.send::<_, Vec<u8>>(request).await?;
+        let bytes: Vec<u8> = response.into_body().await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
 }
 
 impl OllamaRunningModels {
     /// The models Ollama has in memory (`GET /api/ps`).
-    async fn loaded(
-        endpoint: &OllamaEndpoint,
-    ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        use rig::http_client::HttpClientExt;
-
-        let request = endpoint
-            .request(http::Method::GET, "api/ps")
-            .body(Vec::new())?;
-        let response = endpoint.http.send::<_, Vec<u8>>(request).await?;
-        let bytes: Vec<u8> = response.into_body().await?;
-        Ok(serde_json::from_slice(&bytes)?)
+    async fn loaded(endpoint: &OllamaEndpoint) -> std::result::Result<Self, OllamaCallError> {
+        endpoint.call(http::Method::GET, "api/ps", Vec::new()).await
     }
 
     /// Whether `model` is among the loaded ones; a bare name matches its
@@ -1007,6 +1020,76 @@ impl OllamaRunningModels {
         self.models
             .iter()
             .any(|m| m.name == wanted || m.model == wanted || m.name == model || m.model == model)
+    }
+}
+
+/// One thing `POST /api/show` says a model can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OllamaCapability {
+    Completion,
+    Tools,
+    Vision,
+    Embedding,
+    Thinking,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(serde::Deserialize)]
+struct OllamaShow {
+    #[serde(default)]
+    capabilities: Vec<OllamaCapability>,
+}
+
+/// A model an Ollama server has pulled, with what it can do. An Ollama too
+/// old to report capabilities reports none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OllamaModel {
+    pub name: String,
+    /// Bytes on disk.
+    pub size: u64,
+    pub capabilities: Vec<OllamaCapability>,
+}
+
+impl OllamaModel {
+    /// The models the Ollama provider `name` has pulled (`GET /api/tags`),
+    /// each with its capabilities (`POST /api/show`), in the server's order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is not a configured provider or the
+    /// server does not answer.
+    pub async fn list(config: &Config, name: &ProviderName) -> Result<Vec<Self>> {
+        let provider = config
+            .providers
+            .get(name)
+            .ok_or_else(|| Error::Config(format!("no provider named '{name}' is configured")))?;
+        let endpoint = OllamaEndpoint::build(config, name, provider).await?;
+        let failed = |e: OllamaCallError| Error::Llm(format!("ollama at '{name}': {e}"));
+        let pulled: OllamaRunningModels = endpoint
+            .call(http::Method::GET, "api/tags", Vec::new())
+            .await
+            .map_err(failed)?;
+        let mut models = Vec::with_capacity(pulled.models.len());
+        for pulled in pulled.models {
+            let body = serde_json::to_vec(&serde_json::json!({ "model": pulled.name }))?;
+            let shown: OllamaShow = endpoint
+                .call(http::Method::POST, "api/show", body)
+                .await
+                .map_err(failed)?;
+            models.push(Self {
+                name: pulled.name,
+                size: pulled.size,
+                capabilities: shown.capabilities,
+            });
+        }
+        Ok(models)
+    }
+
+    #[must_use]
+    pub fn can(&self, capability: OllamaCapability) -> bool {
+        self.capabilities.contains(&capability)
     }
 }
 

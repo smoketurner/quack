@@ -26,6 +26,7 @@ crossterm          = { workspace = true, features = ["events", "event-stream", "
 csv                = { workspace = true }
 dirs               = { workspace = true }
 futures            = { workspace = true, features = ["std"] }
+inquire            = { workspace = true, features = ["crossterm"] }
 jiff               = { workspace = true, features = ["serde", "std"] }
 mimalloc           = { workspace = true, features = ["secure"] }
 mime_guess         = { workspace = true }

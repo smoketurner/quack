@@ -44,6 +44,7 @@ pub mod priority;
 pub mod progress;
 pub mod proxy;
 pub mod saved;
+pub mod setup;
 pub mod storage;
 pub mod telemetry;
 pub mod text;
