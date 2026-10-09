@@ -3736,8 +3736,8 @@ impl WorkspaceDb {
     /// The live document a person or the model named: by id, exact file
     /// name, exact title (the name the prompt's inventory shows), or id
     /// prefix, tried in that order. Each way is one query that reads at
-    /// most [`NamedDocuments::LISTED`] rows, so the lookup costs the same in
-    /// a workspace of any size.
+    /// most 20 rows, so the lookup costs the same in a workspace of any
+    /// size.
     ///
     /// # Errors
     ///
