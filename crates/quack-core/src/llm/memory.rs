@@ -146,7 +146,7 @@ impl History {
     }
 
     /// After a turn is recorded, bring `session`'s summary up to date on its
-    /// own task ([`AfterTurn::spawn`]) when `compact_history` is on, so the
+    /// own task (`AfterTurn::spawn`) when `compact_history` is on, so the
     /// next turn's [`Self::load`] finds it. A failure is logged; the next
     /// turn replays the window with the summary it has.
     pub fn follow_turn(config: &Config, db: &Arc<Writer>, session: &SessionId) {

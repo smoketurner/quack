@@ -104,7 +104,7 @@ impl SessionTitler {
             .await
     }
 
-    /// Title `session` on its own task ([`AfterTurn::spawn`]); a failure is
+    /// Title `session` on its own task (`AfterTurn::spawn`); a failure is
     /// logged, and the session keeps its derived title.
     pub fn spawn(self, db: Arc<Writer>, session: SessionId) {
         AfterTurn::spawn(async move {
