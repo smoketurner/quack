@@ -43,9 +43,9 @@ use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::tree::{FileResult, Folder, Outcome, Prune};
 use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile};
 use quack_core::llm::Embeddings;
+use quack_core::llm::after_turn::AfterTurn;
 use quack_core::llm::egress::Egress;
 use quack_core::llm::oauth::{KeySource, LoginFlow, LoginPrompt, TokenManager, TokenStatus};
-use quack_core::llm::titles::SessionTitler;
 use quack_core::okf::{self, Bundle, DirSink, TarSink};
 use quack_core::ontology::store::Revision;
 use quack_core::prefix::PrefixMatch;
@@ -1292,8 +1292,8 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         let id = session_id.clone();
         drop(db.run(move |db| sessions::delete_if_empty(db, &id)).await);
     }
-    // The answer is out; a title the turn started finishes before exit.
-    SessionTitler::finish_pending(TITLE_GRACE).await;
+    // The answer is out; a title or summary the turn started finishes before exit.
+    AfterTurn::finish(FOLLOW_UP_GRACE).await;
     Ok(match outcome? {
         TurnOutcome::WriteRefused => ExitCode::from(Exit::WriteRefused),
         TurnOutcome::Answered => ExitCode::SUCCESS,
@@ -1345,8 +1345,8 @@ async fn load_piped_stdin(
 const STDIN_GRACE: Duration = Duration::from_secs(1);
 
 /// How long a command that answers one question waits, after printing, for
-/// the session title its first turn started.
-pub(crate) const TITLE_GRACE: Duration = Duration::from_secs(30);
+/// the session title and history summary its turn started.
+pub(crate) const FOLLOW_UP_GRACE: Duration = Duration::from_secs(30);
 
 /// Whether stdin is worth reading: a pipe or socket is when it becomes
 /// readable (data or end of file) within [`STDIN_GRACE`]; anything else

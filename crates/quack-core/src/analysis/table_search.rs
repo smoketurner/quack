@@ -118,16 +118,35 @@ pub struct RankedTable {
     pub score: f64,
 }
 
+/// What a refresh of the card vectors found.
+#[derive(Debug, Clone)]
+pub enum CardRefresh {
+    /// The prompt describes every table, so nothing is ranked.
+    AllDescribed,
+    /// The cards it read, and how many vectors it made.
+    Ranked { cards: TableCards, made: usize },
+}
+
+impl CardRefresh {
+    /// How many card vectors the refresh made.
+    #[must_use]
+    pub fn made(&self) -> usize {
+        match self {
+            Self::AllDescribed => 0,
+            Self::Ranked { made, .. } => *made,
+        }
+    }
+}
+
 impl TableCards {
-    /// The cards of every user table, built from the catalog, the notes,
-    /// the stored profiles, and `ontology`: a handful of queries whatever
-    /// the number of tables.
+    /// The cards of `tables` (the [`user_tables`]), built from the catalog,
+    /// the notes, the stored profiles, and `ontology`: a handful of queries
+    /// whatever the number of tables.
     ///
     /// # Errors
     ///
     /// Returns an error if a read fails.
-    pub fn read(db: &WorkspaceDb, ontology: Option<&Ontology>) -> Result<Self> {
-        let tables = user_tables(db)?;
+    pub fn read(db: &WorkspaceDb, tables: &[String], ontology: Option<&Ontology>) -> Result<Self> {
         let notes = TableNote::all(db)?;
         let profiles = TableProfile::all(db)?;
         let mut columns: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
@@ -147,7 +166,7 @@ impl TableCards {
         let mut cards = Vec::with_capacity(tables.len());
         for table in tables {
             let mut text = format!("table {}", table.replace('_', " "));
-            let mapping = ontology.and_then(|o| o.mapping_for_table(&table));
+            let mapping = ontology.and_then(|o| o.mapping_for_table(table));
             if let (Some(ontology), Some(mapping)) = (ontology, mapping) {
                 write!(text, "\nclass {}", mapping.class)?;
                 if let Some(description) = ontology
@@ -157,13 +176,13 @@ impl TableCards {
                     write!(text, ": {}", OneLine(description))?;
                 }
             }
-            if let Some(note) = notes.get(&table) {
+            if let Some(note) = notes.get(table) {
                 let cut: String = note.note.chars().take(CARD_NOTE_CHARS).collect();
                 write!(text, "\nnote: {}", OneLine(&cut))?;
             }
-            let profile = profiles.get(&table);
+            let profile = profiles.get(table);
             for (index, (name, kind)) in columns
-                .get(&table)
+                .get(table)
                 .map(Vec::as_slice)
                 .unwrap_or_default()
                 .iter()
@@ -191,7 +210,10 @@ impl TableCards {
                     write!(text, ": {}", OneLine(&samples.samples.join(", ")))?;
                 }
             }
-            cards.push(TableCard { table, text });
+            cards.push(TableCard {
+                table: table.clone(),
+                text,
+            });
         }
         Ok(Self(cards))
     }
@@ -297,13 +319,35 @@ impl TableCards {
         scored.into_iter().map(|(t, _)| t.to_owned()).collect()
     }
 
-    /// Every table with a current vector, by cosine to `query`.
+    /// Every table with a current vector, by cosine to `query`, computed
+    /// in SQL so the vectors never leave `DuckDB`.
     fn vector_ranking(&self, db: &WorkspaceDb, query: &Vector) -> Result<Vec<String>> {
-        let stored = StoredVectors::read(db)?;
+        let Some(fingerprint) = db.embedding_fingerprint() else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = db.connection().prepare(
+            "SELECT table_name, digest, list_cosine_similarity(embedding, ?::FLOAT[]) \
+             FROM _quack_table_cards \
+             WHERE embedding IS NOT NULL AND embedding_profile = ? AND len(embedding) = ?",
+        )?;
+        let mut rows = stmt.query(duckdb::params![
+            query.sql_literal(),
+            fingerprint.as_str(),
+            i64::try_from(query.len()).unwrap_or(i64::MAX)
+        ])?;
+        let mut stored: HashMap<String, (String, f64)> = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let cosine: Option<f64> = row.get(2)?;
+            // A vector with no length has no angle; Vector::cosine calls it 0.
+            let cosine = cosine.filter(|c| c.is_finite()).unwrap_or(0.0);
+            stored.insert(row.get(0)?, (row.get(1)?, cosine));
+        }
         let mut scored: Vec<(&str, f64)> = Vec::new();
         for card in &self.0 {
-            if let Some(vector) = stored.current(db, card) {
-                scored.push((card.table.as_str(), query.cosine(vector)));
+            if let Some((digest, cosine)) = stored.get(&card.table)
+                && *digest == card.digest()
+            {
+                scored.push((card.table.as_str(), *cosine));
             }
         }
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
@@ -322,26 +366,31 @@ impl TableCards {
         reader: &ReaderDb,
         writer: &Writer,
         embedder: &Embedder<M>,
-    ) -> Result<usize> {
-        let stale = reader
+    ) -> Result<CardRefresh> {
+        let read = reader
             .with_db(|db| {
                 let tables = user_tables(db)?;
                 if TableLayout::of(tables.len()) == TableLayout::AllDescribed {
-                    return Ok(Vec::new());
+                    return Ok(None);
                 }
                 let ontology = ontology_store::current(db)?;
-                let cards = Self::read(db, ontology.as_ref())?;
-                let stored = StoredVectors::read(db)?;
-                Ok(cards
+                let cards = Self::read(db, &tables, ontology.as_ref())?;
+                let digests = StoredDigests::read(db)?;
+                let stale: Vec<TableCard> = cards
                     .0
-                    .into_iter()
-                    .filter(|card| stored.current(db, card).is_none())
+                    .iter()
+                    .filter(|card| !digests.is_current(card))
                     .take(EMBEDDED_PER_TURN)
-                    .collect::<Vec<_>>())
+                    .cloned()
+                    .collect();
+                Ok(Some((cards, stale)))
             })
             .await?;
+        let Some((cards, stale)) = read else {
+            return Ok(CardRefresh::AllDescribed);
+        };
         if stale.is_empty() {
-            return Ok(0);
+            return Ok(CardRefresh::Ranked { cards, made: 0 });
         }
         let inputs: Vec<Input> = stale.iter().map(TableCard::input).collect();
         let vectors = embedder.embed(&inputs).await?;
@@ -380,41 +429,34 @@ impl TableCards {
                 })
             })
             .await?;
-        Ok(made)
+        Ok(CardRefresh::Ranked { cards, made })
     }
 }
 
-/// The stored card vectors, by table: digest, profile, vector.
-struct StoredVectors(HashMap<String, (String, Option<String>, Vector)>);
+/// The digests of the cards whose stored vector was made under the
+/// workspace's current embedding profile, by table.
+struct StoredDigests(HashMap<String, String>);
 
-impl StoredVectors {
+impl StoredDigests {
     fn read(db: &WorkspaceDb) -> Result<Self> {
+        let Some(fingerprint) = db.embedding_fingerprint() else {
+            return Ok(Self(HashMap::new()));
+        };
         let mut stmt = db.connection().prepare(
-            "SELECT table_name, digest, embedding_profile, CAST(to_json(embedding) AS VARCHAR) \
-             FROM _quack_table_cards WHERE embedding IS NOT NULL",
+            "SELECT table_name, digest FROM _quack_table_cards \
+             WHERE embedding IS NOT NULL AND embedding_profile = ?",
         )?;
-        let mut rows = stmt.query([])?;
-        let mut out = HashMap::new();
-        while let Some(row) = rows.next()? {
-            let json: String = row.get(3)?;
-            let Ok(values) = serde_json::from_str::<Vec<f32>>(&json) else {
-                continue;
-            };
-            out.insert(
-                row.get(0)?,
-                (row.get(1)?, row.get(2)?, Vector::from(values)),
-            );
-        }
-        Ok(Self(out))
+        let digests = stmt
+            .query_map(duckdb::params![fingerprint.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<duckdb::Result<HashMap<String, String>>>()?;
+        Ok(Self(digests))
     }
 
-    /// The card's vector, when it was made from this text under the
-    /// workspace's current embedding profile.
-    fn current(&self, db: &WorkspaceDb, card: &TableCard) -> Option<&Vector> {
-        let fingerprint = db.embedding_fingerprint()?;
-        let (digest, profile, vector) = self.0.get(&card.table)?;
-        (*digest == card.digest() && profile.as_deref() == Some(fingerprint.as_str()))
-            .then_some(vector)
+    /// Whether the card's vector was made from this text.
+    fn is_current(&self, card: &TableCard) -> bool {
+        self.0.get(&card.table) == Some(&card.digest())
     }
 }
 

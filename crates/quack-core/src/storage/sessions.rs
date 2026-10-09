@@ -507,9 +507,35 @@ pub fn append_message(
     content: &str,
     metadata: Option<&MessageMeta>,
 ) -> Result<i64> {
-    if get_session(db, session_id)?.is_none() {
-        return Err(ResourceKind::Session.missing(session_id.as_str()));
-    }
+    session_title(db, session_id)?;
+    insert_message(db, session_id, role, content, metadata)
+}
+
+/// The session's title, `None` while it has none; `NotFound` when the
+/// session does not exist. One column, not the whole [`SessionRow`].
+fn session_title(db: &WorkspaceDb, session_id: &SessionId) -> Result<Option<String>> {
+    db.connection()
+        .query_row(
+            "SELECT title FROM _quack_sessions WHERE id = ?",
+            duckdb::params![session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => {
+                ResourceKind::Session.missing(session_id.as_str())
+            }
+            other => other.into(),
+        })
+}
+
+/// [`append_message`] for a session already known to exist.
+fn insert_message(
+    db: &WorkspaceDb,
+    session_id: &SessionId,
+    role: MessageRole,
+    content: &str,
+    metadata: Option<&MessageMeta>,
+) -> Result<i64> {
     let conn = db.connection();
     let seq: i64 = conn.query_row(
         "SELECT COALESCE(MAX(seq), 0) + 1 FROM _quack_messages WHERE session_id = ?",
@@ -571,12 +597,11 @@ pub fn record_turn(
     asked_at: Timestamp,
     response: &AgentResponse,
 ) -> Result<()> {
-    let session = get_session(db, session_id)?
-        .ok_or_else(|| ResourceKind::Session.missing(session_id.as_str()))?;
+    let title = session_title(db, session_id)?;
 
     // The turn is recorded once it ends; the question keeps the time it was asked.
     let asked = UserMeta::of(response).map(MessageMeta::User);
-    let seq = append_message(
+    let seq = insert_message(
         db,
         session_id,
         MessageRole::User,
@@ -594,7 +619,7 @@ pub fn record_turn(
     )?;
 
     for step in &response.steps {
-        append_message(
+        insert_message(
             db,
             session_id,
             MessageRole::Tool,
@@ -604,7 +629,7 @@ pub fn record_turn(
     }
 
     let metadata = AssistantMeta::of(response).map(MessageMeta::Assistant);
-    append_message(
+    insert_message(
         db,
         session_id,
         MessageRole::Assistant,
@@ -612,7 +637,7 @@ pub fn record_turn(
         metadata.as_ref(),
     )?;
 
-    if session.title.is_none() {
+    if title.is_none() {
         db.connection().execute(
             "UPDATE _quack_sessions SET title = ?, title_by = ? WHERE id = ?",
             duckdb::params![
@@ -808,21 +833,27 @@ pub fn search_messages(
 ///
 /// Returns an error if the messages cannot be read.
 pub fn session_turns(db: &WorkspaceDb, session_id: &SessionId) -> Result<Vec<Message>> {
-    let stored = messages(db, session_id)?;
+    let mut stmt = db.connection().prepare(
+        "SELECT role, content FROM _quack_messages \
+         WHERE session_id = ? AND role IN ('user', 'assistant') ORDER BY seq",
+    )?;
+    let mut rows = stmt.query(duckdb::params![session_id])?;
     let mut turns = Vec::new();
-    let mut question = None;
-    for row in &stored {
-        match row.role {
-            MessageRole::User => question = Some(row),
+    let mut question: Option<String> = None;
+    while let Some(row) = rows.next()? {
+        let role: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        match role.parse()? {
+            MessageRole::User => question = Some(content),
             MessageRole::Assistant => {
                 let Some(asked) = question.take() else {
                     continue;
                 };
-                if asked.content.trim().is_empty() || row.content.trim().is_empty() {
+                if asked.trim().is_empty() || content.trim().is_empty() {
                     continue;
                 }
-                turns.push(Message::user(asked.content.clone()));
-                turns.push(Message::assistant(row.content.clone()));
+                turns.push(Message::user(asked));
+                turns.push(Message::assistant(content));
             }
             MessageRole::Tool => {}
         }

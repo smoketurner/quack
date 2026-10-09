@@ -9,8 +9,8 @@ use duckdb::types::ToSqlOutput;
 
 use super::resolve::MergeStatus;
 use super::{
-    Drift, Edge, GraphStatus, GraphStatusSummary, Node, NormalizedLabel, Origin, Properties,
-    Provenance, ProvenanceColumns, Standing, tables,
+    Drift, Edge, GraphSize, GraphStatus, GraphStatusSummary, Node, NormalizedLabel, Origin,
+    Properties, Provenance, ProvenanceColumns, Standing, tables,
 };
 use crate::embedding::Vector;
 use crate::error::{Error, Result};
@@ -563,10 +563,12 @@ pub fn record_drift(db: &WorkspaceDb, run: &Drift) -> Result<()> {
 ///
 /// Returns an error if a read fails.
 pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
-    let conn = db.connection();
-    let (nodes, summary) = summary_and_size(db)?;
-    let edges: i64 = conn.query_row("SELECT count(*) FROM _quack_graph_edges", [], |r| r.get(0))?;
-    let pending_merges: i64 = conn.query_row(
+    let GraphSize {
+        nodes,
+        edges,
+        summary,
+    } = size(db)?;
+    let pending_merges: i64 = db.connection().query_row(
         "SELECT count(*) FROM _quack_graph_merges WHERE status = ?",
         [MergeStatus::Pending],
         |r| r.get(0),
@@ -586,7 +588,7 @@ pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
     };
     Ok(GraphStatus {
         nodes,
-        edges: u64::try_from(edges).unwrap_or(0),
+        edges,
         provisional_nodes: summary.provisional_nodes,
         built_with_version: summary.built_with_version,
         ontology_version: summary.ontology_version,
@@ -596,6 +598,24 @@ pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
         missing_tables,
         pending_chunks: db.pool_size(SamplePool::NotGraphExtracted)?,
         pending_tables,
+    })
+}
+
+/// Node and edge counts with the [`summary`]: the status a turn reads,
+/// without [`status`]'s mapped-table hashes and unextracted-chunk count.
+///
+/// # Errors
+///
+/// Returns an error if a read fails.
+pub fn size(db: &WorkspaceDb) -> Result<GraphSize> {
+    let (nodes, summary) = summary_and_size(db)?;
+    let edges: i64 =
+        db.connection()
+            .query_row("SELECT count(*) FROM _quack_graph_edges", [], |r| r.get(0))?;
+    Ok(GraphSize {
+        nodes,
+        edges: u64::try_from(edges).unwrap_or(0),
+        summary,
     })
 }
 

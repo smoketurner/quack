@@ -18,11 +18,11 @@ use quack_core::storage::sessions;
 use quack_core::storage::workspace::QueryResults;
 use quack_core::storage::writer::Writer;
 
+use crate::FOLLOW_UP_GRACE;
 use crate::QueryFormat;
-use crate::TITLE_GRACE;
 use crate::print::{AnswerTo, PrintTurn};
 use crate::text_or_json::TextOrJson;
-use quack_core::llm::titles::SessionTitler;
+use quack_core::llm::after_turn::AfterTurn;
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum SavedAction {
@@ -221,7 +221,7 @@ async fn refresh_pin(
     }
     .run()
     .await;
-    SessionTitler::finish_pending(TITLE_GRACE).await;
+    AfterTurn::finish(FOLLOW_UP_GRACE).await;
     if outcome.is_err() {
         let id = session_id.clone();
         drop(

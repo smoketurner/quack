@@ -702,6 +702,16 @@ fn describe_table_reports_the_exact_row_count() {
     assert_eq!(desc.row_count, 3);
     assert_eq!(desc.sample_rows.rows.len(), 3);
     assert!(db.count_rows("missing").is_err());
+    db.execute_statement(r#"CREATE TABLE "odd ""name" AS SELECT 1 AS x"#)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let tables = [String::from("t"), String::from("odd \"name")];
+    let counts = db
+        .count_rows_of(&tables)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(counts.get("t"), Some(&3));
+    assert_eq!(counts.get("odd \"name"), Some(&1));
+    assert!(db.count_rows_of(&[]).is_ok_and(|c| c.is_empty()));
+    assert!(db.count_rows_of(&[String::from("missing")]).is_err());
     let version = db.duckdb_version().unwrap_or_else(|e| fail(&e.to_string()));
     assert!(version.starts_with('v'), "{version}");
 }

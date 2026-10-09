@@ -435,14 +435,26 @@ fn latest_summary_returns_the_newest_summary_not_the_most_covering() {
 #[test]
 fn append_to_missing_session_is_an_error() {
     let db = db();
-    let err = append_message(&db, &SessionId::from("nope"), MessageRole::User, "x", None).err();
-    assert!(err.is_some_and(|e| matches!(
-        e,
-        Error::NotFound {
-            kind: ResourceKind::Session,
-            ..
-        }
-    )));
+    let missing = |err: Option<Error>| {
+        err.is_some_and(|e| {
+            matches!(
+                e,
+                Error::NotFound {
+                    kind: ResourceKind::Session,
+                    ..
+                }
+            )
+        })
+    };
+    let nope = SessionId::from("nope");
+    assert!(missing(
+        append_message(&db, &nope, MessageRole::User, "x", None).err()
+    ));
+    let answer = AgentResponse::default();
+    assert!(missing(
+        record_turn(&db, &nope, "x", Timestamp::now(), &answer).err()
+    ));
+    assert!(messages(&db, &nope).is_ok_and(|m| m.is_empty()));
 }
 
 #[test]

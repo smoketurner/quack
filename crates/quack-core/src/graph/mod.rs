@@ -535,6 +535,28 @@ impl Drift {
     }
 }
 
+/// The graph's size and its summary: what a turn's prompt and tools
+/// need, without [`GraphStatus`]'s per-table and per-chunk checks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphSize {
+    pub nodes: u64,
+    pub edges: u64,
+    pub summary: GraphStatusSummary,
+}
+
+impl GraphSize {
+    /// Whether the graph exists at all; tools register only then.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.nodes > 0
+    }
+
+    #[must_use]
+    pub fn provisional(&self) -> bool {
+        self.summary.provisional_nodes > 0
+    }
+}
+
 /// What the interfaces show about the graph: size, whether it is
 /// provisional (built from an auto-accepted ontology) or stale (the
 /// ontology moved on), and the drift the corpus expressed.

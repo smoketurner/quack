@@ -148,9 +148,10 @@ file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the mod
 rig's conversation memory (`llm::memory::History`: `SessionMemory` under `TranscriptWindow`,
 rig's token window over `[analysis].history_token_budget`), and with
 `[analysis].compact_history` the turns it leaves out become a chat-model summary kept in
-`_quack_session_summaries`. Retrieval is hybrid (exact cosine scan plus quack's own
+`_quack_session_summaries`, written after the turn by `llm::after_turn::AfterTurn` (with the
+session title), so loading the history calls no model. Retrieval is hybrid (exact cosine scan plus quack's own
 BM25 over `_quack_terms`, each document's chunks stemmed under the language
-`WorkspaceDb::chunk_writer` detects once for it, reciprocal rank fusion in `WorkspaceDb::explain_search`;
+`WorkspaceDb::chunk_writer` detects once for it, reciprocal rank fusion in `WorkspaceDb::explain_search`, whose vector leg runs on a reader clone beside the keyword leg;
 no DuckDB extension is ever loaded, see design doc section 14), then an optional reranker
 (`analysis::rerank`, `[retrieval].rerank = "none" | "model" | "reranker"`; `model` over-fetches
 `rerank_candidates` and has the chat model order them, `reranker` has the dedicated rerank
@@ -192,7 +193,7 @@ beside the HTTP drain under `[server].shutdown_grace_seconds` (20), after cancel
 `query` turn, which runs under a child of it), and then
 `AppState::close` drops the workspace handles so each writer checkpoints. There is no job pool:
 resources are limited where they are used. Every rig HTTP client sends through
-`llm::LimitedHttp` (rig's reqwest transport, plus the provider's `headers`), which holds
+`llm::LimitedHttp` (rig's reqwest transport over one process-wide connection pool, plus the provider's `headers`), which holds
 one permit of the process-wide gate for the provider and the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
 for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
 requests (`TurnRequest::run`, `Embedder::embed_interactive`, via the `quack_core::priority` task-local) before
@@ -383,6 +384,8 @@ was auto-accepted), `stale` (`graph_built_with_ontology_version` lags), pending 
 drift, `pending_chunks` (chunks no extraction read), and `pending_tables` (mapped tables
 whose fingerprint in `_quack_graph_tables_built`, written by each mapping's last batch,
 no longer matches: owning document, keyed row count, hash over the mapped columns);
+a turn reads only `store::size` (node and edge counts and `store::summary`), once, in
+`SystemPrompt::build`, whose `BuiltPrompt` also carries the `Modeled` level and `TableLayout`;
 `[graph].follow_ingest` (`off`, `tables`, `all`) has `graph::follow_up::after_documents`
 extract a document into the graph as it becomes ready (the server queues it as an audited
 graph run after an upload or import; the CLI and terminal run it after their ingest). A
@@ -432,8 +435,8 @@ The ontology's `Property` carries `description`, `unit`, `synonyms`, and `Ontolo
 returns all of it on `TableDescription` (`TableDescription::body`, a `TableDescriptionBody`, is the one REST, MCP, and CLI shape). Past
 `table_search::DETAILED_TABLES` (25) user tables, `find_tables` registers and the prompt ranks
 tables against the question after the workspace context (`analysis::table_search`: a card per
-table, BM25 with `tokenize`, plus cosine over card vectors in `_quack_table_cards` refreshed at
-turn start, fused by RRF). The graph is readable in SQL through `graph::views` (issue #406):
+table, BM25 with `tokenize`, plus cosine over card vectors in `_quack_table_cards`, scored in SQL and
+refreshed at turn start, which hands its cards to the ranking, fused by RRF). The graph is readable in SQL through `graph::views` (issue #406):
 `graph_<class>` with one typed column per property and `graph_edges`, made by `views::ensure` at
 every ontology save and open, marked by a comment; `table_search::user_tables` is
 `list_tables` without them. A write naming `graph_` is refused (`views::write_names_reserved`),

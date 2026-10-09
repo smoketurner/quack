@@ -22,7 +22,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -380,13 +380,18 @@ impl Authorize {
 }
 
 impl LimitedHttp {
-    /// The client for provider `name`, sharing its process-wide gates.
+    /// The client for provider `name`, sharing its process-wide gates and
+    /// the process's connection pool, so a turn reuses the connections
+    /// the last one opened.
     #[must_use]
     pub fn for_provider(name: &ProviderName, provider: &ProviderConfig) -> Self {
-        Self {
+        static POOL: LazyLock<ReqwestClient> = LazyLock::new(|| {
             // A client that cannot be built is a TLS setup failure, which
             // reqwest's default client meets the same way.
-            inner: ReqwestClient::from(Proxies::from_env().client().build().unwrap_or_default()),
+            ReqwestClient::from(Proxies::from_env().client().build().unwrap_or_default())
+        });
+        Self {
+            inner: POOL.clone(),
             gates: ProviderGates::for_provider(name, provider),
             headers: http::HeaderMap::new(),
             authorize: None,

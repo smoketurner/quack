@@ -1835,12 +1835,14 @@ message.
   reads the session's turns (quack records each turn itself, so its `append` stores
   nothing), and `TranscriptWindow` is rig's `TokenWindowMemory` at four characters per token
   that also drops an answer whose question fell outside. With
-  `[analysis].compact_history = true` (off by default), rig's `CompactingMemory` hands the
-  turns the window leaves out to `SessionCompactor`, which has the chat model summarize
-  them (at most a quarter of the budget) and keeps the summary in
-  `_quack_session_summaries` with how many messages it covers; the next turn reuses it and
-  summarizes only what left the window since. The summary leads the history as a system
-  message. Deleting a session deletes its summaries.
+  `[analysis].compact_history = true` (off by default), after each recorded turn a
+  background task (`llm::after_turn::AfterTurn`, as the session title runs) has rig's
+  `CompactingMemory` hand the turns the window leaves out to `SessionCompactor`, which has
+  the chat model summarize them (at most a quarter of the budget) and keeps the summary in
+  `_quack_session_summaries` with how many messages it covers; the next follow-up
+  summarizes only what left the window since. A turn's load calls no model: the stored
+  summary leads the history as a system message, unless it covers more than the window
+  now leaves out (the budget grew). Deleting a session deletes its summaries.
 - Server mode: sessions carry `created_by`. Members see their own, any marked `shared`, and
   any with no creator (started from the CLI or the TUI). `owner` sees all sessions in the
   workspace for audit.

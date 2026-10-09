@@ -1840,7 +1840,7 @@ pub struct AnalysisConfig {
     /// Replace the turns that fall outside `history_token_budget` with a
     /// summary the chat model writes, kept in the workspace, instead of
     /// dropping them. Off by default: each new summary is one more model
-    /// call before a turn.
+    /// call, made after a turn at background priority.
     pub compact_history: bool,
     /// Have the chat model title each session after its first turn, at
     /// background effort; a title a person gives is never replaced.

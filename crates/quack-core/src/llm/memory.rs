@@ -1,20 +1,22 @@
-//! The history a turn replays, loaded through rig's conversation memory:
-//! the session's turns ([`SessionMemory`]) under the token window
-//! ([`TranscriptWindow`]), and with `[analysis].compact_history` the turns
-//! the window leaves out folded into a summary ([`SessionCompactor`])
-//! that leads the history.
+//! The history a turn replays: the session's turns ([`SessionMemory`])
+//! under the token window ([`TranscriptWindow`]), and with
+//! `[analysis].compact_history` the stored summary of the turns the window
+//! leaves out leading it. The summary is written after a turn, through
+//! rig's compacting memory ([`SessionCompactor`]), so a turn never waits
+//! for a model call before its own.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use rig::id::ConversationId;
-use rig::memory::{CompactingMemory, Compactor, ConversationMemory, MemoryError, PolicyMemory};
+use rig::memory::{CompactingMemory, Compactor, ConversationMemory, MemoryError, MemoryPolicy};
 use rig::message::Message;
 use rig::wasm_compat::WasmBoxedFuture;
 
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 
+use super::after_turn::AfterTurn;
 use super::{ChatClient, SchemaCall, Task};
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -85,28 +87,82 @@ impl History {
         })
     }
 
-    /// The messages to replay for `session`, oldest first: a summary of the
-    /// earlier turns first when there is one.
+    /// The messages to replay for `session`, oldest first: the stored
+    /// summary of the earlier turns first, when compaction is on and the
+    /// window leaves turns out. No model is called: the summary was written
+    /// after an earlier turn ([`Self::follow_turn`]).
     ///
     /// # Errors
     ///
-    /// Returns an error if the session cannot be read or a summary fails.
-    pub async fn load(self, session: &SessionId) -> Result<Vec<Message>> {
+    /// Returns an error if the session cannot be read.
+    pub async fn load(&self, session: &SessionId) -> Result<Vec<Message>> {
         let id = ConversationId::from(session.as_str());
         let memory = SessionMemory::new(Arc::clone(&self.db));
         let window = TranscriptWindow::new(self.budget);
-        let loaded = match self.compactor {
-            Some(compactor) => {
-                // Built for this one load, so rig hands the compactor every
-                // message the window leaves out and no carry-over: the
-                // summary stored in the workspace is the carry-over.
-                CompactingMemory::new(memory, window, compactor)
-                    .load(&id)
-                    .await
-            }
-            None => PolicyMemory::new(memory, window).load(&id).await,
+        let failed = |e| Error::Analysis(format!("could not load the session history: {e}"));
+        let messages = memory.load(&id).await.map_err(failed)?;
+        let (mut kept, left_out) = window.apply_with_demoted(messages).map_err(failed)?;
+        if self.compactor.is_none() || left_out.is_empty() {
+            return Ok(kept);
+        }
+        let read = session.clone();
+        let stored = self
+            .db
+            .run(move |db| sessions::latest_summary(db, &read))
+            .await?;
+        // A summary covering more than the window leaves out describes turns
+        // it now keeps verbatim (the budget grew): the next follow-up writes
+        // a new one.
+        if let Some(stored) = stored
+            && stored.covers <= left_out.len()
+            && !stored.text.is_empty()
+        {
+            kept.insert(0, Message::from(Summary(stored.text)));
+        }
+        Ok(kept)
+    }
+
+    /// Summarize what the window leaves out of `session` that the stored
+    /// summary does not cover yet, and store the result; nothing without a
+    /// compactor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session cannot be read or the summary fails.
+    pub async fn compact(self, session: &SessionId) -> Result<()> {
+        let Some(compactor) = self.compactor else {
+            return Ok(());
         };
-        loaded.map_err(|e| Error::Analysis(format!("could not load the session history: {e}")))
+        let id = ConversationId::from(session.as_str());
+        let memory = SessionMemory::new(Arc::clone(&self.db));
+        // Built for this one load, so rig hands the compactor every message
+        // the window leaves out and no carry-over: the summary stored in the
+        // workspace is the carry-over.
+        CompactingMemory::new(memory, TranscriptWindow::new(self.budget), compactor)
+            .load(&id)
+            .await
+            .map(drop)
+            .map_err(|e| Error::Analysis(format!("could not summarize the session history: {e}")))
+    }
+
+    /// After a turn is recorded, bring `session`'s summary up to date on its
+    /// own task (`AfterTurn::spawn`) when `compact_history` is on, so the
+    /// next turn's [`Self::load`] finds it. A failure is logged; the next
+    /// turn replays the window with the summary it has.
+    pub fn follow_turn(config: &Config, db: &Arc<Writer>, session: &SessionId) {
+        if !config.analysis.compact_history {
+            return;
+        }
+        let (config, db, session) = (config.clone(), Arc::clone(db), session.clone());
+        AfterTurn::spawn(async move {
+            let compacted = match Self::from_config(&config, db).await {
+                Ok(history) => history.compact(&session).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = compacted {
+                tracing::warn!(session = %session, error = %e, "the session history was not summarized");
+            }
+        });
     }
 }
 
@@ -291,6 +347,23 @@ mod tests {
         }
     }
 
+    /// A turn's follow-up under `budget`, then the next turn's load.
+    async fn compacted(
+        db: &Arc<Writer>,
+        model: &MockCompletionModel,
+        budget: u32,
+        id: &SessionId,
+    ) -> Vec<Message> {
+        compacting(db, model, budget)
+            .compact(id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        compacting(db, model, budget)
+            .load(id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn evicted_turns_are_summarized_once_and_lead_the_window() {
         let (db, id) = session().await;
@@ -299,11 +372,15 @@ mod tests {
             MockStreamEvent::text(r#"{"summary": "They asked questions 1 to 3."}"#),
             MockStreamEvent::final_response(Usage::default()),
         ]]);
-        // Each turn is 3 + 2 tokens, so 10 keeps the last two.
-        let history = compacting(&db, &model, 10)
+        // Each turn is 3 + 2 tokens, so 10 keeps the last two. Loading
+        // calls no model: there is no summary until a turn's follow-up.
+        let window = compacting(&db, &model, 10)
             .load(&id)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(window.len(), 4);
+        assert_eq!(model.request_count(), 0);
+        let history = compacted(&db, &model, 10, &id).await;
         let shown: Vec<String> = history.iter().map(SpokenText::spoken_text).collect();
         assert_eq!(
             shown,
@@ -322,11 +399,8 @@ mod tests {
             "{request}"
         );
 
-        // The next turn reuses the stored summary without a model call.
-        let again = compacting(&db, &model, 10)
-            .load(&id)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
+        // A follow-up with nothing newly left out makes no model call.
+        let again = compacted(&db, &model, 10, &id).await;
         assert_eq!(again, history);
         let rows = db
             .run(|db| {
@@ -376,10 +450,7 @@ mod tests {
             ],
         ]);
         // Each turn is 3 + 2 tokens, so budget 10 evicts turns 1-3.
-        let first = compacting(&db, &model, 10)
-            .load(&id)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
+        let first = compacted(&db, &model, 10, &id).await;
         let shown: Vec<String> = first.iter().map(SpokenText::spoken_text).collect();
         assert_eq!(
             shown,
@@ -396,10 +467,16 @@ mod tests {
         // Budget 20 keeps turns 2-5 and evicts only turn one: the stored
         // `covers` (6) now exceeds `evicted.len()` (2), so the compactor
         // summarizes again from scratch rather than replay the stale summary.
-        let second = compacting(&db, &model, 20)
+        // Until it has, the load leaves the stale summary out.
+        let unsummarized = compacting(&db, &model, 20)
             .load(&id)
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(
+            !matches!(unsummarized.first(), Some(Message::System { .. })),
+            "{unsummarized:?}"
+        );
+        let second = compacted(&db, &model, 20, &id).await;
         let shown: Vec<String> = second.iter().map(SpokenText::spoken_text).collect();
         assert_eq!(
             shown,
@@ -438,10 +515,7 @@ mod tests {
         // The next load reuses the newest summary without another model call:
         // `latest_summary` returns the new lower-`covers` row, not the old
         // higher-`covers` one, so the compactor does not loop on every load.
-        let again = compacting(&db, &model, 20)
-            .load(&id)
-            .await
-            .unwrap_or_else(|e| fail(&e.to_string()));
+        let again = compacted(&db, &model, 20, &id).await;
         assert_eq!(again, second);
         assert_eq!(model.request_count(), 2);
         let covers = db

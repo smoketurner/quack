@@ -103,7 +103,9 @@ fn prompt(c: &mut Criterion) {
     };
     c.bench_function("build_system_prompt/150_tables", |b| {
         b.iter(|| {
-            let prompt = text_to_sql::SystemPrompt::build(&db, black_box(&options)).unwrap();
+            let prompt = text_to_sql::SystemPrompt::build(&db, black_box(&options))
+                .unwrap()
+                .text;
             assert!(!prompt.is_empty());
         });
     });

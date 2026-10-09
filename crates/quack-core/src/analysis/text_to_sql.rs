@@ -4,13 +4,14 @@ use crate::analysis::search::DocumentScope;
 use crate::embedding::Vector;
 use crate::error::Result;
 use crate::graph::views as graph_views;
-use crate::graph::{GraphStatus, store as graph_store};
+use crate::graph::{GraphSize, store as graph_store};
 use crate::ingestion::parser::PageCounts;
 use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
 use crate::storage::workspace::{ColumnInfo, PinnedDocument, TableDescription, WorkspaceDb};
 use crate::text::{Fenced, OneLine, Tokens};
 use jiff::civil::Date;
+use std::collections::HashMap;
 use std::fmt::Write;
 
 /// `DuckDB`'s Friendly SQL idioms, one line each, for the system prompt. Kept to
@@ -93,6 +94,9 @@ pub struct Question {
     pub vector: Option<Vector>,
     /// `[retrieval].rrf_k`, which fuses the keyword and vector rankings.
     pub rrf_k: u32,
+    /// The table cards the turn's vector refresh read, so the ranking
+    /// does not read them again; `None` reads them when ranking.
+    pub cards: Option<TableCards>,
 }
 
 /// The system prompt, assembled in the order the design fixes (section
@@ -165,7 +169,7 @@ pub enum Modeled {
 
 impl Modeled {
     #[must_use]
-    pub fn of(ontology: Option<&Ontology>, graph: &GraphStatus) -> Self {
+    pub fn of(ontology: Option<&Ontology>, graph: &GraphSize) -> Self {
         if graph.enabled() {
             Self::Graph
         } else if ontology.is_some() {
@@ -192,13 +196,22 @@ impl Modeled {
     }
 }
 
+/// The assembled prompt, and the workspace facts it was built from that
+/// decide which tools a turn registers.
+#[derive(Debug, Clone)]
+pub struct BuiltPrompt {
+    pub text: String,
+    pub modeled: Modeled,
+    pub tables: TableLayout,
+}
+
 impl SystemPrompt {
     /// The prompt for `db` under `options`.
     ///
     /// # Errors
     ///
     /// Returns an error if schema introspection fails.
-    pub fn build(db: &WorkspaceDb, options: &PromptOptions) -> Result<String> {
+    pub fn build(db: &WorkspaceDb, options: &PromptOptions) -> Result<BuiltPrompt> {
         let mut prompt = Self::default();
         prompt.text.push_str(
             "You are a data analysis assistant working inside one workspace that holds tables, \
@@ -226,11 +239,11 @@ impl SystemPrompt {
         writeln!(prompt.text)?;
 
         let ontology = ontology_store::current(db)?;
-        let graph = graph_store::status(db)?;
-        prompt.tool_guidance(
-            Modeled::of(ontology.as_ref(), &graph),
-            TableLayout::of(user_tables(db)?.len()),
-        );
+        let graph = graph_store::size(db)?;
+        let modeled = Modeled::of(ontology.as_ref(), &graph);
+        let tables = user_tables(db)?;
+        let layout = TableLayout::of(tables.len());
+        prompt.tool_guidance(modeled, layout);
 
         let version = db.duckdb_version()?;
         writeln!(
@@ -241,8 +254,7 @@ impl SystemPrompt {
         prompt.text.push_str(DIALECT_REFERENCE);
         prompt.text.push('\n');
 
-        let modeled = Modeled::of(ontology.as_ref(), &graph);
-        let tables = prompt.tables(db, ontology.as_ref(), modeled)?;
+        prompt.tables(db, &tables, ontology.as_ref(), modeled)?;
         let documents = prompt.documents(db)?;
         if let Some(note) = options.scope.prompt_note() {
             writeln!(prompt.text, "{note}")?;
@@ -266,12 +278,12 @@ impl SystemPrompt {
                     } else {
                         ""
                     },
-                    if graph.stale {
+                    if graph.summary.stale {
                         " (stale: the ontology changed since it was built)"
                     } else {
                         ""
                     },
-                    match graph.drift.total() {
+                    match graph.summary.drift_total {
                         0 => String::new(),
                         drift => format!(
                             " (drift: the documents expressed {drift} classes or relations the \
@@ -299,7 +311,11 @@ impl SystemPrompt {
             .text
             .push_str(options.write_policy.prompt_paragraph());
 
-        Ok(prompt.text)
+        Ok(BuiltPrompt {
+            text: prompt.text,
+            modeled,
+            tables: layout,
+        })
     }
 
     /// The numbered procedures, one per substrate. The table, SQL, chart
@@ -442,37 +458,39 @@ impl SystemPrompt {
     /// the tool guidance and the question out of a small context window
     /// (issue #40): the model has `describe_table` and `find_tables` for
     /// the rest. Then the measures and, when the graph has nodes, its views.
-    /// Returns the user tables, so the caller knows whether the workspace
-    /// is empty. The block depends on the workspace alone, never on the
-    /// question, so a provider's prefix cache keeps it.
+    /// The block depends on the workspace alone, never on the question, so
+    /// a provider's prefix cache keeps it.
     fn tables(
         &mut self,
         db: &WorkspaceDb,
+        tables: &[String],
         ontology: Option<&Ontology>,
         modeled: Modeled,
-    ) -> Result<Vec<String>> {
+    ) -> Result<()> {
         let views = graph_views::names(db)?;
-        let tables = user_tables(db)?;
         if !tables.is_empty() {
             writeln!(self.text, "Available tables:")?;
         }
-        for (index, table) in tables.iter().enumerate() {
-            // Tables past the detail cap only ever print their row count,
-            // so only ask for that: describing one also samples rows,
-            // whose output would be thrown away.
-            if index >= DETAILED_TABLES {
-                let Ok(row_count) = db.count_rows(table) else {
-                    writeln!(self.text, "- {table}")?;
-                    continue;
-                };
-                writeln!(self.text, "- {table} ({row_count} rows)")?;
-                continue;
-            }
+        let (described, rest) = tables.split_at(tables.len().min(DETAILED_TABLES));
+        for table in described {
             let Ok(desc) = db.describe_table_under(table, ontology) else {
                 writeln!(self.text, "- {table}")?;
                 continue;
             };
             self.table_detail(&desc)?;
+        }
+        // Tables past the detail cap only ever print their row count, so
+        // only ask for that, in one statement: describing one also samples
+        // rows, whose output would be thrown away.
+        let counts = db.count_rows_of(rest).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not count the rows of the undescribed tables");
+            HashMap::new()
+        });
+        for table in rest {
+            match counts.get(table) {
+                Some(row_count) => writeln!(self.text, "- {table} ({row_count} rows)")?,
+                None => writeln!(self.text, "- {table}")?,
+            }
         }
         if tables.len() > DETAILED_TABLES {
             writeln!(
@@ -509,7 +527,7 @@ impl SystemPrompt {
             writeln!(self.text)?;
             writeln!(self.text)?;
         }
-        Ok(tables)
+        Ok(())
     }
 
     /// One table in full: row count, note, columns with their meaning,
@@ -603,7 +621,14 @@ impl SystemPrompt {
         if TableLayout::of(tables.len()) == TableLayout::AllDescribed {
             return Ok(());
         }
-        let ranked = TableCards::read(db, ontology)?.rank(
+        let read;
+        let cards = if let Some(cards) = &question.cards {
+            cards
+        } else {
+            read = TableCards::read(db, tables, ontology)?;
+            &read
+        };
+        let ranked = cards.rank(
             db,
             &question.text,
             question.vector.as_ref(),

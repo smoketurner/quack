@@ -268,6 +268,13 @@ fn large_tables_extract_in_batches_and_neighbourhoods_stay_bounded() {
     );
     let status = graph_store::status(&db).unwrap();
     assert_eq!(status.nodes, u64::from(rows) + 3 + 2);
+    // The turn's lean read agrees with the full status.
+    let size = graph_store::size(&db).unwrap();
+    assert_eq!(
+        (size.nodes, size.edges, size.provisional()),
+        (status.nodes, status.edges, status.provisional())
+    );
+    assert_eq!(size.summary, graph_store::summary(&db).unwrap());
     // Re-running stays idempotent across batches.
     tables::extract(&db, &current, Standing::Reviewed).unwrap();
     assert_eq!(
