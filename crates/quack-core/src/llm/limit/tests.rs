@@ -473,3 +473,43 @@ async fn a_request_waits_out_its_backoff_without_the_permit() {
         Ok(200)
     );
 }
+
+/// Clients built for later turns reuse the connection an earlier one
+/// opened, rather than a new TCP and TLS handshake per turn.
+#[tokio::test]
+async fn clients_for_a_provider_share_one_connection_pool() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let addr = listener
+        .local_addr()
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 2048];
+                while socket.read(&mut buf).await.is_ok_and(|n| n > 0) {
+                    let reply = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+                    if socket.write_all(reply).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let url = format!("http://{addr}/");
+    for _ in 0..3 {
+        let client = LimitedHttp::for_provider(
+            &name("pool-test"),
+            &provider(ProviderType::Openai, None, &url),
+        );
+        assert_eq!(&*call(client, url.clone(), "").await, b"ok");
+    }
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}

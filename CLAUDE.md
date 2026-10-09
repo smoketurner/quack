@@ -192,7 +192,7 @@ beside the HTTP drain under `[server].shutdown_grace_seconds` (20), after cancel
 `query` turn, which runs under a child of it), and then
 `AppState::close` drops the workspace handles so each writer checkpoints. There is no job pool:
 resources are limited where they are used. Every rig HTTP client sends through
-`llm::LimitedHttp` (rig's reqwest transport, plus the provider's `headers`), which holds
+`llm::LimitedHttp` (rig's reqwest transport over one process-wide connection pool, plus the provider's `headers`), which holds
 one permit of the process-wide gate for the provider and the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
 for Ollama, 8 otherwise) until the body or stream ends; a freed permit goes to interactive
 requests (`TurnRequest::run`, `Embedder::embed_interactive`, via the `quack_core::priority` task-local) before
