@@ -398,13 +398,13 @@ fn write_finished(err: &mut impl Write, step: &ToolStep) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scripted_ollama::{self, ScriptedOllama};
     use quack_core::analysis::agent::AgentResponse;
     use quack_core::analysis::policy::Approver;
     use quack_core::storage::control::AllowedProviders;
     use quack_core::storage::sessions::{self, ChatMode};
     use quack_core::storage::workspace::WorkspaceDb;
     use quack_core::storage::writer::Writer;
+    use quack_testkit::{self, ScriptedOllama};
     use std::sync::Arc;
 
     #[expect(clippy::panic, reason = "test failure path")]
@@ -424,7 +424,7 @@ mod tests {
         let mut config = ollama.config().unwrap_or_else(|e| fail(&e.to_string()));
         config.general.data_dir = dir.path().to_path_buf();
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        scripted_ollama::seed_dictating_note(&db).unwrap_or_else(|e| fail(&e.to_string()));
+        quack_testkit::seed_dictating_note(&db).unwrap_or_else(|e| fail(&e.to_string()));
         let session = sessions::create_session(&db, "scripted/model", ChatMode::Chat, None)
             .unwrap_or_else(|e| fail(&e.to_string()));
         let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
@@ -458,9 +458,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_model_titles_a_session_after_its_first_turn() {
         let ollama = ScriptedOllama::serve(vec![
-            scripted_ollama::Reply::Text("Two vendors were late in March."),
-            scripted_ollama::Reply::Text(r#"{"title": "Late vendors in March"}"#),
-            scripted_ollama::Reply::Text("Cipla was one of them."),
+            quack_testkit::Reply::Text("Two vendors were late in March."),
+            quack_testkit::Reply::Text(r#"{"title": "Late vendors in March"}"#),
+            quack_testkit::Reply::Text("Cipla was one of them."),
         ])
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));

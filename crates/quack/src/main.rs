@@ -14,8 +14,6 @@ mod ontology_cli;
 mod print;
 mod progress_line;
 mod saved_cli;
-#[cfg(test)]
-mod scripted_ollama;
 mod server;
 mod stdio;
 mod tables_cli;

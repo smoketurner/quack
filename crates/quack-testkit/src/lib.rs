@@ -14,11 +14,15 @@ use quack_core::ingestion::parser::SectionKind;
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, WorkspaceDb};
 
 /// One model reply.
-pub(crate) enum Reply {
+pub enum Reply {
+    /// A tool call with its JSON arguments.
     Call {
+        /// The tool's name.
         tool: &'static str,
+        /// The arguments the model passes.
         args: serde_json::Value,
     },
+    /// A plain text answer.
     Text(&'static str),
 }
 
@@ -30,7 +34,7 @@ struct Script {
 }
 
 /// The server; it stops when dropped.
-pub(crate) struct ScriptedOllama {
+pub struct ScriptedOllama {
     base_url: String,
     script: Script,
     task: tokio::task::JoinHandle<()>,
@@ -44,7 +48,11 @@ impl Drop for ScriptedOllama {
 
 impl ScriptedOllama {
     /// Serve `replies`, one per chat request, in order.
-    pub(crate) async fn serve(replies: Vec<Reply>) -> std::io::Result<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error when no loopback port can be bound.
+    pub async fn serve(replies: Vec<Reply>) -> std::io::Result<Self> {
         let script = Script {
             replies: Arc::new(Mutex::new(replies.into())),
             requests: Arc::default(),
@@ -66,7 +74,8 @@ impl ScriptedOllama {
     }
 
     /// Every chat request body received so far, in order.
-    pub(crate) fn requests(&self) -> Vec<serde_json::Value> {
+    #[must_use]
+    pub fn requests(&self) -> Vec<serde_json::Value> {
         self.script
             .requests
             .lock()
@@ -76,12 +85,20 @@ impl ScriptedOllama {
 
     /// A configuration whose chat model is this server, with no embedding
     /// model, so document search is by keyword.
-    pub(crate) fn config(&self) -> Result<Config> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the configuration's parse error, which a test treats as a bug.
+    pub fn config(&self) -> Result<Config> {
         self.config_with("")
     }
 
     /// [`Self::config`], with `more` TOML after it.
-    pub(crate) fn config_with(&self, more: &str) -> Result<Config> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error when `more` is not valid configuration.
+    pub fn config_with(&self, more: &str) -> Result<Config> {
         Config::parse(&format!(
             "[general]\nchat_model = \"scripted/model\"\n\
              [providers.scripted]\ntype = \"ollama\"\nbase_url = \"{}\"\n{more}",
@@ -91,7 +108,8 @@ impl ScriptedOllama {
 
     /// The turn of a model that follows a document's instruction: it
     /// searches, runs [`DICTATED`] as the passage asks, then answers.
-    pub(crate) fn following_the_note() -> Vec<Reply> {
+    #[must_use]
+    pub fn following_the_note() -> Vec<Reply> {
         vec![
             Reply::Call {
                 tool: "search_documents",
@@ -107,11 +125,15 @@ impl ScriptedOllama {
 }
 
 /// The statement the seeded document asks for.
-pub(crate) const DICTATED: &str = "DROP TABLE customers";
+pub const DICTATED: &str = "DROP TABLE customers";
 
 /// A `customers` table and one document telling the assistant to run
 /// [`DICTATED`].
-pub(crate) fn seed_dictating_note(db: &WorkspaceDb) -> Result<()> {
+///
+/// # Errors
+///
+/// Returns the first database error from creating the table or document.
+pub fn seed_dictating_note(db: &WorkspaceDb) -> Result<()> {
     db.execute_statement("CREATE TABLE customers AS SELECT 1 AS id")?;
     let id = DocumentId::from("note");
     db.insert_document(

@@ -3,10 +3,10 @@ use quack_core::storage::writer::Writer;
 use quack_core::config::Config;
 
 use super::*;
-use crate::scripted_ollama::{self, ScriptedOllama};
 use quack_core::analysis::policy::{Approver, Hold};
 use quack_core::ids::WorkspaceId;
 use quack_core::storage::control::AllowedProviders;
+use quack_testkit::{self, ScriptedOllama};
 
 #[expect(clippy::panic, reason = "test failure path")]
 fn fail(msg: &str) -> ! {
@@ -75,7 +75,7 @@ async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
     let mut config = ollama.config().unwrap_or_else(|e| fail(&e.to_string()));
     config.general.data_dir = dir.path().to_path_buf();
     let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-    scripted_ollama::seed_dictating_note(&db).unwrap_or_else(|e| fail(&e.to_string()));
+    quack_testkit::seed_dictating_note(&db).unwrap_or_else(|e| fail(&e.to_string()));
     let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
     let reader = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
     let server = McpServer::new(McpSetup {
@@ -111,7 +111,7 @@ async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
         .unwrap_or_default();
     assert_eq!(
         refused.get("detail").and_then(|d| d.as_str()),
-        Some(scripted_ollama::DICTATED),
+        Some(quack_testkit::DICTATED),
         "{refused}"
     );
     assert_eq!(

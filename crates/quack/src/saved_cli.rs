@@ -386,7 +386,6 @@ mod tests {
     )]
 
     use super::*;
-    use crate::scripted_ollama::{Reply, ScriptedOllama};
     use jiff::Timestamp;
     use quack_core::analysis::agent::AgentResponse;
     use quack_core::analysis::events::{ToolName, ToolStep};
@@ -395,6 +394,7 @@ mod tests {
     use quack_core::storage::control::AllowedProviders;
     use quack_core::storage::sessions::ChatMode;
     use quack_core::storage::workspace::WorkspaceDb;
+    use quack_testkit::{Reply, ScriptedOllama};
     use std::sync::Arc;
 
     #[expect(clippy::panic, reason = "test failure path")]

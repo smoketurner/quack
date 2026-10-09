@@ -1605,7 +1605,7 @@ async fn upload(
 /// answer comes back citable.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_turn_views_an_image_with_a_chat_model_that_reads_images() {
-    use crate::scripted_ollama::{Reply, ScriptedOllama};
+    use quack_testkit::{Reply, ScriptedOllama};
 
     let ollama = ScriptedOllama::serve(vec![
         Reply::Text("A bar chart of revenue by quarter."),
@@ -1668,7 +1668,7 @@ async fn a_turn_views_an_image_with_a_chat_model_that_reads_images() {
 /// image is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_vision_model_reads_images_and_they_are_served() {
-    use crate::scripted_ollama::{Reply, ScriptedOllama};
+    use quack_testkit::{Reply, ScriptedOllama};
 
     let ollama = ScriptedOllama::serve(vec![Reply::Text(
         "A bar chart: revenue rose from 10 to 20.",
@@ -8110,7 +8110,7 @@ async fn a_waiting_write_is_answered_once_by_its_asker() {
 /// and a Windows worker overflowed.
 #[test]
 fn a_turn_fits_a_one_mebibyte_worker_stack() {
-    use crate::scripted_ollama::{Reply, ScriptedOllama};
+    use quack_testkit::{Reply, ScriptedOllama};
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(1024 * 1024)
@@ -8149,9 +8149,9 @@ fn a_turn_fits_a_one_mebibyte_worker_stack() {
 async fn a_turn_that_read_a_document_asks_or_refuses_its_write_under_allow_write() {
     use futures::StreamExt;
 
-    use crate::scripted_ollama::{self, ScriptedOllama};
     use quack_core::analysis::policy::Hold;
     use quack_core::storage::workspace::WorkspaceDb;
+    use quack_testkit::{self, ScriptedOllama};
 
     let mut script = ScriptedOllama::following_the_note();
     script.extend(ScriptedOllama::following_the_note());
@@ -8168,11 +8168,9 @@ async fn a_turn_that_read_a_document_asks_or_refuses_its_write_under_allow_write
         .workspace_db(&ws)
         .await
         .unwrap_or_else(|e| fail(&e.message));
-    with_db(Arc::clone(&db), |db| {
-        scripted_ollama::seed_dictating_note(db)
-    })
-    .await
-    .unwrap_or_else(|e| fail(&e.message));
+    with_db(Arc::clone(&db), quack_testkit::seed_dictating_note)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
     let tables = || async {
         with_db(Arc::clone(&db), WorkspaceDb::list_tables)
             .await
@@ -8226,7 +8224,7 @@ async fn a_turn_that_read_a_document_asks_or_refuses_its_write_under_allow_write
         if asked.is_none()
             && let Some(request) = data_of(&seen, "permission_required")
         {
-            assert_eq!(request["sql"], scripted_ollama::DICTATED, "{request}");
+            assert_eq!(request["sql"], quack_testkit::DICTATED, "{request}");
             assert_eq!(request["reason"], "read_documents", "{request}");
             assert_eq!(
                 request["notice"],

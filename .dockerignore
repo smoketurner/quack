@@ -9,10 +9,12 @@
 
 # Workspace crate manifests (the dependency caching layer)
 !crates/quack-core/Cargo.toml
+!crates/quack-testkit/Cargo.toml
 !crates/quack/Cargo.toml
 
 # Source and compile-time assets
 !crates/quack-core/src/
+!crates/quack-testkit/src/
 # sqlx::migrate!("./migrations") reads these at compile time (docs/migrations.md)
 !crates/quack-core/migrations/
 !crates/quack/src/

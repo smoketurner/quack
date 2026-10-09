@@ -4398,6 +4398,7 @@ dependencies = [
  "proptest",
  "pulldown-cmark",
  "quack-core",
+ "quack-testkit",
  "ratatui",
  "ratatui-textarea",
  "rmcp",
@@ -4492,6 +4493,16 @@ dependencies = [
  "whatlang",
  "windows-native-keyring-store",
  "zip 8.6.0",
+]
+
+[[package]]
+name = "quack-testkit"
+version = "2026.10.5"
+dependencies = [
+ "axum",
+ "quack-core",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
