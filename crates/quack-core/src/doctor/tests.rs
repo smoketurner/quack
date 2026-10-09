@@ -257,6 +257,34 @@ async fn the_chat_model_check_says_what_a_turn_sends() {
     }
 }
 
+/// A level doctor could not check is a warning that says so, never an ok.
+#[test]
+fn an_effort_doctor_cannot_check_is_a_warning() {
+    let chat = ChatSettings::new("m", Wire::Converse, Some(Effort::High), None);
+    let check = |outcome: EffortCheck| outcome.check("br/m", chat, "; costs", String::from("fix"));
+    assert_eq!(check(EffortCheck::Accepted).status, Status::Ok);
+    let unchecked = check(EffortCheck::Unchecked(Error::Config(String::from(
+        "no region",
+    ))));
+    assert_eq!(unchecked.status, Status::Warn);
+    assert!(
+        unchecked
+            .summary
+            .contains("not checked here: configuration error: no region"),
+        "{}",
+        unchecked.summary
+    );
+    let refused = check(EffortCheck::Refused(Error::Config(String::from(
+        "no such level",
+    ))));
+    assert_eq!(refused.status, Status::Fail);
+    assert!(
+        refused.summary.ends_with("no such level; costs"),
+        "{}",
+        refused.summary
+    );
+}
+
 #[tokio::test]
 #[expect(clippy::unwrap_used, reason = "test")]
 async fn the_chat_model_check_fails_what_every_turn_refuses() {

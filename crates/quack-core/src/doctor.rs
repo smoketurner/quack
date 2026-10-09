@@ -735,14 +735,16 @@ async fn chat_settings_check(config: &Config, model: ModelRef<'_>) -> Check {
         return Check::new(Area::ChatModel, Status::Fail, format!("{model}: {e}"));
     }
     let chat = ChatSettings::new(model.model, wire, settings.effort, settings.temperature);
-    match effort_refusal(model, settings.effort).await {
-        None => Check::new(Area::ChatModel, Status::Ok, format!("{model}: {chat}")),
-        Some(e) => Check::new(Area::ChatModel, Status::Fail, format!("{model}: {e}")).fix(format!(
+    EffortCheck::run(model, settings.effort).await.check(
+        &model.to_string(),
+        chat,
+        "",
+        format!(
             "set effort to a level it takes under [providers.{}.models.\"{}\"], \
              [providers.{}], or [analysis]",
             model.provider_name, model.model, model.provider_name
-        )),
-    }
+        ),
+    )
 }
 
 /// What a background call (reranking, history summaries, graph extraction,
@@ -758,39 +760,63 @@ async fn background_check(config: &Config, model: ModelRef<'_>) -> Option<Check>
         settings.background_effort,
         settings.temperature,
     );
-    Some(
-        match effort_refusal(model, settings.background_effort).await {
-            None => Check::new(
-                Area::ChatModel,
-                Status::Ok,
-                format!("{model}, background calls: {chat}"),
-            ),
-            Some(e) => Check::new(
-                Area::ChatModel,
-                Status::Fail,
-                format!(
-                    "{model}, background calls: {e}; graph extraction and the ontology's document \
-                 pass fail, and chat turns run without model reranking and history summaries"
-                ),
-            )
-            .fix(format!(
-                "set background_effort to a level it takes under [providers.{}.models.\"{}\"], \
+    Some(EffortCheck::run(model, settings.background_effort).await.check(
+        &format!("{model}, background calls"),
+        chat,
+        "; graph extraction and the ontology's document pass fail, and chat turns run without \
+         model reranking and history summaries",
+        format!(
+            "set background_effort to a level it takes under [providers.{}.models.\"{}\"], \
              [providers.{}], or [analysis]",
-                model.provider_name, model.model, model.provider_name
-            )),
-        },
-    )
+            model.provider_name, model.model, model.provider_name
+        ),
+    ))
 }
 
-/// Why building `model`'s chat model at `effort` fails, sending nothing: rig
-/// refuses a level the model does not take on its provider's API. A provider
-/// whose client cannot be built here is reported by its own check.
-async fn effort_refusal(model: ModelRef<'_>, effort: Option<Effort>) -> Option<Error> {
-    effort?;
-    let client = ChatClient::without_credential(model.provider_name, model.provider)
-        .await
-        .ok()?;
-    client.chat_model(model.model, effort, None).err()
+/// What building a chat model at an effort says, sending nothing: rig
+/// refuses a level the model does not take on its provider's API.
+enum EffortCheck {
+    /// No effort is set, or rig accepts the level for this model.
+    Accepted,
+    /// rig refuses the level; every request would fail.
+    Refused(Error),
+    /// The provider's client cannot be built here (a Bedrock provider with
+    /// no AWS region, say), so the level is not checked.
+    Unchecked(Error),
+}
+
+impl EffortCheck {
+    /// The check for `subject`, sent `chat`: a refusal says what else it
+    /// costs (`refused_costs`) and how to `fix` it.
+    fn check(self, subject: &str, chat: ChatSettings, refused_costs: &str, fix: String) -> Check {
+        match self {
+            Self::Accepted => Check::new(Area::ChatModel, Status::Ok, format!("{subject}: {chat}")),
+            Self::Unchecked(e) => Check::new(
+                Area::ChatModel,
+                Status::Warn,
+                format!("{subject}: {chat}; the effort is not checked here: {e}"),
+            ),
+            Self::Refused(e) => Check::new(
+                Area::ChatModel,
+                Status::Fail,
+                format!("{subject}: {e}{refused_costs}"),
+            )
+            .fix(fix),
+        }
+    }
+
+    async fn run(model: ModelRef<'_>, effort: Option<Effort>) -> Self {
+        if effort.is_none() {
+            return Self::Accepted;
+        }
+        match ChatClient::without_credential(model.provider_name, model.provider).await {
+            Err(e) => Self::Unchecked(e),
+            Ok(client) => match client.chat_model(model.model, effort, None) {
+                Ok(_) => Self::Accepted,
+                Err(e) => Self::Refused(e),
+            },
+        }
+    }
 }
 
 async fn check_embedding_model(report: &mut Report, config: &Config, probing: Probing) {
