@@ -3,6 +3,7 @@
 //! and the arguments they take. Design doc section 11.
 
 mod args;
+pub mod classify_cli;
 mod confirm;
 pub mod embeddings_cli;
 pub mod graph_cli;

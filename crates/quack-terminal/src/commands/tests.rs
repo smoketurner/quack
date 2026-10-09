@@ -503,3 +503,19 @@ fn quoted(path: &str) -> String {
         format!("'{path}'")
     }
 }
+
+/// `/classify` takes what `quack classify` does: a table, its text columns,
+/// and a question file; or `list`.
+#[test]
+fn classify_takes_a_table_columns_and_a_question_file() {
+    assert!(parses(
+        "/classify tickets --text subject,body --questions q.json --preview 5 --all"
+    ));
+    assert!(parses("/classify list"));
+    assert!(!parses("/classify"));
+    assert!(!parses("/classify tickets"));
+    assert!(!parses(
+        "/classify tickets --text subject --questions q.json --preview 0"
+    ));
+    assert_eq!(words("/cla"), ["/classify"]);
+}

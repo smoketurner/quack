@@ -333,6 +333,7 @@ async fn agent_events_attach_charts_and_steps_and_keys_cancel_the_turn() {
             rows: Some(3),
             result: None,
             duration_ms: 4,
+            run: None,
         }),
     );
     app.handle_turn_event(
@@ -445,6 +446,7 @@ async fn a_turn_with_text_then_a_tool_then_text_keeps_one_assistant_message() {
             rows: Some(1),
             result: None,
             duration_ms: 1,
+            run: None,
         }),
     );
     // More text streams after the tool returns.
@@ -546,6 +548,7 @@ async fn a_turn_with_text_then_a_write_permission_then_text_keeps_one_assistant_
             rows: Some(1),
             result: None,
             duration_ms: 1,
+            run: None,
         }),
     );
     app.handle_turn_event(&mut turn, AgentEvent::TextDelta(String::from(" Done.")));
@@ -2310,4 +2313,63 @@ async fn sessions_are_renamed_and_found_by_title_and_by_what_they_say() {
         app.session_id, other.id,
         "a title's start finds the session"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn classify_is_a_job_that_labels_a_table_and_says_what_it_wrote() {
+    use quack_core::llm::egress::Egress;
+    use quack_testkit::DecisionStub;
+
+    let stub = DecisionStub::start().await;
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let config = Config::parse(&format!(
+        "[providers.local]\ntype = \"ollama\"\nbase_url = \"{}\"\nmax_retries = 0\n\
+         [decision]\nmodel = \"local/laya\"\n",
+        stub.base_url()
+    ))
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let questions = dir.path().join("triage.json");
+    std::fs::write(
+        &questions,
+        r#"{"name": "triage", "questions": {
+            "department": {"type": "choice", "instructions": "Which department?",
+                           "criteria": {"billing": null, "technical": null}}}}"#,
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    Egress::scope(Some(Egress::NoWorkspace), async {
+        let mut app = app_with(dir.path(), config);
+        app.db
+            .run(|db| {
+                db.execute_statement(
+                    "CREATE TABLE tickets AS SELECT range AS id, 'billing issue' AS subject \
+                     FROM range(3)",
+                )
+            })
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        app.handle_slash_command(&format!(
+            "/classify tickets --text subject --questions {}",
+            questions.display()
+        ));
+        settle(&mut app).await;
+        assert!(
+            last(&app)
+                .content
+                .contains("\nWrote tickets_triage: 3 rows labelled"),
+            "{}",
+            last(&app).content
+        );
+        app.handle_slash_command("/classify list");
+        settle(&mut app).await;
+        assert!(
+            last(&app)
+                .content
+                .contains("tickets -> tickets_triage  completed"),
+            "{}",
+            last(&app).content
+        );
+        app.handle_slash_command("/classify tickets");
+        assert_eq!(last(&app).kind, MessageKind::Error, "a usage error");
+    })
+    .await;
 }

@@ -71,6 +71,26 @@ nothing. A failed refresh exits 1, keeps the rows from the run before, and recor
 error, which `quack import list` shows. Under `quack serve`, the Tables page's Refresh button
 and `POST /api/v1/workspaces/{id}/imports/{import}/refresh` run one on demand.
 
+## Labelling new rows
+
+`quack classify TABLE --text COLUMN --questions FILE` labels the rows its output table does
+not hold, so running it again after new rows arrive labels only those. quack has no
+scheduler; to label nightly, add a cron entry on the host that holds the data directory:
+
+```
+# m h dom mon dow  command
+30 2 * * *  quack classify tickets --text subject,body --questions triage.json -w support
+```
+
+Rows whose text changed after they were labelled keep their labels: `--all` labels every row
+again, into a staging table that replaces the output only when it completes. A run that
+stops (a cancel, a refusal from the model, a killed process) keeps the rows it wrote, and the
+next run finishes; a run killed by a signal is marked `interrupted` by the next. A run into
+an output labelled under other questions, or after `ollama pull` changed the model's weights,
+is refused until `--all`. `quack classify list` shows the runs. Each run's definition and
+counts are in `_quack_classifications` inside the workspace file, so deleting a user
+rewrites `started_by` there to `removed` like every other record of who did what.
+
 ## Hardware sizing
 
 Measured on 2026-10-06 with the release binary (`v2026.10.3` plus the changes of this page,

@@ -61,6 +61,7 @@ fn to_json_carries_every_field_and_derives_queries() {
                 rows: Some(1),
                 result: None,
                 duration_ms: 7,
+                run: None,
             },
             ToolStep {
                 tool: ToolName::SearchDocuments,
@@ -69,6 +70,7 @@ fn to_json_carries_every_field_and_derives_queries() {
                 rows: None,
                 result: None,
                 duration_ms: 4,
+                run: None,
             },
         ],
         citations: vec![Citation {

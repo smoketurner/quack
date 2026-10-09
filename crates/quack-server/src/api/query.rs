@@ -20,6 +20,7 @@ use quack_core::analysis::events::{
 use quack_core::analysis::policy::{Hold, WritePolicy};
 use quack_core::analysis::search::{DocumentSearch, SearchBody, SearchDetail, SearchOutcome};
 use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
+use quack_core::classify::LabelJobs;
 use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
@@ -165,6 +166,10 @@ impl PreparedTurn {
             .workspace(access.membership.workspace.id.clone())
             .owner(Some(access.identity.user_id.clone()))
             .lane(Lane::serial(&lane));
+        let user = access.identity.user_id.clone();
+        let labelling = LabelJobs::new(app.jobs.clone())
+            .workspace(access.membership.workspace.id.clone())
+            .on_end(access.run_audit(app, Some(session_id.clone())));
         let job = app
             .jobs
             .submit(spec, move |ctx| async move {
@@ -176,6 +181,8 @@ impl PreparedTurn {
                     policy,
                     message: &text,
                     documents: &documents,
+                    user: Some(&user),
+                    labelling,
                     sink,
                     cancel: ctx.cancel_token(),
                 })

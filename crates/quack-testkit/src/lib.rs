@@ -1,5 +1,10 @@
 //! An Ollama that answers `/api/chat` from a script, on a loopback port, for
-//! tests that run a whole agent turn through an interface.
+//! tests that run a whole agent turn through an interface, and one that
+//! serves a decision model.
+
+mod decision;
+
+pub use decision::{DecisionStub, Fault, Seen, too_long};
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};

@@ -4,6 +4,7 @@
 
 pub(crate) mod admin;
 pub(crate) mod auth;
+pub(crate) mod classify;
 pub(crate) mod context;
 pub(crate) mod documents;
 pub(crate) mod embeddings;
@@ -21,8 +22,11 @@ mod tables;
 pub(crate) mod workspaces;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use axum::handler::Handler;
 use axum::response::sse::Event;
 use axum::routing::{MethodRouter, delete, get, patch, post, put};
+use quack_core::classify::MAX_QUESTION_SET_BYTES;
 
 use super::state::App;
 
@@ -156,6 +160,11 @@ pub(crate) fn router(app: &App) -> ApiRoutes {
         .route("/workspaces/{id}/tables/schema", get(tables::schema))
         .route("/workspaces/{id}/tables/note", put(tables::note))
         .route("/workspaces/{id}/tables/retype", post(tables::retype))
+        .route(
+            "/workspaces/{id}/tables/classify",
+            get(classify::runs)
+                .post(classify::classify.layer(DefaultBodyLimit::max(MAX_QUESTION_SET_BYTES))),
+        )
         .route(
             "/workspaces/{id}/context",
             get(context::show).put(context::replace),

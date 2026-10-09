@@ -22,6 +22,7 @@
 mod text_enum;
 
 pub mod analysis;
+pub mod classify;
 pub mod config;
 pub mod crypto;
 pub mod doctor;

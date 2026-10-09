@@ -608,6 +608,30 @@ CREATE TABLE _quack_saved_runs (
     changed    BOOLEAN NOT NULL,
     statements JSON NOT NULL                 -- per statement: sql, digest, rows, changed, columns, error; never the rows themselves
 );
+-- a table of labels and the runs that made it (section 6.6): one row per run
+CREATE TABLE _quack_classifications (
+    id           TEXT PRIMARY KEY,             -- UUID v7, the run id
+    output_table TEXT NOT NULL,                -- the table of labels
+    document_id  TEXT NOT NULL,                -- the document (source `classify`) that owns it
+    source_table TEXT NOT NULL,
+    key_column   TEXT NOT NULL,                -- the source's key, which the output joins back by
+    key_type     TEXT NOT NULL,                -- the key's DuckDB type; another type is a changed definition
+    text_columns JSON NOT NULL,
+    set_name     TEXT NOT NULL,
+    question_set JSON NOT NULL,                -- the QuestionSet the run asked
+    model        TEXT NOT NULL,                -- provider/model
+    model_digest TEXT NOT NULL,                -- the weights' digest from /api/tags
+    rows_scope   TEXT NOT NULL,                -- missing | all; a first run on a missing output is `missing`
+    status       TEXT NOT NULL,                -- running | completed | cancelled | failed | interrupted
+    error        TEXT,
+    started_by   TEXT,
+    started_at   TIMESTAMP NOT NULL DEFAULT now(),
+    finished_at  TIMESTAMP,
+    labelled UBIGINT NOT NULL DEFAULT 0,       -- rows the model labelled
+    cut      UBIGINT NOT NULL DEFAULT 0,       -- of those, from text cut to fit the model
+    empty    UBIGINT NOT NULL DEFAULT 0,       -- rows with no text, written with NULL labels
+    skipped  UBIGINT NOT NULL DEFAULT 0        -- rows the model refused at every length, not written
+);
 -- [analysis].compact_history: summaries of the turns the history window leaves out
 CREATE TABLE _quack_session_summaries (
     id TEXT PRIMARY KEY,                        -- UUID v7
@@ -1504,6 +1528,111 @@ drift, propose again.
 
 ---
 
+### 6.6 Decision models and row labelling
+
+A decision model is a classifier, not a generator. For a state (a row's text) and a fixed
+list of questions it returns each option's probability in tens of milliseconds, where a chat
+model takes a call per row: 100,000 tickets at 70 ms and three questions take about two
+hours, against days. `[decision].model = "ollama/laya"` names one (`ollama pull laya`, Ollama
+0.40.0 or later). rig has no client for Ollama's `/v1/systemone`, so `llm::decision` sends
+it through the provider's own `OllamaEndpoint` and `LimitedHttp`: the provider's permit
+(`max_concurrent_requests`, 1 for Ollama), the workspace's `allowed_providers` check
+(`Egress`), and the proxy settings all apply. A provider of another type is a `Config` error.
+
+**Questions.** A `Question` is `choice` (one of 2 to 26 options, each with an optional
+description), `noul` (true or false), or `score` (a level on an ordered rubric of 2 to 26
+descriptions). A `Questions` holds 1 to 64 uniquely named questions (names compare without
+regard to case, since they become column names) and is checked once, when it is built, so a
+set that exists can be asked. A repeated key in a question file is refused, not overwritten.
+The file is JSON, quack's only interchange form: `{"name": ..., "questions": {...}}`.
+
+**Fitting a row.** The model reads at most 512 tokens per question, instructions and options
+included, and Ollama refuses a longer state with a 400 instead of cutting it. quack has no
+tokenizer for the model, so `Asker::ask` sends a row's whole state (capped at 4,096
+characters) first, and only a 400 or 413 starts a search, for that row alone, over the
+longest prefix the model accepts (at most 8 requests, stopping within 64 characters of the
+limit once a prefix was accepted). `truncated` is therefore exact: it is true only when the
+text sent was shorter than the row's. The characters that fit vary 24 times with the
+content (2,509 of English, 535 of UUIDs, 105 of CJK), which is why nothing is shared between
+rows. `DecisionModel::asker` first sends two probes: a one-character state, whose refusal
+means the set itself is unusable (`DecisionRefused`, with the server's words), and about 200
+tokens of English, whose refusal means the questions leave too little room for text. Any
+other refusal, a 5xx, or a transport failure fails the run; a row refused at every length,
+while the set still passes a probe again, is `Unfit`: not written, counted `skipped`, and
+tried by the next run.
+
+**Labelling a table.** A `Classification` (table, one to eight text columns, an optional key,
+a `QuestionSet`, and `rows`: `missing` or `all`) is the one request every interface sends
+(`quack classify`, `/classify`, `POST .../tables/classify`, the Tables page's Label rows form,
+MCP `classify`, the agent's `classify_rows`). A run writes `<table>_<set name>`, one row per
+source row:
+
+| Column | Type | Contents |
+|---|---|---|
+| the key | the key's type | the source key, selected from the source so its type and collation match |
+| `NAME` (choice) | `VARCHAR` | the chosen option |
+| `NAME_p`, `NAME_confidence` | `DOUBLE` | the chosen option's probability, and how concentrated the probabilities are (not the chance it is right) |
+| `NAME` (score) | `DOUBLE` | the probability-weighted level |
+| `NAME_level` | `INTEGER` | the most probable level, from 0 |
+| `NAME` (noul) | `DOUBLE` | the probability of true |
+| `truncated` | `BOOLEAN` | the row's text was cut to fit the model |
+
+The key is `--key`, or an id column (`id`, a name ending in `_id` in any case, or ending in
+`Id` after a lowercase letter, as `TableProfile::is_id_name` says) whose values are all present
+and all different and read back from their text unchanged. Any other column is
+refused with the columns that could serve, never picked: a text key would copy the text into
+the output, and a timestamp that later repeats would leave the new row unlabelled for good.
+The output has a `PRIMARY KEY` on the key and rows go in with `ON CONFLICT DO NOTHING`, so a
+key is never twice there. The output is a document with source `classify`, listed with the
+tables, deleted with the document, and not replaceable by a file.
+
+The run reads the source a page of 256 by keyset on the key (never `OFFSET`) on a reader
+connection, asks the questions about each row, and writes the page in one transaction, so a
+cancel or a failure keeps every row already labelled. A run labels the rows whose key the
+output does not hold yet. Rows whose text changed after they were labelled are not labelled
+again; `--all` labels every row again into a hidden `_quack_stage_<output>` table that
+replaces the output in one transaction when the run completes, so the old labels serve until
+then, and a cancel or failure drops the stage. One run labels into one output at a time
+(`Writer::claim`, since each workspace has one writer in the process and the file lock allows
+one process).
+
+Each run is recorded in `_quack_classifications` with the definition it ran under: source,
+key and its type, text columns, questions, and the model's weights digest (`/api/tags`, so `ollama pull`
+of a new version is a change and respelling the model is not). The definition in force for
+an output is the newest run for it, leaving out a run that labels everything again and did
+not complete. A run that adds rows to an output labelled under another definition is
+refused (`definition_changed`) and says to use `--all`; a first run on a missing output is
+recorded as `missing` even when `all` was asked, so a later run compares against it. The
+check is made only when the output exists. A run starts by marking `interrupted` every run
+recorded as running that no run in the process holds (the claims are the registry of live
+runs), so a process that died leaves nothing running for good.
+
+**Where the meaning is.** `describe_table`, the Tables page, the prompt, and the REST and MCP
+descriptions give a labels table's columns a meaning from the definition in force ("expected
+level, 0 Not urgent, 1 Soon, 2 Blocking or deadline"), and the description carries
+`labelled_by`, the run. `quack classify list`, `/classify list`, and `GET
+.../tables/classify` list the runs.
+
+**Who waits.** A background job (the CLI, the terminal, REST) labels any size. The agent's
+`classify_rows` and MCP `classify` wait for the run, so they refuse one with more rows times
+questions than `[decision].interactive_budget` (1,500) answers: the refusal names the count,
+`quack classify`, and `POST .../tables/classify`. A preview (1 to 100 rows) writes nothing and
+needs only the read role; the interfaces that wait hold it to the same budget. The agent's run goes through `WritePolicy` like
+any write (`Turn::permit_write`), and its permission prompt shows the action as comment lines,
+the run and then each question with its instructions, each on one line: `-- label 104233 rows
+of support_tickets into support_tickets_ticket_triage (new table) with ollama/laya`, then
+`-- department: Which department should handle this ticket?`, with `(adds rows)` or
+`(replaces its labels)` for an existing output.
+
+The runs of the agent and MCP are jobs of the process's queue (kind `classify`), so the Jobs
+page and `/jobs` list them, the queue's shutdown cancels them and waits for them, and they
+finish and record their end even when the turn is cancelled or the MCP client leaves. The server
+audits each at its end under the run id; `quack -p` and `quack mcp` keep a queue of their own
+and wait for it before they exit.
+
+The decision model is also meant to check citations, tag documents, screen chunks before
+graph extraction, and accept graph merges; none of that is built.
+
 ## 7. The Agent
 
 ### 7.1 Loop
@@ -1656,12 +1785,13 @@ model (`test-utils`, a dev-dependency feature only).
 | `find_path(from, to, max_hops=4)` | none | Shortest relation path between two entities |
 | `create_chart(sql, kind, x, y, title)` | none | Runs the SQL, emits a chart spec (section 9) |
 | `view_image(document, question)` | none | Sends one image document and the question to the chat model; returns its answer, citable as the document's first chunk, and counts as reading document text |
+| `classify_rows(table, text_columns, key?, question_set, rows?, preview?)` | preview: none; run: prompt | Labels a table's text with the decision model into `<table>_<set name>` (section 6.6); `preview` labels the first rows and writes nothing; a run goes through the write policy and is refused beyond `[decision].interactive_budget` answers |
 
 `search_graph` and `find_path` register only when the graph has nodes; `describe_class`
 whenever an ontology exists, since the prompt's ontology block is capped, and it names the
 class's SQL view with its typed columns; `find_tables` only when the workspace has more than
 25 tables (graph views not counted); `view_image` only when the chat model is marked
-`images = true` and a ready document is an image. The rest register
+`images = true` and a ready document is an image; `classify_rows` only when `[decision].model` is set and the workspace's provider list allows it. The rest register
 in every workspace, and the prompt tells the model what the workspace holds. An `export`
 tool (`COPY ... TO` under `files/`) is not built (section 17).
 
@@ -2372,6 +2502,9 @@ POST   /api/v1/workspaces/{id}/tables/describe  {name}: columns with their meani
 GET    /api/v1/workspaces/{id}/tables/schema    every user table's columns, each name as SQL writes it (capped)
 PUT    /api/v1/workspaces/{id}/tables/note      {name, note}: set the table's note (blank removes it); member or owner
 POST   /api/v1/workspaces/{id}/tables/retype    {name, column, type}: give a column a type, every value converting (422 otherwise); member or owner
+POST   /api/v1/workspaces/{id}/tables/classify   {table, text_columns, key?, question_set, rows?}: label a table's text with the decision model (section 6.6) -> 202 {run, job, outline}; member or owner;
+                                                 ?preview=N (1 to 100) answers 200 with the first rows' labels and writes nothing, for a viewer too
+GET    /api/v1/workspaces/{id}/tables/classify   the runs that labelled tables, newest first (viewer)
 POST   /api/v1/workspaces/{id}/graph/search    {entity?, class?, relation?, hops?}
 POST   /api/v1/workspaces/{id}/graph/path      {from, to, max_hops?}
 GET    /api/v1/workspaces/{id}/graph/status
@@ -2445,8 +2578,8 @@ Every error response under `/api/` is `{"error": "...", "code": "..."}`, and the
 stable `snake_case` value (`ErrorCode` in `server/error.rs`, listed as an enum in the
 document's components): a client branches on it, never on `error`, which is for a person
 and may change in any release. Core errors and failed turns map to specific codes
-(`auth_required`, `workspace_locked`, `no_chat_model`, `table_taken`, `unknown_value`,
-`query_timeout`, `provider_refused`, ...); an error with only a status carries that
+(`auth_required`, `workspace_locked`, `no_chat_model`, `no_decision_model`, `table_taken`, `unknown_value`,
+`query_timeout`, `provider_refused`, `classify_refused`, `definition_changed`, `classify_running`, `too_large_to_wait`, ...); an error with only a status carries that
 status's code (`bad_request`, `forbidden`, `not_found`, `conflict`, `busy`, ...). A user's
 own statement or import that fails is 422 with `sql_failed` or `import_failed` unless a
 more specific code applies. Errors the framework builds itself (a body that is not JSON, a
@@ -2493,7 +2626,7 @@ and returns its `session_id`; passing the id back continues it, and `document_id
 the question to documents. A turn that fails before recording anything leaves no session.
 `search` takes `document_ids`, `entity`, `filters`, `mode`, and `explain`, as REST does.
 
-Tools: `query`, `search`, `sql`, `list_tables`, `describe_table` (the REST describe shape: meanings, note, profile, warnings, measures), `list_documents` (REST's page: `after`, `limit`, and `{documents, next, total}`), and,
+Tools: `query`, `search`, `sql`, `classify` (a table's text labelled by the decision model: `preview` for any connection, a run only where the connection may write, and only up to `[decision].interactive_budget` answers), `list_tables`, `describe_table` (the REST describe shape: meanings, note, profile, warnings, measures), `list_documents` (REST's page: `after`, `limit`, and `{documents, next, total}`), and,
 once the graph has nodes, `search_graph` and `find_path`. Each answers with structured
 content plus text. Refusals (a write without permission, an internal table, a missing
 table) are tool errors the client model can read. Resources:
@@ -2525,7 +2658,7 @@ into text already typed it is inserted like any other paste.
 
 Slash commands: `/help`, `/tables [TABLE] [--note TEXT] [--retype COL=TYPE]` (`quack tables`'s
 arguments and output), `/sql`, `/ingest PATH` (`/attach`),
-`/import`, `/docs`, `/search QUERY` (each hit's leg ranks, then both legs and the rerank
+`/import`, `/classify TABLE --text COLUMN[,COLUMN] --questions FILE [--key COLUMN] [--preview N] [--all]` (or `/classify list`; a job, as `quack classify`), `/docs`, `/search QUERY` (each hit's leg ranks, then both legs and the rerank
 outcome), `/scope [DOCUMENT..]` (limits the next questions to those documents, as the web
 chat's document picker limits one, until `/scope` with none; the header shows it), `/pin`, `/unpin`, `/delete` (asks `y`/`n` first), `/ontology ...` and `/graph ...`, `/graph
 ENTITY`, `/path`, `/context [import FILE | export FILE]`, `/okf DIR`, `/saved [list | add
@@ -2643,6 +2776,8 @@ quack saved list [--format text|json] | add NAME --from-session ID [--message N]
 quack import URL --table T (--from SOURCE_TABLE | --query SQL) [--limit N] [--types COL=TYPE]
             [-H 'NAME: VALUE'] [--bearer-env VAR] [--json-pointer /PATH] [--save NAME [--store-credential]]
 quack import list [--format text|json] | refresh NAME | remove NAME
+quack classify TABLE --text COLUMN[,COLUMN] --questions FILE [--key COLUMN] [--preview N] [--all] [--format text|json]
+quack classify list [--format text|json]
 quack okf export DIR|-
 quack auth login PROVIDER [--device-code] | status [PROVIDER] | logout PROVIDER
 quack auth jwks [PROVIDER] [--rotate [--activate]]
@@ -3046,6 +3181,11 @@ extraction_concurrency = 1              # chunks extracted at once; Ollama serve
 reader_pool_size = 4                    # reader connections per workspace handle, round-robined
 # effort = "high"                       # chat turns: none, minimal, low, medium, high, xhigh, max; unset = model default
 # background_effort = "low"             # graph extraction and the ontology document pass
+
+[decision]
+# model = "ollama/laya"       # a decision model on a type = "ollama" provider (ollama pull laya); unset, nothing is labelled
+keep_alive_minutes = 30       # how long a request asks Ollama to keep it loaded
+interactive_budget = 1500     # answers (rows times questions) an agent turn or MCP call labels or previews while it waits; a larger run is refused
 
 [import]
 max_rows = 1000000

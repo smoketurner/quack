@@ -649,7 +649,8 @@ impl Lane<'_> {
             DocumentSource::Upload
             | DocumentSource::Path
             | DocumentSource::Stdin
-            | DocumentSource::Import => None,
+            | DocumentSource::Import
+            | DocumentSource::Classify => None,
         };
         let (source, old) = (self.source, self.replaces.cloned());
         let config = app.config.clone();

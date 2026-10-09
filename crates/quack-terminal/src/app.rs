@@ -25,6 +25,7 @@ use quack_core::analysis::events::{
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::search::{DocumentScope, DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
+use quack_core::classify::LabelJobs;
 use quack_core::config::Config;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::follow_up::FollowUp;
@@ -67,6 +68,7 @@ use crate::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
 use quack_cli::Confirm;
 use quack_cli::ModeArg;
 use quack_cli::TextOrJson;
+use quack_cli::classify_cli::ClassifyCommand;
 use quack_cli::embeddings_cli::{self, EmbeddingsAction};
 use quack_cli::graph_cli::GraphAction;
 use quack_cli::ontology_cli::{self, OntologyAction};
@@ -573,6 +575,7 @@ enum CliJob {
     ContextExport(String),
     Import(ImportRequest),
     SavedImport(ImportAction),
+    Classify(ClassifyCommand),
     Ingest(PathBuf),
     Search(String),
 }
@@ -586,6 +589,7 @@ impl CliJob {
             Self::Saved(_) => JobKind::Sql,
             Self::Okf(_) | Self::ContextExport(_) => JobKind::Export,
             Self::ContextImport(_) | Self::Import(_) | Self::SavedImport(_) => JobKind::Import,
+            Self::Classify(_) => JobKind::Classify,
             Self::Ingest(_) => JobKind::Ingest,
             Self::Search(_) => JobKind::Search,
         }
@@ -603,6 +607,7 @@ impl CliJob {
             Self::ContextExport(_) => String::from("Exporting the context"),
             Self::Import(request) => format!("import {}", request.url),
             Self::SavedImport(action) => action.label(),
+            Self::Classify(command) => command.label(),
             Self::Search(query) => format!("search {}", one_line(query)),
             Self::Ingest(path) => path.file_name().map_or_else(
                 || path.display().to_string(),
@@ -629,6 +634,7 @@ impl CliJob {
             | Self::ContextImport(_)
             | Self::ContextExport(_)
             | Self::SavedImport(_)
+            | Self::Classify(_)
             | Self::Search(_) => {
                 Message::new(MessageKind::System, format!("{}\u{2026}", self.label()))
             }
@@ -685,15 +691,7 @@ impl CliJob {
                 )
                 .await?;
             }
-            Self::Okf(dir) => {
-                let name = env.workspace_name.clone();
-                let target = dir.clone();
-                let summary = env
-                    .db
-                    .run(move |db| okf::export(db, &name, &mut DirSink::new(Path::new(&target))))
-                    .await?;
-                return Ok(format!("Wrote {} files to {dir}.", summary.files));
-            }
+            Self::Okf(dir) => return Self::okf(env, dir).await,
             Self::ContextImport(file) => {
                 let text = std::fs::read_to_string(&file)
                     .map_err(|e| anyhow!("cannot read {file}: {e}"))?;
@@ -733,10 +731,24 @@ impl CliJob {
                     )
                     .await?;
             }
+            Self::Classify(command) => {
+                command.run(&env.config, &env.db, &mut out, control).await?;
+            }
             Self::Ingest(path) => return Self::ingest(env, &path, control).await,
             Self::Search(query) => return Self::search(env, &query).await,
         }
         Ok(String::from_utf8_lossy(&out).trim_end().to_owned())
+    }
+
+    /// `/okf DIR`: the workspace as an Open Knowledge Format bundle.
+    async fn okf(env: &JobEnv, dir: String) -> Result<String> {
+        let name = env.workspace_name.clone();
+        let target = dir.clone();
+        let summary = env
+            .db
+            .run(move |db| okf::export(db, &name, &mut DirSink::new(Path::new(&target))))
+            .await?;
+        Ok(format!("Wrote {} files to {dir}.", summary.files))
     }
 
     /// `/search QUERY`: the hits with their rank in each leg, then each
@@ -2155,6 +2167,7 @@ impl App {
             SlashCommand::Export { flags, file } => self.export_session(flags.format(), file),
             SlashCommand::Okf { dir } => self.run_job(CliJob::Okf(dir)),
             SlashCommand::Embeddings { action } => self.run_job(CliJob::Embeddings(action)),
+            SlashCommand::Classify(command) => self.run_job(CliJob::Classify(command)),
             SlashCommand::Saved { action } => {
                 let list = SavedAction::List {
                     format: TextOrJson::Text,
@@ -2953,6 +2966,7 @@ impl App {
             .iter()
             .map(|d| d.id.to_string())
             .collect();
+        let labelling = LabelJobs::new(self.jobs.clone()).workspace(self.workspace_id.clone());
         let spec = JobSpec::new(JobKind::Chat, one_line(&message))
             .workspace(self.workspace_id.clone())
             .lane(Lane::serial(&LaneKey::Session(session_id.clone())));
@@ -2966,6 +2980,8 @@ impl App {
                 policy,
                 message: &message,
                 documents: &documents,
+                user: None,
+                labelling,
                 sink,
                 cancel: ctx.cancel_token(),
             })
@@ -3044,7 +3060,10 @@ impl App {
 
     fn handle_background_result(&mut self, job: JobId, result: BackgroundResult) {
         if self.jobs.get(job).is_some_and(|info| {
-            matches!(info.kind, JobKind::Sql | JobKind::Ingest | JobKind::Import)
+            matches!(
+                info.kind,
+                JobKind::Sql | JobKind::Ingest | JobKind::Import | JobKind::Classify
+            )
         }) {
             self.refresh_sql_schema();
         }

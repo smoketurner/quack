@@ -8,6 +8,7 @@ pub mod acting;
 pub mod after_turn;
 pub mod bedrock;
 pub mod chat_model;
+pub mod decision;
 pub mod egress;
 pub mod memory;
 pub mod oauth;
@@ -37,7 +38,8 @@ use crate::analysis::rerank::{RERANK_PROMPT, RERANK_TIMEOUT, RerankAnswer, Reran
 use crate::analysis::search::DocumentScope;
 use crate::analysis::text_to_sql::{PromptOptions, Window};
 use crate::analysis::tools::Rerank;
-use crate::analysis::tools::{ReaderDb, SharedDb};
+use crate::analysis::tools::{Labeller, ReaderDb, SharedDb};
+use crate::classify::LabelJobs;
 use crate::config::{
     BaseUrl, BedrockApi, BedrockEndpoint, Config, Effort, ModelRef, ModelSettings, ProviderAuth,
     ProviderConfig, ProviderName, ProviderType, RerankMode, config_file_path,
@@ -46,7 +48,7 @@ use crate::embedding::{Embedder, EmbeddingModel, Profile};
 use crate::error::{Error, Result};
 use crate::extraction::{Extract, ExtractFuture};
 use crate::graph::extract::{Extraction, ExtractionAnswer};
-use crate::ids::SessionId;
+use crate::ids::{SessionId, UserId};
 use crate::ontology::Ontology;
 use crate::ontology::documents::{self, OpenExtraction};
 use crate::priority::Priority;
@@ -956,6 +958,9 @@ pub(crate) struct OllamaRunningModel {
     /// Bytes on disk (`/api/tags`) or in memory (`/api/ps`).
     #[serde(default)]
     size: u64,
+    /// The weights' digest (`/api/tags`).
+    #[serde(default)]
+    pub(crate) digest: String,
 }
 
 type OllamaCallError = Box<dyn std::error::Error + Send + Sync>;
@@ -975,6 +980,12 @@ impl OllamaEndpoint {
         let bytes: Vec<u8> = response.into_body().await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
+
+    /// What `POST /api/show` says about `model`.
+    async fn show(&self, model: &str) -> std::result::Result<OllamaShow, OllamaCallError> {
+        let body = serde_json::to_vec(&serde_json::json!({ "model": model }))?;
+        self.call(http::Method::POST, "api/show", body).await
+    }
 }
 
 impl OllamaRunningModels {
@@ -983,9 +994,16 @@ impl OllamaRunningModels {
         endpoint.call(http::Method::GET, "api/ps", Vec::new()).await
     }
 
-    /// Whether `model` is among the loaded ones; a bare name matches its
-    /// `:latest` tag, which is how Ollama reports it.
-    pub(crate) fn holds(&self, model: &str) -> bool {
+    /// The models Ollama has pulled (`GET /api/tags`).
+    async fn pulled(endpoint: &OllamaEndpoint) -> std::result::Result<Self, OllamaCallError> {
+        endpoint
+            .call(http::Method::GET, "api/tags", Vec::new())
+            .await
+    }
+
+    /// The entry for `model`; a bare name matches its `:latest` tag, which
+    /// is how Ollama reports it.
+    pub(crate) fn find(&self, model: &str) -> Option<&OllamaRunningModel> {
         let wanted = if model.contains(':') {
             model.to_owned()
         } else {
@@ -993,7 +1011,12 @@ impl OllamaRunningModels {
         };
         self.models
             .iter()
-            .any(|m| m.name == wanted || m.model == wanted || m.name == model || m.model == model)
+            .find(|m| m.name == wanted || m.model == wanted || m.name == model || m.model == model)
+    }
+
+    /// Whether `model` is among the listed ones.
+    pub(crate) fn holds(&self, model: &str) -> bool {
+        self.find(model).is_some()
     }
 }
 
@@ -1006,6 +1029,8 @@ pub enum OllamaCapability {
     Vision,
     Embedding,
     Thinking,
+    /// A decision model, served on `/v1/systemone`.
+    Decision,
     #[serde(other)]
     Other,
 }
@@ -1041,17 +1066,12 @@ impl OllamaModel {
             .ok_or_else(|| Error::Config(format!("no provider named '{name}' is configured")))?;
         let endpoint = OllamaEndpoint::build(config, name, provider).await?;
         let failed = |e: OllamaCallError| Error::Llm(format!("ollama at '{name}': {e}"));
-        let pulled: OllamaRunningModels = endpoint
-            .call(http::Method::GET, "api/tags", Vec::new())
+        let pulled = OllamaRunningModels::pulled(&endpoint)
             .await
             .map_err(failed)?;
         let mut models = Vec::with_capacity(pulled.models.len());
         for pulled in pulled.models {
-            let body = serde_json::to_vec(&serde_json::json!({ "model": pulled.name }))?;
-            let shown: OllamaShow = endpoint
-                .call(http::Method::POST, "api/show", body)
-                .await
-                .map_err(failed)?;
+            let shown = endpoint.show(&pulled.name).await.map_err(failed)?;
             models.push(Self {
                 name: pulled.name,
                 size: pulled.size,
@@ -1297,6 +1317,11 @@ pub struct TurnRequest<'a> {
     /// The documents the person limits the question to, each by id, id
     /// prefix, file name, or title; empty for the whole workspace.
     pub documents: &'a [String],
+    /// The server user asking, recorded on any table they have the agent
+    /// label; `None` on the command line and the terminal.
+    pub user: Option<&'a UserId>,
+    /// The job queue a table the agent labels is labelled through.
+    pub labelling: LabelJobs,
     pub sink: EventSink,
     pub cancel: CancellationToken,
 }
@@ -1321,6 +1346,8 @@ impl TurnRequest<'_> {
             policy,
             message,
             documents,
+            user,
+            labelling,
             sink,
             cancel,
         } = self;
@@ -1332,9 +1359,10 @@ impl TurnRequest<'_> {
             chat,
             embedding_model,
             rerank_model,
+            labeller,
             prompt,
             history,
-        } = match start_turn(config, &db, session_id, policy, documents).await {
+        } = match start_turn(config, &db, session_id, policy, documents, labelling, user).await {
             Ok(started) => started,
             Err(e) => {
                 drop(sink.send(AgentEvent::Failed(TurnFailure::from(&e))));
@@ -1361,6 +1389,7 @@ impl TurnRequest<'_> {
             message,
             asked,
             cancel: cancel.clone(),
+            labeller,
         };
         let turn = Priority::Interactive.scope(dispatch(config, chat, analysis, sink.clone()));
         // The turn goes first: once the model is streaming, it sees the
@@ -1409,6 +1438,8 @@ struct StartedTurn<'c> {
     embedding_model: Option<Embeddings>,
     /// `None` unless `[retrieval].rerank = "reranker"`.
     rerank_model: Option<RerankModel>,
+    /// `None` without a decision model the workspace may use.
+    labeller: Option<Labeller>,
     prompt: PromptOptions,
     /// The session's earlier messages, replayed to the model.
     history: Vec<Message>,
@@ -1420,12 +1451,15 @@ async fn start_turn<'c>(
     session_id: &SessionId,
     policy: WritePolicy,
     documents: &[String],
+    labelling: LabelJobs,
+    user: Option<&UserId>,
 ) -> Result<StartedTurn<'c>> {
     let chat = config.chat_model_ref()?;
     // Without an embedding provider the agent still runs: document search
     // is keyword-only and graph entry is exact (issue #58).
     let embedding_model = Embeddings::from_config(config).await?;
     let rerank_model = RerankModel::from_config(config).await?;
+    let labeller = Labeller::from_config(config, labelling, user).await?;
     // On the blocking pool, in the writer's interactive line: an async
     // worker never waits on the connection.
     let session_id = session_id.to_owned();
@@ -1461,6 +1495,7 @@ async fn start_turn<'c>(
         chat,
         embedding_model,
         rerank_model,
+        labeller,
         prompt,
         history,
     })

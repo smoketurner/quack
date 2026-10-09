@@ -14,6 +14,7 @@ use quack_core::jobs::JobNumber;
 use quack_core::storage::workspace::{SqlName, looks_like_direct_sql};
 
 use quack_cli::ImportAction;
+use quack_cli::classify_cli::ClassifyCommand;
 use quack_cli::embeddings_cli::EmbeddingsAction;
 use quack_cli::graph_cli::GraphAction;
 use quack_cli::ontology_cli::OntologyAction;
@@ -84,6 +85,11 @@ pub(crate) enum SlashCommand {
         #[arg(long, value_name = "POINTER")]
         json_pointer: Option<JsonPointer>,
     },
+    /// Label a table's text with a decision model into a new table
+    /// (`quack classify`): TABLE --text COLUMN[,COLUMN] --questions FILE
+    /// [--key COLUMN] [--preview N] [--all], or `list` for the runs
+    #[command(name = "/classify", disable_help_flag = true)]
+    Classify(ClassifyCommand),
     /// List ingested documents
     #[command(name = "/docs")]
     Docs,

@@ -42,6 +42,7 @@ fn server_on((config, db): &(Config, SharedDb), policy: WritePolicy) -> McpServe
         policy,
         user_id: None,
         auditor: Auditor::None,
+        jobs: JobQueue::new(10),
     })
 }
 
@@ -91,6 +92,7 @@ async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
         policy: WritePolicy::Allow(Approver::Nobody),
         user_id: None,
         auditor: Auditor::None,
+        jobs: JobQueue::new(10),
     });
     let result = server
         .query(
@@ -301,6 +303,7 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
         policy: WritePolicy::Deny,
         user_id: None,
         auditor: Auditor::None,
+        jobs: JobQueue::new(10),
     });
     let ask = |session_id: Option<&str>, mode: Option<&str>| {
         Parameters(QueryArgs {
@@ -457,5 +460,122 @@ fn resource_uris_round_trip() {
     assert_eq!(
         WorkspaceResource::OntologySchema.uri(),
         "quack://workspace/ontology/schema"
+    );
+}
+
+/// `classify` previews for any connection, and runs only where writes are
+/// allowed and only up to `[decision].interactive_budget` answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn classify_previews_anywhere_and_runs_where_writes_are_allowed_up_to_the_budget() {
+    use quack_core::classify::{Classification, Rows};
+
+    let stub = quack_testkit::DecisionStub::start().await;
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut config = Config::parse(&format!(
+        "[providers.local]\ntype = \"ollama\"\nbase_url = \"{}\"\nmax_retries = 0\n\
+         [decision]\nmodel = \"local/laya\"\ninteractive_budget = 12\n",
+        stub.base_url()
+    ))
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    config.general.data_dir = dir.path().to_path_buf();
+    let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+    db.execute_statement(
+        "CREATE TABLE tickets AS SELECT range AS id, 'billing issue' AS subject FROM range(5)",
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    db.execute_statement("CREATE TABLE many AS SELECT range AS id, 'a' AS subject FROM range(50)")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
+    let shared = (config, db);
+    let args = |table: &str, preview: Option<u32>| ClassifyArgs {
+        classification: Classification {
+            table: table.to_owned(),
+            text_columns: vec![String::from("subject")],
+            key: None,
+            question_set: serde_json::from_value(serde_json::json!({
+                "name": "triage",
+                "questions": {
+                    "department": {"type": "choice", "instructions": "Which?",
+                                   "criteria": {"billing": null, "technical": null}},
+                    "churn": {"type": "noul", "instructions": "Will they cancel?"}}
+            }))
+            .unwrap_or_else(|e| fail(&e.to_string())),
+            rows: Rows::Missing,
+        },
+        preview,
+    };
+
+    let read_only = server_on(&shared, WritePolicy::Deny);
+    let preview = read_only
+        .classify(Parameters(args("tickets", Some(2))), Extensions::default())
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert_eq!(field(&preview, "labelled"), 2, "{preview:?}");
+    assert_eq!(field(&preview, "remaining"), 5);
+    let denied = read_only
+        .classify(Parameters(args("tickets", None)), Extensions::default())
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert!(error_text(&denied).contains("cannot write"), "{denied:?}");
+
+    let writer = server_on(&shared, WritePolicy::Allow(Approver::Nobody));
+    let run = writer
+        .classify(Parameters(args("tickets", None)), Extensions::default())
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert_eq!(field(&run, "labelled"), 5, "{run:?}");
+    assert_eq!(field(&run, "status"), "completed");
+    assert_eq!(field(&run, "output_table"), "tickets_triage");
+
+    let too_big = writer
+        .classify(Parameters(args("many", None)), Extensions::default())
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    let text = error_text(&too_big);
+    assert!(
+        text.contains("labelling 50 rows of many with 2 questions is too long to wait for here")
+            && text.contains("quack classify"),
+        "{text}"
+    );
+    let fits = writer
+        .classify(Parameters(args("many", Some(5))), Extensions::default())
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert_eq!(
+        field(&fits, "labelled"),
+        5,
+        "a preview has no budget: {fits:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn classify_without_a_decision_model_says_what_to_set() {
+    use quack_core::classify::{Classification, Rows};
+
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let server = server(dir.path(), WritePolicy::Allow(Approver::Nobody));
+    let refused = server
+        .classify(
+            Parameters(ClassifyArgs {
+                classification: Classification {
+                    table: String::from("t"),
+                    text_columns: vec![String::from("c")],
+                    key: None,
+                    question_set: serde_json::from_value(serde_json::json!({
+                        "name": "q",
+                        "questions": {"x": {"type": "noul", "instructions": "Is it?"}}
+                    }))
+                    .unwrap_or_else(|e| fail(&e.to_string())),
+                    rows: Rows::Missing,
+                },
+                preview: None,
+            }),
+            Extensions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert!(
+        error_text(&refused).contains("[decision].model"),
+        "{refused:?}"
     );
 }

@@ -114,6 +114,7 @@ cargo run --bin quack -- okf export DIR|-                                       
 cargo run --bin quack -- embeddings refresh [-y]                                # refresh vectors a changed embedding model, width, or prefix left stale
 cargo run --bin quack -- import sqlite:/path/src.db --table t --from orders [--types col=TYPE]   # snapshot a SQLite query, an http(s) data file (-H 'Name: value', --bearer-env VAR, --json-pointer /data), or s3://bucket/key as a table
 cargo run --bin quack -- import ... --save NAME [--store-credential] | import list | refresh NAME | remove NAME   # import::SavedImport in _quack_imports; a refresh replaces the table only when the source changed; cron schedules it
+cargo run --bin quack -- classify TABLE --text COL[,COL] --questions FILE [--key COL] [--preview N] [--all] | classify list   # a decision model labels each row's text into <table>_<set>, joined back by the key; a re-run labels only new keys, --all replaces the labels (design doc 6.6)
 cargo run --bin quack -- auth login|status|logout PROVIDER ; auth jwks [PROVIDER] [--rotate [--activate]]  # OAuth tokens; a client's public key
 cargo run --bin quack -- auth register [--issuer URL] [--device-code|--token-env VAR|--open] [--replace] [--print] | unregister   # RFC 7591/7592 client registration
 cargo run --bin quack -- config [--changed] [--format json]                      # every recognized setting, its value and origin, the file's unknown keys, the env vars read
@@ -532,6 +533,29 @@ the rows load through the normal ingestion path as a document with source `impor
 redacted URL as title. S3 and `--bearer-env` use the server's own credentials, so `quack serve`
 with logins refuses them (`Error::ServerCredentials`, 403) unless
 `[import].allow_server_credentials`. No `ATTACH`: the workspace never reaches out at query time.
+
+A decision model (`[decision].model = "ollama/laya"`, `quack_core::llm::decision`) labels text
+without generating any: `DecisionModel` posts questions about a `State` to Ollama's
+`/v1/systemone` through the provider's `OllamaEndpoint` and `LimitedHttp` (rig has no client for
+the route), `Questions` is checked once when built, and `Asker::ask` sends a row's whole state
+first and searches for the longest prefix the model accepts only after a 400 or 413, so
+`Answers::truncated` is exact; `DecisionModel::asker` probes the set (and that it leaves room for
+text) before any row. `quack_core::classify` turns a `Classification` (table, text columns, key,
+`QuestionSet`, `Rows::Missing | All`) into `<table>_<set>` with the source's key as its
+`PRIMARY KEY`: pages of 256 by keyset on a reader clone, one transaction a page, a cancel or
+failure keeps the rows written, `--all` stages into `_quack_stage_<output>` and swaps, one run per
+output (`Writer::claim`), and `_quack_classifications` records each run's definition (the
+weights' digest included), which a run that adds rows must match. Only an id-like column is picked
+as the key (`TableProfile::is_id_name`). `describe_table` gives the output's columns their meaning
+and `labelled_by`. A job (CLI, terminal, REST) labels any size; the agent's `classify_rows`
+(a write through `Turn::permit_write`) and MCP `classify` wait, so they refuse more than
+`[decision].interactive_budget` answers (rows times questions). Their runs are jobs of the
+process's `JobQueue` (`Classification::run_as_job`, `LabelJobs` on the `TurnRequest`): listed
+with the other jobs, cancelled by the turn's token or the queue's shutdown, finished and
+recorded even when the turn or the MCP client is gone, and audited at their end under the run id
+by the `OnEnd` hook the server passes (`Access::run_audit`). `quack -p` and `quack mcp` have a
+queue of their own and wait for it before they exit. The decision tests share
+`quack-testkit`'s `DecisionStub`, which `quack-core` includes by path.
 
 `quack serve` (`crates/quack-server/`) is a thin axum client of core: `auth.rs` turns a
 bearer (login session or API token), the session cookie, or `--local` into an `Identity`

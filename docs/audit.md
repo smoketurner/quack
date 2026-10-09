@@ -66,6 +66,7 @@ API Activity event with that name.
 | `saved_run` | A saved question runs without the model | `allowed`, `error` | API: Read |
 | `table_note` | A table's note is set or removed (`PUT .../tables/note`, the Tables page) | `allowed`, `error` | API: Update |
 | `retype` | A table column is given another type (`POST .../tables/retype`, the Tables page's Fix type) | `allowed`, `error` | API: Update |
+| `classify` | A table's text is labelled by the decision model: a run (`POST .../tables/classify`, the Tables page, `quack classify` on a server's behalf) writes a row at its start and one at its end under the run id, a preview (`?preview=N`) one row, and an MCP call or a run inside an agent turn one row at the run's end under the run id, written by the job itself so a cancelled turn or a client that left still leaves it (the run records the user who started it); a refused provider or request is `denied` or `error` | `allowed`, `denied` (the workspace does not allow the provider, or the connection cannot write), `error` | API: Create |
 
 Channels are `web` (a browser session or local mode), `api` (a bearer), `mcp`, `tui`,
 `desktop`, and `cli` (an operator at the shell, whose rows carry no user). The client

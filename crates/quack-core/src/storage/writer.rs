@@ -21,7 +21,7 @@
 //! thread until it comes back, so work that needs the file closed (a
 //! snapshot's copy, a delete) can close it while every later closure waits.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{JoinHandle, ThreadId};
@@ -68,9 +68,56 @@ impl Lines {
     }
 }
 
+/// Work of which one run at a time may go on in a workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Claimed {
+    /// Labelling the rows of a table into this output table, named in
+    /// lower case.
+    Classify(String),
+}
+
+/// The right to do the [`Claimed`] work, held until dropped.
+pub struct Claim {
+    shared: Arc<Shared>,
+    what: Claimed,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.shared
+            .claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.what);
+    }
+}
+
+/// Which work is claimed right now; see [`Writer::claims`].
+#[derive(Clone)]
+pub struct Claims {
+    shared: Arc<Shared>,
+}
+
+impl Claims {
+    /// The output tables a run is labelling into right now, in lower case.
+    #[must_use]
+    pub fn labelling(&self) -> Vec<String> {
+        self.shared
+            .claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|claimed| match claimed {
+                Claimed::Classify(output) => output.clone(),
+            })
+            .collect()
+    }
+}
+
 struct Shared {
     lines: Mutex<Lines>,
     ready: Condvar,
+    claims: Mutex<HashSet<Claimed>>,
 }
 
 impl Shared {
@@ -193,6 +240,7 @@ impl Writer {
         let shared = Arc::new(Shared {
             lines: Mutex::new(Lines::default()),
             ready: Condvar::new(),
+            claims: Mutex::new(HashSet::new()),
         });
         let serving = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
@@ -292,6 +340,32 @@ impl Writer {
         drop(lines);
         self.shared.ready.notify_one();
         Ok(())
+    }
+
+    /// The right to do `what`, or `None` when another run holds it. Each
+    /// workspace has one writer in the process and the file's lock allows
+    /// one process, so this keeps every interface to one run at a time.
+    #[must_use]
+    pub fn claim(&self, what: Claimed) -> Option<Claim> {
+        let fresh = self
+            .shared
+            .claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(what.clone());
+        fresh.then(|| Claim {
+            shared: Arc::clone(&self.shared),
+            what,
+        })
+    }
+
+    /// A view of the claims that a closure on the writer's thread can read,
+    /// so what it reads and what it writes are one writer step.
+    #[must_use]
+    pub fn claims(&self) -> Claims {
+        Claims {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Closures waiting (interactive, background): the writer's queue

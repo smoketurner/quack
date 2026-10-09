@@ -11,6 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::classify::ClassificationRun;
 use crate::error::{Error, Result};
 use crate::storage::workspace::{INTERNAL_PREFIX, WorkspaceDb, quote_ident};
 use crate::storage::writer::Writer;
@@ -286,6 +287,15 @@ impl Retype<'_> {
             return Err(Error::Analysis(format!(
                 "table '{}' has no column '{}'",
                 self.table, self.column
+            )));
+        }
+        if let Some(labels) = ClassificationRun::in_force(db, self.table)?
+            && labels.key_column.eq_ignore_ascii_case(self.column)
+        {
+            return Err(Error::Analysis(format!(
+                "column '{}' is the key of a table of labels, which keeps the type of the key in \
+                 '{}'; retype it there and label every row again with --all",
+                self.column, labels.source_table
             )));
         }
         let column = quote_ident(self.column);
@@ -699,6 +709,19 @@ impl TableProfile {
     #[must_use]
     pub fn column(&self, name: &str) -> Option<&ColumnProfile> {
         self.columns.iter().find(|c| c.name == name)
+    }
+
+    /// Whether a column is named like a key: `id`, a name ending in `_id`,
+    /// or a camelCase name ending in `Id` (`ticketId`). A bare upper-case
+    /// `ID` suffix does not count, since it ends words such as `PAID`.
+    #[must_use]
+    pub fn is_id_name(name: &str) -> bool {
+        name.eq_ignore_ascii_case("id")
+            || name.to_ascii_lowercase().ends_with("_id")
+            || name
+                .strip_suffix("Id")
+                .and_then(|rest| rest.chars().next_back())
+                .is_some_and(|c| c.is_ascii_lowercase())
     }
 
     /// The column whose values are all present and all different, an `id`

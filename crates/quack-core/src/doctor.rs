@@ -24,11 +24,12 @@ use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::{Error, Result as CoreResult};
 use crate::llm::bedrock;
 use crate::llm::chat_model::{ChatSettings, Wire, check_tool_calls};
+use crate::llm::decision::{DecisionModel, Instructions, Question, QuestionName, Questions};
 use crate::llm::egress::Egress;
 use crate::llm::oauth::client_key::ClientKeys;
 use crate::llm::oauth::registration::{ReadBack, Registrar, RegistrationName, registered_sections};
 use crate::llm::oauth::{KeySource, TokenManager};
-use crate::llm::{ChatClient, Embeddings, ProviderModels, RerankModel};
+use crate::llm::{ChatClient, Embeddings, OllamaCapability, ProviderModels, RerankModel};
 use crate::oidc::SignIn;
 use crate::proxy::Proxies;
 use crate::storage::control::ControlPlane;
@@ -78,6 +79,9 @@ pub enum Area {
     Embeddings,
     /// The dedicated rerank model, when `[retrieval].rerank = "reranker"`.
     Reranker,
+    /// The decision model that labels text, `[decision].model`.
+    #[serde(rename = "decision model")]
+    Decision,
     /// The model that reads images at ingest, `[ingestion].vision_model`.
     Vision,
     Server,
@@ -97,6 +101,7 @@ text_enum!(Area, "doctor area", {
     ChatModel => "chat model",
     Embeddings => "embeddings",
     Reranker => "reranker",
+    Decision => "decision model",
     Vision => "vision",
     Server => "server",
     Auth => "auth",
@@ -338,6 +343,7 @@ pub async fn run(inspection: &Inspection, options: &Options) -> Report {
         check_chat_model(&mut report, config, options.probing).await;
         check_embedding_model(&mut report, config, options.probing).await;
         check_reranker(&mut report, config, options.probing).await;
+        check_decision_model(&mut report, config, options.probing).await;
         check_vision_model(&mut report, config, options.probing).await;
         check_server(&mut report, config, control.as_ref()).await;
         check_sign_in(&mut report, config, options.probing).await;
@@ -914,6 +920,85 @@ async fn check_reranker(report: &mut Report, config: &Config, probing: Probing) 
             model.provider_name, model.model
         )),
     });
+}
+
+/// The decision model, when `[decision].model` is set: the setting
+/// resolves, the provider lists the model, the model says it is a decision
+/// model, and a one-question set is accepted.
+async fn check_decision_model(report: &mut Report, config: &Config, probing: Probing) {
+    let model = match config.decision_model_ref() {
+        Ok(Some(model)) => model,
+        Ok(None) => return,
+        Err(e) => {
+            report.push(Check::new(Area::Decision, Status::Fail, e.to_string()));
+            return;
+        }
+    };
+    check_model(report, Area::Decision, config, model, probing).await;
+    let Some(timeout) = probing.timeout() else {
+        return;
+    };
+    let probe = async {
+        let key = model
+            .provider
+            .auth
+            .credential(config, model.provider_name)
+            .await?;
+        let decision = DecisionModel::with_key(config, model, key.as_deref())?;
+        if !decision
+            .capabilities()
+            .await?
+            .contains(&OllamaCapability::Decision)
+        {
+            return Ok(false);
+        }
+        let question = Question::Noul {
+            instructions: Instructions::try_from(String::from("Is this a probe?"))?,
+            criteria: None,
+        };
+        let questions = Questions::new(vec![(
+            QuestionName::try_from(String::from("probe"))?,
+            question,
+        )])?;
+        decision.asker(&questions).await?;
+        Ok::<bool, Error>(true)
+    };
+    let outcome = match tokio::time::timeout(timeout, probe).await {
+        Ok(Ok(true)) => Check::new(
+            Area::Decision,
+            Status::Ok,
+            format!("{model}: a decision call was answered"),
+        ),
+        Ok(Ok(false)) => Check::new(
+            Area::Decision,
+            Status::Fail,
+            format!("{model}: the server does not report the decision capability"),
+        )
+        .fix(format!(
+            "decision models need Ollama 0.40.0 or later and a model whose capabilities include \
+             decision: ollama show {}",
+            model.model
+        )),
+        Ok(Err(e)) => decision_failure(model, &e),
+        Err(_) => decision_failure(
+            model,
+            &Error::Llm(format!("no answer within {} seconds", timeout.as_secs())),
+        ),
+    };
+    report.push(outcome);
+}
+
+/// A decision call that failed, with how to get the model going.
+fn decision_failure(model: ModelRef<'_>, error: &Error) -> Check {
+    Check::new(
+        Area::Decision,
+        Status::Fail,
+        format!("{model}: a decision call failed: {error}"),
+    )
+    .fix(format!(
+        "check that the Ollama at [providers.{}] is 0.40.0 or later and has the model: ollama pull {}",
+        model.provider_name, model.model
+    ))
 }
 
 /// The vision model, when `[ingestion].vision_model` is set: the setting

@@ -47,6 +47,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub ontology: OntologyConfig,
     pub graph: GraphConfig,
+    pub decision: DecisionConfig,
     pub import: ImportConfig,
     pub jobs: JobsConfig,
 }
@@ -1666,6 +1667,32 @@ text_enum!(SecureCookies, "secure_cookies value", {
     Always => "always",
 });
 
+/// The decision model that labels text (`quack_core::llm::decision`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DecisionConfig {
+    /// The decision model as `provider/model`, on a `type = "ollama"`
+    /// provider (`ollama pull laya`). Unset, nothing is labelled.
+    pub model: Option<ModelSpec>,
+    /// Minutes a request asks Ollama to keep the decision model loaded.
+    pub keep_alive_minutes: u32,
+    /// The most answers an agent turn or an MCP call labels or previews
+    /// while it waits, counted as rows times questions: 1500 is 500 rows of
+    /// three questions. A larger run is refused, and `quack classify` or
+    /// the REST route runs it as a job.
+    pub interactive_budget: u64,
+}
+
+impl Default for DecisionConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            keep_alive_minutes: 30,
+            interactive_budget: 1500,
+        }
+    }
+}
+
 /// Workspace context (the owner-written instructions) settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -2033,6 +2060,7 @@ impl Config {
             self.embedding_dimension()?;
         }
         self.rerank_model_ref()?;
+        self.decision_model_ref()?;
         // Unlike the other [analysis] numbers, this one allocates OS-level
         // DuckDB connections at workspace open, one spawn_blocking round
         // trip and one writer-mutex acquisition each — an unreasonable
@@ -2137,6 +2165,29 @@ impl Config {
                  model with vLLM, llama.cpp, or Text Embeddings Inference and add that server \
                  as a type = \"openai\" provider with its base_url, or set rerank = \"model\" \
                  to rank with the chat model"
+            ))),
+        }
+    }
+
+    /// The decision model `[decision].model` names, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Config` error when it names no configured provider, or a
+    /// provider that is not `type = "ollama"`.
+    pub fn decision_model_ref(&self) -> Result<Option<ModelRef<'_>>> {
+        let Some(spec) = self.decision.model.as_ref() else {
+            return Ok(None);
+        };
+        let model = self.resolve_model("[decision].model", spec)?;
+        match model.provider.provider_type {
+            ProviderType::Ollama => Ok(Some(model)),
+            other @ (ProviderType::Openai
+            | ProviderType::Anthropic
+            | ProviderType::Bedrock
+            | ProviderType::BedrockMantle) => Err(Error::Config(format!(
+                "[decision].model '{model}': {other} has no decision endpoint; decision models \
+                 run on a type = \"ollama\" provider through /v1/systemone"
             ))),
         }
     }

@@ -81,6 +81,9 @@ open:
   bigrams (issue #395).
 - **14**: Adds `_quack_imports`, the imports saved under a name for `quack import refresh`
   (issue #402). The table starts empty and needs no backfill.
+- **15**: Adds `_quack_classifications`, the runs that label a table's text with a decision
+  model (issue #472), and the document source `classify`, which an older quack's reader
+  refuses. The table starts empty and needs no backfill.
 
 A column that needs no backfill needs no bump: `ADD COLUMN IF NOT EXISTS` on open adds it,
 and rows written earlier read as `NULL`. `_quack_documents.page_count`, `pages_unreadable`,

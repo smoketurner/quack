@@ -204,6 +204,7 @@ mod tests {
     use serde_json::Value;
 
     use crate::analysis::chart::ChartKind;
+    use crate::classify::{Rows, RunStatus};
     use crate::doctor::{Area, Status};
     use crate::error::Error;
     use crate::graph::ExtractSource;
@@ -271,6 +272,8 @@ mod tests {
         round_trips(ExtractSource::ALL);
         round_trips(Status::ALL);
         round_trips(Area::ALL);
+        round_trips(RunStatus::ALL);
+        round_trips(Rows::ALL);
         text_round_trips(MetaKey::ALL);
         text_round_trips(ConceptType::ALL);
     }

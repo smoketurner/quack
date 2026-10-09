@@ -64,6 +64,37 @@
         <tbody>{% for r in t.sample_rows %}<tr class="border-b border-slate-800">{% for v in r %}<td class="px-3 py-1"><div class="max-w-xs truncate" title="{{ v }}">{{ v }}</div></td>{% endfor %}</tr>{% endfor %}</tbody>
       </table>
     </div>
+    {% if let Some(l) = t.labelled_by %}
+    <h2 class="mt-4 text-sm font-semibold uppercase text-slate-400">Labelled by</h2>
+    <p class="mt-1 text-sm wrap-anywhere">Question set <span class="font-mono">{{ l.set }}</span> over <span class="font-mono">{{ l.source }}</span> (key <span class="font-mono">{{ l.key }}</span>) with <span class="font-mono">{{ l.model }}</span>: {{ l.counts }}. The run is {{ l.status }}, started {{ l.started_at }}.</p>
+    {% endif %}
+    {% if let Some(form) = label_form %}
+    <form method="post" action="/w/{{ ws.membership.workspace.id }}/tables/classify" class="mt-4 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
+      <h2 class="font-medium">Label rows</h2>
+      <p class="mt-1 text-xs text-slate-400">The decision model answers the questions about each row's text. The labels go to a new table with one row per row of {{ t.name }}, joined by its key.</p>
+      <input type="hidden" name="name" value="{{ t.name }}">
+      <div class="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
+        <label class="text-xs text-slate-400">Text columns, comma-separated<input name="text" value="{{ form.text }}" required class="mt-0.5 block w-full rounded border border-slate-700 px-2 py-1" placeholder="subject, body"></label>
+        <label class="text-xs text-slate-400">Key column<input name="key" value="{{ form.key }}" class="mt-0.5 block w-full rounded border border-slate-700 px-2 py-1" placeholder="an id column, or leave empty to find one"></label>
+        <label class="text-xs text-slate-400 md:col-span-2">Question set (JSON)<textarea name="questions" rows="14" required spellcheck="false" class="mt-0.5 block w-full rounded border border-slate-700 px-2 py-1 font-mono text-xs">{{ form.questions }}</textarea></label>
+        <label class="text-xs text-slate-400">Preview rows<input name="preview_rows" value="{{ form.preview_rows }}" inputmode="numeric" class="mt-0.5 block w-full rounded border border-slate-700 px-2 py-1"></label>
+        <label class="inline-flex items-center gap-1 self-end text-xs text-slate-300"><input type="checkbox" name="all" value="true"{% if form.all %} checked{% endif %}> Label every row again (otherwise only rows not labelled yet)</label>
+      </div>
+      <button type="submit" name="action" value="preview" class="mt-2 rounded border border-slate-700 px-3 py-1 hover:bg-slate-800">Preview</button>
+      <button type="submit" name="action" value="run" class="mt-2 rounded bg-blue-600 px-3 py-1 text-white hover:bg-blue-500">Label rows</button>
+    </form>
+    {% endif %}
+    {% if let Some(p) = preview %}
+    <h2 class="mt-4 text-sm font-semibold uppercase text-slate-400">Preview</h2>
+    <p class="mt-1 text-xs text-slate-400">Key: <span class="font-mono">{{ p.key }}</span>. Nothing was written.</p>
+    <div class="mt-1 overflow-x-auto rounded border border-slate-800 bg-slate-900">
+      <table class="min-w-full text-sm">
+        <thead><tr class="border-b border-slate-700 text-left">{% for c in p.columns %}<th scope="col" class="px-3 py-2 font-mono whitespace-nowrap">{{ c }}</th>{% endfor %}</tr></thead>
+        <tbody>{% for r in p.rows %}<tr class="border-b border-slate-800">{% for v in r %}<td class="px-3 py-1"><div class="max-w-xs truncate" title="{{ v }}">{{ v }}</div></td>{% endfor %}</tr>{% endfor %}</tbody>
+      </table>
+    </div>
+    <p class="mt-1 text-xs text-slate-400">{{ p.summary }}</p>
+    {% endif %}
     <p class="mt-4 text-sm"><a class="text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/sql">Query it in SQL</a></p>
     {% else %}
     <p class="text-slate-400">Pick a table to see its schema and sample rows.</p>

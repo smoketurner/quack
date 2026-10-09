@@ -45,6 +45,7 @@ pub(crate) async fn handle(
                 policy,
                 user_id: Some(access.identity.user_id.clone()),
                 auditor: Auditor::Server(std::sync::Arc::clone(&app)),
+                jobs: app.jobs.clone(),
             })
         })
         .await;

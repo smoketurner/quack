@@ -5,6 +5,7 @@ use crate::config::BedrockConfig;
 use crate::embedding::Dimension;
 use crate::ids::{ChunkId, ClassId, DocumentId, RelationId};
 use crate::ingestion::parser::SectionKind;
+use crate::jobs::JobQueue;
 use crate::ontology::Relation;
 use crate::storage::workspace::{ChunkSearchResult, Ranks, WorkspaceDb};
 use crate::storage::writer::Writer;
@@ -406,6 +407,8 @@ async fn a_turn_cut_at_the_output_limit_says_so() {
             policy: WritePolicy::Deny,
             message: "list the regions",
             documents: &[],
+            user: None,
+            labelling: LabelJobs::new(JobQueue::new(10)),
             sink,
             cancel: CancellationToken::new(),
         }
@@ -894,6 +897,8 @@ async fn cancelled_turns_are_recorded_and_completed() {
         policy: WritePolicy::Deny,
         message: "how many storms?",
         documents: &[],
+        user: None,
+        labelling: LabelJobs::new(JobQueue::new(10)),
         sink,
         cancel,
     }

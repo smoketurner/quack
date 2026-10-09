@@ -203,6 +203,7 @@ impl ToolMeta {
             rows: self.rows,
             result: self.result.clone(),
             duration_ms: self.duration_ms,
+            run: None,
         }
     }
 }

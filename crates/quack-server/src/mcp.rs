@@ -4,8 +4,9 @@
 //! section 11.3.
 //!
 //! Tools: `query` (one agent turn), `search` (hybrid retrieval, no model),
-//! `sql` (classified, writes need permission), `list_tables`,
-//! `describe_table`, `list_documents`. Resources: `quack://workspace/tables`,
+//! `sql` (classified, writes need permission), `classify` (a table's text
+//! labelled by the decision model; a run needs write permission),
+//! `list_tables`, `describe_table`, `list_documents`. Resources: `quack://workspace/tables`,
 //! `quack://workspace/tables/{name}/schema`, `quack://workspace/documents`,
 //! `quack://workspace/ontology`, `quack://workspace/ontology/schema`,
 //! `quack://workspace/context`.
@@ -22,12 +23,16 @@ use quack_core::analysis::events;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::search::{DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{FindPathArgs, ReaderDb, Rerank, SearchGraphArgs, SharedDb};
+use quack_core::classify::{ClassificationRun, ClassifyArgs, LabelJobs, Tracked, Waiting};
 use quack_core::config::Config;
-use quack_core::ids::{DocumentId, SessionId, UserId};
+use quack_core::ids::{DocumentId, RunId, SessionId, UserId, WorkspaceId};
+use quack_core::jobs::JobQueue;
 use quack_core::llm::acting::Acting;
+use quack_core::llm::decision::DecisionModel;
 use quack_core::llm::egress::Egress;
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::{Ontology, store as ontology_store};
+use quack_core::progress::RunControl;
 use quack_core::storage::context;
 use quack_core::storage::control::{
     AuditAction, AuditResource, Outcome, ResourceKind, WorkspaceRow,
@@ -76,6 +81,7 @@ pub(crate) struct McpCaller {
 }
 
 /// The caller of one tool call or resource read.
+#[derive(Clone)]
 enum Caller {
     /// Stdio: nobody to audit or act for.
     Unaudited,
@@ -126,6 +132,29 @@ impl Caller {
         }
     }
 
+    /// The job queue a table this caller has labelled goes through; over
+    /// HTTP, the end of each run is audited too.
+    fn label_jobs(
+        &self,
+        queue: &JobQueue,
+        workspace: &WorkspaceId,
+        session: Option<SessionId>,
+    ) -> LabelJobs {
+        let jobs = LabelJobs::new(queue.clone()).workspace(workspace.clone());
+        match self {
+            Self::Unaudited => jobs,
+            Self::Audited { app, caller } => jobs.on_end(caller.access.run_audit(app, session)),
+        }
+    }
+
+    /// The server user making the call; nobody over stdio.
+    fn user_id(&self) -> Option<UserId> {
+        match self {
+            Self::Unaudited => None,
+            Self::Audited { caller, .. } => Some(caller.access.identity.user_id.clone()),
+        }
+    }
+
     /// Whom model requests are made for (over HTTP, the request's user at
     /// an on-behalf-of provider; over stdio, nobody).
     fn acting(&self) -> Option<Acting> {
@@ -133,6 +162,25 @@ impl Caller {
             Self::Unaudited => None,
             Self::Audited { caller, .. } => caller.acting.clone(),
         }
+    }
+
+    /// Audit the outcome of a `classify` call that started no run (a
+    /// preview, or a call refused before the run began) and give its tool
+    /// result.
+    async fn finish_label(
+        &self,
+        action: AuditAction,
+        detail: serde_json::Value,
+        done: Result<serde_json::Value, CoreError>,
+    ) -> Result<CallToolResult, McpError> {
+        let outcome = done
+            .as_ref()
+            .map_or_else(Outcome::of_failure, |_| Outcome::Allowed);
+        self.record(action, None, outcome, Some(detail)).await?;
+        Ok(match done {
+            Ok(body) => CallToolResult::structured(body),
+            Err(e) => failure(e.to_string()),
+        })
     }
 
     /// The tool result when `error` kept a model from being built, recorded
@@ -161,6 +209,8 @@ pub(crate) struct McpSetup {
     pub policy: WritePolicy,
     pub user_id: Option<UserId>,
     pub auditor: Auditor,
+    /// The queue the tables a turn or a call labels are labelled through.
+    pub jobs: JobQueue,
 }
 
 /// One MCP server over one workspace. The tool router comes from the
@@ -447,6 +497,7 @@ impl McpServer {
                 TurnSession::Created(id) => (id, true),
                 TurnSession::NotFound => return Ok(failure("that session does not exist")),
             };
+        let user = caller.user_id();
         let (sink, mut events) = events::channel();
         // Nothing renders the stream here; drain it so the turn never
         // blocks on a full channel.
@@ -458,6 +509,12 @@ impl McpServer {
             policy: self.inner.policy,
             message: &question,
             documents: &args.document_ids,
+            user: user.as_ref(),
+            labelling: caller.label_jobs(
+                &self.inner.jobs,
+                &self.inner.workspace.id,
+                Some(session_id.clone()),
+            ),
             sink,
             cancel: caller.cancel(),
         }
@@ -664,6 +721,114 @@ impl McpServer {
             "row_count": capped.total_rows,
             "truncated": capped.truncated(),
         })))
+    }
+
+    /// Label a table's text with the decision model.
+    #[tool(
+        name = "classify",
+        description = "Label the text of a table's rows with the workspace's decision model. It answers a fixed set of questions about each row (pick one of 2 to 26 options, true or false, or a level on a rubric) with probabilities, and the answers go to a new table named <table>_<set name> that joins back to the table by its key, so `sql` can GROUP BY and filter on them. Pass `preview` (1 to 100) to see the first rows' labels without writing anything. A run needs write permission on this connection, labels the rows the output lacks (or every row again with rows = \"all\"), and is refused beyond [decision].interactive_budget answers (rows times questions): run `quack classify` for larger tables."
+    )]
+    async fn classify(
+        &self,
+        Parameters(args): Parameters<ClassifyArgs>,
+        extensions: Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = self.caller(&extensions)?;
+        // Boxed: building the model and the run make the future large.
+        Box::pin(self.as_caller(&caller, self.label(args, &caller))).await
+    }
+
+    /// `classify`, as its caller: asking the decision model is a model
+    /// request too.
+    async fn label(&self, args: ClassifyArgs, caller: &Caller) -> Result<CallToolResult, McpError> {
+        let config = &self.inner.config;
+        let ClassifyArgs {
+            classification,
+            preview,
+        } = args;
+        let detail = serde_json::json!({
+            "table": classification.table,
+            "set": classification.question_set.name,
+            "preview": preview,
+        });
+        let decision = match DecisionModel::from_config(config).await {
+            Ok(Some(model)) => model,
+            Ok(None) => {
+                return caller
+                    .unbuilt(AuditAction::Classify, detail, &CoreError::NoDecisionModel)
+                    .await;
+            }
+            Err(e) => return caller.unbuilt(AuditAction::Classify, detail, &e).await,
+        };
+        let cancel = caller.cancel();
+        let db = &*self.inner.db;
+        let waiting = Waiting::Caller {
+            budget: config.decision.interactive_budget,
+        };
+        if let Some(rows) = preview {
+            let control = RunControl {
+                progress: &|_| {},
+                cancel: Some(&cancel),
+            };
+            let done = classification
+                .preview(db, &decision, rows, waiting, control)
+                .await
+                .and_then(|p| serde_json::to_value(p).map_err(CoreError::from));
+            return caller
+                .finish_label(AuditAction::Classify, detail, done)
+                .await;
+        }
+        if !self.inner.policy.allows_unasked() {
+            caller
+                .record(AuditAction::Classify, None, Outcome::Denied, Some(detail))
+                .await?;
+            return Ok(failure(
+                "labelling writes a table and this connection cannot write; pass preview to see \
+                 the labels without writing",
+            ));
+        }
+        let outline = match classification.outline(db, &decision).await {
+            Ok(outline) => outline
+                .within(waiting)
+                .map(|()| outline)
+                .map_err(CoreError::from),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = outline {
+            return caller
+                .finish_label(AuditAction::Classify, detail, Err(e))
+                .await;
+        }
+        let run_id = RunId::generate();
+        let tracked = Tracked {
+            db: Arc::clone(&self.inner.db),
+            decision,
+            started_by: caller.user_id(),
+            run_id: run_id.clone(),
+            waiting,
+            cancel,
+            jobs: caller.label_jobs(&self.inner.jobs, &self.inner.workspace.id, None),
+        };
+        let done = classification.run_as_job(tracked, |_| {}).await;
+        self.inner.reader.observe_write().await;
+        // The run's end is audited by the job under the run's id; a call
+        // refused before the run began has no run, and is audited here.
+        let began = db
+            .run(move |db| ClassificationRun::get(db, &run_id))
+            .await
+            .is_ok();
+        match done {
+            Ok(run) => Ok(CallToolResult::structured(
+                serde_json::to_value(run)
+                    .map_err(|e| internal(format!("cannot encode the run: {e}")))?,
+            )),
+            Err(e) if began => Ok(failure(e.to_string())),
+            Err(e) => {
+                caller
+                    .finish_label(AuditAction::Classify, detail, Err(e))
+                    .await
+            }
+        }
     }
 
     #[tool(
@@ -1046,6 +1211,10 @@ impl ServerHandler for McpServer {
     }
 }
 
+/// How long `quack mcp` waits, after the client hangs up, for a labelling
+/// run the client left behind to record its end.
+const STDIO_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// `quack mcp`: serve the workspace over stdio until the client hangs up.
 ///
 /// # Errors
@@ -1059,6 +1228,7 @@ pub async fn serve_stdio(
     workspace: WorkspaceRow,
     policy: WritePolicy,
 ) -> anyhow::Result<()> {
+    let jobs = JobQueue::from_config(&config.jobs);
     let server = McpServer::new(McpSetup {
         config,
         db,
@@ -1067,14 +1237,15 @@ pub async fn serve_stdio(
         policy,
         user_id: None,
         auditor: Auditor::None,
+        jobs: jobs.clone(),
     });
     let running = rmcp::serve_server(server, rmcp::transport::stdio())
         .await
         .map_err(|e| anyhow::anyhow!("MCP initialization failed: {e}"))?;
-    running
-        .waiting()
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP server task failed: {e}"))?;
+    let served = running.waiting().await;
+    // A run the client left behind finishes and records its end first.
+    jobs.shutdown(STDIO_GRACE).await;
+    served.map_err(|e| anyhow::anyhow!("MCP server task failed: {e}"))?;
     Ok(())
 }
 

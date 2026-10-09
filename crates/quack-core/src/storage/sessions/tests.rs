@@ -108,6 +108,7 @@ fn step(tool: ToolName, detail: &str, summary: &str) -> ToolStep {
         rows: None,
         result: None,
         duration_ms: 7,
+        run: None,
     }
 }
 

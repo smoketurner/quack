@@ -199,3 +199,23 @@ fn column_types_round_trip_any_column_name() {
     let back: ColumnTypes = serde_json::from_str(&json).unwrap_or_default();
     assert_eq!(back, types);
 }
+
+#[test]
+fn only_id_names_qualify_as_a_key() {
+    for yes in [
+        "id",
+        "ID",
+        "Id",
+        "ticket_id",
+        "TICKET_ID",
+        "ticketId",
+        "orderRefId",
+    ] {
+        assert!(TableProfile::is_id_name(yes), "{yes}");
+    }
+    for no in [
+        "", "paid", "PAID", "VALID", "Paid", "grid", "orderID", "identity", "idx", "_idx",
+    ] {
+        assert!(!TableProfile::is_id_name(no), "{no}");
+    }
+}

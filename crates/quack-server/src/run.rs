@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quack_core::analysis::tools::SharedDb;
+use quack_core::classify::ClassificationRun;
 use quack_core::embedding::refresh;
 use quack_core::graph::extract;
 use quack_core::graph::follow_up::{FollowUp, FollowUpSummary};
@@ -64,6 +65,13 @@ impl RunKind {
         resource: ResourceKind::SavedImport,
         label: "import refresh",
     };
+    /// A table's text labelled by the decision model.
+    pub(crate) const CLASSIFY: Self = Self {
+        job: JobKind::Classify,
+        action: AuditAction::Classify,
+        resource: ResourceKind::ClassificationRun,
+        label: "classify",
+    };
     pub(crate) const ONTOLOGY: Self = Self {
         job: JobKind::Ontology,
         action: AuditAction::Propose,
@@ -102,6 +110,16 @@ impl RunReport for ImportSummary {
             LoadStatus::Unchanged => format!("{}: source unchanged", self.table),
             LoadStatus::Loaded => format!("{}: {} rows, replaced", self.table, self.rows),
         }
+    }
+}
+
+impl RunReport for ClassificationRun {
+    fn detail(&self) -> Value {
+        serde_json::json!({ "summary": self })
+    }
+
+    fn message(&self) -> String {
+        self.to_string()
     }
 }
 

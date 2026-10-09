@@ -89,6 +89,7 @@ windows-native-keyring-store = { workspace = true }
 [dev-dependencies]
 axum      = { workspace = true, features = ["http1", "tokio"] } # the test endpoint a webhook posts to
 criterion = { workspace = true, features = ["cargo_bench_support"] }
+quack-testkit = { path = "../quack-testkit" }
 rig       = { workspace = true, features = ["test-utils"] } # rig's scripted model, for whole-turn tests
 sqlx      = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 zip       = { workspace = true, features = ["deflate-flate2-zlib-rs"] }
