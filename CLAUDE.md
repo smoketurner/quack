@@ -148,7 +148,8 @@ file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the mod
 rig's conversation memory (`llm::memory::History`: `SessionMemory` under `TranscriptWindow`,
 rig's token window over `[analysis].history_token_budget`), and with
 `[analysis].compact_history` the turns it leaves out become a chat-model summary kept in
-`_quack_session_summaries`. Retrieval is hybrid (exact cosine scan plus quack's own
+`_quack_session_summaries`, written after the turn by `llm::after_turn::AfterTurn` (with the
+session title), so loading the history calls no model. Retrieval is hybrid (exact cosine scan plus quack's own
 BM25 over `_quack_terms`, each document's chunks stemmed under the language
 `WorkspaceDb::chunk_writer` detects once for it, reciprocal rank fusion in `WorkspaceDb::explain_search`;
 no DuckDB extension is ever loaded, see design doc section 14), then an optional reranker

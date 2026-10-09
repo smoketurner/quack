@@ -1,24 +1,20 @@
 //! A short title for a chat session, written by the chat model after the
 //! session's first turn when `[analysis].title_sessions` asks for one
-//! (issue #421). It runs beside the turn at background priority, never holds
-//! the answer up, and never replaces a title a person gave
-//! (`sessions::set_model_title`).
+//! (issue #421). It runs after the turn at background priority
+//! ([`AfterTurn`]), never holds the answer up, and never replaces a title a
+//! person gave (`sessions::set_model_title`).
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
-
-use tokio_util::task::TaskTracker;
 
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 
+use super::after_turn::AfterTurn;
 use super::{ChatClient, SchemaCall, Task};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::ids::SessionId;
-use crate::llm::acting::Acting;
-use crate::llm::egress::Egress;
-use crate::priority::Priority;
 use crate::storage::sessions::{self, MessageRole};
 use crate::storage::writer::Writer;
 use crate::text::Fenced;
@@ -108,23 +104,14 @@ impl SessionTitler {
             .await
     }
 
-    /// Title `session` on its own task at background priority, carrying the
-    /// caller's provider scope and acting person; a failure is logged, and
-    /// the session keeps its derived title. A process that exits after its
-    /// turn waits for the task through [`Self::finish_pending`].
+    /// Title `session` on its own task ([`AfterTurn::spawn`]); a failure is
+    /// logged, and the session keeps its derived title.
     pub fn spawn(self, db: Arc<Writer>, session: SessionId) {
-        let (acting, egress) = (Acting::current(), Egress::current());
-        PENDING.spawn(Acting::scope(
-            acting,
-            Egress::scope(
-                egress,
-                Priority::Background.scope(async move {
-                    if let Err(e) = self.title(&db, &session).await {
-                        tracing::warn!(session = %session, error = %e, "the session keeps its derived title");
-                    }
-                }),
-            ),
-        ));
+        AfterTurn::spawn(async move {
+            if let Err(e) = self.title(&db, &session).await {
+                tracing::warn!(session = %session, error = %e, "the session keeps its derived title");
+            }
+        });
     }
 
     /// After a turn is recorded, start a title for `session` when titling
@@ -132,6 +119,9 @@ impl SessionTitler {
     /// session decides, not the replayed history, which the token window
     /// may cut; and a cancelled first turn is titled by the next.
     pub async fn follow_turn(config: &Config, db: &Arc<Writer>, session: &SessionId) {
+        if !config.analysis.title_sessions {
+            return;
+        }
         let id = session.clone();
         let untitled = db
             .run(move |db| {
@@ -153,20 +143,4 @@ impl SessionTitler {
             Err(e) => tracing::warn!(error = %e, "the session keeps its derived title"),
         }
     }
-
-    /// Wait, at most `limit`, for titles still being written: a command
-    /// that answers one question and exits (`quack -p`, `saved run
-    /// --refresh`) calls this after printing, or its runtime would drop the
-    /// title mid-call. A server or a terminal session outlives the task.
-    pub async fn finish_pending(limit: Duration) {
-        PENDING.close();
-        if tokio::time::timeout(limit, PENDING.wait()).await.is_err() {
-            tracing::warn!(
-                "a session title was still being written at exit; it keeps its derived title"
-            );
-        }
-    }
 }
-
-/// The title tasks this process started.
-static PENDING: LazyLock<TaskTracker> = LazyLock::new(TaskTracker::new);

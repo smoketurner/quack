@@ -5,6 +5,7 @@
 //! never build providers themselves.
 
 pub mod acting;
+pub mod after_turn;
 pub mod bedrock;
 pub mod chat_model;
 pub mod egress;
@@ -1396,6 +1397,7 @@ impl TurnRequest<'_> {
         if !response.cancelled {
             titles::SessionTitler::follow_turn(config, &db, session_id).await;
         }
+        memory::History::follow_turn(config, &db, session_id);
         Ok(response)
     }
 }
