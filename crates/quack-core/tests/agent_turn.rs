@@ -17,17 +17,22 @@ use quack_core::analysis::events::{self, AgentEvent, ToolName};
 use quack_core::analysis::policy::{Approver, Hold, WritePolicy};
 use quack_core::analysis::search::DocumentScope;
 use quack_core::analysis::text_to_sql::{PromptOptions, Window};
-use quack_core::analysis::tools::{ReaderDb, SharedDb};
+use quack_core::analysis::tools::{Labeller, ReaderDb, SharedDb};
+use quack_core::classify::LabelJobs;
 use quack_core::config::{AnalysisConfig, GraphConfig, RetrievalConfig};
 use quack_core::embedding::{Dimension, Embedder, EmbeddingModel};
 use quack_core::error::Result as TurnResult;
-use quack_core::ids::{ChunkId, DocumentId};
+use quack_core::ids::{ChunkId, DocumentId, UserId};
 use quack_core::ingestion::parser::SectionKind;
+use quack_core::jobs::JobQueue;
 use quack_core::llm::CancellationToken;
+use quack_core::llm::egress::Egress;
 use quack_core::storage::sessions::{self, ChatMode, MessageRole};
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, Pinning, WorkspaceDb};
 use quack_core::storage::writer::Writer;
 use quack_core::text::{Fenced, Tokens};
+use quack_testkit::DecisionStub;
+use quack_testkit::{Reply, ScriptedOllama};
 use rig::ProviderError;
 use rig::completion::Usage;
 use rig::embeddings::Embedding;
@@ -144,7 +149,15 @@ async fn run_turn(
     history: Vec<Message>,
     message: &str,
 ) -> Ran {
-    run_turn_answering(db, model, policy, history, message, Answer::Deny).await
+    Box::pin(run_turn_answering(
+        db,
+        model,
+        policy,
+        history,
+        message,
+        Answer::Deny,
+    ))
+    .await
 }
 
 /// The turn, with every write request answered with `answer` as it arrives.
@@ -156,10 +169,41 @@ async fn run_turn_answering(
     message: &str,
     answer: Answer,
 ) -> Ran {
+    Box::pin(run_turn_labelling(
+        db,
+        model,
+        policy,
+        history,
+        message,
+        answer,
+        Wiring::default(),
+    ))
+    .await
+}
+
+/// What a turn is given beside its history: the decision model `classify_rows`
+/// labels with, when there is one, and the token that cancels the turn.
+#[derive(Default)]
+struct Wiring {
+    labeller: Option<Labeller>,
+    cancel: CancellationToken,
+}
+
+/// [`run_turn_answering`] with the decision model `classify_rows` labels
+/// with, when there is one.
+async fn run_turn_labelling(
+    db: &SharedDb,
+    model: &MockCompletionModel,
+    policy: WritePolicy,
+    history: Vec<Message>,
+    message: &str,
+    answer: Answer,
+    wiring: Wiring,
+) -> Ran {
+    let Wiring { labeller, cancel } = wiring;
     let analysis_config = AnalysisConfig::default();
     let retrieval_config = RetrievalConfig::default();
     let (sink, mut stream) = events::channel();
-    let cancel = CancellationToken::new();
     let analysis = Analysis::<NoEmbedding> {
         db: Arc::clone(db),
         reader_db: ReaderDb::new(Arc::clone(db)),
@@ -184,6 +228,7 @@ async fn run_turn_answering(
         message,
         asked: Instant::now(),
         cancel: cancel.clone(),
+        labeller,
     };
     let run = analysis.run(model.clone().erase().into(), None, None, sink);
     tokio::pin!(run);
@@ -732,4 +777,424 @@ async fn a_malformed_history_is_dropped_with_a_warning() {
             .all(|m| !matches!(m, Message::Assistant { .. })),
         "the model saw none of the history"
     );
+}
+
+/// What the person asks of the `sales` regions, and the questions the chat
+/// model drafts from it: one choice and one true-or-false.
+const SENTENCE: &str = "which region is each sale in, and is it cold";
+
+const DRAFT: &str = r#"{"text_columns": ["region"], "questions": [
+    {"name": "kind", "type": "choice", "instructions": "Which region is it?",
+     "options": [{"label": "north", "description": ""}, {"label": "south", "description": ""}],
+     "levels": []},
+    {"name": "cold", "type": "noul", "instructions": "Is it cold?",
+     "options": [], "levels": []}]}"#;
+
+fn labelling(preview: Option<u32>) -> serde_json::Value {
+    let mut args = serde_json::json!({ "table": "sales", "sentence": SENTENCE });
+    if let Some(rows) = preview {
+        args["preview"] = serde_json::json!(rows);
+    }
+    args
+}
+
+/// The model labels, then answers.
+fn model_that_labels(preview: Option<u32>) -> MockCompletionModel {
+    MockCompletionModel::from_stream_turns([
+        turn(vec![call("t1", "classify_rows", labelling(preview))]),
+        turn(vec![text("Labelled.")]),
+    ])
+}
+
+/// The decision model the stub serves, as the agent is handed it, allowed
+/// `budget` answers while the turn waits.
+async fn labeller(stub: &DecisionStub, budget: u64) -> Labeller {
+    labeller_for(stub, budget, None).await
+}
+
+/// [`labeller`], recording `user` on the runs it starts.
+async fn labeller_for(stub: &DecisionStub, budget: u64, user: Option<&UserId>) -> Labeller {
+    let chat = ScriptedOllama::serve(vec![
+        Reply::Text(DRAFT),
+        Reply::Text(DRAFT),
+        Reply::Text(DRAFT),
+    ])
+    .await
+    .unwrap();
+    let config = chat
+        .config_with(&format!(
+            "[providers.local]\ntype = \"ollama\"\nbase_url = \"{}\"\nmax_retries = 0\n\
+             [decision]\nmodel = \"local/laya\"\ninteractive_budget = {budget}\n",
+            stub.base_url()
+        ))
+        .unwrap();
+    let jobs = LabelJobs::new(JobQueue::new(10));
+    let labeller = Egress::scope(
+        Some(Egress::NoWorkspace),
+        Labeller::from_config(&config, jobs, user),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // The drafter reaches the scripted chat model for as long as the test.
+    Box::leak(Box::new(chat));
+    labeller
+}
+
+async fn label_turn(
+    db: &SharedDb,
+    model: &MockCompletionModel,
+    policy: WritePolicy,
+    answer: Answer,
+    labeller: Labeller,
+) -> Ran {
+    Box::pin(label_turn_cancelled_by(
+        db,
+        model,
+        policy,
+        answer,
+        labeller,
+        CancellationToken::new(),
+    ))
+    .await
+}
+
+async fn label_turn_cancelled_by(
+    db: &SharedDb,
+    model: &MockCompletionModel,
+    policy: WritePolicy,
+    answer: Answer,
+    labeller: Labeller,
+    cancel: CancellationToken,
+) -> Ran {
+    Egress::scope(
+        Some(Egress::NoWorkspace),
+        Box::pin(run_turn_labelling(
+            db,
+            model,
+            policy,
+            Vec::new(),
+            "label it",
+            answer,
+            Wiring {
+                labeller: Some(labeller),
+                cancel,
+            },
+        )),
+    )
+    .await
+}
+
+async fn labelled_rows(db: &SharedDb) -> Option<i64> {
+    db.run(|db| {
+        Ok(db
+            .connection()
+            .query_row("SELECT count(*) FROM sales_labels", [], |row| row.get(0))
+            .ok())
+    })
+    .await
+    .unwrap()
+}
+
+/// A preview reads the first rows and writes nothing, so nobody is asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preview_labels_the_first_rows_without_asking_or_writing() {
+    let stub = DecisionStub::start().await;
+    let db = workspace();
+    let model = model_that_labels(Some(5));
+    let ran = label_turn(
+        &db,
+        &model,
+        WritePolicy::Ask,
+        Answer::Deny,
+        labeller(&stub, 1500).await,
+    )
+    .await;
+    let response = ran.answer();
+
+    assert!(ran.asked.is_empty(), "{:?}", ran.asked);
+    assert!(!response.write_refused);
+    assert_eq!(response.steps[0].tool, ToolName::ClassifyRows);
+    assert_eq!(response.steps[0].summary, "2 rows");
+    assert_eq!(labelled_rows(&db).await, None, "nothing was written");
+    let history = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
+    assert!(
+        history.contains(
+            "sales: 2 rows, key revenue (all different; not named like an id), text in region."
+        ),
+        "{history}"
+    );
+    assert!(
+        history.contains("Nothing is kept until the labelling runs."),
+        "{history}"
+    );
+    assert!(history.contains("kind (p)"), "{history}");
+    let kept: i64 = db
+        .run(|db| {
+            Ok(db.connection().query_row(
+                "SELECT count(*) FROM _quack_classifications",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(kept, 0, "the questions were kept by nothing");
+}
+
+/// A run creates a table, so it asks like any write, with the actual
+/// action and the row count in the statement, and the answer decides.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_asks_the_person_and_labels_the_table_on_approval() {
+    let stub = DecisionStub::start().await;
+    let statement = "-- label 2 rows of sales into sales_labels (new table) with local/laya, 2 questions, under a minute\n\
+-- key revenue (all different; not named like an id); reads region\n\
+-- kind (choice: north, south): Which region is it?\n\
+-- cold (yes/no): Is it cold?\n\
+-- preview: 10: kind=north (0.90), cold=0.10 | 20: kind=south (0.90), cold=0.10";
+
+    let db = workspace();
+    let model = model_that_labels(None);
+    let ran = label_turn(
+        &db,
+        &model,
+        WritePolicy::Ask,
+        Answer::Deny,
+        labeller(&stub, 1500).await,
+    )
+    .await;
+    assert_eq!(ran.asked, [(String::from(statement), Hold::NotPermitted)]);
+    assert!(ran.answer().write_refused);
+    assert_eq!(ran.answer().steps[0].summary, Hold::NotPermitted.summary());
+    assert_eq!(
+        labelled_rows(&db).await,
+        None,
+        "a refused run wrote nothing"
+    );
+
+    let db = workspace();
+    let model = model_that_labels(None);
+    let ran = label_turn(
+        &db,
+        &model,
+        WritePolicy::Ask,
+        Answer::Allow,
+        labeller(&stub, 1500).await,
+    )
+    .await;
+    assert_eq!(ran.asked, [(String::from(statement), Hold::NotPermitted)]);
+    assert!(!ran.answer().write_refused);
+    assert_eq!(
+        ran.answer().steps[0].summary,
+        "2 rows labelled into sales_labels"
+    );
+    assert_eq!(labelled_rows(&db).await, Some(2));
+    let history = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
+    assert!(
+        history.contains("Query it with SQL, joined to sales on revenue."),
+        "{history}"
+    );
+    assert!(
+        history.contains("kind_p: probability of the chosen kind"),
+        "{history}"
+    );
+}
+
+/// Print mode, a non-streamed request, and MCP: after the turn read
+/// document text nobody can approve a write, so the run is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_after_reading_documents_is_refused_when_nobody_can_approve() {
+    let stub = DecisionStub::start().await;
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![call(
+            "t1",
+            "search_documents",
+            serde_json::json!({ "query": "refunds" }),
+        )]),
+        turn(vec![call("t2", "classify_rows", labelling(None))]),
+        turn(vec![text("Done.")]),
+    ]);
+    let policy = WritePolicy::Allow(Approver::Nobody);
+    let ran = label_turn(
+        &db,
+        &model,
+        policy,
+        Answer::Deny,
+        labeller(&stub, 1500).await,
+    )
+    .await;
+
+    assert!(ran.asked.is_empty());
+    assert!(ran.answer().write_refused);
+    assert_eq!(ran.answer().steps[1].tool, ToolName::ClassifyRows);
+    assert_eq!(ran.answer().steps[1].summary, Hold::ReadDocuments.summary());
+    assert_eq!(labelled_rows(&db).await, None);
+    assert!(
+        ran.answer().steps[1].run.is_none(),
+        "a refused run begins nothing"
+    );
+}
+
+/// A turn cannot wait for more than `[decision].interactive_budget`
+/// answers: the refusal names the command, and nobody is asked first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_past_the_budget_is_refused_before_anyone_is_asked() {
+    let stub = DecisionStub::start().await;
+    let db = workspace();
+    let model = model_that_labels(None);
+    let ran = label_turn(
+        &db,
+        &model,
+        WritePolicy::Ask,
+        Answer::Allow,
+        labeller(&stub, 3).await,
+    )
+    .await;
+
+    assert!(ran.asked.is_empty());
+    let summary = &ran.answer().steps[0].summary;
+    assert!(
+        summary.contains("labelling 2 rows of sales with 2 questions is too long to wait for here")
+            && summary.contains("quack classify"),
+        "{summary}"
+    );
+    assert_eq!(labelled_rows(&db).await, None);
+}
+
+/// The tool is offered only where a decision model is configured.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tool_is_registered_only_with_a_decision_model() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([turn(vec![text("Hi.")])]);
+    run_turn(&db, &model, WritePolicy::Ask, Vec::new(), "hello").await;
+    let without = serde_json::to_string(&model.requests()[0]).unwrap();
+    assert!(!without.contains("classify_rows"), "{without}");
+
+    let stub = DecisionStub::start().await;
+    let model = MockCompletionModel::from_stream_turns([turn(vec![text("Hi.")])]);
+    label_turn(
+        &db,
+        &model,
+        WritePolicy::Ask,
+        Answer::Deny,
+        labeller(&stub, 1500).await,
+    )
+    .await;
+    let with = serde_json::to_string(&model.requests()[0]).unwrap();
+    assert!(with.contains("classify_rows"), "{with}");
+}
+
+/// The step names the run it started, and the run names the person.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_labelling_step_names_its_run_and_the_person_who_started_it() {
+    let stub = DecisionStub::start().await;
+    let db = workspace();
+    let model = model_that_labels(None);
+    let asker = labeller_for(&stub, 1500, Some(&UserId::from("user-1"))).await;
+    let ran = label_turn(&db, &model, WritePolicy::Ask, Answer::Allow, asker).await;
+    let run = ran.answer().steps[0].run.clone().unwrap();
+    let recorded: (String, String) = db
+        .run(|db| {
+            Ok(db.connection().query_row(
+                "SELECT id, started_by FROM _quack_classifications",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(recorded, (run.to_string(), String::from("user-1")));
+    let preview = model_that_labels(Some(1));
+    let ran = label_turn(
+        &db,
+        &preview,
+        WritePolicy::Ask,
+        Answer::Deny,
+        labeller(&stub, 1500).await,
+    )
+    .await;
+    assert!(
+        ran.answer().steps[0].run.is_none(),
+        "a preview starts no run"
+    );
+}
+
+/// A cancelled turn stops the labelling it is waiting for, and the run's
+/// record says so instead of staying `running`.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_the_turn_cancels_the_run() {
+    let cancel = CancellationToken::new();
+    let firing = cancel.clone();
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stub = DecisionStub::with_rule(move |_| {
+        // Drafting probes twice, the approval card asks two probes and two
+        // rows; then the run's two probes and its first row: cancel there.
+        if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 8 {
+            firing.cancel();
+        }
+        None
+    })
+    .await;
+    let db = workspace();
+    let model = model_that_labels(None);
+    let asker = labeller(&stub, 1500).await;
+    label_turn_cancelled_by(&db, &model, WritePolicy::Ask, Answer::Allow, asker, cancel).await;
+    // The turn is gone; the run, on a task of its own, notices the token.
+    let mut status = String::new();
+    for _ in 0..200 {
+        status = db
+            .run(|db| {
+                Ok(db.connection().query_row(
+                    "SELECT status FROM _quack_classifications",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        if status != "running" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(status, "cancelled");
+}
+
+/// A run that fails after it began still names its run on the step.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_labelling_step_names_the_run_it_began() {
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&seen);
+    let stub = DecisionStub::with_rule(move |_| {
+        // Drafting and the approval card ask 6 times, the run's two probes
+        // 2 more; then its first row is refused.
+        (counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 8)
+            .then(|| quack_testkit::Fault::new(403, "forbidden"))
+    })
+    .await;
+    let db = workspace();
+    let model = model_that_labels(None);
+    let ran = label_turn(
+        &db,
+        &model,
+        WritePolicy::Ask,
+        Answer::Allow,
+        labeller(&stub, 1500).await,
+    )
+    .await;
+    let step = ran.answer().steps.first().cloned().unwrap();
+    assert!(step.summary.starts_with("error:"), "{}", step.summary);
+    let recorded: (String, String) = db
+        .run(|db| {
+            Ok(db.connection().query_row(
+                "SELECT id, status FROM _quack_classifications",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(step.run.map(|run| run.to_string()), Some(recorded.0));
+    assert_eq!(recorded.1, "failed");
 }

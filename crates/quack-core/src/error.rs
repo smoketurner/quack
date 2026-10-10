@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::classify;
+use crate::llm::decision::QuestionSetError;
 use crate::llm::egress::Refusal;
 use crate::saved::Unsavable;
 use crate::storage::control::ResourceKind;
@@ -214,6 +216,24 @@ pub enum Error {
 
     #[error("unsupported file type: {0}")]
     UnsupportedFileType(String),
+
+    /// The decision model refused a request, with the server's reason.
+    #[error("the decision model refused the request: {0}")]
+    DecisionRefused(String),
+
+    /// Something needs a decision model and `[decision].model` is unset.
+    #[error(
+        "no decision model configured; set [decision].model = \"ollama/laya\" (ollama pull laya)"
+    )]
+    NoDecisionModel,
+
+    /// A table's rows cannot be labelled as asked.
+    #[error(transparent)]
+    Classify(#[from] classify::Error),
+
+    /// A set of decision questions that cannot be asked.
+    #[error("invalid question set: {0}")]
+    QuestionSet(#[from] QuestionSetError),
 
     /// An image arrived with no `[ingestion].vision_model` to read it.
     #[error("{0} is an image; set [ingestion].vision_model to describe images")]

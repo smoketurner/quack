@@ -26,6 +26,8 @@ use quack_core::ids::{AuditId, ChunkId, DocumentId, RunId, SessionId, UserId, Wo
 use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::parser::SectionKind;
 use quack_core::storage::backup::Manifest;
+use quack_core::storage::profile::TableProfile;
+use quack_core::storage::writer::Claimed;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -39,7 +41,8 @@ use quack_core::ontology::Ontology;
 use quack_core::storage::audit;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, IssuedToken, Membership,
-    Origin, Outcome, ResourceKind, Role, Scope, Standing, UserKind,
+    Origin, Outcome, ProviderAllowList, ResourceKind, Role, Scope, Standing, UserKind,
+    WorkspaceChanges,
 };
 use quack_core::storage::workspace::{DocumentFields, DocumentStatus, NewChunk, NewDocument};
 use quack_core::web_sessions::WebSessions;
@@ -4348,6 +4351,7 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
     assert_eq!(
         names,
         [
+            "classify",
             "describe_table",
             "find_path",
             "list_documents",
@@ -7546,6 +7550,7 @@ async fn saved_questions_are_saved_run_and_removed_on_the_web() {
                     rows: Some(1),
                     result: None,
                     duration_ms: 1,
+                    run: None,
                 }],
                 ..AgentResponse::default()
             };
@@ -8539,6 +8544,7 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
                     rows: Some(1),
                     result: None,
                     duration_ms: 1,
+                    run: None,
                 }],
                 ..AgentResponse::default()
             };
@@ -10938,4 +10944,866 @@ async fn the_graph_exports_as_a_download_audited_with_its_counts() {
         Some(body),
         serde_json::to_value(Ontology::json_schema()).ok()
     );
+}
+
+/// What the chat model drafts for the `tickets`: the subject is read, and
+/// two questions are asked about it.
+const TICKETS_DRAFT: &str = r#"{"text_columns": ["subject"], "questions": [
+    {"name": "department", "type": "choice", "instructions": "Which department?",
+     "options": [{"label": "billing", "description": ""}, {"label": "technical", "description": ""}],
+     "levels": []},
+    {"name": "churn", "type": "noul", "instructions": "Will they cancel?",
+     "options": [], "levels": []}]}"#;
+
+/// What a person asks of the tickets.
+const TICKETS_SENTENCE: &str = "which department, and will they cancel";
+
+/// A server whose `[decision].model` is served by a stub and whose chat
+/// model drafts [`TICKETS_DRAFT`], with an owner, a viewer, a workspace,
+/// and a `tickets` table of five rows.
+struct TicketsApp {
+    h: Harness,
+    stub: quack_testkit::DecisionStub,
+    chat: quack_testkit::ScriptedOllama,
+    ws: WorkspaceId,
+    owner_id: UserId,
+    owner: String,
+    viewer: String,
+}
+
+impl TicketsApp {
+    async fn new() -> Self {
+        let stub = quack_testkit::DecisionStub::start().await;
+        let chat = quack_testkit::ScriptedOllama::serve(
+            (0..8)
+                .map(|_| quack_testkit::Reply::Text(TICKETS_DRAFT))
+                .collect(),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let config = chat
+            .config_with(&format!(
+                "[providers.local]\ntype = \"ollama\"\nbase_url = \"{}\"\nmax_retries = 0\n\
+                 [decision]\nmodel = \"local/laya\"\n",
+                stub.base_url()
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let h = harness_with(ServeMode::Login, config).await;
+        let owner = h.user("owner", UserKind::Standard).await;
+        let viewer = h.user("viewer", UserKind::Standard).await;
+        let ws = h.workspace("w", &owner).await;
+        h.app
+            .control
+            .set_member(&ws, &viewer, Role::Viewer, setup_audit())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let db = h
+            .app
+            .workspace_db(&ws)
+            .await
+            .unwrap_or_else(|e| fail(&e.message));
+        db.run(|db| {
+            db.execute_statement(
+                "CREATE TABLE tickets AS SELECT range AS id, \
+                 CASE WHEN range % 2 = 0 THEN 'billing' ELSE 'technical' END AS subject, \
+                 'we will cancel' AS body FROM range(5)",
+            )?;
+            TableProfile::refresh_stale(db).map(drop)
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let (owner_id, owner, viewer) = (owner, h.login("owner").await, h.login("viewer").await);
+        Self {
+            h,
+            stub,
+            chat,
+            ws,
+            owner_id,
+            owner,
+            viewer,
+        }
+    }
+
+    /// Asking for the tickets in a sentence.
+    fn request() -> serde_json::Value {
+        serde_json::json!({ "table": "tickets", "sentence": TICKETS_SENTENCE })
+    }
+
+    /// The questions the chat model drafts, as the editor posts them.
+    fn editor() -> String {
+        format!(
+            "table=tickets&sentence={}&key=id&text=subject\
+             &n0_name=department&n0_kind=choice&n0_ask={}&n0_opts={}\
+             &n1_name=churn&n1_kind=noul&n1_ask={}&n1_opts=\
+             &n2_name=&n2_kind=choice&n2_ask=&n2_opts=",
+            form_value(TICKETS_SENTENCE),
+            form_value("Which department?"),
+            form_value("billing\ntechnical"),
+            form_value("Will they cancel?"),
+        )
+    }
+
+    fn path(&self, query: &str) -> String {
+        format!("/api/v1/workspaces/{}/tables/classify{query}", self.ws)
+    }
+
+    /// An API token that may read and write the workspace.
+    async fn write_token(&self) -> String {
+        self.h
+            .app
+            .control
+            .create_token(
+                &self.ws,
+                &self.owner_id,
+                "rw",
+                &[Scope::Read, Scope::Write],
+                None,
+                setup_audit(),
+            )
+            .await
+            .map_or_else(
+                |e| fail(&e.to_string()),
+                |issued| issued.secret.expose().to_owned(),
+            )
+    }
+
+    async fn classify(&self, token: &str, query: &str) -> (StatusCode, serde_json::Value) {
+        self.h.post(&self.path(query), token, Self::request()).await
+    }
+
+    async fn classified(&self) -> Vec<AuditRow> {
+        self.h
+            .audit(AuditFilter {
+                workspace_id: Some(self.ws.clone()),
+                action: Some(String::from("classify")),
+                ..AuditFilter::default()
+            })
+            .await
+    }
+
+    async fn runs(&self) -> serde_json::Value {
+        self.h.get(&self.path(""), &self.owner).await.1
+    }
+
+    /// A table's description.
+    async fn described(&self, table: &str) -> serde_json::Value {
+        let (status, body) = self
+            .h
+            .post(
+                &format!("/api/v1/workspaces/{}/tables/describe", self.ws),
+                &self.owner,
+                serde_json::json!({ "name": table }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// Wait for the job a response named.
+    async fn finished(&self, started: &serde_json::Value) -> serde_json::Value {
+        wait_for_job(
+            &self.h,
+            &self.ws,
+            started["job"].as_str().unwrap_or_default(),
+            &self.owner,
+        )
+        .await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sentence_is_drafted_and_labelled_by_a_job_audited_at_its_start_and_its_end() {
+    let l = TicketsApp::new().await;
+    let (status, started) = l.classify(&l.owner, "").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+    assert_eq!(started["draft"]["origin"], "drafted");
+    assert_eq!(started["draft"]["set"]["sentence"], TICKETS_SENTENCE);
+    assert_eq!(started["outline"]["output_table"], "tickets_labels");
+    let finished = l.finished(&started).await;
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+    assert_eq!(finished["kind"], "classify");
+
+    let (status, runs) = l.h.get(&l.path(""), &l.viewer).await;
+    assert_eq!(status, StatusCode::OK, "{runs}");
+    let run = &runs["runs"][0];
+    assert_eq!(run["id"], started["run"]);
+    assert_eq!(run["status"], "completed");
+    assert_eq!(run["output_table"], "tickets_labels");
+    assert_eq!(run["labelled"], 5);
+    assert_eq!(run["sentence"], TICKETS_SENTENCE);
+    assert_eq!(run["drafted_by_model"], "scripted/model");
+
+    let table = l.described("tickets_labels").await;
+    assert_eq!(table["row_count"], 5);
+    assert_eq!(table["labelled_by"]["id"], started["run"]);
+    let department = table["columns"]
+        .as_array()
+        .and_then(|c| c.iter().find(|c| c["name"] == "department"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        department["description"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("Which department? One of billing, technical")),
+        "{department}"
+    );
+    let source = l.described("tickets").await;
+    assert_eq!(source["label_set"]["origin"], "reused");
+    assert_eq!(source["label_set"]["set"]["sentence"], TICKETS_SENTENCE);
+    assert_eq!(source["label_set"]["output_table"], "tickets_labels");
+
+    let rows = l.classified().await;
+    let run_id = started["run"].as_str().unwrap_or_default();
+    let ours: Vec<_> = rows
+        .iter()
+        .filter(|r| r.entry.resource_id.as_deref() == Some(run_id))
+        .collect();
+    assert_eq!(ours.len(), 2, "a start row and a closing row: {rows:?}");
+    assert!(ours.iter().all(|r| r.entry.outcome == Outcome::Allowed));
+    assert!(
+        ours.iter()
+            .all(|r| r.entry.resource_type == Some(ResourceKind::ClassificationRun))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preview_keeps_nothing_a_viewer_may_ask_for_one_and_its_set_runs_as_it_is() {
+    let l = TicketsApp::new().await;
+    let (status, report) = l.classify(&l.viewer, "?preview=3").await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["draft"]["origin"], "drafted");
+    assert_eq!(report["outline"]["effect"]["kind"], "new_table");
+    assert_eq!(report["outline"]["remaining"], 5);
+    let preview = &report["preview"];
+    assert_eq!(preview["result"]["rows"].as_array().map(Vec::len), Some(3));
+    assert_eq!(preview["result"]["columns"][1], "department");
+    assert_eq!(preview["compact"]["columns"][1], "department (p)");
+    assert_eq!(preview["compact"]["rows"][0][1], "billing (0.90)");
+    assert_eq!(l.classified().await.len(), 1, "one row for the preview");
+    assert_eq!(l.runs().await["runs"], serde_json::json!([]));
+    assert_eq!(
+        l.described("tickets").await["label_set"],
+        serde_json::Value::Null
+    );
+    assert_eq!(l.chat.requests().len(), 1, "one draft");
+
+    // A run needs the write role.
+    let (status, body) = l.classify(&l.viewer, "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // The questions a preview returned run as they are, with no new draft.
+    let (status, started) =
+        l.h.post(
+            &l.path(""),
+            &l.owner,
+            serde_json::json!({ "table": "tickets", "set": report["draft"]["set"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+    assert_eq!(started["draft"]["origin"], "given");
+    l.finished(&started).await;
+    assert_eq!(
+        l.chat.requests().len(),
+        1,
+        "the chat model was not asked again"
+    );
+    let run = &l.runs().await["runs"][0];
+    assert_eq!(
+        run["sentence"], TICKETS_SENTENCE,
+        "the set carries its sentence"
+    );
+    assert_eq!(run["status"], "completed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_that_cannot_be_carried_out_is_refused_with_a_coded_error() {
+    let l = TicketsApp::new().await;
+    let path = l.path("");
+    let code = |status: StatusCode, body: &serde_json::Value| (status, body["code"].clone());
+
+    let mut request = TicketsApp::request();
+    request["table"] = serde_json::json!("nothing");
+    let (status, body) = l.h.post(&path, &l.owner, request).await;
+    assert_eq!(
+        code(status, &body),
+        (StatusCode::NOT_FOUND, "not_found".into()),
+        "{body}"
+    );
+
+    // Neither a sentence nor questions approved before.
+    let (status, body) =
+        l.h.post(&path, &l.owner, serde_json::json!({ "table": "tickets" }))
+            .await;
+    assert_eq!(
+        code(status, &body),
+        (StatusCode::BAD_REQUEST, "no_questions".into()),
+        "{body}"
+    );
+
+    let (_, report) = l.classify(&l.owner, "?preview=1").await;
+    let set = report["draft"]["set"].clone();
+    let with = |change: &dyn Fn(&mut serde_json::Value)| {
+        let mut set = set.clone();
+        change(&mut set);
+        serde_json::json!({ "table": "tickets", "set": set })
+    };
+    let (status, body) =
+        l.h.post(
+            &path,
+            &l.owner,
+            with(&|s| s["text_columns"] = serde_json::json!(["removed"])),
+        )
+        .await;
+    assert_eq!(
+        code(status, &body),
+        (StatusCode::CONFLICT, "set_columns_gone".into()),
+        "{body}"
+    );
+    let (status, body) =
+        l.h.post(
+            &path,
+            &l.owner,
+            with(&|s| s["key_column"] = serde_json::json!("subject")),
+        )
+        .await;
+    assert_eq!(
+        code(status, &body),
+        (StatusCode::BAD_REQUEST, "classify_refused".into()),
+        "{body}"
+    );
+
+    // Another run holds the table.
+    let db =
+        l.h.app
+            .workspace_db(&l.ws)
+            .await
+            .unwrap_or_else(|e| fail(&e.message));
+    let held = db.claim(Claimed(String::from("tickets_labels")));
+    let (status, body) = l.classify(&l.owner, "").await;
+    assert_eq!(
+        code(status, &body),
+        (StatusCode::CONFLICT, "classify_running".into()),
+        "{body}"
+    );
+    drop(held);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn other_questions_label_every_row_again_and_the_labels_serve_until_then() {
+    let l = TicketsApp::new().await;
+    let (_, started) = l.classify(&l.owner, "").await;
+    l.finished(&started).await;
+    let mut set = started["draft"]["set"].clone();
+    set["questions"] = serde_json::json!({
+        "churn": {"type": "noul", "instructions": "Will they leave?"}
+    });
+    let (status, relabel) =
+        l.h.post(
+            &l.path(""),
+            &l.owner,
+            serde_json::json!({ "table": "tickets", "set": set }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{relabel}");
+    assert_eq!(
+        relabel["outline"]["effect"],
+        serde_json::json!({ "kind": "replaces_labels", "because": "questions_changed" })
+    );
+    assert_eq!(relabel["outline"]["remaining"], 5);
+    let finished = l.finished(&relabel).await;
+    assert_eq!(finished["state"], "succeeded", "{finished}");
+    let run = &l.runs().await["runs"][0];
+    assert_eq!(
+        (run["rows"].as_str(), run["labelled"].as_u64()),
+        (Some("all"), Some(5))
+    );
+    let table = l.described("tickets_labels").await;
+    let names: Vec<&str> = table["columns"]
+        .as_array()
+        .map(|c| c.iter().filter_map(|c| c["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(!names.contains(&"department"), "{names:?}");
+    assert!(names.contains(&"churn"), "{names:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_decision_model_the_route_says_so_and_a_forbidden_provider_is_denied() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("w", &owner).await;
+    let token = h.login("owner").await;
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/tables/classify"),
+            &token,
+            TicketsApp::request(),
+        )
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!("no_decision_model")
+        ),
+        "{body}"
+    );
+
+    let l = TicketsApp::new().await;
+    l.h.app
+        .control
+        .update_workspace(
+            &l.ws,
+            &WorkspaceChanges {
+                allowed_providers: ProviderAllowList::Only(
+                    std::iter::once(String::from("other")).collect(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, body) = l.classify(&l.owner, "").await;
+    assert_eq!(
+        (status, &body["code"]),
+        (
+            StatusCode::FORBIDDEN,
+            &serde_json::json!("provider_refused")
+        ),
+        "{body}"
+    );
+    let denied = l
+        .classified()
+        .await
+        .iter()
+        .filter(|r| r.entry.outcome == Outcome::Denied)
+        .count();
+    assert_eq!(denied, 1);
+    assert_eq!(l.stub.requests(), 0, "nothing was sent");
+    assert!(
+        l.chat.requests().is_empty(),
+        "nothing was sent to the chat model"
+    );
+}
+
+/// A request past the cap is refused while it is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_past_the_cap_is_refused_over_rest() {
+    let l = TicketsApp::new().await;
+    let request = serde_json::json!({ "table": "tickets", "sentence": "x".repeat(70_000) });
+    let (status, _) = l.h.post(&l.path(""), &l.owner, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(l.runs().await["runs"], serde_json::json!([]));
+}
+
+/// `text` as a form field's value.
+fn form_value(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// The Tables page offers the section where it can be used; Draft puts the
+/// questions in an editor, Preview shows their labels, Label rows starts the
+/// run with the questions as edited, and the page then opens the editor with
+/// the questions approved.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tables_page_drafts_previews_and_labels_with_the_questions_as_edited() {
+    let l = TicketsApp::new().await;
+    let h = &l.h;
+    let ws = &l.ws;
+    let owner = web_session(h, "owner").await;
+    let viewer = web_session(h, "viewer").await;
+    let tables = format!("/w/{ws}/tables");
+
+    // A viewer sees the table, and no section to label it.
+    let (status, html, _) = h.form(&tables, Some(&viewer), "name=tickets").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!html.contains("Label rows"), "{html}");
+
+    // The owner's section asks for a sentence and has no editor yet.
+    let (_, html, _) = h.form(&tables, Some(&owner), "name=tickets").await;
+    assert!(html.contains("Label rows"), "{html}");
+    assert!(
+        html.contains("What do you want to know about each row?"),
+        "{html}"
+    );
+    assert!(html.contains("tickets_labels"), "{html}");
+    assert!(!html.contains("n0_name"), "{html}");
+
+    // Draft: the chat model's questions in the editor, nothing kept.
+    let (status, html, _) = h
+        .form(
+            &format!("{tables}/label/draft"),
+            Some(&owner),
+            &format!("table=tickets&sentence={}", form_value(TICKETS_SENTENCE)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(
+        html.contains("name=\"n0_name\" value=\"department\""),
+        "{html}"
+    );
+    assert!(
+        html.contains("Questions drafted from 5 sample rows."),
+        "{html}"
+    );
+    assert!(html.contains("name=\"key\" value=\"id\""), "{html}");
+    assert_eq!(l.runs().await["runs"], serde_json::json!([]));
+
+    // Preview: the labels of the rows, under the questions as posted.
+    let (status, html, _) = h
+        .form(
+            &format!("{tables}/label/preview"),
+            Some(&owner),
+            &TicketsApp::editor(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(
+        html.contains("department (p)") && html.contains("billing (0.90)"),
+        "{html}"
+    );
+    assert!(html.contains("5 rows in"), "{html}");
+    assert_eq!(l.runs().await["runs"], serde_json::json!([]));
+
+    // A question that cannot be asked is said where the section keeps its status.
+    let broken = TicketsApp::editor().replace(&form_value("billing\ntechnical"), "billing");
+    let (status, html, headers) = h
+        .form(&format!("{tables}/label/preview"), Some(&owner), &broken)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("hx-retarget").and_then(|v| v.to_str().ok()),
+        Some("#label-status")
+    );
+    assert!(html.contains("has 1 options"), "{html}");
+
+    // Label rows: a job, and the questions approved.
+    let (status, _, headers) = h
+        .form(
+            &format!("{tables}/label/run"),
+            Some(&owner),
+            &TicketsApp::editor(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, html) = h.land(&headers, Some(&owner)).await;
+    assert!(
+        html.contains("Labelling 5 rows of tickets as job"),
+        "{html}"
+    );
+    for attempt in 0..200 {
+        let runs = l.runs().await;
+        if runs["runs"][0]["status"] == "completed" {
+            assert_eq!(runs["runs"][0]["sentence"], TICKETS_SENTENCE);
+            break;
+        }
+        assert!(attempt < 199, "the run never completed: {runs}");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // The editor now opens with the approved questions.
+    let (_, html, _) = h.form(&tables, Some(&owner), "name=tickets").await;
+    assert!(
+        html.contains("name=\"n0_name\" value=\"department\""),
+        "{html}"
+    );
+    assert!(html.contains("The questions approved before."), "{html}");
+    assert!(html.contains("Label every row again"), "{html}");
+    let (_, html, _) = h.form(&tables, Some(&owner), "name=tickets_labels").await;
+    assert!(
+        html.contains("Labels of") && html.contains("5 labelled"),
+        "{html}"
+    );
+    assert!(html.contains("Which department?"), "{html}");
+}
+
+/// The section is offered where the workspace's providers allow the
+/// decision model.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_label_section_is_offered_only_where_the_providers_allow_the_model() {
+    let l = TicketsApp::new().await;
+    let owner = web_session(&l.h, "owner").await;
+    let tables = format!("/w/{}/tables", l.ws);
+    let (_, html, _) = l.h.form(&tables, Some(&owner), "name=tickets").await;
+    assert!(html.contains("Label rows"), "{html}");
+
+    l.h.app
+        .control
+        .update_workspace(
+            &l.ws,
+            &WorkspaceChanges {
+                allowed_providers: ProviderAllowList::Only(
+                    std::iter::once(String::from("other")).collect(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (status, html, _) = l.h.form(&tables, Some(&owner), "name=tickets").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!html.contains("Label rows"), "{html}");
+    let (status, html, headers) =
+        l.h.form(
+            &format!("{tables}/label/draft"),
+            Some(&owner),
+            &format!("table=tickets&sentence={}", form_value(TICKETS_SENTENCE)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("hx-retarget").and_then(|v| v.to_str().ok()),
+        Some("#label-status")
+    );
+    assert!(html.contains("role=\"alert\""), "{html}");
+    assert!(l.chat.requests().is_empty(), "the chat model was not asked");
+}
+
+/// All the events of one MCP call: the progress notifications the server
+/// streamed, then the result.
+async fn mcp_events(
+    h: &Harness,
+    ws: &WorkspaceId,
+    token: &str,
+    session: &str,
+    body: serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/mcp/v1/{ws}"))
+        .header(header::HOST, "localhost")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("mcp-session-id", session)
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let (_, body, _) = h.send(request).await;
+    body.as_str()
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect()
+}
+
+/// A run over MCP is audited once, under the run id, and records the caller;
+/// a client that asks for progress is sent it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_over_mcp_is_audited_under_its_run_id_and_reports_its_progress() {
+    let l = TicketsApp::new().await;
+    let token = l.write_token().await;
+    let session = mcp_session(&l.h, &l.ws, &token).await;
+    let call = |id: u32, progress: bool| {
+        let mut params = serde_json::json!({
+            "name": "classify",
+            "arguments": TicketsApp::request(),
+        });
+        if progress {
+            params["_meta"] = serde_json::json!({ "progressToken": "p1" });
+        }
+        rpc(id, "tools/call", &params)
+    };
+
+    // A preview with a progress token streams the steps before its result.
+    let events = mcp_events(&l.h, &l.ws, &token, &session, {
+        let mut body = call(2, true);
+        body["params"]["arguments"]["preview"] = serde_json::json!(2);
+        body
+    })
+    .await;
+    let steps: Vec<&str> = events
+        .iter()
+        .filter(|e| e["method"] == "notifications/progress")
+        .filter(|e| e["params"]["progressToken"] == "p1")
+        .filter_map(|e| e["params"]["message"].as_str())
+        .collect();
+    assert_eq!(
+        steps,
+        ["drafting the questions", "previewing the labels"],
+        "{events:?}"
+    );
+    let result = events
+        .iter()
+        .find(|e| e["id"] == 2)
+        .unwrap_or_else(|| fail(&format!("no result in {events:?}")));
+    let content = &result["result"]["structuredContent"];
+    assert_eq!(content["draft"]["origin"], "drafted", "{result}");
+    assert_eq!(content["preview"]["labelled"], 2);
+    assert_eq!(
+        l.runs().await["runs"],
+        serde_json::json!([]),
+        "a preview keeps nothing"
+    );
+
+    // Without a token nothing is streamed but the result.
+    let events = mcp_events(&l.h, &l.ws, &token, &session, call(3, false)).await;
+    assert!(
+        events
+            .iter()
+            .all(|e| e["method"] != "notifications/progress"),
+        "{events:?}"
+    );
+    let result = events
+        .iter()
+        .find(|e| e["id"] == 3)
+        .unwrap_or_else(|| fail(&format!("no result in {events:?}")));
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    let run_id = result["result"]["structuredContent"]["run"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!run_id.is_empty(), "{result}");
+
+    let rows = l.classified().await;
+    let ours: Vec<_> = rows
+        .iter()
+        .filter(|r| r.entry.resource_id.as_deref() == Some(run_id.as_str()))
+        .collect();
+    assert_eq!(ours.len(), 1, "{rows:?}");
+    assert_eq!(ours[0].entry.origin.channel, Channel::Mcp);
+    assert_eq!(ours[0].entry.outcome, Outcome::Allowed);
+
+    let db =
+        l.h.app
+            .workspace_db(&l.ws)
+            .await
+            .unwrap_or_else(|e| fail(&e.message));
+    let recorded: (String, Option<String>) = db
+        .run(|db| {
+            Ok(db.connection().query_row(
+                "SELECT id, started_by FROM _quack_classifications",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        recorded,
+        (run_id, Some(l.owner_id.to_string())),
+        "the run names who started it"
+    );
+}
+
+/// A call refused before any run began is audited as the call, with no run
+/// to name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_mcp_labelling_is_audited_without_a_run() {
+    let l = TicketsApp::new().await;
+    let token = l.write_token().await;
+    let session = mcp_session(&l.h, &l.ws, &token).await;
+    let mut arguments = TicketsApp::request();
+    arguments["table"] = serde_json::json!("nothing");
+    let (status, body, _) = mcp_call(
+        &l.h,
+        &l.ws,
+        Some(&token),
+        Some(&session),
+        rpc(
+            2,
+            "tools/call",
+            &serde_json::json!({ "name": "classify", "arguments": arguments }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let rows = l.classified().await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].entry.resource_id, None);
+    assert_eq!(rows[0].entry.outcome, Outcome::Error);
+    assert_eq!(l.stub.requests(), 0, "nothing was asked of the model");
+}
+
+/// A table labelled inside a turn is audited at the turn's end under the
+/// run's id, beside the turn's own row, and the run records who asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_that_labels_a_table_audits_the_run_under_its_id() {
+    use quack_testkit::{self, Reply, ScriptedOllama};
+
+    let stub = quack_testkit::DecisionStub::start().await;
+    // The turn calls the tool, the tool's drafting asks the chat model, and
+    // the turn answers.
+    let ollama = ScriptedOllama::serve(vec![
+        Reply::Call {
+            tool: "classify_rows",
+            args: TicketsApp::request(),
+        },
+        Reply::Text(TICKETS_DRAFT),
+        Reply::Text("Labelled."),
+    ])
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let config = ollama
+        .config_with(&format!(
+            "[providers.local]\ntype = \"ollama\"\nbase_url = \"{}\"\nmax_retries = 0\n\
+             [decision]\nmodel = \"local/laya\"\n",
+            stub.base_url()
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("w", &owner).await;
+    let token = h.login("owner").await;
+    let db = h
+        .app
+        .workspace_db(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    db.run(|db| {
+        db.execute_statement(
+            "CREATE TABLE tickets AS SELECT range AS id, \
+             CASE WHEN range % 2 = 0 THEN 'billing' ELSE 'technical' END AS subject, \
+             'we will cancel' AS body FROM range(5)",
+        )?;
+        TableProfile::refresh_stale(db).map(drop)
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+
+    let (status, answer) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/query"),
+            &token,
+            serde_json::json!({ "prompt": "label the tickets", "allow_write": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let run_id = answer["steps"][0]["run"].as_str().unwrap_or_default();
+    assert!(!run_id.is_empty(), "the step names its run: {answer}");
+
+    let rows = h
+        .audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("classify")),
+            ..AuditFilter::default()
+        })
+        .await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].entry.resource_id.as_deref(), Some(run_id));
+    assert_eq!(rows[0].entry.outcome, Outcome::Allowed);
+    assert_eq!(
+        rows[0].entry.resource_type,
+        Some(ResourceKind::ClassificationRun)
+    );
+
+    let started_by: Option<String> = db
+        .run(|db| {
+            Ok(db.connection().query_row(
+                "SELECT started_by FROM _quack_classifications",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(started_by, Some(owner.to_string()));
 }

@@ -155,6 +155,8 @@ pub enum JobKind {
     Models,
     /// A document search a person runs without the model.
     Search,
+    /// A table's text labelled by a decision model.
+    Classify,
 }
 
 impl JobKind {
@@ -170,6 +172,7 @@ impl JobKind {
         Self::Export,
         Self::Models,
         Self::Search,
+        Self::Classify,
     ];
 
     /// The kind as it serializes.
@@ -186,6 +189,7 @@ impl JobKind {
             Self::Export => "export",
             Self::Models => "models",
             Self::Search => "search",
+            Self::Classify => "classify",
         }
     }
 }
@@ -203,7 +207,8 @@ impl JobKind {
             | Self::Ontology
             | Self::Graph
             | Self::Embeddings
-            | Self::Export => Priority::Background,
+            | Self::Export
+            | Self::Classify => Priority::Background,
         }
     }
 }

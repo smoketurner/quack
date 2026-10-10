@@ -23,9 +23,9 @@ use super::search::DocumentScope;
 use super::table_search::{CardRefresh, TableCards, TableLayout};
 use super::text_to_sql::{BuiltPrompt, Modeled, PromptOptions, Question, SystemPrompt, Window};
 use super::tools::{
-    CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool, FindTablesTool,
-    GraphTools, ListDocumentsTool, ListTablesTool, ReadDocumentTool, ReaderDb, RunSqlTool,
-    SearchDocumentsTool, SearchGraphTool, SharedDb, Turn, ViewImageTool,
+    ClassifyRowsTool, CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool,
+    FindTablesTool, GraphTools, Labeller, ListDocumentsTool, ListTablesTool, ReadDocumentTool,
+    ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool, SharedDb, Turn, ViewImageTool,
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::GraphResult;
@@ -236,6 +236,9 @@ pub struct Analysis<'a, M> {
     /// Stops the turn. Once the model is streaming, the turn ends with what
     /// it has so far: the text, the steps, the citations, and the usage.
     pub cancel: CancellationToken,
+    /// The decision model the `classify_rows` tool labels with; the tool is
+    /// left out without one.
+    pub labeller: Option<Labeller>,
 }
 
 /// What a cancelled turn's recorded answer ends with.
@@ -458,9 +461,12 @@ where
             message: user_message,
             asked,
             cancel,
+            labeller,
         } = self;
         let read = PromptAndModel::read(&reader_db, &prompt).await?;
-        let turn = Turn::new(recorder.clone(), write_policy).within(prompt.scope.clone());
+        let turn = Turn::new(recorder.clone(), write_policy)
+            .within(prompt.scope.clone())
+            .cancelled_by(cancel.clone());
         let Replay { history, dropped } = Replay::check(history);
         let window = prompt.window;
         let agent = BuildContext {
@@ -475,6 +481,7 @@ where
             rerank_model,
             reranker_call,
             images: images.filter(|_| read.has_images),
+            labeller,
             turn: turn.clone(),
         }
         .build_agent(completion_model, embedding_model, &read.prompt.text)?;
@@ -845,6 +852,8 @@ struct BuildContext<'a> {
     /// The chat model reading images for `view_image`, when it reads them
     /// and the workspace holds one.
     images: Option<ImageReader>,
+    /// The decision model `classify_rows` labels with.
+    labeller: Option<Labeller>,
     /// The turn the agent runs: `always_retrieve` records on it that it
     /// put chunk text in the prompt.
     turn: Turn,
@@ -904,6 +913,14 @@ impl BuildContext<'_> {
 
         if let Some(images) = ctx.images {
             builder = builder.tool(ViewImageTool::new(reader(), images));
+        }
+
+        if let Some(labeller) = ctx.labeller {
+            builder = builder.tool(ClassifyRowsTool::new(
+                Arc::clone(&ctx.shared_db),
+                reader(),
+                labeller,
+            ));
         }
 
         if ctx.tables == TableLayout::Ranked {

@@ -11,6 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::classify;
 use crate::error::{Error, Result};
 use crate::storage::workspace::{INTERNAL_PREFIX, WorkspaceDb, quote_ident};
 use crate::storage::writer::Writer;
@@ -85,6 +86,25 @@ impl ColumnKind {
         } else {
             Self::Other
         }
+    }
+}
+
+impl ColumnKind {
+    /// Whether `duckdb_type` holds whole numbers.
+    #[must_use]
+    pub fn is_integer(duckdb_type: &str) -> bool {
+        const INTEGERS: [&str; 9] = [
+            "TINYINT",
+            "SMALLINT",
+            "INTEGER",
+            "BIGINT",
+            "HUGEINT",
+            "UTINYINT",
+            "USMALLINT",
+            "UINTEGER",
+            "UBIGINT",
+        ];
+        INTEGERS.contains(&duckdb_type.trim().to_ascii_uppercase().as_str())
     }
 }
 
@@ -286,6 +306,15 @@ impl Retype<'_> {
             return Err(Error::Analysis(format!(
                 "table '{}' has no column '{}'",
                 self.table, self.column
+            )));
+        }
+        if let Some(labels) = classify::Run::in_force(db, self.table)?
+            && labels.key_column.eq_ignore_ascii_case(self.column)
+        {
+            return Err(Error::Analysis(format!(
+                "column '{}' is the key of a table of labels, which keeps the type of the key in \
+                 '{}'; retype it there and label every row again with --all",
+                self.column, labels.source_table
             )));
         }
         let column = quote_ident(self.column);
@@ -696,9 +725,44 @@ impl TableProfile {
         Ok(out)
     }
 
+    /// The columns a decision model can read, in table order: text that is
+    /// at least half present, holds at least two different values, does not
+    /// read as numbers or dates, and is neither the key nor named like an
+    /// id.
+    #[must_use]
+    pub fn text_candidates(&self, key: &str) -> Vec<&ColumnProfile> {
+        let rows = self.row_count;
+        self.columns
+            .iter()
+            .filter(|c| {
+                c.kind() == ColumnKind::Text
+                    && rows > 0
+                    && c.non_null.saturating_mul(2) >= rows
+                    && c.distinct >= 2
+                    && c.number_share < MISTYPED_SHARE
+                    && c.date_share < MISTYPED_SHARE
+                    && !c.name.eq_ignore_ascii_case(key)
+                    && !Self::is_id_name(&c.name)
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn column(&self, name: &str) -> Option<&ColumnProfile> {
         self.columns.iter().find(|c| c.name == name)
+    }
+
+    /// Whether a column is named like a key: `id`, a name ending in `_id`,
+    /// or a camelCase name ending in `Id` (`ticketId`). A bare upper-case
+    /// `ID` suffix does not count, since it ends words such as `PAID`.
+    #[must_use]
+    pub fn is_id_name(name: &str) -> bool {
+        name.eq_ignore_ascii_case("id")
+            || name.to_ascii_lowercase().ends_with("_id")
+            || name
+                .strip_suffix("Id")
+                .and_then(|rest| rest.chars().next_back())
+                .is_some_and(|c| c.is_ascii_lowercase())
     }
 
     /// The column whose values are all present and all different, an `id`

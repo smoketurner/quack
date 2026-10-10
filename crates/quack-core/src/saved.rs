@@ -580,6 +580,7 @@ mod tests {
             rows,
             result: None,
             duration_ms: 1,
+            run: None,
         }
     }
 

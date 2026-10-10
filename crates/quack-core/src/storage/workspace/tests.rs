@@ -3028,3 +3028,26 @@ fn pinned_text_past_the_budget_is_not_read() {
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert!(short.iter().all(|p| p.text == PinnedText::OverBudget));
 }
+
+#[test]
+fn opening_a_version_14_workspace_creates_the_classification_runs() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let config = config_in(dir.path());
+    {
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        db.execute_statement("DROP TABLE _quack_classifications")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        db.set_meta(MetaKey::SchemaVersion, "14")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let reopened = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        reopened
+            .meta(MetaKey::SchemaVersion)
+            .unwrap_or_default()
+            .as_deref(),
+        Some("15")
+    );
+    let runs = classify::Run::list(&reopened, 10).unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(runs.runs.is_empty());
+}

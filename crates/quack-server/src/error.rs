@@ -9,6 +9,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use quack_core::analysis::events::{FailureKind, TurnFailure};
+use quack_core::classify;
 use quack_core::error::Error as CoreError;
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -78,6 +79,25 @@ pub(crate) enum ErrorCode {
     UnsupportedFileType,
     /// An image arrived with no vision model configured to read it.
     NoVisionModel,
+    /// The decision model refused the request.
+    DecisionRefused,
+    /// No decision model is configured.
+    NoDecisionModel,
+    /// A set of decision questions cannot be asked.
+    InvalidQuestionSet,
+    /// The rows cannot be labelled as asked: no key, a bad column, a key
+    /// that is not unique.
+    ClassifyRefused,
+    /// The table has no approved questions and the request gave none.
+    NoQuestions,
+    /// The chat model's questions were refused twice.
+    DraftRefused,
+    /// The approved questions read columns the table no longer has.
+    SetColumnsGone,
+    /// Another run is labelling into the same table.
+    ClassifyRunning,
+    /// The run is too long for a caller that waits for it.
+    TooLargeToWait,
     /// The file has no bytes.
     EmptyFile,
     /// The text cannot name a workspace.
@@ -162,6 +182,10 @@ impl ErrorCode {
                 (Self::UnsupportedFileType, StatusCode::BAD_REQUEST)
             }
             CoreError::NoVisionModel(_) => (Self::NoVisionModel, StatusCode::BAD_REQUEST),
+            CoreError::DecisionRefused(_) => (Self::DecisionRefused, StatusCode::BAD_REQUEST),
+            CoreError::NoDecisionModel => (Self::NoDecisionModel, StatusCode::BAD_REQUEST),
+            CoreError::QuestionSet(_) => (Self::InvalidQuestionSet, StatusCode::BAD_REQUEST),
+            CoreError::Classify(refusal) => Self::of_classify(refusal),
             CoreError::EmptyFile(_) => (Self::EmptyFile, StatusCode::BAD_REQUEST),
             CoreError::InvalidWorkspaceName => {
                 (Self::InvalidWorkspaceName, StatusCode::BAD_REQUEST)
@@ -203,6 +227,32 @@ impl ErrorCode {
             | CoreError::ModelRequestUnscoped { .. } => {
                 (Self::Internal, StatusCode::INTERNAL_SERVER_ERROR)
             }
+        }
+    }
+
+    /// The code and status a refused labelling answers with.
+    fn of_classify(refusal: &classify::Error) -> (Self, StatusCode) {
+        match refusal {
+            classify::Error::NoTable(_) => (Self::NotFound, StatusCode::NOT_FOUND),
+            classify::Error::OutputTaken { .. } => (Self::TableTaken, StatusCode::CONFLICT),
+            classify::Error::NoQuestions { .. } => (Self::NoQuestions, StatusCode::BAD_REQUEST),
+            classify::Error::NoDrafter { .. } => (Self::NoChatModel, StatusCode::BAD_REQUEST),
+            classify::Error::DraftRefused { .. } => {
+                (Self::DraftRefused, StatusCode::UNPROCESSABLE_ENTITY)
+            }
+            classify::Error::SetColumnsGone { .. } => (Self::SetColumnsGone, StatusCode::CONFLICT),
+            classify::Error::Running { .. } => (Self::ClassifyRunning, StatusCode::CONFLICT),
+            classify::Error::TooLargeToWait { .. } => {
+                (Self::TooLargeToWait, StatusCode::BAD_REQUEST)
+            }
+            classify::Error::NoText { .. }
+            | classify::Error::TextColumns(_)
+            | classify::Error::NoKey { .. }
+            | classify::Error::KeyNotUnique { .. }
+            | classify::Error::KeyType { .. }
+            | classify::Error::KeyLost { .. }
+            | classify::Error::ColumnClash(_)
+            | classify::Error::ReplaceRefused => (Self::ClassifyRefused, StatusCode::BAD_REQUEST),
         }
     }
 

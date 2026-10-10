@@ -407,11 +407,17 @@ pub struct EmbeddingChoice {
     pub dimension: Dimension,
 }
 
-/// The chat and embedding models a config file names now, as written.
+/// The chat, embedding, and decision models a config file names now, as
+/// written.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "each field is a model, named for the config key it reads"
+)]
 pub struct Current {
     pub chat_model: Option<String>,
     pub embedding_model: Option<String>,
+    pub decision_model: Option<String>,
 }
 
 impl Current {
@@ -432,6 +438,7 @@ impl Current {
         Ok(Self {
             chat_model: read("general", "chat_model"),
             embedding_model: read("embedding", "model"),
+            decision_model: read("decision", "model"),
         })
     }
 
@@ -441,12 +448,15 @@ impl Current {
     }
 }
 
-/// What `quack init` writes: a chat model, an embedding model, and the
-/// providers they name. A model left `None` keeps what the file has.
+/// What `quack init` writes: a chat model, an embedding model, a decision
+/// model, and the providers they name. A model left `None` keeps what the
+/// file has.
 #[derive(Debug, Clone, Default)]
 pub struct SetupPlan {
     pub chat: Option<Choice>,
     pub embedding: Option<EmbeddingChoice>,
+    /// The model that labels the text of a table's rows.
+    pub decision: Option<Choice>,
     /// Ollama's address, when it is not the default.
     pub ollama_base_url: Option<BaseUrl>,
 }
@@ -458,7 +468,7 @@ impl SetupPlan {
     /// Whether the plan changes anything.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.chat.is_none() && self.embedding.is_none()
+        self.chat.is_none() && self.embedding.is_none() && self.decision.is_none()
     }
 
     /// The provider kinds the plan's models name, each once, in
@@ -468,6 +478,7 @@ impl SetupPlan {
         let named = [
             self.chat.as_ref().map(|c| c.kind),
             self.embedding.as_ref().map(|e| e.choice.kind),
+            self.decision.as_ref().map(|d| d.kind),
         ];
         ProviderKind::ALL
             .into_iter()
@@ -564,6 +575,15 @@ impl SetupPlan {
                 "general",
                 "chat_model",
                 model(chat).into(),
+            )?;
+        }
+        if let Some(decision) = &self.decision {
+            set(
+                &mut doc,
+                &mut changes,
+                "decision",
+                "model",
+                model(decision).into(),
             )?;
         }
         if let Some(embedding) = &self.embedding {

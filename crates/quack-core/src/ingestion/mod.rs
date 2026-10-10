@@ -27,6 +27,7 @@ use crate::embedding::EmbeddingModel;
 use crate::config::Config;
 use aws_lc_rs::digest;
 
+use crate::classify;
 use crate::crypto::{hex_lower, sha256_hex};
 use crate::embedding::{Embedder, Input};
 use crate::error::{Error, Result};
@@ -1392,7 +1393,45 @@ impl TableName {
         Self(format!("{}_{}", self.0, Self::sanitized(sheet).0))
     }
 
-    fn sanitized(name: &str) -> Self {
+    /// The table called `name` among `catalog`, spelled as the catalog
+    /// spells it, without regard to case.
+    #[must_use]
+    pub fn in_catalog(catalog: &[String], name: &str) -> Option<Self> {
+        catalog
+            .iter()
+            .find(|table| table.eq_ignore_ascii_case(name))
+            .map(|table| Self(table.clone()))
+    }
+
+    /// The table called `name` among `catalog`, as [`Self::in_catalog`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Ingestion` error for a name quack reserves for itself,
+    /// and [`classify::Error::NoTable`] when no table has the name.
+    pub fn exact(catalog: &[String], name: &str) -> Result<Self> {
+        Self(name.to_owned()).check_unreserved()?;
+        Self::in_catalog(catalog, name)
+            .ok_or_else(|| classify::Error::NoTable(name.to_owned()).into())
+    }
+
+    /// The hidden table a run that labels every row again writes into for
+    /// the output `output` until it completes.
+    #[must_use]
+    pub fn stage_of(output: &str) -> String {
+        format!("{INTERNAL_PREFIX}stage_{}", output.to_ascii_lowercase())
+    }
+
+    /// The same name in lower case.
+    #[must_use]
+    pub fn lowercased(&self) -> Self {
+        Self(self.0.to_ascii_lowercase())
+    }
+
+    /// `name` with every character that is not a letter, digit, or `_`
+    /// replaced by `_`.
+    #[must_use]
+    pub fn sanitized(name: &str) -> Self {
         Self(
             name.chars()
                 .map(|c| {

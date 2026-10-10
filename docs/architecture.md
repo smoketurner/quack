@@ -45,7 +45,7 @@ nothing in it knows about HTTP, terminals, or windows.
 
 | Module | Owns | Design doc |
 |---|---|---|
-| `config` | `config.toml` with every section (`[general]`, `[providers.*]`, `[ingestion]`, `[embedding]`, `[retrieval]`, `[context]`, `[analysis]`, `[server]`, `[ontology]`, `[graph]`, `[import]`, `[jobs]`), unknown keys rejected, `QUACK_*` overrides | 13 |
+| `config` | `config.toml` with every section (`[general]`, `[providers.*]`, `[ingestion]`, `[embedding]`, `[retrieval]`, `[context]`, `[analysis]`, `[server]`, `[ontology]`, `[graph]`, `[decision]`, `[import]`, `[jobs]`), unknown keys rejected, `QUACK_*` overrides | 13 |
 | `config::inspect` | the file read outside `Config::load` (`quack config`): each recognized setting's value in force and origin, unrecognized keys, the environment variables read | 13 |
 | `crypto` | installs the aws-lc-rs provider once | 14 |
 | `vault` | data at rest sealed with HPKE under one key in the OS keychain, per purpose and subject; callers store the `Sealed` value | 10.3, 12 |
@@ -64,6 +64,7 @@ nothing in it knows about HTTP, terminals, or windows.
 | `embedding` | each text's embedding role (query, document, similarity), each model family's trained prefixes (`presets`) and their `[embedding]` overrides, the profile a vector is made under, the width check, `refresh` | 6.1, 5.4 |
 | `ingestion` | registration with SHA-256 dedup, parsers (`parser` for the types and dispatch; `pdf`, `markdown`, `html`, `office`, `epub`, `odt`, `mail`, `captions`, `code`, `rtf`, `xlsx`; `zipped` for the zip-of-XML formats; `table` for tables found inside documents), the decompression limit on zipped uploads (`budget`), chunking by section kind (`chunker`), embedding, tables from structured files and from inside documents, piped stdin | 6.1, 6.2 |
 | `import` | rows from a SQLite file or an HTTP data file as a workspace table | 6.2 |
+| `classify` | a table's text labelled by the decision model into a table that joins back by the key: the questions a person's sentence becomes (`Draft`, `LabelSet`, drafted by the chat model in `drafting`), the plan (key, columns, output, why every row is labelled again), the keyset pipeline with a page written per transaction, the staged replace, runs as jobs for callers that wait (`LabelJobs`), and `_quack_classifications` with the set in force and the last approved | 6.6 |
 | `analysis` | the agent loop as an event stream (`agent`, `events`), the tools (`tools`: plain values over the workspace and its settings, the turn's state, `tools::Turn`, reaching each call as a runtime scope of rig's `ToolContext`), the system prompt (`text_to_sql`), write policy, citations, the chart spec, the reranking hook (`rerank`), the one document search every interface runs and a person's document scope (`search`) | 6.1, 7, 9 |
 | `ontology` | the model, validation, versions and id renames that move the graph (`store`, `IdRenames`), induction from tables and documents (`induction`, `documents`), the review queue (`candidates`) | 6.3, 6.5 |
 | `graph` | the knowledge graph: `store` (nodes, edges, provenance, a person's assertions and corrections, status with the pending chunks and tables), `tables` (mapping extraction and each table's fingerprint), `extract` (constrained model extraction with drift), `resolve` (merges), `traverse`, `export` (the whole graph as CSV, GraphML, or JSON-LD), `follow_up` (the extraction `[graph].follow_ingest` runs after an ingest); `store::Revalidation::preview` counts what a revalidation drops before it runs | 6.4 |
@@ -72,7 +73,7 @@ nothing in it knows about HTTP, terminals, or windows.
 | `extraction` | what both extraction runs share: the `Extract` trait, lenient JSON answers, concurrent calls with per-chunk progress (`RunProgress`), even sampling across documents, name counts (`Tally`) | 6.4, 6.5 |
 | `progress` | the per-chunk progress report the extraction runs make to their caller | 6.5 |
 | `jobs` | the work queue every interface submits background work to: ordered lanes, cancel, progress, a broadcast of job snapshots, and `shutdown(grace)`, the one way the terminal and `quack serve` stop their jobs | 4.1 |
-| `llm` | rig provider construction over `limit::LimitedHttp` (each provider's process-wide request limit), `TurnRequest` (one agent turn), `SchemaCall` (one tool-less prompt whose answer a JSON schema shapes, sent as the provider's structured output and parsed whole: graph extraction against `Ontology::extraction_schema`, the ontology's document pass, the model reranker, and history summaries), OAuth token management (`oauth`), the person an on-behalf-of provider acts for (`acting`, a task-local), the workspace's provider allow-list and its one check (`egress`, a task-local), Amazon Bedrock over the AWS SDK's credential chain with the same limits (`bedrock`) | 4.1, 10 |
+| `llm` | rig provider construction over `limit::LimitedHttp` (each provider's process-wide request limit), `TurnRequest` (one agent turn), `SchemaCall` (one tool-less prompt whose answer a JSON schema shapes, sent as the provider's structured output and parsed whole: graph extraction against `Ontology::extraction_schema`, the ontology's document pass, the model reranker, and history summaries), decision models over Ollama's `/v1/systemone` (`decision`: questions, the row's state, and the per-row fit search), OAuth token management (`oauth`), the person an on-behalf-of provider acts for (`acting`, a task-local), the workspace's provider allow-list and its one check (`egress`, a task-local), Amazon Bedrock over the AWS SDK's credential chain with the same limits (`bedrock`) | 4.1, 10 |
 
 ## `quack-cli`
 
@@ -84,6 +85,7 @@ depends on `quack-core` alone.
 | `print` | `-p`: one turn, answer to stdout, steps to stderr, text or JSON |
 | `ontology_cli`, `graph_cli`, `embeddings_cli`, `saved_cli`, `tables_cli` | `quack ontology`, `quack graph`, `quack embeddings`, `quack saved`, and `quack tables`; each action runs on the workspace writer and writes to the `out` it is given |
 | `import_cli` | `quack import` and its saved imports |
+| `classify_cli` | `quack classify` and `/classify`: the arguments, what is drafted, previewed, and asked (`Prepared`), the questions shown, and the run listing |
 | `args` | `ModeArg`, `ExportFlags`, and `QueryFormat`, the arguments the command line and the slash commands share |
 | `confirm`, `stdio`, `text_or_json`, `session` | the confirmation prompt, named stdin and file inputs, the text-or-JSON output choice, and finding a session by id prefix |
 

@@ -456,6 +456,32 @@ of one policy, templated reports): the right passage is then often below rank 24
 list, and a reranker scores a pair in a few milliseconds, so the cost is small. Leave it
 when the search already returns the right document in its first page.
 
+## Recipe: a decision model
+
+A decision model labels text: for a row's text and a fixed list of questions it returns each
+option's probability in tens of milliseconds, where the chat model takes a call per row
+(`quack classify`, design doc 6.6). The questions come from the chat model, which drafts them
+from a sentence once per table (30 to 120 seconds), so `quack classify` needs `[general].chat_model`
+as well, unless the table's questions were approved before. Laya (`ollama pull laya`, 846 MB, English only) is the
+one quack has been run against. It needs Ollama 0.40.0 or later, whose `/v1/systemone` route
+rig has no client for, so only a `type = "ollama"` provider can serve it:
+
+```toml
+[decision]
+model = "ollama/laya"
+# keep_alive_minutes = 30    # how long a request asks Ollama to keep it loaded
+# interactive_budget = 1500  # answers (rows times questions) an agent turn or MCP call labels or previews while it waits; 1500 is 500 rows of 3 questions
+```
+
+Every request takes the provider's permit (`max_concurrent_requests`, 1 for Ollama), passes
+the workspace's `allowed_providers` check, and uses the proxy settings, like any other
+model. `quack doctor` checks that the model is pulled, that Ollama says it can do `decision`,
+and that a one-question call is answered; an older Ollama answers `404 page not found` and
+the fix line says to upgrade. The model reads 512 tokens per question, instructions and
+options included, and quack cuts a row's text itself to the longest prefix the model
+accepts, counting the rows it cut (`truncated`). Its probabilities are not guaranteed to be
+calibrated on your data: preview a sample before labelling a table.
+
 ## Recipe: LiteLLM
 
 A LiteLLM proxy speaks the OpenAI API, so quack reaches it as one `openai` provider with a

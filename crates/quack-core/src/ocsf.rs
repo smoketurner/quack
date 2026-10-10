@@ -68,6 +68,7 @@ impl EventClass {
             | AuditAction::Propose
             | AuditAction::GraphExtract
             | AuditAction::Save
+            | AuditAction::Classify
             | AuditAction::BreakGlass
             | AuditAction::Admin => Self::Api(Create),
             AuditAction::Context

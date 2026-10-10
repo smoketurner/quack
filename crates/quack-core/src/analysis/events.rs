@@ -16,6 +16,7 @@ use super::citations::CitationRegistry;
 use super::policy::Hold;
 use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
+use crate::ids::RunId;
 use crate::storage::control::Outcome;
 use crate::storage::workspace::QueryResults;
 
@@ -73,6 +74,7 @@ pub enum ToolName {
     FindPath,
     DescribeClass,
     ViewImage,
+    ClassifyRows,
 }
 
 text_enum!(ToolName, "tool", {
@@ -88,6 +90,7 @@ text_enum!(ToolName, "tool", {
     FindPath => "find_path",
     DescribeClass => "describe_class",
     ViewImage => "view_image",
+    ClassifyRows => "classify_rows",
 });
 
 impl ToolName {
@@ -105,7 +108,8 @@ impl ToolName {
             | Self::SearchGraph
             | Self::FindPath
             | Self::DescribeClass
-            | Self::ViewImage => false,
+            | Self::ViewImage
+            | Self::ClassifyRows => false,
         }
     }
 }
@@ -127,6 +131,10 @@ pub struct ToolStep {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<QueryResults>,
     pub duration_ms: u64,
+    /// The run a step that labelled a table started, for the audit row that
+    /// names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunId>,
 }
 
 /// A write the agent wants to run; the interface answers with `allow` or
@@ -483,6 +491,11 @@ impl TurnRecorder {
         }
     }
 
+    /// Tell the interface how a long tool call is going.
+    pub fn status(&self, text: impl Into<String>) {
+        self.emit(AgentEvent::Status(text.into()));
+    }
+
     /// Ask the interface whether a write held for `hold` may run, unless an
     /// earlier answer this turn already granted every write so held: a
     /// grant given before the turn read document text does not cover a
@@ -536,22 +549,33 @@ pub struct StepInProgress {
 
 impl StepInProgress {
     pub fn finish(self, summary: impl Into<String>) {
-        self.record(summary.into(), None, None);
+        self.record(summary.into(), None, None, None);
+    }
+
+    /// Finish a step that ran the labelling `run`.
+    pub fn finish_run(self, summary: impl Into<String>, run: RunId) {
+        self.record(summary.into(), None, None, Some(run));
     }
 
     /// Finish a statement that produced `rows` rows.
     pub fn finish_rows(self, rows: u64) {
-        self.record(format!("{rows} rows"), Some(rows), None);
+        self.record(format!("{rows} rows"), Some(rows), None, None);
     }
 
     /// Finish a statement that produced `rows` rows, keeping the first
     /// `keep` of `result` on the step for the transcript.
     pub fn finish_with_result(self, rows: u64, mut result: QueryResults, keep: usize) {
         result.rows.truncate(keep);
-        self.record(format!("{rows} rows"), Some(rows), Some(result));
+        self.record(format!("{rows} rows"), Some(rows), Some(result), None);
     }
 
-    fn record(self, summary: String, rows: Option<u64>, result: Option<QueryResults>) {
+    fn record(
+        self,
+        summary: String,
+        rows: Option<u64>,
+        result: Option<QueryResults>,
+        run: Option<RunId>,
+    ) {
         let step = ToolStep {
             tool: self.tool,
             detail: self.detail,
@@ -559,6 +583,7 @@ impl StepInProgress {
             rows,
             result,
             duration_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            run,
         };
         if let Ok(mut steps) = self.recorder.steps.lock() {
             steps.push(step.clone());
@@ -569,7 +594,13 @@ impl StepInProgress {
     /// Finish as `error: ...` and hand the error back, for the caller to
     /// return or show the model.
     pub fn fail<E: fmt::Display>(self, error: E) -> E {
-        self.finish(format!("error: {error}"));
+        self.fail_run(error, None)
+    }
+
+    /// [`Self::fail`] for a step that began the labelling `run` before it
+    /// failed.
+    pub fn fail_run<E: fmt::Display>(self, error: E, run: Option<RunId>) -> E {
+        self.record(format!("error: {error}"), None, None, run);
         error
     }
 }

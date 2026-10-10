@@ -1,0 +1,16 @@
+<section aria-labelledby="label-rows" class="mt-4 rounded border border-slate-800 bg-slate-900 p-3 text-sm">
+  <h2 id="label-rows" class="font-medium">Label rows</h2>
+  <p class="mt-1 text-xs text-slate-400">The decision model ({{ model }}) answers questions about each row's text. The labels go to <span class="font-mono">{{ output }}</span>, one row per row of {{ table }}, joined by its key.</p>
+  <form hx-post="/w/{{ ws_id }}/tables/label/draft" hx-target="#label-editor" hx-swap="innerHTML" hx-disabled-elt="find button" hx-indicator="#label-drafting" class="mt-2">
+    <input type="hidden" name="table" value="{{ table }}">
+    <label for="label-sentence" class="text-xs text-slate-400">What do you want to know about each row?</label>
+    <div class="mt-0.5 flex gap-2">
+      <input id="label-sentence" name="sentence" value="{{ sentence }}" class="block w-full rounded border border-slate-700 px-2 py-1" placeholder="which department should handle each ticket, and how urgent it is">
+      <button type="submit" class="rounded bg-blue-600 px-3 py-1 text-white hover:bg-blue-500">Draft</button>
+    </div>
+    <p class="mt-1 text-xs text-slate-400">Draft writes the questions with the chat model from 20 sample rows (usually under two minutes); on a table with approved questions it revises them. Nothing is kept until you label.</p>
+    <p id="label-drafting" class="htmx-indicator mt-1 text-xs text-slate-300" role="status">Drafting; this can take a minute or two…</p>
+  </form>
+  <div id="label-status" role="status" aria-live="polite"></div>
+  <div id="label-editor" class="mt-3">{% if let Some(editor) = editor %}{{ editor|safe }}{% endif %}</div>
+</section>

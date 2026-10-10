@@ -25,8 +25,8 @@ use utoipa::{Modify, OpenApi, ToSchema};
 
 use super::StreamEvent;
 use super::{
-    admin, auth, context, documents, embeddings, graph, import, jobs, members, okf, ontology,
-    query, saved, sessions, tables, workspaces,
+    admin, auth, classify, context, documents, embeddings, graph, import, jobs, members, okf,
+    ontology, query, saved, sessions, tables, workspaces,
 };
 use crate::auth::SESSION_COOKIE;
 use crate::error::{ApiError, ApiResult, ErrorBody, ErrorCode};
@@ -103,6 +103,8 @@ const COOKIE: &str = "session";
         tables::schema,
         tables::note,
         tables::retype,
+        classify::label,
+        classify::runs,
         context::show,
         context::replace,
         context::versions,

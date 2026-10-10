@@ -69,6 +69,7 @@ fn an_existing_model_is_offered_first_and_never_dropped_for_none() {
     let current = Current {
         chat_model: None,
         embedding_model: Some(String::from("local/nomic-embed-text")),
+        decision_model: None,
     };
     let discovery = Discovery(vec![ollama_found(vec![ollama_model(
         "embed:small",

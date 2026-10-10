@@ -720,6 +720,8 @@ pub enum AuditAction {
     TableNote,
     /// A table column was given another type.
     Retype,
+    /// A table's text was labelled by a decision model.
+    Classify,
     /// A stored name this build does not define, as a newer build wrote
     /// it. Read only: the one write path refuses it.
     Unknown(String),
@@ -770,6 +772,7 @@ history_enum!(AuditAction, Unknown, {
     SavedRun => "saved_run",
     TableNote => "table_note",
     Retype => "retype",
+    Classify => "classify",
 });
 
 /// The kinds of resource an audit row names by opaque id. Like
@@ -803,6 +806,8 @@ pub enum ResourceKind {
     SavedQuestion,
     /// An import saved under a name for refreshing.
     SavedImport,
+    /// One run that labelled a table's text.
+    ClassificationRun,
     /// An identity provider's group, named in a workspace's group roles.
     Group,
     /// A stored name this build does not define, as a newer build wrote
@@ -832,6 +837,7 @@ history_enum!(ResourceKind, Unknown, {
     Audit => "audit",
     SavedQuestion => "saved_question",
     SavedImport => "saved_import",
+    ClassificationRun => "classification_run",
     Group => "group",
 });
 

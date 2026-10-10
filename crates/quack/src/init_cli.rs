@@ -134,6 +134,7 @@ async fn setup(talk: &mut impl Write) -> Result<ExitCode> {
     };
     plan.chat = chat_model(&discovery, &plan, &current, talk).await?;
     plan.embedding = embedding(&discovery, &plan, &current, talk).await?;
+    plan.decision = decision_model(&discovery, &current)?;
     if plan.is_empty() {
         if file.text.is_some() {
             writeln!(talk, "Nothing changed.")?;
@@ -348,6 +349,46 @@ async fn embedding(
     Ok(choice)
 }
 
+/// The decision model that labels a table's text, when Ollama has one: its
+/// models whose capabilities say `decision`. Asked only where there is a
+/// choice to make.
+fn decision_model(discovery: &Discovery, current: &Current) -> Result<Option<Choice>> {
+    let mut options: Vec<DecisionOption<'_>> = current
+        .decision_model
+        .iter()
+        .map(|model| DecisionOption::Keep(model))
+        .collect();
+    options.extend(
+        discovery
+            .ollama_models(OllamaCapability::Decision)
+            .into_iter()
+            .map(DecisionOption::Ollama),
+    );
+    if options.is_empty() {
+        return Ok(None);
+    }
+    if current.decision_model.is_none() {
+        options.push(DecisionOption::None);
+    }
+    if matches!(options.as_slice(), [DecisionOption::Keep(_)]) {
+        return Ok(None);
+    }
+    Ok(
+        match inquire::Select::new(
+            "Decision model, for labelling the text of a table's rows:",
+            options,
+        )
+        .prompt()?
+        {
+            DecisionOption::Ollama(model) => Some(Choice {
+                kind: ProviderKind::Ollama,
+                model: model.name.clone(),
+            }),
+            DecisionOption::Keep(_) | DecisionOption::None => None,
+        },
+    )
+}
+
 fn explain_missing(discovery: &Discovery, talk: &mut impl Write) -> Result<()> {
     if discovery
         .get(ProviderKind::Ollama)
@@ -411,6 +452,24 @@ impl fmt::Display for ModelOption<'_> {
             ByteSize(model.size).to_string(),
             capabilities.join(", ")
         )
+    }
+}
+
+/// One answer to the decision model question.
+enum DecisionOption<'a> {
+    /// The model the file names now.
+    Keep(&'a str),
+    Ollama(&'a OllamaModel),
+    None,
+}
+
+impl fmt::Display for DecisionOption<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Keep(model) => write!(f, "Keep {model}"),
+            Self::Ollama(model) => write!(f, "ollama/{}", ModelOption(model)),
+            Self::None => f.write_str("None: quack classify is not available"),
+        }
     }
 }
 

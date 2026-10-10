@@ -5,9 +5,9 @@ use std::path::{MAIN_SEPARATOR, Path};
 
 use quack_core::analysis::citations::Citation;
 use quack_core::config::{
-    AnalysisConfig, BaseUrl, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
-    ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig, ProviderType,
-    RetrievalConfig, ServerConfig,
+    AnalysisConfig, BaseUrl, Config, ContextConfig, DecisionConfig, EmbeddingConfig, GeneralConfig,
+    GraphConfig, ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig,
+    ProviderType, RetrievalConfig, ServerConfig,
 };
 use quack_core::embedding::refresh::{Plan, Retype};
 use quack_core::embedding::{Dimension, Embedder, EmbeddingModel, Profile, Prompts, Vector};
@@ -157,6 +157,7 @@ fn test_config(data_dir: &Path) -> Config {
         server: ServerConfig::default(),
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
+        decision: DecisionConfig::default(),
         import: ImportConfig::default(),
         jobs: JobsConfig::default(),
     }
@@ -178,6 +179,7 @@ fn test_config_no_provider(data_dir: &Path) -> Config {
         server: ServerConfig::default(),
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
+        decision: DecisionConfig::default(),
         import: ImportConfig::default(),
         jobs: JobsConfig::default(),
     }
@@ -1516,7 +1518,7 @@ fn open_records_schema_version_and_embedding_meta() {
     let db = WorkspaceDb::open(&config, "ws-meta").unwrap();
     assert_eq!(
         db.meta(MetaKey::SchemaVersion).unwrap().as_deref(),
-        Some("14")
+        Some("15")
     );
     assert_eq!(
         db.meta(MetaKey::EmbeddingDimension).unwrap().as_deref(),
@@ -2099,7 +2101,7 @@ fn legacy_workspace_gets_its_terms_indexed_on_open() {
     let db = WorkspaceDb::open(&config, "ws-reindex").unwrap();
     assert_eq!(
         db.meta(MetaKey::SchemaVersion).unwrap().as_deref(),
-        Some("14")
+        Some("15")
     );
     let hits = db
         .search_keyword_chunks("8841", 3, &ChunkScope::all())

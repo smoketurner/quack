@@ -10,6 +10,11 @@ use schemars::transform::{Transform, transform_subschemas};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::Deserialize;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
+
+mod classify;
+
+pub use classify::{ClassifyRowsTool, Labeller};
 
 use crate::ids::{ChunkId, DocumentId};
 use crate::storage::profile::TableProfile;
@@ -327,6 +332,8 @@ pub struct Turn {
     /// The documents the person limited the question to; a search the
     /// model narrows further stays within them.
     scope: DocumentScope,
+    /// Stops the turn; a long tool call ends with it.
+    cancel: CancellationToken,
 }
 
 impl Turn {
@@ -341,7 +348,44 @@ impl Turn {
             exposure: Arc::new(Mutex::new(Exposure::None)),
             shapes: Arc::new(Mutex::new(Vec::new())),
             scope: DocumentScope::default(),
+            cancel: CancellationToken::new(),
         }
+    }
+
+    /// The token that stops the turn.
+    #[must_use]
+    pub fn cancel(&self) -> &CancellationToken {
+        &self.cancel
+    }
+
+    /// End the turn's long tool calls when `cancel` fires.
+    #[must_use]
+    pub fn cancelled_by(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Weigh a write against the turn's policy: it runs, a person is
+    /// asked (the prompt holds no connection while it waits), or it is
+    /// refused and the turn records that it was.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Hold`] that kept the write from running.
+    pub async fn permit_write(&self, statement: &str) -> Result<(), Hold> {
+        let hold = match self.policy.decide(self.exposure()) {
+            WriteDecision::Run => return Ok(()),
+            WriteDecision::Ask(hold) => {
+                if self.recorder.ask_permission(statement, hold).await {
+                    return Ok(());
+                }
+                hold
+            }
+            WriteDecision::Refuse(hold) => hold,
+        };
+        self.refused.set();
+        tracing::info!(statement, %hold, "refused write from agent");
+        Err(hold)
     }
 
     /// The documents the person limited the turn to.
@@ -577,19 +621,10 @@ impl SqlGate {
                     tracing::info!(sql, "refused a statement that would create a temp object");
                     return Ok(Gate::Reject(String::from(TEMP_OBJECT_REFUSED)));
                 }
-                let hold = match turn.policy.decide(turn.exposure()) {
-                    WriteDecision::Run => return Ok(Gate::Write),
-                    WriteDecision::Ask(hold) => {
-                        if turn.recorder.ask_permission(sql, hold).await {
-                            return Ok(Gate::Write);
-                        }
-                        hold
-                    }
-                    WriteDecision::Refuse(hold) => hold,
-                };
-                turn.refused.set();
-                tracing::info!(sql, %hold, "refused write statement from agent");
-                Ok(Gate::Refused(hold))
+                Ok(match turn.permit_write(sql).await {
+                    Ok(()) => Gate::Write,
+                    Err(hold) => Gate::Refused(hold),
+                })
             }
         }
     }

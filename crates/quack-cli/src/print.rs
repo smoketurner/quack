@@ -13,8 +13,10 @@ use quack_core::analysis::citations::Sources;
 use quack_core::analysis::events::{self, AgentEvent, DetailPreview, ToolName, ToolStep};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
+use quack_core::classify::LabelJobs;
 use quack_core::config::Config;
 use quack_core::ids::SessionId;
+use quack_core::jobs::JobQueue;
 use quack_core::llm;
 use quack_core::llm::egress::Egress;
 
@@ -145,6 +147,10 @@ impl PrintTurn<'_> {
 
         let interrupt = CtrlCGuard::new();
         let cancel = interrupt.cancel.clone();
+        // A table the agent labels is a job of this queue, which the command
+        // waits for before it exits, so an interrupted run records its end.
+        let jobs = JobQueue::from_config(&config.jobs);
+        let labelling = LabelJobs::new(jobs.clone());
         let turn = tokio::spawn({
             let config = config.clone();
             let prompt = prompt.to_owned();
@@ -158,6 +164,8 @@ impl PrintTurn<'_> {
                     policy,
                     message: &prompt,
                     documents: &documents,
+                    user: None,
+                    labelling,
                     sink,
                     cancel,
                 }
@@ -231,20 +239,14 @@ impl PrintTurn<'_> {
         }
         spinner.clear(&mut err)?;
 
+        let turn = turn.await;
+        jobs.shutdown(FOLLOW_UP_GRACE).await;
         let response = turn
-            .await
             .context("agent task panicked")?
             .context("agent turn failed")?;
         drop(interrupt);
 
-        match format {
-            TextOrJson::Text => write_text_answer(&mut out, &streamed, &response)?,
-            TextOrJson::Json => {
-                let object = response.body(session_id);
-                serde_json::to_writer_pretty(&mut out, &object)?;
-                writeln!(out)?;
-            }
-        }
+        write_answer(&mut out, format, &streamed, &response, session_id)?;
         out.flush()?;
         writeln!(err, "session {session_id}")?;
 
@@ -254,6 +256,24 @@ impl PrintTurn<'_> {
             TurnOutcome::Answered
         })
     }
+}
+
+/// The answer after the turn, as text or as the response object.
+fn write_answer(
+    out: &mut impl Write,
+    format: TextOrJson,
+    streamed: &str,
+    response: &AgentResponse,
+    session_id: &SessionId,
+) -> Result<()> {
+    match format {
+        TextOrJson::Text => write_text_answer(out, streamed, response)?,
+        TextOrJson::Json => {
+            serde_json::to_writer_pretty(&mut *out, &response.body(session_id))?;
+            writeln!(out)?;
+        }
+    }
+    Ok(())
 }
 
 /// The text-mode answer after the turn: the validated content when
@@ -605,6 +625,7 @@ mod tests {
                 rows: Some(3),
                 result: None,
                 duration_ms: 12,
+                run: None,
             },
         )
         .unwrap_or_else(|e| fail(&e.to_string()));

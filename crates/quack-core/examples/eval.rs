@@ -23,9 +23,9 @@ use std::process::ExitCode;
 
 use quack_core::analysis::citations::CitationRegistry;
 use quack_core::config::{
-    AnalysisConfig, Config, ContextConfig, EmbeddingConfig, GeneralConfig, GraphConfig,
-    ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig, ProviderType,
-    RetrievalConfig, ServerConfig,
+    AnalysisConfig, Config, ContextConfig, DecisionConfig, EmbeddingConfig, GeneralConfig,
+    GraphConfig, ImportConfig, IngestionConfig, JobsConfig, OntologyConfig, ProviderConfig,
+    ProviderType, RetrievalConfig, ServerConfig,
 };
 use quack_core::embedding::{Dimension, Embedder, EmbeddingModel, Input, Profile, Prompts};
 use quack_core::error::{Error, Result};
@@ -162,6 +162,7 @@ fn eval_config(data_dir: &Path) -> Result<Config> {
         server: ServerConfig::default(),
         ontology: OntologyConfig::default(),
         graph: GraphConfig::default(),
+        decision: DecisionConfig::default(),
         import: ImportConfig::default(),
         jobs: JobsConfig::default(),
     })

@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::analysis::table_search;
 use crate::analysis::text_to_sql::ColumnLine;
+use crate::classify::{self, Draft};
 use crate::config::Config;
 use crate::crypto;
 use crate::embedding::{
@@ -73,9 +74,11 @@ const TABLE_PROFILES: u32 = 12;
 /// are stemmed under it, with unspaced scripts as bigrams (issue #395):
 /// every document is detected and every chunk reindexed.
 const DOCUMENT_LANGUAGES: u32 = 13;
-/// Imports can be saved under a name and refreshed (`_quack_imports`);
-/// the table needs no backfill.
-const SAVED_IMPORTS: u32 = 14;
+/// Runs that label a table's text are recorded (`_quack_classifications`)
+/// and a table of labels is a document with source `classify`, which an
+/// older quack cannot read; the table needs no backfill. (Version 14,
+/// saved imports, needed none either.)
+const CLASSIFICATIONS: u32 = 15;
 
 /// The documents table, and the columns older files gain on open.
 const DOCUMENTS_DDL: &str = "
@@ -159,7 +162,7 @@ const SESSION_SUMMARIES_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_session_s
 
 /// Schema version of the internal tables, recorded in `_quack_meta`: the
 /// newest step above.
-const WORKSPACE_SCHEMA_VERSION: u32 = SAVED_IMPORTS;
+const WORKSPACE_SCHEMA_VERSION: u32 = CLASSIFICATIONS;
 
 /// The oldest `DuckDB` that must read a file created here, given to `DuckDB`
 /// when the file is opened. It is the bundled library's own default, named so
@@ -1428,6 +1431,7 @@ impl WorkspaceDb {
         self.conn.execute_batch(SESSION_SUMMARIES_DDL)?;
         self.conn.execute_batch(input_history::DDL)?;
         self.conn.execute_batch(SAVED_IMPORTS_DDL)?;
+        self.conn.execute_batch(classify::DDL)?;
         self.conn.execute_batch(saved::DDL)?;
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&graph::ddl(dim))?;
@@ -1970,6 +1974,9 @@ impl WorkspaceDb {
                 document.status
             )));
         }
+        if document.source == DocumentSource::Classify {
+            return Err(classify::Error::ReplaceRefused.into());
+        }
         if let Some(pending) = document.superseded_by {
             return Err(Error::Ingestion(format!(
                 "cannot replace {} ({old}): a replacement ({pending}) is already being processed",
@@ -2082,6 +2089,10 @@ impl WorkspaceDb {
             ),
             (
                 "UPDATE _quack_imports SET created_by = ? WHERE created_by = ?",
+                user_id.as_str(),
+            ),
+            (
+                "UPDATE _quack_classifications SET started_by = ? WHERE started_by = ?",
                 user_id.as_str(),
             ),
             (
@@ -2400,6 +2411,12 @@ impl WorkspaceDb {
         for table in &tables {
             self.conn
                 .execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)))?;
+            if doc.source == DocumentSource::Classify {
+                self.conn.execute_batch(&format!(
+                    "DROP TABLE IF EXISTS {}",
+                    quote_ident(&TableName::stage_of(table))
+                ))?;
+            }
         }
         if doc.status != DocumentStatus::Superseded {
             self.remove_document_files(id, &doc.filename, &tables);
@@ -3628,6 +3645,21 @@ impl WorkspaceDb {
                     .and_then(ColumnMeaning::of);
             }
         }
+        let labelled_by = classify::Run::in_force(self, table_name)?;
+        if let Some(run) = &labelled_by {
+            for (name, description) in run.column_meanings() {
+                if let Some(column) = columns
+                    .iter_mut()
+                    .find(|c| c.name == name && c.meaning.is_none())
+                {
+                    column.meaning = Some(ColumnMeaning {
+                        description: Some(description),
+                        unit: None,
+                        synonyms: Vec::new(),
+                    });
+                }
+            }
+        }
         let profile =
             TableProfile::current(self, table_name, u64::try_from(row_count).unwrap_or(0))?;
         let warnings = profile
@@ -3645,6 +3677,8 @@ impl WorkspaceDb {
             measures: ontology
                 .map(|o| o.measures_on(table_name).into_iter().cloned().collect())
                 .unwrap_or_default(),
+            labelled_by,
+            label_set: Draft::approved(self, table_name)?,
         })
     }
 
@@ -4011,6 +4045,11 @@ pub struct TableDescription {
     pub warnings: Vec<profile::Flagged>,
     /// The ontology's measures over this table.
     pub measures: Vec<Measure>,
+    /// The run whose definition the rows of this table were labelled
+    /// under, when it is a table of labels.
+    pub labelled_by: Option<classify::Run>,
+    /// The questions last approved for labelling this table's text.
+    pub label_set: Option<Draft>,
 }
 
 impl TableDescription {
@@ -4037,6 +4076,8 @@ impl TableDescription {
                 })
                 .collect(),
             measures: self.measures.clone(),
+            labelled_by: self.labelled_by.clone(),
+            label_set: self.label_set.clone(),
             sample: self.sample_rows.clone(),
         }
     }
@@ -4056,6 +4097,12 @@ pub struct TableDescriptionBody {
     pub warnings: Vec<WarningBody>,
     /// The ontology's measures over this table.
     pub measures: Vec<Measure>,
+    /// The run whose definition the rows were labelled under, when this is
+    /// a table of labels.
+    pub labelled_by: Option<classify::Run>,
+    /// The questions last approved for labelling this table's text, with
+    /// the columns they read; none when nothing was approved.
+    pub label_set: Option<Draft>,
     /// A few rows.
     pub sample: QueryResults,
 }
@@ -4097,6 +4144,22 @@ impl fmt::Display for TableDescription {
             for measure in &self.measures {
                 writeln!(f, "  - {measure}")?;
             }
+        }
+        if let Some(draft) = &self.label_set {
+            let names: Vec<String> = draft
+                .set
+                .questions
+                .iter()
+                .map(|(name, _)| name.to_string())
+                .collect();
+            writeln!(
+                f,
+                "Labelling: approved questions ({}) read {}; the labels are in {}. \
+                 classify_rows with no sentence uses them.",
+                names.join(", "),
+                draft.set.columns_in_words(),
+                OneLine(&draft.output_table)
+            )?;
         }
         if !self.sample_rows.rows.is_empty() {
             writeln!(f, "\nSample rows:")?;
@@ -4329,6 +4392,8 @@ pub enum DocumentSource {
     Stdin,
     /// Rows pulled from an external database or a URL (`quack import`).
     Import,
+    /// A table of labels a decision model wrote (`quack classify`).
+    Classify,
 }
 
 text_enum!(DocumentSource, "document source", {
@@ -4337,6 +4402,7 @@ text_enum!(DocumentSource, "document source", {
     Path => "path",
     Stdin => "stdin",
     Import => "import",
+    Classify => "classify",
 });
 
 impl DocumentSource {

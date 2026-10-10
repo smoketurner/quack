@@ -427,6 +427,7 @@ mod tests {
                 rows: Some(1),
                 result: None,
                 duration_ms: 1,
+                run: None,
             }],
             ..AgentResponse::default()
         };

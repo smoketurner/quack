@@ -462,6 +462,10 @@ const SECTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "decision",
+        &["model", "keep_alive_minutes", "interactive_budget"],
+    ),
+    (
         "import",
         &[
             "max_rows",
@@ -553,6 +557,7 @@ fn collect(config: &Config, file: Option<&Table>, in_force: bool) -> Vec<Setting
     server(&mut inventory, config, &defaults);
     ontology(&mut inventory, config, &defaults);
     graph(&mut inventory, config, &defaults);
+    decision(&mut inventory, config, &defaults);
     import(&mut inventory, config, &defaults);
     jobs(&mut inventory, config, &defaults);
     inventory.settings
@@ -1014,6 +1019,23 @@ fn ontology(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
         "min_support_documents",
         ontology.min_support_documents,
         default.min_support_documents,
+    );
+}
+
+fn decision(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
+    let (decision, default) = (&config.decision, &defaults.decision);
+    let mut s = inventory.section("decision");
+    let model = decision.model.as_ref().map(ToString::to_string);
+    s.optional_text("model", model.as_deref(), None);
+    s.literal(
+        "keep_alive_minutes",
+        decision.keep_alive_minutes,
+        default.keep_alive_minutes,
+    );
+    s.literal(
+        "interactive_budget",
+        decision.interactive_budget,
+        default.interactive_budget,
     );
 }
 

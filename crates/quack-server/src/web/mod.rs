@@ -4,6 +4,7 @@
 //! do; the handlers here only shape the response as HTML.
 
 pub(crate) mod flash;
+mod label;
 pub(crate) mod markdown;
 mod saved;
 mod search;
@@ -55,6 +56,7 @@ use rust_embed::Embed;
 use serde::Deserialize;
 
 use self::flash::{Flash, Flashed};
+use self::label::{LabelSection, LabelledView};
 use super::api::admin::{CreateUser, UpdateUser};
 use super::api::auth::LoginRequest;
 use super::api::context::ReplaceContext;
@@ -602,6 +604,8 @@ struct TableView {
     measures: Vec<String>,
     sample_columns: Vec<String>,
     sample_rows: Vec<Vec<String>>,
+    /// The run that labelled the table, when it is a table of labels.
+    labelled_by: Option<LabelledView>,
 }
 
 /// One column on the Tables page: its type, what it means, its profile,
@@ -653,6 +657,7 @@ impl TableView {
             })
             .collect();
         Self {
+            labelled_by: described.labelled_by.as_ref().map(LabelledView::of),
             name: described.table_name,
             note: described.note,
             columns,
@@ -677,6 +682,9 @@ struct TablesPage {
     /// Imports saved for refreshing, with how each last ran.
     imports: Vec<SavedImport>,
     selected: Option<TableView>,
+    /// The "Label rows" section for the selected table, rendered; absent
+    /// without a decision model, or for someone who may not write.
+    label_section: Option<String>,
     error: Option<String>,
     notice: Option<String>,
 }
@@ -692,8 +700,18 @@ impl TablesPage {
         (error, notice): (Option<String>, Option<String>),
     ) -> WebResult<Response> {
         let access = Access::resolve(app, identity, id, Need::READ).await?;
+        let mut label_section = None;
         let selected = if let Some(name) = open {
-            Some(TableView::of(access.describe_table(app, &name).await?))
+            let described = access.describe_table(app, &name).await?;
+            let approved = described.label_set.clone();
+            let view = TableView::of(described);
+            if access.permits(Need::WRITE)
+                && let Some(model) = label::offered(app).await
+            {
+                label_section =
+                    Some(LabelSection::of(id, &view.name, model, approved.as_ref())?.render()?);
+            }
+            Some(view)
         } else {
             access.audit_read(app, AuditAction::Page, "tables").await?;
             None
@@ -709,6 +727,7 @@ impl TablesPage {
             tables: list,
             imports,
             selected,
+            label_section,
             error,
             notice,
         })
@@ -1069,6 +1088,9 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/tables", get(tables).post(table))
         .route("/w/{id}/tables/note", post(table_note))
         .route("/w/{id}/tables/retype", post(table_retype))
+        .route("/w/{id}/tables/label/draft", post(label::draft))
+        .route("/w/{id}/tables/label/preview", post(label::preview))
+        .route("/w/{id}/tables/label/run", post(label::run))
         .route("/w/{id}/import", post(import_submit))
         .route("/w/{id}/imports/{import}/refresh", post(import_refresh))
         .route("/w/{id}/imports/{import}/remove", post(import_remove))

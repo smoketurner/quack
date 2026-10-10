@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,6 +26,7 @@ use quack_core::analysis::events::{
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::search::{DocumentScope, DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
+use quack_core::classify::{self, LabelJobs};
 use quack_core::config::Config;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::follow_up::FollowUp;
@@ -67,6 +69,7 @@ use crate::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
 use quack_cli::Confirm;
 use quack_cli::ModeArg;
 use quack_cli::TextOrJson;
+use quack_cli::classify_cli::{ClassifyCommand, Prepared};
 use quack_cli::embeddings_cli::{self, EmbeddingsAction};
 use quack_cli::graph_cli::GraphAction;
 use quack_cli::ontology_cli::{self, OntologyAction};
@@ -303,6 +306,9 @@ enum Prompt {
     /// A deletion the person asked for, held until they confirm it, as the
     /// web asks before its delete buttons.
     Delete(Deletion),
+    /// A labelling the person saw drafted and previewed, held until they
+    /// say yes.
+    Label(Box<Prepared>),
 }
 
 impl Prompt {
@@ -310,7 +316,7 @@ impl Prompt {
     fn is_write_of(&self, job: JobId) -> bool {
         match self {
             Self::Write { job: owner, .. } => owner.id == job,
-            Self::Delete(_) => false,
+            Self::Delete(_) | Self::Label(_) => false,
         }
     }
 
@@ -318,7 +324,7 @@ impl Prompt {
     fn refuse(self) {
         match self {
             Self::Write { request, .. } => request.deny(),
-            Self::Delete(_) => {}
+            Self::Delete(_) | Self::Label(_) => {}
         }
     }
 }
@@ -345,6 +351,8 @@ impl Deletion {
 
 /// The keys a deletion prompt takes.
 const CONFIRM_KEYS: &str = "[y] Delete   [n] Keep";
+/// The keys of the prompt that holds a labelling.
+const LABEL_KEYS: &str = "[y] Label   [n] Don't";
 
 /// What the prompt overlay asks about: the front prompt, described when
 /// drawn so it never depends on what the transcript still shows.
@@ -573,6 +581,7 @@ enum CliJob {
     ContextExport(String),
     Import(ImportRequest),
     SavedImport(ImportAction),
+    Classify(ClassifyCommand),
     Ingest(PathBuf),
     Search(String),
 }
@@ -586,6 +595,7 @@ impl CliJob {
             Self::Saved(_) => JobKind::Sql,
             Self::Okf(_) | Self::ContextExport(_) => JobKind::Export,
             Self::ContextImport(_) | Self::Import(_) | Self::SavedImport(_) => JobKind::Import,
+            Self::Classify(_) => JobKind::Classify,
             Self::Ingest(_) => JobKind::Ingest,
             Self::Search(_) => JobKind::Search,
         }
@@ -603,6 +613,7 @@ impl CliJob {
             Self::ContextExport(_) => String::from("Exporting the context"),
             Self::Import(request) => format!("import {}", request.url),
             Self::SavedImport(action) => action.label(),
+            Self::Classify(command) => command.label(),
             Self::Search(query) => format!("search {}", one_line(query)),
             Self::Ingest(path) => path.file_name().map_or_else(
                 || path.display().to_string(),
@@ -629,6 +640,7 @@ impl CliJob {
             | Self::ContextImport(_)
             | Self::ContextExport(_)
             | Self::SavedImport(_)
+            | Self::Classify(_)
             | Self::Search(_) => {
                 Message::new(MessageKind::System, format!("{}\u{2026}", self.label()))
             }
@@ -685,15 +697,7 @@ impl CliJob {
                 )
                 .await?;
             }
-            Self::Okf(dir) => {
-                let name = env.workspace_name.clone();
-                let target = dir.clone();
-                let summary = env
-                    .db
-                    .run(move |db| okf::export(db, &name, &mut DirSink::new(Path::new(&target))))
-                    .await?;
-                return Ok(format!("Wrote {} files to {dir}.", summary.files));
-            }
+            Self::Okf(dir) => return Self::okf(env, dir).await,
             Self::ContextImport(file) => {
                 let text = std::fs::read_to_string(&file)
                     .map_err(|e| anyhow!("cannot read {file}: {e}"))?;
@@ -733,10 +737,26 @@ impl CliJob {
                     )
                     .await?;
             }
+            Self::Classify(command) => {
+                command
+                    .run(&env.config, &env.db, Confirm::Assume, &mut out, control)
+                    .await?;
+            }
             Self::Ingest(path) => return Self::ingest(env, &path, control).await,
             Self::Search(query) => return Self::search(env, &query).await,
         }
         Ok(String::from_utf8_lossy(&out).trim_end().to_owned())
+    }
+
+    /// `/okf DIR`: the workspace as an Open Knowledge Format bundle.
+    async fn okf(env: &JobEnv, dir: String) -> Result<String> {
+        let name = env.workspace_name.clone();
+        let target = dir.clone();
+        let summary = env
+            .db
+            .run(move |db| okf::export(db, &name, &mut DirSink::new(Path::new(&target))))
+            .await?;
+        Ok(format!("Wrote {} files to {dir}.", summary.files))
     }
 
     /// `/search QUERY`: the hits with their rank in each leg, then each
@@ -1454,6 +1474,13 @@ impl App {
                 keys: String::from(CONFIRM_KEYS),
                 waiting,
             },
+            Prompt::Label(prepared) => PendingPrompt {
+                heading: prepared.question(),
+                body: "",
+                notice: None,
+                keys: String::from(LABEL_KEYS),
+                waiting,
+            },
         })
     }
 
@@ -1813,7 +1840,7 @@ impl App {
                     self.cancel_turn(job);
                     return;
                 }
-                Some(Prompt::Delete(_)) => {
+                Some(Prompt::Delete(_) | Prompt::Label(_)) => {
                     self.handle_permission_key(KeyCode::Esc);
                     return;
                 }
@@ -1902,7 +1929,11 @@ impl App {
             }
             _ => return,
         };
-        if answer == Decision::AllowTurn && matches!(self.prompts.front(), Some(Prompt::Delete(_)))
+        if answer == Decision::AllowTurn
+            && matches!(
+                self.prompts.front(),
+                Some(Prompt::Delete(_) | Prompt::Label(_))
+            )
         {
             return;
         }
@@ -1920,6 +1951,12 @@ impl App {
             Prompt::Delete(deletion) => match answer {
                 Decision::Allow => self.delete(deletion),
                 Decision::Deny | Decision::AllowTurn => self.note(MessageKind::System, "Kept."),
+            },
+            Prompt::Label(prepared) => match answer {
+                Decision::Allow => self.label(prepared),
+                Decision::Deny | Decision::AllowTurn => {
+                    self.note(MessageKind::System, prepared.declined());
+                }
             },
         }
     }
@@ -2155,6 +2192,7 @@ impl App {
             SlashCommand::Export { flags, file } => self.export_session(flags.format(), file),
             SlashCommand::Okf { dir } => self.run_job(CliJob::Okf(dir)),
             SlashCommand::Embeddings { action } => self.run_job(CliJob::Embeddings(action)),
+            SlashCommand::Classify(command) => self.classify(command),
             SlashCommand::Saved { action } => {
                 let list = SavedAction::List {
                     format: TextOrJson::Text,
@@ -2429,6 +2467,126 @@ impl App {
                     Err(e) => app.note(MessageKind::Error, e.to_string()),
                 }
                 app.finish_switch();
+            },
+        );
+    }
+
+    /// `/classify`: list the runs or show a table's questions as a job;
+    /// otherwise draft or find the questions and preview the labels as a
+    /// job, then ask whether to label, or just label with `-y`.
+    fn classify(&mut self, command: ClassifyCommand) {
+        if command.labelling().is_none() {
+            self.run_job(CliJob::Classify(command));
+            return;
+        }
+        let (config, db, tx) = (
+            Arc::clone(&self.config),
+            Arc::clone(&self.db),
+            self.msg_tx.clone(),
+        );
+        let label = command.label();
+        let announce = Message::new(MessageKind::System, format!("{label}\u{2026}"));
+        self.submit_work(
+            JobKind::Classify,
+            label,
+            Some(announce),
+            move |ctx| async move {
+                let progress = |done: ChunkDone| ctx.progress(done.done, done.total);
+                let cancel = ctx.cancel_token();
+                let control = RunControl {
+                    progress: &progress,
+                    cancel: Some(&cancel),
+                };
+                Self::draft_classification(&command, &config, &db, &tx, control).await
+            },
+        );
+    }
+
+    /// The draft job of `/classify`: what was found and previewed, and the
+    /// prompt for a yes, or the run itself with `-y`.
+    async fn draft_classification(
+        command: &ClassifyCommand,
+        config: &Config,
+        db: &SharedDb,
+        tx: &mpsc::UnboundedSender<AppMsg>,
+        control: RunControl<'_>,
+    ) -> BackgroundResult {
+        let Some(args) = command.labelling() else {
+            return BackgroundResult::Failed(String::from("nothing to label"));
+        };
+        let mut status = Vec::new();
+        let prepared = match args.prepare(config, db, &mut status, control).await {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                if let Some(CoreError::Classify(classify::Error::NoQuestions { table })) =
+                    e.downcast_ref::<CoreError>()
+                {
+                    let line = format!("/classify {table} ");
+                    drop(tx.send(AppMsg::Apply(Box::new(move |app| app.set_input(&line)))));
+                    return BackgroundResult::Failed(format!(
+                        "{table} has no questions yet. Say what you want to know about each row \
+                         after the table name, for example:\n/classify {table} which department \
+                         should handle each ticket"
+                    ));
+                }
+                return BackgroundResult::Failed(format!("{e:#}"));
+            }
+        };
+        let mut out = status;
+        let shown = if prepared.nothing_to_label() {
+            writeln!(out, "{}", prepared.nothing_to_label_note())
+        } else {
+            prepared
+                .show(&mut out)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        };
+        if let Err(e) = shown {
+            return BackgroundResult::Failed(format!("{e:#}"));
+        }
+        if !prepared.nothing_to_label() && args.preview_only().is_none() {
+            if args.yes() {
+                if let Err(e) = prepared.run(config, db, &mut out, control).await {
+                    return BackgroundResult::Failed(format!("{e:#}"));
+                }
+            } else {
+                let prepared = Box::new(prepared);
+                drop(tx.send(AppMsg::Apply(Box::new(move |app| {
+                    app.prompts.push_back(Prompt::Label(prepared));
+                }))));
+            }
+        }
+        BackgroundResult::Done {
+            kind: MessageKind::System,
+            text: String::from_utf8_lossy(&out).trim_end().to_owned(),
+        }
+    }
+
+    /// A yes to the prompt of `/classify`: label the rows as a job.
+    fn label(&mut self, prepared: Box<Prepared>) {
+        let (config, db) = (Arc::clone(&self.config), Arc::clone(&self.db));
+        let announce = Message::new(
+            MessageKind::System,
+            format!("Labelling {}\u{2026}", prepared.draft().table),
+        );
+        self.submit_work(
+            JobKind::Classify,
+            format!("label {}", prepared.draft().table),
+            Some(announce),
+            move |ctx| async move {
+                let progress = |done: ChunkDone| ctx.progress(done.done, done.total);
+                let cancel = ctx.cancel_token();
+                let control = RunControl {
+                    progress: &progress,
+                    cancel: Some(&cancel),
+                };
+                let mut out = Vec::new();
+                match prepared.run(&config, &db, &mut out, control).await {
+                    Ok(()) => BackgroundResult::Done {
+                        kind: MessageKind::System,
+                        text: String::from_utf8_lossy(&out).trim_end().to_owned(),
+                    },
+                    Err(e) => BackgroundResult::Failed(format!("{e:#}")),
+                }
             },
         );
     }
@@ -2953,6 +3111,7 @@ impl App {
             .iter()
             .map(|d| d.id.to_string())
             .collect();
+        let labelling = LabelJobs::new(self.jobs.clone()).workspace(self.workspace_id.clone());
         let spec = JobSpec::new(JobKind::Chat, one_line(&message))
             .workspace(self.workspace_id.clone())
             .lane(Lane::serial(&LaneKey::Session(session_id.clone())));
@@ -2966,6 +3125,8 @@ impl App {
                 policy,
                 message: &message,
                 documents: &documents,
+                user: None,
+                labelling,
                 sink,
                 cancel: ctx.cancel_token(),
             })
@@ -3044,7 +3205,10 @@ impl App {
 
     fn handle_background_result(&mut self, job: JobId, result: BackgroundResult) {
         if self.jobs.get(job).is_some_and(|info| {
-            matches!(info.kind, JobKind::Sql | JobKind::Ingest | JobKind::Import)
+            matches!(
+                info.kind,
+                JobKind::Sql | JobKind::Ingest | JobKind::Import | JobKind::Classify
+            )
         }) {
             self.refresh_sql_schema();
         }

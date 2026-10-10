@@ -4,6 +4,7 @@
 
 pub(crate) mod admin;
 pub(crate) mod auth;
+pub(crate) mod classify;
 pub(crate) mod context;
 pub(crate) mod documents;
 pub(crate) mod embeddings;
@@ -21,10 +22,16 @@ mod tables;
 pub(crate) mod workspaces;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use axum::handler::Handler;
 use axum::response::sse::Event;
 use axum::routing::{MethodRouter, delete, get, patch, post, put};
 
 use super::state::App;
+
+/// The most bytes a labelling request carries: far above the 16 KiB the
+/// questions of a set may take, and small enough to read in no time.
+const CLASSIFY_BODY_BYTES: usize = 64 * 1024;
 
 /// The event names the query and job streams send. Clients subscribe by
 /// these names, so they are a contract, written once.
@@ -156,6 +163,11 @@ pub(crate) fn router(app: &App) -> ApiRoutes {
         .route("/workspaces/{id}/tables/schema", get(tables::schema))
         .route("/workspaces/{id}/tables/note", put(tables::note))
         .route("/workspaces/{id}/tables/retype", post(tables::retype))
+        .route(
+            "/workspaces/{id}/tables/classify",
+            get(classify::runs)
+                .post(classify::label.layer(DefaultBodyLimit::max(CLASSIFY_BODY_BYTES))),
+        )
         .route(
             "/workspaces/{id}/context",
             get(context::show).put(context::replace),

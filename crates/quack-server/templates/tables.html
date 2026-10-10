@@ -64,6 +64,11 @@
         <tbody>{% for r in t.sample_rows %}<tr class="border-b border-slate-800">{% for v in r %}<td class="px-3 py-1"><div class="max-w-xs truncate" title="{{ v }}">{{ v }}</div></td>{% endfor %}</tr>{% endfor %}</tbody>
       </table>
     </div>
+    {% if let Some(l) = t.labelled_by %}
+    <h2 class="mt-4 text-sm font-semibold uppercase text-slate-400">Labelled by</h2>
+    <p class="mt-1 text-sm wrap-anywhere">Labels of <span class="font-mono">{{ l.source }}</span> (key <span class="font-mono">{{ l.key }}</span>){% if let Some(sentence) = l.sentence %}, asking &ldquo;{{ sentence }}&rdquo;,{% endif %} made with <span class="font-mono">{{ l.model }}</span>: {{ l.counts }}. The run is {{ l.status }}, started {{ l.started_at }}.</p>
+    {% endif %}
+    {% if let Some(section) = label_section %}{{ section|safe }}{% endif %}
     <p class="mt-4 text-sm"><a class="text-blue-400 hover:underline" href="/w/{{ ws.membership.workspace.id }}/sql">Query it in SQL</a></p>
     {% else %}
     <p class="text-slate-400">Pick a table to see its schema and sample rows.</p>

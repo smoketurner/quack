@@ -21,7 +21,7 @@
       <button class="text-blue-400 hover:underline" hx-post="/w/{{ ws_id }}/documents/{{ d.id }}/pin" hx-target="#rows" hx-swap="innerHTML">Pin</button>
       {% endif %}
       <button class="ml-3 text-red-400 hover:underline" hx-post="/w/{{ ws_id }}/documents/{{ d.id }}/delete" hx-confirm="Delete {{ d.filename }}?" hx-target="#rows" hx-swap="innerHTML">Delete</button>
-      {% if d.status == DocumentStatus::Ready && d.superseded_by.is_none() %}
+      {% if d.status == DocumentStatus::Ready && d.superseded_by.is_none() && d.source != DocumentSource::Classify %}
       <details class="mt-1 text-left"><summary class="cursor-pointer text-blue-400 hover:underline">Replace</summary>
         <form method="post" action="/w/{{ ws_id }}/documents/{{ d.id }}/replace" enctype="multipart/form-data" class="mt-1 flex flex-wrap items-center gap-2">
           <input type="file" name="file" required aria-label="Replacement for {{ d.filename }}" class="block max-w-full cursor-pointer text-xs text-slate-400 file:mr-2 file:cursor-pointer file:rounded file:border file:border-slate-600 file:bg-slate-800 file:px-2 file:py-1 file:text-xs file:text-slate-100 hover:file:bg-slate-700">

@@ -55,6 +55,7 @@ use std::time::Duration;
 
 use quack_cli::Confirm;
 use quack_cli::TextOrJson;
+use quack_cli::classify_cli::ClassifyCommand;
 use quack_cli::find_session;
 use quack_cli::{AnswerTo, FOLLOW_UP_GRACE, PrintTurn, TurnOutcome};
 use quack_cli::{ExportFlags, ModeArg, QueryFormat};
@@ -243,6 +244,11 @@ enum Commands {
     /// workspace table (the Rust-side replacement for ATTACH); `list`,
     /// `refresh`, and `remove` manage imports saved with `--save`
     Import(ImportCommand),
+
+    /// Label a table's text with a decision model, one question set for
+    /// every row, into a new table that joins back by the key; `list` shows
+    /// the runs
+    Classify(ClassifyCommand),
 
     /// Move the workspace as an Open Knowledge Format bundle
     #[command(subcommand)]
@@ -958,6 +964,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
         }
         Commands::Graph(action) => run_on_writer(cli, action).await,
         Commands::Embeddings(action) => run_on_writer(cli, action).await,
+        Commands::Classify(command) => run_on_writer(cli, command).await,
         Commands::Saved(action) => run_saved(cli, action).await,
         Commands::Vault(action) => action.run().await,
         Commands::Okf(OkfAction::Export { dir }) => run_okf_export(cli, &dir).await,
@@ -1272,6 +1279,18 @@ impl WriterCommand for embeddings_cli::EmbeddingsAction {
         control: RunControl<'_>,
     ) -> Result<()> {
         embeddings_cli::run(config, db, self, Confirm::Ask, out, control).await
+    }
+}
+
+impl WriterCommand for ClassifyCommand {
+    async fn run(
+        self,
+        config: &Config,
+        db: &Writer,
+        out: &mut impl Write,
+        control: RunControl<'_>,
+    ) -> Result<()> {
+        self.run(config, db, Confirm::Ask, out, control).await
     }
 }
 

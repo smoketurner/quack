@@ -34,4 +34,5 @@ winsplit = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 proptest = { workspace = true, features = ["std"] }
+quack-testkit = { path = "../quack-testkit" }
 tempfile = { workspace = true }

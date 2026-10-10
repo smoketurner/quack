@@ -904,6 +904,68 @@ async fn the_rerank_model_is_listed_and_answers_a_probe() {
     .await;
 }
 
+#[tokio::test]
+#[expect(clippy::unwrap_used, reason = "test")]
+async fn the_decision_model_is_listed_reports_its_capability_and_answers_a_probe() {
+    use crate::llm::decision::stub::{DecisionStub, Fault};
+
+    Egress::scope(Some(Egress::NoWorkspace), async {
+        let config = |base: &str, model: &str| -> Config {
+            Config::parse(&format!(
+                "[providers.local]\ntype = \"ollama\"\nbase_url = \"{base}\"\nmax_retries = 0\n\
+                 [decision]\nmodel = \"local/{model}\"\n"
+            ))
+            .unwrap()
+        };
+        let probing = Probing::Online {
+            timeout: Duration::from_secs(5),
+        };
+        let stub = DecisionStub::start().await;
+        let mut report = Report::default();
+        check_decision_model(&mut report, &config(stub.base_url(), "laya"), probing).await;
+        let checks = find(&report, Area::Decision);
+        let last = checks.last().unwrap();
+        assert_eq!(
+            (last.status, last.summary.as_str()),
+            (Status::Ok, "local/laya: a decision call was answered"),
+            "{checks:?}"
+        );
+        assert!(checks.iter().all(|c| c.status == Status::Ok), "{checks:?}");
+
+        let refusing =
+            DecisionStub::with_rule(|_| Some(Fault::new(404, "404 page not found"))).await;
+        let mut report = Report::default();
+        check_decision_model(&mut report, &config(refusing.base_url(), "laya"), probing).await;
+        let failed = find(&report, Area::Decision);
+        let last = failed.last().unwrap();
+        assert_eq!(last.status, Status::Fail, "{failed:?}");
+        assert!(last.summary.contains("404 page not found"), "{last:?}");
+        assert!(
+            last.fix.as_deref().is_some_and(|f| f.contains("0.40.0")),
+            "{last:?}"
+        );
+
+        let mut report = Report::default();
+        check_decision_model(&mut report, &Config::default(), probing).await;
+        assert!(find(&report, Area::Decision).is_empty());
+
+        let mut report = Report::default();
+        check_decision_model(
+            &mut report,
+            &config(stub.base_url(), "laya"),
+            Probing::Offline,
+        )
+        .await;
+        let offline = find(&report, Area::Decision);
+        assert!(
+            offline.iter().all(|c| c.status == Status::Ok),
+            "{offline:?}"
+        );
+        assert_eq!(stub.requests(), 2, "offline sends nothing");
+    })
+    .await;
+}
+
 /// A mock issuer for the doctor: its discovery document lists `grants`,
 /// and it counts token requests.
 #[expect(clippy::unwrap_used, reason = "test")]
