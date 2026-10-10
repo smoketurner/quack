@@ -715,7 +715,7 @@ impl McpServer {
     /// connection's write permission.
     #[tool(
         name = "sql",
-        description = "Run one DuckDB SQL statement over the workspace tables and return the rows. Reads always run; statements that modify data need write permission on this connection."
+        description = "Run one DuckDB SQL statement over the workspace tables and return the rows as a Markdown table whose headers carry each column's type. A long value is cut and says how much was left out, and a result past the row or byte limit ends with how many rows were not shown: aggregate, filter, or LIMIT in one statement rather than paging. Reads always run; statements that modify data need write permission on this connection."
     )]
     async fn sql(
         &self,
@@ -783,12 +783,19 @@ impl McpServer {
             Ok(capped) => capped,
             Err(e) => return Ok(failure(e.message)),
         };
-        Ok(CallToolResult::structured(serde_json::json!({
-            "columns": capped.results.columns,
-            "rows": capped.results.rows,
-            "row_count": capped.total_rows,
+        // The model reads the text: the table `run_sql` gives the agent,
+        // bounded in bytes and saying what was cut. A program reads the
+        // structured rows, every kept one in full.
+        let mut out = CallToolResult::success(vec![ContentBlock::text(capped.to_model_text())]);
+        out.structured_content = Some(serde_json::json!({
             "truncated": capped.truncated(),
-        })))
+            "row_count": capped.total_rows,
+            "row_count_exact": !capped.stopped_early,
+            "columns": capped.results.columns,
+            "column_types": capped.column_types,
+            "rows": capped.results.rows,
+        }));
+        Ok(out)
     }
 
     /// Label a table's text with the decision model.
@@ -989,11 +996,11 @@ impl McpServer {
 
     #[tool(
         name = "list_tables",
-        description = "List the names of the user tables in the workspace, as `{\"tables\": [...]}`. quack's internal tables are not listed. Call `describe_table` on a name for its columns, types, row count, and sample rows, and `sql` to query it. Takes no arguments."
+        description = "List the user tables and views in the workspace, one line each with the estimated row count and every column's name and type (the first 40), so one call gives the schema. quack's internal tables are not listed. Call `describe_table` on a name for its meaning, profile, measures, and sample rows, and `sql` to query it. Takes no arguments."
     )]
     async fn list_tables(&self, extensions: Extensions) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
-        let tables = self.reader_db(WorkspaceDb::list_tables).await;
+        let tables = self.reader_db(WorkspaceDb::table_overview).await;
         caller
             .record(
                 AuditAction::List,
@@ -1003,9 +1010,18 @@ impl McpServer {
             )
             .await?;
         let tables = tables?;
-        Ok(CallToolResult::structured(
-            serde_json::json!({ "tables": tables }),
-        ))
+        let text = if tables.is_empty() {
+            String::from("(no tables)")
+        } else {
+            tables
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut out = CallToolResult::success(vec![ContentBlock::text(text)]);
+        out.structured_content = Some(serde_json::json!({ "tables": tables }));
+        Ok(out)
     }
 
     #[tool(

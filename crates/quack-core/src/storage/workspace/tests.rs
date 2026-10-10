@@ -841,6 +841,175 @@ fn capped_query_keeps_the_cap_and_counts_the_rest() {
     assert_eq!(all.rows.len(), 10);
 }
 
+/// A capped read stops counting `COUNT_PAST_CAP` rows past the cap and
+/// says so, rather than running a huge statement to its end; a digested
+/// read, which must cover every row, never stops.
+#[test]
+fn capped_query_stops_counting_far_past_the_cap() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    let huge = db
+        .execute_query_capped("SELECT range AS n FROM range(1000000000000)", 5)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(huge.stopped_early);
+    assert_eq!(huge.results.rows.len(), 5);
+    assert_eq!(huge.total_rows, 5 + COUNT_PAST_CAP + 1);
+    assert_eq!(huge.at_least(), "at least ");
+    let text = huge.to_model_text();
+    assert!(
+        text.contains("(at least 100001 more rows not shown: the first 5 of at least 100006 rows"),
+        "{text}"
+    );
+    assert!(text.contains("did not run to its end"), "{text}");
+
+    let within = db
+        .execute_query_capped("SELECT range AS n FROM range(1000)", 5)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(!within.stopped_early);
+    assert_eq!(within.total_rows, 1000);
+
+    let digested = db
+        .execute_query_digested("SELECT range AS n FROM range(100010)", 5)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(!digested.results.stopped_early);
+    assert_eq!(digested.results.total_rows, 100_010);
+}
+
+#[test]
+fn capped_query_names_each_column_type() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    let capped = db
+        .execute_query_capped(
+            "SELECT 1::BIGINT AS a, 'x' AS b, 1.25::DECIMAL(10,2) AS c, [1, 2] AS d, \
+             DATE '2026-01-02' AS e, {'k': 1} AS f, NULL AS g, \
+             TIMESTAMPTZ '2026-01-02 03:04:05+00' AS h",
+            5,
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(
+        capped.column_types,
+        [
+            "BIGINT",
+            "VARCHAR",
+            "DECIMAL(10,2)",
+            "INTEGER[]",
+            "DATE",
+            "STRUCT",
+            "NULL",
+            "TIMESTAMP WITH TIME ZONE"
+        ]
+    );
+}
+
+fn capped(columns: &[&str], types: &[&str], rows: Vec<Vec<serde_json::Value>>) -> CappedResults {
+    let total_rows = rows.len();
+    CappedResults {
+        results: QueryResults {
+            columns: columns.iter().map(|c| String::from(*c)).collect(),
+            rows,
+        },
+        column_types: types.iter().map(|t| String::from(*t)).collect(),
+        total_rows,
+        stopped_early: false,
+    }
+}
+
+#[test]
+fn model_text_is_a_compact_typed_markdown_table() {
+    let result = capped(
+        &["name", "n"],
+        &["VARCHAR", "BIGINT"],
+        vec![
+            vec![serde_json::json!("a|b"), serde_json::json!(1)],
+            vec![serde_json::json!("two\nlines"), serde_json::Value::Null],
+        ],
+    );
+    assert_eq!(
+        result.to_model_text(),
+        "| name:VARCHAR | n:BIGINT |\n|---|---|\n| a\\|b | 1 |\n| two\\nlines | NULL |\n(2 rows)\n"
+    );
+    let empty = capped(&["n"], &["BIGINT"], Vec::new());
+    assert_eq!(
+        empty.to_model_text(),
+        "| n:BIGINT |\n|---|\n(no rows)\n"
+    );
+    let statement = capped(&[], &[], Vec::new());
+    assert_eq!(statement.to_model_text(), "OK\n");
+}
+
+#[test]
+fn model_text_cuts_long_values_and_says_how_much() {
+    let long = "x".repeat(MODEL_CELL_CHARS + 4500);
+    let result = capped(&["t"], &["VARCHAR"], vec![vec![serde_json::json!(long)]]);
+    let text = result.to_model_text();
+    let expected = format!("| {}\u{2026}(+4500 chars) |", "x".repeat(MODEL_CELL_CHARS));
+    assert!(text.contains(&expected), "{text}");
+    assert!(text.len() < MODEL_CELL_CHARS + 100, "{}", text.len());
+}
+
+/// Rows stop at the byte budget, and the footer says the bytes cut them,
+/// not the row cap, and how many were left out.
+#[test]
+fn model_text_keeps_within_the_byte_budget() {
+    let cell = "y".repeat(MODEL_CELL_CHARS);
+    let rows: Vec<Vec<serde_json::Value>> = (0..250)
+        .map(|_| vec![serde_json::json!(cell)])
+        .collect();
+    let mut result = capped(&["t"], &["VARCHAR"], rows);
+    result.total_rows = 1000;
+    let text = result.to_model_text();
+    assert!(text.len() <= MODEL_RESULT_BYTES + 400, "{}", text.len());
+    let shown = text.lines().filter(|l| l.starts_with("| yyy")).count();
+    assert!(shown > 1 && shown < 250, "{shown}");
+    let footer = format!(
+        "({} more rows not shown: the first {shown} of 1000 rows, cut at the \
+         {MODEL_RESULT_BYTES}-byte limit. To see what matters, select fewer or narrower columns, ",
+        1000 - shown
+    );
+    assert!(text.contains(&footer), "{text}");
+
+    let mut by_rows = capped(&["n"], &["BIGINT"], vec![vec![serde_json::json!(1)]]);
+    by_rows.total_rows = 10;
+    assert!(
+        by_rows.to_model_text().contains(
+            "(9 more rows not shown: the first 1 of 10 rows, cut at the 1-row limit. \
+             To see what matters, aggregate,"
+        ),
+        "{}",
+        by_rows.to_model_text()
+    );
+}
+
+/// One line per table and view: the estimated rows, then every column's
+/// name and type; internal tables never appear.
+#[test]
+fn table_overview_gives_the_schema_in_one_call() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    db.connection()
+        .execute_batch(
+        "CREATE TABLE orders AS SELECT range AS id, 'c' || range AS customer FROM range(15);
+         CREATE VIEW big_orders AS SELECT id FROM orders WHERE id > 10;",
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let wide: Vec<String> = (0..45).map(|i| format!("c{i} INTEGER")).collect();
+    db.connection()
+        .execute_batch(&format!("CREATE TABLE wide ({})", wide.join(", ")))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let overview = db
+        .table_overview()
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let lines: Vec<String> = overview.iter().map(ToString::to_string).collect();
+    let [view, orders, wide] = lines.as_slice() else {
+        fail(&format!("{lines:?}"))
+    };
+    assert_eq!(view, "big_orders (view): id BIGINT");
+    assert_eq!(orders, "orders (table, ~15 rows): id BIGINT, customer VARCHAR");
+    assert!(wide.starts_with("wide (table, ~0 rows): c0 INTEGER, c1 INTEGER"), "{wide}");
+    assert!(wide.ends_with("c39 INTEGER, +5 more columns"), "{wide}");
+}
+
 /// Columns that share a name keep every value under suffixed keys in
 /// both JSON shapes; CSV, table, and markdown already kept them
 /// (issue #65).

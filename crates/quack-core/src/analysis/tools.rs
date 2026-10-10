@@ -750,7 +750,7 @@ impl Tool for RunSqlTool {
         format!(
             "Execute a SQL query against the workspace DuckDB database. SELECT queries always run; \
              statements that modify data need the user's write permission and may be refused. \
-             Returns up to {} rows as a formatted table.",
+             Returns up to {} rows as a Markdown table whose headers carry each column's type.",
             self.max_query_rows
         )
     }
@@ -815,7 +815,7 @@ impl Tool for RunSqlTool {
                     results.results.clone(),
                     self.step_result_rows,
                 );
-                let mut text = results.to_model_text()?;
+                let mut text = results.to_model_text();
                 if let Some(note) = Self::repeated_note(&turn, &args.query, shape) {
                     text.push('\n');
                     text.push_str(&note);

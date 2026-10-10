@@ -926,7 +926,11 @@ impl DirectSql {
         }
         let mut text = String::from_utf8_lossy(&buf).into_owned();
         if capped.truncated() {
-            let omitted = format!("... {} more rows not shown\n", capped.omitted());
+            let omitted = format!(
+                "... {}{} more rows not shown\n",
+                capped.at_least(),
+                capped.omitted()
+            );
             text.push_str(&omitted);
         }
         let elapsed = format!("{} ms", started.elapsed().as_millis());

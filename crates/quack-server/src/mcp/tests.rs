@@ -61,6 +61,14 @@ fn field(result: &CallToolResult, key: &str) -> serde_json::Value {
         .unwrap_or_default()
 }
 
+fn text_of(result: &CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect()
+}
+
 fn error_text(result: &CallToolResult) -> String {
     assert_eq!(result.is_error, Some(true));
     result
@@ -191,7 +199,33 @@ async fn stdio_tools_gate_writes_and_serve_resources() {
         .list_tables(Extensions::default())
         .await
         .unwrap_or_else(|e| fail(&e.message));
-    assert_eq!(field(&tables, "tables"), serde_json::json!(["t"]));
+    assert_eq!(
+        field(&tables, "tables"),
+        serde_json::json!([{
+            "name": "t",
+            "estimated_rows": 2,
+            "columns": [{ "name": "n", "type": "INTEGER" }],
+        }])
+    );
+    assert_eq!(text_of(&tables), "t (table, ~2 rows): n INTEGER");
+    let read = writer
+        .sql(
+            Parameters(SqlArgs {
+                sql: String::from("SELECT n, n * 1.5 AS half FROM t ORDER BY n"),
+            }),
+            Extensions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert_eq!(
+        text_of(&read),
+        "| n:INTEGER | half:DECIMAL(13,1) |\n|---|---|\n| 1 | 1.5 |\n| 2 | 3.0 |\n(2 rows)\n"
+    );
+    assert_eq!(
+        field(&read, "column_types"),
+        serde_json::json!(["INTEGER", "DECIMAL(13,1)"])
+    );
+    assert_eq!(field(&read, "row_count_exact"), serde_json::json!(true));
     let described = writer
         .describe_table(
             Parameters(DescribeTableArgs {

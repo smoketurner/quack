@@ -932,8 +932,10 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["columns"], serde_json::json!(["a", "b"]));
+    assert_eq!(body["column_types"], serde_json::json!(["INTEGER", "VARCHAR"]));
     assert_eq!(body["rows"][0][0], 1);
     assert_eq!(body["row_count"], 1);
+    assert_eq!(body["row_count_exact"], true);
     assert_eq!(body["truncated"], false);
     let (status, _) = h
         .post(
