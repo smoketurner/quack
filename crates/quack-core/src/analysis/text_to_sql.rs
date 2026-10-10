@@ -362,7 +362,8 @@ impl SystemPrompt {
              1. Call search_documents with the user's question (rephrase and search again if the first results miss)\n\
              2. For a whole section or a document from its start, call read_document with its id or file name and from; it returns consecutive chunks numbered the same way and says where to continue\n\
              3. Answer only from the returned chunks; if none are relevant, say the documents do not cover it\n\
-             4. Cite each claim inline with the chunk's [n] marker, e.g. \"Flood is excluded [2].\"\n\
+             4. Cite each claim inline with the chunk's [n] marker, e.g. \"Flood is excluded [2].\"; \
+             a passage given to you alongside the question carries its marker as cite_as\n\
              5. Do not write a Sources or References section; one is appended for you from the markers\n\n",
         );
 
