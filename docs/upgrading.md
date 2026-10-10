@@ -32,8 +32,7 @@ vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
   `classify_rows`. `quack init` offers a decision model when Ollama has one. Opening a
   workspace with this quack moves its schema version from 14 to 15 (a new table, no
   backfill); an older quack refuses the file afterwards. `quack doctor` checks the decision
-  model when one is set. Workspaces opened by the pre-release builds of this feature (a
-  `_quack_classifications` table with a `set_name` column) must be recreated.
+  model when one is set.
 - Changed: the server and MCP code moved into the `quack-server` crate, so its log targets
   change from `quack::server::...` and `quack::mcp` to `quack_server::...`. Update `RUST_LOG`
   filters and any collector rules that match the old targets. The access log keeps its
@@ -64,7 +63,11 @@ vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
 - Changed: in `quack config --format json`, each unrecognized key carries `hint` in place of
   `suggestion`: `{"did_you_mean": "top_k"}`, or `{"removed": "..."}` for a key an earlier
   release read, with what took its place.
-
+- Config: `[decision]` added, each key defaulted: `model` (unset; nothing runs without it),
+  `keep_alive_minutes` (30), `interactive_budget` (1500). `[analysis].max_context_tokens` is
+  the one key removed.
+- `control.db`: no new migration (12 is still the latest).
+- Embeddings: no refresh needed.
 - Breaking: `GET /api/v1/workspaces/{id}/documents` and MCP `list_documents` return one page,
   newest first: 100 documents unless `limit` asks for more (500 at most), with `total` and,
   when more remain, `next`. Pass `next` as `after` for the following page. A client that read
