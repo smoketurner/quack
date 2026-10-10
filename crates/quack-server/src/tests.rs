@@ -4176,6 +4176,11 @@ fn banner_names_the_address_mode_and_models() {
             .parse()
             .unwrap_or_else(|e: CoreError| fail(&e.to_string())),
     );
+    config.decision.model = Some(
+        "ollama/laya"
+            .parse()
+            .unwrap_or_else(|e: CoreError| fail(&e.to_string())),
+    );
     config.providers.insert(
         "ollama"
             .parse::<ProviderName>()
@@ -4200,6 +4205,8 @@ fn banner_names_the_address_mode_and_models() {
     assert!(text.contains("local: no login"));
     assert!(text.contains("chat model     ollama/llama3"));
     assert!(text.contains("none (documents stored without vectors)"));
+    assert!(text.contains("decision model ollama/laya"));
+    assert!(text.contains("vision model   none (images refused at upload)"));
     assert!(text.contains("ollama (ollama, auth none)"));
     assert!(text.contains("workspaces     2"));
     let auth = banner(ServeMode::Login, 3, 0);

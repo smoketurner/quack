@@ -343,6 +343,14 @@ impl fmt::Display for Banner<'_> {
             || String::from("none (documents stored without vectors)"),
             |m| m.to_string(),
         );
+        let decision = config.decision_model_ref().ok().flatten().map_or_else(
+            || String::from("none (set [decision].model to label rows)"),
+            |m| m.to_string(),
+        );
+        let vision = config.vision_model_ref().ok().flatten().map_or_else(
+            || String::from("none (images refused at upload)"),
+            |m| m.to_string(),
+        );
         let providers: Vec<String> = config
             .providers
             .iter()
@@ -378,6 +386,8 @@ impl fmt::Display for Banner<'_> {
   workspaces     {workspaces}
   chat model     {chat}
   embeddings     {embedding}
+  decision model {decision}
+  vision model   {vision}
   providers      {providers}
   uploads        up to {upload} MB, {workers} worker(s) per workspace
   api            http://{addr}/api/v1
