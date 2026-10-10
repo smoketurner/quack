@@ -930,10 +930,7 @@ fn model_text_is_a_compact_typed_markdown_table() {
         "| name:VARCHAR | n:BIGINT |\n|---|---|\n| a\\|b | 1 |\n| two\\nlines | NULL |\n(2 rows)\n"
     );
     let empty = capped(&["n"], &["BIGINT"], Vec::new());
-    assert_eq!(
-        empty.to_model_text(),
-        "| n:BIGINT |\n|---|\n(no rows)\n"
-    );
+    assert_eq!(empty.to_model_text(), "| n:BIGINT |\n|---|\n(no rows)\n");
     let statement = capped(&[], &[], Vec::new());
     assert_eq!(statement.to_model_text(), "OK\n");
 }
@@ -953,9 +950,8 @@ fn model_text_cuts_long_values_and_says_how_much() {
 #[test]
 fn model_text_keeps_within_the_byte_budget() {
     let cell = "y".repeat(MODEL_CELL_CHARS);
-    let rows: Vec<Vec<serde_json::Value>> = (0..250)
-        .map(|_| vec![serde_json::json!(cell)])
-        .collect();
+    let rows: Vec<Vec<serde_json::Value>> =
+        (0..250).map(|_| vec![serde_json::json!(cell)]).collect();
     let mut result = capped(&["t"], &["VARCHAR"], rows);
     result.total_rows = 1000;
     let text = result.to_model_text();
@@ -989,24 +985,28 @@ fn table_overview_gives_the_schema_in_one_call() {
         WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
     db.connection()
         .execute_batch(
-        "CREATE TABLE orders AS SELECT range AS id, 'c' || range AS customer FROM range(15);
+            "CREATE TABLE orders AS SELECT range AS id, 'c' || range AS customer FROM range(15);
          CREATE VIEW big_orders AS SELECT id FROM orders WHERE id > 10;",
-    )
-    .unwrap_or_else(|e| fail(&e.to_string()));
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
     let wide: Vec<String> = (0..45).map(|i| format!("c{i} INTEGER")).collect();
     db.connection()
         .execute_batch(&format!("CREATE TABLE wide ({})", wide.join(", ")))
         .unwrap_or_else(|e| fail(&e.to_string()));
-    let overview = db
-        .table_overview()
-        .unwrap_or_else(|e| fail(&e.to_string()));
+    let overview = db.table_overview().unwrap_or_else(|e| fail(&e.to_string()));
     let lines: Vec<String> = overview.iter().map(ToString::to_string).collect();
     let [view, orders, wide] = lines.as_slice() else {
         fail(&format!("{lines:?}"))
     };
     assert_eq!(view, "big_orders (view): id BIGINT");
-    assert_eq!(orders, "orders (table, ~15 rows): id BIGINT, customer VARCHAR");
-    assert!(wide.starts_with("wide (table, ~0 rows): c0 INTEGER, c1 INTEGER"), "{wide}");
+    assert_eq!(
+        orders,
+        "orders (table, ~15 rows): id BIGINT, customer VARCHAR"
+    );
+    assert!(
+        wide.starts_with("wide (table, ~0 rows): c0 INTEGER, c1 INTEGER"),
+        "{wide}"
+    );
     assert!(wide.ends_with("c39 INTEGER, +5 more columns"), "{wide}");
 }
 

@@ -932,7 +932,10 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["columns"], serde_json::json!(["a", "b"]));
-    assert_eq!(body["column_types"], serde_json::json!(["INTEGER", "VARCHAR"]));
+    assert_eq!(
+        body["column_types"],
+        serde_json::json!(["INTEGER", "VARCHAR"])
+    );
     assert_eq!(body["rows"][0][0], 1);
     assert_eq!(body["row_count"], 1);
     assert_eq!(body["row_count_exact"], true);
@@ -4413,7 +4416,15 @@ async fn mcp_over_http_lists_tools_runs_sql_reads_resources_and_audits() {
     .await;
     assert_eq!(
         body["result"]["structuredContent"]["tables"],
-        serde_json::json!(["t"]),
+        serde_json::json!([{
+            "name": "t",
+            "estimated_rows": 1,
+            "columns": [{ "name": "n", "type": "DECIMAL(3,1)" }],
+        }]),
+        "{body}"
+    );
+    assert_eq!(
+        body["result"]["content"][0]["text"], "t (table, ~1 rows): n DECIMAL(3,1)",
         "{body}"
     );
     let (_, body, _) = mcp_call(

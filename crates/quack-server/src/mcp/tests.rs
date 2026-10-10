@@ -219,11 +219,11 @@ async fn stdio_tools_gate_writes_and_serve_resources() {
         .unwrap_or_else(|e| fail(&e.message));
     assert_eq!(
         text_of(&read),
-        "| n:INTEGER | half:DECIMAL(13,1) |\n|---|---|\n| 1 | 1.5 |\n| 2 | 3.0 |\n(2 rows)\n"
+        "| n:INTEGER | half:DECIMAL(12,1) |\n|---|---|\n| 1 | 1.5 |\n| 2 | 3 |\n(2 rows)\n"
     );
     assert_eq!(
         field(&read, "column_types"),
-        serde_json::json!(["INTEGER", "DECIMAL(13,1)"])
+        serde_json::json!(["INTEGER", "DECIMAL(12,1)"])
     );
     assert_eq!(field(&read, "row_count_exact"), serde_json::json!(true));
     let described = writer

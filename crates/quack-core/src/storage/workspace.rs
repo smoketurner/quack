@@ -4184,7 +4184,10 @@ impl fmt::Display for TableOverview {
     }
 }
 
-#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde's skip_serializing_if passes a reference")]
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
 const fn is_zero(n: &usize) -> bool {
     *n == 0
 }
