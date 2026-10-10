@@ -66,6 +66,8 @@ use quack_cli::{embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
 use quack_server::ServeMode;
 use quack_terminal::SessionSetup;
 
+use crate::progress_line::StderrProgress;
+
 /// How a command ended when not plainly: the exit status scripts check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Exit {
@@ -1302,13 +1304,14 @@ async fn run_on_writer(cli: &Cli, command: impl WriterCommand) -> Result<ExitCod
     let db = opened.writer()?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+    let progress = StderrProgress::new();
     command
         .run(
             &opened.config,
             &db,
             &mut out,
             RunControl {
-                progress: &progress_line::to_stderr,
+                progress: &|done| progress.report(done),
                 cancel: None,
             },
         )
@@ -2154,6 +2157,7 @@ impl OpenedWorkspace {
                 .await
                 .context("failed to build embedding model")?
         };
+        let progress = StderrProgress::new();
         let report = Folder {
             config,
             db: &ws_db,
@@ -2161,7 +2165,7 @@ impl OpenedWorkspace {
             root: dir,
             embedder: embedding_model.as_ref(),
             control: RunControl {
-                progress: &progress_line::to_stderr,
+                progress: &|done| progress.report(done),
                 cancel: None,
             },
             prune,
@@ -2347,6 +2351,7 @@ impl OpenedWorkspace {
         documents: &[DocumentId],
         out: &mut impl Write,
     ) -> Result<()> {
+        let progress = StderrProgress::new();
         let followed = FollowUp {
             db,
             config: &self.config,
@@ -2355,7 +2360,7 @@ impl OpenedWorkspace {
         .run(
             documents,
             RunControl {
-                progress: &progress_line::to_stderr,
+                progress: &|done| progress.report(done),
                 cancel: None,
             },
         )
