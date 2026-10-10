@@ -19,7 +19,7 @@ resolver = "3"
 members  = ["crates/*"]
 
 [workspace.package]
-version      = "2026.10.5"
+version      = "2026.10.6"
 edition      = "2024"
 rust-version = "1.99.0"
 license      = "Apache-2.0 OR MIT"
@@ -104,7 +104,7 @@ scraper              = { version = "=0.27.0", default-features = false }
 sea-query            = { version = "=1.0.2", default-features = false }
 secrecy              = { version = "=0.10.3", default-features = false }
 serde                = { version = "=1.0.229", default-features = false }
-serde_json           = { version = "=1.0.151", default-features = false }
+serde_json           = { version = "=1.0.152", default-features = false }
 shlex                = { version = "=2.0.1", default-features = false } # terminal slash-command arguments; already built for cc
 winsplit             = { version = "=0.1.0", default-features = false } # dropped file paths in the Windows terminal (CommandLineToArgvW rules)
 sqlparser            = { version = "=0.63.0", default-features = false } # tokenizes typed SQL for terminal completion
@@ -117,9 +117,9 @@ thiserror            = { version = "=2.0.21", default-features = false }
 tiktoken             = { version = "=4.1.2", default-features = false }
 tokio                = { version = "=1.53.2", default-features = false }
 tokio-rustls         = { version = "=0.26.6", default-features = false }
-tokio-util           = { version = "=0.7.19", default-features = false }
-toml                 = { version = "=1.1.7", default-features = false }
-toml_edit            = { version = "=0.25.16", default-features = false }
+tokio-util           = { version = "=0.7.20", default-features = false }
+toml                 = { version = "=1.1.8", default-features = false }
+toml_edit            = { version = "=0.25.17", default-features = false }
 tower                = { version = "=0.5.3", default-features = false }
 tower-http           = { version = "=0.7.1", default-features = false }
 tower_governor       = { version = "=0.8.0", default-features = false }
@@ -127,7 +127,7 @@ tracing              = { version = "=0.1.44", default-features = false }
 tracing-subscriber   = { version = "=0.3.23", default-features = false }
 unic-langid          = { version = "=0.9.6", default-features = false }
 utoipa               = { version = "=6.0.0", default-features = false } # the REST API's OpenAPI document
-uuid                 = { version = "=1.27.0", default-features = false } # IDs — enable "v7"; use Uuid::now_v7()
+uuid                 = { version = "=1.28.0", default-features = false } # IDs — enable "v7"; use Uuid::now_v7()
 webpki-roots         = { version = "=1.0.9", default-features = false }
 whatlang             = { version = "=0.18.0", default-features = false } # per-document language detection for the keyword index
 windows-native-keyring-store = { version = "=1.1.0", default-features = false }
