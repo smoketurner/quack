@@ -32,15 +32,20 @@ fn store_error(e: impl std::fmt::Display) -> VectorStoreError {
     VectorStoreError::datastore(std::io::Error::other(e.to_string()))
 }
 
-/// A chunk as rig puts it in the prompt. rig prints the value as JSON, so
-/// the fence's line breaks arrive as `\n` escapes inside the `content`
-/// string; the markers and their code are intact.
-struct ContextDocument<'a>(&'a ChunkSearchResult);
+/// A chunk as rig puts it in the prompt, with the `[n]` marker the turn's
+/// citation registry gave it. rig prints the value as JSON, so the fence's
+/// line breaks arrive as `\n` escapes inside the `content` string; the
+/// markers and their code are intact.
+struct ContextDocument<'a> {
+    chunk: &'a ChunkSearchResult,
+    n: u32,
+}
 
 impl ContextDocument<'_> {
     fn value(&self) -> serde_json::Value {
-        let chunk = self.0;
+        let chunk = self.chunk;
         json!({
+            "cite_as": format!("[{}]", self.n),
             "content": Fenced(&chunk.content).to_string(),
             "source_document": chunk.document_id,
             "filename": chunk.filename,
@@ -109,13 +114,15 @@ where
         &self,
         req: VectorSearchRequest<Self::Filter>,
     ) -> Result<Vec<VectorSearchResult<T>>, VectorStoreError> {
-        self.search(&req)
-            .await?
+        let chunks = self.search(&req).await?;
+        let markers = self.turn.recorder.citations().number(&chunks);
+        chunks
             .into_iter()
-            .map(|chunk| {
+            .zip(markers)
+            .map(|(chunk, n)| {
                 Ok(VectorSearchResult {
                     score: chunk.score,
-                    document: serde_json::from_value(ContextDocument(&chunk).value())?,
+                    document: serde_json::from_value(ContextDocument { chunk: &chunk, n }.value())?,
                     id: chunk.id.into_string(),
                 })
             })
@@ -192,6 +199,11 @@ mod tests {
     fn index(model: Counting) -> DuckDbVectorIndex<Counting> {
         let db =
             WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        index_over(db, model)
+    }
+
+    /// An index over `db`, for one turn.
+    fn index_over(db: WorkspaceDb, model: Counting) -> DuckDbVectorIndex<Counting> {
         let db = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
         let (sink, _rx) = events::channel();
         DuckDbVectorIndex::new(
@@ -235,6 +247,72 @@ mod tests {
         assert!(found.as_ref().is_ok_and(Vec::is_empty), "{found:?}");
     }
 
+    /// A ready document with two embedded chunks.
+    fn workspace_with_chunks() -> WorkspaceDb {
+        use crate::embedding::Vector;
+        use crate::storage::workspace::{DocumentStatus, NewChunk, NewDocument};
+        let db =
+            WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+        let doc = DocumentId::from("d1");
+        db.insert_document(
+            &NewDocument::new(&doc, "memo.md", "text/markdown", 1)
+                .with_status(DocumentStatus::Ready),
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let embedding = Vector::from(vec![0.5_f32; 4]);
+        for (i, text) in ["The warehouse reopens Oct 18.", "Roof repairs began Aug 4."]
+            .iter()
+            .enumerate()
+        {
+            db.chunk_writer(&doc, text)
+                .and_then(|writer| {
+                    writer.insert(&NewChunk {
+                        id: &ChunkId::from(format!("c{i}")),
+                        chunk_index: u32::try_from(i).unwrap_or(0),
+                        content: text,
+                        heading: None,
+                        page: None,
+                        kind: SectionKind::Body,
+                        locator: None,
+                        embedding: Some(&embedding),
+                    })
+                })
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        db
+    }
+
+    /// The `cite_as` markers of one ask, in order.
+    async fn markers(index: &DuckDbVectorIndex<Counting>) -> Vec<String> {
+        let found: Vec<VectorSearchResult<serde_json::Value>> = index
+            .top_n(request())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        found
+            .iter()
+            .filter_map(|r| r.document.get("cite_as")?.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Retrieved chunks are registered as citations, so the `[n]` markers
+    /// the model writes on them validate; rig asks again before every model
+    /// call, and each chunk keeps the number it was first given.
+    #[tokio::test]
+    async fn retrieved_chunks_are_citable_and_keep_their_numbers() {
+        let index = index_over(workspace_with_chunks(), Counting::default());
+        let first = markers(&index).await;
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert_eq!(markers(&index).await, first);
+        let registered = index.turn.recorder.citations().all();
+        assert_eq!(registered.len(), 2, "{registered:?}");
+        let cited = index
+            .turn
+            .recorder
+            .citations()
+            .validate("It reopens Oct 18 [1], after repairs [2].");
+        assert_eq!(cited.citations.len(), 2, "{cited:?}");
+    }
+
     /// A retrieved chunk goes into the prompt fenced like any other
     /// document text, whatever it says.
     #[test]
@@ -253,8 +331,13 @@ mod tests {
             ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
             ranks: Ranks::default(),
         };
-        let value = ContextDocument(&chunk).value();
+        let value = ContextDocument {
+            chunk: &chunk,
+            n: 3,
+        }
+        .value();
         let field = |name: &str| value.get(name).and_then(serde_json::Value::as_str);
+        assert_eq!(field("cite_as"), Some("[3]"));
         assert_eq!(
             field("content"),
             Some(Fenced(&chunk.content).to_string().as_str())
