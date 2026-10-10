@@ -128,7 +128,9 @@ impl Chunker {
     /// joined by a blank line, so a window may span a page break. Each
     /// chunk records the page its first token lies on and the heading in
     /// force there (a page's own, carried on from the one before, else
-    /// `fallback`).
+    /// `fallback`); a chunk that runs onto later pages names the last one
+    /// in its locator (`through page 4`), so a citation of it covers every
+    /// page its text came from.
     ///
     /// # Errors
     ///
@@ -137,6 +139,8 @@ impl Chunker {
         let separator = self.bpe.encode("\n\n");
         let mut tokens: Vec<u32> = Vec::new();
         let mut starts: Vec<(usize, Option<u32>, Option<String>)> = Vec::new();
+        // The first token of each page's own text, separators left out.
+        let mut texts: Vec<(usize, Option<u32>)> = Vec::new();
         for page in pages {
             let page_tokens = self.bpe.encode(&page.text);
             if page_tokens.is_empty() {
@@ -148,6 +152,7 @@ impl Chunker {
                 tokens.extend_from_slice(&separator);
             }
             starts.push((tokens.len(), page.page, heading));
+            texts.push((tokens.len(), page.page));
             tokens.extend_from_slice(&page_tokens);
         }
         let mut chunks = Vec::new();
@@ -156,16 +161,24 @@ impl Chunker {
                 .iter()
                 .rev()
                 .find(|(first_token, _, _)| *first_token <= window.start);
+            let last = texts
+                .iter()
+                .rev()
+                .find(|(first_token, _)| *first_token < window.end)
+                .and_then(|(_, page)| *page);
             let content = self.decode(&tokens, window)?.trim().to_owned();
             if content.is_empty() {
                 continue;
             }
+            let page = at.and_then(|(_, page, _)| *page);
             chunks.push(Chunk {
                 content,
                 heading: at.and_then(|(_, _, heading)| heading.clone()),
-                page: at.and_then(|(_, page, _)| *page),
+                page,
                 kind: SectionKind::Body,
-                locator: None,
+                locator: last
+                    .filter(|last| page.is_some_and(|first| *last > first))
+                    .map(|last| format!("through page {last}")),
             });
         }
         Ok(chunks)
@@ -469,6 +482,42 @@ mod section_tests {
             );
             assert!(!chunk.content.starts_with('\n'));
         }
+    }
+
+    /// A short report fits one chunk: it starts on page 1 and says it runs
+    /// through page 6, so a fact from page 4 is not cited as page 1 alone.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn a_chunk_over_several_pages_names_the_last_one() {
+        let pages: Vec<Section> = (1..=6).map(|n| page(n, 8)).collect();
+        let chunks = Chunker::new(512, 64, "cl100k_base")
+            .and_then(|c| c.pages(&pages, None))
+            .unwrap();
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+        let only = chunks.first().unwrap();
+        assert_eq!(only.page, Some(1));
+        assert_eq!(only.locator.as_deref(), Some("through page 6"));
+    }
+
+    /// Windows that span a break name their last page; one that stays on
+    /// its page has no locator.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    fn only_a_chunk_that_crosses_a_page_break_has_a_range() {
+        let pages = vec![page(1, 8), page(2, 8), page(3, 8)];
+        let chunks = Chunker::new(50, 10, "cl100k_base")
+            .and_then(|c| c.pages(&pages, None))
+            .unwrap();
+        for chunk in &chunks {
+            let first = chunk.page.unwrap();
+            let last = (first..=3)
+                .rev()
+                .find(|n| chunk.content.contains(&format!("p{n}w")))
+                .unwrap();
+            let expected = (last > first).then(|| format!("through page {last}"));
+            assert_eq!(chunk.locator, expected, "{chunk:?}");
+        }
+        assert!(chunks.iter().any(|c| c.locator.is_some()), "{chunks:?}");
     }
 
     #[test]
