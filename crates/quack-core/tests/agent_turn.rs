@@ -461,6 +461,40 @@ async fn reasoning_is_announced_once_per_model_call_and_never_as_text() {
     assert_eq!(ran.answer().content, "There is one table.");
 }
 
+/// A `<think>` block a model writes into its text (Qwen3 on Ollama, even
+/// with reasoning off) is reasoning, never answer text, whichever deltas it
+/// arrives in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_think_block_in_the_text_is_reasoning_not_answer() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![
+            text("<think>\nI should list "),
+            text("the tables.\n</thi"),
+            text("nk>\n\n"),
+            call("t1", "list_tables", serde_json::json!({})),
+        ]),
+        turn(vec![text("<think>\n\n</think>\n\nThere is one table.")]),
+    ]);
+    let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "tables?").await;
+    assert_eq!(ran.answer().content, "There is one table.");
+    let streamed: String = ran
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed, "There is one table.");
+    let reasoning = ran
+        .events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::Reasoning))
+        .count();
+    assert_eq!(reasoning, 2, "once per model call");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_turn_streams_its_tools_in_order_and_records_the_session() {
     let db = workspace();

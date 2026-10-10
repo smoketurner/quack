@@ -22,6 +22,7 @@ use super::rerank::RerankAnswer;
 use super::search::DocumentScope;
 use super::table_search::{CardRefresh, TableCards, TableLayout};
 use super::text_to_sql::{BuiltPrompt, Modeled, PromptOptions, Question, SystemPrompt, Window};
+use super::think::{self, ThinkFilter};
 use super::tools::{
     ClassifyRowsTool, CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool,
     FindTablesTool, GraphTools, Labeller, ListDocumentsTool, ListTablesTool, ReadDocumentTool,
@@ -594,7 +595,7 @@ impl Streamed {
                 MultiTurnStreamItem::CompletionCall(call) => {
                     this.per_call.add(call.usage);
                     this.cutoff = Cutoff::of(call.finish_reason.as_ref());
-                    this.output.call_ended();
+                    this.output.call_ended(recorder);
                 }
                 MultiTurnStreamItem::ToolCall { .. }
                 | MultiTurnStreamItem::ToolExecutionCommitted { .. } => this.output.call_kept(),
@@ -607,10 +608,13 @@ impl Streamed {
 
     /// The answer, put through `check` (the citation check), and the usage.
     fn answer(
-        self,
+        mut self,
         window: Window,
         check: impl FnOnce(&str) -> CitedAnswer,
     ) -> (CitedAnswer, Option<TokenUsage>) {
+        // A stream that stopped mid-call: what the think filter held.
+        let held = self.output.think.finish();
+        self.output.text.push_str(&held);
         let usage = self.aggregate.or_else(|| self.per_call.reported());
         let answer = if self.cancelled {
             let mut answer = check(&self.output.text);
@@ -674,7 +678,7 @@ fn turn_text(
     check: impl FnOnce(&str) -> CitedAnswer,
 ) -> CitedAnswer {
     let raw = match final_text {
-        Some(text) if streamed.trim().is_empty() => text,
+        Some(text) if streamed.trim().is_empty() => think::strip(&text),
         Some(_) | None => streamed,
     };
     let mut answer = check(&raw);
@@ -714,6 +718,8 @@ struct ModelOutput {
     /// The last call ended and none of its tools has run yet.
     ended: bool,
     reasoning: bool,
+    /// Drops the `<think>` block a model writes into its answer text.
+    think: ThinkFilter,
 }
 
 impl ModelOutput {
@@ -726,24 +732,46 @@ impl ModelOutput {
         }
         match event {
             StreamEvent::Text { text, .. } => {
-                self.text.push_str(&text);
-                recorder.emit(AgentEvent::TextDelta(text));
+                let filtered = self.think.push(&text);
+                if filtered.reasoning {
+                    self.reasoning(recorder);
+                }
+                self.keep(filtered.text, recorder);
             }
             StreamEvent::Reasoning { .. }
             | StreamEvent::Start {
                 kind: PartKind::Reasoning,
                 ..
-            } => {
-                if !mem::replace(&mut self.reasoning, true) {
-                    recorder.emit(AgentEvent::Reasoning);
-                }
-            }
+            } => self.reasoning(recorder),
             StreamEvent::Start { .. } | StreamEvent::Arguments { .. } | StreamEvent::End { .. } => {
             }
         }
     }
 
-    fn call_ended(&mut self) {
+    /// Tell the interface once per model call that the model is reasoning.
+    fn reasoning(&mut self, recorder: &TurnRecorder) {
+        if !mem::replace(&mut self.reasoning, true) {
+            recorder.emit(AgentEvent::Reasoning);
+        }
+    }
+
+    /// Answer text: kept, and passed on.
+    fn keep(&mut self, text: String, recorder: &TurnRecorder) {
+        if !text.is_empty() {
+            self.text.push_str(&text);
+            recorder.emit(AgentEvent::TextDelta(text));
+        }
+    }
+
+    /// The call's stream is over: text the think filter still held goes
+    /// out.
+    fn flush(&mut self, recorder: &TurnRecorder) {
+        let held = self.think.finish();
+        self.keep(held, recorder);
+    }
+
+    fn call_ended(&mut self, recorder: &TurnRecorder) {
+        self.flush(recorder);
         self.ended = true;
         self.reasoning = false;
     }
@@ -756,6 +784,7 @@ impl ModelOutput {
 
     /// A hook rejected the last call for another try.
     fn call_rejected(&mut self) {
+        drop(self.think.finish());
         self.text.truncate(self.kept);
         self.ended = false;
     }
