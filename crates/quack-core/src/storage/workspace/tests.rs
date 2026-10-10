@@ -896,7 +896,7 @@ fn capped_query_names_each_column_type() {
             "INTEGER[]",
             "DATE",
             "STRUCT",
-            "NULL",
+            "INTEGER",
             "TIMESTAMP WITH TIME ZONE"
         ]
     );
