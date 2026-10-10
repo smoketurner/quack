@@ -1147,9 +1147,11 @@ async fn run_sql_caps_rows_and_reports_the_rest() {
         Err(e) => fail_test(&format!("expected tool text, got error: {e}")),
     };
     assert!(text.contains("3 more rows not shown"), "{text}");
+    assert!(text.starts_with("| n:BIGINT |\n|---|\n"), "{text}");
     let numeric_rows = text
         .lines()
-        .filter(|l| !l.trim().is_empty() && l.trim().chars().all(|c| c.is_ascii_digit()))
+        .filter_map(|l| l.strip_prefix("| ")?.strip_suffix(" |"))
+        .filter(|cell| cell.chars().all(|c| c.is_ascii_digit()))
         .count();
     assert_eq!(numeric_rows, 2, "{text}");
     let last = recorder.steps().last().map(|s| s.summary.clone());

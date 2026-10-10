@@ -860,6 +860,8 @@ struct SqlResult {
     headers: Vec<SortHeader>,
     rows: Vec<Vec<String>>,
     row_count: usize,
+    /// `at least ` when counting stopped before the statement's end.
+    at_least: &'static str,
     truncated: bool,
     duration_ms: u64,
     error: Option<String>,
@@ -2094,6 +2096,11 @@ impl SqlResult {
                 sortable,
                 editor_swap: rewritten,
                 truncated: outcome.truncated,
+                at_least: if outcome.row_count_exact {
+                    ""
+                } else {
+                    "at least "
+                },
                 headers: outcome
                     .columns
                     .into_iter()
@@ -2121,6 +2128,7 @@ impl SqlResult {
                 headers: Vec::new(),
                 rows: Vec::new(),
                 row_count: 0,
+                at_least: "",
                 truncated: false,
                 duration_ms: 0,
                 error: Some(e.message),

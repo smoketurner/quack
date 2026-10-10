@@ -1839,7 +1839,7 @@ model (`test-utils`, a dev-dependency feature only).
 | `search_documents(query, top_k=8, document_ids?, entity?, filters?)` | none | Hybrid retrieval within the person's document scope; `filters` is a `DocumentFilter`; returns chunks with citation metadata and the entities each was the source of |
 | `read_document(document, from=0, limit?)` | none | One document's chunks in order from a position, numbered for citing like search hits, within `[retrieval].pinned_token_budget` (at most 50 chunks a call), with a trailer saying where to continue; a document that is not ready or holds tables is refused with the reason |
 | `list_documents(after?)` | none | Registry with status and pinned flag, newest first and 50 a call, ending with the total and the `after` for the next 50 |
-| `run_sql(query)` | read: none; write: prompt | Execute SQL; result capped at `max_query_rows` with a trailer that says to narrow it in one statement, a note when the statement repeats an earlier one with only its literals changed (the one-query-per-group loop), and which tool call of `max_turns` this was |
+| `run_sql(query)` | read: none; write: prompt | Execute SQL; the result is a compact Markdown table whose headers carry each column's type (`n:BIGINT`), each value cut past 500 characters with how much was left out, capped at `max_query_rows` rows and 20,000 bytes, with a trailer that says how many rows were not shown, which limit cut them, and to narrow it in one statement (counting stops 100,000 rows past the cap, which stops the statement, and the count is then "at least"), a note when the statement repeats an earlier one with only its literals changed (the one-query-per-group loop), and which tool call of `max_turns` this was |
 | `describe_table(table_name)` / `list_tables()` | none | Schema with column meanings, note, profile warnings, and measures; inventory |
 | `find_tables(query, top_k=10)` | none | Past 25 tables: ranks a card per table (name, columns with their ontology descriptions and synonyms, note, mapped class, common values) by BM25 over the document index's tokens and, with an embedding model, cosine over each card's stored vector (`_quack_table_cards`, made again when the card's digest or the embedding profile changes, 256 a turn at most), fused by reciprocal rank; returns each table's columns, note, warnings, and measures |
 | `describe_class(class_id)` | none | One ontology class in full, with how many entities of it the graph holds |
@@ -2687,6 +2687,11 @@ One tool set serves two transports through `rmcp`, the official Rust SDK:
 Each `query` call starts a session (owned by the server user, `mode` `chat` or `query`)
 and returns its `session_id`; passing the id back continues it, and `document_ids` limits
 the question to documents. A turn that fails before recording anything leaves no session.
+`sql` answers in text with the table `run_sql` gives the agent (typed headers, values and
+rows bounded, a trailer saying what was cut) and in structured content with every kept row
+in full, `column_types`, `row_count`, and `row_count_exact`; `list_tables` answers one line
+per table or view, `orders (table, ~5000 rows): id BIGINT, ...` (the first 40 columns), with
+the same as structured content, so one call gives the schema.
 `search` takes `document_ids`, `entity`, `filters`, `mode`, and `explain`, as REST does.
 
 Tools: `query`, `search`, `sql`, `classify` (a table's text labelled by the decision model: `preview` for any connection, a run only where the connection may write, and only up to `[decision].interactive_budget` answers), `list_tables`, `describe_table` (the REST describe shape: meanings, note, profile, warnings, measures), `list_documents` (REST's page: `after`, `limit`, and `{documents, next, total}`), and,

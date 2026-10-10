@@ -61,6 +61,14 @@ fn field(result: &CallToolResult, key: &str) -> serde_json::Value {
         .unwrap_or_default()
 }
 
+fn text_of(result: &CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect()
+}
+
 fn error_text(result: &CallToolResult) -> String {
     assert_eq!(result.is_error, Some(true));
     result
@@ -140,6 +148,56 @@ async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
     assert_eq!(tables, ["customers"], "the dictated drop did not run");
 }
 
+/// `list_tables` gives the schema in one call and `sql` answers with the
+/// typed table the agent's `run_sql` gives, the JSON beside it.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_tables_and_sql_answer_in_typed_text() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let shared = workspace(dir.path());
+    let writer = server_on(&shared, WritePolicy::Allow(Approver::Nobody));
+    let created = writer
+        .sql(
+            Parameters(SqlArgs {
+                sql: String::from("CREATE TABLE t AS SELECT 1 AS n UNION ALL SELECT 2"),
+            }),
+            Extensions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert_eq!(created.is_error, Some(false));
+    let tables = writer
+        .list_tables(Extensions::default())
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert_eq!(
+        field(&tables, "tables"),
+        serde_json::json!([{
+            "name": "t",
+            "estimated_rows": 2,
+            "columns": [{ "name": "n", "type": "INTEGER" }],
+        }])
+    );
+    assert_eq!(text_of(&tables), "t (table, ~2 rows): n INTEGER");
+    let read = writer
+        .sql(
+            Parameters(SqlArgs {
+                sql: String::from("SELECT n, n * 1.5 AS half FROM t ORDER BY n"),
+            }),
+            Extensions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert_eq!(
+        text_of(&read),
+        "| n:INTEGER | half:DECIMAL(12,1) |\n|---|---|\n| 1 | 1.5 |\n| 2 | 3 |\n(2 rows)\n"
+    );
+    assert_eq!(
+        field(&read, "column_types"),
+        serde_json::json!(["INTEGER", "DECIMAL(12,1)"])
+    );
+    assert_eq!(field(&read, "row_count_exact"), serde_json::json!(true));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn stdio_tools_gate_writes_and_serve_resources() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -187,11 +245,6 @@ async fn stdio_tools_gate_writes_and_serve_resources() {
         .await
         .unwrap_or_else(|e| fail(&e.message));
     assert_eq!(created.is_error, Some(false));
-    let tables = writer
-        .list_tables(Extensions::default())
-        .await
-        .unwrap_or_else(|e| fail(&e.message));
-    assert_eq!(field(&tables, "tables"), serde_json::json!(["t"]));
     let described = writer
         .describe_table(
             Parameters(DescribeTableArgs {

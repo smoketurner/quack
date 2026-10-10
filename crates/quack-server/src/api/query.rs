@@ -595,7 +595,13 @@ pub(crate) struct SqlOutcome {
     /// One array per row, a JSON value per column.
     #[schema(value_type = Vec<Vec<Object>>)]
     pub rows: Vec<Vec<serde_json::Value>>,
+    /// Each column's `DuckDB` type (`BIGINT`, `DECIMAL(10,2)`), one per column.
+    pub column_types: Vec<String>,
+    /// Every row the statement produced, or, when `row_count_exact` is
+    /// false, a lower bound: counting stops 100,000 rows past the cap and
+    /// the statement with it.
     pub row_count: usize,
+    pub row_count_exact: bool,
     pub truncated: bool,
     /// How long the statement ran, timed on its connection's thread, so a
     /// wait for the writer is not counted.
@@ -781,7 +787,9 @@ impl Access {
         let (capped, took) = result.map_err(|e| e.unprocessable_as(ErrorCode::SqlFailed))?;
         Ok(SqlOutcome {
             truncated: capped.truncated(),
+            row_count_exact: !capped.stopped_early,
             columns: capped.results.columns,
+            column_types: capped.column_types,
             rows: capped.results.rows,
             row_count: capped.total_rows,
             duration_ms: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),

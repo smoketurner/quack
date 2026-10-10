@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use aws_lc_rs::digest;
+use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
 use jiff::civil::DateTime;
 
 use std::collections::{BTreeMap, HashMap};
@@ -617,12 +618,33 @@ pub struct QueryResults {
     pub rows: Vec<Vec<serde_json::Value>>,
 }
 
+/// Rows past the cap a capped read still counts before it stops the
+/// statement: a `SELECT *` over a large table would otherwise run to its end
+/// (or to the timeout, losing the rows it had) only to count what nobody is
+/// shown. Past it the count is a lower bound (`CappedResults::stopped_early`).
+pub const COUNT_PAST_CAP: usize = 100_000;
+
+/// Bytes of rows the model is shown of one result
+/// ([`CappedResults::to_model_text`]): the row cap alone bounds nothing when
+/// the rows are wide, and 250 rows of a long text column run to megabytes.
+pub const MODEL_RESULT_BYTES: usize = 20_000;
+
+/// Characters of one value the model is shown before the rest is counted
+/// instead (`…(+4500 chars)`).
+pub const MODEL_CELL_CHARS: usize = 500;
+
 /// Query results with at most a caller's cap of rows kept, plus how many
 /// the statement produced in all.
 #[derive(Debug, Clone)]
 pub struct CappedResults {
     pub results: QueryResults,
+    /// Each column's type as `DuckDB` names it (`BIGINT`, `DECIMAL(10,2)`,
+    /// `VARCHAR[]`), one per column.
+    pub column_types: Vec<String>,
     pub total_rows: usize,
+    /// Counting stopped [`COUNT_PAST_CAP`] rows past the cap, so the
+    /// statement did not run to its end and `total_rows` is a lower bound.
+    pub stopped_early: bool,
 }
 
 impl CappedResults {
@@ -638,26 +660,165 @@ impl CappedResults {
         self.total_rows.saturating_sub(self.results.rows.len())
     }
 
-    /// The rows as a text table for the model, with a last row saying how
-    /// many more there were and what to do instead when the cap cut it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if formatting fails.
-    pub fn to_model_text(&self) -> Result<String> {
-        let mut table = self.results.clone();
-        if self.truncated() {
-            table.rows.push(vec![serde_json::Value::String(format!(
-                "... ({} more rows not shown: the result was cut at the {}-row limit, so \
-                 aggregate, filter, or ORDER BY and LIMIT it in one statement rather than \
-                 re-running it per group)",
-                self.omitted(),
-                self.results.rows.len()
-            ))]);
+    /// `at least ` when the count is a lower bound, else nothing: the
+    /// prefix every rendering of `total_rows` and `omitted` takes.
+    #[must_use]
+    pub const fn at_least(&self) -> &'static str {
+        if self.stopped_early { "at least " } else { "" }
+    }
+
+    /// The rows as a compact Markdown table for a model: no padding, each
+    /// header `name:TYPE`, a value longer than [`MODEL_CELL_CHARS`] cut with
+    /// how much was left out, rows only while they fit in
+    /// [`MODEL_RESULT_BYTES`], and a last line that counts the rows and,
+    /// when any were left out, says how many, why, and what to do instead.
+    #[must_use]
+    pub fn to_model_text(&self) -> String {
+        let columns = &self.results.columns;
+        if columns.is_empty() {
+            return String::from("OK\n");
         }
-        let mut buf = Vec::new();
-        table.write_table(&mut buf)?;
-        String::from_utf8(buf).map_err(|e| Error::Analysis(format!("UTF-8 error: {e}")))
+        let mut out = String::from("|");
+        for (i, name) in columns.iter().enumerate() {
+            out.push(' ');
+            push_model_cell(&mut out, name);
+            if let Some(kind) = self.column_types.get(i) {
+                out.push(':');
+                out.push_str(kind);
+            }
+            out.push_str(" |");
+        }
+        out.push_str("\n|");
+        for _ in columns {
+            out.push_str("---|");
+        }
+        out.push('\n');
+        let mut shown = 0_usize;
+        let mut line = String::new();
+        for row in &self.results.rows {
+            line.clear();
+            line.push('|');
+            for value in row {
+                line.push(' ');
+                push_model_cell(&mut line, &Cell(value).label());
+                line.push_str(" |");
+            }
+            line.push('\n');
+            // The first row always shows: a result is never all header.
+            if shown > 0 && out.len().saturating_add(line.len()) > MODEL_RESULT_BYTES {
+                break;
+            }
+            out.push_str(&line);
+            shown = shown.saturating_add(1);
+        }
+        out.push_str(&self.model_footer(shown));
+        out
+    }
+
+    /// The line after the rows `to_model_text` showed. It keeps the words
+    /// "more rows not shown", which the system prompt tells the model to
+    /// read as a cut result.
+    fn model_footer(&self, shown: usize) -> String {
+        let at_least = self.at_least();
+        let total = self.total_rows;
+        if total == 0 {
+            return String::from("(no rows)\n");
+        }
+        let by_bytes = shown < self.results.rows.len();
+        if !by_bytes && !self.truncated() {
+            return format!("({total} rows)\n");
+        }
+        let limit = if by_bytes {
+            format!("the {MODEL_RESULT_BYTES}-byte limit")
+        } else {
+            format!("the {shown}-row limit")
+        };
+        let narrower = if by_bytes {
+            "select fewer or narrower columns, "
+        } else {
+            ""
+        };
+        let stopped = if self.stopped_early {
+            "; counting stopped there, so the statement did not run to its end"
+        } else {
+            ""
+        };
+        format!(
+            "({at_least}{} more rows not shown: the first {shown} of {at_least}{total} rows, \
+             cut at {limit}{stopped}. To see what matters, {narrower}aggregate, filter, or \
+             ORDER BY and LIMIT it in one statement rather than re-running it per group)\n",
+            total.saturating_sub(shown),
+        )
+    }
+}
+
+/// A result column's type as `DuckDB`'s SQL spells it.
+fn sql_type_name(kind: &LogicalTypeHandle) -> String {
+    let name = match kind.id() {
+        LogicalTypeId::Decimal => {
+            return format!("DECIMAL({},{})", kind.decimal_width(), kind.decimal_scale());
+        }
+        LogicalTypeId::List | LogicalTypeId::Array => {
+            return format!("{}[]", sql_type_name(&kind.child(0)));
+        }
+        LogicalTypeId::Boolean => "BOOLEAN",
+        LogicalTypeId::Tinyint => "TINYINT",
+        LogicalTypeId::Smallint => "SMALLINT",
+        LogicalTypeId::Integer => "INTEGER",
+        LogicalTypeId::Bigint => "BIGINT",
+        LogicalTypeId::Hugeint => "HUGEINT",
+        LogicalTypeId::UTinyint => "UTINYINT",
+        LogicalTypeId::USmallint => "USMALLINT",
+        LogicalTypeId::UInteger => "UINTEGER",
+        LogicalTypeId::UBigint => "UBIGINT",
+        LogicalTypeId::UHugeint => "UHUGEINT",
+        LogicalTypeId::Float => "FLOAT",
+        LogicalTypeId::Double => "DOUBLE",
+        LogicalTypeId::Bignum => "BIGNUM",
+        LogicalTypeId::Date => "DATE",
+        LogicalTypeId::Time => "TIME",
+        LogicalTypeId::TimeNs => "TIME_NS",
+        LogicalTypeId::TimeTZ => "TIME WITH TIME ZONE",
+        LogicalTypeId::Timestamp => "TIMESTAMP",
+        LogicalTypeId::TimestampS => "TIMESTAMP_S",
+        LogicalTypeId::TimestampMs => "TIMESTAMP_MS",
+        LogicalTypeId::TimestampNs => "TIMESTAMP_NS",
+        LogicalTypeId::TimestampTZ => "TIMESTAMP WITH TIME ZONE",
+        LogicalTypeId::Interval => "INTERVAL",
+        LogicalTypeId::Varchar => "VARCHAR",
+        LogicalTypeId::Blob => "BLOB",
+        LogicalTypeId::Bit => "BIT",
+        LogicalTypeId::Uuid => "UUID",
+        LogicalTypeId::Enum => "ENUM",
+        LogicalTypeId::Struct => "STRUCT",
+        LogicalTypeId::Map => "MAP",
+        LogicalTypeId::Union => "UNION",
+        LogicalTypeId::Geometry => "GEOMETRY",
+        LogicalTypeId::Variant => "VARIANT",
+        LogicalTypeId::SqlNull => "NULL",
+        _ => "UNKNOWN",
+    };
+    String::from(name)
+}
+
+/// One header or value of a model table: `|` escaped, line breaks spelled
+/// out so a value stays on its row, and past [`MODEL_CELL_CHARS`] the rest
+/// counted rather than shown.
+fn push_model_cell(out: &mut String, value: &str) {
+    let mut chars = value.chars();
+    for c in chars.by_ref().take(MODEL_CELL_CHARS) {
+        match c {
+            '|' => out.push_str("\\|"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    let rest = chars.count();
+    if rest > 0 {
+        out.push_str("\u{2026}(+");
+        out.push_str(&rest.to_string());
+        out.push_str(" chars)");
     }
 }
 
@@ -3331,13 +3492,20 @@ impl WorkspaceDb {
         digested: bool,
     ) -> Result<(CappedResults, Option<String>)> {
         let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query([])?;
+        // Streamed, so a read that stops counting early stops the statement
+        // as well: `query` would run it to its end before the first row.
+        drop(stmt.stream_arrow([])?);
+        let mut rows = stmt.raw_query();
 
-        let (columns, column_count) = match rows.as_ref() {
+        let (columns, column_types, column_count) = match rows.as_ref() {
             Some(stmt_ref) if stmt_ref.column_count() > 0 => {
-                (stmt_ref.column_names(), stmt_ref.column_count())
+                let count = stmt_ref.column_count();
+                let types = (0..count)
+                    .map(|i| sql_type_name(&stmt_ref.column_logical_type(i)))
+                    .collect();
+                (stmt_ref.column_names(), types, count)
             }
-            _ => (Vec::new(), 0),
+            _ => (Vec::new(), Vec::new(), 0),
         };
         let mut digest = digested.then(|| ResultDigest::new(&columns)).transpose()?;
         let mut results = CappedResults {
@@ -3345,14 +3513,24 @@ impl WorkspaceDb {
                 columns,
                 rows: Vec::new(),
             },
+            column_types,
             total_rows: 0,
+            stopped_early: false,
         };
         if column_count == 0 {
             return Ok((results, digest.map(ResultDigest::finish)));
         }
+        // A digest covers every row, so only an undigested capped read stops.
+        let count_to = keep
+            .filter(|_| digest.is_none())
+            .map(|keep| keep.saturating_add(COUNT_PAST_CAP));
 
         while let Some(row) = rows.next()? {
             results.total_rows = results.total_rows.saturating_add(1);
+            if count_to.is_some_and(|count_to| results.total_rows > count_to) {
+                results.stopped_early = true;
+                break;
+            }
             let kept = keep.is_none_or(|keep| results.results.rows.len() < keep);
             if !kept && digest.is_none() {
                 continue;
@@ -3586,6 +3764,56 @@ impl WorkspaceDb {
             .into_iter()
             .filter(|name| !is_internal_name(name))
             .collect())
+    }
+
+    /// Every user table and view with `DuckDB`'s estimate of its rows and
+    /// its columns' names and types, in name order: the schema in one call,
+    /// where [`Self::list_tables`] names the tables alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn table_overview(&self) -> Result<Vec<TableOverview>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.table_name, t.estimated_size, c.column_name, c.data_type
+             FROM duckdb_columns() c
+             LEFT JOIN duckdb_tables() t
+               ON t.database_name = c.database_name
+              AND t.schema_name = c.schema_name
+              AND t.table_name = c.table_name
+             WHERE c.database_name = current_database() AND c.schema_name = 'main'
+             ORDER BY c.table_name, c.column_index",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut tables: Vec<TableOverview> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let table: String = row.get(0)?;
+            if is_internal_name(&table) {
+                continue;
+            }
+            let estimated_rows: Option<i64> = row.get(1)?;
+            let column = ColumnInfo {
+                name: row.get(2)?,
+                column_type: row.get(3)?,
+                meaning: None,
+            };
+            if tables.last().is_none_or(|last| last.name != table) {
+                tables.push(TableOverview {
+                    name: table,
+                    estimated_rows: estimated_rows.and_then(|n| u64::try_from(n).ok()),
+                    columns: Vec::new(),
+                    more_columns: 0,
+                });
+            }
+            if let Some(last) = tables.last_mut() {
+                if last.columns.len() < TableOverview::MAX_COLUMNS {
+                    last.columns.push(column);
+                } else {
+                    last.more_columns = last.more_columns.saturating_add(1);
+                }
+            }
+        }
+        Ok(tables)
     }
 
     /// A table's columns, name and `DuckDB` type, in order.
@@ -3916,6 +4144,52 @@ impl WorkspaceDb {
     pub fn connection(&self) -> &duckdb::Connection {
         &self.conn
     }
+}
+
+/// One table or view of [`WorkspaceDb::table_overview`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TableOverview {
+    pub name: String,
+    /// `DuckDB`'s estimate of the rows (exact after a load, drifting with
+    /// deletes); `None` for a view.
+    pub estimated_rows: Option<u64>,
+    /// The first [`Self::MAX_COLUMNS`] columns, in order.
+    pub columns: Vec<ColumnInfo>,
+    /// Columns past [`Self::MAX_COLUMNS`] left out.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub more_columns: usize,
+}
+
+impl TableOverview {
+    /// Columns listed per table; `describe_table` has the rest.
+    pub const MAX_COLUMNS: usize = 40;
+}
+
+/// One line: `orders (table, ~5000 rows): id INTEGER, amount DECIMAL(10,2)`.
+impl fmt::Display for TableOverview {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", OneLine(&self.name))?;
+        match self.estimated_rows {
+            Some(rows) => write!(f, " (table, ~{rows} rows):")?,
+            None => write!(f, " (view):")?,
+        }
+        for (i, column) in self.columns.iter().enumerate() {
+            let sep = if i == 0 { " " } else { ", " };
+            write!(f, "{sep}{} {}", OneLine(&column.name), column.column_type)?;
+        }
+        if self.more_columns > 0 {
+            write!(f, ", +{} more columns", self.more_columns)?;
+        }
+        Ok(())
+    }
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+const fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Column metadata from DESCRIBE, with what the ontology says of it.
