@@ -21,7 +21,7 @@ Two rules hold for every release:
 says which will be upgraded on their next open, and, once they are current, whether their
 vectors are stale (`quack embeddings refresh -w NAME` is its fix line).
 
-## Unreleased
+## v2026.10.5
 
 - Added: `quack classify TABLE "what you want to know about each row"` labels a table's text
   with a decision model (`[decision].model = "ollama/laya"`, `ollama pull laya`, Ollama 0.40.0 or
