@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use pdf_oxide::PdfDocument;
 use pdf_oxide::editor::DocumentInfo;
 use pdf_oxide::extractors::images::{ColorSpace, ImageData};
-use pdf_oxide::layout::TextSpan;
+use pdf_oxide::layout::{TextSpan, Word};
 use pdf_oxide::structure::table_extractor::Table as PdfTable;
 use pdf_oxide::structured::{RegionRole, StructuredPage, StructuredRegion};
 
@@ -44,7 +44,9 @@ pub fn extract(data: &[u8]) -> Result<Extracted> {
             // Table detection is best effort: a page whose tables cannot be
             // read still gives its text.
             let tables = doc.extract_tables(index).unwrap_or_default();
-            Ok(PageContent::of(&structured, &tables))
+            // Words place the cells of a table drawn without rules.
+            let words = doc.extract_words(index).unwrap_or_default();
+            Ok(PageContent::of(&structured, &tables, &words))
         },
         |index| pdf.picture(index),
     )?;
@@ -144,17 +146,194 @@ impl Line {
     }
 }
 
-/// The real tables on a page, for the spans inside them.
-struct Grids<'a>(Vec<&'a PdfTable>);
+/// The gap between two words of a row, in em, past which they are two
+/// cells rather than two words of one: a word space is about a quarter em.
+const CELL_GAP_EM: f32 = 0.8;
+/// Rows a run of aligned rows needs to be read as a table, header included.
+const TABLE_MIN_ROWS: usize = 3;
+/// Characters a cell of a table without rules holds at most: a longer run
+/// of text is prose that happens to line up.
+const CELL_MAX_CHARS: usize = 40;
+/// How far apart, in points, two cells of a column may sit and still be
+/// aligned on an edge or their centre.
+const COLUMN_TOLERANCE: f32 = 3.0;
+
+/// A run of a row's words that stands apart from the rest.
+#[derive(Debug, Clone, PartialEq)]
+struct Cell {
+    left: f32,
+    right: f32,
+    text: String,
+}
+
+impl Cell {
+    /// Whether `other` sits in the same column: aligned on the left edge,
+    /// the right edge (numbers), or the centre.
+    fn aligned(&self, other: &Self) -> bool {
+        (self.left - other.left).abs() <= COLUMN_TOLERANCE
+            || (self.right - other.right).abs() <= COLUMN_TOLERANCE
+            || ((self.left + self.right) - (other.left + other.right)).abs() / 2.0
+                <= COLUMN_TOLERANCE
+    }
+
+    fn short(&self) -> bool {
+        self.text.chars().count() <= CELL_MAX_CHARS
+    }
+}
+
+/// A row of a page's words on one baseline, split into cells where they
+/// stand apart, for telling a table without rules from prose.
+#[derive(Debug, Clone, PartialEq)]
+struct Row {
+    /// Distance from the page's bottom edge to the row's baseline.
+    y: f32,
+    top: f32,
+    cells: Vec<Cell>,
+}
+
+impl Row {
+    /// `words` as rows, top to bottom: a word joins the row whose baseline
+    /// is within half its font size, and a gap of more than
+    /// [`CELL_GAP_EM`] starts a new cell.
+    fn of_words(words: &[&Word]) -> Vec<Self> {
+        let mut grouped: Vec<(f32, Vec<&Word>)> = Vec::new();
+        for word in words {
+            let tolerance = (word.avg_font_size * 0.5).max(1.0);
+            match grouped
+                .iter_mut()
+                .find(|(y, _)| (*y - word.bbox.y).abs() <= tolerance)
+            {
+                Some((_, members)) => members.push(word),
+                None => grouped.push((word.bbox.y, vec![word])),
+            }
+        }
+        let mut rows: Vec<Self> = grouped
+            .into_iter()
+            .map(|(y, mut members)| {
+                members.sort_by(|a, b| a.bbox.x.total_cmp(&b.bbox.x));
+                let mut cells: Vec<Cell> = Vec::new();
+                for word in &members {
+                    let text = word.text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let (left, right) = (word.bbox.x, word.bbox.x + word.bbox.width);
+                    match cells.last_mut() {
+                        Some(cell) if left - cell.right <= word.avg_font_size * CELL_GAP_EM => {
+                            cell.text.push(' ');
+                            cell.text.push_str(text);
+                            cell.right = cell.right.max(right);
+                        }
+                        _ => cells.push(Cell {
+                            left,
+                            right,
+                            text: text.to_owned(),
+                        }),
+                    }
+                }
+                let top = members
+                    .iter()
+                    .map(|w| w.bbox.y + w.bbox.height)
+                    .fold(y, f32::max);
+                Self { y, top, cells }
+            })
+            .collect();
+        rows.sort_by(|a, b| b.y.total_cmp(&a.y));
+        rows
+    }
+
+    /// Whether `next` is another row of the table this row starts: as
+    /// many cells, each short and in this row's column.
+    fn shares_columns(&self, next: &Self) -> bool {
+        next.cells.len() == self.cells.len()
+            && next.cells.iter().all(Cell::short)
+            && self
+                .cells
+                .iter()
+                .zip(&next.cells)
+                .all(|(a, b)| a.aligned(b))
+    }
+}
+
+/// The runs of `rows` that are tables without rules: at least
+/// [`TABLE_MIN_ROWS`] rows in a row, each split into the same number (two
+/// or more) of short cells, every column aligned. A line of prose is one
+/// cell, its words a space apart.
+fn borderless_tables(rows: &[Row]) -> Vec<std::ops::Range<usize>> {
+    let mut found = Vec::new();
+    let mut start = 0;
+    while let Some(first) = rows.get(start) {
+        let mut end = start.saturating_add(1);
+        if first.cells.len() >= 2 && first.cells.iter().all(Cell::short) {
+            while rows.get(end).is_some_and(|row| first.shares_columns(row)) {
+                end = end.saturating_add(1);
+            }
+        }
+        if end.saturating_sub(start) >= TABLE_MIN_ROWS {
+            found.push(start..end);
+            start = end;
+        } else {
+            start = start.saturating_add(1);
+        }
+    }
+    found
+}
+
+/// A table drawn without rules: its rows' cells, and the area its words
+/// cover, which the page's text leaves to it.
+#[derive(Debug)]
+struct Borderless {
+    rows: Vec<Vec<String>>,
+    left: f32,
+    right: f32,
+    bottom: f32,
+    top: f32,
+}
+
+impl Borderless {
+    /// The tables without rules among `rows`.
+    fn find(rows: &[Row]) -> Vec<Self> {
+        borderless_tables(rows)
+            .into_iter()
+            .filter_map(|run| {
+                let rows = rows.get(run)?;
+                let cells = || rows.iter().flat_map(|r| &r.cells);
+                Some(Self {
+                    rows: rows
+                        .iter()
+                        .map(|r| r.cells.iter().map(|c| c.text.clone()).collect())
+                        .collect(),
+                    left: cells().map(|c| c.left).fold(f32::MAX, f32::min) - 1.0,
+                    right: cells().map(|c| c.right).fold(f32::MIN, f32::max) + 1.0,
+                    bottom: rows.iter().map(|r| r.y).fold(f32::MAX, f32::min) - 2.0,
+                    top: rows.iter().map(|r| r.top).fold(f32::MIN, f32::max) + 1.0,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether the point (`x`, `y`) lies in the table's area.
+    fn holds(&self, x: f32, y: f32) -> bool {
+        (self.left..=self.right).contains(&x) && (self.bottom..=self.top).contains(&y)
+    }
+}
+
+/// The real tables on a page, for the spans inside them: the ruled grids
+/// `pdf_oxide` finds, and the tables drawn without rules found here.
+struct Grids<'a> {
+    ruled: Vec<&'a PdfTable>,
+    borderless: Vec<Borderless>,
+}
 
 impl Grids<'_> {
     fn contains(&self, span: &TextSpan) -> bool {
-        self.0.iter().any(|table| {
+        let center = span.bbox.center();
+        self.ruled.iter().any(|table| {
             table
                 .bbox
                 .as_ref()
-                .is_some_and(|b| b.contains_point(&span.bbox.center()))
-        })
+                .is_some_and(|b| b.contains_point(&center))
+        }) || self.borderless.iter().any(|t| t.holds(center.x, center.y))
     }
 }
 
@@ -245,10 +424,24 @@ impl<'a> Page<'a> {
 }
 
 impl PageContent {
-    fn of(page: &StructuredPage, tables: &[PdfTable]) -> Self {
+    fn of(page: &StructuredPage, tables: &[PdfTable], words: &[Word]) -> Self {
+        let ruled: Vec<&PdfTable> = tables.iter().filter(|t| t.is_real_grid()).collect();
+        // Words outside the ruled grids, which already have their tables.
+        let loose: Vec<&Word> = words
+            .iter()
+            .filter(|w| {
+                let center = w.bbox.center();
+                !ruled
+                    .iter()
+                    .any(|t| t.bbox.as_ref().is_some_and(|b| b.contains_point(&center)))
+            })
+            .collect();
         let page = Page {
             page,
-            grids: Grids(tables.iter().filter(|t| t.is_real_grid()).collect()),
+            grids: Grids {
+                ruled,
+                borderless: Borderless::find(&Row::of_words(&loose)),
+            },
         };
         let body_size = page.body_font_size();
         let (lines, mut pending) = page.lines();
@@ -257,7 +450,7 @@ impl PageContent {
         // Tables sit where their top edge is, highest first.
         let mut placed: Vec<(f32, Table)> = page
             .grids
-            .0
+            .ruled
             .iter()
             .filter_map(|table| {
                 let rows = table
@@ -269,6 +462,12 @@ impl PageContent {
                 Table::from_rows(rows).map(|t| (top, t))
             })
             .collect();
+        placed.extend(
+            page.grids
+                .borderless
+                .iter()
+                .filter_map(|t| Table::from_rows(t.rows.clone()).map(|table| (t.top, table))),
+        );
         placed.sort_by(|a, b| b.0.total_cmp(&a.0));
         for line in lines {
             while placed.first().is_some_and(|(top, _)| *top >= line.top) {
@@ -709,6 +908,113 @@ mod tests {
             |_| Some((vec![1], ImageFormat::Png)),
         );
         assert!(scanned_only.is_ok_and(|p| p.sections.is_empty() && p.scans.len() == 2));
+    }
+
+    /// A row of `cells`, each `(left, right, text)`.
+    fn row(y: f32, cells: &[(f32, f32, &str)]) -> Row {
+        Row {
+            y,
+            top: y + 10.0,
+            cells: cells
+                .iter()
+                .map(|(left, right, text)| Cell {
+                    left: *left,
+                    right: *right,
+                    text: (*text).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Rows of short cells in aligned columns are a table: labels by their
+    /// left edge, numbers by their right; prose around them is not.
+    #[test]
+    fn aligned_rows_of_short_cells_are_a_table_without_rules() {
+        let rows = vec![
+            row(
+                720.0,
+                &[(72.0, 400.0, "Revenue by region for the third quarter.")],
+            ),
+            row(
+                700.0,
+                &[
+                    (72.0, 110.0, "Region"),
+                    (150.0, 166.0, "Jul"),
+                    (200.0, 218.0, "Aug"),
+                ],
+            ),
+            row(
+                688.0,
+                &[
+                    (72.0, 100.0, "North"),
+                    (148.0, 166.0, "410"),
+                    (200.0, 218.0, "432"),
+                ],
+            ),
+            row(
+                676.0,
+                &[
+                    (72.0, 96.0, "West"),
+                    (148.0, 166.0, "480"),
+                    (194.0, 218.0, "1,401"),
+                ],
+            ),
+            row(
+                650.0,
+                &[(72.0, 400.0, "The West fell after the warehouse closed.")],
+            ),
+        ];
+        assert_eq!(borderless_tables(&rows), vec![1..4]);
+        // Two rows are not enough to tell a table from a pair of lines.
+        assert!(borderless_tables(rows.get(1..3).unwrap_or_default()).is_empty());
+        // Columns that drift are not a table.
+        let drift = vec![
+            row(700.0, &[(72.0, 110.0, "a"), (150.0, 166.0, "b")]),
+            row(688.0, &[(72.0, 110.0, "c"), (190.0, 230.0, "d")]),
+            row(676.0, &[(72.0, 110.0, "e"), (260.0, 290.0, "f")]),
+        ];
+        assert!(borderless_tables(&drift).is_empty());
+    }
+
+    /// A table drawn as text in a grid, with no rules, becomes a table
+    /// section, and its words leave the body text.
+    #[test]
+    fn a_table_without_rules_becomes_a_table_section() {
+        let mut doc = pdf_oxide::writer::DocumentBuilder::new().title("Ops report");
+        let mut page = doc
+            .letter_page()
+            .at(72.0, 720.0)
+            .text("Revenue held in the East and fell in the West.");
+        let rows = [
+            (680.0, ["Region", "Jul", "Aug", "Sep"]),
+            (662.0, ["North", "410", "432", "455"]),
+            (644.0, ["East", "520", "548", "590"]),
+            (626.0, ["West", "480", "401", "362"]),
+        ];
+        for (y, cells) in rows {
+            for (x, cell) in [72.0, 132.0, 192.0, 252.0].into_iter().zip(cells) {
+                page = page.at(x, y).text(cell);
+            }
+        }
+        page.done();
+        let bytes = doc.build().unwrap_or_default();
+        let extracted = extract(&bytes);
+        assert!(extracted.is_ok(), "{:?}", extracted.as_ref().err());
+        let Ok(extracted) = extracted else { return };
+        let is_table = |s: &&Section| s.kind == super::super::parser::SectionKind::Table;
+        let tables: Vec<&Section> = extracted.sections.iter().filter(is_table).collect();
+        assert_eq!(tables.len(), 1, "{:?}", extracted.sections);
+        let table = tables.first().map(|s| s.text.as_str()).unwrap_or_default();
+        assert!(table.starts_with("| Region | Jul | Aug | Sep |"), "{table}");
+        assert!(table.contains("| West | 480 | 401 | 362 |"), "{table}");
+        let body: String = extracted
+            .sections
+            .iter()
+            .filter(|s| !is_table(s))
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(body.contains("fell in the West"), "{body}");
+        assert!(!body.contains("480"), "{body}");
     }
 
     #[test]

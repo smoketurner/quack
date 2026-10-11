@@ -23,7 +23,7 @@ use quack_core::graph::follow_up::FollowUp;
 use quack_core::ids::{DocumentId, SessionId};
 use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::tree::{FileResult, Folder, Outcome, Prune};
-use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile};
+use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile, Piped};
 use quack_core::llm::Embeddings;
 use quack_core::llm::after_turn::AfterTurn;
 use quack_core::llm::egress::Egress;
@@ -41,8 +41,8 @@ use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, SessionViewer, Sharing, Transcript,
 };
 use quack_core::storage::workspace::{
-    DocumentFields, DocumentInfo, DocumentListing, Pinning, SearchMode, Shown, StatementKind,
-    WorkspaceDb,
+    DocumentFields, DocumentInfo, DocumentListing, DocumentSource, Pinning, SearchMode, Shown,
+    StatementKind, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use quack_core::vault::Vault;
@@ -1098,7 +1098,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         return Ok(ExitCode::from(Exit::Usage));
     }
     let ws_db = opened.open_db()?;
-    load_piped_stdin(config, &ws_db, opened.workspace.id.as_str(), cli.stdin).await?;
+    let piped = load_piped_stdin(config, &ws_db, opened.workspace.id.as_str(), cli.stdin).await?;
     if let Some(note) = ws_db.embedding_status()?.note() {
         tracing::warn!(
             "{note} Run `quack embeddings refresh -w {}` to update them.",
@@ -1112,6 +1112,10 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         cli.mode.map(ChatMode::from),
     )?;
     let (db, reader_db) = opened.shared(ws_db).await?;
+    let mut documents = cli.documents.clone();
+    if let Some(piped) = piped {
+        documents.push(piped.ingest(&opened, &db).await?.to_string());
+    }
     let outcome = PrintTurn {
         config,
         db: Arc::clone(&db),
@@ -1119,7 +1123,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         session_id: &session_id,
         policy,
         prompt,
-        documents: &cli.documents,
+        documents: &documents,
         format,
         verbose: cli.verbose,
         answer_to: AnswerTo::Stdout,
@@ -1151,9 +1155,9 @@ async fn load_piped_stdin(
     db: &WorkspaceDb,
     workspace_id: &str,
     wait: bool,
-) -> Result<()> {
+) -> Result<Option<PipedDocument>> {
     if std::io::stdin().is_terminal() {
-        return Ok(());
+        return Ok(None);
     }
     if !wait && !stdin_has_data().await? {
         tracing::warn!(
@@ -1161,12 +1165,15 @@ async fn load_piped_stdin(
              skipping the `stdin` table (pass --stdin to wait for it)",
             STDIN_GRACE.as_secs()
         );
-        return Ok(());
+        return Ok(None);
     }
     let mut data = Vec::new();
     std::io::stdin()
         .read_to_end(&mut data)
         .context("failed to read stdin")?;
+    if let Piped::Document { name } = Piped::of(&data) {
+        return Ok(Some(PipedDocument { name, data }));
+    }
     if let Some(table) = ingestion::load_stdin_table(config, db, workspace_id, &data)
         .context("failed to load stdin as a table")?
     {
@@ -1176,7 +1183,43 @@ async fn load_piped_stdin(
             "stdin loaded as a temporary table"
         );
     }
-    Ok(())
+    Ok(None)
+}
+
+/// A document piped into `quack -p` or `-q`, as its bytes show it.
+struct PipedDocument {
+    /// `stdin.pdf`, and so on.
+    name: String,
+    data: Vec<u8>,
+}
+
+impl PipedDocument {
+    /// Ingest the document into the workspace (or find the one already
+    /// holding its bytes), for the question to be limited to.
+    async fn ingest(self, opened: &OpenedWorkspace, db: &Writer) -> Result<DocumentId> {
+        let embedder = Embeddings::from_config(&opened.config)
+            .await
+            .context("failed to build embedding model")?;
+        let outcome = ingestion::ingest_file(
+            &opened.config,
+            db,
+            opened.workspace.id.as_str(),
+            &NewFile::new(&self.name, &self.data).source(DocumentSource::Stdin),
+            embedder.as_ref(),
+        )
+        .await
+        .with_context(|| format!("failed to ingest the piped {}", self.name))?;
+        let id = match outcome {
+            IngestOutcome::Ingested(result) => result.document_id,
+            IngestOutcome::Duplicate(existing) => existing.id,
+        };
+        tracing::info!(
+            document = %id,
+            name = %self.name,
+            "piped document ingested; the question is limited to it"
+        );
+        Ok(id)
+    }
 }
 
 /// How long a non-terminal stdin has to deliver a byte or close.
@@ -2381,13 +2424,20 @@ async fn run_query(
 ) -> Result<()> {
     let opened = OpenedWorkspace::resolve(workspace_name).await?;
     let ws_db = opened.open_db()?;
-    load_piped_stdin(
+    if let Some(piped) = load_piped_stdin(
         &opened.config,
         &ws_db,
         opened.workspace.id.as_str(),
         wait_for_stdin,
     )
-    .await?;
+    .await?
+    {
+        anyhow::bail!(
+            "the piped data is a document ({}); -q runs SQL over tables: ask about it with \
+             `quack -p`, or keep it with `quack ingest -`",
+            piped.name
+        );
+    }
 
     let results = ws_db.execute_query(sql).context("query execution failed")?;
     if ws_db.classify_statement(sql)? != StatementKind::Read
