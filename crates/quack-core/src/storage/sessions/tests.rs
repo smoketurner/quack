@@ -97,7 +97,6 @@ fn response(content: &str, steps: Vec<ToolStep>) -> AgentResponse {
         usage: None,
         duration_ms: None,
         documents: DocumentScope::default(),
-        unsourced: Vec::new(),
     }
 }
 

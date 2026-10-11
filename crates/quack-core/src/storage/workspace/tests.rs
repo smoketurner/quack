@@ -3216,8 +3216,48 @@ fn opening_a_version_14_workspace_creates_the_classification_runs() {
             .meta(MetaKey::SchemaVersion)
             .unwrap_or_default()
             .as_deref(),
-        Some("15")
+        Some(WORKSPACE_SCHEMA_VERSION.to_string().as_str())
     );
     let runs = classify::Run::list(&reopened, 10).unwrap_or_else(|e| fail(&e.to_string()));
     assert!(runs.runs.is_empty());
+}
+
+/// A version 15 file's profiles list no values; opening it profiles every
+/// table again, so a text column with few values lists them all.
+#[test]
+fn opening_a_version_15_workspace_lists_each_columns_values() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let config = config_in(dir.path());
+    {
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        db.execute_statement(
+            "CREATE TABLE events AS SELECT * FROM (VALUES ('TEXAS'), ('IOWA'), ('TEXAS')) t(state)",
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        let mut profile =
+            TableProfile::compute(&db, "events").unwrap_or_else(|e| fail(&e.to_string()));
+        for column in &mut profile.columns {
+            column.values.clear();
+        }
+        db.connection()
+            .execute(
+                "INSERT OR REPLACE INTO _quack_table_profiles (table_name, row_count, columns) \
+                 VALUES ('events', 3, ?)",
+                duckdb::params![
+                    serde_json::to_string(&profile.columns)
+                        .unwrap_or_else(|e| fail(&e.to_string()))
+                ],
+            )
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        db.set_meta(MetaKey::SchemaVersion, "15")
+            .unwrap_or_else(|e| fail(&e.to_string()));
+    }
+    let reopened = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+    let profiles = TableProfile::all(&reopened).unwrap_or_else(|e| fail(&e.to_string()));
+    let state = profiles
+        .get("events")
+        .and_then(|p| p.columns.first())
+        .map(|c| c.values.clone())
+        .unwrap_or_default();
+    assert_eq!(state, ["IOWA", "TEXAS"]);
 }

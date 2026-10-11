@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS _quack_table_notes (
 const PROFILED_COLUMNS: usize = 200;
 /// Common values kept per column.
 const SAMPLES: usize = 3;
+/// A text column with at most this many distinct values keeps all of them
+/// (`ColumnProfile::values`), so a question's words can be matched to the
+/// values the column holds (`analysis::grounding::ValueLinks`).
+const LISTED_VALUES: usize = 50;
 /// A kept value longer than this is cut, with an ellipsis.
 const SAMPLE_CHARS: usize = 60;
 /// A column at least this empty is worth a warning.
@@ -345,6 +349,10 @@ pub struct ColumnProfile {
     pub distinct: u64,
     /// The most common values, as text, cut to 60 characters.
     pub samples: Vec<String>,
+    /// Every value of a text column with at most 50 distinct values, none
+    /// longer than 60 characters; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
     /// For a text column, the share of non-null values that cast to a
     /// number; 0 otherwise.
     #[serde(default)]
@@ -520,7 +528,7 @@ impl TableProfile {
             select.push(format!("count({q})"));
             select.push(format!("count(DISTINCT {q})"));
             select.push(format!(
-                "CAST(to_json(approx_top_k(CAST({q} AS VARCHAR), {SAMPLES})) AS VARCHAR)"
+                "CAST(to_json(approx_top_k(CAST({q} AS VARCHAR), {LISTED_VALUES})) AS VARCHAR)"
             ));
             if ColumnKind::of(&column.column_type) == ColumnKind::Text {
                 select.push(format!(
@@ -545,17 +553,24 @@ impl TableProfile {
                         let non_null: i64 = row.get(at)?;
                         let distinct: i64 = row.get(at.saturating_add(1))?;
                         let samples: Option<String> = row.get(at.saturating_add(2))?;
-                        let samples: Vec<Option<String>> = samples
-                            .and_then(|json| serde_json::from_str(&json).ok())
-                            .unwrap_or_default();
+                        let common: Vec<String> = samples
+                            .and_then(|json| {
+                                serde_json::from_str::<Vec<Option<String>>>(&json).ok()
+                            })
+                            .unwrap_or_default()
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                        let distinct = u64::try_from(distinct).unwrap_or(0);
                         let number_share: Option<f64> = row.get(at.saturating_add(3))?;
                         let date_share: Option<f64> = row.get(at.saturating_add(4))?;
                         profiled.push(ColumnProfile {
                             name: column.name.clone(),
                             duckdb_type: column.column_type.to_ascii_uppercase(),
                             non_null: u64::try_from(non_null).unwrap_or(0),
-                            distinct: u64::try_from(distinct).unwrap_or(0),
-                            samples: samples.into_iter().flatten().map(|s| cut(&s)).collect(),
+                            distinct,
+                            values: listed(&column.column_type, distinct, &common),
+                            samples: common.iter().take(SAMPLES).map(|s| cut(s)).collect(),
                             number_share: number_share.unwrap_or(0.0),
                             date_share: date_share.unwrap_or(0.0),
                         });
@@ -865,6 +880,21 @@ impl Stale {
 }
 
 /// `text` cut to [`SAMPLE_CHARS`], with an ellipsis when cut.
+/// All of a text column's values, sorted, when `common` holds every one of
+/// its `distinct` values and none is long; otherwise none.
+fn listed(column_type: &str, distinct: u64, common: &[String]) -> Vec<String> {
+    let complete = u64::try_from(common.len()).is_ok_and(|n| n == distinct);
+    if ColumnKind::of(column_type) != ColumnKind::Text
+        || !complete
+        || common.iter().any(|v| v.chars().count() > SAMPLE_CHARS)
+    {
+        return Vec::new();
+    }
+    let mut values = common.to_vec();
+    values.sort();
+    values
+}
+
 fn cut(text: &str) -> String {
     let mut out: String = text.chars().take(SAMPLE_CHARS).collect();
     if text.chars().count() > SAMPLE_CHARS {

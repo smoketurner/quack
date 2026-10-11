@@ -85,9 +85,9 @@ Assumptions about the current deployment, to be confirmed:
    inside the boundary and is edited through the interfaces. Files are only an import and
    export format.
 8. **DuckDB provides the answers.** The chat model writes the SQL and the tool calls; the
-   figures come from what they return. An answer stating a figure no result or passage of
-   the turn holds is not shown (section 7.7), and the same question over the same data gets
-   the same tool calls (temperature 0 and a fixed seed).
+   answer is the rows they return, shown with the SQL that fetched them (section 7.7), and
+   the same question over the same data gets the same tool calls (temperature 0 and a fixed
+   seed).
 
 ---
 
@@ -2041,25 +2041,23 @@ JSON response carries them on each step. The model is unaffected: it still sees 
 ### 7.7 Grounding
 
 `DuckDB` provides the answers; the chat model writes the SQL and the tool calls that fetch
-them (principle 8). What the model knows is never trusted. Every figure an answer states must
-be one this turn fetched (`analysis::grounding`): a value in a query result or any other tool
-result, a passage search retrieved (`always_retrieve` included), or the question. The system
-prompt and earlier turns of the session are not sources: a figure from them is fetched again.
-The `Unsourced` hook records each tool result as the model receives it and checks each final
-answer; the check runs in every workspace that holds tables or documents.
+them (principle 8). What the model knows is never trusted, and its prose is never the record:
+the statement each `run_sql` ran and the rows it returned are kept on the step and shown in
+every interface, so an answer is checked against its query, not against its sentences. (A
+scan of the answer's numbers against the results was tried and removed: it misread ids and
+dates as figures and threw away correct answers, and it could not catch a real number from
+the wrong row, which is the failure that matters.)
 
-A figure is a number as written, with its thousands separators, a currency sign, a scale
-(`4.2M`, `1.76 million`), or a percent sign. It matches a source when it is the same number
-to the precision it is written in, as written, scaled, or as a ratio: `1.76 million` matches
-`1764000`, `18%` matches `0.18`. Digits that are part of a name (`EF2`, `SR-8841`), citation
-markers, and list numbers are not figures. Words are not checked.
-
-An answer stating a figure nothing holds is asked for once more, with the figures named and
-the instruction to have the SQL do the arithmetic. If the second answer still states one,
-it is not shown: the response's `answer` is what the turn's queries returned (each statement
-and its rows, as the step kept them) under a sentence naming the figures, and `unsourced`
-lists them (`AgentResponse::unsourced`, on every interface's response object). With no
-query run there are no rows to show, and the answer says so.
+The values a query filters on are held to the question instead (`grounding::ValueLinks`).
+A text column with at most 50 distinct values keeps all of them in its profile
+(`ColumnProfile::values`); when the turn starts, the question's words are matched to those
+values as whole words, ignoring case (`Texas` is `TEXAS` in `events.state`). A read whose
+`column = 'value'` or `column IN (...)` (as `DuckDB` parses it, the column bare or inside
+`lower`, `upper`, or `trim`) uses another value of a column the question names a value of is
+not run: `WHERE state = 'TENNESSEE'` for a question about Texas, or `WHERE state = 'Texas'`
+when the column holds `TEXAS`. The model is told the value the column holds and writes the
+query again. A model shown three sample rows otherwise picks the nearest value it saw, and
+the figure its query returns is real.
 
 What else keeps the model to the data: a tool call repeating one the turn made, same tool and
 arguments, is not run again (`RepeatedCalls`); the graph tools register only for a question

@@ -74,9 +74,7 @@ of a chat model.
 `agent_questions.json` to the chat model through a full agent turn and has the vision model
 read the notice (`examples/eval/ollama.rs`). The agent table counts, per kind, correct answers,
 answers through a tool the question names (`run_sql` for a table question),
-cited answers, fallbacks (answers quack replaced by the query results because they stated a
-figure no result held, design doc 7.7), and, under `QUACK_EVAL_REPEAT`, questions answered the
-same every time. Nothing fails on a wrong answer: each case is scored and printed, with the
+cited answers, and, under `QUACK_EVAL_REPEAT`, questions answered the same every time. Nothing fails on a wrong answer: each case is scored and printed, with the
 misses listed, and `QUACK_EVAL_OUT=eval.json` keeps the
 numbers. Model output varies between runs, so compare a run with the last few, not with
 one.

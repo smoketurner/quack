@@ -1,22 +1,16 @@
-//! Recovery hooks on the agent loop: a tool call the model got wrong, a
-//! model turn that came back empty, and an answer that states figures the
-//! workspace did not give it get another try instead of ending the turn.
-//! Local models do all three.
+//! Recovery hooks on the agent loop: a tool call the model got wrong and a
+//! model turn that came back empty get another try instead of ending the
+//! turn, and a tool call the turn already made is not run again. Local
+//! models do all three.
 
 use std::future;
 
 use rig::agent::{
     AgentHook, DispatchAction, DispatchEvent, HookContext, InvalidToolCallAction,
     InvalidToolCallContext, InvalidToolCallReason, ModelTurnAction, ModelTurnFinished,
-    OutcomeAction, OutcomeEvent,
 };
 use rig::completion::FinishReason;
 use rig::message::AssistantContent;
-
-use super::grounding;
-use super::policy::Exposure;
-use super::think;
-use super::tools::Turn;
 
 /// How many times one turn asks the model again after an invalid tool call.
 /// Each retry also counts against `[analysis].max_turns`.
@@ -181,105 +175,6 @@ impl AgentHook for RepeatedCalls {
         event: DispatchEvent<'_>,
     ) -> impl Future<Output = DispatchAction> + Send {
         future::ready(Self::decide(ctx, &event))
-    }
-}
-
-/// Every figure an answer states must be one the turn showed the model
-/// (`grounding`): `DuckDB` provides the answers, and the model only writes the
-/// SQL and the tool calls that fetch them. The hook records every tool
-/// result as the model receives it, and a final answer (text, no tool call)
-/// stating a figure nothing the turn showed holds is asked for once more,
-/// with those figures named. A second such answer is not shown: the turn
-/// answers with the query results instead (`grounding::fallback`).
-/// Registered in a workspace that holds tables or documents.
-pub(crate) struct Unsourced {
-    turn: Turn,
-}
-
-/// The run's count of answers already asked for again.
-#[derive(Clone, Copy, Default)]
-struct UnsourcedRetries(u8);
-
-impl Unsourced {
-    const RETRIES: u8 = 1;
-
-    pub(crate) const fn new(turn: Turn) -> Self {
-        Self { turn }
-    }
-
-    /// Whether the turn has looked at the workspace: a tool ran, or
-    /// `always_retrieve` put document text in the prompt.
-    fn looked(&self) -> bool {
-        !self.turn.recorder.steps().is_empty() || self.turn.exposure() == Exposure::Documents
-    }
-
-    /// A final answer's text; `None` for a turn that calls a tool.
-    fn final_text(event: &ModelTurnFinished<'_>) -> Option<String> {
-        let mut text = String::new();
-        for part in event.content {
-            match part {
-                AssistantContent::Text(part) => text.push_str(&part.text),
-                AssistantContent::ToolCall(_) => return None,
-                _ => {}
-            }
-        }
-        Some(text)
-    }
-
-    fn decide(&self, ctx: &HookContext, event: &ModelTurnFinished<'_>) -> ModelTurnAction {
-        let Some(text) = Self::final_text(event) else {
-            return ModelTurnAction::continue_run();
-        };
-        let unsourced = self.turn.unsourced(&think::strip(&text));
-        if unsourced.is_empty() {
-            return ModelTurnAction::continue_run();
-        }
-        let retry = ctx
-            .scratchpad()
-            .update(|UnsourcedRetries(spent): &mut UnsourcedRetries| {
-                let retry = *spent < Self::RETRIES;
-                if retry {
-                    *spent = spent.saturating_add(1);
-                }
-                retry
-            });
-        if retry {
-            tracing::warn!(
-                ?unsourced,
-                "the answer states figures no result holds; asking again"
-            );
-            ModelTurnAction::retry_with_feedback(grounding::feedback(&unsourced, self.looked()))
-        } else {
-            ModelTurnAction::continue_run()
-        }
-    }
-}
-
-impl AgentHook for Unsourced {
-    fn on_model_turn_finished(
-        &self,
-        ctx: &HookContext,
-        event: ModelTurnFinished<'_>,
-    ) -> impl Future<Output = ModelTurnAction> + Send {
-        future::ready(self.decide(ctx, &event))
-    }
-
-    /// Record what each tool returned, as the model reads it.
-    fn on_outcome(
-        &self,
-        _ctx: &HookContext,
-        event: OutcomeEvent<'_>,
-    ) -> impl Future<Output = OutcomeAction> + Send {
-        if let Some(result) = event.tool_result() {
-            let output = result.output();
-            match output.as_text() {
-                Some(text) => self.turn.saw(text),
-                None => self
-                    .turn
-                    .saw(&serde_json::to_string(output).unwrap_or_default()),
-            }
-        }
-        future::ready(OutcomeAction::Proceed)
     }
 }
 
