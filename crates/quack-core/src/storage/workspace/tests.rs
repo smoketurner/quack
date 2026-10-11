@@ -1879,7 +1879,7 @@ fn a_file_from_a_newer_quack_is_refused_and_left_as_it_was() {
     let newer = WORKSPACE_SCHEMA_VERSION.saturating_add(1);
     {
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        db.execute_statement("DROP TABLE _quack_session_summaries")
+        db.execute_statement("DROP TABLE _quack_imports")
             .unwrap_or_else(|e| fail(&e.to_string()));
         db.set_meta(MetaKey::SchemaVersion, &newer.to_string())
             .unwrap_or_else(|e| fail(&e.to_string()));
@@ -1919,7 +1919,7 @@ fn a_file_from_a_newer_quack_is_refused_and_left_as_it_was() {
     let recreated: bool = conn
         .query_row(
             "SELECT count(*) > 0 FROM duckdb_tables() \
-             WHERE table_name = '_quack_session_summaries'",
+             WHERE table_name = '_quack_imports'",
             [],
             |row| row.get(0),
         )
@@ -1956,7 +1956,7 @@ fn a_schema_version_that_is_not_a_number_is_refused_and_left_as_it_was() {
     let config = config_in(dir.path());
     {
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
-        db.execute_statement("DROP TABLE _quack_session_summaries")
+        db.execute_statement("DROP TABLE _quack_imports")
             .unwrap_or_else(|e| fail(&e.to_string()));
         db.set_meta(MetaKey::SchemaVersion, "eleven")
             .unwrap_or_else(|e| fail(&e.to_string()));
@@ -1982,7 +1982,7 @@ fn a_schema_version_that_is_not_a_number_is_refused_and_left_as_it_was() {
     let recreated: bool = conn
         .query_row(
             "SELECT count(*) > 0 FROM duckdb_tables() \
-             WHERE table_name = '_quack_session_summaries'",
+             WHERE table_name = '_quack_imports'",
             [],
             |row| row.get(0),
         )

@@ -1,18 +1,21 @@
 //! Recovery hooks on the agent loop: a tool call the model got wrong, a
-//! model turn that came back empty, and an answer that states figures
-//! without having looked at the workspace get another try instead of ending
-//! the turn. Local models do all three.
+//! model turn that came back empty, and an answer that states figures the
+//! workspace did not give it get another try instead of ending the turn.
+//! Local models do all three.
 
 use std::future;
 
 use rig::agent::{
-    AgentHook, HookContext, InvalidToolCallAction, InvalidToolCallContext, InvalidToolCallReason,
-    ModelTurnAction, ModelTurnFinished,
+    AgentHook, DispatchAction, DispatchEvent, HookContext, InvalidToolCallAction,
+    InvalidToolCallContext, InvalidToolCallReason, ModelTurnAction, ModelTurnFinished,
+    OutcomeAction, OutcomeEvent,
 };
 use rig::completion::FinishReason;
 use rig::message::AssistantContent;
 
+use super::grounding;
 use super::policy::Exposure;
+use super::think;
 use super::tools::Turn;
 
 /// How many times one turn asks the model again after an invalid tool call.
@@ -124,72 +127,116 @@ impl EmptyAnswer {
     }
 }
 
-/// An answer that states figures (a number the question does not hold)
-/// while the turn has run no tool and read no document is asked for once
-/// more, with the tools named: small
-/// models answer from memory instead of the workspace and sound just as
-/// sure. A second such answer is accepted, and the turn notes that it does
-/// not come from the workspace ([`Ungrounded::NOTE`]). Registered only in a
-/// workspace that holds tables or documents, on a turn with no history,
-/// since a follow-up may rightly restate figures an earlier turn found.
-#[derive(Clone)]
-pub(crate) struct Ungrounded {
-    turn: Turn,
-    /// The person's question: a number it holds, the answer may repeat.
-    question: String,
-}
+/// A tool call that repeats one the turn already made, the same tool with
+/// the same arguments, is not run again: the model is told its result is
+/// already in the conversation. A small model offered a tool it cannot use
+/// well calls it over and over until the turn limit (the evaluation saw a
+/// 3B model spend all 15 calls on one `search_graph`).
+pub(crate) struct RepeatedCalls;
 
-/// The run's count of ungrounded answers already retried.
-#[derive(Clone, Copy, Default)]
-struct UngroundedRetries(u8);
+/// The calls the run has made, as tool name and canonical arguments.
+#[derive(Clone, Default)]
+struct CallsMade(Vec<(String, String)>);
 
-impl Ungrounded {
-    const RETRIES: u8 = 1;
-    const FEEDBACK: &str = "Your answer states figures, but this turn ran no query and read no \
-                            document, so they do not come from this workspace. Use the tools \
-                            (run_sql for tables, search_documents for documents) and answer from \
-                            what they return. If the workspace does not cover the question, say so.";
-    /// The note an answer that stayed ungrounded carries.
-    pub(crate) const NOTE: &str = "No query ran and no document was read this turn, so this answer \
-                                   does not come from the workspace's data.";
+impl RepeatedCalls {
+    /// The arguments with their keys in one order and no whitespace, so two
+    /// calls that differ only in spelling compare equal.
+    fn canonical(args: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(args)
+            .map_or_else(|_| args.trim().to_owned(), |value| value.to_string())
+    }
 
-    pub(crate) fn new(turn: Turn, question: &str) -> Self {
-        Self {
-            turn,
-            question: question.to_owned(),
+    fn decide(ctx: &HookContext, event: &DispatchEvent<'_>) -> DispatchAction {
+        let (Some(name), Some(args)) = (event.tool_name(), event.tool_args()) else {
+            return DispatchAction::proceed();
+        };
+        let call = (name.to_owned(), Self::canonical(args));
+        let repeated = ctx.scratchpad().update(|CallsMade(made): &mut CallsMade| {
+            if made.contains(&call) {
+                true
+            } else {
+                made.push(call.clone());
+                false
+            }
+        });
+        if repeated {
+            tracing::warn!(
+                tool = name,
+                "the model repeated a tool call; not running it again"
+            );
+            DispatchAction::skip(format!(
+                "You already called {name} with these exact arguments this turn; its result is \
+                 above. Answer from it, or call a tool with different arguments."
+            ))
+        } else {
+            DispatchAction::proceed()
         }
     }
+}
 
-    /// Whether `text` states figures the question does not hold while the
-    /// turn has not looked at the workspace: no tool ran, and
-    /// `always_retrieve` put no document text in the prompt.
-    pub(crate) fn applies(&self, text: &str) -> bool {
-        let given: Vec<&str> = numbers(&self.question).collect();
-        numbers(text).any(|n| !given.contains(&n))
-            && self.turn.recorder.steps().is_empty()
-            && self.turn.exposure() != Exposure::Documents
+impl AgentHook for RepeatedCalls {
+    fn on_dispatch(
+        &self,
+        ctx: &HookContext,
+        event: DispatchEvent<'_>,
+    ) -> impl Future<Output = DispatchAction> + Send {
+        future::ready(Self::decide(ctx, &event))
+    }
+}
+
+/// Every figure an answer states must be one the turn showed the model
+/// (`grounding`): `DuckDB` provides the answers, and the model only writes the
+/// SQL and the tool calls that fetch them. The hook records every tool
+/// result as the model receives it, and a final answer (text, no tool call)
+/// stating a figure nothing the turn showed holds is asked for once more,
+/// with those figures named. A second such answer is not shown: the turn
+/// answers with the query results instead (`grounding::fallback`).
+/// Registered in a workspace that holds tables or documents.
+pub(crate) struct Unsourced {
+    turn: Turn,
+}
+
+/// The run's count of answers already asked for again.
+#[derive(Clone, Copy, Default)]
+struct UnsourcedRetries(u8);
+
+impl Unsourced {
+    const RETRIES: u8 = 1;
+
+    pub(crate) const fn new(turn: Turn) -> Self {
+        Self { turn }
     }
 
-    /// A final answer (text, no tool call) that states figures unseen.
-    fn is_ungrounded(&self, event: &ModelTurnFinished<'_>) -> bool {
+    /// Whether the turn has looked at the workspace: a tool ran, or
+    /// `always_retrieve` put document text in the prompt.
+    fn looked(&self) -> bool {
+        !self.turn.recorder.steps().is_empty() || self.turn.exposure() == Exposure::Documents
+    }
+
+    /// A final answer's text; `None` for a turn that calls a tool.
+    fn final_text(event: &ModelTurnFinished<'_>) -> Option<String> {
         let mut text = String::new();
         for part in event.content {
             match part {
                 AssistantContent::Text(part) => text.push_str(&part.text),
-                AssistantContent::ToolCall(_) => return false,
+                AssistantContent::ToolCall(_) => return None,
                 _ => {}
             }
         }
-        self.applies(&text)
+        Some(text)
     }
 
     fn decide(&self, ctx: &HookContext, event: &ModelTurnFinished<'_>) -> ModelTurnAction {
-        if !self.is_ungrounded(event) {
+        let Some(text) = Self::final_text(event) else {
+            return ModelTurnAction::continue_run();
+        };
+        let unsourced = self.turn.unsourced(&think::strip(&text));
+        if unsourced.is_empty() {
             return ModelTurnAction::continue_run();
         }
         let retry = ctx
             .scratchpad()
-            .update(|UngroundedRetries(spent): &mut UngroundedRetries| {
+            .update(|UnsourcedRetries(spent): &mut UnsourcedRetries| {
                 let retry = *spent < Self::RETRIES;
                 if retry {
                     *spent = spent.saturating_add(1);
@@ -197,27 +244,42 @@ impl Ungrounded {
                 retry
             });
         if retry {
-            tracing::warn!("the model answered with figures without using a tool; asking again");
-            ModelTurnAction::retry_with_feedback(Self::FEEDBACK)
+            tracing::warn!(
+                ?unsourced,
+                "the answer states figures no result holds; asking again"
+            );
+            ModelTurnAction::retry_with_feedback(grounding::feedback(&unsourced, self.looked()))
         } else {
             ModelTurnAction::continue_run()
         }
     }
 }
 
-/// The runs of digits in `text`.
-fn numbers(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|c: char| !c.is_ascii_digit())
-        .filter(|run| !run.is_empty())
-}
-
-impl AgentHook for Ungrounded {
+impl AgentHook for Unsourced {
     fn on_model_turn_finished(
         &self,
         ctx: &HookContext,
         event: ModelTurnFinished<'_>,
     ) -> impl Future<Output = ModelTurnAction> + Send {
         future::ready(self.decide(ctx, &event))
+    }
+
+    /// Record what each tool returned, as the model reads it.
+    fn on_outcome(
+        &self,
+        _ctx: &HookContext,
+        event: OutcomeEvent<'_>,
+    ) -> impl Future<Output = OutcomeAction> + Send {
+        if let Some(result) = event.tool_result() {
+            let output = result.output();
+            match output.as_text() {
+                Some(text) => self.turn.saw(text),
+                None => self
+                    .turn
+                    .saw(&serde_json::to_string(output).unwrap_or_default()),
+            }
+        }
+        future::ready(OutcomeAction::Proceed)
     }
 }
 

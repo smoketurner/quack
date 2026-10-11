@@ -3400,11 +3400,9 @@ async fn deleting_an_image_document_removes_its_image() {
     );
     std::fs::create_dir_all(image.path().parent().unwrap()).unwrap();
     std::fs::write(image.path(), b"png").unwrap();
-    assert!(db.has_images().unwrap());
 
     assert!(db.delete_document(&id).unwrap());
     assert!(!image.path().exists());
-    assert!(!db.has_images().unwrap());
 }
 
 /// `tiny_xlsx` with one more sheet part of `megabytes` of spaces: a few

@@ -1,13 +1,11 @@
 use super::*;
 use crate::analysis::events;
-use crate::analysis::rerank::{RerankOutcome, Reranked, Reranker, apply};
 use crate::config::BedrockConfig;
 use crate::embedding::Dimension;
-use crate::ids::{ChunkId, ClassId, DocumentId, RelationId};
-use crate::ingestion::parser::SectionKind;
+use crate::ids::{ClassId, RelationId};
 use crate::jobs::JobQueue;
 use crate::ontology::Relation;
-use crate::storage::workspace::{ChunkSearchResult, Ranks, WorkspaceDb};
+use crate::storage::workspace::WorkspaceDb;
 use crate::storage::writer::Writer;
 
 fn parse(toml_text: &str) -> Config {
@@ -126,9 +124,19 @@ async fn graph_extraction_sends_the_ontology_schema() {
     .await;
 }
 
+/// A small answer shape for the wire tests.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct Small {
+    #[expect(
+        dead_code,
+        reason = "the schema is what the tests send; no answer is read"
+    )]
+    order: Vec<u16>,
+}
+
 /// A small schema the wire tests send.
 fn test_schema() -> Schema {
-    schema_for!(RerankAnswer)
+    schema_for!(Small)
 }
 
 /// One request's head and body, read off a loopback socket that
@@ -179,89 +187,6 @@ async fn capture_one() -> (String, tokio::task::JoinHandle<String>) {
         String::from_utf8_lossy(&read).to_string()
     });
     (format!("http://{addr}"), seen)
-}
-
-fn rerank_hit(n: u32) -> ChunkSearchResult {
-    ChunkSearchResult {
-        id: ChunkId::from(format!("c{n}")),
-        content: format!("passage {n}"),
-        document_id: DocumentId::from("d"),
-        chunk_index: n,
-        filename: String::from("f.md"),
-        heading: None,
-        page: None,
-        score: 1.0,
-        kind: SectionKind::Body,
-        locator: None,
-        ingested_at: jiff::civil::DateTime::constant(2026, 10, 5, 0, 0, 0, 0),
-        ranks: Ranks::default(),
-    }
-}
-
-/// The model reranker is a background call: like graph extraction, the
-/// ontology document pass, and history summaries, it runs at
-/// `[analysis].background_effort`, never the chat turn's `effort`. Built
-/// through `ChatClient::schema_call` (the same route its siblings take),
-/// so the divergent `background_effort` reaches the rerank request.
-#[tokio::test]
-async fn the_model_reranker_uses_background_effort_not_turn_effort() {
-    Egress::scope(Some(Egress::NoWorkspace), async {
-        let (root, seen) = capture_one().await;
-        let config = parse(&format!(
-            "[general]\nchat_model = \"p/gpt-5.6-sol\"\n\
-         [analysis]\neffort = \"xhigh\"\nbackground_effort = \"low\"\n\
-         [retrieval]\nrerank = \"model\"\n\
-         [providers.p]\ntype = \"openai\"\napi = \"chat-completions\"\n\
-         auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\nbase_url = \"{root}\"\n"
-        ));
-        // Build the rerank one-shot the way `dispatch` does: through
-        // `schema_call`, which builds the model at `background_effort`.
-        let call = {
-            let chat = config
-                .chat_model_ref()
-                .unwrap_or_else(|e| fail(&e.to_string()));
-            let client = ChatClient::build(&config, &chat)
-                .await
-                .unwrap_or_else(|e| fail(&e.to_string()));
-            let settings = config.model_settings(chat);
-            client
-                .schema_call::<RerankAnswer>(
-                    chat.model,
-                    settings,
-                    Task {
-                        preamble: RERANK_PROMPT,
-                        timeout: RERANK_TIMEOUT,
-                        label: "rerank",
-                    },
-                    schema_for!(RerankAnswer),
-                )
-                .unwrap_or_else(|e| fail(&e.to_string()))
-        };
-        let reranker = Reranker::model(call);
-        // Two candidates, so `apply` makes the ranking call rather than skip.
-        let Reranked { outcome, .. } = apply(
-            &reranker,
-            "which passage?",
-            vec![rerank_hit(1), rerank_hit(2)],
-            1,
-        )
-        .await;
-        assert!(
-            matches!(&outcome, RerankOutcome::Failed(_)),
-            "the reranker must have made its call: {outcome:?}"
-        );
-        let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
-        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
-        assert!(
-            body.contains(r#""reasoning_effort":"low""#),
-            "the rerank call must use background_effort (\"low\"), not the turn effort: {request}"
-        );
-        assert!(
-            !body.contains("xhigh"),
-            "the turn effort leaked into the rerank call: {request}"
-        );
-    })
-    .await;
 }
 
 /// A loopback Ollama that answers every request with `stream`, an
@@ -653,6 +578,55 @@ async fn background_calls_carry_store_and_no_ollama_load() {
             }
             for field in unsent {
                 assert!(!request.contains(field), "{provider}: {field} in {request}");
+            }
+        }
+    })
+    .await;
+}
+
+/// Every request carries the fixed seed where the API takes one, so a
+/// question asked again samples the same answer; Anthropic's takes none,
+/// and is sent none. Ollama is given an output cap, so a model repeating
+/// itself stops.
+#[tokio::test]
+async fn requests_carry_the_seed_where_the_api_takes_one() {
+    Egress::scope(Some(Egress::NoWorkspace), async {
+        let keyed = "auth = \"api-key\"\napi_key_env = \"CARGO_PKG_NAME\"\n";
+        for (provider, model, sent, unsent) in [
+            (
+                "type = \"ollama\"\n",
+                "qwen2.5:3b",
+                vec![r#""seed":7"#, r#""num_predict":8192"#],
+                vec![],
+            ),
+            (
+                "type = \"openai\"\napi = \"chat-completions\"\n",
+                "corp-model",
+                vec![r#""seed":7"#],
+                vec![],
+            ),
+            (
+                "type = \"anthropic\"\n",
+                "claude-opus-5-5",
+                vec![],
+                vec![r#""seed""#],
+            ),
+        ] {
+            let (root, seen) = capture_one().await;
+            let auth = if provider.contains("ollama") { "" } else { keyed };
+            let config = parse(&format!(
+                "[general]\nchat_model = \"p/{model}\"\n[providers.p]\n{provider}{auth}base_url = \"{root}\"\n"
+            ));
+            let extractor = graph_extractor(&config, &Ontology::default())
+                .await
+                .unwrap_or_else(|e| fail(&format!("{model}: {e}")));
+            assert!(extractor.extract("Orgenics ships to Kenya.").await.is_err());
+            let request = seen.await.unwrap_or_else(|e| fail(&e.to_string()));
+            for field in sent {
+                assert!(request.contains(field), "{model}: {field} in {request}");
+            }
+            for field in unsent {
+                assert!(!request.contains(field), "{model}: {field} in {request}");
             }
         }
     })

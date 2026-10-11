@@ -22,7 +22,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 [retrieval]
 top_k = 3
 always_retrieve = true
-rerank = "model"
+rerank = "none"
 "#;
 
 /// `default_workspace` takes only a name a workspace may have.
@@ -141,7 +141,7 @@ fn full_config_parses_and_resolves_models() {
     assert_eq!(embed.model, "nomic-embed-text");
     assert_eq!(config.embedding_dimension().ok(), Some(Dimension::new(768)));
     assert_eq!(config.retrieval.top_k, 3);
-    assert_eq!(config.retrieval.rerank, RerankMode::Model);
+    assert_eq!(config.retrieval.rerank, RerankMode::None);
     let anthropic = config.providers.get("anthropic");
     assert!(anthropic.is_some_and(|p| {
         p.provider_type == ProviderType::Anthropic
@@ -474,7 +474,6 @@ fn a_model_s_settings_override_its_provider_s_then_analysis_key_by_key() {
             temperature: Some(true),
             effort: Some(Effort::Xhigh),
             background_effort: Some(Effort::Low),
-            images: None,
         }
     );
     assert_eq!(
@@ -483,7 +482,6 @@ fn a_model_s_settings_override_its_provider_s_then_analysis_key_by_key() {
             temperature: Some(false),
             effort: Some(Effort::High),
             background_effort: None,
-            images: None,
         }
     );
     assert_eq!(

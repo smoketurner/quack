@@ -23,7 +23,7 @@ use quack_core::llm::egress::Egress;
 use crate::text_or_json::TextOrJson;
 
 /// How long a command that answers one question waits, after printing, for
-/// the session title and history summary its turn started.
+/// the session title its turn started.
 pub const FOLLOW_UP_GRACE: Duration = Duration::from_secs(30);
 
 /// A cancellation token that Ctrl+C trips, for as long as the guard

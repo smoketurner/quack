@@ -241,11 +241,6 @@ id_type!(
 );
 
 id_type!(
-    /// A stored summary of a session's earlier turns.
-    SummaryId
-);
-
-id_type!(
     /// A line typed at the terminal prompt.
     InputLineId
 );

@@ -601,6 +601,21 @@ pub fn status(db: &WorkspaceDb) -> Result<GraphStatus> {
     })
 }
 
+/// Whether `text` names a node of the graph: a label of three or more
+/// characters it contains, ignoring case.
+///
+/// # Errors
+///
+/// Returns an error if the read fails.
+pub fn named_in(db: &WorkspaceDb, text: &str) -> Result<bool> {
+    Ok(db.connection().query_row(
+        "SELECT EXISTS (SELECT 1 FROM _quack_graph_nodes \
+         WHERE length(label) >= 3 AND strpos(lower(?), lower(label)) > 0)",
+        duckdb::params![text],
+        |row| row.get(0),
+    )?)
+}
+
 /// Node and edge counts with the [`summary`]: the status a turn reads,
 /// without [`status`]'s mapped-table hashes and unextracted-chunk count.
 ///

@@ -37,6 +37,17 @@ use crate::error::{Error, Result};
 /// is sized for a streamed turn rather than for the answer text alone.
 pub const CLAUDE_MAX_TOKENS: u64 = 64_000;
 
+/// The most an Ollama model may write in one call (`num_predict`). Unset,
+/// Ollama generates until the context fills and then shifts it to go on, so
+/// a small model that falls into repeating itself writes for as long as it
+/// is let (the evaluation saw 14,640 tokens over 51 minutes on one call).
+/// An answer, a tool call, or a reasoning trace fits well within it.
+pub const OLLAMA_MAX_TOKENS: u64 = 8_192;
+
+/// The sampling seed every request is sent where the API takes one, so the
+/// same question over the same data samples the same answer.
+pub const SEED: u64 = 7;
+
 /// The API a chat model is called through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wire {
@@ -139,6 +150,9 @@ pub struct ChatSettings {
     max_tokens: Option<u64>,
     /// The configured effort, sent as rig's typed reasoning option.
     effort: Option<Effort>,
+    /// Whether [`SEED`] is sent: only where the API takes a seed, which
+    /// [`ChatModel::new`] asks rig.
+    seed: bool,
 }
 
 impl ChatSettings {
@@ -151,10 +165,15 @@ impl ChatSettings {
         Self {
             wire,
             temperature: temperature.unwrap_or(wire == Wire::Ollama),
-            max_tokens: base_id(model)
-                .starts_with("claude-")
-                .then_some(CLAUDE_MAX_TOKENS),
+            max_tokens: if base_id(model).starts_with("claude-") {
+                Some(CLAUDE_MAX_TOKENS)
+            } else if wire == Wire::Ollama {
+                Some(OLLAMA_MAX_TOKENS)
+            } else {
+                None
+            },
             effort,
+            seed: false,
         }
     }
 }
@@ -172,6 +191,9 @@ impl std::fmt::Display for ChatSettings {
         }?;
         if let Some(max_tokens) = self.max_tokens {
             write!(f, ", max_tokens {max_tokens}")?;
+        }
+        if self.seed {
+            write!(f, ", seed {SEED}")?;
         }
         Ok(())
     }
@@ -197,7 +219,8 @@ impl ChatModel {
         W: rig::wire::Wire<Op = Completion>,
         T: Transport<W>,
     {
-        if let (Some(effort), Some(target)) = (settings.effort, model.wire.describe().replay) {
+        let replay = model.wire.describe().replay;
+        if let (Some(effort), Some(target)) = (settings.effort, replay) {
             let mut probe = CompletionRequest::new(Message::user("")).reasoning(effort);
             options::check(target, &mut probe).map_err(|e| {
                 let why = e
@@ -206,9 +229,15 @@ impl ChatModel {
                 Error::Config(format!("effort \"{effort}\" for {id}: {why}"))
             })?;
         }
+        // A seed goes only where rig says the API takes one (Anthropic's
+        // does not); sending it elsewhere would fail every request.
+        let seed = replay.is_some_and(|target| {
+            let mut probe = CompletionRequest::new(Message::user("")).seed(SEED);
+            options::check(target, &mut probe).is_ok()
+        });
         Ok(Self {
             model: model.erase(),
-            settings,
+            settings: ChatSettings { seed, ..settings },
         })
     }
 
@@ -227,6 +256,7 @@ impl ChatModel {
             temperature: sends_temperature,
             max_tokens,
             effort,
+            seed,
         } = self.settings;
         let mut agent = AgentBuilder::new(self.model);
         if sends_temperature {
@@ -237,6 +267,9 @@ impl ChatModel {
         }
         if let Some(effort) = effort {
             agent = agent.reasoning(effort);
+        }
+        if seed {
+            agent = agent.seed(SEED);
         }
         if wire == Wire::Responses {
             // Neither Bedrock nor `OpenAI` keeps a copy of the conversation
@@ -261,6 +294,7 @@ impl From<DynModel<Completion>> for ChatModel {
                 temperature: true,
                 max_tokens: None,
                 effort: None,
+                seed: false,
             },
         }
     }
@@ -329,7 +363,7 @@ mod tests {
         );
         assert_eq!(
             settings("llama3.1:8b", Wire::Ollama).to_string(),
-            "sends temperature, no reasoning effort"
+            "sends temperature, no reasoning effort, max_tokens 8192"
         );
     }
 

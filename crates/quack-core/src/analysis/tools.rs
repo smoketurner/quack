@@ -27,8 +27,9 @@ use crate::storage::writer::Writer;
 use super::chart::{ChartKind, ChartSpec, SeriesColumns};
 use super::citations::{ChunkLocation, Markers};
 use super::events::{DetailPreview, ToolName, TurnRecorder};
+use super::grounding::Sources;
 use super::policy::{Exposure, Hold, RefusalFlag, WriteDecision, WritePolicy};
-use super::rerank::{RerankAnswer, Reranker};
+use super::rerank::Reranker;
 use super::search::{DocumentScope, DocumentSearch, SearchOutcome, SearchVectors};
 use super::table_search::{TableCards, user_tables};
 use super::text_to_sql::{ColumnLine, Modeled};
@@ -37,8 +38,7 @@ use crate::embedding::{Embedder, EmbeddingModel, Input, Vector};
 use crate::error::Error;
 use crate::graph::views::ClassView;
 use crate::ingestion::parser::PageCounts;
-use crate::llm::vision::ImageReader;
-use crate::llm::{RerankModel, SchemaCall};
+use crate::llm::RerankModel;
 use crate::ontology::{ClassRelations, Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
 use crate::text::{Fenced, NonBlankText, OneLine, Tokens};
@@ -334,6 +334,9 @@ pub struct Turn {
     scope: DocumentScope,
     /// Stops the turn; a long tool call ends with it.
     cancel: CancellationToken,
+    /// The numbers the turn's searches and queries have shown the model,
+    /// which every figure of its answer must come from (`grounding`).
+    sources: Arc<Mutex<Sources>>,
 }
 
 impl Turn {
@@ -349,7 +352,25 @@ impl Turn {
             shapes: Arc::new(Mutex::new(Vec::new())),
             scope: DocumentScope::default(),
             cancel: CancellationToken::new(),
+            sources: Arc::new(Mutex::new(Sources::default())),
         }
+    }
+
+    /// Take the numbers in `text`, which the model has been shown: a tool
+    /// result, a passage put in the prompt, the question.
+    pub(crate) fn saw(&self, text: &str) {
+        self.sources
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .saw(text);
+    }
+
+    /// The figures of `answer` that nothing the turn showed the model holds.
+    pub(crate) fn unsourced(&self, answer: &str) -> Vec<String> {
+        self.sources
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .unsourced(answer)
     }
 
     /// The token that stops the turn.
@@ -889,29 +910,19 @@ impl<M> SearchDocumentsTool<M> {
         }
     }
 
-    /// The tool as `[retrieval]` configures it: the chat model as reranker
-    /// when `rerank = "model"` (`reranker_call`, already built with
-    /// `background_effort`), `rerank_model` when `rerank = "reranker"`.
+    /// The tool as `[retrieval]` configures it: `rerank_model` orders the
+    /// candidates when `rerank = "reranker"`.
     pub fn from_config(
         db: ReaderDb,
-        reranker_call: Option<SchemaCall<RerankAnswer>>,
         rerank_model: Option<RerankModel>,
         embedding_model: Option<Embedder<M>>,
         retrieval: &RetrievalConfig,
     ) -> Self {
         let search = Self::new(db, embedding_model, retrieval);
-        let reranker = match (retrieval.rerank, reranker_call, rerank_model) {
-            (RerankMode::None, _, _) => return search,
-            (RerankMode::Model, Some(call), _) => Arc::new(Reranker::model(call)),
-            (RerankMode::Model, None, _) => {
-                tracing::warn!(
-                    "rerank = \"model\" but the background call was not built; keeping the fused \
-                     order"
-                );
-                return search;
-            }
-            (RerankMode::Reranker, _, Some(model)) => Arc::new(Reranker::scored(model)),
-            (RerankMode::Reranker, _, None) => {
+        let reranker = match (retrieval.rerank, rerank_model) {
+            (RerankMode::None, _) => return search,
+            (RerankMode::Reranker, Some(model)) => Arc::new(Reranker::scored(model)),
+            (RerankMode::Reranker, None) => {
                 tracing::warn!(
                     "rerank = \"reranker\" without a rerank model; keeping the fused order"
                 );
@@ -1288,124 +1299,6 @@ impl Tool for ReadDocumentTool {
             .map_err(format_failed)?;
         }
         Ok(out)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// view_image
-// ---------------------------------------------------------------------------
-
-/// Looks at an image document again for one question: the stored image and
-/// the question go to the chat model, which reads images. Registered only
-/// when the chat model is marked `images = true` and a ready document is
-/// an image.
-pub struct ViewImageTool {
-    db: ReaderDb,
-    reader: Arc<ImageReader>,
-}
-
-impl ViewImageTool {
-    #[must_use]
-    pub fn new(db: ReaderDb, reader: ImageReader) -> Self {
-        Self {
-            db,
-            reader: Arc::new(reader),
-        }
-    }
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct ViewImageArgs {
-    /// The image document: an id from `list_documents` (a prefix is enough),
-    /// its exact file name, or its exact title
-    pub document: String,
-    /// What to find out from the image, as a full question
-    pub question: String,
-}
-
-impl Tool for ViewImageTool {
-    const NAME: &'static str = ToolName::ViewImage.as_str();
-    type Error = ToolExecutionError;
-    type Args = ViewImageArgs;
-    type Output = String;
-
-    fn description(&self) -> String {
-        String::from(
-            "Look at an image document (a PNG, JPEG, WebP, or GIF the workspace holds) to answer \
-             a question its stored description does not: a value in a chart, a label, a \
-             detail. Returns what the image shows, citable as [n] like a document chunk.",
-        )
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        ViewImageArgs::schema()
-    }
-
-    async fn call(
-        &self,
-        context: &mut ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        let turn = Turn::of(context)?;
-        let step = turn.recorder.start(
-            ToolName::ViewImage,
-            &format!("{}: {}", args.document, args.question),
-        );
-        let wanted = args.document;
-        let within = turn.scope().clone();
-        let found = self
-            .db
-            .with_db(move |db| {
-                let document = db.find_document(&wanted)?;
-                within.narrow(vec![document.id.clone()])?;
-                if document.status != DocumentStatus::Ready {
-                    return Err(Error::Analysis(format!(
-                        "{} is {}, not ready, so it cannot be viewed",
-                        OneLine(&document.filename),
-                        document.status
-                    )));
-                }
-                let Some(image) = db.stored_image(&document) else {
-                    return Err(Error::Analysis(format!(
-                        "{} is not an image; read_document reads its text",
-                        OneLine(&document.filename)
-                    )));
-                };
-                let chunks = db.document_chunks(&document.id, 0, 1)?;
-                Ok((document, image, chunks))
-            })
-            .await;
-        let (document, image, chunks) = match found {
-            Ok(found) => found,
-            Err(e) => return Err(step.fail(e.into())),
-        };
-        let answer = match image.read().await {
-            Ok(bytes) => {
-                self.reader
-                    .read(&bytes, image.format(), &args.question)
-                    .await
-            }
-            Err(e) => Err(e),
-        };
-        let answer = match answer {
-            Ok(answer) => answer,
-            Err(e) => return Err(step.fail(e.into())),
-        };
-        step.finish(format!("{} characters", answer.chars().count()));
-        // What the image shows can carry instructions like any document.
-        turn.read_documents();
-        let markers = turn.cite(&chunks);
-        let label = if chunks.is_empty() {
-            String::new()
-        } else {
-            format!("[{}] ", markers.nth(0))
-        };
-        Ok(format!(
-            "What {label}{} shows, as the chat model read it. Cite it with its marker. {}\n{}\n",
-            OneLine(&document.filename),
-            Fenced::NOTICE,
-            Fenced(&answer)
-        ))
     }
 }
 

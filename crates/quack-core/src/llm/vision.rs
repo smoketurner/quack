@@ -1,6 +1,7 @@
 //! A model that reads an image: `[ingestion].vision_model` describing an
-//! uploaded picture at ingest, and a chat model marked `images = true` answering a question about one in a turn
-//! (`view_image`). Each call is one tool-less request through the provider's
+//! uploaded picture, a scanned page, or a figure at ingest, so what it reads
+//! is stored as chunks and searched and cited like any text. Each call is
+//! one tool-less request through the provider's
 //! client, so it takes the provider's permit, keeps to the workspace's
 //! allowed providers, and is retried like any other.
 
@@ -10,7 +11,7 @@ use base64::Engine as _;
 use rig::message::{ImageMediaType, Message, UserContent};
 
 use super::{ChatClient, PlainCall, Task};
-use crate::config::{Config, ModelSettings};
+use crate::config::Config;
 use crate::error::Result;
 use crate::ingestion::parser::ImageFormat;
 
@@ -22,11 +23,6 @@ const DESCRIBE_PROMPT: &str = "You read an image so it can be searched and cited
      diagram, a scan, a screenshot), its subject, and any numbers, labels, axes, or \
      relationships it conveys. Write plain Markdown with no preamble. If the image holds no \
      text, say so in one line and describe it.";
-
-/// What a question about an image in a turn is answered from.
-const LOOK_PROMPT: &str = "You answer a question about one image for a data analysis \
-     assistant. Answer from what the image shows, quoting its text exactly where it matters, \
-     and say plainly when the image does not show what is asked.";
 
 /// How long one image call may run.
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -60,61 +56,6 @@ impl ImageReader {
                 label: "image reading",
             },
         ))))
-    }
-
-    /// The turn's chat model on `client`, when `images = true` marks it
-    /// as one that reads images, for questions about one in a turn; `None`
-    /// otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the model cannot be built on `client`.
-    pub(crate) fn for_turn(
-        client: &ChatClient,
-        model: &str,
-        settings: ModelSettings,
-    ) -> Result<Option<Self>> {
-        if settings.images != Some(true) {
-            return Ok(None);
-        }
-        let chat = client.chat_model(model, settings.effort, settings.temperature)?;
-        Ok(Some(Self(PlainCall::new(
-            chat,
-            Task {
-                preamble: LOOK_PROMPT,
-                timeout: IMAGE_TIMEOUT,
-                label: "image question",
-            },
-        ))))
-    }
-
-    /// The vision model `[ingestion].vision_model` names, for questions
-    /// about an image in a turn whose chat model does not read images; at
-    /// background effort, as at ingest, where it is known to answer.
-    /// `None` when none is configured, or it cannot be built here (a
-    /// provider the workspace may not use): the turn goes without
-    /// `view_image` rather than failing.
-    pub(crate) async fn for_turn_by_vision_model(config: &Config) -> Option<Self> {
-        let model = config.vision_model_ref().ok()??;
-        let settings = config.model_settings(model);
-        let chat = async {
-            ChatClient::build(config, &model).await?.chat_model(
-                model.model,
-                settings.background_effort,
-                settings.temperature,
-            )
-        }
-        .await
-        .inspect_err(|e| tracing::warn!(error = %e, "the turn runs without view_image"))
-        .ok()?;
-        Some(Self(PlainCall::new(
-            chat,
-            Task {
-                preamble: LOOK_PROMPT,
-                timeout: IMAGE_TIMEOUT,
-                label: "image question",
-            },
-        )))
     }
 
     /// The model's answer about `image`, given `instruction` beside it.

@@ -152,17 +152,6 @@ const SAVED_IMPORTS_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_imports (
     last_error TEXT
 );";
 
-/// Summaries of the turns a session's history window leaves out
-/// (`[analysis].compact_history`), each with how many replayable messages,
-/// oldest first, it covers.
-const SESSION_SUMMARIES_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_session_summaries (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    covers INTEGER NOT NULL,
-    summary TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT now()
-);";
-
 /// Schema version of the internal tables, recorded in `_quack_meta`: the
 /// newest step above.
 const WORKSPACE_SCHEMA_VERSION: u32 = CLASSIFICATIONS;
@@ -1591,7 +1580,10 @@ impl WorkspaceDb {
         );
         self.conn.execute_batch(DOCUMENTS_DDL)?;
         self.conn.execute_batch(&sql)?;
-        self.conn.execute_batch(SESSION_SUMMARIES_DDL)?;
+        // Session summaries are no longer written or replayed; an older
+        // file's are dropped.
+        self.conn
+            .execute_batch("DROP TABLE IF EXISTS _quack_session_summaries")?;
         self.conn.execute_batch(input_history::DDL)?;
         self.conn.execute_batch(SAVED_IMPORTS_DDL)?;
         self.conn.execute_batch(classify::DDL)?;
@@ -2667,20 +2659,6 @@ impl WorkspaceDb {
             "removed graph rows that only the deleted document supported"
         );
         Ok(())
-    }
-
-    /// Whether a ready document is an image, which `view_image` can look at.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the query fails.
-    pub fn has_images(&self) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM _quack_documents \
-             WHERE status = ? AND mime_type LIKE 'image/%')",
-            duckdb::params![DocumentStatus::Ready],
-            |row| row.get(0),
-        )?)
     }
 
     /// The image `document` keeps in the workspace's `files/`, when it is

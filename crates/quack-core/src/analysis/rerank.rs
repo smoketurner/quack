@@ -1,22 +1,18 @@
 //! Reranking hook for retrieval: hybrid search over-fetches candidates,
 //! a [`Reranker`] orders them by relevance to the query, and the top `k`
-//! go to the model. The hook is a no-op unless `[retrieval].rerank` names
-//! one: `model`, the chat model ranking the candidates listwise, which an
-//! air-gapped setup already runs; or `reranker`, a dedicated rerank model
-//! (a cross-encoder) scoring each candidate through rig's `Rerank`
-//! operation.
+//! go to the model. The hook is a no-op unless `[retrieval].rerank =
+//! "reranker"` names a dedicated rerank model (a cross-encoder), which scores
+//! each candidate through rig's `Rerank` operation. The chat model never
+//! orders retrieval: what is retrieved is decided by scores, not by it.
 
 use rig::operation::RerankRequest;
-use schemars::JsonSchema;
-use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::llm::{RerankModel, SchemaCall};
+use crate::llm::RerankModel;
 use crate::storage::workspace::{ChunkSearchResult, Ranks};
 
 /// One candidate's place in a reranker's answer: its index among the
-/// candidates, and the score that put it there when the reranker gives one
-/// (a rerank model does; the chat model only orders).
+/// candidates, and the score that put it there.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ranked {
     pub index: usize,
@@ -33,8 +29,6 @@ impl Ranked {
 
 /// Orders retrieval candidates by relevance to a query.
 pub enum Reranker {
-    /// The chat model orders them listwise.
-    Model(Box<ModelReranker>),
     /// A dedicated rerank model scores each one.
     Scored(ScoredReranker),
     /// A fixed order, named for the step summary.
@@ -46,13 +40,6 @@ pub enum Reranker {
 }
 
 impl Reranker {
-    /// The chat model, through the rerank one-shot built with
-    /// `background_effort` ([`ModelReranker`]).
-    #[must_use]
-    pub fn model(call: SchemaCall<RerankAnswer>) -> Self {
-        Self::Model(Box::new(ModelReranker { call }))
-    }
-
     /// A dedicated rerank model.
     #[must_use]
     pub const fn scored(model: RerankModel) -> Self {
@@ -64,17 +51,15 @@ impl Reranker {
     /// range or repeated are ignored.
     async fn rank(&self, query: &str, candidates: &[ChunkSearchResult]) -> Result<Vec<Ranked>> {
         match self {
-            Self::Model(reranker) => reranker.rank(query, candidates).await,
             Self::Scored(reranker) => reranker.rank(query, candidates).await,
             #[cfg(test)]
             Self::Fixed { rank, .. } => rank(candidates),
         }
     }
 
-    /// A short name for the tool step summary (`reranked by model`).
+    /// A short name for the tool step summary (`reranked by reranker`).
     const fn name(&self) -> &'static str {
         match self {
-            Self::Model(_) => "model",
             Self::Scored(_) => "reranker",
             #[cfg(test)]
             Self::Fixed { name, .. } => name,
@@ -177,78 +162,8 @@ fn reorder(candidates: Vec<ChunkSearchResult>, order: &[Ranked]) -> Vec<ChunkSea
     out
 }
 
-/// Preamble for the chat model as a listwise reranker.
-pub const RERANK_PROMPT: &str = "You rank passages by how well they answer a question. \
-    You will get the question and numbered passages. Answer with the passage numbers in \
-    `order`, most relevant first, leaving out passages that do not help answer the question.";
-
-/// The chat model's ranking: passage numbers, 1-based, best first.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
-#[schemars(title = "rerank")]
-pub struct RerankAnswer {
-    pub order: Vec<u16>,
-}
-
-impl RerankAnswer {
-    /// The order as 0-based indices below `len`; numbers out of range are
-    /// dropped.
-    fn indices(&self, len: usize) -> Vec<Ranked> {
-        self.order
-            .iter()
-            .map(|&n| usize::from(n))
-            .filter(|&n| n >= 1 && n <= len)
-            .map(|n| Ranked::at(n.saturating_sub(1)))
-            .collect()
-    }
-}
-
-/// Characters of each passage shown to the ranking model.
-pub const PASSAGE_CHARS: usize = 1200;
-
 /// How long one ranking call may take.
 pub const RERANK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// The chat model as a listwise reranker: one tool-less call with the
-/// query and numbered passages, answered with the passage numbers in
-/// order.
-///
-/// Built from a [`SchemaCall`] the turn already routed through
-/// `ChatClient::schema_call`, so its reasoning effort is
-/// `[analysis].background_effort` — the same background effort graph
-/// extraction, the ontology document pass, and history summaries use —
-/// not the chat turn's `[analysis].effort`.
-pub struct ModelReranker {
-    call: SchemaCall<RerankAnswer>,
-}
-
-/// The `SchemaCall` owns its model (its effort set once, at construction), so the
-/// caller hands one built through `schema_call` rather than the turn's
-/// model, or the rerank call inherits the turn's `effort`.
-impl ModelReranker {
-    /// The user message for one ranking call: the query and numbered
-    /// passages, each cut to `max_chars`.
-    fn request(query: &str, candidates: &[ChunkSearchResult], max_chars: usize) -> String {
-        let mut text = format!("Question: {query}\n\nPassages:\n");
-        for (i, chunk) in candidates.iter().enumerate() {
-            let body: String = chunk.content.trim().chars().take(max_chars).collect();
-            let n = i.saturating_add(1);
-            text.push('[');
-            text.push_str(&n.to_string());
-            text.push_str("] ");
-            text.push_str(&body);
-            text.push_str("\n\n");
-        }
-        text
-    }
-}
-
-impl ModelReranker {
-    async fn rank(&self, query: &str, candidates: &[ChunkSearchResult]) -> Result<Vec<Ranked>> {
-        let request = Self::request(query, candidates, PASSAGE_CHARS);
-        let answer = self.call.answer(&request).await?;
-        Ok(answer.indices(candidates.len()))
-    }
-}
 
 /// A dedicated rerank model: one `/rerank` call scores every candidate
 /// against the query, and the order is the scores', best first.
@@ -288,7 +203,6 @@ mod tests {
     use crate::ids::{ChunkId, DocumentId};
     use crate::ingestion::parser::SectionKind;
     use crate::llm::egress::Egress;
-    use schemars::schema_for;
 
     fn hit(n: u32) -> ChunkSearchResult {
         ChunkSearchResult {
@@ -441,28 +355,5 @@ mod tests {
         assert_eq!(ids, ["c3", "c1", "c2", "c4"]);
         let places: Vec<Option<u32>> = out.iter().map(|c| c.ranks.rerank_rank).collect();
         assert_eq!(places, [Some(1), Some(2), None, None]);
-    }
-
-    #[test]
-    fn the_ranking_is_one_based_and_drops_numbers_out_of_range() {
-        let answer: RerankAnswer =
-            serde_json::from_str(r#"{"order": [3, 1, 7, 0, 2]}"#).unwrap_or_default();
-        assert_eq!(answer.indices(3), [2, 0, 1].map(Ranked::at));
-        assert!(RerankAnswer::default().indices(3).is_empty());
-        assert!(serde_json::from_str::<RerankAnswer>("[1, 2]").is_err());
-        let schema = serde_json::to_string(&schema_for!(RerankAnswer)).unwrap_or_default();
-        assert!(schema.contains("\"order\""), "{schema}");
-    }
-
-    #[test]
-    fn request_numbers_and_truncates_passages() {
-        let long = ChunkSearchResult {
-            content: "x".repeat(50),
-            ..hit(1)
-        };
-        let text = ModelReranker::request("why?", &[long, hit(2)], 10);
-        assert!(text.starts_with("Question: why?"));
-        assert!(text.contains("[1] xxxxxxxxxx\n"));
-        assert!(text.contains("[2] passage 2"));
     }
 }

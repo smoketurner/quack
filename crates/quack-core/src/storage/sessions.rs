@@ -17,7 +17,7 @@ use crate::analysis::events::{ToolName, ToolStep};
 use crate::analysis::search::DocumentScope;
 use crate::error::{Error, Result};
 use crate::graph::GraphResult;
-use crate::ids::{MessageId, SessionId, SummaryId, UserId};
+use crate::ids::{MessageId, SessionId, UserId};
 use crate::storage::control::ResourceKind;
 use crate::text::Tokens;
 use rig::id::ConversationId;
@@ -973,61 +973,6 @@ impl MemoryPolicy for TranscriptWindow {
     }
 }
 
-/// A summary of a session's earliest replayable messages.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredSummary {
-    /// How many of [`session_turns`]' messages, oldest first, it covers.
-    pub covers: usize,
-    pub text: String,
-}
-
-/// The session's newest summary, if one was made: the row with the greatest
-/// `id`, a UUID v7 so ids sort by creation time (`ids.rs`), not the row that
-/// covers the most messages — `covers` is not monotonic once a budget grows
-/// and the compactor re-summarizes from scratch over a smaller prefix.
-///
-/// # Errors
-///
-/// Returns an error if the query fails.
-pub fn latest_summary(db: &WorkspaceDb, session_id: &SessionId) -> Result<Option<StoredSummary>> {
-    let mut stmt = db.connection().prepare(
-        "SELECT covers, summary FROM _quack_session_summaries WHERE session_id = ? \
-         ORDER BY id DESC LIMIT 1",
-    )?;
-    let mut rows = stmt.query(duckdb::params![session_id])?;
-    let Some(row) = rows.next()? else {
-        return Ok(None);
-    };
-    let covers: i64 = row.get(0)?;
-    Ok(Some(StoredSummary {
-        covers: usize::try_from(covers).unwrap_or_default(),
-        text: row.get(1)?,
-    }))
-}
-
-/// Keep a new summary of the session's first `covers` replayable messages.
-///
-/// # Errors
-///
-/// Returns an error if the insert fails.
-pub fn save_summary(
-    db: &WorkspaceDb,
-    session_id: &SessionId,
-    covers: usize,
-    text: &str,
-) -> Result<()> {
-    db.connection().execute(
-        "INSERT INTO _quack_session_summaries (id, session_id, covers, summary) VALUES (?, ?, ?, ?)",
-        duckdb::params![
-            SummaryId::generate(),
-            session_id,
-            i64::try_from(covers).unwrap_or(i64::MAX),
-            text
-        ],
-    )?;
-    Ok(())
-}
-
 /// How a session is exported.
 #[derive(
     Debug,
@@ -1163,10 +1108,6 @@ pub fn delete_session(db: &WorkspaceDb, session_id: &SessionId) -> Result<bool> 
     }
     db.connection().execute(
         "DELETE FROM _quack_messages WHERE session_id = ?",
-        duckdb::params![session_id],
-    )?;
-    db.connection().execute(
-        "DELETE FROM _quack_session_summaries WHERE session_id = ?",
         duckdb::params![session_id],
     )?;
     db.connection().execute(

@@ -181,6 +181,24 @@ impl Modeled {
         }
     }
 
+    /// What a turn asking `question` is offered: the graph tools only
+    /// when the question names something the graph holds, since a small
+    /// model offered tools it has no use for calls them anyway, and a
+    /// question about a table's figures is answered by SQL. Without a
+    /// question, everything modeled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the graph cannot be read.
+    pub fn for_question(self, db: &WorkspaceDb, question: Option<&str>) -> Result<Self> {
+        Ok(match (self, question) {
+            (Self::Graph, Some(question)) if !graph_store::named_in(db, question)? => {
+                Self::Ontology
+            }
+            (modeled, _) => modeled,
+        })
+    }
+
     #[must_use]
     pub fn has_ontology(self) -> bool {
         match self {
@@ -247,7 +265,8 @@ impl SystemPrompt {
 
         let ontology = ontology_store::current(db)?;
         let graph = graph_store::size(db)?;
-        let modeled = Modeled::of(ontology.as_ref(), &graph);
+        let modeled = Modeled::of(ontology.as_ref(), &graph)
+            .for_question(db, options.question.as_ref().map(|q| q.text.as_str()))?;
         let tables = user_tables(db)?;
         let layout = TableLayout::of(tables.len());
         prompt.tool_guidance(modeled, layout);
@@ -273,7 +292,7 @@ impl SystemPrompt {
             prompt
                 .text
                 .push_str(&ontology.render_capped(PROMPT_ONTOLOGY_ITEMS));
-            if graph.enabled() {
+            if modeled.has_graph() {
                 writeln!(
                     prompt.text,
                     "Knowledge graph: {} nodes, {} edges typed by this ontology{}{}{}. \

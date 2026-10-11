@@ -230,7 +230,7 @@ async fn run_turn_labelling(
         cancel: cancel.clone(),
         labeller,
     };
-    let run = analysis.run(model.clone().erase().into(), None, None, sink);
+    let run = analysis.run(model.clone().erase().into(), sink);
     tokio::pin!(run);
     let mut events = Vec::new();
     let mut asked = Vec::new();
@@ -814,10 +814,11 @@ async fn an_answer_with_figures_and_no_tool_is_asked_for_again() {
     assert!(retry.contains("ran no query and read no"), "{retry}");
 }
 
-/// A second ungrounded answer is accepted, and says it does not come from
-/// the workspace.
+/// A second answer whose figures nothing the turn showed holds is not
+/// shown: with no query run there is nothing to show instead, and the
+/// response names the figures.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_second_ungrounded_answer_carries_the_note() {
+async fn a_second_unsourced_answer_is_not_shown() {
     let db = workspace();
     let model = MockCompletionModel::from_stream_turns([
         turn(vec![text("North fell by 100.")]),
@@ -832,12 +833,70 @@ async fn a_second_ungrounded_answer_carries_the_note() {
         "which region fell?",
     )
     .await;
-    assert_eq!(
-        ran.answer().content,
-        "North fell by 100, reopening next week.\n\n(No query ran and no document was read \
-         this turn, so this answer does not come from the workspace's data.)"
+    let answer = ran.answer();
+    assert!(!answer.content.contains("reopening"), "{}", answer.content);
+    assert!(
+        answer.content.contains("100 did not come from"),
+        "{}",
+        answer.content
     );
+    assert!(
+        answer.content.contains("No query returned rows"),
+        "{}",
+        answer.content
+    );
+    assert_eq!(answer.unsourced, vec![String::from("100")]);
     assert_eq!(model.request_count(), 2);
+}
+
+/// A figure the query did not return is named back to the model, which
+/// answers again from the result; the corrected answer stands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_figure_the_query_did_not_return_is_asked_about() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![call(
+            "t1",
+            "run_sql",
+            serde_json::json!({"query": "SELECT sum(revenue) AS total FROM sales"}),
+        )]),
+        turn(vec![text("Revenue totals 35.")]),
+        turn(vec![text("Revenue totals 30.")]),
+    ]);
+    let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "total revenue?").await;
+    assert_eq!(ran.answer().content, "Revenue totals 30.");
+    assert!(ran.answer().unsourced.is_empty());
+    let retry = serde_json::to_string(&model.requests()[2].chat_history).unwrap();
+    assert!(
+        retry.contains("do not appear in any query result"),
+        "{retry}"
+    );
+    assert!(retry.contains("35"), "{retry}");
+}
+
+/// An answer that still states a figure no result holds is replaced by
+/// what the query returned, which `DuckDB` computed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_still_unsourced_shows_the_query_result() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![call(
+            "t1",
+            "run_sql",
+            serde_json::json!({"query": "SELECT sum(revenue) AS total FROM sales"}),
+        )]),
+        turn(vec![text("Revenue totals 35.")]),
+        turn(vec![text("Revenue totals about 35.")]),
+    ]);
+    let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "total revenue?").await;
+    let content = &ran.answer().content;
+    assert!(!content.contains("Revenue totals"), "{content}");
+    assert!(
+        content.contains("SELECT sum(revenue) AS total FROM sales"),
+        "{content}"
+    );
+    assert!(content.contains("| total |\n| --- |\n| 30 |"), "{content}");
+    assert_eq!(ran.answer().unsourced, vec![String::from("35")]);
 }
 
 /// Numbers the question holds are the person's, not figures the model

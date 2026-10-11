@@ -36,9 +36,7 @@ impl AfterTurn {
     pub async fn finish(limit: Duration) {
         PENDING.close();
         if tokio::time::timeout(limit, PENDING.wait()).await.is_err() {
-            tracing::warn!(
-                "a session title or history summary was still being written at exit; it is dropped"
-            );
+            tracing::warn!("a session title was still being written at exit; it is dropped");
         }
     }
 }
