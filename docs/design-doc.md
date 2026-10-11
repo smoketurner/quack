@@ -1195,6 +1195,13 @@ converts. The prompt's tables block, `describe_table`, `find_tables`, the Tables
 `_quack_table_notes` and audited as `table_note`. It renders under the table wherever the table
 is described, the prompt and the terminal's `/tables TABLE` included, and feeds the table search.
 
+**Trying a failed file again.** A file whose ingestion failed stays listed as `error` with
+its message until it is ingested again: registering a file deletes the earlier `error` rows
+with the same name and source path (`WorkspaceDb::failed_attempts`, each removed as
+`delete_document` removes a document), so the list shows the file once, ready or failed with
+the newest reason. A file of the same name from another place in a folder is another file and
+keeps its row.
+
 **Replacing a document.** `quack ingest FILE --replace [ID]` (the newest ready document
 with the file's name when no id is given), `POST .../documents?replace={doc}`, and the
 Replace control on a Documents page row register the new file with `NewFile::replaces`.

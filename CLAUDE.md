@@ -497,7 +497,8 @@ same transaction, so no change stands unaudited; the content
 half of each audit row is `storage::audit` (`_quack_audit`) inside the workspace under the
 same UUID v7. Ingestion is `register_document` (status `queued`, or `Registration::Duplicate` when the
 bytes' SHA-256 already belong to a non-failed document whose table or chunks still exist;
-`Error::TableTaken` when the file's table belongs to another live document) plus `Processing::run`
+`Error::TableTaken` when the file's table belongs to another live document; a new attempt at a
+file deletes its earlier `error` rows, same name and source path, `WorkspaceDb::failed_attempts`) plus `Processing::run`
 (`processing` to `ready` or `error`, recording `chunk_count`, the parsed title, and a PDF's
 `parser::PageCounts`: pages in the file, pages whose extraction failed, pages without text;
 `PageCounts::note` is the one wording every interface shows, as `3 of 40 pages unreadable`);

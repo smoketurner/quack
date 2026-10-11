@@ -547,6 +547,13 @@ impl Pending {
         if let Load::Table(_) = self.file_type.load() {
             TableName::of_file(&self.filename).check_free(db, self.replaces.as_ref())?;
         }
+        // A new attempt at a file that failed takes the failed rows' place,
+        // so the list shows the file once. They go before the new row, as
+        // their files under `files/` share its name.
+        for failed in db.failed_attempts(&self.filename, self.source_path.as_deref())? {
+            db.delete_document(&failed)?;
+            tracing::info!(document = %failed, file = %self.filename, "removed an earlier failed attempt at the file");
+        }
         let doc_id = DocumentId::generate();
         if let Some(old) = &self.replaces {
             db.begin_replacement(old, &doc_id)?;
