@@ -3222,8 +3222,9 @@ fn opening_a_version_14_workspace_creates_the_classification_runs() {
     assert!(runs.runs.is_empty());
 }
 
-/// A version 15 file's profiles list no values; opening it profiles every
-/// table again, so a text column with few values lists them all.
+/// A version 15 file's profiles list no values and no ranges; opening it
+/// profiles every table again, so a text column with few values lists them
+/// all and a number column has its range.
 #[test]
 fn opening_a_version_15_workspace_lists_each_columns_values() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
@@ -3231,13 +3232,14 @@ fn opening_a_version_15_workspace_lists_each_columns_values() {
     {
         let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
         db.execute_statement(
-            "CREATE TABLE events AS SELECT * FROM (VALUES ('TEXAS'), ('IOWA'), ('TEXAS')) t(state)",
+            "CREATE TABLE events AS SELECT * FROM (VALUES ('TEXAS', 3), ('IOWA', 1), ('TEXAS', 2)) t(state, n)",
         )
         .unwrap_or_else(|e| fail(&e.to_string()));
         let mut profile =
             TableProfile::compute(&db, "events").unwrap_or_else(|e| fail(&e.to_string()));
         for column in &mut profile.columns {
             column.values.clear();
+            column.range = None;
         }
         db.connection()
             .execute(
@@ -3260,4 +3262,10 @@ fn opening_a_version_15_workspace_lists_each_columns_values() {
         .map(|c| c.values.clone())
         .unwrap_or_default();
     assert_eq!(state, ["IOWA", "TEXAS"]);
+    let range = profiles
+        .get("events")
+        .and_then(|p| p.column("n"))
+        .and_then(|c| c.range.as_ref())
+        .map(ToString::to_string);
+    assert_eq!(range.as_deref(), Some("1 to 3"));
 }

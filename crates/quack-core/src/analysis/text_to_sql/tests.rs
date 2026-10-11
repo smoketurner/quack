@@ -387,7 +387,19 @@ fn prompt_states_mode_and_lists_tables_and_documents() {
         .unwrap()
         .text;
     assert!(query.contains("Mode: query."));
-    assert!(query.contains("Do not answer from memory"));
+    assert!(query.contains("nothing from memory"));
+    // The exit sentence is given verbatim in the role, in both modes, and
+    // the constant every interface can recognize it by says the same.
+    assert!(
+        query.contains(&format!("reply with the sentence \"{NOT_IN_DATA}\"")),
+        "{query}"
+    );
+    assert!(chat.contains(NOT_IN_DATA));
+    assert!(!chat.contains("general knowledge may"), "{chat}");
+    assert!(
+        chat.contains("never supplies a fact the workspace does not hold"),
+        "{chat}"
+    );
     assert!(query.contains("ends with that chunk's [n] marker"));
 }
 
@@ -576,9 +588,9 @@ fn dialect_reference_is_pinned_to_the_bundled_duckdb_and_stays_in_the_sandbox() 
     assert!(tools_at < dialect_at && dialect_at < perms_at);
 }
 
-/// A wide table lists its first columns and counts the rest, shows
-/// no sample rows, and a long narrative cell is cut; tables past the
-/// detailed count appear by name only (issue #40).
+/// A wide table lists its first columns and counts the rest, no row of
+/// any table is shown, and tables past the detailed count appear by name
+/// only (issue #40).
 #[test]
 #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
 fn prompt_bounds_wide_tables_long_cells_and_many_tables() {
@@ -609,15 +621,8 @@ fn prompt_bounds_wide_tables_long_cells_and_many_tables() {
     assert!(prompt.contains("- c39 (INTEGER)"), "{prompt}");
     assert!(!prompt.contains("- c40 (INTEGER)"), "{prompt}");
     assert!(prompt.contains("... and 10 more columns"), "{prompt}");
-    assert!(
-        prompt.contains("Sample rows omitted (50 columns)"),
-        "{prompt}"
-    );
-    assert!(!prompt.contains(&narrative), "{prompt}");
-    assert!(
-        prompt.contains(&format!("{}\u{2026}", "x".repeat(60))),
-        "{prompt}"
-    );
+    assert!(!prompt.contains("Sample"), "{prompt}");
+    assert!(!prompt.contains(&"x".repeat(20)), "{prompt}");
     assert!(
         prompt.contains("Only the first 25 tables are described"),
         "{prompt}"
@@ -823,6 +828,71 @@ fn tables_workspace(n: usize) -> WorkspaceDb {
     db
 }
 
+/// A column line carries what the profile says of a text column's values:
+/// every one for a small column, the count and the form for a wide one or
+/// an identifier, the range for a number or a date; no sample
+/// rows; and the values the question names come after the workspace
+/// context, as the columns hold them.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn column_lines_carry_values_or_their_form_and_the_question_names_stored_ones() {
+    let db = db();
+    db.execute_statement(
+        "CREATE TABLE events (event_id VARCHAR, state VARCHAR, office VARCHAR, note VARCHAR, \
+         damage INTEGER, begin_date DATE);
+         INSERT INTO events
+         SELECT 'EVT-' || i, 'TEXAS', 'AKQ' || lpad(CAST(i AS VARCHAR), 2, '0'), \
+         repeat('narrative ', 20), i, DATE '2024-01-01' + INTERVAL (i) DAY
+         FROM range(60) t(i)
+         UNION ALL SELECT 'EVT-X', 'TENNESSEE', 'FWD1', 'short', 1, DATE '2023-12-31';",
+    )
+    .unwrap();
+    TableProfile::refresh(&db, "events").unwrap();
+    let prompt = SystemPrompt::build(&db, &asking("What was the damage in Texas?"))
+        .unwrap()
+        .text;
+    assert!(
+        prompt.contains("    - state (VARCHAR); values: 'TENNESSEE', 'TEXAS'\n"),
+        "{prompt}"
+    );
+    // Named like a key with every value distinct: an identifier, whose form
+    // says enough.
+    assert!(
+        prompt.contains("    - event_id (VARCHAR); 61 distinct values, form AAA-9"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("    - office (VARCHAR); 61 distinct values, form AAA99\n"),
+        "{prompt}"
+    );
+    // A value longer than 60 characters keeps the column off the list.
+    assert!(
+        prompt.contains(
+            "    - note (VARCHAR); 2 distinct values, form aaaaaaaaa aaaaaaaaa aaaa\u{2026}\n"
+        ),
+        "{prompt}"
+    );
+    // A number or date column shows its range, never a row.
+    assert!(
+        prompt.contains("    - damage (INTEGER); 0 to 59\n"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("    - begin_date (DATE); 2023-12-31 to 2024-02-29\n"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("narrative narrative"), "{prompt}");
+    let line = "The question names these stored values; filter on them exactly as written: \
+                events.state = 'TEXAS' (Texas)";
+    let at = prompt.find(line).unwrap();
+    assert!(prompt.find("Fiscal years start in April.").unwrap() < at);
+    assert!(at < prompt.find("Permissions:").unwrap());
+    let unnamed = SystemPrompt::build(&db, &asking("Which state had the most damage?"))
+        .unwrap()
+        .text;
+    assert!(!unnamed.contains("The question names"), "{unnamed}");
+}
+
 fn asking(text: &str) -> PromptOptions {
     PromptOptions {
         question: Some(Question {
@@ -844,7 +914,7 @@ fn a_described_table_carries_its_note_meaning_warnings_and_measures() {
         .unwrap()
         .text;
     assert!(
-        prompt.contains("- zz_orders (1 rows)\n  Note (from the owner): One row per order; cancelled orders are kept\n  Columns:\n    - order_id (VARCHAR)\n    - amount (VARCHAR): order total [cents]\n  Warnings:\n    - amount: numbers stored as text"),
+        prompt.contains("- zz_orders (1 rows)\n  Note (from the owner): One row per order; cancelled orders are kept\n  Columns:\n    - order_id (VARCHAR); 1 distinct value, form a9\n    - amount (VARCHAR): order total [cents]; values: '1250'\n  Warnings:\n    - amount: numbers stored as text"),
         "{prompt}"
     );
     assert!(

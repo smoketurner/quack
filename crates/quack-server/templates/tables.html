@@ -30,7 +30,7 @@
     {% if let Some(at) = t.profiled_at %}<p class="mt-1 text-xs text-slate-400">Profiled {{ at }}</p>{% endif %}
     <div class="mt-1 overflow-x-auto">
     <table class="data-table text-sm" aria-label="Columns of {{ t.name }}">
-      <thead><tr class="border-b border-slate-700 text-left text-xs uppercase text-slate-400"><th scope="col">Column</th><th scope="col">Type</th><th scope="col">Meaning</th><th scope="col">Present</th><th scope="col">Distinct</th><th scope="col">Warnings</th></tr></thead>
+      <thead><tr class="border-b border-slate-700 text-left text-xs uppercase text-slate-400"><th scope="col">Column</th><th scope="col">Type</th><th scope="col">Meaning</th><th scope="col">Present</th><th scope="col">Distinct</th><th scope="col">Range</th><th scope="col">Warnings</th></tr></thead>
       <tbody>
       {% for c in t.columns %}<tr class="align-top">
         <td class="font-mono wrap-anywhere">{{ c.name }}</td>
@@ -38,6 +38,7 @@
         <td class="wrap-anywhere">{{ c.meaning }}</td>
         <td class="tabular-nums">{{ c.present }}</td>
         <td class="tabular-nums">{{ c.distinct }}</td>
+        <td class="tabular-nums">{{ c.range }}</td>
         <td class="text-amber-300">
           {% for w in c.warnings %}<div>{{ w }}</div>{% endfor %}
           {% if ws.can_write %}{% if let Some(fix) = c.fix %}

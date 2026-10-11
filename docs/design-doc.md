@@ -1174,9 +1174,10 @@ type button (members and owners) change an existing table the same way, audited 
 that wrote (the agent's `run_sql`, the SQL page, MCP `sql`, the terminal, `quack -q`) when its
 row count changed, and once on upgrade to schema version 12 (`storage::profile::TableProfile`,
 `_quack_table_profiles`). One statement per table counts each column's present and distinct
-values, keeps its three most common values (`approx_top_k`, cut to 60 characters), and for a
-text column the share of values that cast to a number and to a date; columns past 200 are left
-out. A profile whose row count no longer matches the table is not shown. Warnings are worked out
+values, keeps its three most common values (`approx_top_k`, cut to 60 characters), for a
+number or date column its smallest and largest value as `DuckDB` writes them
+(`ColumnProfile::range`), and for a text column the share of values that cast to a number and
+to a date; columns past 200 are left out. A profile whose row count no longer matches the table is not shown. Warnings are worked out
 when read: every value empty, at least half empty, numbers stored as text and dates stored as
 text (at least 90% of values cast), and a key that repeats (the mapping's key column, or a
 column named `id`). A mistyped-text warning names the type that fixes it only when every value
@@ -1754,8 +1755,12 @@ terminal as a system line, SSE as a `status` event.
 ### 7.2 System prompt
 
 1. Role and behavior for the mode (7.5): retrieve before answering, cite with `[n]`, run
-   SQL rather than estimate, state assumptions, ask one clarifying question when the
-   request is ambiguous. Then today's date (`Today is YYYY-MM-DD.`, the system's local
+   SQL rather than estimate, for a request that could be read more than one way take the
+   most likely reading, say which, and run the query (a reply that asks a question and
+   runs nothing is no answer: a reasoning model takes "ask a clarifying question" literally,
+   and in print mode and MCP nobody can answer it, so the person gets the nothing-fetched
+   note of 7.7 instead of a figure), and when the workspace does not hold the answer reply
+   with the exit sentence of 7.5 and stop. Then today's date (`Today is YYYY-MM-DD.`, the system's local
    zone), so "last quarter" has an anchor without a tool call; it is the one line that
    changes between turns, once a day.
 2. Tool guidance, the error rule (read a `run_sql` error, fix the statement, rerun it), and
@@ -1765,14 +1770,28 @@ terminal as a system line, SSE as a `status` event.
    guidance is one numbered procedure per substrate: structured data, document content,
    and, only when the graph tools are registered, how entities relate.
 3. Tables block: user-facing tables and views with columns, types, row count, the owner's
-   note, each column's meaning and unit from the ontology, the profile's warnings, and three
-   sample rows (section 6.2). It is bounded so one wide or narrative table cannot push the
-   guidance and question out of a small window: the first 25 tables are described and the
-   rest listed by name; the first 40 columns are listed and the rest counted; sample rows
-   appear only up to 20 columns, cut at 60 characters per cell. `describe_table` and
-   `find_tables` have the rest. The ontology's measures follow (30 at most), then, when the
+   note, each column's meaning and unit from the ontology, what the profile says of each
+   text column's values, and the profile's warnings (section 6.2). A text column with at
+   most 50 distinct values lists every one (`values: 'TENNESSEE', 'TEXAS'`), so a filter
+   copied from the line is one the column holds; a wider column shows its distinct count
+   and the form of its values with every letter and digit replaced (`61 distinct values,
+   form AAA99`), which says how to write one without a value to copy, as does an identifier
+   (a column named like a key whose every value differs, `25 distinct values, form
+   AAA-9999`); a number or date column shows its range (`damage_property_usd (BIGINT); 0 to
+   62000000`, `begin_date (DATE); 2023-01-04 to 2023-11-28`), which says the period the data
+   covers and the unit the figures imply, and the guidance says a period or an amount outside
+   it is not in the data. No rows are shown: a value the model copies from a
+   row is a guess that returns a real figure (section 7.7). It is bounded so one wide or
+   narrative table cannot push the guidance and question out of a small window: the first
+   25 tables are described and the rest listed by name; the first 40 columns are listed and
+   the rest counted; a table's lines list at most 200 values between them, and a column
+   past that shows its count and form. `describe_table` and `find_tables` have the rest,
+   sample rows included. The ontology's measures follow (30 at most), then, when the
    graph has nodes, one line naming the graph views (30 at most). The graph views are not
-   counted or described as tables. The block depends on the workspace only, never on the
+   counted or described as tables. The ontology block itself (item 5) ends with the joins
+   its mappings imply, each a predicate as SQL writes it (`fatalities.event_id =
+   events.event_id (during)`, `Ontology::joins`), since a multi-table question needs that
+   one fact most and the mapping already records it. The block depends on the workspace only, never on the
    question, so a provider's prefix cache keeps it.
 4. Documents block: every document by filename, title, status and mime type, then, when
    the person limited the question to documents, a sentence naming them (`DocumentScope`,
@@ -2005,12 +2024,19 @@ Per session: `chat` unless set at creation (`--mode`, the REST `mode` field, the
 selector, the MCP `mode` argument), changed only explicitly (`/mode`,
 `PATCH .../sessions/{sid}`).
 
-- **chat** - the agent may answer from general knowledge as well as retrieved sources; it
-  must still cite a source it used.
+- **chat** - every figure comes from a query the turn ran and every statement about a
+  document from a cited chunk; general knowledge may explain a term or a method the person
+  asks about, never supply a fact the workspace does not hold.
 - **query** - the agent must ground every claim in a retrieved chunk, a query result, or a
-  graph result; if retrieval finds nothing relevant, it says so instead of answering. This
-  is AnythingLLM's query mode and the default for classified workspaces. Provisional graph
-  results are excluded.
+  graph result, nothing from memory, not even to explain a term. This is AnythingLLM's
+  query mode and the default for classified workspaces. Provisional graph results are
+  excluded.
+
+In both modes the role paragraph gives the model its exit verbatim: when the tables and
+documents do not hold the answer, or a query returns no rows for it, it replies *I can't tell
+from the data in this workspace.* (`text_to_sql::NOT_IN_DATA`) followed by what it looked
+at, and stops. A model follows a permitted sentence where it ignores a prohibition on
+guessing, and one fixed sentence is something every interface, and the eval, can recognize.
 
 ### 7.6 Visibility
 
@@ -2048,16 +2074,22 @@ scan of the answer's numbers against the results was tried and removed: it misre
 dates as figures and threw away correct answers, and it could not catch a real number from
 the wrong row, which is the failure that matters.)
 
-The values a query filters on are held to the question instead (`grounding::ValueLinks`).
+The values a query filters on are held to the workspace instead (`grounding::ValueLinks`).
 A text column with at most 50 distinct values keeps all of them in its profile
 (`ColumnProfile::values`); when the turn starts, the question's words are matched to those
-values as whole words, ignoring case (`Texas` is `TEXAS` in `events.state`). A read whose
-`column = 'value'` or `column IN (...)` (as `DuckDB` parses it, the column bare or inside
-`lower`, `upper`, or `trim`) uses another value of a column the question names a value of is
-not run: `WHERE state = 'TENNESSEE'` for a question about Texas, or `WHERE state = 'Texas'`
-when the column holds `TEXAS`. The model is told the value the column holds and writes the
-query again. A model shown three sample rows otherwise picks the nearest value it saw, and
-the figure its query returns is real.
+values as whole words, ignoring case (`Texas` is `TEXAS` in `events.state`), and the matches
+go into the prompt after the workspace context, as the columns hold them (`The question
+names these stored values; filter on them exactly as written: events.state = 'TEXAS'
+(Texas)`), so the first query can be the right one. A read whose `column = 'value'` or
+`column IN (...)` (as `DuckDB` parses it, the column bare or inside `lower`, `upper`, or
+`trim`) uses another value of a column the question names a value of is not run: `WHERE
+state = 'TENNESSEE'` for a question about Texas, or `WHERE state = 'Texas'` when the column
+holds `TEXAS`. The model is told the value the column holds and writes the query again. And
+whatever the question names, a filter on a column whose every value is listed, with a value
+the list does not hold, is not run either: the model is given the list. A column with more
+values than the profile lists is held by the prompt's guidance alone, which tells the model
+to run `SELECT DISTINCT` before filtering on a value it has not seen; the prompt shows it
+no value to copy, only the count and the form.
 
 An answer is shown only when the turn fetched something: a tool ran (`run_sql`, a search, a
 listing, `describe_table`; any step), or the answer cites a passage `always_retrieve` put in

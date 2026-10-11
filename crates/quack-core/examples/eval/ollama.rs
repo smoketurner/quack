@@ -398,7 +398,20 @@ async fn evaluate_agent(
         outcomes.push(match turn {
             Ok(response) => {
                 let tools: Vec<ToolName> = response.steps.iter().map(|s| s.tool).collect();
-                let answer = response.content.to_lowercase();
+                // A model writes an id with a non-breaking hyphen or a dash
+                // as readily as with a hyphen; the expected values use one.
+                let answer: String = response
+                    .content
+                    .to_lowercase()
+                    .chars()
+                    .map(|c| {
+                        if matches!(c, '\u{2010}'..='\u{2015}') {
+                            '-'
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
                 AgentOutcome {
                     correct: case.expect.iter().all(|group| {
                         group
