@@ -787,6 +787,69 @@ async fn a_second_empty_reply_ends_the_turn_with_the_note() {
     assert_eq!(model.request_count(), 2);
 }
 
+/// An answer with figures from a turn that ran no tool and read nothing is
+/// asked for again; the second answer used the tools and stands as it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_with_figures_and_no_tool_is_asked_for_again() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![text("North fell by 100.")]),
+        turn(vec![call(
+            "t1",
+            "run_sql",
+            serde_json::json!({"query": "SELECT region, revenue FROM sales"}),
+        )]),
+        turn(vec![text("North has 10 and south 20.")]),
+    ]);
+    let ran = run_turn(
+        &db,
+        &model,
+        WritePolicy::Deny,
+        Vec::new(),
+        "which region fell?",
+    )
+    .await;
+    assert_eq!(ran.answer().content, "North has 10 and south 20.");
+    let retry = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
+    assert!(retry.contains("ran no query and read no"), "{retry}");
+}
+
+/// A second ungrounded answer is accepted, and says it does not come from
+/// the workspace.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_ungrounded_answer_carries_the_note() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![text("North fell by 100.")]),
+        turn(vec![text("North fell by 100, reopening next week.")]),
+        turn(vec![text("never reached")]),
+    ]);
+    let ran = run_turn(
+        &db,
+        &model,
+        WritePolicy::Deny,
+        Vec::new(),
+        "which region fell?",
+    )
+    .await;
+    assert_eq!(
+        ran.answer().content,
+        "North fell by 100, reopening next week.\n\n(No query ran and no document was read \
+         this turn, so this answer does not come from the workspace's data.)"
+    );
+    assert_eq!(model.request_count(), 2);
+}
+
+/// An answer that states no figures is not second-guessed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_without_figures_is_not_asked_again() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([turn(vec![text("Hello there.")])]);
+    let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "hi").await;
+    assert_eq!(ran.answer().content, "Hello there.");
+    assert_eq!(model.request_count(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_malformed_history_is_dropped_with_a_warning() {
     let db = workspace();

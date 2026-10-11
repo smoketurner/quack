@@ -16,7 +16,7 @@ use crate::ids::SessionId;
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
 use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, TurnRecorder};
-use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls};
+use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls, Ungrounded};
 use super::policy::WritePolicy;
 use super::rerank::RerankAnswer;
 use super::search::DocumentScope;
@@ -469,6 +469,7 @@ where
             .within(prompt.scope.clone())
             .cancelled_by(cancel.clone());
         let Replay { history, dropped } = Replay::check(history);
+        let check_grounding = read.prompt.holds_data && history.is_empty();
         let window = prompt.window;
         let agent = BuildContext {
             shared_db: Arc::clone(&shared_db),
@@ -484,6 +485,7 @@ where
             images: images.filter(|_| read.has_images),
             labeller,
             turn: turn.clone(),
+            check_grounding,
         }
         .build_agent(completion_model, embedding_model, &read.prompt.text)?;
         let max_turns = usize::try_from(analysis_config.max_turns)
@@ -502,7 +504,12 @@ where
         let cancelled = streamed.cancelled;
         let (mut answer, usage) =
             streamed.answer(window, |text| recorder.citations().validate(text));
-        if let Some(note) = dropped {
+        let ungrounded = (check_grounding
+            && !cancelled
+            && Ungrounded::states_figures(&answer.text)
+            && !Ungrounded::grounded(&turn))
+        .then(|| String::from(Ungrounded::NOTE));
+        for note in [dropped, ungrounded].into_iter().flatten() {
             answer.text.push_str("\n\n(");
             answer.text.push_str(&note);
             answer.text.push(')');
@@ -886,6 +893,9 @@ struct BuildContext<'a> {
     /// The turn the agent runs: `always_retrieve` records on it that it
     /// put chunk text in the prompt.
     turn: Turn,
+    /// Ask again for an answer that states figures without having looked
+    /// at the workspace ([`Ungrounded`]).
+    check_grounding: bool,
 }
 
 impl BuildContext<'_> {
@@ -932,6 +942,9 @@ impl BuildContext<'_> {
             ))
             .add_hook(InvalidToolCalls)
             .add_hook(EmptyAnswer);
+        if ctx.check_grounding {
+            builder = builder.add_hook(Ungrounded::new(ctx.turn.clone()));
+        }
 
         // The ontology is describable as soon as it exists: the prompt block
         // is capped, so a class the model wants the detail of may not be in it
