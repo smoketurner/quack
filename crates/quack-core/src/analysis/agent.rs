@@ -16,7 +16,7 @@ use crate::ids::SessionId;
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
 use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, TurnRecorder};
-use super::grounding::{self, ValueLinks};
+use super::grounding;
 use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls, RepeatedCalls};
 use super::policy::WritePolicy;
 use super::search::DocumentScope;
@@ -31,7 +31,6 @@ use super::tools::{
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::GraphResult;
 use crate::llm::{ChatModel, RerankModel};
-use crate::storage::profile::TableProfile;
 use crate::storage::sessions::ChatMode;
 
 /// What the provider charged for a turn. Every budget quack computes
@@ -451,17 +450,13 @@ where
             labeller,
         } = self;
         let read = PromptAndModel::read(&reader_db, &prompt).await?;
-        let question = user_message.to_owned();
-        let named = reader_db
-            .with_db(move |db| Ok(ValueLinks::find(&TableProfile::all(db)?, &question)))
-            .await?;
+        // Shown only when the turn fetched something; the note otherwise.
+        let holds_data = read.prompt.holds_data();
         let turn = Turn::new(recorder.clone(), write_policy)
             .within(prompt.scope.clone())
             .cancelled_by(cancel.clone())
-            .naming(named);
+            .naming(read.prompt.values);
         let Replay { history, dropped } = Replay::check(history);
-        // Shown only when the turn fetched something; the note otherwise.
-        let holds_data = read.prompt.holds_data();
         let nothing_fetched =
             grounding::nothing_fetched(&read.prompt.table_names, read.prompt.documents);
         let window = prompt.window;

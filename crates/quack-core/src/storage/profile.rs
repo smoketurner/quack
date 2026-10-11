@@ -42,6 +42,8 @@ const SAMPLES: usize = 3;
 const LISTED_VALUES: usize = 50;
 /// A kept value longer than this is cut, with an ellipsis.
 const SAMPLE_CHARS: usize = 60;
+/// A value's form (`ColumnProfile::form`) is cut past this many characters.
+const FORM_CHARS: usize = 24;
 /// A column at least this empty is worth a warning.
 const HIGH_NULL_SHARE: f64 = 0.5;
 /// A text column whose values read as numbers or dates at least this often
@@ -367,6 +369,33 @@ impl ColumnProfile {
     #[must_use]
     pub fn kind(&self) -> ColumnKind {
         ColumnKind::of(&self.duckdb_type)
+    }
+
+    /// The form of a text column's values, from its most common one, with
+    /// every letter and digit replaced (`AAA` for `AKQ`, `9999-99-99` for a
+    /// date stored as text): what a query needs to write a value the column
+    /// holds, without a value to copy. `None` for a column that is not text
+    /// or holds nothing.
+    #[must_use]
+    pub fn form(&self) -> Option<String> {
+        if self.kind() != ColumnKind::Text {
+            return None;
+        }
+        let sample = self.samples.first()?;
+        let mut form: String = sample
+            .chars()
+            .take(FORM_CHARS)
+            .map(|c| match c {
+                c if c.is_uppercase() => 'A',
+                c if c.is_lowercase() => 'a',
+                c if c.is_numeric() => '9',
+                c => c,
+            })
+            .collect();
+        if sample.chars().count() > FORM_CHARS {
+            form.push('\u{2026}');
+        }
+        Some(form)
     }
 
     /// What is worth telling someone about the column, given the table's

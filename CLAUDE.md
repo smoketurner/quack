@@ -441,7 +441,11 @@ What the agent knows of a table (issue #403): `storage::profile::TableProfile` (
 present and distinct counts, three common values, every value of a text column with at most 50, the share of a text column that casts to a
 number or a date) is stored in `_quack_table_profiles` at load, import, and after any write that
 changed the row count (`TableProfile::after_write`, called by every interface that runs a write),
-and shown only while its row count matches; `profile::ColumnWarning` (all empty, half empty,
+and shown only while its row count matches; the prompt's column line lists every value of a text
+column with at most 50 (200 a table), shows the count and `ColumnProfile::form` (`AAA99`) of a wider
+one, and shows no rows; `grounding::ValueLinks` (built in `SystemPrompt::build`, carried on
+`BuiltPrompt`) puts the values the question names into the prompt after the context and refuses a
+read filtering a listed column on a value it does not hold; `profile::ColumnWarning` (all empty, half empty,
 numbers or dates stored as text, a repeating key) is worked out when read, with the
 `ColumnType` that fixes it when every value converts (`profile::Retype`, a strict `CAST`;
 `--types` at ingest and import). Owners' notes are `profile::TableNote` (`_quack_table_notes`).

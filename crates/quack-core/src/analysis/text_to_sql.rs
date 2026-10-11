@@ -1,3 +1,4 @@
+use super::grounding::ValueLinks;
 use super::table_search::{DETAILED_TABLES, RankedTable, TableCards, TableLayout, user_tables};
 use crate::analysis::policy::WritePolicy;
 use crate::analysis::search::DocumentScope;
@@ -7,6 +8,7 @@ use crate::graph::views as graph_views;
 use crate::graph::{GraphSize, store as graph_store};
 use crate::ingestion::parser::PageCounts;
 use crate::ontology::{Ontology, store as ontology_store};
+use crate::storage::profile::{ColumnProfile, TableProfile};
 use crate::storage::sessions::ChatMode;
 use crate::storage::workspace::{
     ColumnInfo, PinnedDocument, PinnedText, SamplePool, TableDescription, WorkspaceDb,
@@ -133,10 +135,9 @@ const PROMPT_MEASURES: usize = 30;
 const PROMPT_GRAPH_VIEWS: usize = 30;
 /// Columns past this many per table are counted, not listed.
 const LISTED_COLUMNS: usize = 40;
-/// Sample rows are shown only for tables up to this wide.
-const SAMPLED_COLUMNS: usize = 20;
-/// A sample cell longer than this is cut, with an ellipsis.
-const SAMPLE_CELL_CHARS: usize = 60;
+/// A table's column lines carry at most this many listed values between
+/// them; a column past the budget shows its count instead.
+const LISTED_VALUES_PER_TABLE: usize = 200;
 /// Documents past this many (newest first) are counted, not listed.
 const LISTED_DOCUMENTS: usize = 40;
 /// A document title longer than this is cut, with an ellipsis.
@@ -231,6 +232,9 @@ pub struct BuiltPrompt {
     pub table_names: Vec<String>,
     /// How many ready documents the workspace holds.
     pub documents: u64,
+    /// The stored values the question names and every listed column's
+    /// values, which hold the turn's filters (`grounding::ValueLinks`).
+    pub values: ValueLinks,
 }
 
 impl BuiltPrompt {
@@ -304,30 +308,7 @@ impl SystemPrompt {
                 .text
                 .push_str(&ontology.render_capped(PROMPT_ONTOLOGY_ITEMS));
             if modeled.has_graph() {
-                writeln!(
-                    prompt.text,
-                    "Knowledge graph: {} nodes, {} edges typed by this ontology{}{}{}. \
-                     search_graph and find_path read it; both return provenance to cite.",
-                    graph.nodes,
-                    graph.edges,
-                    if graph.provisional() {
-                        " (provisional: built from an unreviewed ontology; say so when you use it)"
-                    } else {
-                        ""
-                    },
-                    if graph.summary.stale {
-                        " (stale: the ontology changed since it was built)"
-                    } else {
-                        ""
-                    },
-                    match graph.summary.drift_total {
-                        0 => String::new(),
-                        drift => format!(
-                            " (drift: the documents expressed {drift} classes or relations the \
-                             ontology lacks)"
-                        ),
-                    }
-                )?;
+                prompt.graph_line(&graph)?;
             }
             writeln!(prompt.text)?;
         }
@@ -343,6 +324,7 @@ impl SystemPrompt {
 
         prompt.context(options)?;
         prompt.ranked_tables(db, ontology.as_ref(), &tables, options)?;
+        let values = prompt.named_values(db, options)?;
 
         prompt.text.push_str(TRUST_RULE);
         prompt
@@ -356,6 +338,7 @@ impl SystemPrompt {
             has_documents: documents > 0,
             table_names: tables,
             documents: u64::try_from(documents).unwrap_or(u64::MAX),
+            values,
         })
     }
 
@@ -370,18 +353,22 @@ impl SystemPrompt {
                 "When answering analytical questions about structured data:\n\
                  1. The tables block below describes the data: columns with their meaning and \
                  unit when the owner gave one, notes, and warnings about the values. Follow the \
-                 notes and warnings, call describe_table for a table it lists without columns, and \
-                 run SELECT DISTINCT col FROM t to see the values a column holds before filtering \
-                 on one\n"
+                 notes and warnings, and call describe_table for a table it lists without \
+                 columns. A column line lists every value a small text column holds: filter on \
+                 one of them, exactly as written. A column line that shows a count and a form \
+                 instead has more values than it lists: run SELECT DISTINCT col FROM t before \
+                 filtering on one, since a value you have not seen is a guess\n"
             }
             TableLayout::Ranked => {
                 "When answering analytical questions about structured data:\n\
                  1. The workspace has more tables than the tables block describes. The tables \
                  ranked for this question are listed after the workspace context; if none fits, \
                  call find_tables with the question in other words, which returns each match's \
-                 columns, so describe_table is rarely needed. Follow the notes and warnings, and \
-                 run SELECT DISTINCT col FROM t to see the values a column holds before filtering \
-                 on one\n"
+                 columns, so describe_table is rarely needed. Follow the notes and warnings. A \
+                 column line lists every value a small text column holds: filter on one of them, \
+                 exactly as written. A column line that shows a count and a form instead has \
+                 more values than it lists: run SELECT DISTINCT col FROM t before filtering on \
+                 one, since a value you have not seen is a guess\n"
             }
         });
         self.text.push_str(
@@ -610,16 +597,27 @@ impl SystemPrompt {
         Ok(())
     }
 
-    /// One table in full: row count, note, columns with their meaning,
-    /// the profile's warnings, and sample rows.
+    /// One table in full: row count, note, columns with their meaning and
+    /// what the profile says of each text column's values, and the
+    /// profile's warnings. No rows: a value the model copies from a row is
+    /// a guess that returns a real figure (design doc 7.7).
     fn table_detail(&mut self, desc: &TableDescription) -> Result<()> {
         writeln!(self.text, "- {} ({} rows)", desc.table_name, desc.row_count)?;
         if let Some(note) = &desc.note {
             writeln!(self.text, "  Note (from the owner): {}", OneLine(note))?;
         }
         writeln!(self.text, "  Columns:")?;
+        let mut budget = LISTED_VALUES_PER_TABLE;
         for col in desc.columns.iter().take(LISTED_COLUMNS) {
-            writeln!(self.text, "    - {}", ColumnLine(col))?;
+            write!(self.text, "    - {}", ColumnLine(col))?;
+            let profiled = desc
+                .profile
+                .as_ref()
+                .and_then(|p| p.columns.iter().find(|c| c.name == col.name));
+            if let Some(profiled) = profiled {
+                self.column_values(profiled, &mut budget)?;
+            }
+            writeln!(self.text)?;
         }
         if desc.columns.len() > LISTED_COLUMNS {
             writeln!(
@@ -634,31 +632,82 @@ impl SystemPrompt {
                 writeln!(self.text, "    - {}: {}", flagged.column, flagged.warning)?;
             }
         }
-        if desc.sample_rows.rows.is_empty() {
+        Ok(())
+    }
+
+    /// What a column line says of a text column's values: every one when
+    /// the profile lists them all and the table's budget allows, else how
+    /// many there are and their form, so the model writes one the column
+    /// holds or asks `DuckDB` for them. An identifier (named like a key,
+    /// every value different) shows its form, since a list of ids tells the
+    /// model nothing the form does not. Other columns say nothing: their
+    /// type is their form.
+    fn column_values(&mut self, profiled: &ColumnProfile, budget: &mut usize) -> Result<()> {
+        let Some(form) = profiled.form() else {
             return Ok(());
-        }
-        if desc.columns.len() > SAMPLED_COLUMNS {
-            writeln!(
+        };
+        let identifier =
+            TableProfile::is_id_name(&profiled.name) && profiled.distinct == profiled.non_null;
+        if !identifier && !profiled.values.is_empty() && profiled.values.len() <= *budget {
+            *budget = budget.saturating_sub(profiled.values.len());
+            let listed: Vec<String> = profiled
+                .values
+                .iter()
+                .map(|v| format!("'{}'", OneLine(v)))
+                .collect();
+            write!(self.text, "; values: {}", listed.join(", "))?;
+        } else {
+            let s = if profiled.distinct == 1 { "" } else { "s" };
+            write!(
                 self.text,
-                "  Sample rows omitted ({} columns); describe_table shows them",
-                desc.columns.len()
+                "; {} distinct value{s}, form {form}",
+                profiled.distinct
             )?;
-            return Ok(());
-        }
-        writeln!(self.text, "  Sample data:")?;
-        let mut buf = Vec::new();
-        if desc
-            .sample_rows
-            .with_cells_cut(SAMPLE_CELL_CHARS)
-            .write_table(&mut buf)
-            .is_ok()
-            && let Ok(text) = String::from_utf8(buf)
-        {
-            for line in text.lines() {
-                writeln!(self.text, "    {line}")?;
-            }
         }
         Ok(())
+    }
+
+    /// The graph's size and standing, when it has nodes.
+    fn graph_line(&mut self, graph: &GraphSize) -> Result<()> {
+        writeln!(
+            self.text,
+            "Knowledge graph: {} nodes, {} edges typed by this ontology{}{}{}. \
+             search_graph and find_path read it; both return provenance to cite.",
+            graph.nodes,
+            graph.edges,
+            if graph.provisional() {
+                " (provisional: built from an unreviewed ontology; say so when you use it)"
+            } else {
+                ""
+            },
+            if graph.summary.stale {
+                " (stale: the ontology changed since it was built)"
+            } else {
+                ""
+            },
+            match graph.summary.drift_total {
+                0 => String::new(),
+                drift => format!(
+                    " (drift: the documents expressed {drift} classes or relations the \
+                     ontology lacks)"
+                ),
+            }
+        )?;
+        Ok(())
+    }
+
+    /// The stored values the question names, after the workspace context
+    /// like the ranked tables, since they depend on the question.
+    fn named_values(&mut self, db: &WorkspaceDb, options: &PromptOptions) -> Result<ValueLinks> {
+        let Some(question) = &options.question else {
+            return Ok(ValueLinks::default());
+        };
+        let values = ValueLinks::find(&TableProfile::all(db)?, &question.text);
+        if let Some(line) = values.prompt_line() {
+            writeln!(self.text, "{line}")?;
+            writeln!(self.text)?;
+        }
+        Ok(values)
     }
 
     /// The ontology's measures, bounded; `describe_table` lists a table's.

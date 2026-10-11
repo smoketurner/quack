@@ -1765,12 +1765,20 @@ terminal as a system line, SSE as a `status` event.
    guidance is one numbered procedure per substrate: structured data, document content,
    and, only when the graph tools are registered, how entities relate.
 3. Tables block: user-facing tables and views with columns, types, row count, the owner's
-   note, each column's meaning and unit from the ontology, the profile's warnings, and three
-   sample rows (section 6.2). It is bounded so one wide or narrative table cannot push the
-   guidance and question out of a small window: the first 25 tables are described and the
-   rest listed by name; the first 40 columns are listed and the rest counted; sample rows
-   appear only up to 20 columns, cut at 60 characters per cell. `describe_table` and
-   `find_tables` have the rest. The ontology's measures follow (30 at most), then, when the
+   note, each column's meaning and unit from the ontology, what the profile says of each
+   text column's values, and the profile's warnings (section 6.2). A text column with at
+   most 50 distinct values lists every one (`values: 'TENNESSEE', 'TEXAS'`), so a filter
+   copied from the line is one the column holds; a wider column shows its distinct count
+   and the form of its values with every letter and digit replaced (`61 distinct values,
+   form AAA99`), which says how to write one without a value to copy, as does an identifier
+   (a column named like a key whose every value differs, `25 distinct values, form
+   AAA-9999`); a number or date column shows nothing beyond its type. No rows are shown: a value the model copies from a
+   row is a guess that returns a real figure (section 7.7). It is bounded so one wide or
+   narrative table cannot push the guidance and question out of a small window: the first
+   25 tables are described and the rest listed by name; the first 40 columns are listed and
+   the rest counted; a table's lines list at most 200 values between them, and a column
+   past that shows its count and form. `describe_table` and `find_tables` have the rest,
+   sample rows included. The ontology's measures follow (30 at most), then, when the
    graph has nodes, one line naming the graph views (30 at most). The graph views are not
    counted or described as tables. The block depends on the workspace only, never on the
    question, so a provider's prefix cache keeps it.
@@ -2048,16 +2056,22 @@ scan of the answer's numbers against the results was tried and removed: it misre
 dates as figures and threw away correct answers, and it could not catch a real number from
 the wrong row, which is the failure that matters.)
 
-The values a query filters on are held to the question instead (`grounding::ValueLinks`).
+The values a query filters on are held to the workspace instead (`grounding::ValueLinks`).
 A text column with at most 50 distinct values keeps all of them in its profile
 (`ColumnProfile::values`); when the turn starts, the question's words are matched to those
-values as whole words, ignoring case (`Texas` is `TEXAS` in `events.state`). A read whose
-`column = 'value'` or `column IN (...)` (as `DuckDB` parses it, the column bare or inside
-`lower`, `upper`, or `trim`) uses another value of a column the question names a value of is
-not run: `WHERE state = 'TENNESSEE'` for a question about Texas, or `WHERE state = 'Texas'`
-when the column holds `TEXAS`. The model is told the value the column holds and writes the
-query again. A model shown three sample rows otherwise picks the nearest value it saw, and
-the figure its query returns is real.
+values as whole words, ignoring case (`Texas` is `TEXAS` in `events.state`), and the matches
+go into the prompt after the workspace context, as the columns hold them (`The question
+names these stored values; filter on them exactly as written: events.state = 'TEXAS'
+(Texas)`), so the first query can be the right one. A read whose `column = 'value'` or
+`column IN (...)` (as `DuckDB` parses it, the column bare or inside `lower`, `upper`, or
+`trim`) uses another value of a column the question names a value of is not run: `WHERE
+state = 'TENNESSEE'` for a question about Texas, or `WHERE state = 'Texas'` when the column
+holds `TEXAS`. The model is told the value the column holds and writes the query again. And
+whatever the question names, a filter on a column whose every value is listed, with a value
+the list does not hold, is not run either: the model is given the list. A column with more
+values than the profile lists is held by the prompt's guidance alone, which tells the model
+to run `SELECT DISTINCT` before filtering on a value it has not seen; the prompt shows it
+no value to copy, only the count and the form.
 
 An answer is shown only when the turn fetched something: a tool ran (`run_sql`, a search, a
 listing, `describe_table`; any step), or the answer cites a passage `always_retrieve` put in

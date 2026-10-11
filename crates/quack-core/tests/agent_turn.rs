@@ -1318,4 +1318,56 @@ async fn a_filter_on_a_value_the_question_does_not_name_is_refused() {
     assert_eq!(ran.answer().content, "Texas had 1764 in damage.");
     let retry = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
     assert!(retry.contains("Texas is 'TEXAS'"), "{retry}");
+    let prompt = serde_json::to_string(&model.requests()[0]).unwrap();
+    assert!(
+        prompt.contains("events.state = 'TEXAS' (Texas)"),
+        "{prompt}"
+    );
+}
+
+/// A query filtering a column whose every value is listed on a value it
+/// does not hold is not run, whatever the question names: the model is
+/// given the list and writes the query again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filter_on_a_value_the_column_does_not_hold_is_refused() {
+    let db = workspace();
+    db.run(|db| {
+        db.connection().execute_batch(
+            "CREATE TABLE events (state VARCHAR, damage INTEGER);
+             INSERT INTO events VALUES ('TENNESSEE', 2655), ('TEXAS', 1764);",
+        )?;
+        TableProfile::refresh(db, "events")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![call(
+            "t1",
+            "run_sql",
+            serde_json::json!({"query": "SELECT sum(damage) FROM events WHERE state = 'Texas'"}),
+        )]),
+        turn(vec![call(
+            "t2",
+            "run_sql",
+            serde_json::json!({"query": "SELECT state, sum(damage) AS total FROM events GROUP BY ALL ORDER BY total DESC LIMIT 1"}),
+        )]),
+        turn(vec![text("Tennessee had the most damage.")]),
+    ]);
+    let ran = run_turn(
+        &db,
+        &model,
+        WritePolicy::Deny,
+        Vec::new(),
+        "Which state had the most damage?",
+    )
+    .await;
+    let steps = &ran.answer().steps;
+    assert_eq!(steps[0].summary, "refused");
+    assert_eq!(steps[1].rows, Some(1));
+    let retry = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
+    assert!(
+        retry.contains("events.state holds no value 'Texas'. It holds 'TENNESSEE', 'TEXAS'."),
+        "{retry}"
+    );
 }

@@ -660,7 +660,8 @@ impl SqlGate {
     }
 
     /// A read runs unless it filters a column the question names a value of
-    /// on another value (`grounding::ValueLinks`).
+    /// on another value, or a column whose every value is listed on a value
+    /// it does not hold (`grounding::ValueLinks`).
     async fn named_values(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolExecutionError> {
         if turn.values.is_empty() {
             return Ok(Gate::Read);
@@ -673,10 +674,7 @@ impl SqlGate {
         Ok(
             match filters.and_then(|filters| turn.values.refusal(&filters)) {
                 Some(refusal) => {
-                    tracing::info!(
-                        sql,
-                        "refused a read filtering on a value the question does not name"
-                    );
+                    tracing::info!(sql, "refused a read filtering on a value it must not use");
                     Gate::Reject(refusal)
                 }
                 None => Gate::Read,

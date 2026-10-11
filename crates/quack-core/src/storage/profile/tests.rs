@@ -242,3 +242,34 @@ fn text_candidates_leave_out_the_key_ids_numbers_dates_sparse_and_constant_colum
     assert_eq!(names("id"), ["subject", "body"], "in table order");
     assert_eq!(names("SUBJECT"), ["body"], "the key is not read");
 }
+
+/// A text column's form replaces every letter and digit and keeps the
+/// rest, cut past 24 characters; a number has no form, nor an empty column.
+#[test]
+fn a_text_columns_form_replaces_letters_and_digits() {
+    let column = |duckdb_type: &str, sample: &str| ColumnProfile {
+        name: String::from("c"),
+        duckdb_type: duckdb_type.to_owned(),
+        non_null: 1,
+        distinct: 1,
+        samples: vec![sample.to_owned()],
+        values: Vec::new(),
+        number_share: 0.0,
+        date_share: 0.0,
+    };
+    assert_eq!(column("VARCHAR", "AKQ").form().as_deref(), Some("AAA"));
+    assert_eq!(
+        column("VARCHAR", "2024-01-15").form().as_deref(),
+        Some("9999-99-99")
+    );
+    assert_eq!(
+        column("VARCHAR", "Flash Flood Emergency, Harris County")
+            .form()
+            .as_deref(),
+        Some("Aaaaa Aaaaa Aaaaaaaaa, A\u{2026}")
+    );
+    assert_eq!(column("BIGINT", "42").form(), None);
+    let mut empty = column("VARCHAR", "x");
+    empty.samples.clear();
+    assert_eq!(empty.form(), None);
+}
