@@ -62,11 +62,9 @@ impl StdioPath {
     pub fn named(&self, name: Option<&str>) -> Result<NamedInput> {
         match self {
             Self::Stdio => {
-                let name = name
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("--filename is required when reading from stdin")
-                    })?
-                    .to_owned();
+                // With no name, the bytes say the type: ingestion records
+                // the file as `stdin.<ext>`.
+                let name = name.unwrap_or("-").to_owned();
                 let mut data = Vec::new();
                 std::io::stdin()
                     .read_to_end(&mut data)

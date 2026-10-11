@@ -932,7 +932,8 @@ async fn ingest_unknown_file_type_returns_error() {
         &config,
         &writer,
         workspace_id,
-        &ingestion::NewFile::new("scan.tiff", b"fake image data"),
+        // A TIFF header: binary, and no type quack reads.
+        &ingestion::NewFile::new("scan.tiff", b"II*\x00\x08\x00\x00\x00\x00\x00"),
         None,
     )
     .await;
@@ -942,6 +943,61 @@ async fn ingest_unknown_file_type_returns_error() {
     assert!(
         matches!(err, Error::UnsupportedFileType(_)),
         "expected UnsupportedFileType, got: {err}"
+    );
+}
+
+/// A file whose name says no type is recorded under the extension its
+/// bytes show, and loads as that type: a PDF saved without one, a pipe
+/// with no name, a JSON download.
+#[tokio::test]
+async fn a_file_without_an_extension_is_typed_by_its_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-sniff").unwrap();
+    let writer = writer_of(&db);
+    let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Report");
+    pdf.letter_page()
+        .at(72.0, 720.0)
+        .text("Quarterly report")
+        .done();
+    let pdf = pdf.build().unwrap();
+
+    for (name, bytes, recorded, file_type) in [
+        ("report", pdf.as_slice(), "report.pdf", FileType::Pdf),
+        (
+            "-",
+            b"Standup notes: WH-OAK reopens Oct 18.".as_slice(),
+            "stdin.txt",
+            FileType::Text,
+        ),
+        (
+            "rows",
+            b"[{\"region\": \"West\", \"revenue\": 362}]".as_slice(),
+            "rows.json",
+            FileType::Json,
+        ),
+    ] {
+        let result = ingestion::ingest_file::<MockEmbeddingModel>(
+            &config,
+            &writer,
+            "ws-sniff",
+            &ingestion::NewFile::new(name, bytes),
+            None,
+        )
+        .await
+        .unwrap()
+        .ingested()
+        .unwrap();
+        assert_eq!(result.filename, recorded);
+        assert_eq!(result.file_type, file_type);
+        let doc = db.document(&result.document_id).unwrap().unwrap();
+        assert_eq!(doc.filename, recorded);
+        assert_eq!(doc.status, DocumentStatus::Ready);
+    }
+    assert_eq!(
+        ingestion::recorded_name("notes.md", ingestion::FileData::Bytes(b"%PDF-")).unwrap(),
+        "notes.md",
+        "a name that says a type is kept, whatever the bytes"
     );
 }
 

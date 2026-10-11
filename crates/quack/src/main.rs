@@ -461,7 +461,7 @@ struct IngestArgs {
     /// File path to ingest (use - for stdin)
     file: StdioPath,
 
-    /// Override the filename (required when reading from stdin)
+    /// Override the filename (from stdin without one, the type comes from the bytes)
     #[arg(long)]
     filename: Option<String>,
 
@@ -2441,6 +2441,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         name: effective_filename,
         data,
     } = file.named(filename.as_deref())?;
+    let effective_filename = ingestion::recorded_name(&effective_filename, data.file_data())?;
 
     let ws_db = opened.writer()?;
     let replaces = match replace {
