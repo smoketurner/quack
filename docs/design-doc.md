@@ -3628,10 +3628,11 @@ Every gap is a GitHub issue unless the item says otherwise.
       or their ancestors); and `resource` into a document property candidate, all in the
       ontology review queue. The CLI offers `index.md` as the workspace context; the API
       returns it as `context`.
-14. **No `quack workspace snapshot`**, the only gap here with no issue of its own. Section 15
-    item 3 names it as the supported online backup; there is no `workspace` subcommand and
-    nothing calls `CHECKPOINT`. Today's backup is the directory copy section 15 item 3
-    describes. Sections 15, 19.
+14. ~~No `quack workspace snapshot`~~ (#504, closed): `quack workspace snapshot NAME
+    [--to FILE|-]`, the Settings page's download, and `GET .../snapshot` write one tar
+    (`manifest.json`, then `data.duckdb` copied after a `CHECKPOINT` with every connection to
+    it closed, then `files/`), and `quack workspace restore` and `POST .../workspaces/restore`
+    read it into a new workspace (`storage::backup`, section 11).
 15. **Work queues, first pass** (section 4.1).
     - Done: the terminal, the web chat, REST `query`, uploads, graph extraction, and the
       document pass run on `quack_core::jobs`. `llm::LimitedHttp` limits model requests per
