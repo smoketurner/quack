@@ -18,7 +18,7 @@ use super::parser::FileType;
 const HEAD: usize = 8 * 1024;
 
 /// The extension the bytes `data` show, when they are a type quack reads;
-/// `None` otherwise, a `.doc` among them until there is a parser for it.
+/// `None` otherwise.
 #[must_use]
 pub fn extension(mut data: impl Read + Seek) -> Option<String> {
     let mut head = Vec::with_capacity(HEAD);
