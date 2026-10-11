@@ -3363,7 +3363,7 @@ redirect_uri = "https://quack.example.com/auth/oidc/callback"   # this server's 
     release.
 - **Dependencies** follow the workspace rules in `CLAUDE.md`. This design added `argon2`,
   `rmcp` for MCP, `scraper` for HTML, `zip` + `quick-xml` for DOCX and PPTX (no `docx-rs`),
-  `rust-stemmers`, and `tower_governor`. `yaml-rust2` only reads YAML files at ingest, where
+  `rust-stemmers`, and `tower_governor`. `serde-saphyr` only reads YAML files at ingest, where
   a list of records loads as a table; JSON stays the only ontology interchange form.
   `tauri` comes only if `quack desktop` is built.
 
