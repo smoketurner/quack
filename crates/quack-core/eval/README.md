@@ -79,22 +79,22 @@ misses listed, and `QUACK_EVAL_OUT=eval.json` keeps the
 numbers. Model output varies between runs, so compare a run with the last few, not with
 one.
 
-It needs Ollama running with the models pulled; each is a variable with a default small
-enough for a CPU:
+It needs Ollama running with the models pulled; each is a variable whose default is what a
+developer machine runs (`.github/workflows/eval.yml` names smaller ones for its CPU runner):
 
 | Variable | Default |
 |---|---|
 | `QUACK_EVAL_OLLAMA_URL` | `http://127.0.0.1:11434` |
-| `QUACK_EVAL_CHAT_MODEL` | `qwen2.5:3b` |
-| `QUACK_EVAL_EMBEDDING_MODEL` | `embeddinggemma` |
+| `QUACK_EVAL_CHAT_MODEL` | `gpt-oss:20b` |
+| `QUACK_EVAL_EMBEDDING_MODEL` | `embeddinggemma-2` |
 | `QUACK_EVAL_EMBEDDING_DIMENSION` | `768` |
-| `QUACK_EVAL_VISION_MODEL` | `qwen2.5vl:3b` (`none` skips the vision section) |
+| `QUACK_EVAL_VISION_MODEL` | `gemma4:e4b` (`none` skips the vision section) |
 | `QUACK_EVAL_TURN_SECONDS` | `300`: a question past it is stopped and scored as timed out |
 | `QUACK_EVAL_REPEAT` | `1`: past one, each question is asked that many times and the report counts the questions answered the same every time |
 
 ```bash
 OLLAMA_CONTEXT_LENGTH=16384 ollama serve &
-ollama pull qwen2.5:3b && ollama pull embeddinggemma && ollama pull qwen2.5vl:3b
+ollama pull gpt-oss:20b && ollama pull embeddinggemma-2 && ollama pull gemma4:e4b
 make eval
 ```
 
