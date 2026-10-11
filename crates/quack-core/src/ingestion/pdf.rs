@@ -352,7 +352,7 @@ impl Borderless {
     }
 
     /// Whether `point` lies in the table's area.
-    fn holds(&self, point: &Point) -> bool {
+    fn holds(&self, point: Point) -> bool {
         (self.left..=self.right).contains(&point.x) && (self.bottom..=self.top).contains(&point.y)
     }
 }
@@ -367,15 +367,18 @@ struct Grids<'a> {
 impl Grids<'_> {
     fn contains(&self, span: &TextSpan) -> bool {
         let center = span.bbox.center();
-        in_ruled(&self.ruled, &center) || self.borderless.iter().any(|t| t.holds(&center))
+        in_ruled(&self.ruled, center) || self.borderless.iter().any(|t| t.holds(center))
     }
 }
 
 /// Whether `point` lies inside one of the `ruled` grids.
-fn in_ruled(ruled: &[&PdfTable], point: &Point) -> bool {
-    ruled
-        .iter()
-        .any(|table| table.bbox.as_ref().is_some_and(|b| b.contains_point(point)))
+fn in_ruled(ruled: &[&PdfTable], point: Point) -> bool {
+    ruled.iter().any(|table| {
+        table
+            .bbox
+            .as_ref()
+            .is_some_and(|b| b.contains_point(&point))
+    })
 }
 
 /// A page with its real tables, read for content: chrome regions dropped,
@@ -470,7 +473,7 @@ impl PageContent {
         // Words outside the ruled grids, which already have their tables.
         let loose: Vec<&Word> = words
             .iter()
-            .filter(|w| !in_ruled(&ruled, &w.bbox.center()))
+            .filter(|w| !in_ruled(&ruled, w.bbox.center()))
             .collect();
         let page = Page {
             page,
