@@ -638,6 +638,9 @@ impl Lane<'_> {
             .and_then(|n| n.to_str())
             .map(str::to_owned)
             .ok_or_else(|| ApiError::bad_request("bad file name"))?;
+        // A name without a known extension gets the one its bytes show,
+        // here, so the job that processes it reads the same name.
+        let filename = ingestion::recorded_name(&filename, ingestion::FileData::Bytes(&data))?;
         let size = data.len();
         let name = filename.clone();
         let user = access.identity.user_id.clone();

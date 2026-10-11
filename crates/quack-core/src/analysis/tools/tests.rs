@@ -747,6 +747,7 @@ async fn list_documents_names_the_pages_missing_from_a_document() {
                     total: 40,
                     unreadable: 3,
                     empty: 2,
+                    transcribed: 0,
                 }),
             )
         })

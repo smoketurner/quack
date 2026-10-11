@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
-use quack_core::ingestion::FileData;
+use quack_core::ingestion::{self, FileData};
 use quack_core::storage::workspace::DocumentSource;
 
 /// A file to read or write, or `-` for standard input or output.
@@ -62,15 +62,12 @@ impl StdioPath {
     pub fn named(&self, name: Option<&str>) -> Result<NamedInput> {
         match self {
             Self::Stdio => {
-                let name = name
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("--filename is required when reading from stdin")
-                    })?
-                    .to_owned();
                 let mut data = Vec::new();
                 std::io::stdin()
                     .read_to_end(&mut data)
                     .context("failed to read from stdin")?;
+                // With no name, the bytes say the type: `stdin.<ext>`.
+                let name = ingestion::recorded_name(name.unwrap_or("-"), FileData::Bytes(&data))?;
                 Ok(NamedInput {
                     name,
                     data: InputData::Read(data),
@@ -82,6 +79,8 @@ impl StdioPath {
                     .map(String::from)
                     .or_else(|| path.file_name().and_then(|n| n.to_str()).map(String::from))
                     .unwrap_or_else(|| String::from("unknown"));
+                // A file saved without an extension: its bytes say the type.
+                let name = ingestion::recorded_name(&name, FileData::Path(path))?;
                 Ok(NamedInput {
                     name,
                     data: InputData::File(path.clone()),

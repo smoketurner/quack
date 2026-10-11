@@ -53,6 +53,7 @@ pub fn extract(text: &str) -> Extracted {
         flow: Flow::Sectioned,
         pages: None,
         meta,
+        ..Extracted::default()
     }
 }
 

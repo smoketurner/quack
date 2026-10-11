@@ -53,7 +53,7 @@ impl SessionTitler {
         if !config.analysis.title_sessions {
             return Ok(None);
         }
-        let chat = config.chat_model_ref()?;
+        let chat = config.background_model_ref()?;
         Ok(ChatClient::build(config, &chat)
             .await?
             .optional_schema_call(

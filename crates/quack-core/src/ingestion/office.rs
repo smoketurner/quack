@@ -44,6 +44,7 @@ pub fn docx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         flow: Flow::Sectioned,
         pages: None,
         meta,
+        ..Extracted::default()
     })
 }
 
@@ -113,6 +114,7 @@ pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         flow: Flow::Sectioned,
         pages: None,
         meta,
+        ..Extracted::default()
     })
 }
 

@@ -34,6 +34,7 @@ pub fn eml(data: &[u8]) -> Result<Extracted> {
         flow: Flow::Sectioned,
         pages: None,
         meta,
+        ..Extracted::default()
     })
 }
 

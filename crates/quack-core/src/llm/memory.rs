@@ -59,7 +59,7 @@ impl History {
     pub async fn from_config(config: &Config, db: Arc<Writer>) -> Result<Self> {
         let budget = config.analysis.history_token_budget;
         let compactor = if config.analysis.compact_history {
-            let chat = config.chat_model_ref()?;
+            let chat = config.background_model_ref()?;
             ChatClient::build(config, &chat)
                 .await?
                 .optional_schema_call(
