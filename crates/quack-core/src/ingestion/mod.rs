@@ -15,6 +15,7 @@ pub mod sniff;
 pub mod table;
 pub mod tree;
 pub mod xlsx;
+pub mod yaml;
 pub mod zipped;
 
 use std::borrow::Cow;
@@ -52,6 +53,9 @@ use parser::{
 
 /// What the vision model is asked of a page that has a picture and no text.
 const SCAN_INSTRUCTION: &str = "This is a scanned page of a document. Transcribe its text.";
+/// What the vision model is asked of a picture inside a document.
+const FIGURE_INSTRUCTION: &str = "This picture is a figure inside a document. Transcribe any \
+                                  text, labels, and numbers it shows, then describe what it shows.";
 use table::Table;
 
 /// Result of ingesting a single file into a workspace.
@@ -691,6 +695,40 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 })
             }
             Load::Chunks(format) => self.chunk(format, file_type, &data.bytes().await?).await,
+            Load::Yaml => {
+                let bytes = data.bytes().await?.into_owned();
+                let records = parse_off_runtime({
+                    let bytes = bytes.clone();
+                    move || Ok(std::str::from_utf8(&bytes).ok().and_then(yaml::records))
+                })
+                .await?;
+                let Some(json) = records else {
+                    // Not records: read as text, as YAML always was.
+                    return self.chunk(TextFormat::Code, file_type, &bytes).await;
+                };
+                // The records load as a JSON file would; the copy kept under
+                // `files/` is that JSON.
+                let step = StructuredLoad {
+                    config: config.clone(),
+                    workspace_id: workspace_id.to_owned(),
+                    doc_id: doc_id.clone(),
+                    filename: filename.to_owned(),
+                    data: Original::Bytes(json),
+                    reader: Reader::Json,
+                };
+                let types = self.file.types.clone();
+                let table_name = db
+                    .run(move |db| {
+                        let table = step.load(db)?;
+                        types.finish_load(db, std::slice::from_ref(&table))?;
+                        Ok(table)
+                    })
+                    .await?;
+                Ok(IngestResult {
+                    tables: vec![table_name],
+                    ..IngestResult::of(doc_id, filename, file_type)
+                })
+            }
             Load::Image(format) => self.image(format, file_type).await,
         }
     }
@@ -718,6 +756,99 @@ impl<M: EmbeddingModel> Processing<'_, M> {
             .write(&bytes)
             .await?;
         Ok(result)
+    }
+
+    /// Have the vision model describe the pictures inside the document, up
+    /// to `[ingestion].max_figures`, each into a section where it sits,
+    /// after its alternative text. A picture left unread keeps only its
+    /// alternative text; a document of nothing but unread pictures is
+    /// refused with the setting that would read them.
+    async fn read_figures(&self, extracted: &mut Extracted) -> Result<()> {
+        let figures = std::mem::take(&mut extracted.figures);
+        if figures.is_empty() {
+            return Ok(());
+        }
+        let limit = usize::try_from(self.config.ingestion.max_figures).unwrap_or(usize::MAX);
+        let reader = if limit == 0 {
+            None
+        } else {
+            ImageReader::for_ingest(self.config).await?
+        };
+        let reading = if reader.is_some() {
+            figures.len().min(limit)
+        } else {
+            0
+        };
+        if reading > 0 {
+            tracing::info!(
+                file = %self.file.filename,
+                figures = reading,
+                "the vision model is reading the pictures inside the document"
+            );
+        }
+        let mut read = Vec::with_capacity(figures.len());
+        for (n, figure) in figures.iter().enumerate() {
+            let described = match &reader {
+                Some(reader) if n < limit => {
+                    let result = self
+                        .file
+                        .control
+                        .or_cancelled(reader.read(&figure.image, figure.format, FIGURE_INSTRUCTION))
+                        .await;
+                    match result {
+                        Ok(text) => Some(text),
+                        // A cancel, a sign-in, or a refused provider stops
+                        // the document; one picture the model could not
+                        // read leaves out only that picture.
+                        Err(e @ (Error::Cancelled | Error::AuthRequired { .. })) => return Err(e),
+                        Err(e) if e.is_provider_refusal() => return Err(e),
+                        Err(e) => {
+                            tracing::warn!(
+                                file = %self.file.filename,
+                                figure = n,
+                                error = %e,
+                                "the vision model could not read a picture inside the document"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let text = [figure.alt.as_deref(), described.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if !text.is_empty() {
+                read.push((
+                    figure.at,
+                    Section::body(figure.heading.clone(), format!("Figure: {text}"))
+                        .on_page(figure.page),
+                ));
+            }
+        }
+        let unread = figures.len().saturating_sub(reading);
+        if unread > 0 {
+            tracing::warn!(
+                file = %self.file.filename,
+                unread,
+                limit,
+                vision_model = reader.is_some(),
+                "pictures inside the document were not read"
+            );
+        }
+        extracted.insert_figures(read);
+        if extracted.sections.is_empty() && extracted.scans.is_empty() {
+            return Err(Error::Ingestion(format!(
+                "no extractable text: {} holds only pictures; set [ingestion].vision_model \
+                 to have them read",
+                OneLine(self.file.filename)
+            )));
+        }
+        Ok(())
     }
 
     /// Have the vision model transcribe the pages that hold a picture and
@@ -792,6 +923,9 @@ impl<M: EmbeddingModel> Processing<'_, M> {
             Ok((parsing, extracted))
         })
         .await?;
+        // Figures first: they are placed by section index, which the
+        // scans' pages would move.
+        self.read_figures(&mut extracted).await?;
         self.read_scans(&mut extracted).await?;
         let Parsed {
             title,
@@ -870,6 +1004,9 @@ struct Parsing {
     chunk_overlap: u32,
     encoding: String,
     table_rows_as_table: u32,
+    /// Whether a PDF's pictures on pages with text are taken: only when a
+    /// vision model will read them.
+    figures: bool,
 }
 
 /// What parsing a document found.
@@ -897,6 +1034,7 @@ impl Parsing {
             chunk_overlap: config.ingestion.chunk_overlap_tokens,
             encoding: config.ingestion.tokenizer_encoding.clone(),
             table_rows_as_table: config.ingestion.table_rows_as_table,
+            figures: config.ingestion.vision_model.is_some() && config.ingestion.max_figures > 0,
         }
     }
 
@@ -906,7 +1044,10 @@ impl Parsing {
     fn extract(&mut self) -> Result<Extracted> {
         let budget = std::mem::replace(&mut self.budget, DecompressionBudget::megabytes(0));
         let data = std::mem::take(&mut self.data);
-        self.format.extract(&data, budget)
+        match self.format {
+            TextFormat::Pdf => pdf::extract(&data, self.figures),
+            format => format.extract(&data, budget),
+        }
     }
 
     /// Chunk `extracted`, and find the tables inside it big enough to load.
@@ -996,7 +1137,10 @@ impl Piped {
             return Self::Table;
         };
         match FileType::of(&name).map(FileType::load) {
-            Some(Load::Table(_) | Load::Chunks(TextFormat::Text)) | None => Self::Table,
+            // YAML is text to the sniffer, so piped it stays text, as before.
+            Some(Load::Table(_) | Load::Yaml | Load::Chunks(TextFormat::Text)) | None => {
+                Self::Table
+            }
             Some(Load::Workbook | Load::Chunks(_) | Load::Image(_)) => Self::Document { name },
         }
     }

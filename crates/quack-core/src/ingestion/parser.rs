@@ -37,6 +37,8 @@ pub enum FileType {
     /// Source code, chunked by line with line-number locators.
     Code,
     Rtf,
+    /// YAML: a list of records loads as a table, anything else as text.
+    Yaml,
     /// A picture, read by `[ingestion].vision_model`.
     Image(ImageFormat),
 }
@@ -85,6 +87,8 @@ pub enum Load {
     Chunks(TextFormat),
     /// A picture a vision model describes; its description is chunked.
     Image(ImageFormat),
+    /// YAML: a table when it is a list of records, else chunked as text.
+    Yaml,
 }
 
 impl Load {
@@ -93,7 +97,8 @@ impl Load {
     pub const fn makes_tables(self) -> bool {
         match self {
             Self::Table(_) | Self::Workbook => true,
-            Self::Chunks(_) | Self::Image(_) => false,
+            // Not every YAML file is a table, so it is not offered as one.
+            Self::Chunks(_) | Self::Image(_) | Self::Yaml => false,
         }
     }
 }
@@ -234,6 +239,7 @@ impl FileType {
             Self::Vtt => Load::Chunks(TextFormat::Vtt),
             Self::Srt => Load::Chunks(TextFormat::Srt),
             Self::Code => Load::Chunks(TextFormat::Code),
+            Self::Yaml => Load::Yaml,
             Self::Rtf => Load::Chunks(TextFormat::Rtf),
             Self::Image(format) => Load::Image(format),
         }
@@ -272,6 +278,7 @@ impl FileType {
             Self::Vtt => "text/vtt",
             Self::Srt => "application/x-subrip",
             Self::Code => "text/x-source",
+            Self::Yaml => "application/yaml",
             Self::Rtf => "application/rtf",
             Self::Image(format) => format.mime_type(),
         }
@@ -301,6 +308,7 @@ impl std::fmt::Display for FileType {
             Self::Vtt => "WebVTT captions",
             Self::Srt => "SubRip captions",
             Self::Code => "Source code",
+            Self::Yaml => "YAML",
             Self::Rtf => "Rich Text",
             Self::Image(_) => "Image",
         };
@@ -337,6 +345,46 @@ pub struct Scan {
     pub format: ImageFormat,
 }
 
+/// An image inside a document (a chart on a slide, a figure in a report,
+/// a picture in a Word file), for the vision model to describe where it
+/// sits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Figure {
+    /// Where it goes: before the section at this index of the sections as
+    /// parsed, so at their end when it equals their count.
+    pub at: usize,
+    /// The heading of the text around it.
+    pub heading: Option<String>,
+    /// The page or slide it is on, from 1.
+    pub page: Option<u32>,
+    /// The alternative text the author gave it.
+    pub alt: Option<String>,
+    pub image: Vec<u8>,
+    pub format: ImageFormat,
+}
+
+/// The figures of one document, each picture once: a logo on every page
+/// is read once, where it first appears.
+#[derive(Debug, Default)]
+pub(crate) struct Figures {
+    seen: std::collections::HashSet<Vec<u8>>,
+    list: Vec<Figure>,
+}
+
+impl Figures {
+    /// Keep `figure` unless the same picture was already kept.
+    pub(crate) fn add(&mut self, figure: Figure) {
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &figure.image);
+        if self.seen.insert(digest.as_ref().to_vec()) {
+            self.list.push(figure);
+        }
+    }
+
+    pub(crate) fn finish(self) -> Vec<Figure> {
+        self.list
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Extracted {
     pub title: Option<String>,
@@ -350,6 +398,9 @@ pub struct Extracted {
     /// model to read before chunking (only a PDF has them). Each one is
     /// counted in `pages.empty` until it is read.
     pub scans: Vec<Scan>,
+    /// Images inside the document, in document order, for the vision
+    /// model to describe before chunking (PDF, DOCX, and PPTX have them).
+    pub figures: Vec<Figure>,
 }
 
 /// What a file says about itself: who wrote it and when, its tags, and
@@ -461,6 +512,17 @@ impl PageCounts {
 }
 
 impl Extracted {
+    /// Put each `(at, section)` before the section that was at `at` when
+    /// the figures were found, keeping their order.
+    pub fn insert_figures(&mut self, sections: Vec<(usize, Section)>) {
+        // Back to front, so an index is not moved by an insertion before
+        // it; equal indexes keep their order.
+        for (at, section) in sections.into_iter().rev() {
+            let at = at.min(self.sections.len());
+            self.sections.insert(at, section);
+        }
+    }
+
     /// Put `sections`, each on a page, among the document's in page order:
     /// each after the last section on its page or an earlier one.
     pub fn insert_by_page(&mut self, sections: Vec<Section>) {
@@ -671,8 +733,8 @@ const EXTENSIONS: &[(&str, FileType)] = &[
     ("sh", FileType::Code),
     ("sql", FileType::Code),
     ("toml", FileType::Code),
-    ("yaml", FileType::Code),
-    ("yml", FileType::Code),
+    ("yaml", FileType::Yaml),
+    ("yml", FileType::Yaml),
 ];
 
 impl TextFormat {
@@ -691,7 +753,7 @@ impl TextFormat {
     /// supported), or if a zipped format inflates past `budget`.
     pub fn extract(self, data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         match self {
-            Self::Pdf => pdf::extract(data),
+            Self::Pdf => pdf::extract(data, false),
             Self::Markdown => Ok(markdown::extract(&utf8(data)?)),
             Self::Text => Ok(Extracted {
                 sections: vec![Section::body(None, utf8(data)?)],
@@ -774,6 +836,13 @@ impl SectionBuilder {
         if !section.text.trim().is_empty() {
             self.sections.push(section);
         }
+    }
+
+    /// End the current body section, and say where the next section goes
+    /// and under what heading: where an image found now sits.
+    pub(crate) fn mark(&mut self) -> (usize, Option<String>) {
+        self.flush();
+        (self.sections.len(), self.heading.clone())
     }
 
     fn flush(&mut self) {
