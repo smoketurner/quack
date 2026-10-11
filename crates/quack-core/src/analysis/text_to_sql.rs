@@ -205,8 +205,6 @@ pub struct BuiltPrompt {
     pub text: String,
     pub modeled: Modeled,
     pub tables: TableLayout,
-    /// The workspace holds tables or documents an answer could come from.
-    pub holds_data: bool,
     /// The workspace holds ready documents, which `always_retrieve =
     /// "auto"` retrieves from up front.
     pub has_documents: bool,
@@ -323,7 +321,6 @@ impl SystemPrompt {
             text: prompt.text,
             modeled,
             tables: layout,
-            holds_data: !tables.is_empty() || documents > 0,
             has_documents: documents > 0,
         })
     }
