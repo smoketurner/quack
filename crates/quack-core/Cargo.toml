@@ -71,6 +71,7 @@ tracing       = { workspace = true, features = ["std"] }
 utoipa        = { workspace = true, features = ["macros", "uuid", "jiff_0_2"] }
 uuid          = { workspace = true, features = ["std", "v7"] }
 whatlang      = { workspace = true }
+serde-saphyr  = { workspace = true, features = ["deserialize"] }
 zip           = { workspace = true, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
