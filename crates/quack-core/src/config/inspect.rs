@@ -380,6 +380,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "max_decompressed_mb",
             "table_rows_as_table",
             "vision_model",
+            "max_figures",
         ],
     ),
     (
@@ -750,6 +751,7 @@ fn ingestion(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) 
     );
     let vision = ingestion.vision_model.as_ref().map(ToString::to_string);
     s.optional_text("vision_model", vision.as_deref(), None);
+    s.literal("max_figures", ingestion.max_figures, default.max_figures);
 }
 
 /// The model, its width, and the prefix in force for each role: the
