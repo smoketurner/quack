@@ -53,7 +53,9 @@ dataset `examples/storms/` uses.
   each is expected to survive `analysis::citations::validate`.
 - `agent_questions.json` — questions for the agent under `make eval`, each with the values
   its answer must hold (every group matched by one of its strings, ignoring case), the
-  tools it should come from, and whether it should cite a passage. `kind` is `table`
+  tools it should come from (table questions only: passages `always_retrieve` puts in the
+  prompt can answer a document question with no tool, so its citation shows the
+  grounding), and whether it should cite a passage. `kind` is `table`
   (answered by SQL over `tables/`) or `document` (from `documents/`).
 - `vision/shelter-notice.jpg` — a picture of a short notice for the vision model, read
   three ways under `make eval`: as an image, as the only picture on a PDF page, and as a

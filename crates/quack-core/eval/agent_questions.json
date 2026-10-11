@@ -39,56 +39,48 @@
     "question": "What are the estimated wind speeds for an EF2 tornado?",
     "kind": "document",
     "expect": [["111"], ["135"]],
-    "tools": ["search_documents", "read_document"],
     "cite": true
   },
   {
     "question": "Where did the tornado in storm report SR-8841 touch down?",
     "kind": "document",
     "expect": [["rutherford"]],
-    "tools": ["search_documents", "read_document"],
     "cite": true
   },
   {
     "question": "How much snow fell during storm report SR-6688?",
     "kind": "document",
     "expect": [["fourteen", "14"]],
-    "tools": ["search_documents", "read_document"],
     "cite": true
   },
   {
     "question": "Who is the readiness lead for the Jackson forecast office?",
     "kind": "document",
     "expect": [["natarajan"]],
-    "tools": ["search_documents", "read_document"],
     "cite": true
   },
   {
     "question": "How many cots does the fairgrounds pavilion shelter hold?",
     "kind": "document",
     "expect": [["400"]],
-    "tools": ["search_documents", "read_document"],
     "cite": true
   },
   {
     "question": "Which dam's spillway gate test was rated urgent?",
     "kind": "document",
     "expect": [["cedar hollow"]],
-    "tools": ["search_documents", "read_document"],
     "cite": true
   },
   {
     "question": "In the storm data, what does a fatality code of I mean?",
     "kind": "document",
     "expect": [["indirect"]],
-    "tools": ["search_documents", "read_document"],
     "cite": true
   },
   {
     "question": "What is the sustained wind speed range of a Category 4 hurricane?",
     "kind": "document",
     "expect": [["130"], ["156"]],
-    "tools": ["search_documents", "read_document"],
     "cite": true
   }
 ]

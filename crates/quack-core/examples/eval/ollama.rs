@@ -164,7 +164,7 @@ impl ModelsReport {
                 out,
                 "{kind:<10} {:>8} {:>10} {:>10} {:>8} {:>8} {:>10.1}",
                 format!("{}/{}", tally.correct, tally.n),
-                format!("{}/{}", tally.right_tool, tally.n),
+                format!("{}/{}", tally.right_tool, tally.tooled),
                 format!("{}/{}", tally.cited, tally.citing),
                 tally.think_leaks,
                 tally.errors,
@@ -271,6 +271,10 @@ struct AgentCase {
     /// Every group must be matched by one of its strings, ignoring case.
     expect: Vec<Vec<String>>,
     /// The tools an answer should come from; any one of them will do.
+    /// Empty for a question passages put in the prompt can answer
+    /// (`[retrieval].always_retrieve`), where the citation shows the
+    /// grounding instead.
+    #[serde(default)]
     tools: Vec<ToolName>,
     /// Whether the answer should cite a passage.
     #[serde(default)]
@@ -282,7 +286,8 @@ struct AgentOutcome {
     question: String,
     kind: String,
     correct: bool,
-    right_tool: bool,
+    /// `None` when the question names no tool.
+    right_tool: Option<bool>,
     /// `None` when the question does not call for a citation.
     cited: Option<bool>,
     think_leak: bool,
@@ -297,7 +302,9 @@ struct AgentOutcome {
 struct Tally {
     n: usize,
     correct: usize,
+    /// Of `tooled`, the questions answered through a tool they name.
     right_tool: usize,
+    tooled: usize,
     /// Of `citing`, the questions whose answer cited a passage.
     cited: usize,
     citing: usize,
@@ -311,7 +318,12 @@ impl Tally {
         let count = |flag: bool| usize::from(flag);
         self.n = self.n.saturating_add(1);
         self.correct = self.correct.saturating_add(count(outcome.correct));
-        self.right_tool = self.right_tool.saturating_add(count(outcome.right_tool));
+        self.tooled = self
+            .tooled
+            .saturating_add(count(outcome.right_tool.is_some()));
+        self.right_tool = self
+            .right_tool
+            .saturating_add(count(outcome.right_tool == Some(true)));
         self.citing = self.citing.saturating_add(count(outcome.cited.is_some()));
         self.cited = self
             .cited
@@ -380,7 +392,8 @@ async fn evaluate_agent(
                             .iter()
                             .any(|want| answer.contains(&want.to_lowercase()))
                     }),
-                    right_tool: tools.iter().any(|t| case.tools.contains(t)),
+                    right_tool: (!case.tools.is_empty())
+                        .then(|| tools.iter().any(|t| case.tools.contains(t))),
                     cited: case.cite.then_some(!response.citations.is_empty()),
                     think_leak: answer.contains("<think>") || answer.contains("</think>"),
                     tools,
@@ -393,7 +406,7 @@ async fn evaluate_agent(
             }
             Err(e) => AgentOutcome {
                 correct: false,
-                right_tool: false,
+                right_tool: (!case.tools.is_empty()).then_some(false),
                 cited: case.cite.then_some(false),
                 think_leak: false,
                 tools: Vec::new(),
