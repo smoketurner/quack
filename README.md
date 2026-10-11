@@ -174,7 +174,7 @@ supply chain shipments.
 ```bash
 quack workspace create sales             # -w names a workspace that exists; with no -w, commands use "default"
 quack ingest sales.csv -w sales          # CSV, Parquet, JSON, and XLSX become tables
-quack ingest policy.pdf -w sales --pin   # PDF, DOCX, PPTX, HTML, Markdown, and text become chunks; --pin puts the full text in every prompt
+quack ingest policy.pdf -w sales --pin   # PDF, DOCX, DOC, PPTX, PPT, HTML, Markdown, and text become chunks; --pin puts the full text in every prompt
 quack ingest policy.pdf -w sales --replace   # a changed file takes the old document's place once ready; the old one stays until then
 quack ingest contracts/ -w sales [--prune]   # every supported file in a folder; run it again to pick up changed files and report (or --prune) deleted ones
 quack import sqlite:/data/shop.db --table orders --from orders   # snapshot a SQLite query, or an https file
