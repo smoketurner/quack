@@ -985,18 +985,14 @@ mod tests {
             .letter_page()
             .at(72.0, 720.0)
             .text("Revenue held in the East and fell in the West.");
-        for (index, cells) in [
-            ["Region", "Jul", "Aug", "Sep"],
-            ["North", "410", "432", "455"],
-            ["East", "520", "548", "590"],
-            ["West", "480", "401", "362"],
-        ]
-        .iter()
-        .enumerate()
-        {
-            let y = 680.0 - 18.0 * f32::from(u8::try_from(index).unwrap_or(0));
-            for (column, cell) in cells.iter().enumerate() {
-                let x = 72.0 + 60.0 * f32::from(u8::try_from(column).unwrap_or(0));
+        let rows = [
+            (680.0, ["Region", "Jul", "Aug", "Sep"]),
+            (662.0, ["North", "410", "432", "455"]),
+            (644.0, ["East", "520", "548", "590"]),
+            (626.0, ["West", "480", "401", "362"]),
+        ];
+        for (y, cells) in rows {
+            for (x, cell) in [72.0, 132.0, 192.0, 252.0].into_iter().zip(cells) {
                 page = page.at(x, y).text(cell);
             }
         }
