@@ -45,7 +45,7 @@ fn binary(head: &[u8]) -> Option<&'static str> {
     (head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP")).then_some("webp")
 }
 
-/// An Office, OpenDocument, or EPUB package, by the parts it holds.
+/// An Office, `OpenDocument`, or EPUB package, by the parts it holds.
 fn archive(data: impl Read + Seek) -> Option<&'static str> {
     let mut zip = zip::ZipArchive::new(data).ok()?;
     let holds = |name: &str| zip.file_names().any(|n| n == name);
