@@ -1770,7 +1770,11 @@ terminal as a system line, SSE as a `status` event.
    and range (compact), capped at 30 items per section with the rest counted, since an
    induced ontology has a class per table; `describe_class` has what the cap omits. Node and
    edge counts, and whether the graph is provisional or stale, follow only when the graph
-   has content.
+   has content. Then, only when there is something to say, one upkeep line naming what the
+   agent cannot run itself: chunks graph extraction has not read (with an ontology) and
+   vectors the configured embedding model did not make, each with its command (`quack graph
+   extract`, `quack embeddings refresh`), and the rule to name it when an answer may be
+   incomplete for it.
 6. Global context prefix, then the workspace context.
 7. Past 25 tables, the five tables the question ranks highest (`analysis::table_search`, the
    ranking `find_tables` uses), each described in full unless the tables block already did.

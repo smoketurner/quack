@@ -104,6 +104,51 @@ fn the_graph_procedure_appears_only_once_the_graph_has_nodes() {
     assert!(with.contains("Knowledge graph: 1 nodes, 0 edges"), "{with}");
 }
 
+/// Chunks the graph has not read are named, with the command that reads
+/// them, once there is an ontology to read them into; not before.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn chunks_the_graph_has_not_read_are_named_with_the_command() {
+    const UPKEEP: &str = "1 document chunks have not been extracted into the knowledge graph \
+                          (`quack graph extract`)";
+    let db = db();
+    let doc = DocumentId::from("d1");
+    db.insert_document(
+        &NewDocument::new(&doc, "memo.md", "text/markdown", 1).with_status(DocumentStatus::Ready),
+    )
+    .unwrap();
+    db.chunk_writer(&doc, "WH-OAK reopens Oct 18.")
+        .and_then(|writer| {
+            writer.insert(&NewChunk {
+                id: &ChunkId::from("c1"),
+                chunk_index: 0,
+                content: "WH-OAK reopens Oct 18.",
+                heading: None,
+                page: None,
+                kind: SectionKind::Body,
+                locator: None,
+                embedding: None,
+            })
+        })
+        .unwrap();
+    let before = SystemPrompt::build(&db, &options(ChatMode::Chat, 0))
+        .unwrap()
+        .text;
+    assert!(!before.contains("Workspace upkeep"), "{before}");
+
+    ontology_store::save(
+        &db,
+        &Ontology::builtin_default(),
+        Revision::reviewed(Some("tester"), None),
+    )
+    .unwrap();
+    let after = SystemPrompt::build(&db, &options(ChatMode::Chat, 0))
+        .unwrap()
+        .text;
+    assert!(after.contains(UPKEEP), "{after}");
+    assert!(after.contains("say so and name the command"), "{after}");
+}
+
 /// The stable part of the prompt (role, tool guidance, dialect, table
 /// and document schema, ontology) must come out byte-identical across
 /// two calls with nothing in the workspace changed, and the whole

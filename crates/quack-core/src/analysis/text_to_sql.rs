@@ -9,7 +9,7 @@ use crate::ingestion::parser::PageCounts;
 use crate::ontology::{Ontology, store as ontology_store};
 use crate::storage::sessions::ChatMode;
 use crate::storage::workspace::{
-    ColumnInfo, PinnedDocument, PinnedText, TableDescription, WorkspaceDb,
+    ColumnInfo, PinnedDocument, PinnedText, SamplePool, TableDescription, WorkspaceDb,
 };
 use crate::text::{Fenced, OneLine, Tokens};
 use jiff::civil::Date;
@@ -309,6 +309,7 @@ impl SystemPrompt {
             )?;
             writeln!(prompt.text)?;
         }
+        prompt.upkeep(db, ontology.is_some())?;
 
         prompt.context(options)?;
         prompt.ranked_tables(db, ontology.as_ref(), &tables, options)?;
@@ -412,6 +413,40 @@ impl SystemPrompt {
     /// question out (`list_documents` has the rest). Returns how many
     /// documents the workspace holds, so the caller can tell an empty
     /// workspace from a full one.
+    /// What the workspace has left undone that an answer may need: chunks
+    /// the graph has not read (only once an ontology exists to read them
+    /// into), and vectors the configured embedding model did not make,
+    /// which vector search skips. The agent cannot run either; it says so,
+    /// with the command, when an answer may be incomplete for it.
+    fn upkeep(&mut self, db: &WorkspaceDb, has_ontology: bool) -> Result<()> {
+        let mut notes = Vec::new();
+        if has_ontology {
+            let pending = db.pool_size(SamplePool::NotGraphExtracted)?;
+            if pending > 0 {
+                notes.push(format!(
+                    "{pending} document chunks have not been extracted into the knowledge graph \
+                     (`quack graph extract`)"
+                ));
+            }
+        }
+        if let Some(note) = db.embedding_status()?.note() {
+            notes.push(format!(
+                "{} (`quack embeddings refresh`)",
+                note.trim_end_matches('.')
+            ));
+        }
+        if !notes.is_empty() {
+            writeln!(
+                self.text,
+                "Workspace upkeep you cannot run yourself: {}. When an answer may be incomplete \
+                 because of it, say so and name the command.",
+                notes.join("; ")
+            )?;
+            writeln!(self.text)?;
+        }
+        Ok(())
+    }
+
     fn documents(&mut self, db: &WorkspaceDb) -> Result<usize> {
         let (docs, total) = db.recent_documents(LISTED_DOCUMENTS)?;
         if docs.is_empty() {
