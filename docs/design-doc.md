@@ -3363,8 +3363,9 @@ redirect_uri = "https://quack.example.com/auth/oidc/callback"   # this server's 
     release.
 - **Dependencies** follow the workspace rules in `CLAUDE.md`. This design added `argon2`,
   `rmcp` for MCP, `scraper` for HTML, `zip` + `quick-xml` for DOCX and PPTX (no `docx-rs`),
-  `rust-stemmers`, and `tower_governor`. No YAML crate: JSON is the only ontology
-  interchange form. `tauri` comes only if `quack desktop` is built.
+  `rust-stemmers`, and `tower_governor`. `yaml-rust2` only reads YAML files at ingest, where
+  a list of records loads as a table; JSON stays the only ontology interchange form.
+  `tauri` comes only if `quack desktop` is built.
 
 ---
 
@@ -3674,7 +3675,7 @@ Every gap is a GitHub issue unless the item says otherwise.
   classified inside it; `control.db` holds access control only; audit split at the boundary
 - Documents: upload, paste, path, stdin; PDF, Markdown, text, HTML, DOCX, PPTX; chunk
   metadata; hybrid retrieval; citations; pinned documents; SHA dedup; chat and query modes
-- Tables: CSV/TSV/Parquet/JSON/JSONL/XLSX; snapshot imports from SQLite and http(s) data
+- Tables: CSV/TSV/Parquet/JSON/JSONL/XLSX, and YAML lists of records; snapshot imports from SQLite and http(s) data
   files through `quack import` (no `ATTACH`; Postgres, MySQL, and S3 URLs are refused)
 - Ontology: stored in workspace tables with inheritance, relations with domain/range, typed
   properties, table mappings, built-in default, versioning with snapshot, diff, restore,

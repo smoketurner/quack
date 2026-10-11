@@ -33,6 +33,8 @@ pub enum FileType {
     /// Source code, chunked by line with line-number locators.
     Code,
     Rtf,
+    /// YAML: a list of records loads as a table, anything else as text.
+    Yaml,
     /// A picture, read by `[ingestion].vision_model`.
     Image(ImageFormat),
 }
@@ -81,6 +83,8 @@ pub enum Load {
     Chunks(TextFormat),
     /// A picture a vision model describes; its description is chunked.
     Image(ImageFormat),
+    /// YAML: a table when it is a list of records, else chunked as text.
+    Yaml,
 }
 
 impl Load {
@@ -89,7 +93,8 @@ impl Load {
     pub const fn makes_tables(self) -> bool {
         match self {
             Self::Table(_) | Self::Workbook => true,
-            Self::Chunks(_) | Self::Image(_) => false,
+            // Not every YAML file is a table, so it is not offered as one.
+            Self::Chunks(_) | Self::Image(_) | Self::Yaml => false,
         }
     }
 }
@@ -226,6 +231,7 @@ impl FileType {
             Self::Vtt => Load::Chunks(TextFormat::Vtt),
             Self::Srt => Load::Chunks(TextFormat::Srt),
             Self::Code => Load::Chunks(TextFormat::Code),
+            Self::Yaml => Load::Yaml,
             Self::Rtf => Load::Chunks(TextFormat::Rtf),
             Self::Image(format) => Load::Image(format),
         }
@@ -262,6 +268,7 @@ impl FileType {
             Self::Vtt => "text/vtt",
             Self::Srt => "application/x-subrip",
             Self::Code => "text/x-source",
+            Self::Yaml => "application/yaml",
             Self::Rtf => "application/rtf",
             Self::Image(format) => format.mime_type(),
         }
@@ -289,6 +296,7 @@ impl std::fmt::Display for FileType {
             Self::Vtt => "WebVTT captions",
             Self::Srt => "SubRip captions",
             Self::Code => "Source code",
+            Self::Yaml => "YAML",
             Self::Rtf => "Rich Text",
             Self::Image(_) => "Image",
         };
@@ -657,8 +665,8 @@ const EXTENSIONS: &[(&str, FileType)] = &[
     ("sh", FileType::Code),
     ("sql", FileType::Code),
     ("toml", FileType::Code),
-    ("yaml", FileType::Code),
-    ("yml", FileType::Code),
+    ("yaml", FileType::Yaml),
+    ("yml", FileType::Yaml),
 ];
 
 impl TextFormat {

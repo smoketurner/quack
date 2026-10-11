@@ -1001,6 +1001,61 @@ async fn a_file_without_an_extension_is_typed_by_its_bytes() {
     );
 }
 
+/// A YAML list of records loads as a table named after the file, its
+/// nested lists kept; any other YAML is chunked as text, as before.
+#[tokio::test]
+async fn yaml_records_load_as_a_table_and_other_yaml_as_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-yaml").unwrap();
+    let writer = writer_of(&db);
+    let records = b"warehouses:\n  - id: WH-OAK\n    city: Oakland\n    serves: [West]\n    \
+                    reopen: 2026-10-18\n  - id: WH-RNO\n    city: Reno\n    serves: [West]\n  \
+                    - id: WH-PDX\n    city: Portland\n    serves: [North, East]\n";
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
+        &config,
+        &writer,
+        "ws-yaml",
+        &ingestion::NewFile::new("warehouses.yaml", records),
+        None,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(result.tables, vec![String::from("warehouses")]);
+    assert_eq!(result.chunks_stored, 0);
+    let rows = db
+        .execute_query("SELECT id, city, len(serves) FROM warehouses ORDER BY id")
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(
+        rows.first(),
+        Some(&vec![
+            serde_json::json!("WH-OAK"),
+            serde_json::json!("Oakland"),
+            serde_json::json!(1)
+        ]),
+        "{rows:?}"
+    );
+
+    let config_yaml = b"server:\n  port: 8080\nlog: info\n";
+    let text = ingestion::ingest_file::<MockEmbeddingModel>(
+        &config,
+        &writer,
+        "ws-yaml",
+        &ingestion::NewFile::new("settings.yml", config_yaml),
+        None,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert!(text.tables.is_empty());
+    assert!(text.chunks_stored > 0);
+}
+
 /// An empty file of a chunked type is refused like an empty table file:
 /// a document with nothing in it would only ever answer "no results".
 #[tokio::test]

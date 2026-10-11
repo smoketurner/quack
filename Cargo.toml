@@ -131,6 +131,7 @@ uuid                 = { version = "=1.28.0", default-features = false } # IDs â
 webpki-roots         = { version = "=1.0.9", default-features = false }
 whatlang             = { version = "=0.18.0", default-features = false } # per-document language detection for the keyword index
 windows-native-keyring-store = { version = "=1.1.0", default-features = false }
+yaml-rust2           = { version = "=0.13.0", default-features = false } # YAML records loaded as tables
 zip                  = { version = "=8.6.0", default-features = false } # calamine's version, to keep one copy
 
 # ---------------------------------------------------------------------------

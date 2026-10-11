@@ -15,6 +15,7 @@ pub mod sniff;
 pub mod table;
 pub mod tree;
 pub mod xlsx;
+pub mod yaml;
 pub mod zipped;
 
 use std::borrow::Cow;
@@ -684,6 +685,40 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 })
             }
             Load::Chunks(format) => self.chunk(format, file_type, &data.bytes().await?).await,
+            Load::Yaml => {
+                let bytes = data.bytes().await?.into_owned();
+                let records = parse_off_runtime({
+                    let bytes = bytes.clone();
+                    move || Ok(std::str::from_utf8(&bytes).ok().and_then(yaml::records))
+                })
+                .await?;
+                let Some(json) = records else {
+                    // Not records: read as text, as YAML always was.
+                    return self.chunk(TextFormat::Code, file_type, &bytes).await;
+                };
+                // The records load as a JSON file would; the copy kept under
+                // `files/` is that JSON.
+                let step = StructuredLoad {
+                    config: config.clone(),
+                    workspace_id: workspace_id.to_owned(),
+                    doc_id: doc_id.clone(),
+                    filename: filename.to_owned(),
+                    data: Original::Bytes(json),
+                    reader: Reader::Json,
+                };
+                let types = self.file.types.clone();
+                let table_name = db
+                    .run(move |db| {
+                        let table = step.load(db)?;
+                        types.finish_load(db, std::slice::from_ref(&table))?;
+                        Ok(table)
+                    })
+                    .await?;
+                Ok(IngestResult {
+                    tables: vec![table_name],
+                    ..IngestResult::of(doc_id, filename, file_type)
+                })
+            }
             Load::Image(format) => self.image(format, file_type).await,
         }
     }
