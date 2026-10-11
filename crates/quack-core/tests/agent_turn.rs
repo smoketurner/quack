@@ -705,12 +705,17 @@ async fn a_rejected_calls_text_is_left_out_of_the_answer() {
         (
             vec![
                 turn(vec![text("Let me look into that. "), unknown()]),
+                turn(vec![tool()]),
                 turn(vec![text("There is one table, sales.")]),
             ],
             "There is one table, sales.",
         ),
         (
-            vec![turn(vec![text("   ")]), turn(vec![text("Two regions.")])],
+            vec![
+                turn(vec![text("   ")]),
+                turn(vec![tool()]),
+                turn(vec![text("Two regions.")]),
+            ],
             "Two regions.",
         ),
         (
@@ -764,12 +769,45 @@ async fn an_empty_reply_is_asked_for_again() {
     let db = workspace();
     let model = MockCompletionModel::from_stream_turns([
         turn(Vec::new()),
+        turn(vec![call("t1", "list_tables", serde_json::json!({}))]),
         turn(vec![text("Two regions.")]),
     ]);
     let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "regions?").await;
     assert_eq!(ran.answer().content, "Two regions.");
     let retry = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
     assert!(retry.contains("Your last reply was empty"), "{retry}");
+}
+
+/// In a workspace that holds data, a turn that ran no tool has no answer
+/// to show, whatever the model wrote: the person is told what the
+/// workspace holds. A workspace holding nothing keeps the model's text.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_from_a_turn_that_ran_nothing_is_not_shown() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([turn(vec![text("North fell by 100.")])]);
+    let ran = run_turn(
+        &db,
+        &model,
+        WritePolicy::Deny,
+        Vec::new(),
+        "which region fell?",
+    )
+    .await;
+    let answer = ran.answer();
+    assert_eq!(
+        answer.content,
+        "quack ran no query and no search for this question, so there is no answer to show. \
+         The workspace holds the table sales, and 1 document. Ask about them, naming the \
+         table or the document when you can."
+    );
+    assert!(answer.citations.is_empty());
+    assert_eq!(model.request_count(), 1);
+
+    let empty =
+        Arc::new(Writer::spawn(WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap()).unwrap());
+    let model = MockCompletionModel::from_stream_turns([turn(vec![text("Hello there.")])]);
+    let ran = run_turn(&empty, &model, WritePolicy::Deny, Vec::new(), "hi").await;
+    assert_eq!(ran.answer().content, "Hello there.");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -791,7 +829,10 @@ async fn a_second_empty_reply_ends_the_turn_with_the_note() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_malformed_history_is_dropped_with_a_warning() {
     let db = workspace();
-    let model = MockCompletionModel::from_stream_turns([turn(vec![text("Hello.")])]);
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![call("t1", "list_tables", serde_json::json!({}))]),
+        turn(vec![text("Hello.")]),
+    ]);
     // Two assistant messages in a row: rig refuses such a transcript.
     let history = vec![
         Message::user("hi"),

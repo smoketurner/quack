@@ -248,7 +248,9 @@ retried with the real names (twice at most), an empty reply is asked for once mo
 tool call repeating one the turn made (same tool and arguments) is not run again
 (`RepeatedCalls`). `DuckDB` provides the answers (design doc 7.7, `analysis::grounding`): the
 SQL and the rows it returned are the record of every answer, shown on each step in every
-interface; the model's prose is never checked against them. The question's words are matched
+interface; the model's prose is never checked against them, and in a workspace that holds data
+a turn that ran no tool and cites no passage shows `grounding::nothing_fetched` (what the
+workspace holds) instead of the model's text. The question's words are matched
 to the values of text columns with at most 50 (`ColumnProfile::values`, `grounding::ValueLinks`),
 and a read filtering such a column on a value the question does not name (`'TENNESSEE'` for
 Texas) or a spelling the column does not hold is refused with the stored value

@@ -226,6 +226,19 @@ pub struct BuiltPrompt {
     /// The workspace holds ready documents, which `always_retrieve =
     /// "auto"` retrieves from up front.
     pub has_documents: bool,
+    /// The user tables, named in the note a turn that fetched nothing gets
+    /// (`grounding::nothing_fetched`).
+    pub table_names: Vec<String>,
+    /// How many ready documents the workspace holds.
+    pub documents: u64,
+}
+
+impl BuiltPrompt {
+    /// Whether the workspace holds anything an answer could come from.
+    #[must_use]
+    pub fn holds_data(&self) -> bool {
+        !self.table_names.is_empty() || self.documents > 0
+    }
 }
 
 impl SystemPrompt {
@@ -341,6 +354,8 @@ impl SystemPrompt {
             modeled,
             tables: layout,
             has_documents: documents > 0,
+            table_names: tables,
+            documents: u64::try_from(documents).unwrap_or(u64::MAX),
         })
     }
 

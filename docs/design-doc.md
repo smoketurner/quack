@@ -2059,6 +2059,18 @@ when the column holds `TEXAS`. The model is told the value the column holds and 
 query again. A model shown three sample rows otherwise picks the nearest value it saw, and
 the figure its query returns is real.
 
+An answer is shown only when the turn fetched something: a tool ran (`run_sql`, a search, a
+listing, `describe_table`; any step), or the answer cites a passage `always_retrieve` put in
+the prompt (a citation that survives validation names a chunk retrieved this turn; passages
+the answer does not cite count for nothing, since the model was told to cite what it uses). In
+a workspace that holds tables or documents, a turn that ran nothing has no answer to show,
+whatever the model wrote, and the response is a fixed note instead: *quack ran no query and
+no search for this question, so there is no answer to show. The workspace holds the tables
+events, fatalities, states, and 32 documents. Ask about them, naming the table or the
+document when you can.* (`grounding::nothing_fetched`). A turn the person cancelled keeps
+what streamed, and a model that returned no text keeps that note. Asking the person to
+rephrase is better than an answer from the model's memory.
+
 What else keeps the model to the data: a tool call repeating one the turn made, same tool and
 arguments, is not run again (`RepeatedCalls`); the graph tools register only for a question
 about the graph (7.3).

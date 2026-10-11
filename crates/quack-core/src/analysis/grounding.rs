@@ -5,11 +5,63 @@
 //! `events.state`) is the one a query filtering that column must use, never
 //! a neighbour the model picked (`TENNESSEE`) or the question's own spelling
 //! the column does not hold (`Texas`).
+//!
+//! An answer is shown only when the turn fetched something: a tool ran, or
+//! the answer cites a passage `always_retrieve` put in the prompt. A turn
+//! that ran nothing has no answer to show, whatever the model wrote; the
+//! person is told what the workspace holds instead ([`nothing_fetched`]).
 
 use std::collections::BTreeMap;
 
 use crate::storage::profile::TableProfile;
 use crate::storage::workspace::{Filters, ValueFilter};
+
+/// Tables named in the note before the rest are counted.
+const NOTE_TABLES: usize = 10;
+
+/// What a turn that ran no query and no search answers with, in a workspace
+/// holding `tables` and `documents` ready documents: the model's text is
+/// not shown, since nothing it says came from the workspace.
+#[must_use]
+pub(crate) fn nothing_fetched(tables: &[String], documents: u64) -> String {
+    let shown: Vec<&str> = tables
+        .iter()
+        .take(NOTE_TABLES)
+        .map(String::as_str)
+        .collect();
+    let more = tables.len().saturating_sub(shown.len());
+    let listed_tables = (!shown.is_empty()).then(|| {
+        let rest = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        format!(
+            "the table{} {}{rest}",
+            plural(tables.len()),
+            shown.join(", ")
+        )
+    });
+    let counted_documents = (documents > 0).then(|| {
+        let s = if documents == 1 { "" } else { "s" };
+        format!("{documents} document{s}")
+    });
+    let listed = match (listed_tables, counted_documents) {
+        (Some(tables), Some(documents)) => format!("{tables}, and {documents}"),
+        (Some(tables), None) => tables,
+        (None, Some(documents)) => documents,
+        (None, None) => String::from("no tables and no documents"),
+    };
+    format!(
+        "quack ran no query and no search for this question, so there is no answer to show. \
+         The workspace holds {listed}. Ask about them, naming the table or the document when \
+         you can."
+    )
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
 
 /// A value of a text column that the question names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,5 +274,26 @@ mod tests {
         );
         let (_, both) = linked("Compare Texas with Iowa");
         assert_eq!(both.links.len(), 2);
+    }
+
+    #[test]
+    fn the_note_names_what_the_workspace_holds() {
+        let t = |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).to_owned()).collect() };
+        let both = nothing_fetched(&t(&["events", "states"]), 32);
+        assert!(
+            both.contains("holds the tables events, states, and 32 documents."),
+            "{both}"
+        );
+        assert!(
+            both.starts_with("quack ran no query and no search"),
+            "{both}"
+        );
+        let tables = nothing_fetched(&t(&["events"]), 0);
+        assert!(tables.contains("holds the table events. Ask"), "{tables}");
+        let documents = nothing_fetched(&[], 1);
+        assert!(documents.contains("holds 1 document. Ask"), "{documents}");
+        let many: Vec<String> = (1..=12).map(|i| format!("t{i}")).collect();
+        let capped = nothing_fetched(&many, 0);
+        assert!(capped.contains("t10 and 2 more."), "{capped}");
     }
 }

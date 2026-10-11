@@ -16,7 +16,7 @@ use crate::ids::SessionId;
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
 use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, TurnRecorder};
-use super::grounding::ValueLinks;
+use super::grounding::{self, ValueLinks};
 use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls, RepeatedCalls};
 use super::policy::WritePolicy;
 use super::search::DocumentScope;
@@ -460,6 +460,10 @@ where
             .cancelled_by(cancel.clone())
             .naming(named);
         let Replay { history, dropped } = Replay::check(history);
+        // Shown only when the turn fetched something; the note otherwise.
+        let holds_data = read.prompt.holds_data();
+        let nothing_fetched =
+            grounding::nothing_fetched(&read.prompt.table_names, read.prompt.documents);
         let window = prompt.window;
         let agent = BuildContext {
             shared_db: Arc::clone(&shared_db),
@@ -490,8 +494,24 @@ where
         let streamed =
             Streamed::read(stream, &cancel, recorder, analysis_config.max_turns, window).await?;
         let cancelled = streamed.cancelled;
-        let (mut answer, usage) =
-            streamed.answer(window, |text| recorder.citations().validate(text));
+        let ran_a_tool = !turn.recorder.steps().is_empty();
+        let (mut answer, usage) = streamed.answer(window, |text| {
+            let checked = recorder.citations().validate(text);
+            // A passage `always_retrieve` put in the prompt counts only
+            // when the answer cites it: a citation that survives validation
+            // names a chunk retrieved this turn.
+            let fetched = ran_a_tool || !checked.citations.is_empty();
+            if holds_data && !fetched && !cancelled && !checked.text.trim().is_empty() {
+                // Nothing the model wrote came from the workspace: the
+                // person is told what it holds instead (design doc 7.7).
+                tracing::info!("the turn ran no query and no search; the answer is not shown");
+                return CitedAnswer {
+                    text: nothing_fetched.clone(),
+                    citations: Vec::new(),
+                };
+            }
+            checked
+        });
         if let Some(note) = dropped {
             answer.text.push_str("\n\n(");
             answer.text.push_str(&note);
