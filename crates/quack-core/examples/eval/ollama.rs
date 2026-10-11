@@ -30,6 +30,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::progress;
 use office_oxide::create::create_from_ir_to_writer;
 use office_oxide::format::DocumentFormat;
 use office_oxide::ir::{DocumentIR, Element, Image, ImageFormat as IrImageFormat};
@@ -235,6 +236,10 @@ pub(crate) async fn evaluate(
     fixture_dir: &Path,
 ) -> Result<ModelsReport> {
     let db = WorkspaceDb::open(config, WORKSPACE)?;
+    progress(&format!(
+        "\nIngesting the fixture again with {} for the model sections...",
+        models.embedding
+    ));
     super::ingest_documents(
         config,
         &db,
@@ -370,9 +375,16 @@ async fn evaluate_agent(
 ) -> Result<AgentReport> {
     let limit = Duration::from_secs(models.turn_seconds);
     let cases: Vec<AgentCase> = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let total = cases.len();
     let reader = ReaderDb::open(shared, config.analysis.reader_pool_size).await;
     let labelling = LabelJobs::new(JobQueue::new(1));
     let mut outcomes = Vec::with_capacity(cases.len());
+    progress(&format!(
+        "Asking {} questions with {} ({}s each at most)...",
+        cases.len(),
+        models.chat,
+        models.turn_seconds
+    ));
     let ask = Asker {
         config,
         shared,
@@ -398,20 +410,7 @@ async fn evaluate_agent(
         outcomes.push(match turn {
             Ok(response) => {
                 let tools: Vec<ToolName> = response.steps.iter().map(|s| s.tool).collect();
-                // A model writes an id with a non-breaking hyphen or a dash
-                // as readily as with a hyphen; the expected values use one.
-                let answer: String = response
-                    .content
-                    .to_lowercase()
-                    .chars()
-                    .map(|c| {
-                        if matches!(c, '\u{2010}'..='\u{2015}') {
-                            '-'
-                        } else {
-                            c
-                        }
-                    })
-                    .collect();
+                let answer = comparable(&response.content);
                 AgentOutcome {
                     correct: case.expect.iter().all(|group| {
                         group
@@ -445,6 +444,9 @@ async fn evaluate_agent(
                 kind: case.kind,
             },
         });
+        if let Some(outcome) = outcomes.last() {
+            progress(&outcome.progress_line(outcomes.len(), total));
+        }
     }
     let mut all = Tally::default();
     let mut by_kind: BTreeMap<String, Tally> = BTreeMap::new();
@@ -461,6 +463,44 @@ async fn evaluate_agent(
         by_kind,
         cases: outcomes,
     })
+}
+
+/// An answer as the expected values are matched against it: lowercase,
+/// every dash a hyphen and every space a plain one, since a model writes
+/// `EVT-0013` with a non-breaking hyphen and `Cedar Hollow` with a
+/// non-breaking space as readily as not, and the expected values use the
+/// plain characters.
+fn comparable(answer: &str) -> String {
+    answer
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            '\u{2010}'..='\u{2015}' => '-',
+            c if c.is_whitespace() => ' ',
+            c => c,
+        })
+        .collect()
+}
+
+impl AgentOutcome {
+    /// One line as the question finishes: its number, how long it took,
+    /// whether it was right, and the question, so a run of minutes shows
+    /// where it is.
+    fn progress_line(&self, n: usize, total: usize) -> String {
+        let mark = match (&self.error, self.correct) {
+            (Some(_), _) => "FAIL",
+            (None, true) => "ok",
+            (None, false) => "MISS",
+        };
+        let detail = self
+            .error
+            .as_deref()
+            .map_or(String::new(), |e| format!(" ({e})"));
+        format!(
+            "  [{n}/{total}] {:>5.1}s  {mark:<4} {}: {}{detail}",
+            self.seconds, self.kind, self.question
+        )
+    }
 }
 
 /// What a question is put to the agent with: a session of its own each
@@ -561,6 +601,7 @@ async fn evaluate_vision(
         ),
     ];
     let mut cases = Vec::with_capacity(files.len());
+    progress(&format!("Reading {} images with {model}...", files.len()));
     for (name, filename, bytes) in files {
         let started = Instant::now();
         let ingested = match bytes {
@@ -590,6 +631,16 @@ async fn evaluate_vision(
             }
             Err(e) => (Vec::new(), Some(e.to_string())),
         };
+        progress(&format!(
+            "  [{}/3] {seconds:>5.1}s  {:<4} {name}{}",
+            cases.len().saturating_add(1),
+            if found.len() == NOTICE_WORDS.len() {
+                "ok"
+            } else {
+                "MISS"
+            },
+            error.as_deref().map_or(String::new(), |e| format!(": {e}")),
+        ));
         cases.push(VisionCase {
             name,
             found,

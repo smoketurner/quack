@@ -60,16 +60,10 @@ const HASH_DIM_U32: u32 = 64;
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
-        Ok(report) => match report.print() {
-            Ok(()) => match maybe_write_json(&report) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    print_error(&format!("failed to write QUACK_EVAL_OUT: {e}"));
-                    ExitCode::FAILURE
-                }
-            },
+        Ok(report) => match maybe_write_json(&report) {
+            Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                print_error(&format!("failed to print the report: {e}"));
+                print_error(&format!("failed to write QUACK_EVAL_OUT: {e}"));
                 ExitCode::FAILURE
             }
         },
@@ -88,6 +82,13 @@ fn maybe_write_json(report: &Report) -> Result<()> {
 }
 
 fn print_error(message: &str) {
+    progress(message);
+}
+
+/// A line to the person running the eval, on stderr, where it stays out of
+/// a report piped to a file. Each section prints as it completes and each
+/// model call reports as it ends, so a run of many minutes is never silent.
+pub(crate) fn progress(message: &str) {
     use std::io::Write as _;
     if writeln!(std::io::stderr(), "{message}").is_err() {
         // Nothing more can be done if stderr itself is gone.
@@ -104,8 +105,10 @@ async fn run() -> Result<Report> {
             let embedder = Embeddings::require(&config).await?;
             models.reachable(&embedder).await?;
             let mut report = evaluate(&config, &fixture_dir, &embedder).await?;
-            report.models =
-                Some(ollama::evaluate(&models, &config, &embedder, &fixture_dir).await?);
+            report.print()?;
+            let models = ollama::evaluate(&models, &config, &embedder, &fixture_dir).await?;
+            models.print(&mut std::io::stdout().lock())?;
+            report.models = Some(models);
             Ok(report)
         }))
         .await;
@@ -121,7 +124,9 @@ async fn run() -> Result<Report> {
             Prompts::default(),
         ),
     );
-    evaluate(&config, &fixture_dir, &embedder).await
+    let report = evaluate(&config, &fixture_dir, &embedder).await?;
+    report.print()?;
+    Ok(report)
 }
 
 /// Ingest the fixture with `embedder` and measure retrieval, induction,
@@ -950,6 +955,8 @@ struct Report {
 }
 
 impl Report {
+    /// The sections that need no model, printed as soon as they are
+    /// measured; the model sections print themselves after.
     fn print(&self) -> Result<()> {
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
@@ -975,10 +982,7 @@ impl Report {
                 m.recall_at_1, m.recall_at_5, m.recall_at_8, m.mrr
             )?;
         }
-        writeln!(
-            out,
-            "\nRetrieval by question kind (identifier/phrase questions carry the decoys that make #77's fix visible):"
-        )?;
+        writeln!(out, "\nRetrieval by question kind:")?;
         writeln!(
             out,
             "{:<10} {:<10} {:>10} {:>10} {:>10} {:>8} {:>6}",
@@ -1048,9 +1052,7 @@ impl Report {
             self.citation_validity.survived_markers,
             self.citation_validity.original_markers
         )?;
-        if let Some(models) = &self.models {
-            models.print(&mut out)?;
-        }
+        out.flush()?;
         Ok(())
     }
 
