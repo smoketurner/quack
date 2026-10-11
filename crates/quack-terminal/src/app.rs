@@ -849,9 +849,7 @@ impl CliJob {
         let pages = result
             .pages
             .and_then(PageCounts::note)
-            .map_or(String::new(), |note| {
-                format!("\n{note}; the rest was kept.")
-            });
+            .map_or(String::new(), |note| format!("\nPages: {note}."));
         let graph = FollowUp {
             db: &env.db,
             config: &env.config,

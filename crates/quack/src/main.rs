@@ -2528,10 +2528,7 @@ fn report_ingested(out: &mut impl Write, result: &IngestResult, pin: bool) -> Re
         writeln!(out, "  Table: {table}")?;
     }
     if let Some(note) = result.pages.and_then(PageCounts::note) {
-        writeln!(
-            out,
-            "  Pages skipped: {note} (the rest of the document was kept)"
-        )?;
+        writeln!(out, "  Pages: {note}")?;
     }
     if result.chunks_stored > 0 {
         writeln!(out, "  Chunks: {}", result.chunks_stored)?;

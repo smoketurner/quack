@@ -406,6 +406,7 @@ CREATE TABLE _quack_documents (
     page_count       INTEGER,              -- a PDF's pages; NULL for other sources
     pages_unreadable INTEGER,              -- pages whose extraction failed
     pages_empty      INTEGER,              -- pages that read and held no text
+    pages_transcribed INTEGER,             -- pages without text the vision model read
     ingested_by   TEXT,
     ingested_at   TIMESTAMP DEFAULT now(),
     language      TEXT                     -- ISO 639-3 code its text was indexed under (deu, cmn)
@@ -927,7 +928,8 @@ own values win (`quack ingest --author`, `--authored`, `--tag`), and a person ca
 them afterwards (`PATCH .../documents/{doc}`, `quack docs --author|--authored|--tag|--untag`).
 They show in the Documents page, `list_documents`, and the prompt's document inventory.
 
-A scanned PDF (no text layer) is reported as `error: no extractable text`. OCR is deferred.
+A scanned PDF (no text layer) is read page by page by `[ingestion].vision_model` (below);
+with no vision model it is reported as `error: no extractable text` naming that setting.
 
 **Images.** `[ingestion].vision_model` names a chat model that reads images
 (`provider/model`, like `chat_model`); it runs at that model's `background_effort`. An uploaded
@@ -943,12 +945,18 @@ document's passage page shows the image, served by `GET .../documents/{doc}/imag
 
 **Partly read PDFs.** A PDF with some pages missing from its text still becomes `ready`, and
 the document row records what is missing (`parser::PageCounts`): `page_count`,
-`pages_unreadable` (extraction failed), and `pages_empty` (the page read and held no text,
-as a scanned image does). `DocumentInfo` carries them as `pages`
-(`{"total": 40, "unreadable": 3, "empty": 2}`, `null` for any other source), so REST, MCP
-`list_documents`, and `quack docs --format json` return them. Every listing a person or the
-agent reads shows one note from `PageCounts::note`, such as `3 of 40 pages
-unreadable, 2 without text`: `quack ingest`, `quack docs`, the terminal's `/docs` and load
+`pages_unreadable` (extraction failed), `pages_empty` (the page read and held no text,
+as a scanned image does, and no vision model read it), and `pages_transcribed`. With
+`[ingestion].vision_model` set, each page without text that holds a picture (its largest
+image, at least 200 pixels a side, a JPEG as stored, anything else as PNG) goes to the vision
+model, and the transcription becomes a section on that page before chunking, so it is cited
+like any page; such a page counts as `transcribed`, not `empty`. A PDF of scanned pages alone
+is refused without a vision model, with a message naming the setting. `DocumentInfo` carries
+the counts as `pages` (`{"total": 40, "unreadable": 3, "empty": 2, "transcribed": 0}`, `null`
+for any other source), so REST, MCP `list_documents`, and `quack docs --format json` return
+them. Every listing a person or the agent reads shows one note from `PageCounts::note`, such
+as `3 of 40 pages unreadable, 2 without text` or `5 of 6 pages transcribed by the vision
+model`: `quack ingest`, `quack docs`, the terminal's `/docs` and load
 message, the web Documents row, an upload job's result, the agent's `list_documents` output,
 and the documents block of the system prompt.
 
@@ -3692,7 +3700,7 @@ Every gap is a GitHub issue unless the item says otherwise.
 2. Data connectors: GitHub, Confluence, SharePoint (fetching a data file over http(s)
    already ships in `quack import`)
 3. ~~Cross-encoder reranking provider~~ (`[retrieval].rerank = "reranker"`)
-4. OCR for scanned PDFs
+4. ~~OCR for scanned PDFs~~ (pages without text go to `[ingestion].vision_model`)
 5. Postgres + pgvector storage backend, which now also means building the seam section 15
    item 4 describes
 6. Ontology import from OWL / SKOS; a registry of domain packs
