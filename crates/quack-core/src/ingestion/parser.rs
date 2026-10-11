@@ -428,8 +428,45 @@ impl Extracted {
         self.title
             .as_deref()
             .and_then(str::non_blank)
+            .filter(|title| !is_placeholder(title))
             .or_else(|| title_of(&self.sections))
     }
+}
+
+/// Whether `title` is one an authoring tool fills in when the author gave
+/// none: `(anonymous)`, `Untitled`, `Document1`, `Microsoft Word -
+/// report.docx`, or a bare file name. Such a title says nothing the file
+/// name does not, so the first heading, then the file name, are used.
+fn is_placeholder(title: &str) -> bool {
+    const DEFAULTS: &[&str] = &[
+        "anonymous",
+        "untitled",
+        "untitled document",
+        "no title",
+        "title",
+        "document",
+        "presentation",
+        "powerpoint presentation",
+        "book",
+        "unknown",
+        "none",
+        "null",
+    ];
+    const FILE_EXTENSIONS: &[&str] = &[
+        ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".odt", ".rtf", ".txt", ".htm",
+        ".html", ".md",
+    ];
+    let lower = title
+        .trim()
+        .trim_matches(|c| c == '(' || c == ')' || c == '[' || c == ']')
+        .trim()
+        .to_lowercase();
+    // A default name with a counter: `Document1`, `Presentation 2`.
+    let counted = lower.trim_end_matches(|c: char| c.is_ascii_digit()).trim();
+    DEFAULTS.contains(&lower.as_str())
+        || (counted.len() < lower.len() && DEFAULTS.contains(&counted))
+        || (lower.starts_with("microsoft ") && lower.contains(" - "))
+        || FILE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
 }
 
 /// A run of text that shares one heading, one page, and one kind.
@@ -826,6 +863,39 @@ mod tests {
             page_40.is_some_and(|(text, heading)| text.contains("Page 40") && heading.is_none()),
             "{page_40:?}"
         );
+    }
+
+    /// A title an authoring tool filled in gives way to the first heading.
+    #[test]
+    fn a_placeholder_title_gives_way_to_the_first_heading() {
+        let with_title = |title: &str| Extracted {
+            title: Some(title.to_owned()),
+            sections: vec![Section::body(Some(String::from("Q3 Operations")), "text")],
+            ..Extracted::default()
+        };
+        for placeholder in [
+            "(anonymous)",
+            "Untitled",
+            "untitled document",
+            "Document1",
+            "Presentation 2",
+            "Microsoft Word - ops_report.docx",
+            "ops_report.pdf",
+            "  [Title]  ",
+        ] {
+            assert_eq!(
+                with_title(placeholder).title(),
+                Some("Q3 Operations"),
+                "{placeholder}"
+            );
+        }
+        for real in [
+            "Harbor Roasters Operations Report",
+            "Document Retention Policy",
+            "2026",
+        ] {
+            assert_eq!(with_title(real).title(), Some(real));
+        }
     }
 
     #[test]
