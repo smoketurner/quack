@@ -124,15 +124,19 @@ impl EmptyAnswer {
     }
 }
 
-/// An answer that states figures (any digit) while the turn has run no tool
-/// and read no document is asked for once more, with the tools named: small
+/// An answer that states figures (a number the question does not hold)
+/// while the turn has run no tool and read no document is asked for once
+/// more, with the tools named: small
 /// models answer from memory instead of the workspace and sound just as
 /// sure. A second such answer is accepted, and the turn notes that it does
 /// not come from the workspace ([`Ungrounded::NOTE`]). Registered only in a
 /// workspace that holds tables or documents, on a turn with no history,
 /// since a follow-up may rightly restate figures an earlier turn found.
+#[derive(Clone)]
 pub(crate) struct Ungrounded {
     turn: Turn,
+    /// The person's question: a number it holds, the answer may repeat.
+    question: String,
 }
 
 /// The run's count of ungrounded answers already retried.
@@ -149,17 +153,21 @@ impl Ungrounded {
     pub(crate) const NOTE: &str = "No query ran and no document was read this turn, so this answer \
                                    does not come from the workspace's data.";
 
-    pub(crate) const fn new(turn: Turn) -> Self {
-        Self { turn }
+    pub(crate) fn new(turn: Turn, question: &str) -> Self {
+        Self {
+            turn,
+            question: question.to_owned(),
+        }
     }
 
-    /// Whether `text` states figures (any digit) while `turn` has not
-    /// looked at the workspace: no tool ran, and `always_retrieve` put no
-    /// document text in the prompt.
-    pub(crate) fn applies(text: &str, turn: &Turn) -> bool {
-        text.chars().any(|c| c.is_ascii_digit())
-            && turn.recorder.steps().is_empty()
-            && turn.exposure() != Exposure::Documents
+    /// Whether `text` states figures the question does not hold while the
+    /// turn has not looked at the workspace: no tool ran, and
+    /// `always_retrieve` put no document text in the prompt.
+    pub(crate) fn applies(&self, text: &str) -> bool {
+        let given: Vec<&str> = numbers(&self.question).collect();
+        numbers(text).any(|n| !given.contains(&n))
+            && self.turn.recorder.steps().is_empty()
+            && self.turn.exposure() != Exposure::Documents
     }
 
     /// A final answer (text, no tool call) that states figures unseen.
@@ -172,7 +180,7 @@ impl Ungrounded {
                 _ => {}
             }
         }
-        Self::applies(&text, &self.turn)
+        self.applies(&text)
     }
 
     fn decide(&self, ctx: &HookContext, event: &ModelTurnFinished<'_>) -> ModelTurnAction {
@@ -195,6 +203,12 @@ impl Ungrounded {
             ModelTurnAction::continue_run()
         }
     }
+}
+
+/// The runs of digits in `text`.
+fn numbers(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_ascii_digit())
+        .filter(|run| !run.is_empty())
 }
 
 impl AgentHook for Ungrounded {

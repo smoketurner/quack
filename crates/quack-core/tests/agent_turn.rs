@@ -840,6 +840,29 @@ async fn a_second_ungrounded_answer_carries_the_note() {
     assert_eq!(model.request_count(), 2);
 }
 
+/// Numbers the question holds are the person's, not figures the model
+/// made up: an answer that only repeats them is not asked for again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_repeating_the_questions_numbers_is_not_asked_again() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([turn(vec![text(
+        "The workspace has no data on Apollo 11 or the year 1969.",
+    )])]);
+    let ran = run_turn(
+        &db,
+        &model,
+        WritePolicy::Deny,
+        Vec::new(),
+        "Did Apollo 11 land in 1969?",
+    )
+    .await;
+    assert_eq!(
+        ran.answer().content,
+        "The workspace has no data on Apollo 11 or the year 1969."
+    );
+    assert_eq!(model.request_count(), 1);
+}
+
 /// An answer that states no figures is not second-guessed.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_answer_without_figures_is_not_asked_again() {

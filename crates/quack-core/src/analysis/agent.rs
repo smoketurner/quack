@@ -469,7 +469,8 @@ where
             .within(prompt.scope.clone())
             .cancelled_by(cancel.clone());
         let Replay { history, dropped } = Replay::check(history);
-        let check_grounding = read.prompt.holds_data && history.is_empty();
+        let grounding = (read.prompt.holds_data && history.is_empty())
+            .then(|| Ungrounded::new(turn.clone(), user_message));
         let window = prompt.window;
         let agent = BuildContext {
             shared_db: Arc::clone(&shared_db),
@@ -485,7 +486,7 @@ where
             images: images.filter(|_| read.has_images),
             labeller,
             turn: turn.clone(),
-            check_grounding,
+            grounding: grounding.clone(),
             has_documents: read.prompt.has_documents,
         }
         .build_agent(completion_model, embedding_model, &read.prompt.text)?;
@@ -505,9 +506,8 @@ where
         let cancelled = streamed.cancelled;
         let (mut answer, usage) =
             streamed.answer(window, |text| recorder.citations().validate(text));
-        let ungrounded =
-            (check_grounding && !cancelled && Ungrounded::applies(&answer.text, &turn))
-                .then(|| String::from(Ungrounded::NOTE));
+        let ungrounded = (!cancelled && grounding.is_some_and(|g| g.applies(&answer.text)))
+            .then(|| String::from(Ungrounded::NOTE));
         for note in [dropped, ungrounded].into_iter().flatten() {
             answer.text.push_str("\n\n(");
             answer.text.push_str(&note);
@@ -894,7 +894,7 @@ struct BuildContext<'a> {
     turn: Turn,
     /// Ask again for an answer that states figures without having looked
     /// at the workspace ([`Ungrounded`]).
-    check_grounding: bool,
+    grounding: Option<Ungrounded>,
     /// The workspace holds ready documents (`always_retrieve = "auto"`).
     has_documents: bool,
 }
@@ -943,8 +943,8 @@ impl BuildContext<'_> {
             ))
             .add_hook(InvalidToolCalls)
             .add_hook(EmptyAnswer);
-        if ctx.check_grounding {
-            builder = builder.add_hook(Ungrounded::new(ctx.turn.clone()));
+        if let Some(grounding) = ctx.grounding.clone() {
+            builder = builder.add_hook(grounding);
         }
 
         // The ontology is describable as soon as it exists: the prompt block
