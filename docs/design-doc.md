@@ -3515,8 +3515,8 @@ the whole workspace) are local-only and not wired into a release. Every file par
 the chunker are fuzzed nightly (`fuzz/`, `docs/ci-cd.md`), and `cargo deny check` runs
 weekly on its own.
 
-**Evaluation.** `make eval` (`crates/quack-core/examples/eval.rs`, issue #74) measures
-answer quality. It ingests an in-tree storms-like fixture (`crates/quack-core/eval/`: 32
+**Evaluation.** `make eval-offline` (`crates/quack-core/examples/eval/`, issue #74) measures
+answer quality with no model. It ingests an in-tree storms-like fixture (`crates/quack-core/eval/`: 32
 documents, one German and one Chinese among them, and three CSV tables written for the
 harness, not the NOAA download) into a temporary workspace and prints:
 
@@ -3534,6 +3534,18 @@ harness, not the NOAA download) into a temporary workspace and prints:
 Vector search uses a deterministic hashing embedder (a bag-of-words projection, not a
 semantic one), so the run needs no Ollama and takes seconds. With `QUACK_EVAL_OUT` set, it
 also writes the numbers as JSON for a before/after diff.
+
+`make eval` (`--ollama`, `examples/eval/ollama.rs`) runs the same suite against Ollama and
+adds what only a model shows. Retrieval embeds with a real model. The agent answers
+`eval/agent_questions.json` (questions over the tables and over the documents) through
+`TurnRequest::run`, each scored on whether the answer holds the expected values, used a
+tool it should, cited a passage where the question calls for one, and leaked no `<think>`
+text. The vision model reads one notice three ways, as an image, as the only picture on a
+PDF page, and as a figure inside a DOCX, scored by the notice's words found in the chunks.
+Wrong answers are reported, never failed: the models are `QUACK_EVAL_*` variables with
+small defaults (`qwen2.5:3b`, `embeddinggemma`, `qwen2.5vl:3b`), and
+`.github/workflows/eval.yml` runs it nightly and on dispatch, outside CI, with the report in
+the job summary and the JSON as an artifact.
 
 Decoys make the fixture discriminate issue #77's identifier-joining and phrase-filter fix
 rather than score 1.000 either way. Five identifier questions (`SR-8841`, `SR-4437`,

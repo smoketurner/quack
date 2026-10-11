@@ -1,0 +1,124 @@
+name: Eval
+
+# The evaluation suite against real models (`make eval`, crates/quack-core/eval/):
+# retrieval with a real embedding model, the agent's answers to the fixture
+# questions, and the vision model reading a notice. It never gates a pull
+# request: what a model writes varies from run to run, so each run is a sample
+# to compare with the last, shown in the job summary and uploaded as JSON.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      chat_model:
+        description: Ollama chat model
+        type: string
+        default: qwen2.5:3b
+      embedding_model:
+        description: Ollama embedding model
+        type: string
+        default: embeddinggemma
+      embedding_dimension:
+        description: Width of the embedding model's vectors
+        type: string
+        default: "768"
+      vision_model:
+        description: Ollama vision model, or none to skip the vision section
+        type: string
+        default: qwen2.5vl:3b
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # The FIPS module builds with clang on Linux (see ci.yml).
+  AWS_LC_FIPS_SYS_CC: clang
+  AWS_LC_FIPS_SYS_CXX: clang++
+  OLLAMA_VERSION: "0.40.2"
+
+jobs:
+  eval:
+    name: Eval (Ollama)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    env:
+      # A scheduled run has no inputs, so each falls back to the default.
+      QUACK_EVAL_CHAT_MODEL: ${{ inputs.chat_model || 'qwen2.5:3b' }}
+      QUACK_EVAL_EMBEDDING_MODEL: ${{ inputs.embedding_model || 'embeddinggemma' }}
+      QUACK_EVAL_EMBEDDING_DIMENSION: ${{ inputs.embedding_dimension || '768' }}
+      QUACK_EVAL_VISION_MODEL: ${{ inputs.vision_model || 'qwen2.5vl:3b' }}
+      QUACK_EVAL_OUT: eval.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
+      - name: Setup Rust toolchain
+        # Only the pinned toolchain, so the cache key matches ci.yml's.
+        shell: bash
+        run: |
+          rustup show
+          pinned=$(rustup show active-toolchain | awk '{print $1}')
+          rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
+      - name: Setup Rust cache
+        # Restores the debug cache main's CI saves; this job never writes one.
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: "v1"
+          shared-key: "debug-${{ runner.os }}"
+          save-if: false
+      - name: Install and start Ollama
+        # The service the install script starts is replaced by one with a
+        # context window the agent's prompt fits in (tables, documents, and
+        # tool guidance run past Ollama's default).
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          sudo systemctl stop ollama || true
+          OLLAMA_CONTEXT_LENGTH=16384 nohup ollama serve > ollama.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:11434/api/version && exit 0
+            sleep 1
+          done
+          cat ollama.log
+          exit 1
+      - name: Pull the models
+        run: |
+          ollama pull "${QUACK_EVAL_CHAT_MODEL}"
+          ollama pull "${QUACK_EVAL_EMBEDDING_MODEL}"
+          if [ "${QUACK_EVAL_VISION_MODEL}" != "none" ]; then
+            ollama pull "${QUACK_EVAL_VISION_MODEL}"
+          fi
+      - name: Run the evaluation
+        # The report is the example's stdout; build output and logs go to
+        # eval.log.
+        run: make eval > eval.txt 2> eval.log
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## Eval"
+            echo
+            echo "Chat \`${QUACK_EVAL_CHAT_MODEL}\`, embeddings \`${QUACK_EVAL_EMBEDDING_MODEL}\`, vision \`${QUACK_EVAL_VISION_MODEL}\`"
+            echo
+            echo '```'
+            cat eval.txt 2>/dev/null || echo "no report: see eval.log in the artifact"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: eval-${{ github.run_number }}
+          path: |
+            eval.json
+            eval.txt
+            eval.log
+            ollama.log
+          if-no-files-found: ignore

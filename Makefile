@@ -20,7 +20,7 @@ WORKSPACE ?= storms
 # The crate whose templates Tailwind scans; its built CSS is committed.
 SERVER_CRATE ?= quack-server
 
-.PHONY: all build check clean setup doc changelog fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates image hooks css-dev css-build editor-build run run-server demo-data help
+.PHONY: all build check clean setup doc changelog fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates eval eval-offline image hooks css-dev css-build editor-build run run-server demo-data help
 
 all: build
 
@@ -70,7 +70,10 @@ test-coverage: ## Generate an HTML coverage report (requires cargo-llvm-cov)
 test-mutants: ## Run mutation testing (requires cargo-mutants)
 	$(CARGO) mutants
 
-eval: ## Run the evaluation harness: retrieval, induction, extraction, citations
+eval: ## Run the evaluation suite against Ollama: retrieval with real embeddings, agent answers, vision (eval/README.md)
+	$(CARGO) run -p quack-core --example eval -- --ollama
+
+eval-offline: ## Run the evaluation harness with no model: retrieval, induction, extraction, citations
 	$(CARGO) run -p quack-core --example eval
 
 crypto-gates: ## No ring or OpenSSL in the runtime dependency tree (needs no extra tools)

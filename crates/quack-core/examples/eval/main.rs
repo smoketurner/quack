@@ -1,9 +1,10 @@
 //! Evaluation harness (design doc section 16, issue #74): retrieval quality,
 //! ontology induction, graph extraction, and citation validity, all over a
-//! small in-tree storms-like fixture (`crates/quack-core/eval/`) with no
-//! model required. Run with `make eval` or `cargo run -p quack-core --example
-//! eval`; set `QUACK_EVAL_OUT=path.json` to also write the numbers as JSON
-//! for a CI job or a before/after diff.
+//! small in-tree storms-like fixture (`crates/quack-core/eval/`). Without
+//! arguments (`make eval-offline`) no model is needed. With `--ollama`
+//! (`make eval`) retrieval embeds with a real model, and the agent and the
+//! vision model are measured too (`ollama.rs`). Set `QUACK_EVAL_OUT=path.json`
+//! to also write the numbers as JSON for a before/after diff.
 //!
 //! The embedding backend is [`HashEmbedder`], a deterministic stand-in for a
 //! real provider: it hashes each token into one of a fixed number of
@@ -36,6 +37,8 @@ use quack_core::graph::{self, Standing, store};
 use quack_core::ids::{ChunkId, ClassId, DocumentId, NodeId, RelationId};
 use quack_core::ingestion::parser::{FileType, Load, SectionKind};
 use quack_core::ingestion::{self, NewFile};
+use quack_core::llm::Embeddings;
+use quack_core::llm::egress::Egress;
 use quack_core::ontology::Ontology;
 use quack_core::ontology::induction::{self, Proposal, TableEvidenceOptions};
 use quack_core::ontology::store::{self as ontology_store, Revision};
@@ -48,6 +51,8 @@ use quack_core::storage::writer::Writer;
 use rig::ProviderError;
 use rig::embeddings::Embedding;
 use serde::{Deserialize, Serialize};
+
+mod ollama;
 
 const HASH_DIM: usize = 64;
 const HASH_DIM_U32: u32 = 64;
@@ -92,9 +97,20 @@ fn print_error(message: &str) {
 async fn run() -> Result<Report> {
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("eval");
     let data_dir = tempfile::tempdir()?;
+    if std::env::args().skip(1).any(|arg| arg == "--ollama") {
+        let models = ollama::Models::from_env();
+        return Box::pin(Egress::scope(Some(Egress::NoWorkspace), async {
+            let config = models.config(data_dir.path())?;
+            let embedder = Embeddings::require(&config).await?;
+            models.reachable(&embedder).await?;
+            let mut report = evaluate(&config, &fixture_dir, &embedder).await?;
+            report.models =
+                Some(ollama::evaluate(&models, &config, &embedder, &fixture_dir).await?);
+            Ok(report)
+        }))
+        .await;
+    }
     let config = eval_config(data_dir.path())?;
-    let workspace_id = "eval";
-    let db = WorkspaceDb::open(&config, workspace_id)?;
     // No prefixes: the hashing embedder counts tokens, and a prefix would
     // add the same tokens to every input.
     let embedder = Embedder::new(
@@ -105,16 +121,27 @@ async fn run() -> Result<Report> {
             Prompts::default(),
         ),
     );
+    evaluate(&config, &fixture_dir, &embedder).await
+}
 
+/// Ingest the fixture with `embedder` and measure retrieval, induction,
+/// extraction, and citations.
+async fn evaluate<M: EmbeddingModel>(
+    config: &Config,
+    fixture_dir: &Path,
+    embedder: &Embedder<M>,
+) -> Result<Report> {
+    let workspace_id = "eval";
+    let db = WorkspaceDb::open(config, workspace_id)?;
     ingest_documents(
-        &config,
+        config,
         &db,
         workspace_id,
         &fixture_dir.join("documents"),
-        &embedder,
+        embedder,
     )
     .await?;
-    ingest_tables(&config, &db, workspace_id, &fixture_dir.join("tables")).await?;
+    ingest_tables(config, &db, workspace_id, &fixture_dir.join("tables")).await?;
 
     let chunks = load_chunk_index(&db)?;
 
@@ -122,7 +149,7 @@ async fn run() -> Result<Report> {
         &db,
         &fixture_dir.join("gold_questions.json"),
         &chunks,
-        &embedder,
+        embedder,
         config.retrieval.top_k,
         config.retrieval.rrf_k,
     )
@@ -133,10 +160,12 @@ async fn run() -> Result<Report> {
     let citation_validity = evaluate_citations(&fixture_dir.join("citation_fixture.json"))?;
 
     Ok(Report {
+        embedding: embedder.profile().model.clone(),
         retrieval,
         ontology_induction,
         graph_extraction,
         citation_validity,
+        models: None,
     })
 }
 
@@ -247,12 +276,12 @@ fn writer_of(db: &WorkspaceDb) -> Result<Writer> {
     Writer::spawn(db.try_clone_reader()?)
 }
 
-async fn ingest_documents(
+async fn ingest_documents<M: EmbeddingModel>(
     config: &Config,
     db: &WorkspaceDb,
     workspace_id: &str,
     dir: &Path,
-    embedder: &Embedder<HashEmbedder>,
+    embedder: &Embedder<M>,
 ) -> Result<()> {
     let writer = writer_of(db)?;
     for path in list_chunked_files(dir)? {
@@ -487,11 +516,11 @@ fn aggregate(per_question: &QuestionPairs) -> RetrievalMetrics {
     }
 }
 
-async fn evaluate_retrieval(
+async fn evaluate_retrieval<M: EmbeddingModel>(
     db: &WorkspaceDb,
     gold_path: &Path,
     chunks: &[ChunkRow],
-    embedder: &Embedder<HashEmbedder>,
+    embedder: &Embedder<M>,
     top_k: u32,
     rrf_k: u32,
 ) -> Result<RetrievalReport> {
@@ -908,10 +937,16 @@ fn evaluate_citations(path: &Path) -> Result<CitationReport> {
 
 #[derive(Debug, Serialize)]
 struct Report {
+    /// The embedding model retrieval ran with: the hashing stand-in, or
+    /// the real model under `--ollama`.
+    embedding: String,
     retrieval: RetrievalReport,
     ontology_induction: InductionReport,
     graph_extraction: GraphReport,
     citation_validity: CitationReport,
+    /// The agent and vision sections, under `--ollama` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    models: Option<ollama::ModelsReport>,
 }
 
 impl Report {
@@ -919,7 +954,11 @@ impl Report {
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
 
-        writeln!(out, "Retrieval quality ({} questions)", self.retrieval.n)?;
+        writeln!(
+            out,
+            "Retrieval quality ({} questions, embeddings from {})",
+            self.retrieval.n, self.embedding
+        )?;
         writeln!(
             out,
             "{:<10} {:>10} {:>10} {:>10} {:>8}",
@@ -1009,6 +1048,9 @@ impl Report {
             self.citation_validity.survived_markers,
             self.citation_validity.original_markers
         )?;
+        if let Some(models) = &self.models {
+            models.print(&mut out)?;
+        }
         Ok(())
     }
 
