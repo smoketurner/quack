@@ -11,6 +11,7 @@ pub mod office;
 pub mod parser;
 pub mod pdf;
 pub mod rtf;
+pub mod sniff;
 pub mod table;
 pub mod tree;
 pub mod xlsx;
@@ -328,6 +329,17 @@ pub async fn ingest_file<M: EmbeddingModel>(
     file: &NewFile<'_>,
     embedder: Option<&Embedder<M>>,
 ) -> Result<IngestOutcome> {
+    let name = match file.data {
+        FileData::Bytes(_) => recorded_name(file.filename, file.data)?,
+        FileData::Path(path) => {
+            let (filename, path) = (file.filename.to_owned(), path.to_owned());
+            parse_off_runtime(move || recorded_name(&filename, FileData::Path(&path))).await?
+        }
+    };
+    let file = &NewFile {
+        filename: &name,
+        ..file.clone()
+    };
     Pending::file_type(config, file)?;
     let measured = file.data.measured().await?;
     let pending = Pending::of(config, file, measured)?;
@@ -419,6 +431,30 @@ impl StoredImage {
     pub async fn read(&self) -> Result<Vec<u8>> {
         Ok(tokio::fs::read(&self.path).await?)
     }
+}
+
+/// The name a file is recorded under: `filename` when it has an extension,
+/// else `filename` with the extension of the type its bytes show (`report`
+/// becomes `report.pdf`, and a pipe with no name `stdin.pdf`), so every
+/// later step reads the type from the name. A name with an extension quack
+/// does not read, and bytes that show no type, are refused as unsupported.
+///
+/// # Errors
+///
+/// Returns an error if a file on disk cannot be opened.
+pub fn recorded_name(filename: &str, data: FileData<'_>) -> Result<String> {
+    if Path::new(filename).extension().is_some() {
+        return Ok(filename.to_owned());
+    }
+    let ext = match data {
+        FileData::Bytes(bytes) => sniff::extension(std::io::Cursor::new(bytes)),
+        FileData::Path(path) => sniff::extension(std::fs::File::open(path)?),
+    };
+    let base = match filename.trim() {
+        "" | "-" => "stdin",
+        name => name,
+    };
+    Ok(ext.map_or_else(|| filename.to_owned(), |ext| format!("{base}.{ext}")))
 }
 
 /// Insert the document row with status `queued` and return its id, or the

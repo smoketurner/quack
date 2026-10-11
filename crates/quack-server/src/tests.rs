@@ -1671,6 +1671,34 @@ async fn a_turn_views_an_image_with_a_chat_model_that_reads_images() {
     );
 }
 
+/// An upload whose name says no type is recorded under the extension its
+/// bytes show, and the job that processes it reads that name.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_without_an_extension_is_typed_by_its_bytes() {
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("sniffed", &owner).await;
+    let token = h.login("owner").await;
+    let (status, body) = upload(
+        &h,
+        &ws,
+        &token,
+        "standup",
+        "application/octet-stream",
+        b"WH-OAK reopens on October 18.",
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["documents"][0]["filename"], "standup.txt", "{body}");
+    let doc = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let ready = h.wait_ready(&ws, &doc, &token).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    assert_eq!(ready["filename"], "standup.txt", "{ready}");
+}
+
 /// An image is described by the vision model at upload, served back as
 /// uploaded, and shown on its passage page; without a vision model an
 /// image is refused.

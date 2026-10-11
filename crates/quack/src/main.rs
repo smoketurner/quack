@@ -461,7 +461,7 @@ struct IngestArgs {
     /// File path to ingest (use - for stdin)
     file: StdioPath,
 
-    /// Override the filename (required when reading from stdin)
+    /// Override the filename (from stdin without one, the type comes from the bytes)
     #[arg(long)]
     filename: Option<String>,
 
