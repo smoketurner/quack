@@ -142,6 +142,17 @@ const LISTED_DOCUMENTS: usize = 40;
 /// A document title longer than this is cut, with an ellipsis.
 const DOCUMENT_TITLE_CHARS: usize = 80;
 
+/// The role, first in every prompt. A reply that asks a clarifying question
+/// and runs nothing shows the person the nothing-fetched note, not a figure,
+/// and in print mode and MCP nobody can answer it; a reasoning model takes
+/// an invitation to ask literally, so the prompt makes none.
+const ROLE: &str = "You are a data analysis assistant working inside one workspace that holds \
+                    tables, documents, or both. Answer by using the tools: run SQL rather than \
+                    estimating, search the documents rather than recalling. When a question could \
+                    be read more than one way, take the most likely reading, say which you took, \
+                    and run the query; a reply that asks a question and runs nothing is no \
+                    answer.\n\n";
+
 /// A column as the model reads it: `amount (BIGINT): order total [cents]`.
 pub struct ColumnLine<'a>(pub &'a ColumnInfo);
 
@@ -249,12 +260,7 @@ impl SystemPrompt {
     /// Returns an error if schema introspection fails.
     pub fn build(db: &WorkspaceDb, options: &PromptOptions) -> Result<BuiltPrompt> {
         let mut prompt = Self::default();
-        prompt.text.push_str(
-            "You are a data analysis assistant working inside one workspace that holds tables, \
-             documents, or both. Answer by using the tools: run SQL rather than estimating, \
-             search the documents rather than recalling, state assumptions, and when a question \
-             is ambiguous ask one clarifying question instead of guessing.\n\n",
-        );
+        prompt.text.push_str(ROLE);
 
         match options.mode {
             ChatMode::Chat => prompt.text.push_str(

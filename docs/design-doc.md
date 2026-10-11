@@ -1754,8 +1754,11 @@ terminal as a system line, SSE as a `status` event.
 ### 7.2 System prompt
 
 1. Role and behavior for the mode (7.5): retrieve before answering, cite with `[n]`, run
-   SQL rather than estimate, state assumptions, ask one clarifying question when the
-   request is ambiguous. Then today's date (`Today is YYYY-MM-DD.`, the system's local
+   SQL rather than estimate, and for a request that could be read more than one way take
+   the most likely reading, say which, and run the query (a reply that asks a question and
+   runs nothing is no answer: a reasoning model takes "ask a clarifying question" literally,
+   and in print mode and MCP nobody can answer it, so the person gets the nothing-fetched
+   note of 7.7 instead of a figure). Then today's date (`Today is YYYY-MM-DD.`, the system's local
    zone), so "last quarter" has an anchor without a tool call; it is the one line that
    changes between turns, once a day.
 2. Tool guidance, the error rule (read a `run_sql` error, fix the statement, rerun it), and
