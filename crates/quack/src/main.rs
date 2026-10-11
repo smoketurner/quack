@@ -2441,7 +2441,6 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         name: effective_filename,
         data,
     } = file.named(filename.as_deref())?;
-    let effective_filename = ingestion::recorded_name(&effective_filename, data.file_data())?;
 
     let ws_db = opened.writer()?;
     let replaces = match replace {

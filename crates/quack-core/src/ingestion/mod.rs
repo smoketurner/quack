@@ -430,17 +430,17 @@ impl StoredImage {
     }
 }
 
-/// The name a file is recorded under: `filename` when its extension names
-/// a type quack reads, else `filename` with the extension of the type its
-/// bytes show (`report` becomes `report.pdf`, and a pipe with no name
-/// `stdin.pdf`), so every later step reads the type from the name. A file
-/// whose bytes show no type keeps its name and is refused as unsupported.
+/// The name a file is recorded under: `filename` when it has an extension,
+/// else `filename` with the extension of the type its bytes show (`report`
+/// becomes `report.pdf`, and a pipe with no name `stdin.pdf`), so every
+/// later step reads the type from the name. A name with an extension quack
+/// does not read, and bytes that show no type, are refused as unsupported.
 ///
 /// # Errors
 ///
 /// Returns an error if a file on disk cannot be opened.
 pub fn recorded_name(filename: &str, data: FileData<'_>) -> Result<String> {
-    if FileType::of(filename).is_some() {
+    if Path::new(filename).extension().is_some() {
         return Ok(filename.to_owned());
     }
     let ext = match data {

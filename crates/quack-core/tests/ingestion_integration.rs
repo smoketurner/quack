@@ -932,8 +932,7 @@ async fn ingest_unknown_file_type_returns_error() {
         &config,
         &writer,
         workspace_id,
-        // A TIFF header: binary, and no type quack reads.
-        &ingestion::NewFile::new("scan.tiff", b"II*\x00\x08\x00\x00\x00\x00\x00"),
+        &ingestion::NewFile::new("scan.tiff", b"fake image data"),
         None,
     )
     .await;
