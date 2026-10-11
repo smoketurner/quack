@@ -1744,10 +1744,12 @@ pub struct RetrievalConfig {
     /// Approximate token budget for pinned documents injected into the prompt.
     pub pinned_token_budget: Tokens,
     /// Also inject the top chunks for every user message via rig's
-    /// `dynamic_context`, in addition to the `search_documents` tool.
-    /// Off by default: retrieval should be a visible tool call the model
-    /// chooses, not an invisible prefix on every turn.
-    pub always_retrieve: bool,
+    /// `dynamic_context`, in addition to the `search_documents` tool:
+    /// `auto` (the default) in a workspace that holds ready documents,
+    /// `true` always, `false` never. Small models answer from tables or
+    /// documents but rarely search both, so passages up front keep them
+    /// grounded; each is numbered for citing like a search result.
+    pub always_retrieve: AlwaysRetrieve,
     /// Reranking after hybrid fusion: `none` (the default); `model`, the
     /// chat model ordering the candidates listwise; or `reranker`, the
     /// dedicated rerank model `rerank_model` names scoring each one.
@@ -1770,11 +1772,62 @@ impl Default for RetrievalConfig {
             top_k: 8,
             rrf_k: 60,
             pinned_token_budget: Tokens::new(8000),
-            always_retrieve: false,
+            always_retrieve: AlwaysRetrieve::Auto,
             rerank: RerankMode::None,
             rerank_candidates: 24,
             rerank_model: None,
             languages: LanguageSetting::Auto,
+        }
+    }
+}
+
+/// When a turn retrieves passages up front (`[retrieval].always_retrieve`).
+/// The setting takes `true` and `false`, as it did when it was a flag, or
+/// `"auto"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "AlwaysRetrieveSetting")]
+pub enum AlwaysRetrieve {
+    Off,
+    On,
+    /// On in a workspace that holds ready documents.
+    Auto,
+}
+
+text_enum!(AlwaysRetrieve, "always_retrieve value", {
+    Off => "false",
+    On => "true",
+    Auto => "auto",
+});
+
+impl AlwaysRetrieve {
+    /// Whether a turn in a workspace that does or does not hold ready
+    /// documents (`has_documents`) retrieves up front.
+    #[must_use]
+    pub const fn applies(self, has_documents: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::On => true,
+            Self::Auto => has_documents,
+        }
+    }
+}
+
+/// `always_retrieve` as written: a flag, or a word.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AlwaysRetrieveSetting {
+    Flag(bool),
+    Word(String),
+}
+
+impl TryFrom<AlwaysRetrieveSetting> for AlwaysRetrieve {
+    type Error = Error;
+
+    fn try_from(setting: AlwaysRetrieveSetting) -> Result<Self> {
+        match setting {
+            AlwaysRetrieveSetting::Flag(true) => Ok(Self::On),
+            AlwaysRetrieveSetting::Flag(false) => Ok(Self::Off),
+            AlwaysRetrieveSetting::Word(word) => word.parse(),
         }
     }
 }

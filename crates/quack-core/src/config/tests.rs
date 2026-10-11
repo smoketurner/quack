@@ -42,6 +42,25 @@ fn a_default_workspace_no_workspace_may_take_is_refused() {
     );
 }
 
+/// `always_retrieve` takes the flag it used to be, or `"auto"`, which
+/// retrieves only where there are documents to retrieve from.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn always_retrieve_takes_a_flag_or_auto() {
+    let of = |value: &str| {
+        Config::parse(&format!("[retrieval]\nalways_retrieve = {value}\n"))
+            .map(|c| c.retrieval.always_retrieve)
+    };
+    assert_eq!(of("true").unwrap(), AlwaysRetrieve::On);
+    assert_eq!(of("false").unwrap(), AlwaysRetrieve::Off);
+    assert_eq!(of("\"auto\"").unwrap(), AlwaysRetrieve::Auto);
+    assert!(of("\"sometimes\"").is_err());
+    assert!(AlwaysRetrieve::Auto.applies(true));
+    assert!(!AlwaysRetrieve::Auto.applies(false));
+    assert!(AlwaysRetrieve::On.applies(false));
+    assert!(!AlwaysRetrieve::Off.applies(true));
+}
+
 #[test]
 fn default_config_values() {
     let config = Config::default();
@@ -51,7 +70,7 @@ fn default_config_values() {
     assert_eq!(config.retrieval.top_k, 8);
     assert_eq!(config.retrieval.rrf_k, 60);
     assert_eq!(config.retrieval.pinned_token_budget, Tokens::new(8000));
-    assert!(!config.retrieval.always_retrieve);
+    assert_eq!(config.retrieval.always_retrieve, AlwaysRetrieve::Auto);
     assert_eq!(config.retrieval.rerank, RerankMode::None);
     assert_eq!(config.retrieval.rerank_candidates, 24);
     assert_eq!(config.context.max_tokens, Tokens::new(4000));
