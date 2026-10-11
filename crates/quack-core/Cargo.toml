@@ -27,6 +27,7 @@ csv           = { workspace = true }
 dirs          = { workspace = true }
 duckdb        = { workspace = true, features = ["bundled", "json"] }
 ego-tree      = { workspace = true }
+file-format   = { workspace = true, features = ["reader-cfb", "reader-txt", "reader-zip"] }
 futures       = { workspace = true, features = ["std"] }
 http          = { workspace = true, features = ["std"] }
 forwarded-header-value = { workspace = true }

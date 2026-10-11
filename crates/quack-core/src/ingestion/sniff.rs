@@ -2,73 +2,38 @@
 //! piped file, a download saved without one. The answer is an extension,
 //! so the file is recorded under a name that says its type and every later
 //! step reads the type from the name as usual.
+//!
+//! `file_format` reads the signatures and looks inside containers: the
+//! parts of a zip tell DOCX, XLSX, PPTX, ODT, ODS, and EPUB apart, and the
+//! streams of an OLE2 file tell `.doc`, `.xls`, and `.ppt` apart. Text it
+//! can only call plain is told apart here: JSON, HTML, captions.
 
 use std::io::{Read, Seek, SeekFrom};
 
-/// Bytes read from the start of a file to decide.
+use file_format::FileFormat;
+
+use super::parser::FileType;
+
+/// Bytes read from the start of a file to tell kinds of text apart.
 const HEAD: usize = 8 * 1024;
 
-/// The extension the bytes `data` show, or `None` when they are no type
-/// quack reads. Office and EPUB files are zip archives, told apart by the
-/// parts they hold; text that is not JSON, HTML, or captions is plain text.
+/// The extension the bytes `data` show, when they are a type quack reads;
+/// `None` otherwise, a `.doc` among them until there is a parser for it.
 #[must_use]
-pub fn extension(mut data: impl Read + Seek) -> Option<&'static str> {
+pub fn extension(mut data: impl Read + Seek) -> Option<String> {
     let mut head = Vec::with_capacity(HEAD);
     data.by_ref()
         .take(u64::try_from(HEAD).unwrap_or(u64::MAX))
         .read_to_end(&mut head)
         .ok()?;
-    if let Some(ext) = binary(&head) {
-        return Some(ext);
-    }
-    if head.starts_with(b"PK\x03\x04") {
-        data.seek(SeekFrom::Start(0)).ok()?;
-        return archive(data);
-    }
-    text(&head)
-}
-
-/// A format with a signature at its start.
-fn binary(head: &[u8]) -> Option<&'static str> {
-    const SIGNATURES: &[(&[u8], &str)] = &[
-        (b"%PDF-", "pdf"),
-        (b"PAR1", "parquet"),
-        (b"\x89PNG\r\n\x1a\n", "png"),
-        (b"\xFF\xD8\xFF", "jpg"),
-        (b"GIF87a", "gif"),
-        (b"GIF89a", "gif"),
-        (b"{\\rtf", "rtf"),
-    ];
-    if let Some((_, ext)) = SIGNATURES.iter().find(|(sig, _)| head.starts_with(sig)) {
-        return Some(ext);
-    }
-    (head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP")).then_some("webp")
-}
-
-/// An Office, `OpenDocument`, or EPUB package, by the parts it holds.
-fn archive(data: impl Read + Seek) -> Option<&'static str> {
-    let mut zip = zip::ZipArchive::new(data).ok()?;
-    let holds = |name: &str| zip.file_names().any(|n| n == name);
-    if holds("word/document.xml") {
-        return Some("docx");
-    }
-    if holds("ppt/presentation.xml") {
-        return Some("pptx");
-    }
-    if holds("xl/workbook.xml") {
-        return Some("xlsx");
-    }
-    let mut mimetype = String::new();
-    zip.by_name("mimetype")
-        .ok()?
-        .take(128)
-        .read_to_string(&mut mimetype)
-        .ok()?;
-    match mimetype.trim() {
-        "application/epub+zip" => Some("epub"),
-        "application/vnd.oasis.opendocument.text" => Some("odt"),
-        "application/vnd.oasis.opendocument.spreadsheet" => Some("ods"),
-        _ => None,
+    data.seek(SeekFrom::Start(0)).ok()?;
+    let format = FileFormat::from_reader(data).ok()?;
+    match format {
+        FileFormat::Empty | FileFormat::PlainText => text(&head).map(str::to_owned),
+        _ => {
+            let ext = format.extension();
+            FileType::of(&format!("file.{ext}")).map(|_| ext.to_owned())
+        }
     }
 }
 
@@ -105,66 +70,115 @@ fn text(head: &[u8]) -> Option<&'static str> {
 mod tests {
     use std::io::Cursor;
 
-    use super::super::zipped::tests::package as zip;
+    use super::super::zipped::tests::package;
     use super::*;
 
-    fn of(bytes: &[u8]) -> Option<&'static str> {
+    fn of(bytes: &[u8]) -> Option<String> {
         extension(Cursor::new(bytes))
+    }
+
+    /// An EPUB or `OpenDocument` package: `mimetype` first and stored
+    /// uncompressed, as both specifications require, then `parts`.
+    fn package_of(mimetype: &str, parts: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let wrote = out.start_file("mimetype", stored).is_ok()
+            && out.write_all(mimetype.as_bytes()).is_ok()
+            && parts.iter().all(|(name, body)| {
+                out.start_file(*name, SimpleFileOptions::default()).is_ok()
+                    && out.write_all(body.as_bytes()).is_ok()
+            });
+        if !wrote {
+            return Vec::new();
+        }
+        out.finish().map(Cursor::into_inner).unwrap_or_default()
+    }
+
+    fn is(bytes: &[u8], ext: &str) {
+        assert_eq!(of(bytes).as_deref(), Some(ext), "{:?}", bytes.get(..16));
     }
 
     #[test]
     fn signatures_name_binary_formats() {
-        assert_eq!(of(b"%PDF-1.7\n..."), Some("pdf"));
-        assert_eq!(of(b"PAR1\x15\x04"), Some("parquet"));
-        assert_eq!(of(b"\x89PNG\r\n\x1a\n\0\0"), Some("png"));
-        assert_eq!(of(b"\xFF\xD8\xFF\xE0"), Some("jpg"));
-        assert_eq!(of(b"GIF89a"), Some("gif"));
-        assert_eq!(of(b"RIFF\0\0\0\0WEBPVP8 "), Some("webp"));
-        assert_eq!(of(b"{\\rtf1\\ansi"), Some("rtf"));
+        is(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n1 0 obj\n", "pdf");
+        is(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR", "png");
+        is(b"\xFF\xD8\xFF\xE0\0\x10JFIF\0", "jpg");
+        is(b"GIF89a\x01\0\x01\0", "gif");
+        is(b"{\\rtf1\\ansi\\deff0 hello}", "rtf");
     }
 
     #[test]
     fn packages_are_told_apart_by_their_parts() {
-        assert_eq!(of(&zip(&[("word/document.xml", "<w/>")])), Some("docx"));
-        assert_eq!(of(&zip(&[("ppt/presentation.xml", "<p/>")])), Some("pptx"));
-        assert_eq!(of(&zip(&[("xl/workbook.xml", "<x/>")])), Some("xlsx"));
-        assert_eq!(
-            of(&zip(&[("mimetype", "application/epub+zip")])),
-            Some("epub")
+        is(
+            &package(&[
+                ("[Content_Types].xml", "<Types/>"),
+                ("word/document.xml", "<w:document/>"),
+            ]),
+            "docx",
         );
-        assert_eq!(
-            of(&zip(&[(
-                "mimetype",
-                "application/vnd.oasis.opendocument.spreadsheet"
-            )])),
-            Some("ods")
+        is(
+            &package(&[
+                ("[Content_Types].xml", "<Types/>"),
+                ("xl/workbook.xml", "<workbook/>"),
+            ]),
+            "xlsx",
         );
-        assert_eq!(of(&zip(&[("readme.txt", "hello")])), None);
+        is(
+            &package(&[
+                ("[Content_Types].xml", "<Types/>"),
+                ("ppt/presentation.xml", "<p:presentation/>"),
+            ]),
+            "pptx",
+        );
+        is(
+            &package_of(
+                "application/epub+zip",
+                &[("META-INF/container.xml", "<container/>")],
+            ),
+            "epub",
+        );
+        is(
+            &package_of(
+                "application/vnd.oasis.opendocument.text",
+                &[("content.xml", "<office:document-content/>")],
+            ),
+            "odt",
+        );
+        is(
+            &package_of(
+                "application/vnd.oasis.opendocument.spreadsheet",
+                &[("content.xml", "<office:document-content/>")],
+            ),
+            "ods",
+        );
+        // A zip that is no document type quack reads.
+        assert_eq!(of(&package(&[("readme.txt", "hello")])), None);
     }
 
     #[test]
     fn text_is_json_html_captions_or_plain() {
-        assert_eq!(of(b"  [{\"a\": 1}]"), Some("json"));
-        assert_eq!(of(b"\xEF\xBB\xBF{\"a\": 1}\n{\"a\": 2}\n"), Some("json"));
-        assert_eq!(of(b"<!DOCTYPE html><html></html>"), Some("html"));
-        assert_eq!(of(b"WEBVTT\n\n00:00.000 --> 00:01.000\nHi"), Some("vtt"));
-        assert_eq!(of("# Notes\n\nCafé au lait.".as_bytes()), Some("txt"));
+        is(b"  [{\"a\": 1}]", "json");
+        is(b"{\"a\": 1}\n{\"a\": 2}\n", "json");
+        is(b"<!DOCTYPE html><html><body>Hi</body></html>", "html");
+        is(b"WEBVTT\n\n00:00.000 --> 00:01.000\nHi", "vtt");
+        is("# Notes\n\nCaf\u{e9} au lait.".as_bytes(), "txt");
     }
 
     #[test]
     fn other_bytes_are_no_type() {
-        // An OLE2 compound file (.doc, .xls, .ppt) cannot be told apart
-        // without parsing it.
-        assert_eq!(of(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0\0"), None);
-        assert_eq!(of(b"\x00\x01\x02binary"), None);
-        assert_eq!(of(b""), Some("txt"));
+        // An OLE2 compound file with no Word, Excel, or PowerPoint stream.
+        assert_eq!(of(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1\0\0\0\0"), None);
+        assert_eq!(of(&[0, 1, 2, 3, 0xFE, 0xFF, 0, 0]), None);
     }
 
     /// A head cut in the middle of a character is still text.
     #[test]
     fn a_character_cut_by_the_head_is_still_text() {
         let mut bytes = vec![b'a'; HEAD - 1];
-        bytes.extend_from_slice("é".as_bytes());
-        assert_eq!(of(&bytes), Some("txt"));
+        bytes.extend_from_slice("\u{e9}".as_bytes());
+        is(&bytes, "txt");
     }
 }
