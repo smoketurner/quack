@@ -87,6 +87,8 @@ open:
 - **16**: Profiles every user table again, so each text column with at most 50 distinct values
   lists them all (`ColumnProfile::values`); a question's words are matched to those values
   before the agent's queries run (design doc 7.7).
+- **17**: Profiles every user table again, so each number and date column records its
+  smallest and largest value (`ColumnProfile::range`), which the prompt's column line shows.
 
 A column that needs no backfill needs no bump: `ADD COLUMN IF NOT EXISTS` on open adds it,
 and rows written earlier read as `NULL`. `_quack_documents.page_count`, `pages_unreadable`,

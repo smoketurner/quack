@@ -616,6 +616,8 @@ struct ColumnRow {
     meaning: String,
     present: String,
     distinct: String,
+    /// A number or date column's smallest and largest value.
+    range: String,
     warnings: Vec<String>,
     fix: Option<String>,
 }
@@ -648,6 +650,10 @@ impl TableView {
                         _ => String::new(),
                     },
                     distinct: counts.map(|c| c.distinct.to_string()).unwrap_or_default(),
+                    range: counts
+                        .and_then(|c| c.range.as_ref())
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
                     warnings: flagged.iter().map(|f| f.warning.to_string()).collect(),
                     fix: flagged
                         .iter()

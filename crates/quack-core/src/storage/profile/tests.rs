@@ -254,6 +254,7 @@ fn a_text_columns_form_replaces_letters_and_digits() {
         distinct: 1,
         samples: vec![sample.to_owned()],
         values: Vec::new(),
+        range: None,
         number_share: 0.0,
         date_share: 0.0,
     };
@@ -272,4 +273,34 @@ fn a_text_columns_form_replaces_letters_and_digits() {
     let mut empty = column("VARCHAR", "x");
     empty.samples.clear();
     assert_eq!(empty.form(), None);
+}
+
+/// A number or date column records its smallest and largest value as
+/// `DuckDB` writes them; a text or empty column records no range.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn number_and_date_columns_record_their_range() {
+    let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
+    db.connection()
+        .execute_batch(
+            "CREATE TABLE t (n INTEGER, d DATE, x DOUBLE, s VARCHAR, e INTEGER);
+             INSERT INTO t VALUES (5, '2024-03-01', 1.5, 'a', NULL), (-2, '2023-11-30', 0.25, 'b', NULL);",
+        )
+        .unwrap();
+    let profile = TableProfile::compute(&db, "t").unwrap();
+    let range = |name: &str| profile.column(name).unwrap().range.clone();
+    assert_eq!(
+        range("n").map(|r| r.to_string()).as_deref(),
+        Some("-2 to 5")
+    );
+    assert_eq!(
+        range("d").map(|r| r.to_string()).as_deref(),
+        Some("2023-11-30 to 2024-03-01")
+    );
+    assert_eq!(
+        range("x").map(|r| r.to_string()).as_deref(),
+        Some("0.25 to 1.5")
+    );
+    assert_eq!(range("s"), None);
+    assert_eq!(range("e"), None);
 }

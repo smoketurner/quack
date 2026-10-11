@@ -1174,9 +1174,10 @@ type button (members and owners) change an existing table the same way, audited 
 that wrote (the agent's `run_sql`, the SQL page, MCP `sql`, the terminal, `quack -q`) when its
 row count changed, and once on upgrade to schema version 12 (`storage::profile::TableProfile`,
 `_quack_table_profiles`). One statement per table counts each column's present and distinct
-values, keeps its three most common values (`approx_top_k`, cut to 60 characters), and for a
-text column the share of values that cast to a number and to a date; columns past 200 are left
-out. A profile whose row count no longer matches the table is not shown. Warnings are worked out
+values, keeps its three most common values (`approx_top_k`, cut to 60 characters), for a
+number or date column its smallest and largest value as `DuckDB` writes them
+(`ColumnProfile::range`), and for a text column the share of values that cast to a number and
+to a date; columns past 200 are left out. A profile whose row count no longer matches the table is not shown. Warnings are worked out
 when read: every value empty, at least half empty, numbers stored as text and dates stored as
 text (at least 90% of values cast), and a key that repeats (the mapping's key column, or a
 column named `id`). A mistyped-text warning names the type that fixes it only when every value
@@ -1776,7 +1777,10 @@ terminal as a system line, SSE as a `status` event.
    and the form of its values with every letter and digit replaced (`61 distinct values,
    form AAA99`), which says how to write one without a value to copy, as does an identifier
    (a column named like a key whose every value differs, `25 distinct values, form
-   AAA-9999`); a number or date column shows nothing beyond its type. No rows are shown: a value the model copies from a
+   AAA-9999`); a number or date column shows its range (`damage_property_usd (BIGINT); 0 to
+   62000000`, `begin_date (DATE); 2023-01-04 to 2023-11-28`), which says the period the data
+   covers and the unit the figures imply, and the guidance says a period or an amount outside
+   it is not in the data. No rows are shown: a value the model copies from a
    row is a guess that returns a real figure (section 7.7). It is bounded so one wide or
    narrative table cannot push the guidance and question out of a small window: the first
    25 tables are described and the rest listed by name; the first 40 columns are listed and
@@ -1784,7 +1788,10 @@ terminal as a system line, SSE as a `status` event.
    past that shows its count and form. `describe_table` and `find_tables` have the rest,
    sample rows included. The ontology's measures follow (30 at most), then, when the
    graph has nodes, one line naming the graph views (30 at most). The graph views are not
-   counted or described as tables. The block depends on the workspace only, never on the
+   counted or described as tables. The ontology block itself (item 5) ends with the joins
+   its mappings imply, each a predicate as SQL writes it (`fatalities.event_id =
+   events.event_id (during)`, `Ontology::joins`), since a multi-table question needs that
+   one fact most and the mapping already records it. The block depends on the workspace only, never on the
    question, so a provider's prefix cache keeps it.
 4. Documents block: every document by filename, title, status and mime type, then, when
    the person limited the question to documents, a sentence naming them (`DocumentScope`,

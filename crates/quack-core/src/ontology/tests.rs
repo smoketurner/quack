@@ -320,3 +320,37 @@ fn a_class_named_like_the_edge_view_is_refused() {
         "{error}"
     );
 }
+
+/// The joins the mappings imply render as SQL predicates, one per mapped
+/// relation whose target class is mapped to a table; a target class no
+/// table maps gives none.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn mapped_relations_render_as_join_predicates() {
+    let ontology = Ontology::from_json(
+        r#"{"classes": [{"id": "event", "key": "event_id", "properties": ["event_id"]},
+                        {"id": "fatality", "key": "fatality_id", "properties": ["fatality_id"]},
+                        {"id": "office"}],
+            "properties": [{"id": "event_id", "type": "string"}, {"id": "fatality_id", "type": "string"}],
+            "relations": [{"id": "during", "domain": "fatality", "range": "event"},
+                          {"id": "filed_by", "domain": "event", "range": "office"}],
+            "mappings": [{"table": "events", "class": "event", "key": "event_id"},
+                         {"table": "fatalities", "class": "fatality", "key": "fatality_id",
+                          "relations": [{"relation": "during", "column": "event_id", "target_class": "event", "target_key": "event_id"}]}]}"#,
+    )
+    .unwrap();
+    let joins: Vec<String> = ontology.joins().iter().map(ToString::to_string).collect();
+    assert_eq!(joins, ["fatalities.event_id = events.event_id (during)"]);
+    let text = ontology.render_capped(30);
+    assert!(
+        text.contains(
+            "- joins (a column holding another mapped table's key; JOIN on it):\n  - fatalities.event_id = events.event_id (during)\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        !Ontology::builtin_default()
+            .render_capped(30)
+            .contains("joins")
+    );
+}

@@ -401,6 +401,28 @@ pub struct Mapping {
     pub relations: Vec<MappingRelation>,
 }
 
+/// A join the mappings imply: a column of one mapped table holds the key of
+/// another, as SQL writes it (`fatalities.event_id = events.event_id`),
+/// with the relation the edge takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Join {
+    pub table: String,
+    pub column: String,
+    pub target_table: String,
+    pub target_column: String,
+    pub relation: RelationId,
+}
+
+impl std::fmt::Display for Join {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}.{} = {}.{} ({})",
+            self.table, self.column, self.target_table, self.target_column, self.relation
+        )
+    }
+}
+
 impl Mapping {
     /// The stable id of a mapping: its table.
     #[must_use]
@@ -1013,6 +1035,31 @@ impl Ontology {
         self.render_capped(usize::MAX)
     }
 
+    /// Every join the mappings imply: each mapped relation whose target
+    /// class is mapped to a table, as a predicate over the two tables'
+    /// columns. A target class no table maps gives no join.
+    #[must_use]
+    pub fn joins(&self) -> Vec<Join> {
+        self.mappings
+            .iter()
+            .flat_map(|mapping| {
+                mapping.relations.iter().filter_map(|relation| {
+                    let target = self
+                        .mappings
+                        .iter()
+                        .find(|m| m.class == relation.target_class)?;
+                    Some(Join {
+                        table: mapping.table.clone(),
+                        column: relation.column.clone(),
+                        target_table: target.table.clone(),
+                        target_column: target.key.clone(),
+                        relation: relation.relation.clone(),
+                    })
+                })
+            })
+            .collect()
+    }
+
     /// The block the system prompt carries (design doc 7.2), capped at
     /// `limit` items per section. An ontology induced from a wide
     /// workspace has a class per table and a property per column, which
@@ -1073,6 +1120,16 @@ impl Ontology {
             }
             if let Some(rest) = hidden(self.mappings.len(), limit) {
                 lines.push(format!("  - ... and {rest} more mapped tables"));
+            }
+            let joins = self.joins();
+            if !joins.is_empty() {
+                lines.push(String::from(
+                    "- joins (a column holding another mapped table's key; JOIN on it):",
+                ));
+                lines.extend(joins.iter().take(limit).map(|j| format!("  - {j}")));
+                if let Some(rest) = hidden(joins.len(), limit) {
+                    lines.push(format!("  - ... and {rest} more joins"));
+                }
             }
         }
         let mut out = lines.join("\n");

@@ -75,12 +75,12 @@ const TABLE_PROFILES: u32 = 12;
 /// are stemmed under it, with unspaced scripts as bigrams (issue #395):
 /// every document is detected and every chunk reindexed.
 const DOCUMENT_LANGUAGES: u32 = 13;
-/// A text column's profile lists all its values when it has few, so a
-/// question's words can be matched to them: every table is profiled again.
-/// (Version 15 recorded the runs that label a table's text and the document
-/// source `classify`, and version 14 saved imports; neither needed a
-/// backfill.)
-const VALUE_LISTS: u32 = 16;
+/// Profiles record each number and date column's range, and a text column's
+/// profile lists all its values when it has few, so a question's words can
+/// be matched to them (version 16): every table is profiled again. (Version
+/// 15 recorded the runs that label a table's text and the document source
+/// `classify`, and version 14 saved imports; neither needed a backfill.)
+const VALUE_RANGES: u32 = 17;
 
 /// The documents table, and the columns older files gain on open.
 const DOCUMENTS_DDL: &str = "
@@ -155,7 +155,7 @@ const SAVED_IMPORTS_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_imports (
 
 /// Schema version of the internal tables, recorded in `_quack_meta`: the
 /// newest step above.
-const WORKSPACE_SCHEMA_VERSION: u32 = VALUE_LISTS;
+const WORKSPACE_SCHEMA_VERSION: u32 = VALUE_RANGES;
 
 /// The oldest `DuckDB` that must read a file created here, given to `DuckDB`
 /// when the file is opened. It is the bundled library's own default, named so
@@ -1695,7 +1695,7 @@ impl WorkspaceDb {
         if recorded < MERGE_DEDUP {
             self.collapse_duplicate_merge_proposals()?;
         }
-        if recorded < VALUE_LISTS {
+        if recorded < VALUE_RANGES {
             if recorded >= TABLE_PROFILES {
                 self.conn.execute("DELETE FROM _quack_table_profiles", [])?;
             }

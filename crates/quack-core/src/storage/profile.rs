@@ -1,6 +1,7 @@
 //! What a table's columns hold (issue #403): each column's counts, a few
-//! common values, and how much of a text column reads as numbers or dates,
-//! kept in `_quack_table_profiles` with the row count they were taken at.
+//! common values, the range of a number or date column, and how much of a
+//! text column reads as numbers or dates, kept in `_quack_table_profiles`
+//! with the row count they were taken at.
 //! A profile is taken when a table is loaded or imported and again after a
 //! write changes the row count; one whose count no longer matches is not
 //! shown, so a stale profile never misleads. Warnings are worked out when
@@ -342,6 +343,21 @@ impl Retype<'_> {
     }
 }
 
+/// The smallest and largest value of a number or date column, as `DuckDB`
+/// writes them: what a query needs to filter on a value the column holds
+/// (a year the dates cover, a unit the figures imply) without a row to copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ValueRange {
+    pub min: String,
+    pub max: String,
+}
+
+impl fmt::Display for ValueRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} to {}", self.min, self.max)
+    }
+}
+
 /// One column's counts and common values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ColumnProfile {
@@ -355,6 +371,9 @@ pub struct ColumnProfile {
     /// longer than 60 characters; empty otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
+    /// For a number or date column with a value, its smallest and largest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<ValueRange>,
     /// For a text column, the share of non-null values that cast to a
     /// number; 0 otherwise.
     #[serde(default)]
@@ -559,16 +578,29 @@ impl TableProfile {
             select.push(format!(
                 "CAST(to_json(approx_top_k(CAST({q} AS VARCHAR), {LISTED_VALUES})) AS VARCHAR)"
             ));
-            if ColumnKind::of(&column.column_type) == ColumnKind::Text {
-                select.push(format!(
-                    "avg(CASE WHEN {q} IS NULL THEN NULL WHEN TRY_CAST({q} AS DOUBLE) IS NOT NULL THEN 1.0 ELSE 0.0 END)"
-                ));
-                select.push(format!(
-                    "avg(CASE WHEN {q} IS NULL THEN NULL WHEN TRY_CAST({q} AS DATE) IS NOT NULL THEN 1.0 ELSE 0.0 END)"
-                ));
-            } else {
-                select.push(String::from("NULL::DOUBLE"));
-                select.push(String::from("NULL::DOUBLE"));
+            match ColumnKind::of(&column.column_type) {
+                ColumnKind::Text => {
+                    select.push(format!(
+                        "avg(CASE WHEN {q} IS NULL THEN NULL WHEN TRY_CAST({q} AS DOUBLE) IS NOT NULL THEN 1.0 ELSE 0.0 END)"
+                    ));
+                    select.push(format!(
+                        "avg(CASE WHEN {q} IS NULL THEN NULL WHEN TRY_CAST({q} AS DATE) IS NOT NULL THEN 1.0 ELSE 0.0 END)"
+                    ));
+                    select.push(String::from("NULL::VARCHAR"));
+                    select.push(String::from("NULL::VARCHAR"));
+                }
+                ColumnKind::Numeric | ColumnKind::Temporal => {
+                    select.push(String::from("NULL::DOUBLE"));
+                    select.push(String::from("NULL::DOUBLE"));
+                    select.push(format!("CAST(min({q}) AS VARCHAR)"));
+                    select.push(format!("CAST(max({q}) AS VARCHAR)"));
+                }
+                ColumnKind::Boolean | ColumnKind::Other => {
+                    select.push(String::from("NULL::DOUBLE"));
+                    select.push(String::from("NULL::DOUBLE"));
+                    select.push(String::from("NULL::VARCHAR"));
+                    select.push(String::from("NULL::VARCHAR"));
+                }
             }
         }
         let sql = format!("SELECT {} FROM {}", select.join(", "), quote_ident(table));
@@ -578,7 +610,7 @@ impl TableProfile {
                     let rows: i64 = row.get(0)?;
                     let mut profiled = Vec::with_capacity(columns.len());
                     for (i, column) in columns.iter().enumerate() {
-                        let at = i.saturating_mul(5).saturating_add(1);
+                        let at = i.saturating_mul(7).saturating_add(1);
                         let non_null: i64 = row.get(at)?;
                         let distinct: i64 = row.get(at.saturating_add(1))?;
                         let samples: Option<String> = row.get(at.saturating_add(2))?;
@@ -593,12 +625,15 @@ impl TableProfile {
                         let distinct = u64::try_from(distinct).unwrap_or(0);
                         let number_share: Option<f64> = row.get(at.saturating_add(3))?;
                         let date_share: Option<f64> = row.get(at.saturating_add(4))?;
+                        let min: Option<String> = row.get(at.saturating_add(5))?;
+                        let max: Option<String> = row.get(at.saturating_add(6))?;
                         profiled.push(ColumnProfile {
                             name: column.name.clone(),
                             duckdb_type: column.column_type.to_ascii_uppercase(),
                             non_null: u64::try_from(non_null).unwrap_or(0),
                             distinct,
                             values: listed(&column.column_type, distinct, &common),
+                            range: min.zip(max).map(|(min, max)| ValueRange { min, max }),
                             samples: common.iter().take(SAMPLES).map(|s| cut(s)).collect(),
                             number_share: number_share.unwrap_or(0.0),
                             date_share: date_share.unwrap_or(0.0),

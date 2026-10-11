@@ -374,7 +374,9 @@ impl SystemPrompt {
                  columns. A column line lists every value a small text column holds: filter on \
                  one of them, exactly as written. A column line that shows a count and a form \
                  instead has more values than it lists: run SELECT DISTINCT col FROM t before \
-                 filtering on one, since a value you have not seen is a guess\n"
+                 filtering on one, since a value you have not seen is a guess. A number or date \
+                 column line shows its smallest and largest value: a period or an amount outside \
+                 them is not in the data\n"
             }
             TableLayout::Ranked => {
                 "When answering analytical questions about structured data:\n\
@@ -385,7 +387,9 @@ impl SystemPrompt {
                  column line lists every value a small text column holds: filter on one of them, \
                  exactly as written. A column line that shows a count and a form instead has \
                  more values than it lists: run SELECT DISTINCT col FROM t before filtering on \
-                 one, since a value you have not seen is a guess\n"
+                 one, since a value you have not seen is a guess. A number or date column line \
+                 shows its smallest and largest value: a period or an amount outside them is not \
+                 in the data\n"
             }
         });
         self.text.push_str(
@@ -652,14 +656,19 @@ impl SystemPrompt {
         Ok(())
     }
 
-    /// What a column line says of a text column's values: every one when
-    /// the profile lists them all and the table's budget allows, else how
-    /// many there are and their form, so the model writes one the column
-    /// holds or asks `DuckDB` for them. An identifier (named like a key,
-    /// every value different) shows its form, since a list of ids tells the
-    /// model nothing the form does not. Other columns say nothing: their
-    /// type is their form.
+    /// What a column line says of a column's values. A text column: every
+    /// one when the profile lists them all and the table's budget allows,
+    /// else how many there are and their form, so the model writes one the
+    /// column holds or asks `DuckDB` for them; an identifier (named like a
+    /// key, every value different) shows its form, since a list of ids
+    /// tells the model nothing the form does not. A number or date column:
+    /// its range, which says the years the dates cover and the unit the
+    /// figures imply. Other columns say nothing: their type is their form.
     fn column_values(&mut self, profiled: &ColumnProfile, budget: &mut usize) -> Result<()> {
+        if let Some(range) = &profiled.range {
+            write!(self.text, "; {range}")?;
+            return Ok(());
+        }
         let Some(form) = profiled.form() else {
             return Ok(());
         };

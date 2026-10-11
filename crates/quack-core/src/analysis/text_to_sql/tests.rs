@@ -830,7 +830,7 @@ fn tables_workspace(n: usize) -> WorkspaceDb {
 
 /// A column line carries what the profile says of a text column's values:
 /// every one for a small column, the count and the form for a wide one or
-/// an identifier, nothing for a number; no sample
+/// an identifier, the range for a number or a date; no sample
 /// rows; and the values the question names come after the workspace
 /// context, as the columns hold them.
 #[test]
@@ -839,12 +839,12 @@ fn column_lines_carry_values_or_their_form_and_the_question_names_stored_ones() 
     let db = db();
     db.execute_statement(
         "CREATE TABLE events (event_id VARCHAR, state VARCHAR, office VARCHAR, note VARCHAR, \
-         damage INTEGER);
+         damage INTEGER, begin_date DATE);
          INSERT INTO events
          SELECT 'EVT-' || i, 'TEXAS', 'AKQ' || lpad(CAST(i AS VARCHAR), 2, '0'), \
-         repeat('narrative ', 20), i
+         repeat('narrative ', 20), i, DATE '2024-01-01' + INTERVAL (i) DAY
          FROM range(60) t(i)
-         UNION ALL SELECT 'EVT-X', 'TENNESSEE', 'FWD1', 'short', 1;",
+         UNION ALL SELECT 'EVT-X', 'TENNESSEE', 'FWD1', 'short', 1, DATE '2023-12-31';",
     )
     .unwrap();
     TableProfile::refresh(&db, "events").unwrap();
@@ -872,7 +872,15 @@ fn column_lines_carry_values_or_their_form_and_the_question_names_stored_ones() 
         ),
         "{prompt}"
     );
-    assert!(prompt.contains("    - damage (INTEGER)\n"), "{prompt}");
+    // A number or date column shows its range, never a row.
+    assert!(
+        prompt.contains("    - damage (INTEGER); 0 to 59\n"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("    - begin_date (DATE); 2023-12-31 to 2024-02-29\n"),
+        "{prompt}"
+    );
     assert!(!prompt.contains("narrative narrative"), "{prompt}");
     let line = "The question names these stored values; filter on them exactly as written: \
                 events.state = 'TEXAS' (Texas)";
