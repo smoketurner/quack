@@ -903,6 +903,7 @@ terminal's `/ingest` takes files.
 | HTML | `scraper` (html5ever) | headings, `<table>` as table sections; `nav`, `aside`, `footer`, `form`, scripts, and styles skipped; `<title>` and the `author`, `date`, `keywords`, `description` meta tags (HTML, Dublin Core, Open Graph names) |
 | DOCX | `office_oxide` | headings from outline levels (any style name, any locale), tables, footnotes, endnotes, and comments as note sections; core title, creator, dates, keywords |
 | PPTX | `office_oxide` | one section per slide, slide title as heading, slide number as page, speaker notes as note sections; core properties |
+| DOC, PPT (97-2003) | `office_oxide` | read as DOCX and PPTX are, from `office_oxide`'s conversion of the compound file; a `.doc`'s headings come through only where the file marks them as such |
 | EPUB | `zip` + `quick-xml` + the HTML parser | the spine's XHTML items as chapters, `chapter N` as the locator; OPF title, creator, date, subjects |
 | ODT | `zip` + `quick-xml` (`ingestion::odt`) | `text:h` headings, tables, footnote bodies as note sections; `meta.xml` title, creator, dates, keywords |
 | `.eml`, `.mbox` | `mail-parser` | one section per message under its subject, with From, To, and Date above the body (HTML-only bodies read as text); `message N` as a mailbox's locator; From and Date as author and date |
@@ -3672,7 +3673,7 @@ Every gap is a GitHub issue unless the item says otherwise.
 - `quack-core` with the three substrates and one agent, as an event stream
 - Workspace as the classification boundary: one DuckDB file plus `files/`, everything
   classified inside it; `control.db` holds access control only; audit split at the boundary
-- Documents: upload, paste, path, stdin; PDF, Markdown, text, HTML, DOCX, PPTX; chunk
+- Documents: upload, paste, path, stdin; PDF, Markdown, text, HTML, DOCX, PPTX, DOC, PPT; chunk
   metadata; hybrid retrieval; citations; pinned documents; SHA dedup; chat and query modes
 - Tables: CSV/TSV/Parquet/JSON/JSONL/XLSX; snapshot imports from SQLite and http(s) data
   files through `quack import` (no `ATTACH`; Postgres, MySQL, and S3 URLs are refused)
