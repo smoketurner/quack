@@ -191,6 +191,28 @@ impl CitationRegistry {
         markers
     }
 
+    /// The marker of each of `hits`: the one it was given when first
+    /// registered this turn, else a new one after the last. Chunks shown
+    /// again before every model call keep the number the model already saw.
+    #[must_use]
+    pub fn number(&self, hits: &[ChunkSearchResult]) -> Vec<u32> {
+        let Ok(mut all) = self.inner.lock() else {
+            return Vec::new();
+        };
+        hits.iter()
+            .map(|hit| {
+                if let Some(known) = all.iter().find(|c| c.chunk_id == hit.id) {
+                    return known.n;
+                }
+                let n = u32::try_from(all.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(1);
+                all.push(Citation::new(n, hit));
+                n
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn all(&self) -> Vec<Citation> {
         self.inner.lock().map(|c| c.clone()).unwrap_or_default()

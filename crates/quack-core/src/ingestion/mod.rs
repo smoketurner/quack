@@ -46,9 +46,12 @@ use crate::text::{NonBlankText, OneLine};
 use budget::DecompressionBudget;
 use chunker::Chunker;
 use parser::{
-    DocumentMeta, FileType, ImageFormat, Load, PageCounts, Reader, SectionKind, Separator,
-    TextFormat,
+    DocumentMeta, Extracted, FileType, ImageFormat, Load, PageCounts, Reader, Section, SectionKind,
+    Separator, TextFormat,
 };
+
+/// What the vision model is asked of a page that has a picture and no text.
+const SCAN_INSTRUCTION: &str = "This is a scanned page of a document. Transcribe its text.";
 use table::Table;
 
 /// Result of ingesting a single file into a workspace.
@@ -710,6 +713,53 @@ impl<M: EmbeddingModel> Processing<'_, M> {
         Ok(result)
     }
 
+    /// Have the vision model transcribe the pages that hold a picture and
+    /// no text, each into a section on its page, so they are chunked and
+    /// cited like the rest. With no vision model they stay out and are
+    /// counted as pages without text; a document of nothing else is refused
+    /// with the setting that would read it.
+    async fn read_scans(&self, extracted: &mut Extracted) -> Result<()> {
+        let scans = std::mem::take(&mut extracted.scans);
+        if scans.is_empty() {
+            return Ok(());
+        }
+        let Some(reader) = ImageReader::for_ingest(self.config).await? else {
+            if extracted.sections.is_empty() {
+                return Err(Error::Ingestion(format!(
+                    "no extractable text: {} has no text layer; set [ingestion].vision_model \
+                     to have its pages read",
+                    OneLine(self.file.filename)
+                )));
+            }
+            return Ok(());
+        };
+        let mut read = Vec::with_capacity(scans.len());
+        for scan in scans {
+            let text = self
+                .file
+                .control
+                .or_cancelled(reader.read(&scan.image, scan.format, SCAN_INSTRUCTION))
+                .await?;
+            let text = text.trim();
+            if !text.is_empty() {
+                read.push(Section::body(None, text.to_owned()).on_page(Some(scan.page)));
+            }
+        }
+        if let Some(counts) = extracted.pages.as_mut() {
+            let transcribed = u32::try_from(read.len()).unwrap_or(u32::MAX);
+            counts.empty = counts.empty.saturating_sub(transcribed);
+            counts.transcribed = counts.transcribed.saturating_add(transcribed);
+        }
+        if extracted.sections.is_empty() && read.is_empty() {
+            return Err(Error::Ingestion(String::from(
+                "no extractable text: the PDF has no text layer and the vision model found no \
+                 text on its pages",
+            )));
+        }
+        extracted.insert_by_page(read);
+        Ok(())
+    }
+
     /// Parse and chunk a text document, record what it says about itself,
     /// load the tables inside it that are big enough, and embed the chunks.
     async fn chunk(
@@ -729,13 +779,20 @@ impl<M: EmbeddingModel> Processing<'_, M> {
         // Parsing and chunking are the slow, CPU-bound part: off the
         // runtime's workers, and not on the writer.
         let parsing = Parsing::new(config, format, filename, data);
+        let (parsing, mut extracted) = parse_off_runtime(move || {
+            let mut parsing = parsing;
+            let extracted = parsing.extract()?;
+            Ok((parsing, extracted))
+        })
+        .await?;
+        self.read_scans(&mut extracted).await?;
         let Parsed {
             title,
             pages,
             chunks,
             meta,
             tables: found,
-        } = parse_off_runtime(move || parsing.run()).await?;
+        } = parse_off_runtime(move || parsing.finish(extracted)).await?;
         let (id, fields) = (doc_id.to_owned(), self.file.fields.clone());
         db.run(move |db| {
             if let Some(title) = title {
@@ -836,8 +893,17 @@ impl Parsing {
         }
     }
 
-    fn run(self) -> Result<Parsed> {
-        let extracted = self.format.extract(&self.data, self.budget)?;
+    /// The document's text and structure, before any vision model reads
+    /// its pictures.
+    /// The budget and the bytes are spent here: chunking needs neither.
+    fn extract(&mut self) -> Result<Extracted> {
+        let budget = std::mem::replace(&mut self.budget, DecompressionBudget::megabytes(0));
+        let data = std::mem::take(&mut self.data);
+        self.format.extract(&data, budget)
+    }
+
+    /// Chunk `extracted`, and find the tables inside it big enough to load.
+    fn finish(self, extracted: Extracted) -> Result<Parsed> {
         let chunks = Chunker::new(self.chunk_size, self.chunk_overlap, &self.encoding)?
             .document(&extracted, self.stem.as_deref())?;
         let mut tables = Vec::new();

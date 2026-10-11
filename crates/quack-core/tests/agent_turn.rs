@@ -461,6 +461,40 @@ async fn reasoning_is_announced_once_per_model_call_and_never_as_text() {
     assert_eq!(ran.answer().content, "There is one table.");
 }
 
+/// A `<think>` block a model writes into its text (Qwen3 on Ollama, even
+/// with reasoning off) is reasoning, never answer text, whichever deltas it
+/// arrives in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_think_block_in_the_text_is_reasoning_not_answer() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![
+            text("<think>\nI should list "),
+            text("the tables.\n</thi"),
+            text("nk>\n\n"),
+            call("t1", "list_tables", serde_json::json!({})),
+        ]),
+        turn(vec![text("<think>\n\n</think>\n\nThere is one table.")]),
+    ]);
+    let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "tables?").await;
+    assert_eq!(ran.answer().content, "There is one table.");
+    let streamed: String = ran
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed, "There is one table.");
+    let reasoning = ran
+        .events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::Reasoning))
+        .count();
+    assert_eq!(reasoning, 2, "once per model call");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_turn_streams_its_tools_in_order_and_records_the_session() {
     let db = workspace();
@@ -751,6 +785,69 @@ async fn a_second_empty_reply_ends_the_turn_with_the_note() {
         "(The model returned no text; ask again or narrow the question.)"
     );
     assert_eq!(model.request_count(), 2);
+}
+
+/// An answer with figures from a turn that ran no tool and read nothing is
+/// asked for again; the second answer used the tools and stands as it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_with_figures_and_no_tool_is_asked_for_again() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![text("North fell by 100.")]),
+        turn(vec![call(
+            "t1",
+            "run_sql",
+            serde_json::json!({"query": "SELECT region, revenue FROM sales"}),
+        )]),
+        turn(vec![text("North has 10 and south 20.")]),
+    ]);
+    let ran = run_turn(
+        &db,
+        &model,
+        WritePolicy::Deny,
+        Vec::new(),
+        "which region fell?",
+    )
+    .await;
+    assert_eq!(ran.answer().content, "North has 10 and south 20.");
+    let retry = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
+    assert!(retry.contains("ran no query and read no"), "{retry}");
+}
+
+/// A second ungrounded answer is accepted, and says it does not come from
+/// the workspace.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_ungrounded_answer_carries_the_note() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![text("North fell by 100.")]),
+        turn(vec![text("North fell by 100, reopening next week.")]),
+        turn(vec![text("never reached")]),
+    ]);
+    let ran = run_turn(
+        &db,
+        &model,
+        WritePolicy::Deny,
+        Vec::new(),
+        "which region fell?",
+    )
+    .await;
+    assert_eq!(
+        ran.answer().content,
+        "North fell by 100, reopening next week.\n\n(No query ran and no document was read \
+         this turn, so this answer does not come from the workspace's data.)"
+    );
+    assert_eq!(model.request_count(), 2);
+}
+
+/// An answer that states no figures is not second-guessed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_without_figures_is_not_asked_again() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([turn(vec![text("Hello there.")])]);
+    let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "hi").await;
+    assert_eq!(ran.answer().content, "Hello there.");
+    assert_eq!(model.request_count(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

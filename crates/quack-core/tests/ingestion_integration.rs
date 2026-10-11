@@ -31,6 +31,7 @@ use quack_core::storage::workspace::{
 use quack_core::storage::writer::Writer;
 use quack_core::text::Tokens;
 use quack_core::{import, ingestion};
+use quack_testkit::{Reply, ScriptedOllama};
 use rig::ProviderError;
 use rig::embeddings::Embedding;
 
@@ -2868,6 +2869,7 @@ async fn a_pdf_page_without_text_is_counted_on_the_document() {
         total: 3,
         unreadable: 0,
         empty: 1,
+        transcribed: 0,
     };
     assert_eq!(result.pages, Some(counts));
     assert_eq!(
@@ -2898,6 +2900,107 @@ async fn a_pdf_page_without_text_is_counted_on_the_document() {
     assert_eq!(text.pages, None);
     let doc = db.document(&text.document_id).unwrap().unwrap();
     assert_eq!(doc.pages, None);
+}
+
+/// A two-page PDF: typed text on the first page, the second only a
+/// scanned picture.
+fn scanned_pdf(pages_of_text: bool) -> Vec<u8> {
+    const SCAN: &[u8] = include_bytes!("fixtures/scanned_page.jpg");
+    let page = pdf_oxide::geometry::Rect::new(0.0, 0.0, 612.0, 792.0);
+    let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Scanned");
+    if pages_of_text {
+        pdf.letter_page()
+            .at(72.0, 720.0)
+            .text("Typed cover page")
+            .done();
+    }
+    pdf.letter_page()
+        .image_from_bytes(SCAN, page)
+        .unwrap()
+        .done();
+    pdf.build().unwrap()
+}
+
+/// A PDF page that is only a picture goes to the vision model, and its
+/// transcription is chunked on its page and counted apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scanned_pdf_page_is_read_by_the_vision_model() {
+    let vision = ScriptedOllama::serve(vec![Reply::Text("WH-OAK reopens on October 18.")])
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = vision
+        .config_with("[ingestion]\nvision_model = \"scripted/model\"\n")
+        .unwrap();
+    config.general.data_dir = dir.path().to_path_buf();
+    let db = WorkspaceDb::open(&config, "ws-scan").unwrap();
+    let writer = writer_of(&db);
+    let result = Egress::scope(
+        Some(Egress::NoWorkspace),
+        ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-scan",
+            &ingestion::NewFile::new("scanned.pdf", &scanned_pdf(true)),
+            None::<&Embedder<MockEmbeddingModel>>,
+        ),
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+
+    let counts = PageCounts {
+        total: 2,
+        unreadable: 0,
+        empty: 0,
+        transcribed: 1,
+    };
+    assert_eq!(result.pages, Some(counts));
+    let doc = db.document(&result.document_id).unwrap().unwrap();
+    assert_eq!(doc.pages, Some(counts));
+    assert_eq!(
+        doc.pages.and_then(PageCounts::note).as_deref(),
+        Some("1 of 2 pages transcribed by the vision model")
+    );
+    let hits = db
+        .search_keyword_chunks("reopens", 5, &ChunkScope::all())
+        .unwrap();
+    let hit = hits.first().unwrap();
+    assert!(hit.content.contains("WH-OAK reopens"), "{hit:?}");
+    // Windowed with the typed page before it, as any page is.
+    assert!(hit.content.starts_with("Typed cover page"), "{hit:?}");
+    assert_eq!(hit.page, Some(1), "{hit:?}");
+    // The model was sent the page's picture.
+    let sent = vision.requests();
+    let images = sent
+        .first()
+        .and_then(|r| r["messages"].as_array())
+        .and_then(|m| m.iter().find_map(|m| m["images"].as_array()))
+        .map_or(0, Vec::len);
+    assert_eq!(images, 1, "{sent:?}");
+}
+
+/// Without a vision model, a PDF of scanned pages alone is refused with
+/// the setting that would read it.
+#[tokio::test]
+async fn a_scanned_pdf_without_a_vision_model_names_the_setting() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-scan-none").unwrap();
+    let writer = writer_of(&db);
+    let failed = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-scan-none",
+        &ingestion::NewFile::new("scanned.pdf", &scanned_pdf(false)),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(failed.contains("[ingestion].vision_model"), "{failed}");
 }
 
 /// An image is refused before it is registered when no vision model is

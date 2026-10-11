@@ -1525,6 +1525,7 @@ fn page_counts_are_stored_on_the_document_and_cleared_with_none() {
         total: 40,
         unreadable: 3,
         empty: 2,
+        transcribed: 0,
     };
     db.set_document_pages(&id, Some(counts))
         .unwrap_or_else(|e| fail(&e.to_string()));
