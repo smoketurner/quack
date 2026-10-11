@@ -486,6 +486,7 @@ where
             labeller,
             turn: turn.clone(),
             check_grounding,
+            has_documents: read.prompt.has_documents,
         }
         .build_agent(completion_model, embedding_model, &read.prompt.text)?;
         let max_turns = usize::try_from(analysis_config.max_turns)
@@ -896,6 +897,8 @@ struct BuildContext<'a> {
     /// Ask again for an answer that states figures without having looked
     /// at the workspace ([`Ungrounded`]).
     check_grounding: bool,
+    /// The workspace holds ready documents (`always_retrieve = "auto"`).
+    has_documents: bool,
 }
 
 impl BuildContext<'_> {
@@ -985,7 +988,10 @@ impl BuildContext<'_> {
                 .tool(FindPathTool(graph));
         }
 
-        if ctx.retrieval_config.always_retrieve
+        if ctx
+            .retrieval_config
+            .always_retrieve
+            .applies(ctx.has_documents)
             && let Some(embedding_model) = embedding_model
         {
             let samples = usize::try_from(ctx.retrieval_config.top_k)

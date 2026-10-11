@@ -3226,7 +3226,7 @@ rerank = "none"          # or "model": the chat model orders rerank_candidates l
 rerank_candidates = 24
 # rerank_model = "tei/BAAI/bge-reranker-v2-m3"   # a type = "openai" provider serving /rerank
 pinned_token_budget = 8000   # full text of pinned documents in the prompt
-always_retrieve = false      # retrieve every turn, not only when the model asks
+always_retrieve = "auto"     # passages up front every turn: "auto" where there are documents, true, or false
 languages = ["auto"]         # what a document may be detected as for keyword stemming:
                              # "auto", or Snowball names (["english", "german"]); one name fixes it
 
