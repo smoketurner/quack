@@ -181,7 +181,9 @@ Two settings let quack read images. Neither sends an image anywhere until it is 
   `background_effort`.
 - `images = true` on `[providers.NAME]` or `[providers.NAME.models."ID"]` says the chat
   model reads images, which gives the agent the `view_image` tool in a workspace that holds
-  an image: the stored image and the agent's question go to the chat model again.
+  an image: the stored image and the agent's question go to the chat model again. When the
+  chat model does not read images, `view_image` sends them to the `vision_model` instead, at
+  its `background_effort`, so a text-only chat model can still look at an image again.
 
 ```toml
 [ingestion]

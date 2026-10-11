@@ -88,6 +88,35 @@ impl ImageReader {
         ))))
     }
 
+    /// The vision model `[ingestion].vision_model` names, for questions
+    /// about an image in a turn whose chat model does not read images; at
+    /// background effort, as at ingest, where it is known to answer.
+    /// `None` when none is configured, or it cannot be built here (a
+    /// provider the workspace may not use): the turn goes without
+    /// `view_image` rather than failing.
+    pub(crate) async fn for_turn_by_vision_model(config: &Config) -> Option<Self> {
+        let model = config.vision_model_ref().ok()??;
+        let settings = config.model_settings(model);
+        let chat = async {
+            ChatClient::build(config, &model).await?.chat_model(
+                model.model,
+                settings.background_effort,
+                settings.temperature,
+            )
+        }
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e, "the turn runs without view_image"))
+        .ok()?;
+        Some(Self(PlainCall::new(
+            chat,
+            Task {
+                preamble: LOOK_PROMPT,
+                timeout: IMAGE_TIMEOUT,
+                label: "image question",
+            },
+        )))
+    }
+
     /// The model's answer about `image`, given `instruction` beside it.
     ///
     /// # Errors
