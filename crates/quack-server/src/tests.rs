@@ -1805,12 +1805,13 @@ async fn a_partly_read_document_says_so_over_rest_mcp_and_the_web() {
                 total: 40,
                 unreadable: 3,
                 empty: 2,
+                transcribed: 0,
             }),
         )
     })
     .await
     .unwrap_or_else(|e| fail(&e.to_string()));
-    let counts = serde_json::json!({ "total": 40, "unreadable": 3, "empty": 2 });
+    let counts = serde_json::json!({ "total": 40, "unreadable": 3, "empty": 2, "transcribed": 0 });
 
     let base = format!("/api/v1/workspaces/{ws}/documents");
     let (status, body) = h.get(&base, &token).await;

@@ -79,6 +79,7 @@ fn docs_show_the_pages_missing_from_a_document() {
             total: 40,
             unreadable: 3,
             empty: 2,
+            transcribed: 0,
         }),
     )
     .unwrap();
@@ -87,7 +88,7 @@ fn docs_show_the_pages_missing_from_a_document() {
     let row: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(
         row.get("pages").unwrap(),
-        &serde_json::json!({ "total": 40, "unreadable": 3, "empty": 2 }),
+        &serde_json::json!({ "total": 40, "unreadable": 3, "empty": 2, "transcribed": 0 }),
         "{row}"
     );
     let mut out = Vec::new();

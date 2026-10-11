@@ -314,6 +314,17 @@ pub enum Flow {
 /// one (`<title>`, Office core properties, a PDF's Info dictionary), its
 /// sections and how they relate, how its pages read, and the metadata
 /// the file carries about itself.
+/// A page with no text, as the image a vision model can read: the largest
+/// picture on it, in the encoding the file holds it in when that is one a
+/// model takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scan {
+    /// The page's number, from 1.
+    pub page: u32,
+    pub image: Vec<u8>,
+    pub format: ImageFormat,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Extracted {
     pub title: Option<String>,
@@ -323,6 +334,10 @@ pub struct Extracted {
     /// has them).
     pub pages: Option<PageCounts>,
     pub meta: DocumentMeta,
+    /// Pages with no text but a picture, in page order, for the vision
+    /// model to read before chunking (only a PDF has them). Each one is
+    /// counted in `pages.empty` until it is read.
+    pub scans: Vec<Scan>,
 }
 
 /// What a file says about itself: who wrote it and when, its tags, and
@@ -387,8 +402,13 @@ pub struct PageCounts {
     pub total: u32,
     /// Pages whose extraction failed.
     pub unreadable: u32,
-    /// Pages that read without error and yielded no text.
+    /// Pages that read without error and yielded no text, and that no
+    /// vision model read.
     pub empty: u32,
+    /// Pages with no text that the vision model transcribed from their
+    /// image.
+    #[serde(default)]
+    pub transcribed: u32,
 }
 
 impl PageCounts {
@@ -400,14 +420,21 @@ impl PageCounts {
             total,
             unreadable,
             empty,
+            transcribed,
         } = self;
-        match (unreadable, empty) {
+        let missing = match (unreadable, empty) {
             (0, 0) => None,
             (_, 0) => Some(format!("{unreadable} of {total} pages unreadable")),
             (0, _) => Some(format!("{empty} of {total} pages without text")),
             (_, _) => Some(format!(
                 "{unreadable} of {total} pages unreadable, {empty} without text"
             )),
+        };
+        let read = (transcribed > 0)
+            .then(|| format!("{transcribed} of {total} pages transcribed by the vision model"));
+        match (missing, read) {
+            (Some(missing), Some(read)) => Some(format!("{missing}, {read}")),
+            (missing, read) => missing.or(read),
         }
     }
 
@@ -422,6 +449,19 @@ impl PageCounts {
 }
 
 impl Extracted {
+    /// Put `sections`, each on a page, among the document's in page order:
+    /// each after the last section on its page or an earlier one.
+    pub fn insert_by_page(&mut self, sections: Vec<Section>) {
+        for section in sections {
+            let at = self
+                .sections
+                .iter()
+                .rposition(|s| s.page <= section.page)
+                .map_or(0, |i| i.saturating_add(1));
+            self.sections.insert(at, section);
+        }
+    }
+
     /// The title: the document's own, else the first section's heading.
     #[must_use]
     pub fn title(&self) -> Option<&str> {
@@ -811,7 +851,8 @@ mod tests {
             Some(PageCounts {
                 total: 60,
                 unreadable: 0,
-                empty: 0
+                empty: 0,
+                transcribed: 0,
             })
         );
         assert_eq!(extracted.pages.and_then(PageCounts::note), None);
@@ -834,6 +875,7 @@ mod tests {
             total: 40,
             unreadable,
             empty,
+            transcribed: 0,
         };
         assert_eq!(counts(0, 0).note(), None);
         assert_eq!(
@@ -855,6 +897,34 @@ mod tests {
         );
         assert_eq!(PageCounts::suffix(Some(counts(0, 0))), "");
         assert_eq!(PageCounts::suffix(None), "");
+        // Pages the vision model read are named apart.
+        let read = |empty, transcribed| PageCounts {
+            total: 6,
+            unreadable: 0,
+            empty,
+            transcribed,
+        };
+        assert_eq!(
+            read(0, 6).note().as_deref(),
+            Some("6 of 6 pages transcribed by the vision model")
+        );
+        assert_eq!(
+            read(1, 5).note().as_deref(),
+            Some("1 of 6 pages without text, 5 of 6 pages transcribed by the vision model")
+        );
+    }
+
+    /// Transcribed pages go in among the document's sections by page.
+    #[test]
+    fn sections_are_inserted_in_page_order() {
+        let page = |n: u32| Section::body(None, format!("page {n}")).on_page(Some(n));
+        let mut extracted = Extracted {
+            sections: vec![page(2), page(4)],
+            ..Extracted::default()
+        };
+        extracted.insert_by_page(vec![page(1), page(3), page(5)]);
+        let order: Vec<Option<u32>> = extracted.sections.iter().map(|s| s.page).collect();
+        assert_eq!(order, [1, 2, 3, 4, 5].map(Some));
     }
 
     #[test]

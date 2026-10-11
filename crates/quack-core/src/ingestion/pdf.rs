@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 
 use pdf_oxide::PdfDocument;
 use pdf_oxide::editor::DocumentInfo;
+use pdf_oxide::extractors::images::{ColorSpace, ImageData};
 use pdf_oxide::layout::TextSpan;
 use pdf_oxide::structure::table_extractor::Table as PdfTable;
 use pdf_oxide::structured::{RegionRole, StructuredPage, StructuredRegion};
 
-use super::parser::{DocumentMeta, Extracted, Flow, PageCounts, Section};
+use super::parser::{DocumentMeta, Extracted, Flow, ImageFormat, PageCounts, Scan, Section};
 use super::table::Table;
 use crate::error::{Error, Result};
 
@@ -36,21 +37,30 @@ pub fn extract(data: &[u8]) -> Result<Extracted> {
         .page_count()
         .map_err(|e| Error::Ingestion(format!("PDF extraction failed: {e}")))?;
     let (meta, title) = pdf.meta();
-    let pages = Pages::read(page_count, |index| {
-        let structured = doc.extract_structured(index).map_err(|e| e.to_string())?;
-        // Table detection is best effort: a page whose tables cannot be
-        // read still gives its text.
-        let tables = doc.extract_tables(index).unwrap_or_default();
-        Ok(PageContent::of(&structured, &tables))
-    })?;
+    let pages = Pages::read_scanning(
+        page_count,
+        |index| {
+            let structured = doc.extract_structured(index).map_err(|e| e.to_string())?;
+            // Table detection is best effort: a page whose tables cannot be
+            // read still gives its text.
+            let tables = doc.extract_tables(index).unwrap_or_default();
+            Ok(PageContent::of(&structured, &tables))
+        },
+        |index| pdf.picture(index),
+    )?;
     Ok(Extracted {
         title,
         sections: pages.sections,
         flow: Flow::Continuous,
         pages: Some(pages.counts),
         meta,
+        scans: pages.scans,
     })
 }
+
+/// The smallest picture taken for a page's scan, in pixels on each side:
+/// below it an image is a logo or a rule, not a page.
+const SCAN_MIN_SIDE: u32 = 200;
 
 /// What one page holds once its chrome is dropped, in reading order:
 /// runs of body text, each starting at a heading or continuing the one
@@ -319,25 +329,42 @@ impl PageContent {
     }
 }
 
-/// A PDF's pages as sections, and how the pages read.
+/// A PDF's pages as sections, how the pages read, and the pictures of the
+/// pages without text.
 struct Pages {
     sections: Vec<Section>,
     counts: PageCounts,
+    scans: Vec<Scan>,
 }
 
 impl Pages {
     /// Read `page_count` pages with `read`, carrying each heading onto the
     /// pages after it, counting the pages that fail and the pages that
     /// hold nothing.
+    #[cfg(test)]
     fn read(
         page_count: usize,
         read: impl Fn(usize) -> std::result::Result<PageContent, String>,
     ) -> Result<Self> {
+        Self::read_scanning(page_count, read, |_| None)
+    }
+
+    /// [`Pages::read`], taking from `picture` the image of each page that
+    /// reads without text, for a vision model. A PDF of such pages alone
+    /// is not refused here: whether they can be read is the vision model's
+    /// to say.
+    fn read_scanning(
+        page_count: usize,
+        read: impl Fn(usize) -> std::result::Result<PageContent, String>,
+        picture: impl Fn(usize) -> Option<(Vec<u8>, ImageFormat)>,
+    ) -> Result<Self> {
+        let mut scans = Vec::new();
         let mut sections = Vec::new();
         let mut counts = PageCounts {
             total: u32::try_from(page_count).unwrap_or(u32::MAX),
             unreadable: 0,
             empty: 0,
+            transcribed: 0,
         };
         let mut heading: Option<String> = None;
         for index in 0..page_count {
@@ -362,14 +389,23 @@ impl Pages {
                         }
                     }
                 }
-                Ok(_) => counts.empty = counts.empty.saturating_add(1),
+                Ok(_) => {
+                    counts.empty = counts.empty.saturating_add(1);
+                    if let Some((image, format)) = picture(index) {
+                        scans.push(Scan {
+                            page,
+                            image,
+                            format,
+                        });
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(page, error = %error, "skipping an unreadable PDF page");
                     counts.unreadable = counts.unreadable.saturating_add(1);
                 }
             }
         }
-        if sections.is_empty() {
+        if sections.is_empty() && scans.is_empty() {
             if counts.unreadable > 0 {
                 return Err(Error::Ingestion(format!(
                     "no readable text: {} of {page_count} pages failed to parse",
@@ -377,10 +413,14 @@ impl Pages {
                 )));
             }
             return Err(Error::Ingestion(String::from(
-                "no extractable text: the PDF has no text layer (scanned pages need OCR)",
+                "no extractable text: the PDF has no text layer and no page pictures to read",
             )));
         }
-        Ok(Self { sections, counts })
+        Ok(Self {
+            sections,
+            counts,
+            scans,
+        })
     }
 }
 
@@ -388,6 +428,38 @@ impl Pages {
 struct Pdf(PdfDocument);
 
 impl Pdf {
+    /// The largest picture on page `index`, as a vision model takes it: an
+    /// RGB or gray JPEG as stored, anything else as PNG; `None` when the page holds no
+    /// picture the size of a page's text.
+    fn picture(&self, index: usize) -> Option<(Vec<u8>, ImageFormat)> {
+        let images = self
+            .0
+            .extract_images(index)
+            .inspect_err(
+                |e| tracing::warn!(page = index, error = %e, "could not read a PDF page's images"),
+            )
+            .ok()?;
+        let image = images
+            .into_iter()
+            .filter(|i| i.width() >= SCAN_MIN_SIDE && i.height() >= SCAN_MIN_SIDE)
+            .max_by_key(|i| u64::from(i.width()).saturating_mul(u64::from(i.height())))?;
+        let plain = matches!(
+            image.color_space(),
+            ColorSpace::DeviceRGB | ColorSpace::DeviceGray
+        );
+        match image.data() {
+            ImageData::Jpeg(bytes) if plain => Some((bytes.clone(), ImageFormat::Jpeg)),
+            // A CMYK or palette JPEG, or raw pixels: converted.
+            ImageData::Jpeg(_) | ImageData::Raw { .. } => match image.to_png_bytes() {
+                Ok(png) => Some((png, ImageFormat::Png)),
+                Err(e) => {
+                    tracing::warn!(page = index, error = %e, "could not encode a PDF page's picture");
+                    None
+                }
+            },
+        }
+    }
+
     /// The Info dictionary: the metadata, and the title apart.
     fn meta(&self) -> (DocumentMeta, Option<String>) {
         let doc = &self.0;
@@ -509,10 +581,12 @@ mod tests {
         })
         .unwrap_or_else(|_| Pages {
             sections: Vec::new(),
+            scans: Vec::new(),
             counts: PageCounts {
                 total: 0,
                 unreadable: 0,
                 empty: 0,
+                transcribed: 0,
             },
         });
         assert_eq!(
@@ -520,7 +594,8 @@ mod tests {
             PageCounts {
                 total: 4,
                 unreadable: 1,
-                empty: 1
+                empty: 1,
+                transcribed: 0,
             }
         );
         let numbered: Vec<Option<u32>> = pages.sections.iter().map(|s| s.page).collect();
@@ -567,10 +642,12 @@ mod tests {
         })
         .unwrap_or_else(|_| Pages {
             sections: Vec::new(),
+            scans: Vec::new(),
             counts: PageCounts {
                 total: 0,
                 unreadable: 0,
                 empty: 0,
+                transcribed: 0,
             },
         });
         let summary: Vec<(Option<&str>, &str, Option<u32>)> = pages
@@ -593,6 +670,45 @@ mod tests {
                 .get(2)
                 .is_some_and(|s| s.text.starts_with("| Peril | Covered |"))
         );
+    }
+
+    /// A page with a picture and no text is kept for the vision model,
+    /// counted without text until it is read; a PDF of only such pages is
+    /// not refused here.
+    #[test]
+    fn a_page_without_text_hands_its_picture_on() {
+        let pages = Pages::read_scanning(
+            3,
+            |index| {
+                Ok(match index {
+                    1 => PageContent {
+                        pieces: vec![Piece::Run {
+                            started: None,
+                            text: String::from("typed page"),
+                        }],
+                    },
+                    _ => PageContent::default(),
+                })
+            },
+            |index| (index == 2).then(|| (vec![0xFF, 0xD8], ImageFormat::Jpeg)),
+        );
+        assert!(pages.is_ok(), "{:?}", pages.as_ref().err());
+        let Ok(pages) = pages else { return };
+        assert_eq!(pages.counts.empty, 2);
+        assert_eq!(
+            pages.scans,
+            vec![Scan {
+                page: 3,
+                image: vec![0xFF, 0xD8],
+                format: ImageFormat::Jpeg,
+            }]
+        );
+        let scanned_only = Pages::read_scanning(
+            2,
+            |_| Ok(PageContent::default()),
+            |_| Some((vec![1], ImageFormat::Png)),
+        );
+        assert!(scanned_only.is_ok_and(|p| p.sections.is_empty() && p.scans.len() == 2));
     }
 
     #[test]
