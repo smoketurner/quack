@@ -1603,7 +1603,12 @@ async fn dispatch(
     } else {
         None
     };
-    let images = ImageReader::for_turn(&client, chat.model, settings)?;
+    // The chat model looks at an image itself when it reads them, else the
+    // vision model does.
+    let images = match ImageReader::for_turn(&client, chat.model, settings)? {
+        Some(reader) => Some(reader),
+        None => ImageReader::for_turn_by_vision_model(config).await,
+    };
     Box::pin(analysis.run(model, reranker, images, sink)).await
 }
 

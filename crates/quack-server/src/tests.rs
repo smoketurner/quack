@@ -1671,6 +1671,57 @@ async fn a_turn_views_an_image_with_a_chat_model_that_reads_images() {
     );
 }
 
+/// With a chat model that does not read images, `view_image` asks the
+/// vision model instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_views_an_image_with_the_vision_model_when_the_chat_model_cannot() {
+    use quack_testkit::{Reply, ScriptedOllama};
+
+    let ollama = ScriptedOllama::serve(vec![
+        Reply::Text("A bar chart of revenue by quarter."),
+        Reply::Call {
+            tool: "view_image",
+            args: serde_json::json!({ "document": "chart.png", "question": "What is the peak?" }),
+        },
+        Reply::Text("The peak is 20, in the fourth quarter."),
+        Reply::Text("Revenue peaked at 20 [1]."),
+    ])
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let config = ollama
+        .config_with("[ingestion]\nvision_model = \"scripted/model\"\n")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("pictures", &owner).await;
+    let token = h.login("owner").await;
+    let (status, body) = upload(&h, &ws, &token, "chart.png", "image/png", PIXEL_PNG).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let doc = body["documents"][0]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    h.wait_ready(&ws, &doc, &token).await;
+
+    let (status, answer) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/query"),
+            &token,
+            serde_json::json!({ "prompt": "What was peak revenue?" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["steps"][0]["tool"], "view_image", "{answer}");
+    assert_eq!(answer["answer"], "Revenue peaked at 20 [1].", "{answer}");
+    let look = ollama.requests().get(2).cloned().unwrap_or_default();
+    let user = look["messages"]
+        .as_array()
+        .and_then(|m| m.iter().find(|m| m["role"] == "user"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(user["images"].as_array().map(Vec::len), Some(1), "{look}");
+}
+
 /// An image is described by the vision model at upload, served back as
 /// uploaded, and shown on its passage page; without a vision model an
 /// image is refused.
