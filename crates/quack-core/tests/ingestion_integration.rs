@@ -3036,6 +3036,67 @@ async fn a_scanned_pdf_page_is_read_by_the_vision_model() {
     assert_eq!(images, 1, "{sent:?}");
 }
 
+/// A file of `tests/fixtures/legacy_office.zip`: Word and `PowerPoint`
+/// 97-2003 files, kept zipped since the `.ppt` is mostly empty masters.
+fn legacy_office(name: &str) -> Vec<u8> {
+    use std::io::Read as _;
+    const ZIPPED: &[u8] = include_bytes!("fixtures/legacy_office.zip");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(ZIPPED)).unwrap();
+    let mut bytes = Vec::new();
+    archive
+        .by_name(name)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    bytes
+}
+
+/// A `.doc` and a `.ppt` read as a DOCX and a PPTX are: text, tables, and
+/// slides with their titles.
+#[tokio::test]
+async fn word_and_powerpoint_97_files_are_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-legacy").unwrap();
+    let writer = writer_of(&db);
+    for (name, file_type) in [("memo.doc", FileType::Doc), ("deck.ppt", FileType::Ppt)] {
+        assert_eq!(FileType::of(name), Some(file_type));
+        // Piped without a name, the bytes say which it is.
+        let ext = name.rsplit('.').next();
+        assert_eq!(
+            ingestion::sniff::extension(std::io::Cursor::new(legacy_office(name))).as_deref(),
+            ext
+        );
+        let result = ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-legacy",
+            &ingestion::NewFile::new(name, &legacy_office(name)),
+            None::<&Embedder<MockEmbeddingModel>>,
+        )
+        .await
+        .unwrap()
+        .ingested()
+        .unwrap();
+        assert_eq!(result.file_type, file_type);
+        assert!(result.chunks_stored > 0, "{name}");
+    }
+    let memo = db
+        .search_keyword_chunks("WH-OAK", 5, &ChunkScope::all())
+        .unwrap();
+    assert!(
+        memo.iter()
+            .any(|h| h.content.contains("| WH-OAK | closed |")),
+        "{memo:?}"
+    );
+    let deck = db
+        .search_keyword_chunks("board", 5, &ChunkScope::all())
+        .unwrap();
+    let slide = deck.first().unwrap();
+    assert_eq!(slide.page, Some(1), "{slide:?}");
+    assert!(slide.content.contains("Q3 Board Update"), "{slide:?}");
+}
+
 /// Without a vision model, a PDF of scanned pages alone is refused with
 /// the setting that would read it.
 #[tokio::test]

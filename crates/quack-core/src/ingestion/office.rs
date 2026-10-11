@@ -1,4 +1,5 @@
-//! DOCX and PPTX through `office_oxide`'s document model. Word documents
+//! DOCX and PPTX, and their 97-2003 forms `.doc` and `.ppt`, through
+//! `office_oxide`'s document model. Word documents
 //! become sections split at headings resolved from outline levels (any
 //! style name, any locale), with tables, footnotes, endnotes, and comments
 //! as sections of their own kinds; presentations become one section per
@@ -24,7 +25,27 @@ use crate::error::{Error, Result};
 /// Returns an error when the bytes are not a Word package, hold no text,
 /// or inflate past `budget`.
 pub fn docx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
-    let package = Package::open(data, FileType::Docx, DocumentFormat::Docx, budget)?;
+    word(
+        &Package::open(data, FileType::Docx, DocumentFormat::Docx, budget)?,
+        "DOCX",
+    )
+}
+
+/// A Word 97-2003 document, read as a DOCX is.
+///
+/// # Errors
+///
+/// Returns an error when the bytes are not a Word 97-2003 file or hold no
+/// text.
+pub fn doc(data: &[u8]) -> Result<Extracted> {
+    word(
+        &Package::open_legacy(data, FileType::Doc, DocumentFormat::Doc)?,
+        "DOC",
+    )
+}
+
+/// A Word document's model as sections with headings, tables, and notes.
+fn word(package: &Package, kind: &str) -> Result<Extracted> {
     let mut walker = Walker::default();
     for section in &package.0.sections {
         for element in &section.elements {
@@ -33,8 +54,8 @@ pub fn docx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
     }
     let sections = walker.finish();
     if sections.is_empty() {
-        return Err(Error::Ingestion(String::from(
-            "no extractable text: the DOCX has no paragraphs",
+        return Err(Error::Ingestion(format!(
+            "no extractable text: the {kind} has no paragraphs"
         )));
     }
     let (meta, title) = package.meta();
@@ -55,7 +76,27 @@ pub fn docx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
 /// Returns an error when the bytes are not a `PowerPoint` package, hold no
 /// text, or inflate past `budget`.
 pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
-    let package = Package::open(data, FileType::Pptx, DocumentFormat::Pptx, budget)?;
+    slides(
+        &Package::open(data, FileType::Pptx, DocumentFormat::Pptx, budget)?,
+        "PPTX",
+    )
+}
+
+/// A `PowerPoint` 97-2003 presentation, read as a PPTX is.
+///
+/// # Errors
+///
+/// Returns an error when the bytes are not a `PowerPoint` 97-2003 file or
+/// hold no text.
+pub fn ppt(data: &[u8]) -> Result<Extracted> {
+    slides(
+        &Package::open_legacy(data, FileType::Ppt, DocumentFormat::Ppt)?,
+        "PPT",
+    )
+}
+
+/// A presentation's model as one section per slide, its notes apart.
+fn slides(package: &Package, kind: &str) -> Result<Extracted> {
     let mut sections = Vec::new();
     for (index, slide) in package.0.sections.iter().enumerate() {
         let number = u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX);
@@ -102,8 +143,8 @@ pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         }
     }
     if sections.is_empty() {
-        return Err(Error::Ingestion(String::from(
-            "no extractable text: the PPTX has no text on any slide",
+        return Err(Error::Ingestion(format!(
+            "no extractable text: the {kind} has no text on any slide"
         )));
     }
     let first_title = sections.first().and_then(|s| s.heading.clone());
@@ -131,6 +172,12 @@ impl Package {
         mut budget: DecompressionBudget,
     ) -> Result<Self> {
         budget.admit_zip(data)?;
+        Self::open_legacy(data, file_type, format)
+    }
+
+    /// A 97-2003 file is one compound file, not a zip: nothing in it
+    /// inflates, so the upload limit bounds it.
+    fn open_legacy(data: &[u8], file_type: FileType, format: DocumentFormat) -> Result<Self> {
         let document = Document::from_reader(Cursor::new(data.to_vec()), format)
             .map_err(|e| Error::Ingestion(format!("not a {file_type} file: {e}")))?;
         Ok(Self(document.to_ir()))
@@ -466,6 +513,24 @@ pub(crate) mod tests {
                 ),
                 (Some("Title only"), "body", Some(2), "Title only"),
             ]
+        );
+    }
+
+    /// Bytes that are not a 97-2003 file say which type they were taken
+    /// for.
+    #[test]
+    fn doc_or_ppt_that_is_not_one_is_an_error() {
+        let doc = doc(b"not a compound file").err().map(|e| e.to_string());
+        assert!(
+            doc.as_deref()
+                .is_some_and(|e| e.contains("not a Word 97-2003 file")),
+            "{doc:?}"
+        );
+        let ppt = ppt(&docx_package(false)).err().map(|e| e.to_string());
+        assert!(
+            ppt.as_deref()
+                .is_some_and(|e| e.contains("not a PowerPoint 97-2003 file")),
+            "{ppt:?}"
         );
     }
 

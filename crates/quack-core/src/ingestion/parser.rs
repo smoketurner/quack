@@ -20,6 +20,10 @@ pub enum FileType {
     Html,
     Docx,
     Pptx,
+    /// A Word 97-2003 document.
+    Doc,
+    /// A `PowerPoint` 97-2003 presentation.
+    Ppt,
     Epub,
     Odt,
     /// One RFC 5322 message.
@@ -108,6 +112,8 @@ pub enum TextFormat {
     Html,
     Docx,
     Pptx,
+    Doc,
+    Ppt,
     Epub,
     Odt,
     Eml,
@@ -224,6 +230,8 @@ impl FileType {
             Self::Html => Load::Chunks(TextFormat::Html),
             Self::Docx => Load::Chunks(TextFormat::Docx),
             Self::Pptx => Load::Chunks(TextFormat::Pptx),
+            Self::Doc => Load::Chunks(TextFormat::Doc),
+            Self::Ppt => Load::Chunks(TextFormat::Ppt),
             Self::Epub => Load::Chunks(TextFormat::Epub),
             Self::Odt => Load::Chunks(TextFormat::Odt),
             Self::Eml => Load::Chunks(TextFormat::Eml),
@@ -261,6 +269,8 @@ impl FileType {
             Self::Pptx => {
                 "application/vnd.openxmlformats-officedocument.presentationml.presentation"
             }
+            Self::Doc => "application/msword",
+            Self::Ppt => "application/vnd.ms-powerpoint",
             Self::Epub => "application/epub+zip",
             Self::Odt => "application/vnd.oasis.opendocument.text",
             Self::Eml => "message/rfc822",
@@ -289,6 +299,8 @@ impl std::fmt::Display for FileType {
             Self::Html => "HTML",
             Self::Docx => "Word",
             Self::Pptx => "PowerPoint",
+            Self::Doc => "Word 97-2003",
+            Self::Ppt => "PowerPoint 97-2003",
             Self::Epub => "EPUB",
             Self::Odt => "OpenDocument text",
             Self::Eml => "Email",
@@ -637,6 +649,8 @@ const EXTENSIONS: &[(&str, FileType)] = &[
     ("xhtml", FileType::Html),
     ("docx", FileType::Docx),
     ("pptx", FileType::Pptx),
+    ("doc", FileType::Doc),
+    ("ppt", FileType::Ppt),
     ("epub", FileType::Epub),
     ("odt", FileType::Odt),
     ("eml", FileType::Eml),
@@ -695,6 +709,8 @@ impl TextFormat {
             Self::Html => html::html(&utf8(data)?),
             Self::Docx => office::docx(data, budget),
             Self::Pptx => office::pptx(data, budget),
+            Self::Doc => office::doc(data),
+            Self::Ppt => office::ppt(data),
             Self::Epub => epub::extract(data, budget),
             Self::Odt => odt::extract(data, budget),
             Self::Eml => mail::eml(data),
