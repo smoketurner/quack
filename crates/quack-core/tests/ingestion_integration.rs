@@ -3614,8 +3614,8 @@ async fn tables_have_one_owner_and_dedup_needs_the_table_to_exist() {
     let reloaded = ingested(again).unwrap();
     assert_ne!(reloaded.document_id, first.document_id);
     assert!(db.list_tables().unwrap().contains(&String::from("sales")));
-    let stale = db.document(&first.document_id).unwrap().unwrap();
-    assert_eq!(stale.status, DocumentStatus::Error);
+    // The row that lost its table failed, and the new attempt took its place.
+    assert!(db.document(&first.document_id).unwrap().is_none());
     assert!(
         db.table_owner("sales")
             .unwrap()
@@ -4721,4 +4721,86 @@ fn every_document(db: &WorkspaceDb) -> Vec<DocumentInfo> {
     })
     .unwrap()
     .documents
+}
+
+/// A file that failed and is ingested again takes the failed row's place,
+/// whether the new attempt works or fails too; a failure of a file of the
+/// same name from elsewhere in a folder is a different file and stays.
+#[tokio::test]
+async fn ingesting_a_failed_file_again_replaces_its_error_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-retry").unwrap();
+    let writer = writer_of(&db);
+    let ingest = |file: ingestion::NewFile<'static>| {
+        let (config, writer) = (&config, &writer);
+        async move {
+            ingestion::ingest_file(
+                config,
+                writer,
+                "ws-retry",
+                &file,
+                None::<&Embedder<MockEmbeddingModel>>,
+            )
+            .await
+        }
+    };
+    let broken: &'static [u8] = &[0xff, 0xfe, 0x00, 0x41];
+    let statuses = |db: &WorkspaceDb| {
+        let mut rows = db
+            .documents(&DocumentListing::default())
+            .unwrap()
+            .documents
+            .into_iter()
+            .map(|d| (d.filename, d.source_path, d.status))
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.1.cmp(&b.1));
+        rows
+    };
+
+    assert!(
+        ingest(ingestion::NewFile::new("notes.md", broken))
+            .await
+            .is_err()
+    );
+    // A namesake from a folder fails too; it is not this file.
+    assert!(
+        ingest(ingestion::NewFile::new("notes.md", broken).in_folder("/docs", "a/notes.md"))
+            .await
+            .is_err()
+    );
+    // The same file fails again: still one row for it.
+    assert!(
+        ingest(ingestion::NewFile::new("notes.md", &[0xff, 0x41]))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        statuses(&db),
+        vec![
+            (String::from("notes.md"), None, DocumentStatus::Error),
+            (
+                String::from("notes.md"),
+                Some(String::from("a/notes.md")),
+                DocumentStatus::Error
+            ),
+        ]
+    );
+
+    ingest(ingestion::NewFile::new("notes.md", b"# Notes\n\nFixed.\n"))
+        .await
+        .unwrap()
+        .ingested()
+        .unwrap();
+    assert_eq!(
+        statuses(&db),
+        vec![
+            (String::from("notes.md"), None, DocumentStatus::Ready),
+            (
+                String::from("notes.md"),
+                Some(String::from("a/notes.md")),
+                DocumentStatus::Error
+            ),
+        ]
+    );
 }

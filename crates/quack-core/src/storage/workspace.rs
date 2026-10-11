@@ -2017,6 +2017,32 @@ impl WorkspaceDb {
         }
     }
 
+    /// The documents that failed to ingest under `filename` from
+    /// `source_path` (none for an upload): what a new attempt at the same
+    /// file takes the place of.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn failed_attempts(
+        &self,
+        filename: &str,
+        source_path: Option<&str>,
+    ) -> Result<Vec<DocumentId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM _quack_documents WHERE status = ? AND filename = ? \
+             AND source_path IS NOT DISTINCT FROM ? ORDER BY id",
+        )?;
+        let ids = stmt
+            .query_map(
+                duckdb::params![DocumentStatus::Error, filename, source_path],
+                |row| row.get::<_, String>(0),
+            )?
+            .map(|id| id.map(DocumentId::from))
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
     /// The live document that loaded `table`, if any: one document owns a
     /// table (issue #51).
     ///
