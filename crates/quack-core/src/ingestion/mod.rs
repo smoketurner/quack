@@ -968,6 +968,33 @@ async fn parse_off_runtime<T: Send + 'static>(
 /// The table piped data loads into for one invocation.
 pub const STDIN_TABLE: &str = "stdin";
 
+/// What bytes piped into `quack -p` or `-q` are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Piped {
+    /// Table data, or text: the temporary `stdin` table loads it.
+    Table,
+    /// A document (or a workbook) quack ingests, recorded under `name`
+    /// (`stdin.pdf`), for a question to be limited to.
+    Document { name: String },
+}
+
+impl Piped {
+    /// What `data` is, by the bytes as `quack ingest -` reads them: a PDF,
+    /// Office, `OpenDocument`, EPUB, RTF, HTML, image, or workbook file is a
+    /// document; CSV, JSON, Parquet, and other text stay table data, as
+    /// they always were.
+    #[must_use]
+    pub fn of(data: &[u8]) -> Self {
+        let Ok(name) = recorded_name("-", FileData::Bytes(data)) else {
+            return Self::Table;
+        };
+        match FileType::of(&name).map(FileType::load) {
+            Some(Load::Table(_) | Load::Chunks(TextFormat::Text)) | None => Self::Table,
+            Some(Load::Workbook | Load::Chunks(_) | Load::Image(_)) => Self::Document { name },
+        }
+    }
+}
+
 /// Load bytes piped into the CLI as the temporary table `stdin` on this
 /// connection: JSON when they start with `{` or `[`, Parquet by its magic,
 /// else CSV (delimiter sniffed). The bytes pass through `files/` because

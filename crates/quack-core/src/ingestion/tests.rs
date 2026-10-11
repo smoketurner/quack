@@ -120,3 +120,36 @@ fn a_streamed_hash_matches_the_bytes() {
     }
     assert!(Measured::of_file(&dir.path().join("missing")).is_err());
 }
+
+/// Piped table data and text still load as the `stdin` table; a document
+/// piped in is ingested under the name its bytes give it.
+#[test]
+fn piped_bytes_are_table_data_or_a_document() {
+    use super::Piped;
+    use super::zipped::tests::package;
+    assert_eq!(Piped::of(b"region,revenue\nWest,362\n"), Piped::Table);
+    assert_eq!(Piped::of(b"[{\"region\": \"West\"}]"), Piped::Table);
+    assert_eq!(Piped::of(b"just some notes"), Piped::Table);
+    let document = |name: &str| Piped::Document {
+        name: name.to_owned(),
+    };
+    assert_eq!(
+        Piped::of(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n1 0 obj\n"),
+        document("stdin.pdf")
+    );
+    assert_eq!(
+        Piped::of(b"<!DOCTYPE html><html><body>Hi</body></html>"),
+        document("stdin.html")
+    );
+    assert_eq!(
+        Piped::of(&package(&[
+            ("[Content_Types].xml", "<Types/>"),
+            ("word/document.xml", "<w:document/>"),
+        ])),
+        document("stdin.docx")
+    );
+    assert_eq!(
+        Piped::of(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"),
+        document("stdin.png")
+    );
+}
