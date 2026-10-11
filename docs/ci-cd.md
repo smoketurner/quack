@@ -24,6 +24,10 @@
   in `fuzz/` (`pdf`, `markdown`, `text`, `html`, `docx`, `pptx`, `xlsx`, `chunker`) on the
   nightly toolchain, seeded from the evaluation fixtures by `fuzz/seed.sh`, ten minutes
   each; a crash uploads `fuzz/artifacts/` as the run's artifact.
+- **`.github/workflows/eval.yml`**: every night (and on dispatch, with the models as
+  inputs), `make eval` against Ollama on a CPU runner: real-embedding retrieval, the agent's
+  answers to the fixture questions, and the vision model reading a notice. It gates
+  nothing; the report goes to the job summary and `eval.json` to the run's artifact.
 
 CI runs on pushes to main. The release workflow runs on tags alone, so ordinary pushes
 spend no release minutes.

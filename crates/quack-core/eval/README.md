@@ -1,6 +1,7 @@
 # Eval fixture
 
-The in-tree fixture for `cargo run -p quack-core --example eval` (`make eval`), a
+The in-tree fixture for `cargo run -p quack-core --example eval` (`make eval-offline`, no
+model) and `... --example eval -- --ollama` (`make eval`, against Ollama), a
 storms-like corpus written for this harness rather than downloaded: not the full NOAA
 dataset `examples/storms/` uses.
 
@@ -50,8 +51,49 @@ dataset `examples/storms/` uses.
 - `citation_fixture.json` — recorded answers with `[n]` markers, some valid, some
   referencing an unregistered chunk or a provider channel token, with how many markers
   each is expected to survive `analysis::citations::validate`.
+- `agent_questions.json` — questions for the agent under `make eval`, each with the values
+  its answer must hold (every group matched by one of its strings, ignoring case), the
+  tools it should come from, and whether it should cite a passage. `kind` is `table`
+  (answered by SQL over `tables/`) or `document` (from `documents/`).
+- `vision/shelter-notice.jpg` — a picture of a short notice for the vision model, read
+  three ways under `make eval`: as an image, as the only picture on a PDF page, and as a
+  figure inside a DOCX (both built at run time). No file name, title, or alt text the
+  cases give holds one of the words it is scored on.
 
 Ingestion goes through the normal `ingestion::ingest_file` path into a temporary
-workspace. There is no Ollama dependency: chunk embeddings come from a deterministic
-hashing "embedding" (see the `HashEmbedder` doc comment in `examples/eval.rs`), and the
-graph section uses a canned `Extract<Extraction>` instead of a chat model.
+workspace. Under `make eval-offline` there is no Ollama dependency: chunk embeddings come
+from a deterministic hashing "embedding" (see the `HashEmbedder` doc comment in
+`examples/eval/main.rs`), and the graph section uses a canned `Extract<Extraction>` instead
+of a chat model.
+
+## Against Ollama (`make eval`)
+
+`make eval` runs the same sections with a real embedding model, then puts
+`agent_questions.json` to the chat model through a full agent turn and has the vision model
+read the notice (`examples/eval/ollama.rs`). Nothing fails on a wrong answer: each case is
+scored and printed, with the misses listed, and `QUACK_EVAL_OUT=eval.json` keeps the
+numbers. Model output varies between runs, so compare a run with the last few, not with
+one.
+
+It needs Ollama running with the models pulled; each is a variable with a default small
+enough for a CPU:
+
+| Variable | Default |
+|---|---|
+| `QUACK_EVAL_OLLAMA_URL` | `http://127.0.0.1:11434` |
+| `QUACK_EVAL_CHAT_MODEL` | `qwen2.5:3b` |
+| `QUACK_EVAL_EMBEDDING_MODEL` | `embeddinggemma` |
+| `QUACK_EVAL_EMBEDDING_DIMENSION` | `768` |
+| `QUACK_EVAL_VISION_MODEL` | `qwen2.5vl:3b` (`none` skips the vision section) |
+| `QUACK_EVAL_TURN_SECONDS` | `300`: a question past it is stopped and scored as timed out |
+
+```bash
+OLLAMA_CONTEXT_LENGTH=16384 ollama serve &
+ollama pull qwen2.5:3b && ollama pull embeddinggemma && ollama pull qwen2.5vl:3b
+make eval
+```
+
+The agent's prompt (tables, documents, tool guidance) runs past Ollama's default context
+window, hence `OLLAMA_CONTEXT_LENGTH`. `.github/workflows/eval.yml` does the same nightly
+and on dispatch (with the models as inputs), outside CI: it gates nothing, writes the
+report to the job summary, and uploads `eval.json`.
