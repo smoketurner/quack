@@ -6,14 +6,15 @@
 //! runs. What a model writes varies between runs, so one run's score is a
 //! sample, not a verdict.
 //!
-//! The models come from the environment, each with a default small enough
-//! for a CPU runner:
+//! The models come from the environment, each defaulting to what a
+//! developer machine runs (the nightly workflow names smaller ones for its
+//! CPU runner):
 //!
 //! - `QUACK_EVAL_OLLAMA_URL` (`http://127.0.0.1:11434`)
-//! - `QUACK_EVAL_CHAT_MODEL` (`qwen2.5:3b`)
-//! - `QUACK_EVAL_EMBEDDING_MODEL` (`embeddinggemma`) and
+//! - `QUACK_EVAL_CHAT_MODEL` (`gpt-oss:20b`)
+//! - `QUACK_EVAL_EMBEDDING_MODEL` (`embeddinggemma-2`) and
 //!   `QUACK_EVAL_EMBEDDING_DIMENSION` (768)
-//! - `QUACK_EVAL_VISION_MODEL` (`qwen2.5vl:3b`; `none` skips the vision
+//! - `QUACK_EVAL_VISION_MODEL` (`gemma4:e4b`; `none` skips the vision
 //!   section)
 //! - `QUACK_EVAL_REPEAT` (1): how many times each question is asked; past
 //!   one, the report says how many questions got the same answer every
@@ -80,11 +81,11 @@ impl Models {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| default.to_owned())
         };
-        let vision = var("QUACK_EVAL_VISION_MODEL", "qwen2.5vl:3b");
+        let vision = var("QUACK_EVAL_VISION_MODEL", "gemma4:e4b");
         Self {
             url: var("QUACK_EVAL_OLLAMA_URL", "http://127.0.0.1:11434"),
-            chat: var("QUACK_EVAL_CHAT_MODEL", "qwen2.5:3b"),
-            embedding: var("QUACK_EVAL_EMBEDDING_MODEL", "embeddinggemma"),
+            chat: var("QUACK_EVAL_CHAT_MODEL", "gpt-oss:20b"),
+            embedding: var("QUACK_EVAL_EMBEDDING_MODEL", "embeddinggemma-2"),
             dimension: var("QUACK_EVAL_EMBEDDING_DIMENSION", "768")
                 .parse()
                 .unwrap_or(768),

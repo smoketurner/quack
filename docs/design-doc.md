@@ -3568,10 +3568,11 @@ adds what only a model shows. Retrieval embeds with a real model. The agent answ
 tool it should, cited a passage where the question calls for one, and leaked no `<think>`
 text. The vision model reads one notice three ways, as an image, as the only picture on a
 PDF page, and as a figure inside a DOCX, scored by the notice's words found in the chunks.
-Wrong answers are reported, never failed: the models are `QUACK_EVAL_*` variables with
-small defaults (`qwen2.5:3b`, `embeddinggemma`, `qwen2.5vl:3b`), and
-`.github/workflows/eval.yml` runs it nightly and on dispatch, outside CI, with the report in
-the job summary and the JSON as an artifact.
+Wrong answers are reported, never failed: the models are `QUACK_EVAL_*` variables
+defaulting to what a developer machine runs (`gpt-oss:20b`, `embeddinggemma-2`,
+`gemma4:e4b`), and `.github/workflows/eval.yml` runs it nightly and on dispatch, outside
+CI, on smaller models it names itself, with the report in the job summary and the JSON as
+an artifact.
 
 Decoys make the fixture discriminate issue #77's identifier-joining and phrase-filter fix
 rather than score 1.000 either way. Five identifier questions (`SR-8841`, `SR-4437`,
