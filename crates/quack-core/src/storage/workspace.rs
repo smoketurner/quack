@@ -75,11 +75,12 @@ const TABLE_PROFILES: u32 = 12;
 /// are stemmed under it, with unspaced scripts as bigrams (issue #395):
 /// every document is detected and every chunk reindexed.
 const DOCUMENT_LANGUAGES: u32 = 13;
-/// Runs that label a table's text are recorded (`_quack_classifications`)
-/// and a table of labels is a document with source `classify`, which an
-/// older quack cannot read; the table needs no backfill. (Version 14,
-/// saved imports, needed none either.)
-const CLASSIFICATIONS: u32 = 15;
+/// A text column's profile lists all its values when it has few, so a
+/// question's words can be matched to them: every table is profiled again.
+/// (Version 15 recorded the runs that label a table's text and the document
+/// source `classify`, and version 14 saved imports; neither needed a
+/// backfill.)
+const VALUE_LISTS: u32 = 16;
 
 /// The documents table, and the columns older files gain on open.
 const DOCUMENTS_DDL: &str = "
@@ -154,7 +155,7 @@ const SAVED_IMPORTS_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_imports (
 
 /// Schema version of the internal tables, recorded in `_quack_meta`: the
 /// newest step above.
-const WORKSPACE_SCHEMA_VERSION: u32 = CLASSIFICATIONS;
+const WORKSPACE_SCHEMA_VERSION: u32 = VALUE_LISTS;
 
 /// The oldest `DuckDB` that must read a file created here, given to `DuckDB`
 /// when the file is opened. It is the bundled library's own default, named so
@@ -254,6 +255,25 @@ impl StatementKind {
     }
 }
 
+/// One text value a statement compares a column with: `column = 'value'`
+/// or `column IN ('a', 'b')`, as `DuckDB` parsed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueFilter {
+    /// The column's own name, without its table.
+    pub column: String,
+    pub value: String,
+    /// The column is wrapped in `lower`, `upper`, or `trim`, so the
+    /// value's case does not decide what matches.
+    pub folded: bool,
+}
+
+/// The tables a statement reads and the text values it filters on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filters {
+    pub tables: Vec<String>,
+    pub values: Vec<ValueFilter>,
+}
+
 /// A statement as `DuckDB`'s `json_serialize_sql` returns it.
 enum SerializedStatement {
     /// A `SELECT`-shaped statement, as its parse tree.
@@ -275,6 +295,18 @@ impl SerializedStatement {
         };
         blank_constants(&mut tree);
         Some(tree.to_string())
+    }
+
+    /// The tables the statement reads and the text values it compares
+    /// columns with.
+    fn filters(&self) -> Option<Filters> {
+        let Self::Tree(tree) = self else {
+            return None;
+        };
+        let mut filters = Filters::default();
+        collect_table_names(tree, &mut filters.tables);
+        collect_value_filters(tree, &mut filters.values);
+        Some(filters)
     }
 
     /// The names of the tables the statement reads.
@@ -1448,6 +1480,16 @@ impl WorkspaceDb {
         Ok(self.serialize(sql)?.shape())
     }
 
+    /// The tables a statement reads and the text values it compares columns
+    /// with, as `DuckDB` parsed it; `None` when it cannot be serialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the serialization query itself fails.
+    pub fn statement_filters(&self, sql: &str) -> Result<Option<Filters>> {
+        Ok(self.serialize(sql)?.filters())
+    }
+
     /// Names of tables a statement references, as `DuckDB` parsed them, or
     /// `None` when `DuckDB` cannot serialize the statement.
     fn referenced_base_tables(&self, sql: &str) -> Result<Option<Vec<String>>> {
@@ -1653,7 +1695,10 @@ impl WorkspaceDb {
         if recorded < MERGE_DEDUP {
             self.collapse_duplicate_merge_proposals()?;
         }
-        if recorded < TABLE_PROFILES {
+        if recorded < VALUE_LISTS {
+            if recorded >= TABLE_PROFILES {
+                self.conn.execute("DELETE FROM _quack_table_profiles", [])?;
+            }
             let profiled = TableProfile::refresh_stale(self)?;
             if profiled > 0 {
                 tracing::info!(tables = profiled, "profiled existing tables");
@@ -5763,6 +5808,95 @@ fn collect_table_names(node: &serde_json::Value, out: &mut Vec<String>) {
         | serde_json::Value::Number(_)
         | serde_json::Value::String(_) => {}
     }
+}
+
+/// Every `column = 'text'` and `column IN ('text', ...)` under `node`.
+fn collect_value_filters(node: &serde_json::Value, out: &mut Vec<ValueFilter>) {
+    match node {
+        serde_json::Value::Object(map) => {
+            let kind = map.get("type").and_then(serde_json::Value::as_str);
+            let operands: Vec<&serde_json::Value> = match kind {
+                Some("COMPARE_EQUAL") => [map.get("left"), map.get("right")]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+                Some("COMPARE_IN") => map
+                    .get("children")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|c| c.iter().collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            if let Some((column, folded)) = operands.iter().find_map(|o| column_of(o)) {
+                for value in operands.iter().filter_map(|o| text_constant(o)) {
+                    out.push(ValueFilter {
+                        column: column.clone(),
+                        value,
+                        folded,
+                    });
+                }
+            }
+            for child in map.values() {
+                collect_value_filters(child, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_value_filters(item, out);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+/// The column a filter operand names, directly or inside `lower`, `upper`,
+/// or `trim` (then folded).
+fn column_of(node: &serde_json::Value) -> Option<(String, bool)> {
+    match node.get("class").and_then(serde_json::Value::as_str)? {
+        "COLUMN_REF" => node
+            .get("column_names")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|names| names.last())
+            .and_then(serde_json::Value::as_str)
+            .map(|name| (name.to_owned(), false)),
+        "FUNCTION" => {
+            let name = node
+                .get("function_name")
+                .and_then(serde_json::Value::as_str)?;
+            let children = node.get("children").and_then(serde_json::Value::as_array)?;
+            let [child] = children.as_slice() else {
+                return None;
+            };
+            matches!(name, "lower" | "upper" | "lcase" | "ucase" | "trim")
+                .then(|| column_of(child).map(|(column, _)| (column, true)))
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// A filter operand's text, when it is a `VARCHAR` constant.
+fn text_constant(node: &serde_json::Value) -> Option<String> {
+    if node.get("class").and_then(serde_json::Value::as_str) != Some("CONSTANT") {
+        return None;
+    }
+    let value = node.get("value")?;
+    let is_text = value
+        .get("type")
+        .and_then(|t| t.get("id"))
+        .and_then(serde_json::Value::as_str)
+        == Some("VARCHAR");
+    let is_null = value
+        .get("is_null")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    (is_text && !is_null)
+        .then(|| value.get("value").and_then(serde_json::Value::as_str))
+        .flatten()
+        .map(str::to_owned)
 }
 
 /// Conservative token scan used for statements the parser will not serialize.

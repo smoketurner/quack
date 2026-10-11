@@ -40,7 +40,7 @@ QUALIFY row_number() OVER (PARTITION BY g ORDER BY measure DESC) <= 3 its top th
 WHERE g IN ('a', 'b') covers a chosen set\n\
 - GROUPING SETS, CUBE, and ROLLUP for multi-level totals; PIVOT t ON col USING sum(v) and \
 UNPIVOT reshape between wide and long\n\
-- DESCRIBE t shows columns and types; SUMMARIZE t profiles every column\n\
+- DESCRIBE t shows columns and types\n\
 - Joins: ASOF JOIN matches the nearest earlier key, POSITIONAL JOIN pairs rows by position, \
 LATERAL correlates a subquery with the rows before it\n\
 - Lists and structs: [1, 2, 3] is a list, l[1] is its first element and l[-1] its last, \
@@ -223,11 +223,22 @@ pub struct BuiltPrompt {
     pub text: String,
     pub modeled: Modeled,
     pub tables: TableLayout,
-    /// The workspace holds tables or documents an answer could come from.
-    pub holds_data: bool,
     /// The workspace holds ready documents, which `always_retrieve =
     /// "auto"` retrieves from up front.
     pub has_documents: bool,
+    /// The user tables, named in the note a turn that fetched nothing gets
+    /// (`grounding::nothing_fetched`).
+    pub table_names: Vec<String>,
+    /// How many ready documents the workspace holds.
+    pub documents: u64,
+}
+
+impl BuiltPrompt {
+    /// Whether the workspace holds anything an answer could come from.
+    #[must_use]
+    pub fn holds_data(&self) -> bool {
+        !self.table_names.is_empty() || self.documents > 0
+    }
 }
 
 impl SystemPrompt {
@@ -342,8 +353,9 @@ impl SystemPrompt {
             text: prompt.text,
             modeled,
             tables: layout,
-            holds_data: !tables.is_empty() || documents > 0,
             has_documents: documents > 0,
+            table_names: tables,
+            documents: u64::try_from(documents).unwrap_or(u64::MAX),
         })
     }
 
@@ -359,7 +371,8 @@ impl SystemPrompt {
                  1. The tables block below describes the data: columns with their meaning and \
                  unit when the owner gave one, notes, and warnings about the values. Follow the \
                  notes and warnings, call describe_table for a table it lists without columns, and \
-                 run SUMMARIZE <table> when you need min, max, or distinct counts per column\n"
+                 run SELECT DISTINCT col FROM t to see the values a column holds before filtering \
+                 on one\n"
             }
             TableLayout::Ranked => {
                 "When answering analytical questions about structured data:\n\
@@ -367,11 +380,14 @@ impl SystemPrompt {
                  ranked for this question are listed after the workspace context; if none fits, \
                  call find_tables with the question in other words, which returns each match's \
                  columns, so describe_table is rarely needed. Follow the notes and warnings, and \
-                 run SUMMARIZE <table> when you need min, max, or distinct counts per column\n"
+                 run SELECT DISTINCT col FROM t to see the values a column holds before filtering \
+                 on one\n"
             }
         });
         self.text.push_str(
-            "2. Write and execute SQL queries using run_sql\n\
+            "2. Write and execute SQL queries using run_sql. Every calculation runs there, \
+             arithmetic on figures in the question included (SELECT 17 * 23), never in your \
+             text: the person sees the statement and its result, not your working\n\
              3. If run_sql returns an error, read it: DuckDB names candidate columns for a \
              misspelled one and describe_table shows the real names. Fix the statement and run \
              it again; do not give up after one error and do not ask the user to correct SQL\n\

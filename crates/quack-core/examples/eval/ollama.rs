@@ -158,16 +158,8 @@ impl ModelsReport {
         )?;
         writeln!(
             out,
-            "{:<10} {:>8} {:>10} {:>10} {:>9} {:>11} {:>8} {:>8} {:>10}",
-            "kind",
-            "correct",
-            "right tool",
-            "cited",
-            "fallback",
-            "same answer",
-            "<think>",
-            "errors",
-            "seconds"
+            "{:<10} {:>8} {:>10} {:>10} {:>11} {:>8} {:>8} {:>10}",
+            "kind", "correct", "right tool", "cited", "same answer", "<think>", "errors", "seconds"
         )?;
         for (kind, tally) in agent
             .by_kind
@@ -176,11 +168,10 @@ impl ModelsReport {
         {
             writeln!(
                 out,
-                "{kind:<10} {:>8} {:>10} {:>10} {:>9} {:>11} {:>8} {:>8} {:>10.1}",
+                "{kind:<10} {:>8} {:>10} {:>10} {:>11} {:>8} {:>8} {:>10.1}",
                 format!("{}/{}", tally.correct, tally.n),
                 format!("{}/{}", tally.right_tool, tally.tooled),
                 format!("{}/{}", tally.cited, tally.citing),
-                format!("{}/{}", tally.fallbacks, tally.n),
                 format!("{}/{}", tally.consistent, tally.repeated),
                 tally.think_leaks,
                 tally.errors,
@@ -307,10 +298,6 @@ struct AgentOutcome {
     /// `None` when the question does not call for a citation.
     cited: Option<bool>,
     think_leak: bool,
-    /// The figures the model stated that no result held; when any are
-    /// listed, quack showed the query results instead of its answer.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    unsourced: Vec<String>,
     /// Under `QUACK_EVAL_REPEAT`, whether every asking gave the same answer.
     #[serde(skip_serializing_if = "Option::is_none")]
     consistent: Option<bool>,
@@ -332,8 +319,6 @@ struct Tally {
     cited: usize,
     citing: usize,
     think_leaks: usize,
-    /// Answers quack replaced by the query results.
-    fallbacks: usize,
     /// Of `repeated`, the questions answered the same every time.
     consistent: usize,
     repeated: usize,
@@ -357,9 +342,6 @@ impl Tally {
             .cited
             .saturating_add(count(outcome.cited == Some(true)));
         self.think_leaks = self.think_leaks.saturating_add(count(outcome.think_leak));
-        self.fallbacks = self
-            .fallbacks
-            .saturating_add(count(!outcome.unsourced.is_empty()));
         self.repeated = self
             .repeated
             .saturating_add(count(outcome.consistent.is_some()));
@@ -426,7 +408,6 @@ async fn evaluate_agent(
                         .then(|| tools.iter().any(|t| case.tools.contains(t))),
                     cited: case.cite.then_some(!response.citations.is_empty()),
                     think_leak: answer.contains("<think>") || answer.contains("</think>"),
-                    unsourced: response.unsourced.clone(),
                     consistent,
                     tools,
                     seconds,
@@ -441,7 +422,6 @@ async fn evaluate_agent(
                 right_tool: (!case.tools.is_empty()).then_some(false),
                 cited: case.cite.then_some(false),
                 think_leak: false,
-                unsourced: Vec::new(),
                 consistent: None,
                 tools: Vec::new(),
                 seconds,

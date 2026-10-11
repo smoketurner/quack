@@ -16,10 +16,8 @@ use crate::ids::SessionId;
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
 use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, TurnRecorder};
-use super::grounding;
-use super::hooks::{
-    EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls, RepeatedCalls, Unsourced,
-};
+use super::grounding::{self, ValueLinks};
+use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls, RepeatedCalls};
 use super::policy::WritePolicy;
 use super::search::DocumentScope;
 use super::table_search::{CardRefresh, TableCards, TableLayout};
@@ -33,6 +31,7 @@ use super::tools::{
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::GraphResult;
 use crate::llm::{ChatModel, RerankModel};
+use crate::storage::profile::TableProfile;
 use crate::storage::sessions::ChatMode;
 
 /// What the provider charged for a turn. Every budget quack computes
@@ -123,12 +122,6 @@ pub struct AgentResponse {
     /// whole workspace.
     #[serde(default)]
     pub documents: DocumentScope,
-    /// Figures the model's answer stated that no query result or passage
-    /// of the turn held, after it was asked once more. When any are left,
-    /// `content` is what the queries returned instead of the model's
-    /// answer (design doc 7.7).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unsourced: Vec<String>,
 }
 
 /// One SQL statement the turn ran, as the response object lists it.
@@ -179,7 +172,6 @@ impl AgentResponse {
             usage: self.usage,
             duration_ms: self.duration_ms,
             documents: self.documents.clone(),
-            unsourced: self.unsourced.clone(),
             session_id: session_id.clone(),
         }
     }
@@ -207,10 +199,6 @@ pub struct AgentResponseBody {
     pub duration_ms: Option<u64>,
     /// The documents the question was limited to; empty for all.
     pub documents: DocumentScope,
-    /// Figures the model stated that no result or passage held; when any
-    /// are listed, `answer` shows the query results instead of the
-    /// model's answer.
-    pub unsourced: Vec<String>,
     pub session_id: SessionId,
 }
 
@@ -463,17 +451,19 @@ where
             labeller,
         } = self;
         let read = PromptAndModel::read(&reader_db, &prompt).await?;
+        let question = user_message.to_owned();
+        let named = reader_db
+            .with_db(move |db| Ok(ValueLinks::find(&TableProfile::all(db)?, &question)))
+            .await?;
         let turn = Turn::new(recorder.clone(), write_policy)
             .within(prompt.scope.clone())
-            .cancelled_by(cancel.clone());
+            .cancelled_by(cancel.clone())
+            .naming(named);
         let Replay { history, dropped } = Replay::check(history);
-        // Every figure of the answer must come from what this turn's
-        // searches and queries return, or from the question itself: never
-        // from the model, the prompt, or an earlier answer.
-        let check_grounding = read.prompt.holds_data;
-        if check_grounding {
-            turn.saw(user_message);
-        }
+        // Shown only when the turn fetched something; the note otherwise.
+        let holds_data = read.prompt.holds_data();
+        let nothing_fetched =
+            grounding::nothing_fetched(&read.prompt.table_names, read.prompt.documents);
         let window = prompt.window;
         let agent = BuildContext {
             shared_db: Arc::clone(&shared_db),
@@ -487,7 +477,6 @@ where
             rerank_model,
             labeller,
             turn: turn.clone(),
-            check_grounding,
             has_documents: read.prompt.has_documents,
         }
         .build_agent(completion_model, embedding_model, &read.prompt.text)?;
@@ -505,26 +494,24 @@ where
         let streamed =
             Streamed::read(stream, &cancel, recorder, analysis_config.max_turns, window).await?;
         let cancelled = streamed.cancelled;
-        let mut unsourced = Vec::new();
+        let ran_a_tool = !turn.recorder.steps().is_empty();
         let (mut answer, usage) = streamed.answer(window, |text| {
             let checked = recorder.citations().validate(text);
-            if check_grounding && !cancelled {
-                unsourced = turn.unsourced(&checked.text);
+            // A passage `always_retrieve` put in the prompt counts only
+            // when the answer cites it: a citation that survives validation
+            // names a chunk retrieved this turn.
+            let fetched = ran_a_tool || !checked.citations.is_empty();
+            if holds_data && !fetched && !cancelled && !checked.text.trim().is_empty() {
+                // Nothing the model wrote came from the workspace: the
+                // person is told what it holds instead (design doc 7.7).
+                tracing::info!("the turn ran no query and no search; the answer is not shown");
+                return CitedAnswer {
+                    text: nothing_fetched.clone(),
+                    citations: Vec::new(),
+                };
             }
             checked
         });
-        if !unsourced.is_empty() {
-            // DuckDB provides the answers: one the model would not state
-            // from what the queries returned is replaced by what they did.
-            tracing::warn!(
-                ?unsourced,
-                "the answer still states figures no result holds; showing the results"
-            );
-            answer = CitedAnswer {
-                text: grounding::fallback(&unsourced, &turn.recorder.steps()),
-                citations: Vec::new(),
-            };
-        }
         if let Some(note) = dropped {
             answer.text.push_str("\n\n(");
             answer.text.push_str(&note);
@@ -532,7 +519,6 @@ where
         }
         let mut response = turn.finish(answer, usage, asked);
         response.cancelled = cancelled;
-        response.unsourced = unsourced;
         Ok(response)
     }
 }
@@ -881,7 +867,6 @@ impl Turn {
             usage,
             duration_ms: Some(u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX)),
             documents: self.scope().clone(),
-            unsourced: Vec::new(),
         }
     }
 }
@@ -904,9 +889,6 @@ struct BuildContext<'a> {
     /// The turn the agent runs: `always_retrieve` records on it that it
     /// put chunk text in the prompt.
     turn: Turn,
-    /// Check every figure of the answer against what the turn showed the
-    /// model ([`Unsourced`]).
-    check_grounding: bool,
     /// The workspace holds ready documents (`always_retrieve = "auto"`).
     has_documents: bool,
 }
@@ -958,9 +940,6 @@ impl BuildContext<'_> {
             .add_hook(InvalidToolCalls)
             .add_hook(EmptyAnswer)
             .add_hook(RepeatedCalls);
-        if ctx.check_grounding {
-            builder = builder.add_hook(Unsourced::new(ctx.turn.clone()));
-        }
 
         // The ontology is describable as soon as it exists: the prompt block
         // is capped, so a class the model wants the detail of may not be in it

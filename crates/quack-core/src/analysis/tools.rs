@@ -27,7 +27,7 @@ use crate::storage::writer::Writer;
 use super::chart::{ChartKind, ChartSpec, SeriesColumns};
 use super::citations::{ChunkLocation, Markers};
 use super::events::{DetailPreview, ToolName, TurnRecorder};
-use super::grounding::Sources;
+use super::grounding::ValueLinks;
 use super::policy::{Exposure, Hold, RefusalFlag, WriteDecision, WritePolicy};
 use super::rerank::Reranker;
 use super::search::{DocumentScope, DocumentSearch, SearchOutcome, SearchVectors};
@@ -334,9 +334,9 @@ pub struct Turn {
     scope: DocumentScope,
     /// Stops the turn; a long tool call ends with it.
     cancel: CancellationToken,
-    /// The numbers the turn's searches and queries have shown the model,
-    /// which every figure of its answer must come from (`grounding`).
-    sources: Arc<Mutex<Sources>>,
+    /// The values of text columns the question names, which a read
+    /// filtering those columns must use.
+    values: Arc<ValueLinks>,
 }
 
 impl Turn {
@@ -352,25 +352,8 @@ impl Turn {
             shapes: Arc::new(Mutex::new(Vec::new())),
             scope: DocumentScope::default(),
             cancel: CancellationToken::new(),
-            sources: Arc::new(Mutex::new(Sources::default())),
+            values: Arc::new(ValueLinks::default()),
         }
-    }
-
-    /// Take the numbers in `text`, which the model has been shown: a tool
-    /// result, a passage put in the prompt, the question.
-    pub(crate) fn saw(&self, text: &str) {
-        self.sources
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .saw(text);
-    }
-
-    /// The figures of `answer` that nothing the turn showed the model holds.
-    pub(crate) fn unsourced(&self, answer: &str) -> Vec<String> {
-        self.sources
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .unsourced(answer)
     }
 
     /// The token that stops the turn.
@@ -419,6 +402,13 @@ impl Turn {
     #[must_use]
     pub fn within(mut self, scope: DocumentScope) -> Self {
         self.scope = scope;
+        self
+    }
+
+    /// The values of text columns the question names.
+    #[must_use]
+    pub(crate) fn naming(mut self, values: ValueLinks) -> Self {
+        self.values = Arc::new(values);
         self
     }
 
@@ -631,7 +621,7 @@ impl SqlGate {
             }
         };
         match kind {
-            StatementKind::Read => Ok(Gate::Read),
+            StatementKind::Read => self.named_values(sql, turn).await,
             StatementKind::Invalid(msg) => Ok(Gate::Reject(format!("SQL syntax error: {msg}"))),
             StatementKind::Write => {
                 if creates_temp_object(sql) {
@@ -659,7 +649,7 @@ impl SqlGate {
                 Gate::Read
             }
             Screened::Internal => Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)),
-            Screened::Kind(StatementKind::Read) => Gate::Read,
+            Screened::Kind(StatementKind::Read) => self.named_values(sql, turn).await?,
             Screened::Kind(StatementKind::Invalid(msg)) => {
                 Gate::Reject(format!("SQL syntax error: {msg}"))
             }
@@ -667,6 +657,31 @@ impl SqlGate {
                 Gate::Refused(Hold::NotPermitted)
             }
         })
+    }
+
+    /// A read runs unless it filters a column the question names a value of
+    /// on another value (`grounding::ValueLinks`).
+    async fn named_values(&self, sql: &str, turn: &Turn) -> Result<Gate, ToolExecutionError> {
+        if turn.values.is_empty() {
+            return Ok(Gate::Read);
+        }
+        let read = sql.to_owned();
+        let filters = self
+            .db
+            .with_db(move |db| db.statement_filters(&read))
+            .await?;
+        Ok(
+            match filters.and_then(|filters| turn.values.refusal(&filters)) {
+                Some(refusal) => {
+                    tracing::info!(
+                        sql,
+                        "refused a read filtering on a value the question does not name"
+                    );
+                    Gate::Reject(refusal)
+                }
+                None => Gate::Read,
+            },
+        )
     }
 
     /// The statement's kind on a reader, unless it names an internal table
@@ -1327,8 +1342,7 @@ impl Tool for DescribeTableTool {
              on the table, warnings from its profile (empty columns, numbers or dates stored as \
              text, a key that repeats), the measures defined over it, and up to 3 sample rows. A \
              name that matches no table returns an error followed by the names of the tables that \
-             exist. For min, max, or distinct counts per column, run SUMMARIZE <table> with \
-             run_sql.",
+             exist.",
         )
     }
 

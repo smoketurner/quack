@@ -84,6 +84,9 @@ open:
 - **15**: Adds `_quack_classifications`, the runs that label a table's text with a decision
   model (issue #472), and the document source `classify`, which an older quack's reader
   refuses. The table starts empty and needs no backfill.
+- **16**: Profiles every user table again, so each text column with at most 50 distinct values
+  lists them all (`ColumnProfile::values`); a question's words are matched to those values
+  before the agent's queries run (design doc 7.7).
 
 A column that needs no backfill needs no bump: `ADD COLUMN IF NOT EXISTS` on open adds it,
 and rows written earlier read as `NULL`. `_quack_documents.page_count`, `pages_unreadable`,

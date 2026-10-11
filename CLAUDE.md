@@ -247,11 +247,14 @@ it. Rig hooks (`analysis::hooks`) keep a turn going: an unknown tool name is rep
 retried with the real names (twice at most), an empty reply is asked for once more, and a
 tool call repeating one the turn made (same tool and arguments) is not run again
 (`RepeatedCalls`). `DuckDB` provides the answers (design doc 7.7, `analysis::grounding`): the
-`Unsourced` hook records every tool result and retrieved passage of the turn, and a final
-answer stating a figure that none of them nor the question holds (matched to the precision
-written, scaled or as a ratio) is asked for once more; still unsourced, the answer is replaced
-by the turn's query results and the figures go on `AgentResponse::unsourced`. What the model
-knows, the system prompt, and earlier turns are never a source. The graph tools register only
+SQL and the rows it returned are the record of every answer, shown on each step in every
+interface; the model's prose is never checked against them, and in a workspace that holds data
+a turn that ran no tool and cites no passage shows `grounding::nothing_fetched` (what the
+workspace holds) instead of the model's text. The question's words are matched
+to the values of text columns with at most 50 (`ColumnProfile::values`, `grounding::ValueLinks`),
+and a read filtering such a column on a value the question does not name (`'TENNESSEE'` for
+Texas) or a spelling the column does not hold is refused with the stored value
+(`WorkspaceDb::statement_filters` over `DuckDB`'s parse tree). The graph tools register only
 when the question names a node (`graph::store::named_in`, `Modeled::for_question`);
 `tests/agent_turn.rs` drives whole turns with rig's scripted model. The tools hold only the
 workspace and its settings; a turn's recorder, write policy, refusal flag, and chart and graph
@@ -435,7 +438,7 @@ tool guidance in the system prompt gains a numbered graph procedure whenever tho
 are registered.
 
 What the agent knows of a table (issue #403): `storage::profile::TableProfile` (per column
-present and distinct counts, three common values, the share of a text column that casts to a
+present and distinct counts, three common values, every value of a text column with at most 50, the share of a text column that casts to a
 number or a date) is stored in `_quack_table_profiles` at load, import, and after any write that
 changed the row count (`TableProfile::after_write`, called by every interface that runs a write),
 and shown only while its row count matches; `profile::ColumnWarning` (all empty, half empty,

@@ -550,7 +550,7 @@ fn dialect_reference_is_pinned_to_the_bundled_duckdb_and_stays_in_the_sandbox() 
     assert!(prompt.contains(&format!("DuckDB {version} SQL reference")));
     for idiom in [
         "GROUP BY ALL",
-        "SUMMARIZE t profiles every column",
+        "DESCRIBE t shows columns and types",
         "EXCLUDE (a, b)",
         "count() FILTER",
         "ASOF JOIN",

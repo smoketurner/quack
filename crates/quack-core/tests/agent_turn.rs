@@ -27,6 +27,7 @@ use quack_core::ingestion::parser::SectionKind;
 use quack_core::jobs::JobQueue;
 use quack_core::llm::CancellationToken;
 use quack_core::llm::egress::Egress;
+use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{self, ChatMode, MessageRole};
 use quack_core::storage::workspace::{DocumentStatus, NewChunk, NewDocument, Pinning, WorkspaceDb};
 use quack_core::storage::writer::Writer;
@@ -704,12 +705,17 @@ async fn a_rejected_calls_text_is_left_out_of_the_answer() {
         (
             vec![
                 turn(vec![text("Let me look into that. "), unknown()]),
+                turn(vec![tool()]),
                 turn(vec![text("There is one table, sales.")]),
             ],
             "There is one table, sales.",
         ),
         (
-            vec![turn(vec![text("   ")]), turn(vec![text("Two regions.")])],
+            vec![
+                turn(vec![text("   ")]),
+                turn(vec![tool()]),
+                turn(vec![text("Two regions.")]),
+            ],
             "Two regions.",
         ),
         (
@@ -763,12 +769,45 @@ async fn an_empty_reply_is_asked_for_again() {
     let db = workspace();
     let model = MockCompletionModel::from_stream_turns([
         turn(Vec::new()),
+        turn(vec![call("t1", "list_tables", serde_json::json!({}))]),
         turn(vec![text("Two regions.")]),
     ]);
     let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "regions?").await;
     assert_eq!(ran.answer().content, "Two regions.");
     let retry = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
     assert!(retry.contains("Your last reply was empty"), "{retry}");
+}
+
+/// In a workspace that holds data, a turn that ran no tool has no answer
+/// to show, whatever the model wrote: the person is told what the
+/// workspace holds. A workspace holding nothing keeps the model's text.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_from_a_turn_that_ran_nothing_is_not_shown() {
+    let db = workspace();
+    let model = MockCompletionModel::from_stream_turns([turn(vec![text("North fell by 100.")])]);
+    let ran = run_turn(
+        &db,
+        &model,
+        WritePolicy::Deny,
+        Vec::new(),
+        "which region fell?",
+    )
+    .await;
+    let answer = ran.answer();
+    assert_eq!(
+        answer.content,
+        "quack ran no query and no search for this question, so there is no answer to show. \
+         The workspace holds the table sales, and 1 document. Ask about them, naming the \
+         table or the document when you can."
+    );
+    assert!(answer.citations.is_empty());
+    assert_eq!(model.request_count(), 1);
+
+    let empty =
+        Arc::new(Writer::spawn(WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap()).unwrap());
+    let model = MockCompletionModel::from_stream_turns([turn(vec![text("Hello there.")])]);
+    let ran = run_turn(&empty, &model, WritePolicy::Deny, Vec::new(), "hi").await;
+    assert_eq!(ran.answer().content, "Hello there.");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -787,155 +826,13 @@ async fn a_second_empty_reply_ends_the_turn_with_the_note() {
     assert_eq!(model.request_count(), 2);
 }
 
-/// An answer with figures from a turn that ran no tool and read nothing is
-/// asked for again; the second answer used the tools and stands as it is.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_answer_with_figures_and_no_tool_is_asked_for_again() {
-    let db = workspace();
-    let model = MockCompletionModel::from_stream_turns([
-        turn(vec![text("North fell by 100.")]),
-        turn(vec![call(
-            "t1",
-            "run_sql",
-            serde_json::json!({"query": "SELECT region, revenue FROM sales"}),
-        )]),
-        turn(vec![text("North has 10 and south 20.")]),
-    ]);
-    let ran = run_turn(
-        &db,
-        &model,
-        WritePolicy::Deny,
-        Vec::new(),
-        "which region fell?",
-    )
-    .await;
-    assert_eq!(ran.answer().content, "North has 10 and south 20.");
-    let retry = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
-    assert!(retry.contains("ran no query and read no"), "{retry}");
-}
-
-/// A second answer whose figures nothing the turn showed holds is not
-/// shown: with no query run there is nothing to show instead, and the
-/// response names the figures.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_second_unsourced_answer_is_not_shown() {
-    let db = workspace();
-    let model = MockCompletionModel::from_stream_turns([
-        turn(vec![text("North fell by 100.")]),
-        turn(vec![text("North fell by 100, reopening next week.")]),
-        turn(vec![text("never reached")]),
-    ]);
-    let ran = run_turn(
-        &db,
-        &model,
-        WritePolicy::Deny,
-        Vec::new(),
-        "which region fell?",
-    )
-    .await;
-    let answer = ran.answer();
-    assert!(!answer.content.contains("reopening"), "{}", answer.content);
-    assert!(
-        answer.content.contains("100 did not come from"),
-        "{}",
-        answer.content
-    );
-    assert!(
-        answer.content.contains("No query returned rows"),
-        "{}",
-        answer.content
-    );
-    assert_eq!(answer.unsourced, vec![String::from("100")]);
-    assert_eq!(model.request_count(), 2);
-}
-
-/// A figure the query did not return is named back to the model, which
-/// answers again from the result; the corrected answer stands.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_figure_the_query_did_not_return_is_asked_about() {
-    let db = workspace();
-    let model = MockCompletionModel::from_stream_turns([
-        turn(vec![call(
-            "t1",
-            "run_sql",
-            serde_json::json!({"query": "SELECT sum(revenue) AS total FROM sales"}),
-        )]),
-        turn(vec![text("Revenue totals 35.")]),
-        turn(vec![text("Revenue totals 30.")]),
-    ]);
-    let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "total revenue?").await;
-    assert_eq!(ran.answer().content, "Revenue totals 30.");
-    assert!(ran.answer().unsourced.is_empty());
-    let retry = serde_json::to_string(&model.requests()[2].chat_history).unwrap();
-    assert!(
-        retry.contains("do not appear in any query result"),
-        "{retry}"
-    );
-    assert!(retry.contains("35"), "{retry}");
-}
-
-/// An answer that still states a figure no result holds is replaced by
-/// what the query returned, which `DuckDB` computed.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_answer_still_unsourced_shows_the_query_result() {
-    let db = workspace();
-    let model = MockCompletionModel::from_stream_turns([
-        turn(vec![call(
-            "t1",
-            "run_sql",
-            serde_json::json!({"query": "SELECT sum(revenue) AS total FROM sales"}),
-        )]),
-        turn(vec![text("Revenue totals 35.")]),
-        turn(vec![text("Revenue totals about 35.")]),
-    ]);
-    let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "total revenue?").await;
-    let content = &ran.answer().content;
-    assert!(!content.contains("Revenue totals"), "{content}");
-    assert!(
-        content.contains("SELECT sum(revenue) AS total FROM sales"),
-        "{content}"
-    );
-    assert!(content.contains("| total |\n| --- |\n| 30 |"), "{content}");
-    assert_eq!(ran.answer().unsourced, vec![String::from("35")]);
-}
-
-/// Numbers the question holds are the person's, not figures the model
-/// made up: an answer that only repeats them is not asked for again.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_answer_repeating_the_questions_numbers_is_not_asked_again() {
-    let db = workspace();
-    let model = MockCompletionModel::from_stream_turns([turn(vec![text(
-        "The workspace has no data on Apollo 11 or the year 1969.",
-    )])]);
-    let ran = run_turn(
-        &db,
-        &model,
-        WritePolicy::Deny,
-        Vec::new(),
-        "Did Apollo 11 land in 1969?",
-    )
-    .await;
-    assert_eq!(
-        ran.answer().content,
-        "The workspace has no data on Apollo 11 or the year 1969."
-    );
-    assert_eq!(model.request_count(), 1);
-}
-
-/// An answer that states no figures is not second-guessed.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_answer_without_figures_is_not_asked_again() {
-    let db = workspace();
-    let model = MockCompletionModel::from_stream_turns([turn(vec![text("Hello there.")])]);
-    let ran = run_turn(&db, &model, WritePolicy::Deny, Vec::new(), "hi").await;
-    assert_eq!(ran.answer().content, "Hello there.");
-    assert_eq!(model.request_count(), 1);
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn a_malformed_history_is_dropped_with_a_warning() {
     let db = workspace();
-    let model = MockCompletionModel::from_stream_turns([turn(vec![text("Hello.")])]);
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![call("t1", "list_tables", serde_json::json!({}))]),
+        turn(vec![text("Hello.")]),
+    ]);
     // Two assistant messages in a row: rig refuses such a transcript.
     let history = vec![
         Message::user("hi"),
@@ -1376,4 +1273,49 @@ async fn a_failed_labelling_step_names_the_run_it_began() {
         .unwrap();
     assert_eq!(step.run.map(|run| run.to_string()), Some(recorded.0));
     assert_eq!(recorded.1, "failed");
+}
+
+/// A query filtering on a state the question does not name is not run:
+/// the model is told the value the column holds for the one it names, and
+/// the answer comes from the query that uses it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filter_on_a_value_the_question_does_not_name_is_refused() {
+    let db = workspace();
+    db.run(|db| {
+        db.connection().execute_batch(
+            "CREATE TABLE events (state VARCHAR, damage INTEGER);
+             INSERT INTO events VALUES ('TENNESSEE', 2655), ('TEXAS', 1764);",
+        )?;
+        TableProfile::refresh(db, "events")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let model = MockCompletionModel::from_stream_turns([
+        turn(vec![call(
+            "t1",
+            "run_sql",
+            serde_json::json!({"query": "SELECT sum(damage) FROM events WHERE state = 'TENNESSEE'"}),
+        )]),
+        turn(vec![call(
+            "t2",
+            "run_sql",
+            serde_json::json!({"query": "SELECT sum(damage) AS total FROM events WHERE state = 'TEXAS'"}),
+        )]),
+        turn(vec![text("Texas had 1764 in damage.")]),
+    ]);
+    let ran = run_turn(
+        &db,
+        &model,
+        WritePolicy::Deny,
+        Vec::new(),
+        "What was the damage in Texas?",
+    )
+    .await;
+    let steps = &ran.answer().steps;
+    assert_eq!(steps[0].summary, "refused");
+    assert_eq!(steps[1].rows, Some(1));
+    assert_eq!(ran.answer().content, "Texas had 1764 in damage.");
+    let retry = serde_json::to_string(&model.requests()[1].chat_history).unwrap();
+    assert!(retry.contains("Texas is 'TEXAS'"), "{retry}");
 }
