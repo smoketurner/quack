@@ -153,15 +153,13 @@ impl Ungrounded {
         Self { turn }
     }
 
-    /// Whether `text` states figures the workspace could be the source of.
-    pub(crate) fn states_figures(text: &str) -> bool {
+    /// Whether `text` states figures (any digit) while `turn` has not
+    /// looked at the workspace: no tool ran, and `always_retrieve` put no
+    /// document text in the prompt.
+    pub(crate) fn applies(text: &str, turn: &Turn) -> bool {
         text.chars().any(|c| c.is_ascii_digit())
-    }
-
-    /// Whether the turn has looked at the workspace: a tool ran, or
-    /// `always_retrieve` put document text in the prompt.
-    pub(crate) fn grounded(turn: &Turn) -> bool {
-        !turn.recorder.steps().is_empty() || turn.exposure() == Exposure::Documents
+            && turn.recorder.steps().is_empty()
+            && turn.exposure() != Exposure::Documents
     }
 
     /// A final answer (text, no tool call) that states figures unseen.
@@ -174,7 +172,7 @@ impl Ungrounded {
                 _ => {}
             }
         }
-        Self::states_figures(&text) && !Self::grounded(&self.turn)
+        Self::applies(&text, &self.turn)
     }
 
     fn decide(&self, ctx: &HookContext, event: &ModelTurnFinished<'_>) -> ModelTurnAction {

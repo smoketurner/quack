@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use pdf_oxide::PdfDocument;
 use pdf_oxide::editor::DocumentInfo;
 use pdf_oxide::extractors::images::{ColorSpace, ImageData, PdfImage};
+use pdf_oxide::geometry::Point;
 use pdf_oxide::layout::{TextSpan, Word};
 use pdf_oxide::structure::table_extractor::Table as PdfTable;
 use pdf_oxide::structured::{RegionRole, StructuredPage, StructuredRegion};
@@ -172,6 +173,10 @@ const TABLE_MIN_ROWS: usize = 3;
 /// Characters a cell of a table without rules holds at most: a longer run
 /// of text is prose that happens to line up.
 const CELL_MAX_CHARS: usize = 40;
+/// Words every cell of one column of a table without rules holds at most:
+/// a table has a column of labels or numbers, where two columns of prose
+/// set side by side have none.
+const TERSE_CELL_WORDS: usize = 3;
 /// How far apart, in points, two cells of a column may sit and still be
 /// aligned on an edge or their centre.
 const COLUMN_TOLERANCE: f32 = 3.0;
@@ -196,6 +201,10 @@ impl Cell {
 
     fn short(&self) -> bool {
         self.text.chars().count() <= CELL_MAX_CHARS
+    }
+
+    fn terse(&self) -> bool {
+        self.text.split_whitespace().count() <= TERSE_CELL_WORDS
     }
 }
 
@@ -275,8 +284,9 @@ impl Row {
 
 /// The runs of `rows` that are tables without rules: at least
 /// [`TABLE_MIN_ROWS`] rows in a row, each split into the same number (two
-/// or more) of short cells, every column aligned. A line of prose is one
-/// cell, its words a space apart.
+/// or more) of short cells, every column aligned, and one column terse in
+/// every row. A line of prose is one cell, its words a space apart, and a
+/// page set in narrow columns of prose has no terse column.
 fn borderless_tables(rows: &[Row]) -> Vec<std::ops::Range<usize>> {
     let mut found = Vec::new();
     let mut start = 0;
@@ -287,7 +297,9 @@ fn borderless_tables(rows: &[Row]) -> Vec<std::ops::Range<usize>> {
                 end = end.saturating_add(1);
             }
         }
-        if end.saturating_sub(start) >= TABLE_MIN_ROWS {
+        if end.saturating_sub(start) >= TABLE_MIN_ROWS
+            && rows.get(start..end).is_some_and(has_terse_column)
+        {
             found.push(start..end);
             start = end;
         } else {
@@ -295,6 +307,15 @@ fn borderless_tables(rows: &[Row]) -> Vec<std::ops::Range<usize>> {
         }
     }
     found
+}
+
+/// Whether one column of `rows` is [`Cell::terse`] in every row.
+fn has_terse_column(rows: &[Row]) -> bool {
+    let width = rows.first().map_or(0, |row| row.cells.len());
+    (0..width).any(|column| {
+        rows.iter()
+            .all(|row| row.cells.get(column).is_some_and(Cell::terse))
+    })
 }
 
 /// A table drawn without rules: its rows' cells, and the area its words
@@ -330,9 +351,9 @@ impl Borderless {
             .collect()
     }
 
-    /// Whether the point (`x`, `y`) lies in the table's area.
-    fn holds(&self, x: f32, y: f32) -> bool {
-        (self.left..=self.right).contains(&x) && (self.bottom..=self.top).contains(&y)
+    /// Whether `point` lies in the table's area.
+    fn holds(&self, point: &Point) -> bool {
+        (self.left..=self.right).contains(&point.x) && (self.bottom..=self.top).contains(&point.y)
     }
 }
 
@@ -346,13 +367,15 @@ struct Grids<'a> {
 impl Grids<'_> {
     fn contains(&self, span: &TextSpan) -> bool {
         let center = span.bbox.center();
-        self.ruled.iter().any(|table| {
-            table
-                .bbox
-                .as_ref()
-                .is_some_and(|b| b.contains_point(&center))
-        }) || self.borderless.iter().any(|t| t.holds(center.x, center.y))
+        in_ruled(&self.ruled, &center) || self.borderless.iter().any(|t| t.holds(&center))
     }
+}
+
+/// Whether `point` lies inside one of the `ruled` grids.
+fn in_ruled(ruled: &[&PdfTable], point: &Point) -> bool {
+    ruled
+        .iter()
+        .any(|table| table.bbox.as_ref().is_some_and(|b| b.contains_point(point)))
 }
 
 /// A page with its real tables, read for content: chrome regions dropped,
@@ -447,12 +470,7 @@ impl PageContent {
         // Words outside the ruled grids, which already have their tables.
         let loose: Vec<&Word> = words
             .iter()
-            .filter(|w| {
-                let center = w.bbox.center();
-                !ruled
-                    .iter()
-                    .any(|t| t.bbox.as_ref().is_some_and(|b| b.contains_point(&center)))
-            })
+            .filter(|w| !in_ruled(&ruled, &w.bbox.center()))
             .collect();
         let page = Page {
             page,
@@ -1079,6 +1097,60 @@ mod tests {
             .collect();
         assert!(body.contains("fell in the West"), "{body}");
         assert!(!body.contains("480"), "{body}");
+    }
+
+    /// Two columns of prose set side by side line up like a table without
+    /// rules, but neither column is terse, so they stay body text.
+    #[test]
+    fn two_columns_of_prose_are_not_a_table() {
+        let mut doc = pdf_oxide::writer::DocumentBuilder::new().title("Harbor news");
+        let mut page = doc.letter_page();
+        let lines = [
+            (
+                700.0,
+                "The harbor reopened on Monday after",
+                "Volunteers will plant the new",
+            ),
+            (
+                686.0,
+                "a week of repairs to the north pier.",
+                "garden beside the ticket office on",
+            ),
+            (
+                672.0,
+                "Crews replaced forty pilings and",
+                "Saturday; bring gloves and water.",
+            ),
+            (
+                658.0,
+                "resurfaced the loading deck, and",
+                "Seedlings come from the school",
+            ),
+            (
+                644.0,
+                "the first ferry docked at nine.",
+                "greenhouse, which grew them all.",
+            ),
+        ];
+        for (y, left, right) in lines {
+            page = page.at(72.0, y).text(left).at(320.0, y).text(right);
+        }
+        page.done();
+        let bytes = doc.build().unwrap_or_default();
+        let extracted = extract(&bytes, false);
+        assert!(extracted.is_ok(), "{:?}", extracted.as_ref().err());
+        let Ok(extracted) = extracted else { return };
+        assert!(
+            extracted
+                .sections
+                .iter()
+                .all(|s| s.kind != super::super::parser::SectionKind::Table),
+            "{:?}",
+            extracted.sections
+        );
+        let body: String = extracted.sections.iter().map(|s| s.text.as_str()).collect();
+        assert!(body.contains("forty pilings"), "{body}");
+        assert!(body.contains("ticket office"), "{body}");
     }
 
     #[test]

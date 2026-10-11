@@ -131,6 +131,11 @@ impl fmt::Display for Sources<'_> {
     }
 }
 
+/// The `[n]` marker of the chunk at `index` in a list numbered from 1.
+fn marker_at(index: usize) -> u32 {
+    u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1)
+}
+
 /// The markers one registration assigned: `[first]`, `[first + 1]`, and so
 /// on, one per chunk in the order registered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,9 +186,7 @@ impl CitationRegistry {
             return Markers { first: 1 };
         };
         let markers = Markers {
-            first: u32::try_from(all.len())
-                .unwrap_or(u32::MAX)
-                .saturating_add(1),
+            first: marker_at(all.len()),
         };
         for (i, hit) in hits.iter().enumerate() {
             all.push(Citation::new(markers.nth(i), hit));
@@ -204,9 +207,7 @@ impl CitationRegistry {
                 if let Some(known) = all.iter().find(|c| c.chunk_id == hit.id) {
                     return known.n;
                 }
-                let n = u32::try_from(all.len())
-                    .unwrap_or(u32::MAX)
-                    .saturating_add(1);
+                let n = marker_at(all.len());
                 all.push(Citation::new(n, hit));
                 n
             })
@@ -283,11 +284,9 @@ impl CitationRegistry {
                 };
                 let renumbered =
                     if let Some(pos) = cited.iter().position(|c| c.chunk_id == source.chunk_id) {
-                        u32::try_from(pos).unwrap_or(u32::MAX).saturating_add(1)
+                        marker_at(pos)
                     } else {
-                        let next = u32::try_from(cited.len())
-                            .unwrap_or(u32::MAX)
-                            .saturating_add(1);
+                        let next = marker_at(cited.len());
                         let mut c = source.clone();
                         c.n = next;
                         cited.push(c);

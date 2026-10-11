@@ -505,11 +505,9 @@ where
         let cancelled = streamed.cancelled;
         let (mut answer, usage) =
             streamed.answer(window, |text| recorder.citations().validate(text));
-        let ungrounded = (check_grounding
-            && !cancelled
-            && Ungrounded::states_figures(&answer.text)
-            && !Ungrounded::grounded(&turn))
-        .then(|| String::from(Ungrounded::NOTE));
+        let ungrounded =
+            (check_grounding && !cancelled && Ungrounded::applies(&answer.text, &turn))
+                .then(|| String::from(Ungrounded::NOTE));
         for note in [dropped, ungrounded].into_iter().flatten() {
             answer.text.push_str("\n\n(");
             answer.text.push_str(&note);
