@@ -722,7 +722,22 @@ async fn check_chat_model(report: &mut Report, config: &Config, probing: Probing
         Ok(model) => {
             check_model(report, Area::ChatModel, config, model, probing).await;
             report.push(chat_settings_check(config, model).await);
-            if let Some(check) = background_check(config, model).await {
+            let background = match config.background_model_ref() {
+                Ok(background) if background.to_string() == model.to_string() => model,
+                Ok(background) => {
+                    check_model(report, Area::ChatModel, config, background, probing).await;
+                    background
+                }
+                Err(e) => {
+                    report.push(Check::new(
+                        Area::ChatModel,
+                        Status::Fail,
+                        format!("background_model: {e}"),
+                    ));
+                    return;
+                }
+            };
+            if let Some(check) = background_check(config, background).await {
                 report.push(check);
             }
         }

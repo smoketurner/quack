@@ -867,8 +867,9 @@ where
     }
 }
 
-/// The configured chat model as a constrained extractor for the graph: its
-/// preamble carries the ontology.
+/// The background model (`[analysis].background_model`, else the chat
+/// model) as a constrained extractor for the graph: its preamble carries
+/// the ontology.
 ///
 /// # Errors
 ///
@@ -878,7 +879,7 @@ pub async fn graph_extractor(
     config: &Config,
     ontology: &Ontology,
 ) -> Result<Box<dyn Extract<Extraction>>> {
-    let chat = config.chat_model_ref()?;
+    let chat = config.background_model_ref()?;
     let call: SchemaCall<ExtractionAnswer> = ChatClient::build(config, &chat).await?.schema_call(
         chat.model,
         config.model_settings(chat),
@@ -892,14 +893,15 @@ pub async fn graph_extractor(
     Ok(Box::new(call))
 }
 
-/// The configured chat model as an open extractor for ontology induction.
+/// The background model (`[analysis].background_model`, else the chat
+/// model) as an open extractor for ontology induction.
 ///
 /// # Errors
 ///
 /// Returns an error when no chat model is configured or the provider
 /// cannot be built (a missing key, a needed login).
 pub async fn chat_extractor(config: &Config) -> Result<Box<dyn Extract<OpenExtraction>>> {
-    let chat = config.chat_model_ref()?;
+    let chat = config.background_model_ref()?;
     let call: SchemaCall<OpenExtraction> = ChatClient::build(config, &chat).await?.schema_call(
         chat.model,
         config.model_settings(chat),
@@ -913,8 +915,9 @@ pub async fn chat_extractor(config: &Config) -> Result<Box<dyn Extract<OpenExtra
     Ok(Box::new(call))
 }
 
-/// The configured chat model as the drafter of a table's questions: its
-/// answer must name one of `candidates` as a text column.
+/// The background model (`[analysis].background_model`, else the chat
+/// model) as the drafter of a table's questions: its answer must name one
+/// of `candidates` as a text column.
 ///
 /// # Errors
 ///
@@ -924,7 +927,7 @@ pub async fn question_drafter(
     config: &Config,
     candidates: &[String],
 ) -> Result<Box<dyn Extract<DraftAnswer>>> {
-    let chat = config.chat_model_ref()?;
+    let chat = config.background_model_ref()?;
     let call: SchemaCall<DraftAnswer> = ChatClient::build(config, &chat).await?.schema_call(
         chat.model,
         config.model_settings(chat),
