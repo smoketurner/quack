@@ -96,6 +96,9 @@ where
         if !chunks.is_empty() {
             self.turn.read_documents();
         }
+        for chunk in &chunks {
+            self.turn.saw(&chunk.content);
+        }
         Ok(chunks)
     }
 }

@@ -84,6 +84,10 @@ Assumptions about the current deployment, to be confirmed:
 7. **Context is data too.** The workspace context (definitions, caveats, persona) lives
    inside the boundary and is edited through the interfaces. Files are only an import and
    export format.
+8. **DuckDB provides the answers.** The chat model writes the SQL and the tool calls; the
+   figures come from what they return. An answer stating a figure no result or passage of
+   the turn holds is not shown (section 7.7), and the same question over the same data gets
+   the same tool calls (temperature 0 and a fixed seed).
 
 ---
 
@@ -196,7 +200,7 @@ Model requests follow the same priority. `TurnRequest::run` and
 are background. A freed permit goes to the oldest interactive waiter first, so a question
 never queues behind a whole ingest. rig's streaming loop drains a model response before
 running its tool calls, so a tool that calls the same provider (the query embedding, the
-model reranker) never waits on a permit its own turn holds.
+rerank model) never waits on a permit its own turn holds.
 `[analysis].extraction_concurrency` and `[ingestion].embedding_concurrency` set the width of
 one run's pipeline; the provider limit caps them across runs.
 
@@ -636,14 +640,6 @@ CREATE TABLE _quack_classifications (
     skipped  UBIGINT NOT NULL DEFAULT 0,       -- rows the model refused at every length, not written
     ask_ms   UBIGINT NOT NULL DEFAULT 0        -- milliseconds spent on the requests to the decision model
 );
--- [analysis].compact_history: summaries of the turns the history window leaves out
-CREATE TABLE _quack_session_summaries (
-    id TEXT PRIMARY KEY,                        -- UUID v7
-    session_id TEXT NOT NULL,
-    covers INTEGER NOT NULL,                    -- replayable messages it summarizes, oldest first
-    summary TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT now()
-);
 -- the terminal's typed input, newest 500 kept (section 11)
 CREATE TABLE _quack_input_history (
     id       TEXT PRIMARY KEY,                  -- UUID v7, so ids sort in typing order
@@ -939,9 +935,8 @@ and what it writes is chunked and embedded like any Markdown document. Without a
 an image is refused before it is registered (`Error::NoVisionModel`, REST 400
 `no_vision_model`). Images are not a `quack import` source, which loads tables.
 
-A chat model marked `images = true` (`[providers.NAME]` or `[providers.NAME.models."ID"]`)
-also gets the `view_image` tool in every workspace holding an image (section 7.3). The image
-document's passage page shows the image, served by `GET .../documents/{doc}/image` (and
+A turn never sends an image to a model: what the vision model wrote at ingest is what search
+finds and the answer cites. The image document's passage page shows the image, served by `GET .../documents/{doc}/image` (and
 `/w/{id}/documents/{doc}/image` in the web console), audited as opening the document.
 
 **Pictures inside documents.** A picture inside a PDF (on a page with text), a DOCX, or a
@@ -1068,10 +1063,8 @@ which leaves keyword-exact questions (part numbers, policy IDs) unanswered.
 - *Fusion:* each ranking is over-fetched to twice `top_k` (more with a phrase), fused by
   reciprocal rank fusion (`k = 60`), and the top `k` chunks (default 8) returned.
 - *Reranking:* `analysis::rerank::Reranker` sits between fusion and the answer, off by
-  default (`[retrieval].rerank = "none"`). `"model"` over-fetches `rerank_candidates` (24)
-  and has the chat model order them listwise in one tool-less call, so an air-gapped
-  deployment reranks with the model it already runs. `"reranker"` sends the same
-  candidates to a dedicated rerank model (a cross-encoder) through rig's `Rerank`
+  default (`[retrieval].rerank = "none"`). The chat model never orders retrieval.
+  `"reranker"` over-fetches `rerank_candidates` (24) and sends them to a dedicated rerank model (a cross-encoder) through rig's `Rerank`
   operation (`analysis::rerank::ScoredReranker`): `[retrieval].rerank_model` names a
   `type = "openai"` provider whose `base_url` serves `/rerank` (vLLM, llama.cpp, Text
   Embeddings Inference), reached over `LimitedHttp` with the turn's priority, and the
@@ -1380,8 +1373,7 @@ Anthropic's and Bedrock's output configuration; `llm::SchemaCall`): `{nodes: [{l
 properties}], edges: [{source, target, relation, properties}]}`, with `class` and `relation`
 enumerated from the ontology's ids and properties as name and value pairs, since a strict
 schema has no free-key objects. The whole answer parses; nothing is scanned out of prose.
-The ontology's document pass (`OpenExtraction`'s derived schema), the model reranker (`{order:
-[n]}`), and history summaries (`{summary}`) are the same kind of call. Drift is still
+The ontology's document pass (`OpenExtraction`'s derived schema) is the same kind of call. Drift is still
 counted, for a provider that does not enforce the schema. A chunk that fails is logged and
 skipped, never retried in a loop. Each chunk of a ready document goes to the model once: `_quack_graph_extracted`
 records every chunk processed (with the ontology version and its yield), so a later run
@@ -1740,7 +1732,7 @@ graph extraction, and accept graph merges; none of that is built.
 0. Before 2, when the model has to be loaded first (Ollama, cold): emit Status { line }
 ```
 
-`max_turns` 15, temperature 0.1. `llm::chat_model` adjusts that per model. Only Ollama's own API
+`max_turns` 15, temperature 0 and seed 7 (section 7.7). `llm::chat_model` adjusts that per model. Only Ollama's own API
 is sent the temperature, because Claude and `OpenAI`'s reasoning models (GPT-5.x, GPT-6,
 o-series) reject a non-default one and a gateway's model name need not say which model it is.
 Claude gets `max_tokens` 64,000, since thinking counts against it. `[analysis].effort` goes out
@@ -1878,14 +1870,16 @@ model (`test-utils`, a dev-dependency feature only).
 | `search_graph(entity?, class?, relation?, hops=2)` | none | Neighborhood or class listing with provenance |
 | `find_path(from, to, max_hops=4)` | none | Shortest relation path between two entities |
 | `create_chart(sql, kind, x, y, title)` | none | Runs the SQL, emits a chart spec (section 9) |
-| `view_image(document, question)` | none | Sends one image document and the question to the chat model; returns its answer, citable as the document's first chunk, and counts as reading document text |
 | `classify_rows(table, sentence?, preview?)` | preview: none; run: prompt | Drafts questions from the sentence (or uses the approved ones) and labels a table's text with the decision model into `<table>_labels` (section 6.6); `preview` shows the questions and the first rows' labels and keeps nothing; a run goes through the write policy and is refused beyond `[decision].interactive_budget` answers |
 
-`search_graph` and `find_path` register only when the graph has nodes; `describe_class`
+`search_graph` and `find_path` register only when the graph has nodes and the question names
+one of them (a node label of three or more characters it contains, ignoring case,
+`graph::store::named_in`), and the prompt's graph block appears with them: a small model
+offered tools it has no use for calls them anyway (the evaluation saw a 3B model spend all
+15 calls of a turn on one `search_graph`). `describe_class`
 whenever an ontology exists, since the prompt's ontology block is capped, and it names the
 class's SQL view with its typed columns; `find_tables` only when the workspace has more than
-25 tables (graph views not counted); `view_image` only when the chat model is marked
-`images = true` and a ready document is an image; `classify_rows` only when `[decision].model` is set and the workspace's provider list allows it. The rest register
+25 tables (graph views not counted); `classify_rows` only when `[decision].model` is set and the workspace's provider list allows it. The rest register
 in every workspace, and the prompt tells the model what the workspace holds. An `export`
 tool (`COPY ... TO` under `files/`) is not built (section 17).
 
@@ -2044,6 +2038,36 @@ step's SQL to the SQL page's download; `/steps` in the terminal prints them as a
 JSON response carries them on each step. The model is unaffected: it still sees up to
 `max_query_rows`.
 
+### 7.7 Grounding
+
+`DuckDB` provides the answers; the chat model writes the SQL and the tool calls that fetch
+them (principle 8). What the model knows is never trusted. Every figure an answer states must
+be one this turn fetched (`analysis::grounding`): a value in a query result or any other tool
+result, a passage search retrieved (`always_retrieve` included), or the question. The system
+prompt and earlier turns of the session are not sources: a figure from them is fetched again.
+The `Unsourced` hook records each tool result as the model receives it and checks each final
+answer; the check runs in every workspace that holds tables or documents.
+
+A figure is a number as written, with its thousands separators, a currency sign, a scale
+(`4.2M`, `1.76 million`), or a percent sign. It matches a source when it is the same number
+to the precision it is written in, as written, scaled, or as a ratio: `1.76 million` matches
+`1764000`, `18%` matches `0.18`. Digits that are part of a name (`EF2`, `SR-8841`), citation
+markers, and list numbers are not figures. Words are not checked.
+
+An answer stating a figure nothing holds is asked for once more, with the figures named and
+the instruction to have the SQL do the arithmetic. If the second answer still states one,
+it is not shown: the response's `answer` is what the turn's queries returned (each statement
+and its rows, as the step kept them) under a sentence naming the figures, and `unsourced`
+lists them (`AgentResponse::unsourced`, on every interface's response object). With no
+query run there are no rows to show, and the answer says so.
+
+What else keeps the model to the data: a tool call repeating one the turn made, same tool and
+arguments, is not run again (`RepeatedCalls`); the graph tools register only for a question
+about the graph (7.3).
+Chat requests go out at temperature 0 with seed 7 where the API takes one (Ollama and
+`OpenAI`-compatible APIs; rig says which, and Anthropic's takes none), and an Ollama call
+writes at most 8,192 tokens (`num_predict`), so a model repeating itself stops.
+
 ---
 
 ## 8. Sessions
@@ -2064,15 +2088,9 @@ message.
   rig's conversation memory (`llm::memory::History`): `storage::sessions::SessionMemory`
   reads the session's turns (quack records each turn itself, so its `append` stores
   nothing), and `TranscriptWindow` is rig's `TokenWindowMemory` at four characters per token
-  that also drops an answer whose question fell outside. With
-  `[analysis].compact_history = true` (off by default), after each recorded turn a
-  background task (`llm::after_turn::AfterTurn`, as the session title runs) has rig's
-  `CompactingMemory` hand the turns the window leaves out to `SessionCompactor`, which has
-  the chat model summarize them (at most a quarter of the budget) and keeps the summary in
-  `_quack_session_summaries` with how many messages it covers; the next follow-up
-  summarizes only what left the window since. A turn's load calls no model: the stored
-  summary leads the history as a system message, unless it covers more than the window
-  now leaves out (the budget grew). Deleting a session deletes its summaries.
+  that also drops an answer whose question fell outside. The turns it leaves out are not
+  replayed and nothing summarizes them; a turn's load calls no model. A file from a quack
+  that kept summaries has its `_quack_session_summaries` dropped on open.
 - Server mode: sessions carry `created_by`. Members see their own, any marked `shared`, and
   any with no creator (started from the CLI or the TUI). `owner` sees all sessions in the
   workspace for audit.
@@ -3245,8 +3263,7 @@ dimension = 768                          # the width of its vectors (1024 for Be
 [retrieval]
 top_k = 8
 rrf_k = 60
-rerank = "none"          # or "model": the chat model orders rerank_candidates listwise;
-                         # or "reranker": rerank_model scores them
+rerank = "none"          # or "reranker": rerank_model scores rerank_candidates
 rerank_candidates = 24
 # rerank_model = "tei/BAAI/bge-reranker-v2-m3"   # a type = "openai" provider serving /rerank
 pinned_token_budget = 8000   # full text of pinned documents in the prompt
@@ -3277,7 +3294,6 @@ memory_limit_mb = 256
 threads = 4
 max_turns = 15
 history_token_budget = 32000
-compact_history = false                 # summarize the turns the budget leaves out instead of dropping them
 extraction_timeout_seconds = 120        # one chunk's extraction call (ontology evidence, graph extract)
 extraction_concurrency = 1              # chunks extracted at once; Ollama serves one unless OLLAMA_NUM_PARALLEL
 reader_pool_size = 4                    # reader connections per workspace handle, round-robined

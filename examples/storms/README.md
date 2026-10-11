@@ -109,8 +109,9 @@ quack -w storms graph extract --documents-only --sample 100          # named ent
 quack -w storms graph merges                                         # near-duplicate labels the extractor proposed to merge
 ```
 
-`[retrieval].rerank = "model"` in the config turns on reranking of retrieved chunks for
-the query-mode questions above; the NWS instruction is long enough for it to matter.
+`[retrieval].rerank = "reranker"` with a `rerank_model` in the config turns on reranking of
+retrieved chunks for the query-mode questions above; the NWS instruction is long enough for it
+to matter.
 
 ## Why this dataset
 

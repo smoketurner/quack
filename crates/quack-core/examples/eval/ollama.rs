@@ -15,6 +15,9 @@
 //!   `QUACK_EVAL_EMBEDDING_DIMENSION` (768)
 //! - `QUACK_EVAL_VISION_MODEL` (`qwen2.5vl:3b`; `none` skips the vision
 //!   section)
+//! - `QUACK_EVAL_REPEAT` (1): how many times each question is asked; past
+//!   one, the report says how many questions got the same answer every
+//!   time, which with temperature 0 and a seed they should.
 //! - `QUACK_EVAL_TURN_SECONDS` (300): how long one question may take. A
 //!   small model can loop on a tool or generate until Ollama's context
 //!   shifts, so a turn past it is stopped and scored as timed out, which
@@ -31,6 +34,7 @@ use office_oxide::format::DocumentFormat;
 use office_oxide::ir::{DocumentIR, Element, Image, ImageFormat as IrImageFormat};
 use pdf_oxide::geometry::Rect;
 use pdf_oxide::writer::DocumentBuilder;
+use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::events::{self, ToolName};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
@@ -64,6 +68,7 @@ pub(crate) struct Models {
     /// `None` skips the vision section.
     vision: Option<String>,
     turn_seconds: u64,
+    repeat: u32,
 }
 
 impl Models {
@@ -85,6 +90,7 @@ impl Models {
                 .unwrap_or(768),
             vision: (!vision.eq_ignore_ascii_case("none")).then_some(vision),
             turn_seconds: var("QUACK_EVAL_TURN_SECONDS", "300").parse().unwrap_or(300),
+            repeat: var("QUACK_EVAL_REPEAT", "1").parse().unwrap_or(1).max(1),
         }
     }
 
@@ -152,8 +158,16 @@ impl ModelsReport {
         )?;
         writeln!(
             out,
-            "{:<10} {:>8} {:>10} {:>10} {:>8} {:>8} {:>10}",
-            "kind", "correct", "right tool", "cited", "<think>", "errors", "seconds"
+            "{:<10} {:>8} {:>10} {:>10} {:>9} {:>11} {:>8} {:>8} {:>10}",
+            "kind",
+            "correct",
+            "right tool",
+            "cited",
+            "fallback",
+            "same answer",
+            "<think>",
+            "errors",
+            "seconds"
         )?;
         for (kind, tally) in agent
             .by_kind
@@ -162,10 +176,12 @@ impl ModelsReport {
         {
             writeln!(
                 out,
-                "{kind:<10} {:>8} {:>10} {:>10} {:>8} {:>8} {:>10.1}",
+                "{kind:<10} {:>8} {:>10} {:>10} {:>9} {:>11} {:>8} {:>8} {:>10.1}",
                 format!("{}/{}", tally.correct, tally.n),
                 format!("{}/{}", tally.right_tool, tally.tooled),
                 format!("{}/{}", tally.cited, tally.citing),
+                format!("{}/{}", tally.fallbacks, tally.n),
+                format!("{}/{}", tally.consistent, tally.repeated),
                 tally.think_leaks,
                 tally.errors,
                 tally.seconds,
@@ -291,6 +307,13 @@ struct AgentOutcome {
     /// `None` when the question does not call for a citation.
     cited: Option<bool>,
     think_leak: bool,
+    /// The figures the model stated that no result held; when any are
+    /// listed, quack showed the query results instead of its answer.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unsourced: Vec<String>,
+    /// Under `QUACK_EVAL_REPEAT`, whether every asking gave the same answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    consistent: Option<bool>,
     tools: Vec<ToolName>,
     seconds: f64,
     answer: String,
@@ -309,6 +332,11 @@ struct Tally {
     cited: usize,
     citing: usize,
     think_leaks: usize,
+    /// Answers quack replaced by the query results.
+    fallbacks: usize,
+    /// Of `repeated`, the questions answered the same every time.
+    consistent: usize,
+    repeated: usize,
     errors: usize,
     seconds: f64,
 }
@@ -329,6 +357,15 @@ impl Tally {
             .cited
             .saturating_add(count(outcome.cited == Some(true)));
         self.think_leaks = self.think_leaks.saturating_add(count(outcome.think_leak));
+        self.fallbacks = self
+            .fallbacks
+            .saturating_add(count(!outcome.unsourced.is_empty()));
+        self.repeated = self
+            .repeated
+            .saturating_add(count(outcome.consistent.is_some()));
+        self.consistent = self
+            .consistent
+            .saturating_add(count(outcome.consistent == Some(true)));
         self.errors = self.errors.saturating_add(count(outcome.error.is_some()));
         self.seconds += outcome.seconds;
     }
@@ -353,35 +390,28 @@ async fn evaluate_agent(
     let reader = ReaderDb::open(shared, config.analysis.reader_pool_size).await;
     let labelling = LabelJobs::new(JobQueue::new(1));
     let mut outcomes = Vec::with_capacity(cases.len());
+    let ask = Asker {
+        config,
+        shared,
+        reader: &reader,
+        labelling: &labelling,
+        model: format!("ollama/{}", models.chat),
+        limit,
+    };
     for case in cases {
-        let model = format!("ollama/{}", models.chat);
-        let session = shared
-            .run(move |db| sessions::create_session(db, &model, ChatMode::Chat, None))
-            .await?;
-        let (sink, _events) = events::channel();
-        let started = Instant::now();
-        let cancel = CancellationToken::new();
-        let turn = TurnRequest {
-            db: Arc::clone(shared),
-            reader_db: reader.clone(),
-            session_id: &session.id,
-            policy: WritePolicy::Deny,
-            message: &case.question,
-            documents: &[],
-            user: None,
-            labelling: labelling.clone(),
-            sink,
-            cancel: cancel.clone(),
-        }
-        .run(config);
-        let turn = tokio::time::timeout(limit, turn).await.unwrap_or_else(|_| {
-            cancel.cancel();
-            Err(Error::Ingestion(format!(
-                "timed out after {}s (QUACK_EVAL_TURN_SECONDS)",
-                limit.as_secs()
-            )))
-        });
-        let seconds = started.elapsed().as_secs_f64();
+        let (turn, seconds) = ask.question(&case.question).await;
+        let consistent = if models.repeat > 1
+            && let Ok(first) = &turn
+        {
+            let mut same = true;
+            for _ in 1..models.repeat {
+                let (again, _) = ask.question(&case.question).await;
+                same &= again.is_ok_and(|again| again.content == first.content);
+            }
+            Some(same)
+        } else {
+            None
+        };
         outcomes.push(match turn {
             Ok(response) => {
                 let tools: Vec<ToolName> = response.steps.iter().map(|s| s.tool).collect();
@@ -396,6 +426,8 @@ async fn evaluate_agent(
                         .then(|| tools.iter().any(|t| case.tools.contains(t))),
                     cited: case.cite.then_some(!response.citations.is_empty()),
                     think_leak: answer.contains("<think>") || answer.contains("</think>"),
+                    unsourced: response.unsourced.clone(),
+                    consistent,
                     tools,
                     seconds,
                     answer: excerpt(&response.content),
@@ -409,6 +441,8 @@ async fn evaluate_agent(
                 right_tool: (!case.tools.is_empty()).then_some(false),
                 cited: case.cite.then_some(false),
                 think_leak: false,
+                unsourced: Vec::new(),
+                consistent: None,
                 tools: Vec::new(),
                 seconds,
                 answer: String::new(),
@@ -433,6 +467,58 @@ async fn evaluate_agent(
         by_kind,
         cases: outcomes,
     })
+}
+
+/// What a question is put to the agent with: a session of its own each
+/// time, under the turn's time limit.
+struct Asker<'a> {
+    config: &'a Config,
+    shared: &'a SharedDb,
+    reader: &'a ReaderDb,
+    labelling: &'a LabelJobs,
+    model: String,
+    limit: Duration,
+}
+
+impl Asker<'_> {
+    /// The agent's response to `question`, and how long it took.
+    async fn question(&self, question: &str) -> (Result<AgentResponse>, f64) {
+        let started = Instant::now();
+        let model = self.model.clone();
+        let session = match self
+            .shared
+            .run(move |db| sessions::create_session(db, &model, ChatMode::Chat, None))
+            .await
+        {
+            Ok(session) => session,
+            Err(e) => return (Err(e), started.elapsed().as_secs_f64()),
+        };
+        let (sink, _events) = events::channel();
+        let cancel = CancellationToken::new();
+        let turn = TurnRequest {
+            db: Arc::clone(self.shared),
+            reader_db: self.reader.clone(),
+            session_id: &session.id,
+            policy: WritePolicy::Deny,
+            message: question,
+            documents: &[],
+            user: None,
+            labelling: self.labelling.clone(),
+            sink,
+            cancel: cancel.clone(),
+        }
+        .run(self.config);
+        let turn = tokio::time::timeout(self.limit, turn)
+            .await
+            .unwrap_or_else(|_| {
+                cancel.cancel();
+                Err(Error::Ingestion(format!(
+                    "timed out after {}s (QUACK_EVAL_TURN_SECONDS)",
+                    self.limit.as_secs()
+                )))
+            });
+        (turn, started.elapsed().as_secs_f64())
+    }
 }
 
 /// The start of `text`, cut at a character boundary.

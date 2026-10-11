@@ -16,9 +16,11 @@ use crate::ids::SessionId;
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
 use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, TurnRecorder};
-use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls, Ungrounded};
+use super::grounding;
+use super::hooks::{
+    EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls, RepeatedCalls, Unsourced,
+};
 use super::policy::WritePolicy;
-use super::rerank::RerankAnswer;
 use super::search::DocumentScope;
 use super::table_search::{CardRefresh, TableCards, TableLayout};
 use super::text_to_sql::{BuiltPrompt, Modeled, PromptOptions, Question, SystemPrompt, Window};
@@ -26,12 +28,11 @@ use super::think::{self, ThinkFilter};
 use super::tools::{
     ClassifyRowsTool, CreateChartTool, DescribeClassTool, DescribeTableTool, FindPathTool,
     FindTablesTool, GraphTools, Labeller, ListDocumentsTool, ListTablesTool, ReadDocumentTool,
-    ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool, SharedDb, Turn, ViewImageTool,
+    ReaderDb, RunSqlTool, SearchDocumentsTool, SearchGraphTool, SharedDb, Turn,
 };
 use super::vector_index::DuckDbVectorIndex;
 use crate::graph::GraphResult;
-use crate::llm::vision::ImageReader;
-use crate::llm::{ChatModel, RerankModel, SchemaCall};
+use crate::llm::{ChatModel, RerankModel};
 use crate::storage::sessions::ChatMode;
 
 /// What the provider charged for a turn. Every budget quack computes
@@ -122,6 +123,12 @@ pub struct AgentResponse {
     /// whole workspace.
     #[serde(default)]
     pub documents: DocumentScope,
+    /// Figures the model's answer stated that no query result or passage
+    /// of the turn held, after it was asked once more. When any are left,
+    /// `content` is what the queries returned instead of the model's
+    /// answer (design doc 7.7).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsourced: Vec<String>,
 }
 
 /// One SQL statement the turn ran, as the response object lists it.
@@ -172,6 +179,7 @@ impl AgentResponse {
             usage: self.usage,
             duration_ms: self.duration_ms,
             documents: self.documents.clone(),
+            unsourced: self.unsourced.clone(),
             session_id: session_id.clone(),
         }
     }
@@ -199,6 +207,10 @@ pub struct AgentResponseBody {
     pub duration_ms: Option<u64>,
     /// The documents the question was limited to; empty for all.
     pub documents: DocumentScope,
+    /// Figures the model stated that no result or passage held; when any
+    /// are listed, `answer` shows the query results instead of the
+    /// model's answer.
+    pub unsourced: Vec<String>,
     pub session_id: SessionId,
 }
 
@@ -261,13 +273,7 @@ where
     ///
     /// Returns an error if system prompt generation, agent building, or
     /// the model call fails.
-    pub async fn run(
-        self,
-        completion_model: ChatModel,
-        reranker_call: Option<SchemaCall<RerankAnswer>>,
-        images: Option<ImageReader>,
-        sink: EventSink,
-    ) -> Result<AgentResponse> {
+    pub async fn run(self, completion_model: ChatModel, sink: EventSink) -> Result<AgentResponse> {
         let max_turns = usize::try_from(self.config.max_turns)
             .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
         let recorder = TurnRecorder::new(sink).with_turn_limit(max_turns);
@@ -283,10 +289,7 @@ where
             )
             .await,
         );
-        match this
-            .run_inner(completion_model, reranker_call, images, &recorder)
-            .await
-        {
+        match this.run_inner(completion_model, &recorder).await {
             Ok(response) => {
                 recorder.emit(AgentEvent::TurnComplete(response.clone()));
                 Ok(response)
@@ -303,8 +306,6 @@ where
 /// turn's reader connection: the two decide which tools register.
 struct PromptAndModel {
     prompt: BuiltPrompt,
-    /// Whether a ready document is an image, for `view_image` to look at.
-    has_images: bool,
 }
 
 impl Question {
@@ -360,7 +361,6 @@ impl PromptAndModel {
             .with_db(move |db| {
                 Ok(Self {
                     prompt: SystemPrompt::build(db, &prompt)?,
-                    has_images: db.has_images()?,
                 })
             })
             .await
@@ -444,8 +444,6 @@ where
     async fn run_inner(
         self,
         completion_model: ChatModel,
-        reranker_call: Option<SchemaCall<RerankAnswer>>,
-        images: Option<ImageReader>,
         recorder: &TurnRecorder,
     ) -> Result<AgentResponse> {
         let Self {
@@ -469,8 +467,13 @@ where
             .within(prompt.scope.clone())
             .cancelled_by(cancel.clone());
         let Replay { history, dropped } = Replay::check(history);
-        let grounding = (read.prompt.holds_data && history.is_empty())
-            .then(|| Ungrounded::new(turn.clone(), user_message));
+        // Every figure of the answer must come from what this turn's
+        // searches and queries return, or from the question itself: never
+        // from the model, the prompt, or an earlier answer.
+        let check_grounding = read.prompt.holds_data;
+        if check_grounding {
+            turn.saw(user_message);
+        }
         let window = prompt.window;
         let agent = BuildContext {
             shared_db: Arc::clone(&shared_db),
@@ -482,11 +485,9 @@ where
             tables: read.prompt.tables,
             mode: prompt.mode,
             rerank_model,
-            reranker_call,
-            images: images.filter(|_| read.has_images),
             labeller,
             turn: turn.clone(),
-            grounding: grounding.clone(),
+            check_grounding,
             has_documents: read.prompt.has_documents,
         }
         .build_agent(completion_model, embedding_model, &read.prompt.text)?;
@@ -504,17 +505,34 @@ where
         let streamed =
             Streamed::read(stream, &cancel, recorder, analysis_config.max_turns, window).await?;
         let cancelled = streamed.cancelled;
-        let (mut answer, usage) =
-            streamed.answer(window, |text| recorder.citations().validate(text));
-        let ungrounded = (!cancelled && grounding.is_some_and(|g| g.applies(&answer.text)))
-            .then(|| String::from(Ungrounded::NOTE));
-        for note in [dropped, ungrounded].into_iter().flatten() {
+        let mut unsourced = Vec::new();
+        let (mut answer, usage) = streamed.answer(window, |text| {
+            let checked = recorder.citations().validate(text);
+            if check_grounding && !cancelled {
+                unsourced = turn.unsourced(&checked.text);
+            }
+            checked
+        });
+        if !unsourced.is_empty() {
+            // DuckDB provides the answers: one the model would not state
+            // from what the queries returned is replaced by what they did.
+            tracing::warn!(
+                ?unsourced,
+                "the answer still states figures no result holds; showing the results"
+            );
+            answer = CitedAnswer {
+                text: grounding::fallback(&unsourced, &turn.recorder.steps()),
+                citations: Vec::new(),
+            };
+        }
+        if let Some(note) = dropped {
             answer.text.push_str("\n\n(");
             answer.text.push_str(&note);
             answer.text.push(')');
         }
         let mut response = turn.finish(answer, usage, asked);
         response.cancelled = cancelled;
+        response.unsourced = unsourced;
         Ok(response)
     }
 }
@@ -863,6 +881,7 @@ impl Turn {
             usage,
             duration_ms: Some(u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX)),
             documents: self.scope().clone(),
+            unsourced: Vec::new(),
         }
     }
 }
@@ -880,21 +899,14 @@ struct BuildContext<'a> {
     tables: TableLayout,
     mode: ChatMode,
     rerank_model: Option<RerankModel>,
-    /// The model reranker's one-shot, built at `background_effort` by
-    /// `dispatch`'s `schema_call`. `Some` only when `rerank = "model"`; the
-    /// search tool wires it in, the other rerank modes ignore it.
-    reranker_call: Option<SchemaCall<RerankAnswer>>,
-    /// The chat model reading images for `view_image`, when it reads them
-    /// and the workspace holds one.
-    images: Option<ImageReader>,
     /// The decision model `classify_rows` labels with.
     labeller: Option<Labeller>,
     /// The turn the agent runs: `always_retrieve` records on it that it
     /// put chunk text in the prompt.
     turn: Turn,
-    /// Ask again for an answer that states figures without having looked
-    /// at the workspace ([`Ungrounded`]).
-    grounding: Option<Ungrounded>,
+    /// Check every figure of the answer against what the turn showed the
+    /// model ([`Unsourced`]).
+    check_grounding: bool,
     /// The workspace holds ready documents (`always_retrieve = "auto"`).
     has_documents: bool,
 }
@@ -913,7 +925,6 @@ impl BuildContext<'_> {
         let ctx = self;
         let search = SearchDocumentsTool::from_config(
             ctx.reader_db.clone(),
-            ctx.reranker_call,
             ctx.rerank_model.clone(),
             embedding_model.clone(),
             ctx.retrieval_config,
@@ -921,7 +932,10 @@ impl BuildContext<'_> {
         .with_model(ctx.modeled);
         let reader = || ctx.reader_db.clone();
         let mut builder = completion_model
-            .agent(0.1)
+            // Temperature 0 (and the seed `ChatModel` sends where it can):
+            // the model only writes SQL and tool calls, which should be the
+            // same each time a question is asked of the same data.
+            .agent(0.0)
             .preamble(system_prompt)
             .tool(search)
             .tool(ReadDocumentTool::new(reader(), ctx.retrieval_config))
@@ -942,9 +956,10 @@ impl BuildContext<'_> {
                 usize::try_from(ctx.analysis_config.step_result_rows).unwrap_or(usize::MAX),
             ))
             .add_hook(InvalidToolCalls)
-            .add_hook(EmptyAnswer);
-        if let Some(grounding) = ctx.grounding.clone() {
-            builder = builder.add_hook(grounding);
+            .add_hook(EmptyAnswer)
+            .add_hook(RepeatedCalls);
+        if ctx.check_grounding {
+            builder = builder.add_hook(Unsourced::new(ctx.turn.clone()));
         }
 
         // The ontology is describable as soon as it exists: the prompt block
@@ -952,10 +967,6 @@ impl BuildContext<'_> {
         // even when nothing has been extracted into the graph yet.
         if ctx.modeled.has_ontology() {
             builder = builder.tool(DescribeClassTool(reader()));
-        }
-
-        if let Some(images) = ctx.images {
-            builder = builder.tool(ViewImageTool::new(reader(), images));
         }
 
         if let Some(labeller) = ctx.labeller {

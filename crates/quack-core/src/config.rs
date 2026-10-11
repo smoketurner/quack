@@ -781,9 +781,6 @@ pub struct ModelSettings {
     pub effort: Option<Effort>,
     /// Reasoning effort for background calls.
     pub background_effort: Option<Effort>,
-    /// Whether the model reads images: a chat model that does is offered
-    /// `view_image`.
-    pub images: Option<bool>,
 }
 
 impl ModelSettings {
@@ -794,7 +791,6 @@ impl ModelSettings {
             temperature: self.temperature.or(fallback.temperature),
             effort: self.effort.or(fallback.effort),
             background_effort: self.background_effort.or(fallback.background_effort),
-            images: self.images.or(fallback.images),
         }
     }
 }
@@ -821,7 +817,6 @@ struct RawProviderConfig {
     temperature: Option<bool>,
     effort: Option<Effort>,
     background_effort: Option<Effort>,
-    images: Option<bool>,
     #[serde(default)]
     models: BTreeMap<String, ModelSettings>,
 }
@@ -920,7 +915,6 @@ impl TryFrom<RawProviderConfig> for ProviderConfig {
                 temperature: raw.temperature,
                 effort: raw.effort,
                 background_effort: raw.background_effort,
-                images: raw.images,
             },
             models: raw.models,
         };
@@ -1756,9 +1750,8 @@ pub struct RetrievalConfig {
     /// documents but rarely search both, so passages up front keep them
     /// grounded; each is numbered for citing like a search result.
     pub always_retrieve: AlwaysRetrieve,
-    /// Reranking after hybrid fusion: `none` (the default); `model`, the
-    /// chat model ordering the candidates listwise; or `reranker`, the
-    /// dedicated rerank model `rerank_model` names scoring each one.
+    /// Reranking after hybrid fusion: `none` (the default), or `reranker`,
+    /// the dedicated rerank model `rerank_model` names scoring each one.
     pub rerank: RerankMode,
     /// Candidates fetched for reranking before the top `k` are kept.
     pub rerank_candidates: u32,
@@ -1843,13 +1836,11 @@ impl TryFrom<AlwaysRetrieveSetting> for AlwaysRetrieve {
 #[serde(rename_all = "lowercase")]
 pub enum RerankMode {
     None,
-    Model,
     Reranker,
 }
 
 text_enum!(RerankMode, "rerank mode", {
     None => "none",
-    Model => "model",
     Reranker => "reranker",
 });
 
@@ -1920,20 +1911,14 @@ pub struct AnalysisConfig {
     /// Reasoning effort for chat turns. Unset: the model's own default.
     pub effort: Option<Effort>,
     /// Reasoning effort for background calls: graph extraction, the
-    /// ontology's document pass, reranking, and history summaries. Unset:
-    /// the model's default.
+    /// ontology's document pass, and session titles. Unset: the model's
+    /// default.
     pub background_effort: Option<Effort>,
     /// The model for bulk background work, as `provider/model`: graph
     /// extraction, the ontology's document pass, a table's question
-    /// drafting, session titles, and history summaries, so a cheap model
-    /// can do those while the chat model answers. Unset: the chat model.
-    /// Model reranking stays with the chat model.
+    /// drafting, and session titles, so a cheap model can do those while
+    /// the chat model answers. Unset: the chat model.
     pub background_model: Option<ModelSpec>,
-    /// Replace the turns that fall outside `history_token_budget` with a
-    /// summary the chat model writes, kept in the workspace, instead of
-    /// dropping them. Off by default: each new summary is one more model
-    /// call, made after a turn at background priority.
-    pub compact_history: bool,
     /// Have the chat model title each session after its first turn, at
     /// background effort; a title a person gives is never replaced.
     pub title_sessions: bool,
@@ -1969,7 +1954,6 @@ impl Default for AnalysisConfig {
             effort: None,
             background_effort: None,
             background_model: None,
-            compact_history: false,
             title_sessions: false,
         }
     }
@@ -2204,7 +2188,6 @@ impl Config {
                 temperature: None,
                 effort: self.analysis.effort,
                 background_effort: self.analysis.background_effort,
-                images: None,
             })
     }
 

@@ -423,7 +423,6 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "effort",
             "background_effort",
             "background_model",
-            "compact_history",
             "title_sessions",
         ],
     ),
@@ -501,12 +500,11 @@ const PROVIDER_KEYS: &[&str] = &[
     "temperature",
     "effort",
     "background_effort",
-    "images",
     "models",
 ];
 
 /// The keys a `[providers.NAME.models."ID"]` table accepts.
-const MODEL_KEYS: &[&str] = &["temperature", "effort", "background_effort", "images"];
+const MODEL_KEYS: &[&str] = &["temperature", "effort", "background_effort"];
 
 /// The keys a `[server.webhooks]` table accepts.
 const WEBHOOK_KEYS: &[&str] = &["url", "secret_env", "kinds", "timeout_seconds"];
@@ -884,11 +882,6 @@ fn analysis(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     );
     let background_model = analysis.background_model.as_ref().map(ToString::to_string);
     s.optional_text("background_model", background_model.as_deref(), None);
-    s.literal(
-        "compact_history",
-        analysis.compact_history,
-        default.compact_history,
-    );
     s.literal(
         "title_sessions",
         analysis.title_sessions,
@@ -1478,7 +1471,6 @@ impl Section<'_, '_> {
             settings.background_effort.map(Effort::as_str),
             None,
         );
-        self.optional("images", settings.images.map(|i| i.to_string()), None);
     }
 
     /// A number or a flag: shown as TOML writes it, unquoted.

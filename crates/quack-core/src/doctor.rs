@@ -770,8 +770,8 @@ async fn chat_settings_check(config: &Config, model: ModelRef<'_>) -> Check {
     )
 }
 
-/// What a background call (reranking, history summaries, graph extraction,
-/// the ontology's document pass) sends, when its effort is not the turn's.
+/// What a background call (graph extraction, the ontology's document pass,
+/// session titles) sends, when its effort is not the turn's.
 async fn background_check(config: &Config, model: ModelRef<'_>) -> Option<Check> {
     let settings = config.model_settings(model);
     if settings.background_effort == settings.effort {
@@ -786,8 +786,7 @@ async fn background_check(config: &Config, model: ModelRef<'_>) -> Option<Check>
     Some(EffortCheck::run(model, settings.background_effort).await.check(
         &format!("{model}, background calls"),
         chat,
-        "; graph extraction and the ontology's document pass fail, and chat turns run without \
-         model reranking and history summaries",
+        "; graph extraction and the ontology's document pass fail, and sessions are not titled",
         format!(
             "set background_effort to a level it takes under [providers.{}.models.\"{}\"], \
              [providers.{}], or [analysis]",

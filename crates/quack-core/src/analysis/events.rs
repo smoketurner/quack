@@ -73,6 +73,7 @@ pub enum ToolName {
     SearchGraph,
     FindPath,
     DescribeClass,
+    /// No longer offered; kept so transcripts that recorded it still load.
     ViewImage,
     ClassifyRows,
 }

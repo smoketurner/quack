@@ -147,16 +147,14 @@ form go through the same `Access` methods (`list_saved`, `save_answer`, `run_sav
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
 file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model through
 rig's conversation memory (`llm::memory::History`: `SessionMemory` under `TranscriptWindow`,
-rig's token window over `[analysis].history_token_budget`), and with
-`[analysis].compact_history` the turns it leaves out become a chat-model summary kept in
-`_quack_session_summaries`, written after the turn by `llm::after_turn::AfterTurn` (with the
-session title), so loading the history calls no model. Retrieval is hybrid (exact cosine scan plus quack's own
+rig's token window over `[analysis].history_token_budget`); the turns it leaves out are not
+replayed, and loading the history calls no model. Retrieval is hybrid (exact cosine scan plus quack's own
 BM25 over `_quack_terms`, each document's chunks stemmed under the language
 `WorkspaceDb::chunk_writer` detects once for it, reciprocal rank fusion in `WorkspaceDb::explain_search`, whose vector leg runs on a reader clone beside the keyword leg;
 no DuckDB extension is ever loaded, see design doc section 14), then an optional reranker
-(`analysis::rerank`, `[retrieval].rerank = "none" | "model" | "reranker"`; `model` over-fetches
-`rerank_candidates` and has the chat model order them, `reranker` has the dedicated rerank
-model `rerank_model` score them through rig's `Rerank` at an OpenAI-compatible `/rerank`).
+(`analysis::rerank`, `[retrieval].rerank = "none" | "reranker"`; `reranker` over-fetches
+`rerank_candidates` and has the dedicated rerank model `rerank_model` score them through rig's
+`Rerank` at an OpenAI-compatible `/rerank`; the chat model never orders retrieval).
 Each document's text is stemmed under the language `whatlang` detects at ingest
 (`storage::workspace::{Language, Stemming, Analyzer}`, `_quack_documents.language`,
 `[retrieval].languages = ["auto"]` or Snowball names), Chinese, Japanese, and Korean runs
@@ -245,8 +243,16 @@ terminal's included, is a plain task on the runtime. Tests that also read throug
 
 The agent turn is an event stream (`quack_core::analysis::events`): text deltas, tool
 started/finished with timing, permission requests, turn complete. Every interface consumes
-it. Two rig hooks (`analysis::hooks`) keep a turn going: an unknown tool name is repaired or
-retried with the real names (twice at most), and an empty reply is asked for once more;
+it. Rig hooks (`analysis::hooks`) keep a turn going: an unknown tool name is repaired or
+retried with the real names (twice at most), an empty reply is asked for once more, and a
+tool call repeating one the turn made (same tool and arguments) is not run again
+(`RepeatedCalls`). `DuckDB` provides the answers (design doc 7.7, `analysis::grounding`): the
+`Unsourced` hook records every tool result and retrieved passage of the turn, and a final
+answer stating a figure that none of them nor the question holds (matched to the precision
+written, scaled or as a ratio) is asked for once more; still unsourced, the answer is replaced
+by the turn's query results and the figures go on `AgentResponse::unsourced`. What the model
+knows, the system prompt, and earlier turns are never a source. The graph tools register only
+when the question names a node (`graph::store::named_in`, `Modeled::for_question`);
 `tests/agent_turn.rs` drives whole turns with rig's scripted model. The tools hold only the
 workspace and its settings; a turn's recorder, write policy, refusal flag, and chart and graph
 results are one `analysis::tools::Turn`, handed to every call as a runtime scope of rig's
@@ -280,8 +286,6 @@ registration (`Error::NoVisionModel`). The pictures inside a PDF, DOCX, or PPTX 
 `parser::Figure`s (each picture once by hash; icons, bullets, and decorative ones left out),
 and up to `[ingestion].max_figures` of them (20) go to the same model, each read into a
 `Figure: ...` section after its alt text where it sits; unread, a picture keeps its alt text.
-A chat model marked `images = true` gets `view_image` (the
-stored image and a question back to the chat model) in a workspace that holds an image.
 Chunk bodies, graph source excerpts, and pinned text reach the model inside `text::Fenced`
 markers, whose code is a digest of the enclosed text (so the text cannot close its own block),
 after a fixed sentence that it is data; an `always_retrieve` chunk is fenced too, as the `content`
@@ -295,7 +299,10 @@ Claude gets `max_tokens` 64,000, and `[analysis].effort` / `background_effort` g
 model is built; Ollama chat requests carry no `num_ctx` or `keep_alive` (the server's
 `OLLAMA_CONTEXT_LENGTH` and `OLLAMA_KEEP_ALIVE` decide); `temperature`, `effort`, and `background_effort` on
 `[providers.NAME]` or `[providers.NAME.models."ID"]` (`config::ModelSettings`, resolved by
-`Config::model_settings`: model, then provider, then `[analysis]`) override that. `type = "openai"` takes
+`Config::model_settings`: model, then provider, then `[analysis]`) override that. Turns run at
+temperature 0; every request carries `llm::chat_model::SEED` where rig says the API takes a seed
+(Ollama, `OpenAI`-compatible; not Anthropic), and Ollama calls carry `num_predict`
+`OLLAMA_MAX_TOKENS` (8,192) so a model repeating itself stops. `type = "openai"` takes
 `api = "responses"` or `"chat-completions"`; unset, `OpenAI` itself gets Responses and a `base_url`
 server gets Chat Completions. OAuth providers (`quack_core::llm::oauth`) hand out a bearer through
 one shared `TokenManager` per provider: PKCE or device-code login via `quack auth` (or the

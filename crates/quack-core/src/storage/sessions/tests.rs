@@ -97,6 +97,7 @@ fn response(content: &str, steps: Vec<ToolStep>) -> AgentResponse {
         usage: None,
         duration_ms: None,
         documents: DocumentScope::default(),
+        unsourced: Vec::new(),
     }
 }
 
@@ -413,24 +414,6 @@ fn latest_session_is_the_most_recently_updated() {
     .unwrap();
     assert_eq!(latest_session(&db).unwrap().unwrap().id, first.id);
     assert_eq!(list_sessions(&db, 10).unwrap().len(), 2);
-}
-
-/// `latest_summary` returns the newest summary — the row with the
-/// greatest `id`, a UUID v7 sorted by creation time — not the one that
-/// covers the most messages, because `covers` is not monotonic once a
-/// budget grows and the compactor re-summarizes over a smaller prefix.
-#[test]
-#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
-fn latest_summary_returns_the_newest_summary_not_the_most_covering() {
-    let db = db();
-    let session = create_session(&db, "m", ChatMode::Chat, None).unwrap();
-    // The older row covers more; the newer row covers less. The stored
-    // `id`s are UUID v7, so they sort by creation time within one process.
-    save_summary(&db, &session.id, 6, "the older broader summary").unwrap();
-    save_summary(&db, &session.id, 2, "the newer narrower summary").unwrap();
-    let latest = latest_summary(&db, &session.id).unwrap().unwrap();
-    assert_eq!(latest.covers, 2);
-    assert_eq!(latest.text, "the newer narrower summary");
 }
 
 #[test]

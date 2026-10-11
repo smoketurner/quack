@@ -158,7 +158,7 @@ background_effort = "low"                # graph extraction and ontology inducti
 temperature = false                      # use the model's own sampling defaults
 ```
 
-`temperature = true` sends quack's temperature (0.1 for chat turns, 0.0 for extraction). If only
+`temperature = true` sends quack's temperature (0.0, for chat turns and extraction alike). If only
 some of a gateway's models reason, set `effort` on those models rather than in `[analysis]`,
 because a model that does not reason rejects the field. `quack config` lists every key, and
 `quack doctor` shows what the chat model is sent. It checks `background_effort` too when that differs from
@@ -166,39 +166,30 @@ because a model that does not reason rejects the field. `quack config` lists eve
 
 `[analysis].background_model` (`provider/model`, like `chat_model`) moves the bulk background
 work off the chat model: graph extraction, the ontology's document pass, a table's question
-drafting, session titles, and history summaries. A cheap or local model can then do the
-extraction while a stronger one answers. Unset, all of it runs on the chat model; model
-reranking always does, since it runs inside a turn. `quack doctor` probes the background model
-when it differs from the chat model. A level the model refuses fails graph extraction and the ontology's document pass;
-a chat turn still answers, without model reranking and history summaries, and logs a warning.
+drafting, and session titles. A cheap or local model can then do the extraction while a
+stronger one answers. Unset, all of it runs on the chat model. `quack doctor` probes the
+background model when it differs from the chat model. A level the model refuses fails graph
+extraction and the ontology's document pass, and leaves sessions untitled.
 
 ## Images
 
-Two settings let quack read images. Neither sends an image anywhere until it is set.
-
-- `[ingestion].vision_model` names the model that reads an uploaded PNG, JPEG, WebP, or GIF
-  once at ingest, a PDF page that is only a picture, and the pictures inside a PDF, DOCX,
-  or PPTX (at most `[ingestion].max_figures` per document, 20, one call each). Without it,
-  an image upload is refused and a picture inside a document keeps only its alt text. It
-  runs at the model's `background_effort`.
-- `images = true` on `[providers.NAME]` or `[providers.NAME.models."ID"]` says the chat
-  model reads images, which gives the agent the `view_image` tool in a workspace that holds
-  an image: the stored image and the agent's question go to the chat model again. When the
-  chat model does not read images, `view_image` sends them to the `vision_model` instead, at
-  its `background_effort`, so a text-only chat model can still look at an image again.
+`[ingestion].vision_model` names the model that reads an uploaded PNG, JPEG, WebP, or GIF
+once at ingest, a PDF page that is only a picture, and the pictures inside a PDF, DOCX, or
+PPTX (at most `[ingestion].max_figures` per document, 20, one call each). Its transcription
+and description are chunked and searched like any other text; a turn never sends an image to a
+model. Without it, an image upload is refused and a picture inside a document keeps only its
+alt text. It runs at the model's `background_effort`. Nothing sends an image anywhere until it
+is set.
 
 ```toml
 [ingestion]
 vision_model = "ollama/gemma4:e4b"
-
-[providers.ollama.models."gemma4:e4b"]
-images = true                            # only when gemma4:e4b is also the chat model
 ```
 
 Any provider type works if the model accepts images: Ollama's vision models, OpenAI's
 and Claude's current models, and Bedrock's Claude models. A model that does not read
-images either rejects the request or answers without seeing the image, so set these
-only for one that does. `quack doctor` checks that the provider lists `vision_model`.
+images either rejects the request or answers without seeing the image, so set it only to
+one that does. `quack doctor` checks that the provider lists `vision_model`.
 
 ## Credentials
 

@@ -34,7 +34,7 @@ use rig::prelude::*;
 use crate::analysis::agent::{AgentResponse, Analysis, CANCELLED_NOTE, Cutoff};
 use crate::analysis::events::{AgentEvent, EventSink, TurnFailure};
 use crate::analysis::policy::WritePolicy;
-use crate::analysis::rerank::{RERANK_PROMPT, RERANK_TIMEOUT, RerankAnswer, Reranker};
+use crate::analysis::rerank::Reranker;
 use crate::analysis::search::DocumentScope;
 use crate::analysis::text_to_sql::{PromptOptions, Window};
 use crate::analysis::tools::Rerank;
@@ -58,7 +58,6 @@ pub use chat_model::ChatModel;
 use chat_model::{ChatSettings, Wire};
 use egress::Egress;
 pub use tokio_util::sync::CancellationToken;
-use vision::ImageReader;
 
 pub mod limit;
 
@@ -654,26 +653,6 @@ impl ChatClient {
             .inspect_err(|e| tracing::warn!(error = %e, "the turn runs without its {label} call"))
             .ok()
     }
-
-    /// The chat model as a listwise reranker, at `background_effort` like
-    /// every other background call; `None` when it cannot be built, and
-    /// the search keeps its fused order.
-    fn rerank_call(
-        &self,
-        model: &str,
-        settings: ModelSettings,
-    ) -> Option<SchemaCall<RerankAnswer>> {
-        self.optional_schema_call::<RerankAnswer>(
-            model,
-            settings,
-            Task {
-                preamble: RERANK_PROMPT,
-                timeout: RERANK_TIMEOUT,
-                label: "rerank",
-            },
-            schema_for!(RerankAnswer),
-        )
-    }
 }
 
 impl Rerank {
@@ -691,14 +670,6 @@ impl Rerank {
                 Some(model) => Arc::new(Reranker::scored(model)),
                 None => return Ok(None),
             },
-            RerankMode::Model => {
-                let chat = config.chat_model_ref()?;
-                let client = ChatClient::build(config, &chat).await?;
-                match client.rerank_call(chat.model, config.model_settings(chat)) {
-                    Some(call) => Arc::new(Reranker::model(call)),
-                    None => return Ok(None),
-                }
-            }
         };
         Ok(Some(Self {
             reranker,
@@ -1493,7 +1464,6 @@ impl TurnRequest<'_> {
         if !response.cancelled {
             titles::SessionTitler::follow_turn(config, &db, session_id).await;
         }
-        memory::History::follow_turn(config, &db, session_id);
         Ok(response)
     }
 }
@@ -1555,7 +1525,6 @@ async fn start_turn<'c>(
         })
         .await?;
     let history = memory::History::from_config(config, Arc::clone(db))
-        .await?
         .load(&session_id)
         .await?;
     Ok(StartedTurn {
@@ -1599,20 +1568,7 @@ async fn dispatch(
         }
     }
     let model = client.chat_model(chat.model, settings.effort, settings.temperature)?;
-    // Built here, where the turn's client is, at `background_effort` like
-    // every other background call; without it the search keeps its fused order.
-    let reranker = if config.retrieval.rerank == RerankMode::Model {
-        client.rerank_call(chat.model, settings)
-    } else {
-        None
-    };
-    // The chat model looks at an image itself when it reads them, else the
-    // vision model does.
-    let images = match ImageReader::for_turn(&client, chat.model, settings)? {
-        Some(reader) => Some(reader),
-        None => ImageReader::for_turn_by_vision_model(config).await,
-    };
-    Box::pin(analysis.run(model, reranker, images, sink)).await
+    Box::pin(analysis.run(model, sink)).await
 }
 
 #[cfg(test)]
