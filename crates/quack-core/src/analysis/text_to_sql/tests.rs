@@ -387,7 +387,19 @@ fn prompt_states_mode_and_lists_tables_and_documents() {
         .unwrap()
         .text;
     assert!(query.contains("Mode: query."));
-    assert!(query.contains("Do not answer from memory"));
+    assert!(query.contains("nothing from memory"));
+    // The exit sentence is given verbatim in the role, in both modes, and
+    // the constant every interface can recognize it by says the same.
+    assert!(
+        query.contains(&format!("reply with the sentence \"{NOT_IN_DATA}\"")),
+        "{query}"
+    );
+    assert!(chat.contains(NOT_IN_DATA));
+    assert!(!chat.contains("general knowledge may"), "{chat}");
+    assert!(
+        chat.contains("never supplies a fact the workspace does not hold"),
+        "{chat}"
+    );
     assert!(query.contains("ends with that chunk's [n] marker"));
 }
 

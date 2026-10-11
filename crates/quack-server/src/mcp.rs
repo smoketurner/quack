@@ -297,9 +297,10 @@ pub(crate) struct QueryArgs {
     /// A session to continue, from an earlier answer's `session_id`;
     /// omit to start a new one.
     pub session_id: Option<String>,
-    /// `chat` (general knowledge allowed, the default) or `query` (every
-    /// claim from the workspace), for a new session; an existing session
-    /// keeps the mode it was created with.
+    /// `chat` (the default: figures and document statements from the
+    /// workspace, general knowledge only to explain a term) or `query`
+    /// (every claim from the workspace), for a new session; an existing
+    /// session keeps the mode it was created with.
     #[schemars(with = "Option<ChatMode>")]
     pub mode: Option<String>,
     /// Limit the question to these documents: ids from `list_documents`

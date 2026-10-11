@@ -1754,11 +1754,12 @@ terminal as a system line, SSE as a `status` event.
 ### 7.2 System prompt
 
 1. Role and behavior for the mode (7.5): retrieve before answering, cite with `[n]`, run
-   SQL rather than estimate, and for a request that could be read more than one way take
-   the most likely reading, say which, and run the query (a reply that asks a question and
+   SQL rather than estimate, for a request that could be read more than one way take the
+   most likely reading, say which, and run the query (a reply that asks a question and
    runs nothing is no answer: a reasoning model takes "ask a clarifying question" literally,
    and in print mode and MCP nobody can answer it, so the person gets the nothing-fetched
-   note of 7.7 instead of a figure). Then today's date (`Today is YYYY-MM-DD.`, the system's local
+   note of 7.7 instead of a figure), and when the workspace does not hold the answer reply
+   with the exit sentence of 7.5 and stop. Then today's date (`Today is YYYY-MM-DD.`, the system's local
    zone), so "last quarter" has an anchor without a tool call; it is the one line that
    changes between turns, once a day.
 2. Tool guidance, the error rule (read a `run_sql` error, fix the statement, rerun it), and
@@ -2016,12 +2017,19 @@ Per session: `chat` unless set at creation (`--mode`, the REST `mode` field, the
 selector, the MCP `mode` argument), changed only explicitly (`/mode`,
 `PATCH .../sessions/{sid}`).
 
-- **chat** - the agent may answer from general knowledge as well as retrieved sources; it
-  must still cite a source it used.
+- **chat** - every figure comes from a query the turn ran and every statement about a
+  document from a cited chunk; general knowledge may explain a term or a method the person
+  asks about, never supply a fact the workspace does not hold.
 - **query** - the agent must ground every claim in a retrieved chunk, a query result, or a
-  graph result; if retrieval finds nothing relevant, it says so instead of answering. This
-  is AnythingLLM's query mode and the default for classified workspaces. Provisional graph
-  results are excluded.
+  graph result, nothing from memory, not even to explain a term. This is AnythingLLM's
+  query mode and the default for classified workspaces. Provisional graph results are
+  excluded.
+
+In both modes the role paragraph gives the model its exit verbatim: when the tables and
+documents do not hold the answer, or a query returns no rows for it, it replies *I can't tell
+from the data in this workspace.* (`text_to_sql::NOT_IN_DATA`) followed by what it looked
+at, and stops. A model follows a permitted sentence where it ignores a prohibition on
+guessing, and one fixed sentence is something every interface, and the eval, can recognize.
 
 ### 7.6 Visibility
 

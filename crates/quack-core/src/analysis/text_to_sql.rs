@@ -143,16 +143,26 @@ const LISTED_DOCUMENTS: usize = 40;
 /// A document title longer than this is cut, with an ellipsis.
 const DOCUMENT_TITLE_CHARS: usize = 80;
 
+/// The sentence the model is told to answer with when the workspace does
+/// not hold the answer: a permitted exit, which a model takes over a
+/// prohibition on guessing, and one every interface can recognize.
+pub const NOT_IN_DATA: &str = "I can't tell from the data in this workspace.";
+
 /// The role, first in every prompt. A reply that asks a clarifying question
 /// and runs nothing shows the person the nothing-fetched note, not a figure,
 /// and in print mode and MCP nobody can answer it; a reasoning model takes
-/// an invitation to ask literally, so the prompt makes none.
+/// an invitation to ask literally, so the prompt makes none. The exit
+/// sentence is given verbatim so that not knowing has a shape to take.
 const ROLE: &str = "You are a data analysis assistant working inside one workspace that holds \
                     tables, documents, or both. Answer by using the tools: run SQL rather than \
                     estimating, search the documents rather than recalling. When a question could \
                     be read more than one way, take the most likely reading, say which you took, \
                     and run the query; a reply that asks a question and runs nothing is no \
-                    answer.\n\n";
+                    answer. When the tables and documents do not hold the answer, or a query \
+                    returns no rows for it, reply with the sentence \"I can't tell from the data \
+                    in this workspace.\" followed by what you looked at, and stop: a wrong figure \
+                    is worse than none, and nothing you know from elsewhere is an answer \
+                    here.\n\n";
 
 /// A column as the model reads it: `amount (BIGINT): order total [cents]`.
 pub struct ColumnLine<'a>(pub &'a ColumnInfo);
@@ -268,13 +278,14 @@ impl SystemPrompt {
 
         match options.mode {
             ChatMode::Chat => prompt.text.push_str(
-                "Mode: chat. You may draw on general knowledge, but whenever you use a retrieved \
-                 chunk or a query result, cite it.\n\n",
+                "Mode: chat. Every figure comes from a query you ran this turn and every \
+                 statement about a document from a chunk you cite. General knowledge may explain \
+                 a term or a method the person asks about; it never supplies a fact the \
+                 workspace does not hold.\n\n",
             ),
             ChatMode::Query => prompt.text.push_str(
                 "Mode: query. Every factual claim must come from a retrieved chunk or from a \
-                 query you ran this turn. Do not answer from memory. If search and queries find \
-                 nothing relevant, say that the workspace does not cover the question and stop. \
+                 query you ran this turn, nothing from memory, not even to explain a term. \
                  Every sentence that states something from a document ends with that chunk's [n] \
                  marker, e.g. \"Flood damage is excluded [2].\", because the sources listed under \
                  the answer are built from those markers and a sentence without one has no \
@@ -397,7 +408,7 @@ impl SystemPrompt {
              When answering questions about document content:\n\
              1. Call search_documents with the user's question (rephrase and search again if the first results miss)\n\
              2. For a whole section or a document from its start, call read_document with its id or file name and from; it returns consecutive chunks numbered the same way and says where to continue\n\
-             3. Answer only from the returned chunks; if none are relevant, say the documents do not cover it\n\
+             3. Answer only from the returned chunks; if none are relevant, say \"I can't tell from the data in this workspace.\" and what you searched for\n\
              4. Cite each claim inline with the chunk's [n] marker, e.g. \"Flood is excluded [2].\"; \
              a passage given to you alongside the question carries its marker as cite_as\n\
              5. Do not write a Sources or References section; one is appended for you from the markers\n\n",
@@ -427,8 +438,8 @@ impl SystemPrompt {
                  A result that names table rows can be read with run_sql: it gives the predicate\n\
                  5. A result that says it was cut off at the node limit is not the whole answer; \
                  narrow the class or count with describe_class instead of counting the lines\n\
-                 6. If the graph has nothing, search the documents before telling the user the \
-                 workspace does not cover the question\n\
+                 6. If the graph has nothing, search the documents before answering that you \
+                 can't tell from the data\n\
                  7. To count, filter, aggregate, or join entities, run_sql over the graph_<class> \
                  view (one row per entity, one typed column per property; describe_class lists \
                  them) and graph_edges; in query mode add WHERE NOT provisional\n\n",

@@ -170,8 +170,9 @@ struct Cli {
     #[arg(short = 'r', long, value_name = "SESSION_ID")]
     resume: Option<String>,
 
-    /// Answer mode: chat may use general knowledge; query answers only from
-    /// retrieved chunks and query results
+    /// Answer mode: chat explains terms from general knowledge but takes every
+    /// fact from the workspace; query takes everything from retrieved chunks
+    /// and query results
     #[arg(long, value_enum, global = true)]
     mode: Option<ModeArg>,
 
