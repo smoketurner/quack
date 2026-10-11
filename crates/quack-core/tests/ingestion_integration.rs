@@ -146,6 +146,7 @@ fn test_config(data_dir: &Path) -> Config {
             upload_max_mb: 512,
             max_decompressed_mb: 1024,
             vision_model: None,
+            max_figures: 20,
         },
         embedding: EmbeddingConfig {
             model: Some("mock/mock-model".parse().unwrap()),
@@ -2979,6 +2980,201 @@ async fn a_scanned_pdf_page_is_read_by_the_vision_model() {
         .and_then(|m| m.iter().find_map(|m| m["images"].as_array()))
         .map_or(0, Vec::len);
     assert_eq!(images, 1, "{sent:?}");
+}
+
+/// A PDF page of text with a figure on it: the text, then the figure's
+/// picture once (repeated on the next page, it is not read again).
+fn pdf_with_figure() -> Vec<u8> {
+    const FIGURE: &[u8] = include_bytes!("fixtures/scanned_page.jpg");
+    let place = pdf_oxide::geometry::Rect::new(72.0, 300.0, 240.0, 240.0);
+    let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Ops review");
+    for text in ["Regional volumes are charted below.", "The chart again."] {
+        pdf.letter_page()
+            .at(72.0, 720.0)
+            .text(text)
+            .image_from_bytes(FIGURE, place)
+            .unwrap()
+            .done();
+    }
+    pdf.build().unwrap()
+}
+
+/// `config` reading a vision model from `vision`, under `dir`.
+fn vision_config(vision: &ScriptedOllama, dir: &Path, extra: &str) -> Config {
+    let mut config = vision
+        .config_with(&format!(
+            "[ingestion]\nvision_model = \"scripted/model\"\n{extra}"
+        ))
+        .unwrap();
+    config.general.data_dir = dir.to_path_buf();
+    config
+}
+
+/// The pictures inside a document go to the vision model, each once, and
+/// what it writes is chunked where the picture sits, on its page.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_figure_inside_a_pdf_is_read_by_the_vision_model() {
+    let vision = ScriptedOllama::serve(vec![Reply::Text("Bar chart: West volumes fell 18%.")])
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let config = vision_config(&vision, dir.path(), "");
+    let db = WorkspaceDb::open(&config, "ws-figure").unwrap();
+    let writer = writer_of(&db);
+    let result = Egress::scope(
+        Some(Egress::NoWorkspace),
+        ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-figure",
+            &ingestion::NewFile::new("review.pdf", &pdf_with_figure()),
+            None::<&Embedder<MockEmbeddingModel>>,
+        ),
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(vision.requests().len(), 1, "{:?}", vision.requests());
+    let hits = db
+        .search_keyword_chunks("volumes fell", 5, &ChunkScope::all())
+        .unwrap();
+    let hit = hits.first().unwrap();
+    assert!(
+        hit.content
+            .contains("Figure: Bar chart: West volumes fell 18%."),
+        "{hit:?}"
+    );
+    assert_eq!(hit.page, Some(1), "{hit:?}");
+    // The pages are typed, so none counts as transcribed.
+    assert_eq!(result.pages.map(|p| p.transcribed), Some(0));
+}
+
+/// A two-inch picture for an Office package, with `alt` text when it is
+/// not blank; `shade` makes its bytes differ from another's, so neither
+/// is a repeat.
+fn office_picture(alt: &str, shade: u8) -> office_oxide::ir::Element {
+    const PICTURE: &[u8] = include_bytes!("fixtures/scanned_page.jpg");
+    let mut data = PICTURE.to_vec();
+    data.push(shade);
+    office_oxide::ir::Element::Image(office_oxide::ir::Image {
+        alt_text: (!alt.is_empty()).then(|| String::from(alt)),
+        data: Some(data),
+        format: Some(office_oxide::ir::ImageFormat::Jpeg),
+        display_width_emu: Some(1_828_800),
+        display_height_emu: Some(1_828_800),
+        ..office_oxide::ir::Image::default()
+    })
+}
+
+/// `[ingestion].max_figures` bounds the model calls; a picture left
+/// unread keeps its alternative text, as it does with no vision model.
+#[tokio::test(flavor = "multi_thread")]
+async fn figures_past_the_limit_or_without_a_model_keep_their_alt_text() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::DocumentIR;
+    let picture = office_picture;
+    let package = |text: &str| {
+        let mut ir = DocumentIR::from_markdown(text, DocumentFormat::Docx);
+        let body = ir.sections.first_mut().unwrap();
+        body.elements.push(picture("Chart of churn by month", 1));
+        body.elements.push(picture("Map of the warehouses", 2));
+        let mut out = std::io::Cursor::new(Vec::new());
+        office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut out)
+            .unwrap();
+        out.into_inner()
+    };
+
+    let vision = ScriptedOllama::serve(vec![Reply::Text("Churn peaked in March.")])
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let config = vision_config(&vision, dir.path(), "max_figures = 1\n");
+    let db = WorkspaceDb::open(&config, "ws-figures").unwrap();
+    let writer = writer_of(&db);
+    Egress::scope(
+        Some(Egress::NoWorkspace),
+        ingestion::ingest_file(
+            &config,
+            &writer,
+            "ws-figures",
+            &ingestion::NewFile::new("deck.docx", &package("# Churn\n\nSee the figures.\n")),
+            None::<&Embedder<MockEmbeddingModel>>,
+        ),
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(vision.requests().len(), 1);
+    let text = |db: &WorkspaceDb, word: &str| {
+        db.search_keyword_chunks(word, 5, &ChunkScope::all())
+            .unwrap()
+            .into_iter()
+            .map(|h| h.content)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let read = text(&db, "march");
+    assert!(
+        read.contains("Figure: Chart of churn by month\n\nChurn peaked in March."),
+        "{read}"
+    );
+    let unread = text(&db, "warehouses");
+    assert!(unread.contains("Figure: Map of the warehouses"), "{unread}");
+
+    // No vision model: the alternative text alone, and pictures with
+    // nothing else are refused.
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-figures-none").unwrap();
+    let writer = writer_of(&db);
+    ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-figures-none",
+        &ingestion::NewFile::new("deck.docx", &package("# Churn\n\nSee the figures.\n")),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .unwrap();
+    assert!(text(&db, "churn").contains("Figure: Chart of churn by month"));
+}
+
+/// With no vision model, a deck of nothing but pictures without alt text
+/// is refused naming the setting.
+#[tokio::test]
+async fn a_deck_of_unread_pictures_names_the_vision_setting() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::{DocumentIR, Metadata, Section};
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-figures-none").unwrap();
+    let writer = writer_of(&db);
+    let ir = DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Pptx,
+            ..Metadata::default()
+        },
+        sections: vec![Section {
+            elements: vec![office_picture("", 3)],
+            ..Section::default()
+        }],
+    };
+    let mut out = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Pptx, &mut out).unwrap();
+    let failed = ingestion::ingest_file(
+        &config,
+        &writer,
+        "ws-figures-none",
+        &ingestion::NewFile::new("pictures.pptx", &out.into_inner()),
+        None::<&Embedder<MockEmbeddingModel>>,
+    )
+    .await
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(failed.contains("[ingestion].vision_model"), "{failed}");
 }
 
 /// Without a vision model, a PDF of scanned pages alone is refused with

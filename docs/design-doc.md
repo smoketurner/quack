@@ -943,6 +943,18 @@ also gets the `view_image` tool in every workspace holding an image (section 7.3
 document's passage page shows the image, served by `GET .../documents/{doc}/image` (and
 `/w/{id}/documents/{doc}/image` in the web console), audited as opening the document.
 
+**Pictures inside documents.** A picture inside a PDF (on a page with text), a DOCX, or a
+PPTX is a figure (`parser::Figure`): kept once by its SHA-256, so a logo on every page counts
+once, and left out when it is decorative, smaller than 100 pixels (half an inch on display) a
+side, or in a format a vision model does not take. With `[ingestion].vision_model` set, the
+first `[ingestion].max_figures` (20; zero reads none) go to the model, one call each, asked to
+transcribe the picture's text and numbers and describe it; what it writes, after the author's
+alt text, becomes a `Figure: ...` section where the picture sits, on its page or slide, so it is
+chunked and cited like the text around it. A picture the model does not read keeps only its
+alt text, and the log says how many went unread; a picture the model fails on is left out
+with a warning, while a cancel, a sign-in, or a refused provider stops the document. A
+document of nothing but unread pictures is refused naming the setting.
+
 **Partly read PDFs.** A PDF with some pages missing from its text still becomes `ready`, and
 the document row records what is missing (`parser::PageCounts`): `page_count`,
 `pages_unreadable` (extraction failed), `pages_empty` (the page read and held no text,
@@ -3244,6 +3256,7 @@ upload_max_mb = 512
 max_decompressed_mb = 1024      # what a DOCX, PPTX, or zipped workbook may inflate to while parsed
 table_rows_as_table = 20        # a table inside a document with this many rows also loads as a workspace table
 # vision_model = "ollama/gemma4:e4b"   # describes uploaded images at ingest; images are refused without it
+max_figures = 20                # pictures inside one document (PDF, DOCX, PPTX) the vision model describes; 0 reads none
 
 [context]
 max_tokens = 4000

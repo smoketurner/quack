@@ -1091,6 +1091,11 @@ pub struct IngestionConfig {
     /// no text, as `provider/model`. Unset, images are refused and such
     /// pages stay empty.
     pub vision_model: Option<ModelSpec>,
+    /// Pictures inside one document (a PDF's figures, a slide's chart, a
+    /// picture in a DOCX) the vision model describes at most, in document
+    /// order; each is one model call. Zero reads none, and a picture left
+    /// unread keeps only its alternative text.
+    pub max_figures: u32,
 }
 
 impl IngestionConfig {
@@ -1115,6 +1120,7 @@ impl Default for IngestionConfig {
             max_decompressed_mb: 1024,
             table_rows_as_table: 20,
             vision_model: None,
+            max_figures: 20,
         }
     }
 }

@@ -276,7 +276,11 @@ Images (PNG, JPEG, WebP, GIF; `FileType::Image`) are read once at ingest by
 `background_effort`), whose transcription and description are chunked as Markdown; the image is
 kept as `files/<document id>.<ext>` (`ingestion::StoredImage`, `WorkspaceDb::stored_image`) and
 served by `GET .../documents/{doc}/image`. With no vision model an image is refused at
-registration (`Error::NoVisionModel`). A chat model marked `images = true` gets `view_image` (the
+registration (`Error::NoVisionModel`). The pictures inside a PDF, DOCX, or PPTX are
+`parser::Figure`s (each picture once by hash; icons, bullets, and decorative ones left out),
+and up to `[ingestion].max_figures` of them (20) go to the same model, each read into a
+`Figure: ...` section after its alt text where it sits; unread, a picture keeps its alt text.
+A chat model marked `images = true` gets `view_image` (the
 stored image and a question back to the chat model) in a workspace that holds an image.
 Chunk bodies, graph source excerpts, and pinned text reach the model inside `text::Fenced`
 markers, whose code is a digest of the enclosed text (so the text cannot close its own block),

@@ -177,8 +177,10 @@ a chat turn still answers, without model reranking and history summaries, and lo
 Two settings let quack read images. Neither sends an image anywhere until it is set.
 
 - `[ingestion].vision_model` names the model that reads an uploaded PNG, JPEG, WebP, or GIF
-  once at ingest. Without it, an image upload is refused. It runs at the model's
-  `background_effort`.
+  once at ingest, a PDF page that is only a picture, and the pictures inside a PDF, DOCX,
+  or PPTX (at most `[ingestion].max_figures` per document, 20, one call each). Without it,
+  an image upload is refused and a picture inside a document keeps only its alt text. It
+  runs at the model's `background_effort`.
 - `images = true` on `[providers.NAME]` or `[providers.NAME.models."ID"]` says the chat
   model reads images, which gives the agent the `view_image` tool in a workspace that holds
   an image: the stored image and the agent's question go to the chat model again. When the

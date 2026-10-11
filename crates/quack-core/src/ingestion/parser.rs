@@ -325,6 +325,46 @@ pub struct Scan {
     pub format: ImageFormat,
 }
 
+/// An image inside a document (a chart on a slide, a figure in a report,
+/// a picture in a Word file), for the vision model to describe where it
+/// sits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Figure {
+    /// Where it goes: before the section at this index of the sections as
+    /// parsed, so at their end when it equals their count.
+    pub at: usize,
+    /// The heading of the text around it.
+    pub heading: Option<String>,
+    /// The page or slide it is on, from 1.
+    pub page: Option<u32>,
+    /// The alternative text the author gave it.
+    pub alt: Option<String>,
+    pub image: Vec<u8>,
+    pub format: ImageFormat,
+}
+
+/// The figures of one document, each picture once: a logo on every page
+/// is read once, where it first appears.
+#[derive(Debug, Default)]
+pub(crate) struct Figures {
+    seen: std::collections::HashSet<Vec<u8>>,
+    list: Vec<Figure>,
+}
+
+impl Figures {
+    /// Keep `figure` unless the same picture was already kept.
+    pub(crate) fn add(&mut self, figure: Figure) {
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &figure.image);
+        if self.seen.insert(digest.as_ref().to_vec()) {
+            self.list.push(figure);
+        }
+    }
+
+    pub(crate) fn finish(self) -> Vec<Figure> {
+        self.list
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Extracted {
     pub title: Option<String>,
@@ -338,6 +378,9 @@ pub struct Extracted {
     /// model to read before chunking (only a PDF has them). Each one is
     /// counted in `pages.empty` until it is read.
     pub scans: Vec<Scan>,
+    /// Images inside the document, in document order, for the vision
+    /// model to describe before chunking (PDF, DOCX, and PPTX have them).
+    pub figures: Vec<Figure>,
 }
 
 /// What a file says about itself: who wrote it and when, its tags, and
@@ -449,6 +492,17 @@ impl PageCounts {
 }
 
 impl Extracted {
+    /// Put each `(at, section)` before the section that was at `at` when
+    /// the figures were found, keeping their order.
+    pub fn insert_figures(&mut self, sections: Vec<(usize, Section)>) {
+        // Back to front, so an index is not moved by an insertion before
+        // it; equal indexes keep their order.
+        for (at, section) in sections.into_iter().rev() {
+            let at = at.min(self.sections.len());
+            self.sections.insert(at, section);
+        }
+    }
+
     /// Put `sections`, each on a page, among the document's in page order:
     /// each after the last section on its page or an earlier one.
     pub fn insert_by_page(&mut self, sections: Vec<Section>) {
@@ -677,7 +731,7 @@ impl TextFormat {
     /// supported), or if a zipped format inflates past `budget`.
     pub fn extract(self, data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         match self {
-            Self::Pdf => pdf::extract(data),
+            Self::Pdf => pdf::extract(data, false),
             Self::Markdown => Ok(markdown::extract(&utf8(data)?)),
             Self::Text => Ok(Extracted {
                 sections: vec![Section::body(None, utf8(data)?)],
@@ -758,6 +812,13 @@ impl SectionBuilder {
         if !section.text.trim().is_empty() {
             self.sections.push(section);
         }
+    }
+
+    /// End the current body section, and say where the next section goes
+    /// and under what heading: where an image found now sits.
+    pub(crate) fn mark(&mut self) -> (usize, Option<String>) {
+        self.flush();
+        (self.sections.len(), self.heading.clone())
     }
 
     fn flush(&mut self) {

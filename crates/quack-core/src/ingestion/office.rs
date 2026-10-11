@@ -3,17 +3,21 @@
 //! style name, any locale), with tables, footnotes, endnotes, and comments
 //! as sections of their own kinds; presentations become one section per
 //! slide, headed by the slide's title, with speaker notes as note
-//! sections. The core properties give the title, author, dates, and
-//! keywords.
+//! sections. Pictures are figures where they sit, for the vision model.
+//! The core properties give the title, author, dates, and keywords.
 
 use std::io::Cursor;
 
 use office_oxide::Document;
 use office_oxide::format::DocumentFormat;
-use office_oxide::ir::{DocumentIR, Element, InlineContent, Note, Table as IrTable};
+use office_oxide::ir::{
+    DocumentIR, Element, Image, ImageFormat as IrImageFormat, InlineContent, Note, Table as IrTable,
+};
 
 use super::budget::DecompressionBudget;
-use super::parser::{DocumentMeta, Extracted, FileType, Flow, Section, SectionBuilder};
+use super::parser::{
+    DocumentMeta, Extracted, Figure, Figures, FileType, Flow, ImageFormat, Section, SectionBuilder,
+};
 use super::table::Table;
 use crate::error::{Error, Result};
 
@@ -31,8 +35,13 @@ pub fn docx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
             walker.walk(element);
         }
     }
-    let sections = walker.finish();
-    if sections.is_empty() {
+    let (sections, found) = walker.finish_with_figures();
+    let mut figures = Figures::default();
+    for figure in found {
+        figures.add(figure);
+    }
+    let figures = figures.finish();
+    if sections.is_empty() && figures.is_empty() {
         return Err(Error::Ingestion(String::from(
             "no extractable text: the DOCX has no paragraphs",
         )));
@@ -44,6 +53,7 @@ pub fn docx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         flow: Flow::Sectioned,
         pages: None,
         meta,
+        figures,
         ..Extracted::default()
     })
 }
@@ -57,6 +67,7 @@ pub fn docx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
 pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
     let package = Package::open(data, FileType::Pptx, DocumentFormat::Pptx, budget)?;
     let mut sections = Vec::new();
+    let mut figures = Figures::default();
     for (index, slide) in package.0.sections.iter().enumerate() {
         let number = u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX);
         let heading = slide
@@ -72,8 +83,17 @@ pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         for element in &slide.elements {
             walker.walk(element);
         }
-        let mut body: Vec<Section> = walker
-            .finish()
+        let (found, pictures) = walker.finish_with_figures();
+        let offset = sections.len();
+        for figure in pictures {
+            figures.add(Figure {
+                at: offset.saturating_add(figure.at),
+                heading: heading.clone(),
+                page: Some(number),
+                ..figure
+            });
+        }
+        let mut body: Vec<Section> = found
             .into_iter()
             // A slide's own heading is the title; its body headings read as
             // lines of the slide.
@@ -101,7 +121,8 @@ pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
             sections.push(section.on_page(Some(number)));
         }
     }
-    if sections.is_empty() {
+    let figures = figures.finish();
+    if sections.is_empty() && figures.is_empty() {
         return Err(Error::Ingestion(String::from(
             "no extractable text: the PPTX has no text on any slide",
         )));
@@ -114,6 +135,7 @@ pub fn pptx(data: &[u8], budget: DecompressionBudget) -> Result<Extracted> {
         flow: Flow::Sectioned,
         pages: None,
         meta,
+        figures,
         ..Extracted::default()
     })
 }
@@ -159,9 +181,10 @@ impl Package {
 }
 
 /// Block elements into sections: headings start sections, tables and
-/// notes are sections of their kind, the rest is lines.
+/// notes are sections of their kind, pictures are figures where they sit,
+/// the rest is lines.
 #[derive(Default)]
-struct Walker(SectionBuilder);
+struct Walker(SectionBuilder, Vec<Figure>);
 
 impl Walker {
     fn walk(&mut self, element: &Element) {
@@ -200,10 +223,33 @@ impl Walker {
                     self.walk(element);
                 }
             }
-            // Images, breaks, shapes, and any variant a newer library adds
+            Element::Image(image) => self.image(image),
+            // Breaks, shapes, and any variant a newer library adds
             // (`Element` is non-exhaustive) read as nothing.
             _ => {}
         }
+    }
+
+    /// A picture big enough to hold something, in a format a vision model
+    /// takes, as a figure where the walk has reached.
+    fn image(&mut self, image: &Image) {
+        let Some((data, format)) = Picture(image).readable() else {
+            return;
+        };
+        let (at, heading) = self.0.mark();
+        self.1.push(Figure {
+            at,
+            heading,
+            page: None,
+            alt: image
+                .alt_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned),
+            image: data.to_vec(),
+            format,
+        });
     }
 
     /// A footnote, endnote, or comment (an endnote whose marker is the
@@ -224,6 +270,10 @@ impl Walker {
 
     fn finish(self) -> Vec<Section> {
         self.0.finish()
+    }
+
+    fn finish_with_figures(self) -> (Vec<Section>, Vec<Figure>) {
+        (self.0.finish(), self.1)
     }
 
     /// Block elements as lines of text.
@@ -259,6 +309,48 @@ impl Table {
                 })
                 .collect(),
         )
+    }
+}
+
+/// A picture smaller than this many pixels a side is an icon, a bullet,
+/// or a rule, not a figure.
+const FIGURE_MIN_PIXELS: u32 = 100;
+
+/// Half an inch, in EMUs: a picture shown smaller than this on either side
+/// is an icon.
+const FIGURE_MIN_EMU: u64 = 457_200;
+
+/// With neither its pixels nor its displayed size known, a picture of
+/// fewer bytes than this is an icon.
+const FIGURE_MIN_BYTES: usize = 2048;
+
+/// An `office_oxide` image, and whether it is worth a vision model's call.
+struct Picture<'a>(&'a Image);
+
+impl<'a> Picture<'a> {
+    /// The picture's bytes and format, when it is not decorative, is in a
+    /// format a vision model takes, and is big enough to hold something.
+    fn readable(self) -> Option<(&'a [u8], ImageFormat)> {
+        let image = self.0;
+        if image.decorative {
+            return None;
+        }
+        let data = image.data.as_deref()?;
+        let format = match image.format.as_ref()? {
+            IrImageFormat::Png => ImageFormat::Png,
+            IrImageFormat::Jpeg => ImageFormat::Jpeg,
+            IrImageFormat::Gif => ImageFormat::Gif,
+            _ => return None,
+        };
+        let big = match (
+            image.pixel_width.zip(image.pixel_height),
+            image.display_width_emu.zip(image.display_height_emu),
+        ) {
+            (Some((w, h)), _) => w >= FIGURE_MIN_PIXELS && h >= FIGURE_MIN_PIXELS,
+            (None, Some((w, h))) => w >= FIGURE_MIN_EMU && h >= FIGURE_MIN_EMU,
+            (None, None) => data.len() >= FIGURE_MIN_BYTES,
+        };
+        big.then_some((data, format))
     }
 }
 
@@ -467,6 +559,97 @@ pub(crate) mod tests {
                 (Some("Title only"), "body", Some(2), "Title only"),
             ]
         );
+    }
+
+    /// A picture worth reading, two inches a side, as `office_oxide` writes
+    /// it into a package.
+    fn picture(alt: &str) -> Element {
+        Element::Image(Image {
+            alt_text: Some(String::from(alt)),
+            data: Some(include_bytes!("../../tests/fixtures/scanned_page.jpg").to_vec()),
+            format: Some(IrImageFormat::Jpeg),
+            display_width_emu: Some(1_828_800),
+            display_height_emu: Some(1_828_800),
+            ..Image::default()
+        })
+    }
+
+    /// `ir` written as a package of `format`.
+    fn written(ir: &DocumentIR, format: DocumentFormat) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        office_oxide::create::create_from_ir_to_writer(ir, format, &mut out)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        out.into_inner()
+    }
+
+    /// A picture in a Word file is a figure between the text before and
+    /// after it, under its heading, with its alternative text; the same
+    /// picture again is the one figure.
+    #[test]
+    fn a_docx_picture_is_a_figure_where_it_sits() {
+        let mut ir = DocumentIR::from_markdown(
+            "# Quarterly\n\nSales rose.\n\nSee above.\n",
+            DocumentFormat::Docx,
+        );
+        let Some(body) = ir.sections.first_mut() else {
+            fail("no section");
+        };
+        let after = body
+            .elements
+            .iter()
+            .position(|e| matches!(e, Element::Paragraph(_)))
+            .map_or(0, |i| i.saturating_add(1));
+        body.elements.insert(after, picture("Q3 sales chart"));
+        body.elements.push(picture("Q3 sales chart"));
+        let extracted = docx(&written(&ir, DocumentFormat::Docx), BUDGET)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let texts: Vec<&str> = extracted.sections.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["Sales rose.", "See above."]);
+        let figures: Vec<(usize, Option<&str>, Option<&str>)> = extracted
+            .figures
+            .iter()
+            .map(|f| (f.at, f.heading.as_deref(), f.alt.as_deref()))
+            .collect();
+        assert_eq!(
+            figures,
+            vec![(1, Some("Quarterly"), Some("Q3 sales chart"))]
+        );
+        assert!(
+            extracted
+                .figures
+                .first()
+                .is_some_and(|f| f.format == ImageFormat::Jpeg && !f.image.is_empty())
+        );
+    }
+
+    /// A slide of only a picture is not an empty deck: the picture is a
+    /// figure on that slide. A tiny or decorative one is not.
+    #[test]
+    fn a_pptx_slide_of_a_picture_is_a_figure_on_that_slide() {
+        let mut icon = picture("bullet");
+        if let Element::Image(image) = &mut icon {
+            image.display_width_emu = Some(91_440);
+            image.display_height_emu = Some(91_440);
+        }
+        let ir = DocumentIR {
+            metadata: office_oxide::ir::Metadata {
+                format: DocumentFormat::Pptx,
+                ..office_oxide::ir::Metadata::default()
+            },
+            sections: vec![office_oxide::ir::Section {
+                elements: vec![picture("Pipeline by region"), icon],
+                ..office_oxide::ir::Section::default()
+            }],
+        };
+        let extracted = pptx(&written(&ir, DocumentFormat::Pptx), BUDGET)
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert!(extracted.sections.is_empty());
+        let figures: Vec<(usize, Option<u32>, Option<&str>)> = extracted
+            .figures
+            .iter()
+            .map(|f| (f.at, f.page, f.alt.as_deref()))
+            .collect();
+        assert_eq!(figures, vec![(0, Some(1), Some("Pipeline by region"))]);
     }
 
     #[test]
