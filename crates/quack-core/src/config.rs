@@ -1864,6 +1864,12 @@ pub struct AnalysisConfig {
     /// ontology's document pass, reranking, and history summaries. Unset:
     /// the model's default.
     pub background_effort: Option<Effort>,
+    /// The model for bulk background work, as `provider/model`: graph
+    /// extraction, the ontology's document pass, a table's question
+    /// drafting, session titles, and history summaries, so a cheap model
+    /// can do those while the chat model answers. Unset: the chat model.
+    /// Model reranking stays with the chat model.
+    pub background_model: Option<ModelSpec>,
     /// Replace the turns that fall outside `history_token_budget` with a
     /// summary the chat model writes, kept in the workspace, instead of
     /// dropping them. Off by default: each new summary is one more model
@@ -1903,6 +1909,7 @@ impl Default for AnalysisConfig {
             reader_pool_size: 4,
             effort: None,
             background_effort: None,
+            background_model: None,
             compact_history: false,
             title_sessions: false,
         }
@@ -2045,6 +2052,9 @@ impl Config {
             self.chat_model_ref()?;
         }
         self.vision_model_ref()?;
+        if let Some(spec) = &self.analysis.background_model {
+            self.resolve_model("[analysis].background_model", spec)?;
+        }
         if let Some(embed) = self.embedding_model_ref()? {
             if embed.provider.provider_type == ProviderType::Anthropic {
                 return Err(Error::Config(format!(
@@ -2108,6 +2118,20 @@ impl Config {
                 config_file: config_file_path(),
             })?;
         self.resolve_model("chat_model", spec)
+    }
+
+    /// The model background work runs on: `[analysis].background_model`,
+    /// else the chat model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when neither is configured, or the one set names a
+    /// provider that does not exist.
+    pub fn background_model_ref(&self) -> Result<ModelRef<'_>> {
+        match &self.analysis.background_model {
+            Some(spec) => self.resolve_model("[analysis].background_model", spec),
+            None => self.chat_model_ref(),
+        }
     }
 
     /// What requests to `model` carry: its own settings, else its

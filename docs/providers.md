@@ -162,7 +162,14 @@ temperature = false                      # use the model's own sampling defaults
 some of a gateway's models reason, set `effort` on those models rather than in `[analysis]`,
 because a model that does not reason rejects the field. `quack config` lists every key, and
 `quack doctor` shows what the chat model is sent. It checks `background_effort` too when that differs from
-`effort`. A level the model refuses fails graph extraction and the ontology's document pass;
+`effort`.
+
+`[analysis].background_model` (`provider/model`, like `chat_model`) moves the bulk background
+work off the chat model: graph extraction, the ontology's document pass, a table's question
+drafting, session titles, and history summaries. A cheap or local model can then do the
+extraction while a stronger one answers. Unset, all of it runs on the chat model; model
+reranking always does, since it runs inside a turn. `quack doctor` probes the background model
+when it differs from the chat model. A level the model refuses fails graph extraction and the ontology's document pass;
 a chat turn still answers, without model reranking and history summaries, and logs a warning.
 
 ## Images

@@ -889,6 +889,36 @@ fn chat_model_unset_is_a_clear_error_when_asked_for() {
     assert!(config.embedding_model_ref().is_ok_and(|m| m.is_none()));
 }
 
+/// Background work runs on `[analysis].background_model` when it is set,
+/// else on the chat model; one naming no provider is refused at load.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+fn background_work_runs_on_its_own_model_or_the_chat_model() {
+    let parse = |more: &str| {
+        Config::parse(&format!(
+            "[general]\nchat_model = \"cloud/big\"\n\
+             [providers.cloud]\ntype = \"ollama\"\n\
+             [providers.local]\ntype = \"ollama\"\n{more}"
+        ))
+    };
+    let config = parse("").unwrap();
+    assert_eq!(
+        config.background_model_ref().unwrap().to_string(),
+        "cloud/big"
+    );
+    let config = parse("[analysis]\nbackground_model = \"local/small\"\n").unwrap();
+    assert_eq!(
+        config.background_model_ref().unwrap().to_string(),
+        "local/small"
+    );
+    assert_eq!(config.chat_model_ref().unwrap().to_string(), "cloud/big");
+    let err = parse("[analysis]\nbackground_model = \"missing/small\"\n")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("background_model"), "{err}");
+}
+
 #[test]
 fn path_helpers_use_data_dir() {
     let mut config = Config::default();

@@ -3250,6 +3250,7 @@ extraction_concurrency = 1              # chunks extracted at once; Ollama serve
 reader_pool_size = 4                    # reader connections per workspace handle, round-robined
 # effort = "high"                       # chat turns: none, minimal, low, medium, high, xhigh, max; unset = model default
 # background_effort = "low"             # graph extraction and the ontology document pass
+# background_model = "ollama/qwen3:4b"  # extraction, question drafting, titles, summaries; unset = chat_model
 
 [decision]
 # model = "ollama/laya"       # a decision model on a type = "ollama" provider (ollama pull laya); unset, nothing is labelled
