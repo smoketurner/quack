@@ -385,7 +385,9 @@ impl SystemPrompt {
             }
         });
         self.text.push_str(
-            "2. Write and execute SQL queries using run_sql\n\
+            "2. Write and execute SQL queries using run_sql. Every calculation runs there, \
+             arithmetic on figures in the question included (SELECT 17 * 23), never in your \
+             text: the person sees the statement and its result, not your working\n\
              3. If run_sql returns an error, read it: DuckDB names candidate columns for a \
              misspelled one and describe_table shows the real names. Fix the statement and run \
              it again; do not give up after one error and do not ask the user to correct SQL\n\
