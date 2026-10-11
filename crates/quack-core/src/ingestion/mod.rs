@@ -1024,7 +1024,10 @@ impl Piped {
             return Self::Table;
         };
         match FileType::of(&name).map(FileType::load) {
-            Some(Load::Table(_) | Load::Chunks(TextFormat::Text)) | None => Self::Table,
+            // YAML is text to the sniffer, so piped it stays text, as before.
+            Some(Load::Table(_) | Load::Yaml | Load::Chunks(TextFormat::Text)) | None => {
+                Self::Table
+            }
             Some(Load::Workbook | Load::Chunks(_) | Load::Image(_)) => Self::Document { name },
         }
     }
