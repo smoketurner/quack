@@ -2241,7 +2241,11 @@ region"): distinct x values in first-seen order become the axis, and a series wi
 a label gets 0 there. `stacked` (`#[serde(default)]`, so stored specs decode unchanged) stacks
 bars and lines: ECharts stacks them, the terminal draws stacked lines as running sums and
 stacked bars as one bar of the total with the parts named in the title. A NULL x becomes the
-label "NULL", a NULL y becomes 0, and a non-numeric y is an error reported to the model. The
+label "NULL", a NULL y becomes 0, and a non-numeric y is an error reported to the model. `x`,
+`y`, and `series_by` name columns of the query's own result: a blank `series_by` or a blank
+`y` entry reads as left out, a bare string for `y` reads as one column, and a column the
+result does not hold fails with the columns it did return, the step's record carrying the
+columns the call asked for beside the error, so the next call can land. The
 prompt's guidance says when to use several `y` columns or `series_by`, and to bin a histogram
 in SQL and chart the counts as bars; there is no histogram kind. A pie takes its first series.
 The chart's SQL always runs read-only, so charting never prompts for a write. A chart attaches
