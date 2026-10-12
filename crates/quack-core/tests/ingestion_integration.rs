@@ -5053,3 +5053,47 @@ async fn ingesting_a_failed_file_again_replaces_its_error_row() {
         ]
     );
 }
+
+/// A Parquet file loads as a table: the reader is compiled into the
+/// binary, so the confined connection never reaches for an extension (which
+/// it cannot fetch, and which is what the error said before the `parquet`
+/// feature was on).
+#[tokio::test]
+async fn parquet_loads_as_a_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let workspace_id = "ws-parquet";
+    std::fs::create_dir_all(config.workspace_files_dir(workspace_id)).unwrap();
+    let source = dir.path().join("readings.parquet");
+    duckdb::Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT 'Mill Road' AS gauge, 4.2 AS stage_ft UNION ALL SELECT 'Cedar Hollow', 11.1) \
+             TO '{}' (FORMAT PARQUET)",
+            source.display()
+        ))
+        .unwrap();
+    let bytes = std::fs::read(&source).unwrap();
+    let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+    let writer = writer_of(&db);
+    let result = ingestion::ingest_file::<MockEmbeddingModel>(
+        &config,
+        &writer,
+        workspace_id,
+        &ingestion::NewFile::new("readings.parquet", &bytes),
+        None,
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    assert_eq!(result.file_type, FileType::Parquet);
+    assert_eq!(result.tables, ["readings"]);
+    let qr = db
+        .execute_query("SELECT count(*) FROM readings WHERE gauge = 'Cedar Hollow'")
+        .unwrap();
+    assert_eq!(
+        qr.rows.first().and_then(|r| r.first()),
+        Some(&serde_json::Value::Number(1.into()))
+    );
+}

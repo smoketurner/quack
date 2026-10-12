@@ -25,7 +25,7 @@ bytes         = { workspace = true, features = ["std"] }
 calamine      = { workspace = true }
 csv           = { workspace = true }
 dirs          = { workspace = true }
-duckdb        = { workspace = true, features = ["bundled", "json"] }
+duckdb        = { workspace = true, features = ["bundled", "json", "parquet"] }
 ego-tree      = { workspace = true }
 file-format   = { workspace = true, features = ["reader-cfb", "reader-txt", "reader-zip"] }
 futures       = { workspace = true, features = ["std"] }

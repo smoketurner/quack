@@ -1,0 +1,53 @@
+[
+  {
+    "question": "How many tornadoes are recorded for 2011?",
+    "kind": "scale",
+    "expect": [],
+    "expect_sql": "SELECT count(*) FROM tornadoes WHERE yr = 2011",
+    "tools": [
+      "run_sql"
+    ]
+  },
+  {
+    "question": "Which state has had the most tornadoes overall?",
+    "kind": "scale",
+    "expect": [],
+    "expect_sql": "SELECT st FROM tornadoes GROUP BY st ORDER BY count(*) DESC LIMIT 1",
+    "tools": [
+      "run_sql"
+    ]
+  },
+  {
+    "question": "How many people were killed by tornadoes in Oklahoma in 1999?",
+    "kind": "scale",
+    "expect": [],
+    "expect_sql": "SELECT sum(fat) FROM tornadoes WHERE st = 'OK' AND yr = 1999",
+    "tools": [
+      "run_sql"
+    ]
+  },
+  {
+    "question": "How many tornadoes rated 5 on the Fujita or Enhanced Fujita scale are in the data?",
+    "kind": "scale",
+    "expect": [],
+    "expect_sql": "SELECT count(*) FROM tornadoes WHERE mag = 5",
+    "tools": [
+      "run_sql"
+    ]
+  },
+  {
+    "question": "In which year did the single deadliest tornado occur, and how many people did it kill?",
+    "kind": "scale",
+    "expect": [],
+    "expect_sql": "SELECT yr, fat FROM tornadoes ORDER BY fat DESC LIMIT 1",
+    "tools": [
+      "run_sql"
+    ]
+  },
+  {
+    "question": "How many tornadoes struck Puerto Rico in 1950?",
+    "kind": "scale",
+    "expect": [],
+    "shape": "not_in_data"
+  }
+]

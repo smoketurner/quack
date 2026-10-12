@@ -5,12 +5,12 @@ crates and modules that exist.
 
 ## Workspace
 
-quack is a virtual Cargo workspace (`Cargo.toml` has no `[package]`) with six members
+quack is a virtual Cargo workspace (`Cargo.toml` has no `[package]`) with seven members
 under `crates/`: `quack-core`, the library; `quack-cli`, the command verbs the binary and
 the terminal share; `quack-server`, `quack serve` and the MCP server; `quack-terminal`, the
-interactive session;
-`quack-testkit`, the scripted Ollama server the
-interface tests run whole agent turns against; and `quack`, the one binary. The root sets:
+interactive session; `quack-testkit`, the scripted Ollama server the interface tests run
+whole agent turns against; `quack`, the one binary; and `quack-eval`, the evaluation harness
+that drives the built binary as a person would (`make eval`). The root sets:
 
 - `[workspace.package]`: edition 2024, the MSRV.
 - `[workspace.dependencies]`: every dependency pinned to an exact version, default features
