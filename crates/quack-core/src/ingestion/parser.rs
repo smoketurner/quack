@@ -772,7 +772,7 @@ impl TextFormat {
             Self::Vtt => captions::vtt(&utf8(data)?),
             Self::Srt => captions::srt(&utf8(data)?),
             Self::Code => Ok(code::extract(&utf8(data)?)),
-            Self::Rtf => rtf::extract(&utf8(data)?),
+            Self::Rtf => rtf::extract(data),
         }
     }
 }

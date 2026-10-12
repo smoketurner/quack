@@ -909,7 +909,7 @@ folders; the terminal's `/ingest` takes files.
 | `.eml`, `.mbox` | `mail-parser` | one section per message under its subject, with From, To, and Date above the body (HTML-only bodies read as text); `message N` as a mailbox's locator; From and Date as author and date |
 | `.vtt`, `.srt` | `subtp` | cues merged into runs of about 600 characters, a new run after a gap over 10 seconds; the run's start time (`12:04`) as the locator |
 | source code (`.rs`, `.py`, `.js`, `.ts`, `.go`, `.java`, `.c`, `.sql`, ...) | direct | one code section, chunked by whole lines with `line N` as each chunk's locator (no grammar: a definition-aware split is a dependency decision left open) |
-| RTF | `rtf-parser` | one section |
+| RTF | `rclip-rtf` | one section |
 | PNG, JPEG, WebP, GIF | `[ingestion].vision_model` (`llm::vision`) | the model's transcription of the image's text, then a description of what it shows, as one Markdown section under the file name; the image is kept as `files/<document id>.<ext>`; refused at upload when no vision model is set |
 | CSV, Parquet, JSON, JSONL, XLSX | DuckDB (section 6.2) | become tables, not chunks |
 
