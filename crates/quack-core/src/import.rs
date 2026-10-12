@@ -2,14 +2,14 @@
 //! (design doc 6.2, issue #21): the scanner and httpfs extensions cannot
 //! be compiled into the static binary, so rows are pulled here and loaded
 //! as a workspace table through the same path a CSV upload takes. Sources:
-//! a SQLite file through sqlx, opened read-only (every column cast to text
-//! on the source side, so any type comes through), and a CSV, Parquet,
+//! a SQLite file through sqlx, opened read-only, each cell carried with the
+//! type SQLite reports (integer, real, text, blob, null), and a CSV, Parquet,
 //! JSON, or workbook file over HTTP(S) through reqwest, with any headers
 //! the caller gives, or from Amazon S3 (`s3`). Credentials in the URL or a
 //! header are used once and never stored: the document row and the audit
 //! detail carry the redacted URL and the headers' names.
 
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::str::FromStr;
@@ -17,15 +17,16 @@ use std::time::Duration;
 
 use http::{HeaderName, HeaderValue, StatusCode};
 
-use crate::embedding::EmbeddingModel;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::TryStreamExt as _;
-use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
 use sqlx::{
     AssertSqlSafe, Column, ConnectOptions as _, Executor as _, Row, SqlSafeStr as _, Statement as _,
 };
 
 use crate::config::Config;
-use crate::embedding::Embedder;
+use crate::embedding::{Embedder, EmbeddingModel};
 use crate::error::{Error, Result};
 use crate::ids::DocumentId;
 use crate::ingestion::parser::FileType;
@@ -455,10 +456,10 @@ struct Pulled {
 }
 
 impl<M: EmbeddingModel> Importing<'_, M> {
-    /// Pull the rows and load them as the request's table. The source's
-    /// rows go through `files/<table>.csv` and `read_csv_auto`, so the
-    /// table is registered as a document (source `import`) and can be
-    /// deleted like any other.
+    /// Pull the rows and load them as the request's table. A query's rows
+    /// go through `files/<table>.jsonl` and `read_json_auto`, typed as the
+    /// source typed them, so the table is registered as a document (source
+    /// `import`) and can be deleted like any other.
     ///
     /// # Errors
     ///
@@ -557,7 +558,7 @@ impl<M: EmbeddingModel> Importing<'_, M> {
     }
 
     /// Fetch the source as a staging file for `table`: a download, or at
-    /// most `limit` rows of a query written as CSV.
+    /// most `limit` rows of a query written as JSON lines.
     async fn pull(&self, table: &TableName, limit: u64) -> Result<Pulled> {
         let (config, request, policy, control) =
             (self.config, self.request, self.policy, self.control);
@@ -612,8 +613,8 @@ impl<M: EmbeddingModel> Importing<'_, M> {
                 };
                 let fetched = control.or_cancelled(fetch).await?;
                 Ok(Pulled {
-                    filename: format!("{table}.csv"),
-                    bytes: fetched.csv,
+                    filename: format!("{table}.jsonl"),
+                    bytes: fetched.jsonl,
                     columns: fetched.columns,
                     rows: Some(fetched.rows),
                 })
@@ -722,17 +723,42 @@ impl ImportRequest {
     }
 }
 
-/// Run `inner` on the source with every column cast to text and at most
-/// `limit` rows; returns the column names and the rows as text cells.
-/// What a query source yielded, already as CSV: rows are written as they
-/// arrive, so the memory cost is the file once, not the rows as strings
-/// plus the file (issue #62).
+/// What a query source yielded, already as newline-delimited JSON: rows
+/// are written as they arrive, so the memory cost is the file once, not
+/// the rows as values plus the file (issue #62). JSON keeps the type of
+/// every cell SQLite reported (integer, real, text, null; a blob as its
+/// base64 text), so `read_json_auto` loads the columns typed instead of
+/// sniffing text.
 struct Fetched {
     columns: Vec<String>,
-    csv: Vec<u8>,
+    jsonl: Vec<u8>,
     rows: u64,
 }
 
+/// One SQLite cell as the JSON value `read_json_auto` types it from.
+fn json_cell(row: &SqliteRow, i: usize, column: &str) -> Result<serde_json::Value> {
+    use sqlx::{TypeInfo as _, ValueRef as _};
+    let raw = row
+        .try_get_raw(i)
+        .map_err(|e| Error::Ingestion(format!("cannot read column {column}: {e}")))?;
+    if raw.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+    let kind = raw.type_info().name().to_owned();
+    let read = |e: sqlx::Error| Error::Ingestion(format!("cannot read column {column}: {e}"));
+    Ok(match kind.as_str() {
+        "INTEGER" => serde_json::Value::from(row.try_get::<i64, _>(i).map_err(read)?),
+        "REAL" => serde_json::Value::from(row.try_get::<f64, _>(i).map_err(read)?),
+        "BLOB" => {
+            let bytes: Vec<u8> = row.try_get(i).map_err(read)?;
+            serde_json::Value::from(BASE64.encode(bytes))
+        }
+        _ => serde_json::Value::from(row.try_get::<String, _>(i).map_err(read)?),
+    })
+}
+
+/// Run `inner` on the source with at most `limit` rows; returns the column
+/// names and the rows as typed JSON lines.
 async fn fetch_rows(path: &Path, inner: &str, limit: u64) -> Result<Fetched> {
     // Read-only, and opened by path rather than parsed from a URL, so a
     // Windows path needs no rewriting and the source is never changed.
@@ -757,17 +783,8 @@ async fn fetch_rows(path: &Path, inner: &str, limit: u64) -> Result<Fetched> {
             "the query returns no columns",
         )));
     }
-    let mut select = String::from("SELECT ");
-    for (i, column) in columns.iter().enumerate() {
-        if i > 0 {
-            select.push_str(", ");
-        }
-        let quoted = format!("\"{}\"", column.replace('"', "\"\""));
-        write!(select, "CAST({quoted} AS TEXT) AS {quoted}")?;
-    }
-    write!(select, " FROM ({inner}) AS quack_q LIMIT {limit}")?;
-    let mut writer = csv::Writer::from_writer(Vec::new());
-    writer.write_record(&columns)?;
+    let select = format!("SELECT * FROM ({inner}) AS quack_q LIMIT {limit}");
+    let mut jsonl = Vec::new();
     let mut rows = 0u64;
     let mut stream = sqlx::query(AssertSqlSafe(select)).fetch(&mut conn);
     while let Some(row) = stream
@@ -775,23 +792,19 @@ async fn fetch_rows(path: &Path, inner: &str, limit: u64) -> Result<Fetched> {
         .await
         .map_err(|e| Error::Ingestion(format!("the source query failed: {e}")))?
     {
-        let mut cells = Vec::with_capacity(columns.len());
-        for i in 0..columns.len() {
-            // NULL is an empty field, which `read_csv_auto` reads back as
-            // NULL.
-            let cell: Option<String> = row.try_get(i).map_err(|e| {
-                Error::Ingestion(format!(
-                    "cannot read column {}: {e}",
-                    columns.get(i).map_or("?", String::as_str)
-                ))
-            })?;
-            cells.push(cell.unwrap_or_default());
+        let mut record = serde_json::Map::with_capacity(columns.len());
+        for (i, column) in columns.iter().enumerate() {
+            record.insert(column.clone(), json_cell(&row, i, column)?);
         }
-        writer.write_record(&cells)?;
+        serde_json::to_writer(&mut jsonl, &record)?;
+        jsonl.push(b'\n');
         rows = rows.saturating_add(1);
     }
-    let csv = writer.into_inner().map_err(|e| Error::Io(e.into_error()))?;
-    Ok(Fetched { columns, csv, rows })
+    Ok(Fetched {
+        columns,
+        jsonl,
+        rows,
+    })
 }
 
 /// How a download is bounded.

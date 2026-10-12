@@ -3577,30 +3577,37 @@ async fn a_file_that_inflates_past_the_limit_ends_in_error_and_a_normal_one_load
     assert_eq!(loaded.tables.len(), 2);
 }
 
-#[tokio::test]
-async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = test_config_no_provider(dir.path());
-    let db = WorkspaceDb::open(&config, "ws-import").unwrap();
-    let writer = writer_of(&db);
-    // Beside the data directory, not inside it: quack's own files are
-    // refused as a source (issue #69).
+/// A SQLite file beside the data directory (never inside it: quack's own
+/// files are refused as a source, issue #69) with an `orders` table of
+/// every SQLite type; returns the directory keeping it and its URL.
+async fn sqlite_orders_source() -> (tempfile::TempDir, String) {
     let source_dir = tempfile::tempdir().unwrap();
     let source_path = source_dir.path().join("source.db");
     {
         use sqlx::{Connection as _, Executor as _};
         let url = format!("sqlite://{}?mode=rwc", source_path.display());
         let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
-        conn.execute("CREATE TABLE orders (id INTEGER, region TEXT, total REAL, placed TEXT)")
-            .await
-            .unwrap();
         conn.execute(
-            "INSERT INTO orders VALUES (1, 'north', 10.5, '2024-01-02'), (2, 'south, east', 20, NULL), (3, 'west', 7.25, '2024-03-04')",
+            "CREATE TABLE orders (id INTEGER, region TEXT, total REAL, placed TEXT, zip TEXT, raw BLOB)",
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO orders VALUES (1, 'north', 10.5, '2024-01-02', '02134', X'0001'), (2, 'south, east', 20, NULL, NULL, NULL), (3, 'west', 7.25, '2024-03-04', '10001', X'FF')",
         )
         .await
         .unwrap();
     }
-    let url = format!("sqlite://{}", source_path.display());
+    (source_dir, format!("sqlite://{}", source_path.display()))
+}
+
+#[tokio::test]
+async fn sqlite_sources_import_as_typed_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-import").unwrap();
+    let writer = writer_of(&db);
+    let (_source_dir, url) = sqlite_orders_source().await;
     let request = ImportRequest {
         source_table: Some(String::from("orders")),
         ..ImportRequest::new(url.clone(), String::from("Orders Import"))
@@ -3619,10 +3626,31 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
     .unwrap();
     assert_eq!(summary.table, "Orders_Import");
     assert_eq!(summary.rows, 3);
-    assert_eq!(summary.columns, ["id", "region", "total", "placed"]);
+    assert_eq!(
+        summary.columns,
+        ["id", "region", "total", "placed", "zip", "raw"]
+    );
     assert_eq!(summary.source, url);
+    // The source's types arrive as typed columns: an integer id, a double
+    // total, a date, text that keeps its leading zero, a blob as base64.
+    let types = db
+        .execute_query(
+            "SELECT typeof(id), typeof(region), typeof(total), typeof(placed), typeof(zip), typeof(raw) FROM Orders_Import LIMIT 1",
+        )
+        .unwrap();
+    assert_eq!(
+        types.rows,
+        vec![vec![
+            serde_json::json!("BIGINT"),
+            serde_json::json!("VARCHAR"),
+            serde_json::json!("DOUBLE"),
+            serde_json::json!("DATE"),
+            serde_json::json!("VARCHAR"),
+            serde_json::json!("VARCHAR"),
+        ]]
+    );
     let rows = db
-        .execute_query("SELECT region, total, placed FROM Orders_Import ORDER BY id")
+        .execute_query("SELECT region, total, placed, zip, raw FROM Orders_Import ORDER BY id")
         .unwrap();
     assert_eq!(
         rows.rows,
@@ -3630,17 +3658,23 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
             vec![
                 serde_json::json!("north"),
                 serde_json::json!(10.5),
-                serde_json::json!("2024-01-02")
+                serde_json::json!("2024-01-02"),
+                serde_json::json!("02134"),
+                serde_json::json!("AAE=")
             ],
             vec![
                 serde_json::json!("south, east"),
                 serde_json::json!(20.0),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
                 serde_json::Value::Null
             ],
             vec![
                 serde_json::json!("west"),
                 serde_json::json!(7.25),
-                serde_json::json!("2024-03-04")
+                serde_json::json!("2024-03-04"),
+                serde_json::json!("10001"),
+                serde_json::json!("/w==")
             ],
         ]
     );
@@ -3651,14 +3685,21 @@ async fn sqlite_sources_import_as_tables_with_every_column_as_text_then_sniffed(
         doc.tables.as_deref(),
         Some(&[String::from("Orders_Import")][..])
     );
+}
 
-    // A query with a limit, into another table.
+#[tokio::test]
+async fn sqlite_import_runs_a_query_under_its_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-import").unwrap();
+    let writer = writer_of(&db);
+    let (_source_dir, url) = sqlite_orders_source().await;
     let request = ImportRequest {
         query: Some(String::from(
             "SELECT region, total * 2 AS doubled FROM orders ORDER BY id",
         )),
         limit: Some(2),
-        ..ImportRequest::new(url.clone(), String::from("big"))
+        ..ImportRequest::new(url, String::from("big"))
     };
     let summary = import::Importing {
         config: &config,

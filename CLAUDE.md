@@ -544,7 +544,7 @@ Bearer resource_metadata=...` on 401, so MCP clients can sign users in themselve
 
 External data comes in through `quack_core::import` (`quack import`, `POST .../import`, the
 Tables page form, `/import` in the terminal): a query runs on a SQLite file, opened read-only
-by path, with every column cast to text through sqlx, or a CSV, Parquet, JSON, or workbook
+by path, each column keeping the type SQLite reports (a blob as base64 text), or a CSV, Parquet, JSON, or workbook
 file is fetched over HTTP(S) (with `import::SourceHeader`s: given ones, or a bearer token read
 from `--bearer-env` at fetch time; `JsonPointer` picks the rows of an enveloped JSON) or from S3
 (`import::s3`, a GET signed by `llm::bedrock::Signer::s3` with the AWS SDK's credentials), and
