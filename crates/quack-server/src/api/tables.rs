@@ -9,6 +9,7 @@ use crate::auth::{Access, Identity, Need};
 use crate::error::{ApiError, ApiResult};
 use crate::state::{App, with_db};
 use quack_core::analysis::table_search;
+use quack_core::completion::{SqlCompletion, SqlVocabulary};
 use quack_core::graph::views;
 use quack_core::storage::profile::{ColumnType, Retype, TableNote};
 use quack_core::storage::workspace::{
@@ -42,9 +43,9 @@ pub(crate) async fn list(
     Ok(Json(TableList { tables }))
 }
 
-/// Every user table with its columns, each name as a statement writes it,
-/// for the SQL editor's completion. Capped (`SqlSchema::MAX_TABLES` and
-/// `MAX_COLUMNS`), with `truncated` set when something was left out.
+/// Every user table with its columns, each name as a statement writes it.
+/// Capped (`SqlSchema::MAX_TABLES` and `MAX_COLUMNS`), with `truncated` set
+/// when something was left out.
 #[utoipa::path(
     get,
     path = "/workspaces/{id}/tables/schema",
@@ -60,6 +61,53 @@ pub(crate) async fn schema(
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::List, "schema").await?;
     Ok(Json(app.read(&id, WorkspaceDb::sql_schema).await?))
+}
+
+/// A statement being typed and the cursor's position in it, in characters.
+/// In the body: the statement is workspace content, and a URL ends up in
+/// logs.
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CompleteSql {
+    pub sql: String,
+    pub cursor: usize,
+}
+
+/// What the statement can take at the cursor: table and column names where
+/// the statement takes them, then `DuckDB`'s keywords and functions in an
+/// expression (`quack_core::completion`, the completer the terminal uses).
+/// `items` is empty where nothing fits. Audited as `complete` without the
+/// statement.
+#[utoipa::path(
+    post,
+    path = "/workspaces/{id}/sql/complete",
+    tag = "tables",
+    request_body = CompleteSql,
+    params(WorkspaceId),
+    responses((status = 200, description = "The completion", body = SqlCompletion)),
+)]
+pub(crate) async fn complete(
+    State(app): State<App>,
+    identity: Identity,
+    Path(id): Path<WorkspaceId>,
+    Json(body): Json<CompleteSql>,
+) -> ApiResult<Json<SqlCompletion>> {
+    let access = Access::resolve(&app, identity, &id, Need::READ).await?;
+    access
+        .audit_read(&app, AuditAction::Complete, "sql")
+        .await?;
+    let words = SqlVocabulary::duckdb()?;
+    let CompleteSql { sql, cursor } = body;
+    let found = app
+        .read(&id, move |db| {
+            let schema = db.sql_schema()?;
+            Ok(SqlCompletion::for_sql(&sql, cursor, &schema, &words))
+        })
+        .await?;
+    Ok(Json(found.unwrap_or(SqlCompletion {
+        start: cursor,
+        end: cursor,
+        items: Vec::new(),
+    })))
 }
 
 /// The table to describe. In the body, not the path: a table's name is

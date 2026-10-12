@@ -60,20 +60,10 @@ impl Table {
         format!("| {} |", cells.join(" | "))
     }
 
-    /// The CSV the workspace's reader loads, header first.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a row cannot be written.
-    pub fn csv(&self) -> std::io::Result<Vec<u8>> {
-        let mut writer = csv::Writer::from_writer(Vec::new());
-        let header: Vec<String> = self.header.iter().map(|c| c.replace("\\|", "|")).collect();
-        writer.write_record(&header)?;
-        for row in &self.rows {
-            let cells: Vec<String> = row.iter().map(|c| c.replace("\\|", "|")).collect();
-            writer.write_record(&cells)?;
-        }
-        writer.into_inner().map_err(csv::IntoInnerError::into_error)
+    /// A cell as it was written, the pipe the rendering escaped restored.
+    #[must_use]
+    pub fn unescaped(cell: &str) -> String {
+        cell.replace("\\|", "|")
     }
 
     /// The header and the rows of a rendered table's lines, for a chunker
@@ -131,8 +121,7 @@ mod tests {
         let (header, body) = Table::split_rendered(&rendered).unwrap_or_default();
         assert_eq!(header.len(), 2);
         assert_eq!(body.len(), 2);
-        let csv = String::from_utf8(table.csv().unwrap_or_default()).unwrap_or_default();
-        assert_eq!(csv, "Item,Amount\nFlood | storm,\"1,200\"\nFire,\n");
+        assert_eq!(Table::unescaped("Flood \\| storm"), "Flood | storm");
     }
 
     #[test]

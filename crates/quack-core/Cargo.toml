@@ -56,6 +56,7 @@ sea-query     = { workspace = true, features = ["backend-sqlite", "derive"] }
 secrecy       = { workspace = true }
 serde         = { workspace = true, features = ["derive", "std"] }
 serde_json    = { workspace = true, features = ["std"] }
+sqlparser     = { workspace = true, features = ["std"] }
 sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 strsim        = { workspace = true }
 subtp         = { workspace = true }

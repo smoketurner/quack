@@ -58,6 +58,7 @@ impl EventClass {
             | AuditAction::Query
             | AuditAction::Search
             | AuditAction::Sql
+            | AuditAction::Complete
             | AuditAction::Export
             | AuditAction::Graph
             | AuditAction::SessionRead

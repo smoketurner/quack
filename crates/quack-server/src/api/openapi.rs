@@ -101,6 +101,7 @@ const COOKIE: &str = "session";
         tables::list,
         tables::describe,
         tables::schema,
+        tables::complete,
         tables::note,
         tables::retype,
         classify::label,

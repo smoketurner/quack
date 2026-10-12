@@ -2517,13 +2517,14 @@ fn piped_bytes_load_as_a_temporary_stdin_table() {
     );
 }
 
-/// A minimal two-sheet workbook with inline strings, enough for calamine.
+/// A minimal two-sheet workbook with inline strings and one date style
+/// (number format 14, cell style 1), enough for calamine.
 fn tiny_xlsx() -> Vec<u8> {
     use std::io::Write as _;
-    let parts: [(&str, &str); 6] = [
+    let parts: [(&str, &str); 7] = [
         (
             "[Content_Types].xml",
-            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>"#,
         ),
         (
             "_rels/.rels",
@@ -2535,7 +2536,11 @@ fn tiny_xlsx() -> Vec<u8> {
         ),
         (
             "xl/_rels/workbook.xml.rels",
-            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#,
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+        ),
+        (
+            "xl/styles.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="14" applyNumberFormat="1"/></cellXfs></styleSheet>"#,
         ),
         (
             "xl/worksheets/sheet1.xml",
@@ -2608,16 +2613,31 @@ async fn workbook_loads_one_table_per_sheet_and_delete_drops_them() {
         )
     );
 
+    // The columns keep the workbook's types: no CSV is written and sniffed.
+    let types = db
+        .execute_query(
+            "SELECT typeof(region), typeof(total), typeof(\"when\"), min(\"when\")::VARCHAR \
+             FROM Region_Sales_Sales_Q1 GROUP BY ALL",
+        )
+        .unwrap();
+    assert_eq!(
+        types.rows,
+        vec![vec![
+            serde_json::json!("VARCHAR"),
+            serde_json::json!("DOUBLE"),
+            serde_json::json!("DATE"),
+            serde_json::json!("2023-03-15"),
+        ]]
+    );
     let files_dir = config.workspace_files_dir("ws-xlsx");
     assert_eq!(
         std::fs::read_dir(&files_dir).unwrap().count(),
-        2,
-        "one CSV per sheet"
+        0,
+        "a workbook leaves no file behind"
     );
     assert!(db.delete_document(&result.document_id).unwrap());
     assert!(db.list_tables().unwrap().is_empty());
     assert!(db.document(&result.document_id).unwrap().is_none());
-    // The workbook and its per-sheet CSVs are gone from files/ too.
     assert_eq!(std::fs::read_dir(&files_dir).unwrap().count(), 0);
 }
 

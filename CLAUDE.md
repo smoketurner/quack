@@ -620,7 +620,10 @@ and `/w/{id}/jobs` is the web console's Jobs page; every workspace page carries 
 the same `Access::resolve` checks and the API's `Access` operations; `WebUser` redirects to `/login` instead
 of a 401; the built Tailwind CSS is committed (`make css-build` after template edits),
 htmx, ECharts, and Redoc are vendored, and the SQL page's CodeMirror editor is bundled from
-`crates/quack-server/editor/` (`make editor-build`, bundle committed; `docs/web-ui.md`). The API's
+`crates/quack-server/editor/` (`make editor-build`, bundle committed; `docs/web-ui.md`); its
+completion is `POST .../sql/complete`, answered by `quack_core::completion` (the completer the
+terminal's popup uses: names where the statement takes them, then DuckDB's own keywords and
+functions), audited as `complete`. The API's
 contract is `api/openapi.rs`: an OpenAPI 3.1 document generated with `utoipa` from a
 `#[utoipa::path]` on every handler and `ToSchema` on every request and response type (core
 types included), served at `/api/v1/openapi.json` and rendered by Redoc at `/api/v1/docs`,
