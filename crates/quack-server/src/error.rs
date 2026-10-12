@@ -159,15 +159,12 @@ impl ErrorCode {
             // happens, another process lets go of the workspace file, or a
             // quack new enough for the file runs.
             CoreError::AuthRequired { .. } => (Self::AuthRequired, StatusCode::SERVICE_UNAVAILABLE),
-            CoreError::WorkspaceLocked { .. } => {
-                (Self::WorkspaceLocked, StatusCode::SERVICE_UNAVAILABLE)
-            }
             // The server holds its workspaces, so it never reads through
-            // another process; these name the same condition from the other
-            // side.
-            CoreError::ForwardedWriteRefused { .. } | CoreError::Forward { .. } => {
-                (Self::WorkspaceLocked, StatusCode::SERVICE_UNAVAILABLE)
-            }
+            // another process; the forwarding errors name the same condition
+            // from the other side.
+            CoreError::WorkspaceLocked { .. }
+            | CoreError::ForwardedWriteRefused { .. }
+            | CoreError::Forward { .. } => (Self::WorkspaceLocked, StatusCode::SERVICE_UNAVAILABLE),
             CoreError::WorkspaceTooNew { .. } => {
                 (Self::WorkspaceTooNew, StatusCode::SERVICE_UNAVAILABLE)
             }

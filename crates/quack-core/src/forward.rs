@@ -537,7 +537,12 @@ mod tests {
         let paths = Paths::of(&config, "ws");
         let mut record: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&paths.token).unwrap()).unwrap();
-        record["token"] = serde_json::Value::String(String::from("not-it"));
+        if let Some(fields) = record.as_object_mut() {
+            fields.insert(
+                String::from("token"),
+                serde_json::Value::String(String::from("not-it")),
+            );
+        }
         std::fs::write(&paths.token, record.to_string()).unwrap();
         let client = connect(&config, "ws").await.unwrap().unwrap();
         let err = client.query("SELECT 1").await.unwrap_err();

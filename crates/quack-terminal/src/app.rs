@@ -988,8 +988,13 @@ pub(crate) struct App {
     db: SharedDb,
     reader_db: ReaderDb,
     /// The socket another `quack` process reads this workspace through
-    /// while the session holds its lock (`quack_core::forward`).
-    _forward: Option<Listener>,
+    /// while the session holds its lock (`quack_core::forward`); held for
+    /// its drop, which removes the socket and token files.
+    #[expect(
+        dead_code,
+        reason = "held for its Drop: the socket and token files go when the session ends"
+    )]
+    forward: Option<Listener>,
     /// `--allow-write`: the agent's writes run without asking.
     allow_write: bool,
     /// `/scope`: the documents questions are limited to; every document
@@ -1060,7 +1065,7 @@ impl App {
             workspace_id,
             db,
             reader_db,
-            _forward: None,
+            forward: None,
             allow_write: writes.allows_unasked(),
             scope: DocumentScope::default(),
             expand_steps: false,
@@ -1121,7 +1126,7 @@ impl App {
         )
         .await
         {
-            Ok(listener) => self._forward = Some(listener),
+            Ok(listener) => self.forward = Some(listener),
             Err(e) => {
                 tracing::warn!(error = %e, "other quack processes cannot read this workspace through the session");
             }
