@@ -219,22 +219,6 @@ async fn a_created_workspace_opens_by_name() {
     assert_eq!(control.list_workspaces().await.unwrap().len(), 1);
 }
 
-/// With no `-w`, a new data directory gets the default workspace.
-#[tokio::test]
-#[expect(clippy::unwrap_used, reason = "test")]
-async fn no_workspace_flag_creates_the_default_on_a_fresh_data_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = config_in(dir.path());
-    let opened = OpenedWorkspace::in_config(config.clone(), None)
-        .await
-        .unwrap();
-    assert_eq!(opened.name, "default");
-    let again = OpenedWorkspace::in_config(config, Some("default"))
-        .await
-        .unwrap();
-    assert_eq!(again.workspace.id, opened.workspace.id);
-}
-
 #[test]
 fn auth_status_names_the_actor_only_when_one_is_sent() {
     let token = TokenStatus {

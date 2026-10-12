@@ -87,7 +87,8 @@ depends on `quack-core` alone.
 | `import_cli` | `quack import` and its saved imports |
 | `classify_cli` | `quack classify` and `/classify`: the arguments, what is drafted, previewed, and asked (`Prepared`), the questions shown, and the run listing |
 | `args` | `ModeArg`, `ExportFlags`, and `QueryFormat`, the arguments the command line and the slash commands share |
-| `confirm`, `stdio`, `text_or_json`, `session` | the confirmation prompt, named stdin and file inputs, the text-or-JSON output choice, and finding a session by id prefix |
+| `workspace` | `OpenedWorkspace`: the workspace a command runs in (`-w`, which must exist, or the default, created on first use), its `Egress` scope, its connection, its writer thread and reader pool; the binary, the terminal's setup, and the desktop app open a workspace through it |
+| `confirm`, `stdio`, `text_or_json`, `session` | the confirmation prompt, named stdin and file inputs, the text-or-JSON output choice, finding a session by id prefix, and choosing the session a run continues (`SessionChoice`, `resolve_session`) |
 
 ## `quack-server`
 

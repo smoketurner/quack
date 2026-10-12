@@ -56,11 +56,11 @@ use std::time::Duration;
 use quack_cli::Confirm;
 use quack_cli::TextOrJson;
 use quack_cli::classify_cli::ClassifyCommand;
-use quack_cli::find_session;
 use quack_cli::{AnswerTo, FOLLOW_UP_GRACE, PrintTurn, TurnOutcome};
 use quack_cli::{ExportFlags, ModeArg, QueryFormat};
 use quack_cli::{ImportAction, ImportArgs, ImportContext};
 use quack_cli::{NamedInput, StdioPath};
+use quack_cli::{OpenedWorkspace, SessionChoice, find_session, resolve_session};
 use quack_cli::{embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
 
 use quack_server::ServeMode;
@@ -1763,16 +1763,6 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     Ok(ExitCode::SUCCESS)
 }
 
-/// Which session a run continues.
-#[derive(Debug, Clone, Copy)]
-enum SessionChoice<'a> {
-    New,
-    /// `--continue`: the most recent one, or a new one when there is none.
-    Latest,
-    /// `--resume ID`: this one (prefixes accepted).
-    Resume(&'a str),
-}
-
 impl Cli {
     fn session_choice(&self) -> SessionChoice<'_> {
         match (self.resume.as_deref(), self.continue_latest) {
@@ -1781,32 +1771,6 @@ impl Cli {
             (None, false) => SessionChoice::New,
         }
     }
-}
-
-/// Pick the session for this run: the latest with `--continue`, a specific
-/// one with `--resume`, otherwise a new one for the configured chat model.
-/// `--mode` sets the mode on a new session and overrides it on a resumed one.
-fn resolve_session(
-    config: &Config,
-    db: &WorkspaceDb,
-    choice: SessionChoice<'_>,
-    mode: Option<ChatMode>,
-) -> Result<SessionId> {
-    let existing = match choice {
-        SessionChoice::Resume(prefix) => Some(find_session(db, prefix)?.id),
-        SessionChoice::Latest => sessions::latest_session(db)?.map(|s| s.id),
-        SessionChoice::New => None,
-    };
-    if let Some(id) = existing {
-        if let Some(mode) = mode {
-            sessions::set_session_mode(db, &id, mode)?;
-        }
-        return Ok(id);
-    }
-    let model = config
-        .chat_model_ref()
-        .map_or_else(|_| String::from("unconfigured"), |m| m.to_string());
-    Ok(sessions::create_session(db, &model, mode.unwrap_or_default(), None)?.id)
 }
 
 fn run_context(db: &WorkspaceDb, action: ContextAction) -> Result<()> {
@@ -2108,313 +2072,259 @@ fn init_logging_as(default: &str, format: LogFormat) {
     CryptoModule::linked().log();
 }
 
-/// The configuration and the workspace a command runs in: the one `-w`
-/// names, which must exist, or the default, created on first use.
-struct OpenedWorkspace {
-    config: Config,
-    workspace: WorkspaceRow,
-    name: String,
+/// `quack ingest DIR`: an OKF bundle, or every supported file under the
+/// folder. The per-file flags have no meaning for a folder.
+async fn ingest_dir(
+    opened: &OpenedWorkspace,
+    dir: &Path,
+    per_file: bool,
+    no_embed: bool,
+    prune: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        !per_file,
+        "--replace, --pin, --title, --filename, --author, --authored, --tag, and --types take one file, not a directory"
+    );
+    if Bundle::is_dir(dir) {
+        return ingest_bundle(opened, &dir.display().to_string(), no_embed).await;
+    }
+    let prune = if prune { Prune::Delete } else { Prune::Keep };
+    ingest_folder(opened, dir, no_embed, prune).await
 }
 
-impl OpenedWorkspace {
-    async fn resolve(workspace_name: Option<&str>) -> Result<Self> {
-        let config = Config::load().context("failed to load configuration")?;
-        Self::in_config(config, workspace_name).await
-    }
-
-    /// The workspace `workspace_name` selects under `config`.
-    async fn in_config(config: Config, workspace_name: Option<&str>) -> Result<Self> {
-        let control = ControlPlane::open(&config)
+/// `quack ingest DIR` on a folder of files: every file quack can load
+/// becomes a document, one line each; a changed file replaces the document
+/// at its path, an unchanged one is skipped, unsupported files are listed,
+/// and documents whose file is gone are reported, or deleted with
+/// `--prune`. A file that fails is reported and fails the command once
+/// the rest have run.
+async fn ingest_folder(
+    opened: &OpenedWorkspace,
+    dir: &Path,
+    no_embed: bool,
+    prune: Prune,
+) -> Result<()> {
+    let (config, workspace_id) = (&opened.config, opened.workspace.id.as_str());
+    let ws_db = opened.writer()?;
+    let embedding_model = if no_embed {
+        None
+    } else {
+        Embeddings::from_config(config)
             .await
-            .context("failed to open control plane")?;
-        let workspace = control
-            .workspace_or_default(workspace_name, &config.general.default_workspace)
-            .await?;
-        let name = workspace.name.clone();
-        // The command sends only to the model providers the workspace allows.
-        Egress::Workspace(workspace.allowed_providers.clone()).enter();
-        Ok(Self {
-            config,
-            workspace,
-            name,
-        })
+            .context("failed to build embedding model")?
+    };
+    let progress = StderrProgress::new();
+    let report = Folder {
+        config,
+        db: &ws_db,
+        workspace_id,
+        root: dir,
+        embedder: embedding_model.as_ref(),
+        control: RunControl {
+            progress: &|done| progress.report(done),
+            cancel: None,
+        },
+        prune,
     }
-
-    /// The workspace's connection.
-    fn open_db(&self) -> Result<WorkspaceDb> {
-        WorkspaceDb::open(&self.config, self.workspace.id.as_str())
-            .context("failed to open workspace database")
-    }
-
-    /// The workspace's connection on a writer thread of its own: the
-    /// commands that run core's multi-step work (ingestion, import, graph
-    /// and ontology commands) send it their steps exactly as the server
-    /// and the terminal do.
-    fn writer(&self) -> Result<Writer> {
-        Writer::spawn(self.open_db()?).context("failed to start the workspace writer")
-    }
-
-    /// `db` moved onto its writer thread, and a reader pool over it, for
-    /// the commands that run agent turns.
-    async fn shared(&self, db: WorkspaceDb) -> Result<(SharedDb, ReaderDb)> {
-        let db: SharedDb =
-            Arc::new(Writer::spawn(db).context("failed to start the workspace writer")?);
-        let reader_db = ReaderDb::open(&db, self.config.analysis.reader_pool_size).await;
-        Ok((db, reader_db))
-    }
-
-    /// `quack ingest DIR`: an OKF bundle, or every supported file under the
-    /// folder. The per-file flags have no meaning for a folder.
-    async fn ingest_dir(
-        &self,
-        dir: &Path,
-        per_file: bool,
-        no_embed: bool,
-        prune: bool,
-    ) -> Result<()> {
-        anyhow::ensure!(
-            !per_file,
-            "--replace, --pin, --title, --filename, --author, --authored, --tag, and --types take one file, not a directory"
-        );
-        if Bundle::is_dir(dir) {
-            return self
-                .ingest_bundle(&dir.display().to_string(), no_embed)
-                .await;
-        }
-        let prune = if prune { Prune::Delete } else { Prune::Keep };
-        self.ingest_folder(dir, no_embed, prune).await
-    }
-
-    /// `quack ingest DIR` on a folder of files: every file quack can load
-    /// becomes a document, one line each; a changed file replaces the document
-    /// at its path, an unchanged one is skipped, unsupported files are listed,
-    /// and documents whose file is gone are reported, or deleted with
-    /// `--prune`. A file that fails is reported and fails the command once
-    /// the rest have run.
-    async fn ingest_folder(&self, dir: &Path, no_embed: bool, prune: Prune) -> Result<()> {
-        let (config, workspace_id) = (&self.config, self.workspace.id.as_str());
-        let ws_db = self.writer()?;
-        let embedding_model = if no_embed {
-            None
-        } else {
-            Embeddings::from_config(config)
-                .await
-                .context("failed to build embedding model")?
-        };
-        let progress = StderrProgress::new();
-        let report = Folder {
-            config,
-            db: &ws_db,
-            workspace_id,
-            root: dir,
-            embedder: embedding_model.as_ref(),
-            control: RunControl {
-                progress: &|done| progress.report(done),
-                cancel: None,
-            },
-            prune,
-        }
-        .run()
-        .await
-        .with_context(|| format!("ingesting {}", dir.display()))?;
-        let stdout = std::io::stdout();
-        let mut out = std::io::BufWriter::new(stdout.lock());
-        for FileResult { relative, outcome } in &report.results {
-            match outcome {
-                Outcome::Ingested(id) => writeln!(out, "ingested  {relative} ({id})")?,
-                Outcome::Replaced { old, new } => {
-                    writeln!(out, "replaced  {relative} ({old} -> {new})")?;
-                }
-                Outcome::Skipped(id) => writeln!(out, "skipped   {relative} (identical to {id})")?,
-                Outcome::Moved { document, from } => {
-                    writeln!(out, "moved     {from} -> {relative} ({document})")?;
-                }
-                Outcome::Failed(error) => writeln!(out, "failed    {relative}: {error}")?,
+    .run()
+    .await
+    .with_context(|| format!("ingesting {}", dir.display()))?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    for FileResult { relative, outcome } in &report.results {
+        match outcome {
+            Outcome::Ingested(id) => writeln!(out, "ingested  {relative} ({id})")?,
+            Outcome::Replaced { old, new } => {
+                writeln!(out, "replaced  {relative} ({old} -> {new})")?;
             }
-        }
-        if !report.unsupported.is_empty() {
-            writeln!(
-                out,
-                "Not ingested ({} unsupported): {}",
-                report.unsupported.len(),
-                report.unsupported.join(", ")
-            )?;
-        }
-        if !report.gone.is_empty() {
-            let names: Vec<String> = report
-                .gone
-                .iter()
-                .map(|d| {
-                    format!(
-                        "{} ({})",
-                        d.source_path.as_deref().unwrap_or(&d.filename),
-                        d.id
-                    )
-                })
-                .collect();
-            match report.pruned {
-                Prune::Delete => {
-                    writeln!(out, "Deleted ({} gone): {}", names.len(), names.join(", "))?;
-                }
-                Prune::Keep => writeln!(
-                    out,
-                    "Gone from {} ({}, still in the workspace; --prune deletes them): {}",
-                    dir.display(),
-                    names.len(),
-                    names.join(", ")
-                )?,
+            Outcome::Skipped(id) => writeln!(out, "skipped   {relative} (identical to {id})")?,
+            Outcome::Moved { document, from } => {
+                writeln!(out, "moved     {from} -> {relative} ({document})")?;
             }
+            Outcome::Failed(error) => writeln!(out, "failed    {relative}: {error}")?,
         }
-        out.flush()?;
-        let stored: Vec<DocumentId> = report
-            .results
-            .iter()
-            .filter_map(|r| match &r.outcome {
-                Outcome::Ingested(id) | Outcome::Replaced { new: id, .. } => Some(id.clone()),
-                Outcome::Skipped(_) | Outcome::Moved { .. } | Outcome::Failed(_) => None,
-            })
-            .collect();
-        self.follow_ingest(&ws_db, embedding_model.as_ref(), &stored, &mut out)
-            .await?;
-        out.flush()?;
-        let failed = report.failed();
-        if failed > 0 {
-            anyhow::bail!("{failed} of {} files failed", report.results.len());
-        }
-        Ok(())
     }
-
-    /// `quack ingest DIR` on an OKF bundle. Every concept file becomes a
-    /// Markdown document, its front matter and links feed the ontology review
-    /// queue, and `index.md` is offered as the workspace context.
-    async fn ingest_bundle(&self, dir: &str, no_embed: bool) -> Result<()> {
-        let (config, workspace_id) = (&self.config, self.workspace.id.as_str());
-        let bundle = Bundle::from_dir(&PathBuf::from(dir))?;
-        let ws_db = self.writer()?;
-        let embedding_model = if no_embed {
-            None
-        } else {
-            Embeddings::from_config(config)
-                .await
-                .context("failed to build embedding model")?
-        };
-        let stdout = std::io::stdout();
-        let mut out = std::io::BufWriter::new(stdout.lock());
-        let mut stored = 0usize;
-        let mut skipped = 0usize;
-        for file in bundle.documents() {
-            let front = okf::parse_front_matter(&file.content).front;
-            let name = file.document_name();
-            let outcome = ingestion::ingest_file(
-                config,
-                &ws_db,
-                workspace_id,
-                &NewFile::new(&name, file.content.as_bytes()).title(front.get("title")),
-                embedding_model.as_ref(),
-            )
-            .await
-            .with_context(|| format!("ingesting {}", file.path))?;
-            match outcome {
-                IngestOutcome::Ingested(_) => stored = stored.saturating_add(1),
-                IngestOutcome::Duplicate(_) => skipped = skipped.saturating_add(1),
-            }
-        }
+    if !report.unsupported.is_empty() {
         writeln!(
             out,
-            "Ingested {stored} concept files from {dir}{}.",
-            if skipped > 0 {
-                format!(" ({skipped} already present)")
-            } else {
-                String::new()
-            }
+            "Not ingested ({} unsupported): {}",
+            report.unsupported.len(),
+            report.unsupported.join(", ")
         )?;
-        let index_body = bundle
-            .index()
-            .map(|index| {
-                okf::parse_front_matter(&index.content)
-                    .body
-                    .trim()
-                    .to_owned()
-            })
-            .filter(|body| !body.is_empty());
-        // The ontology, the review queue, and the current context: one step on
-        // the writer.
-        let note = format!("restored from {dir}");
-        let (report, existing) = ws_db
-            .run(move |db| {
-                let report = bundle.restore_into(db, Revision::reviewed(None, Some(&note)))?;
-                Ok((report, context::current(db)?.map(|c| c.content)))
-            })
-            .await?;
-        if let Some(version) = report.restored {
-            writeln!(
-                out,
-                "Restored the bundle's ontology (version {version} in this workspace)."
-            )?;
-        }
-        if report.candidates > 0 {
-            writeln!(
-                out,
-                "{} ontology candidates from the bundle's types and links: `quack ontology review`.",
-                report.candidates
-            )?;
-        }
-        if let Some(body) = index_body {
-            if existing.as_deref() == Some(body.as_str()) {
-                writeln!(out, "index.md already is the workspace context.")?;
-            } else {
-                let question = format!(
-                    "index.md can become the workspace context{}. Apply it?",
-                    if existing.is_some() {
-                        " (replacing the current one)"
-                    } else {
-                        ""
-                    }
-                );
-                if Confirm::Ask.ask(&mut out, &question, None)? {
-                    let stored = ws_db.run(move |db| context::set(db, &body, None)).await?;
-                    writeln!(out, "context is now version {}", stored.version)?;
-                } else {
-                    writeln!(
-                        out,
-                        "Left the context alone; `quack context import {dir}/index.md` applies it later."
-                    )?;
-                }
-            }
-        }
-        out.flush()?;
-        Ok(())
     }
-
-    /// The graph extraction `[graph].follow_ingest` asks for after an ingest
-    /// or import, run here and reported in one line; nothing when it is off.
-    async fn follow_ingest(
-        &self,
-        db: &Writer,
-        embedder: Option<&Embeddings>,
-        documents: &[DocumentId],
-        out: &mut impl Write,
-    ) -> Result<()> {
-        let progress = StderrProgress::new();
-        let followed = FollowUp {
-            db,
-            config: &self.config,
-            embeddings: embedder,
+    if !report.gone.is_empty() {
+        let names: Vec<String> = report
+            .gone
+            .iter()
+            .map(|d| {
+                format!(
+                    "{} ({})",
+                    d.source_path.as_deref().unwrap_or(&d.filename),
+                    d.id
+                )
+            })
+            .collect();
+        match report.pruned {
+            Prune::Delete => {
+                writeln!(out, "Deleted ({} gone): {}", names.len(), names.join(", "))?;
+            }
+            Prune::Keep => writeln!(
+                out,
+                "Gone from {} ({}, still in the workspace; --prune deletes them): {}",
+                dir.display(),
+                names.len(),
+                names.join(", ")
+            )?,
         }
-        .run(
-            documents,
-            RunControl {
-                progress: &|done| progress.report(done),
-                cancel: None,
-            },
+    }
+    out.flush()?;
+    let stored: Vec<DocumentId> = report
+        .results
+        .iter()
+        .filter_map(|r| match &r.outcome {
+            Outcome::Ingested(id) | Outcome::Replaced { new: id, .. } => Some(id.clone()),
+            Outcome::Skipped(_) | Outcome::Moved { .. } | Outcome::Failed(_) => None,
+        })
+        .collect();
+    follow_ingest(opened, &ws_db, embedding_model.as_ref(), &stored, &mut out).await?;
+    out.flush()?;
+    let failed = report.failed();
+    if failed > 0 {
+        anyhow::bail!("{failed} of {} files failed", report.results.len());
+    }
+    Ok(())
+}
+
+/// `quack ingest DIR` on an OKF bundle. Every concept file becomes a
+/// Markdown document, its front matter and links feed the ontology review
+/// queue, and `index.md` is offered as the workspace context.
+async fn ingest_bundle(opened: &OpenedWorkspace, dir: &str, no_embed: bool) -> Result<()> {
+    let (config, workspace_id) = (&opened.config, opened.workspace.id.as_str());
+    let bundle = Bundle::from_dir(&PathBuf::from(dir))?;
+    let ws_db = opened.writer()?;
+    let embedding_model = if no_embed {
+        None
+    } else {
+        Embeddings::from_config(config)
+            .await
+            .context("failed to build embedding model")?
+    };
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut stored = 0usize;
+    let mut skipped = 0usize;
+    for file in bundle.documents() {
+        let front = okf::parse_front_matter(&file.content).front;
+        let name = file.document_name();
+        let outcome = ingestion::ingest_file(
+            config,
+            &ws_db,
+            workspace_id,
+            &NewFile::new(&name, file.content.as_bytes()).title(front.get("title")),
+            embedding_model.as_ref(),
         )
         .await
-        .context("graph follow-up failed")?;
-        if let Some(summary) = followed {
-            writeln!(out, "  Graph: {summary}")?;
+        .with_context(|| format!("ingesting {}", file.path))?;
+        match outcome {
+            IngestOutcome::Ingested(_) => stored = stored.saturating_add(1),
+            IngestOutcome::Duplicate(_) => skipped = skipped.saturating_add(1),
         }
-        Ok(())
     }
+    writeln!(
+        out,
+        "Ingested {stored} concept files from {dir}{}.",
+        if skipped > 0 {
+            format!(" ({skipped} already present)")
+        } else {
+            String::new()
+        }
+    )?;
+    let index_body = bundle
+        .index()
+        .map(|index| {
+            okf::parse_front_matter(&index.content)
+                .body
+                .trim()
+                .to_owned()
+        })
+        .filter(|body| !body.is_empty());
+    // The ontology, the review queue, and the current context: one step on
+    // the writer.
+    let note = format!("restored from {dir}");
+    let (report, existing) = ws_db
+        .run(move |db| {
+            let report = bundle.restore_into(db, Revision::reviewed(None, Some(&note)))?;
+            Ok((report, context::current(db)?.map(|c| c.content)))
+        })
+        .await?;
+    if let Some(version) = report.restored {
+        writeln!(
+            out,
+            "Restored the bundle's ontology (version {version} in this workspace)."
+        )?;
+    }
+    if report.candidates > 0 {
+        writeln!(
+            out,
+            "{} ontology candidates from the bundle's types and links: `quack ontology review`.",
+            report.candidates
+        )?;
+    }
+    if let Some(body) = index_body {
+        if existing.as_deref() == Some(body.as_str()) {
+            writeln!(out, "index.md already is the workspace context.")?;
+        } else {
+            let question = format!(
+                "index.md can become the workspace context{}. Apply it?",
+                if existing.is_some() {
+                    " (replacing the current one)"
+                } else {
+                    ""
+                }
+            );
+            if Confirm::Ask.ask(&mut out, &question, None)? {
+                let stored = ws_db.run(move |db| context::set(db, &body, None)).await?;
+                writeln!(out, "context is now version {}", stored.version)?;
+            } else {
+                writeln!(
+                    out,
+                    "Left the context alone; `quack context import {dir}/index.md` applies it later."
+                )?;
+            }
+        }
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// The graph extraction `[graph].follow_ingest` asks for after an ingest
+/// or import, run here and reported in one line; nothing when it is off.
+async fn follow_ingest(
+    opened: &OpenedWorkspace,
+    db: &Writer,
+    embedder: Option<&Embeddings>,
+    documents: &[DocumentId],
+    out: &mut impl Write,
+) -> Result<()> {
+    let progress = StderrProgress::new();
+    let followed = FollowUp {
+        db,
+        config: &opened.config,
+        embeddings: embedder,
+    }
+    .run(
+        documents,
+        RunControl {
+            progress: &|done| progress.report(done),
+            cancel: None,
+        },
+    )
+    .await
+    .context("graph follow-up failed")?;
+    if let Some(summary) = followed {
+        writeln!(out, "  Graph: {summary}")?;
+    }
+    Ok(())
 }
 
 async fn run_query(
@@ -2483,7 +2393,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
             || authored.is_some()
             || !tags.is_empty()
             || !types.is_empty();
-        return opened.ingest_dir(dir, per_file, no_embed, prune).await;
+        return ingest_dir(&opened, dir, per_file, no_embed, prune).await;
     }
     if prune {
         anyhow::bail!("--prune goes with a folder");
@@ -2551,14 +2461,14 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     }
     report_ingested(&mut out, &result, pin)?;
     out.flush()?;
-    opened
-        .follow_ingest(
-            &ws_db,
-            embedding_model.as_ref(),
-            &[result.document_id],
-            &mut out,
-        )
-        .await?;
+    follow_ingest(
+        &opened,
+        &ws_db,
+        embedding_model.as_ref(),
+        &[result.document_id],
+        &mut out,
+    )
+    .await?;
     out.flush()?;
     Ok(())
 }
