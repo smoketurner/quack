@@ -76,18 +76,21 @@ jobs:
           shared-key: "debug-${{ runner.os }}"
           save-if: false
       - name: Install and start Ollama
-        # The service the install script starts is replaced by one with a
-        # context window the agent's prompt fits in (tables, documents, and
-        # tool guidance run past Ollama's default).
+        uses: ai-action/setup-ollama@6782d243db5fbcbf7583532ce0b5122f64242689 # v2.1.5
+        with:
+          version: ${{ env.OLLAMA_VERSION }}
+        env:
+          # The server the action starts inherits this: the agent's prompt
+          # (tables, documents, and tool guidance) runs past Ollama's default
+          # context window.
+          OLLAMA_CONTEXT_LENGTH: "16384"
+      - name: Wait for Ollama
+        # The action returns once the server is started, not once it answers.
         run: |
-          curl -fsSL https://ollama.com/install.sh | sh
-          sudo systemctl stop ollama || true
-          OLLAMA_CONTEXT_LENGTH=16384 nohup ollama serve > ollama.log 2>&1 &
           for _ in $(seq 1 30); do
             curl -sf http://127.0.0.1:11434/api/version && exit 0
             sleep 1
           done
-          cat ollama.log
           exit 1
       - name: Pull the models
         run: |
@@ -121,5 +124,4 @@ jobs:
             eval.json
             eval.txt
             eval.log
-            ollama.log
           if-no-files-found: ignore
