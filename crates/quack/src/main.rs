@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::search::{DocumentSearch, SearchDetail};
-use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
+use quack_core::analysis::tools::Rerank;
 use quack_core::config::inspect::SettingFilter;
 use quack_core::config::{Config, Grant, LogFormat};
 use quack_core::crypto::{self, CryptoModule};
@@ -20,7 +20,7 @@ use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::export::Destination;
 use quack_core::graph::follow_up::FollowUp;
-use quack_core::ids::{DocumentId, SessionId};
+use quack_core::ids::DocumentId;
 use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::tree::{FileResult, Folder, Outcome, Prune};
 use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile, Piped};
@@ -35,7 +35,7 @@ use quack_core::ontology::store::Revision;
 use quack_core::progress::RunControl;
 use quack_core::proxy::Proxies;
 use quack_core::storage::context;
-use quack_core::storage::control::{ControlPlane, WorkspaceRow};
+use quack_core::storage::control::ControlPlane;
 use quack_core::storage::profile::{ColumnTypes, TableProfile};
 use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, SessionViewer, Sharing, Transcript,
