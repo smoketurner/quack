@@ -1119,9 +1119,11 @@ that would exceed what is left is skipped with a visible "(omitted)" line, not t
 | Postgres, MySQL | Not supported: `postgres://` and `mysql://` URLs are refused. Export the rows to a file, or put the file behind HTTP(S). The scanner extensions stay out (section 15). | — |
 | S3 | `quack import s3://BUCKET/KEY --table T`: a `SigV4`-signed GET (`aws-sigv4`, the `import::s3` module), with the credentials and region the AWS SDK finds as the AWS CLI does, through the same proxies; `AWS_ENDPOINT_URL_S3` names an S3-compatible store. A bucket in another region is signed again for it once. The httpfs extension stays out (section 15). | Table in `data.duckdb` |
 
-**Import.** sqlx opens a SQLite file read-only by path and runs the query with every
-column cast to text; a download or an S3 object is fetched whole. Rows
-pass through `files/<table>.csv` and `read_csv_auto`, so `DuckDB` sniffs the types. The table
+**Import.** sqlx opens a SQLite file read-only by path and runs the query, each cell
+carried with the type SQLite reports (integer, real, text, null; a blob as base64 text); a
+download or an S3 object is fetched whole. A query's rows pass through
+`files/<table>.jsonl` and `read_json_auto`, so the columns load typed, with leading zeros
+kept and NULL still NULL. The table
 is a document (source `import`, title the redacted URL), deletable like any other. The URL's
 password and every header value are used once and never stored; audit rows carry the
 redacted URL and the headers' names. Caps:
@@ -3678,7 +3680,7 @@ Every gap is a GitHub issue unless the item says otherwise.
    each format carrying its own title. Sections 6.1, 6.2.
 6. ~~No `ATTACH` to external databases~~ (#21, closed): `quack import`, the Rust-side
    replacement, snapshots a SQLite query or a data file over HTTP(S) into a
-   workspace table through the CSV path (`quack_core::import`). A live `ATTACH` (queries
+   workspace table through the upload path (`quack_core::import`). A live `ATTACH` (queries
    pushed to the source) is not offered: the scanner extensions cannot ship in the static
    binary, and a snapshot keeps the classification boundary simple, since the rows live in
    the workspace file like any upload. Postgres and MySQL are not offered; S3 is the next
