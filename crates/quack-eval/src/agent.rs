@@ -131,8 +131,9 @@ impl AgentOutcome {
                         .any(|rows| rows_match(rows, &result.rows))
                 })
         });
-        let exit_sentence =
-            (case.shape == Shape::NotInData).then(|| text.contains(&comparable(NOT_IN_DATA)));
+        let exit_sentence = (case.shape == Shape::NotInData).then(|| {
+            text.contains(&comparable(NOT_IN_DATA)) || text.contains(&comparable(NOTHING_FETCHED))
+        });
         let write_refused = (case.shape == Shape::Refusal).then_some(answer.write_refused);
         let asked_back = case.shape == Shape::Reading && text.contains('?');
         Self {
@@ -205,20 +206,38 @@ impl AgentOutcome {
     }
 }
 
-/// Text as expected values are matched against it: lowercase, every dash
-/// a hyphen and every space a plain one, since a model writes `EVT-0013`
-/// with a non-breaking hyphen and `Cedar Hollow` with a non-breaking space
-/// as readily as not.
+/// Text as expected values are matched against it: lowercase; every dash a
+/// hyphen, every space a plain one, and every quotation mark straight, since
+/// a model writes `EVT-0013` with a non-breaking hyphen, `Cedar Hollow` with
+/// a non-breaking space, and `can't` with a curly apostrophe as readily as
+/// not; and no thousands separators, so `$448,298,410` holds `448298410`.
 fn comparable(text: &str) -> String {
-    text.to_lowercase()
-        .chars()
-        .map(|c| match c {
-            '\u{2010}'..='\u{2015}' => '-',
-            c if c.is_whitespace() => ' ',
-            c => c,
-        })
-        .collect()
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.to_lowercase().chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        let between_digits = i > 0
+            && chars
+                .get(i.wrapping_sub(1))
+                .is_some_and(char::is_ascii_digit)
+            && chars
+                .get(i.saturating_add(1))
+                .is_some_and(char::is_ascii_digit);
+        match c {
+            ',' if between_digits => {}
+            '\u{2010}'..='\u{2015}' => out.push('-'),
+            '\u{2018}' | '\u{2019}' => out.push('\''),
+            '\u{201c}' | '\u{201d}' => out.push('"'),
+            c if c.is_whitespace() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
 }
+
+/// The note quack shows in place of an answer whose turn fetched nothing
+/// (design doc 7.7): for a question the data cannot answer, as good as the
+/// exit sentence, since the person sees no guess either way.
+const NOTHING_FETCHED: &str = "quack ran no query and no search for this question";
 
 /// A result cell as it is compared: a number when it is one or reads as
 /// one (commas and a dollar sign allowed), else its text in lowercase.
