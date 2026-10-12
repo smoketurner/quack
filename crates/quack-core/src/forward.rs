@@ -139,10 +139,10 @@ mod unix {
     }
 
     fn refuse(path: &Path, what: &str) -> Error {
-        Error::Forward {
-            holder: String::from(SOMEONE),
-            message: format!("{} {what}; refusing to use it", path.display()),
-        }
+        Error::Forward(format!(
+            "{} {what}; refusing to use it (the workspace is open in {SOMEONE})",
+            path.display()
+        ))
     }
 
     /// `path` is a `kind` file this user owns. Symlinks are not followed, so
@@ -190,13 +190,10 @@ mod unix {
     fn check_peer(stream: &UnixStream) -> Result<()> {
         let cred = stream.peer_cred()?;
         if cred.uid() != current_uid() {
-            return Err(Error::Forward {
-                holder: String::from(SOMEONE),
-                message: format!(
-                    "the other end of the socket runs as uid {}, not this user; refusing it",
-                    cred.uid()
-                ),
-            });
+            return Err(Error::Forward(format!(
+                "the other end of the socket runs as uid {}, not this user; refusing it",
+                cred.uid()
+            )));
         }
         Ok(())
     }
@@ -231,13 +228,10 @@ mod unix {
             if paths.socket.exists() {
                 check_owned(&paths.socket, Kind::Socket)?;
                 if UnixStream::connect(&paths.socket).await.is_ok() {
-                    return Err(Error::Forward {
-                        holder: holder.to_owned(),
-                        message: format!(
-                            "another process already answers on {}",
-                            paths.socket.display()
-                        ),
-                    });
+                    return Err(Error::Forward(format!(
+                        "{holder} cannot listen: another process already answers on {}",
+                        paths.socket.display()
+                    )));
                 }
                 std::fs::remove_file(&paths.socket)?;
             }
@@ -467,10 +461,7 @@ mod unix {
         }
 
         fn failed(&self, message: String) -> Error {
-            Error::Forward {
-                holder: self.holder.clone(),
-                message,
-            }
+            Error::Forward(format!("reading through {} failed: {message}", self.holder))
         }
     }
 }
@@ -521,10 +512,10 @@ mod other {
         ///
         /// Never constructed, so never called.
         pub async fn query(&self, _sql: &str) -> Result<QueryResults> {
-            Err(crate::error::Error::Forward {
-                holder: self.holder.clone(),
-                message: String::from("read forwarding needs Unix sockets"),
-            })
+            Err(crate::error::Error::Forward(format!(
+                "reading through {} failed: read forwarding needs Unix sockets",
+                self.holder
+            )))
         }
     }
 
@@ -614,7 +605,7 @@ mod tests {
             "{refused}"
         );
         let failed = client.query("SELECT FROM").await.unwrap_err();
-        assert!(matches!(failed, Error::Forward { .. }), "{failed}");
+        assert!(matches!(failed, Error::Forward(_)), "{failed}");
 
         let paths = Paths::of(&config, "ws");
         for path in [&paths.socket, &paths.token] {
@@ -647,7 +638,7 @@ mod tests {
         chmod(&paths.socket, 0o666);
         let err = connect(&config, "ws").await.unwrap_err();
         assert!(
-            matches!(&err, Error::Forward { message, .. } if message.contains("reachable by others (mode 666)")),
+            matches!(&err, Error::Forward(message) if message.contains("reachable by others (mode 666)")),
             "{err}"
         );
         chmod(&paths.socket, 0o600);
@@ -655,7 +646,7 @@ mod tests {
         chmod(&paths.token, 0o640);
         let err = connect(&config, "ws").await.unwrap_err();
         assert!(
-            matches!(&err, Error::Forward { message, .. } if message.contains("reachable by others (mode 640)")),
+            matches!(&err, Error::Forward(message) if message.contains("reachable by others (mode 640)")),
             "{err}"
         );
         chmod(&paths.token, 0o600);
@@ -665,7 +656,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &paths.token).unwrap();
         let err = connect(&config, "ws").await.unwrap_err();
         assert!(
-            matches!(&err, Error::Forward { message, .. } if message.contains("is not a regular file")),
+            matches!(&err, Error::Forward(message) if message.contains("is not a regular file")),
             "{err}"
         );
         std::fs::remove_file(&paths.token).unwrap();
@@ -699,7 +690,7 @@ mod tests {
         let client = connect(&config, "ws").await.unwrap().unwrap();
         let err = client.query("SELECT 1").await.unwrap_err();
         assert!(
-            matches!(&err, Error::Forward { message, .. } if message.contains("token")),
+            matches!(&err, Error::Forward(message) if message.contains("token")),
             "{err}"
         );
     }

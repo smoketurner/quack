@@ -164,7 +164,7 @@ impl ErrorCode {
             // from the other side.
             CoreError::WorkspaceLocked { .. }
             | CoreError::ForwardedWriteRefused { .. }
-            | CoreError::Forward { .. } => (Self::WorkspaceLocked, StatusCode::SERVICE_UNAVAILABLE),
+            | CoreError::Forward(_) => (Self::WorkspaceLocked, StatusCode::SERVICE_UNAVAILABLE),
             CoreError::WorkspaceTooNew { .. } => {
                 (Self::WorkspaceTooNew, StatusCode::SERVICE_UNAVAILABLE)
             }

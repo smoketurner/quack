@@ -129,9 +129,10 @@ pub enum Error {
     ForwardedWriteRefused { holder: String },
 
     /// A read sent to the process holding the workspace failed there, or
-    /// the exchange broke.
-    #[error("reading through {holder} failed: {message}")]
-    Forward { holder: String, message: String },
+    /// the exchange broke; the message names the holder. One field, so the
+    /// variant does not grow `Error` (and every future holding a `Result`).
+    #[error("{0}")]
+    Forward(String),
 
     /// A newer quack upgraded the workspace file past the schema this one
     /// knows; it is left as it was.
