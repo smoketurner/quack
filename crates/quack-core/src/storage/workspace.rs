@@ -3601,6 +3601,30 @@ impl WorkspaceDb {
         Ok((results, digest.map(ResultDigest::finish)))
     }
 
+    /// Append `rows` to `table` through `DuckDB`'s appender, one value per
+    /// column in the table's column order; a typed load with no file in
+    /// between (a workbook's sheets, a table found inside a document).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table does not exist or a value does not
+    /// fit its column's type.
+    pub fn append_rows<I>(&self, table: &str, rows: I) -> Result<()>
+    where
+        I: IntoIterator<Item = Vec<duckdb::types::Value>>,
+    {
+        let mut appender = self.conn.appender(table)?;
+        for row in rows {
+            let params: Vec<&dyn duckdb::types::ToSql> = row
+                .iter()
+                .map(|v| -> &dyn duckdb::types::ToSql { v })
+                .collect();
+            appender.append_row(params.as_slice())?;
+        }
+        appender.flush()?;
+        Ok(())
+    }
+
     /// Execute a SQL statement that does not return rows.
     ///
     /// # Errors

@@ -48,7 +48,7 @@ use budget::DecompressionBudget;
 use chunker::Chunker;
 use parser::{
     DocumentMeta, Extracted, FileType, ImageFormat, Load, PageCounts, Reader, Section, SectionKind,
-    Separator, TextFormat,
+    TextFormat,
 };
 
 /// What the vision model is asked of a page that has a picture and no text.
@@ -675,7 +675,6 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 let budget = config.ingestion.decompression_budget();
                 let sheets = parse_off_runtime(move || xlsx::sheets(&bytes, budget)).await?;
                 let load = WorkbookLoad {
-                    files_dir: config.workspace_files_dir(workspace_id),
                     doc_id: doc_id.clone(),
                     filename: filename.to_owned(),
                     sheets,
@@ -906,7 +905,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
         file_type: FileType,
         data: &[u8],
     ) -> Result<IngestResult> {
-        let (config, db, workspace_id, doc_id, embedder) = (
+        let (config, db, _, doc_id, embedder) = (
             self.config,
             self.db,
             self.workspace_id,
@@ -950,7 +949,6 @@ impl<M: EmbeddingModel> Processing<'_, M> {
             Vec::new()
         } else {
             let load = WorkbookLoad {
-                files_dir: config.workspace_files_dir(workspace_id),
                 doc_id: doc_id.clone(),
                 filename: filename.to_owned(),
                 sheets: found,
@@ -1017,7 +1015,7 @@ struct Parsed {
     meta: DocumentMeta,
     /// Tables inside the document big enough to load as tables of the
     /// workspace, as the workbook loader takes them: `table1`, `table2`, ...
-    tables: Vec<xlsx::SheetCsv>,
+    tables: Vec<xlsx::TypedSheet>,
 }
 
 impl Parsing {
@@ -1085,11 +1083,15 @@ impl Parsing {
                 ) else {
                     continue;
                 };
-                tables.push(xlsx::SheetCsv {
-                    sheet: format!("table{}", tables.len().saturating_add(1)),
-                    csv: table.csv()?,
-                    rows: table.rows.len(),
-                });
+                let unescape = |cells: &[String]| -> Vec<String> {
+                    cells.iter().map(|c| Table::unescaped(c)).collect()
+                };
+                let rows: Vec<Vec<String>> = table.rows.iter().map(|r| unescape(r)).collect();
+                tables.push(xlsx::TypedSheet::from_text(
+                    format!("table{}", tables.len().saturating_add(1)),
+                    &unescape(&table.header),
+                    &rows,
+                ));
             }
         }
         Ok(Parsed {
@@ -1345,10 +1347,9 @@ impl TableLoad<'_> {
 
 /// A workbook's sheets, parsed, for the workspace writer's thread.
 struct WorkbookLoad {
-    files_dir: PathBuf,
     doc_id: DocumentId,
     filename: String,
-    sheets: Vec<xlsx::SheetCsv>,
+    sheets: Vec<xlsx::TypedSheet>,
     /// Name every table `<stem>_<sheet>`, a lone sheet included: the
     /// tables found inside a document, which never take the file's name.
     suffixed: bool,
@@ -1356,22 +1357,20 @@ struct WorkbookLoad {
 
 impl WorkbookLoad {
     /// Every data sheet as its own table: `<stem>` for a single sheet,
-    /// `<stem>_<sheet>` otherwise. The sheets pass through `files/` as CSV
-    /// for `DuckDB`'s reader (the `excel` extension is not in the static
-    /// binary). Two sheets that sanitize to the same `<stem>_<sheet>`
-    /// name cannot share a table (`CREATE OR REPLACE` would silently drop
-    /// one sheet's rows), so the load refuses them before any table is
-    /// created.
+    /// `<stem>_<sheet>` otherwise. Each table is created with the columns'
+    /// types and filled through `DuckDB`'s appender; no file is written.
+    /// Two sheets that sanitize to the same `<stem>_<sheet>` name cannot
+    /// share a table (`CREATE OR REPLACE` would silently drop one sheet's
+    /// rows), so the load refuses them before any table is created.
     ///
     /// # Errors
     ///
     /// Returns an `Ingestion` error when two of the workbook's sheet names
-    /// collide on the same sanitized table name, or when `DuckDB` cannot
-    /// read a sheet's CSV (the message names the sheet, the log keeps the
-    /// reader's text and its on-disk path), or `TableTaken` when a table
-    /// another document owns is in the way.
+    /// collide on the same sanitized table name, or when `DuckDB` refuses a
+    /// sheet's rows (the message names the sheet, the log keeps `DuckDB`'s
+    /// text), or `TableTaken` when a table another document owns is in the
+    /// way.
     fn load(self, db: &WorkspaceDb) -> Result<Vec<String>> {
-        std::fs::create_dir_all(&self.files_dir)?;
         let stem = TableName::of_file(&self.filename);
         let single = self.sheets.len() == 1 && !self.suffixed;
         let names: Vec<TableName> = self
@@ -1405,15 +1404,15 @@ impl WorkbookLoad {
         }
         let mut tables = Vec::with_capacity(self.sheets.len());
         for (sheet, table_name) in self.sheets.into_iter().zip(names) {
-            let dest = self.files_dir.join(format!("{table_name}.csv"));
-            std::fs::write(&dest, &sheet.csv)?;
-            let path = dest.to_string_lossy();
             let create_sql = format!(
-                "CREATE OR REPLACE TABLE {} AS SELECT * FROM {}(?, header = true)",
+                "CREATE OR REPLACE TABLE {} ({})",
                 quote_ident(table_name.as_str()),
-                Reader::Csv(Separator::Comma).sql_fn()
+                sheet.column_sql(quote_ident)
             );
-            if let Err(e) = db.execute_with_params(&create_sql, duckdb::params![path.as_ref()]) {
+            let loaded = db
+                .execute_statement(&create_sql)
+                .and_then(|()| db.append_rows(table_name.as_str(), sheet.rows()));
+            if let Err(e) = loaded {
                 return Err(match e {
                     Error::DuckDb(e) => {
                         tracing::warn!(file = %self.filename, sheet = %sheet.sheet, error = %e, "workbook sheet refused");
