@@ -448,9 +448,16 @@
     ],
     "follow_up": {
       "question": "How many direct deaths did those cause?",
-      "rows": [
+      "rows_any": [
         [
-          12
+          [
+            12
+          ]
+        ],
+        [
+          [
+            8
+          ]
         ]
       ]
     }

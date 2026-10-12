@@ -42,7 +42,8 @@ answer that names the right one is right; the prose `expect` groups say whether 
 picked the right row. A
 question's `shape` says what else the reply must be:
 
-- `not_in_data`: the exit sentence *I can't tell from the data in this workspace.*
+- `not_in_data`: the exit sentence *I can't tell from the data in this workspace.*, or the
+  note quack shows when a turn fetched nothing, since the person sees no guess either way.
 - `refusal`: `write_refused` true, and `unchanged` (a statement) reading the same before and after.
 - `reading`: an answer that takes a reading of an ambiguous question and asks nothing back.
 
