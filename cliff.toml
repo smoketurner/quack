@@ -1,17 +1,9 @@
-# git-cliff configuration: release notes and CHANGELOG.md from the
-# Conventional Commits this repository requires (.claude/rules/commits-and-issues.md).
-# `make changelog` renders CHANGELOG.md; release.yml renders the tag being
-# published and puts that version's docs/upgrading.md section above it.
+# git-cliff configuration: release notes from the Conventional Commits this
+# repository requires (.claude/rules/commits-and-issues.md). release.yml renders
+# the tag being published.
 
 [changelog]
-header = """
-# Changelog
-
-Every release, newest first, from the commit history. The upgrade steps a release
-needs (config keys, schema moves, `quack embeddings refresh`) are in
-[docs/upgrading.md](docs/upgrading.md).
-
-"""
+header = ""
 body = """
 {% if version -%}
 ## {{ version }} ({{ timestamp | date(format="%Y-%m-%d") }})

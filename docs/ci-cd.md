@@ -146,10 +146,8 @@ attestation names `reusable-build.yml`, so a consumer can require that identity.
 
 1. **gates**: `cargo fmt --check`, clippy, the test suite, `make crypto-gates`, and
    `cargo deny check` through the pinned action. On a tag it then renders the release
-   notes: this tag's section of `docs/upgrading.md` (`scripts/upgrading-section.sh`; a
-   missing section fails the release) above the commits since the previous tag, grouped by
-   Conventional Commit type by git-cliff (`cliff.toml`, the same output `CHANGELOG.md`
-   holds), uploaded as the `release-notes` artifact.
+   notes: the commits since the previous tag, grouped by Conventional Commit type by
+   git-cliff (`cliff.toml`), uploaded as the `release-notes` artifact.
    - The tests restore CI's `v1-check-Linux` cache read-only, which is why the job's
      `CARGO_*` environment must match `ci.yml`.
    - `make crypto-gates` requires `cargo tree -i ring -e normal` and
