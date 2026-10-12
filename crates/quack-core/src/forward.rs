@@ -18,6 +18,12 @@
 //! run under the holder's policy with nobody to ask and no one to audit it
 //! as.
 //!
+//! Neither end trusts the files or the peer on faith. A client uses the
+//! socket and the token file only when each is the right kind of file,
+//! owned by the current user, and unreachable by anyone else; both ends
+//! check the peer's credentials and refuse a process running as another
+//! user; a holder never removes a stale socket that is not its own user's.
+//!
 //! One request per connection, one JSON object per line each way. The
 //! module is Unix-only; elsewhere [`connect`] finds no holder and
 //! [`Listener::bind`] listens on nothing.
@@ -97,17 +103,12 @@ impl Paths {
             token: dir.join(TOKEN_FILE),
         }
     }
-
-    fn read_token(&self) -> Option<TokenFile> {
-        let text = std::fs::read_to_string(&self.token).ok()?;
-        serde_json::from_str(&text).ok()
-    }
 }
 
 #[cfg(unix)]
 mod unix {
     use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::Path;
     use std::sync::Arc;
 
@@ -121,6 +122,81 @@ mod unix {
     use crate::storage::control::random_bytes;
     use crate::storage::workspace::{QueryResults, StatementKind};
 
+    /// What a refusal names as the holder before the token file has been
+    /// read, or when the other end is not who it should be.
+    const SOMEONE: &str = "another process";
+
+    /// The user this process runs as.
+    fn current_uid() -> u32 {
+        rustix::process::getuid().as_raw()
+    }
+
+    /// Which kind of file a path must be to be used.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Socket,
+        Regular,
+    }
+
+    fn refuse(path: &Path, what: &str) -> Error {
+        Error::Forward {
+            holder: String::from(SOMEONE),
+            message: format!("{} {what}; refusing to use it", path.display()),
+        }
+    }
+
+    /// `path` is a `kind` file this user owns. Symlinks are not followed, so
+    /// a link planted at the path is refused rather than resolved.
+    fn check_owned(path: &Path, kind: Kind) -> Result<std::fs::Metadata> {
+        let meta = std::fs::symlink_metadata(path)?;
+        let is_kind = match kind {
+            Kind::Socket => meta.file_type().is_socket(),
+            Kind::Regular => meta.file_type().is_file(),
+        };
+        if !is_kind {
+            let want = match kind {
+                Kind::Socket => "a socket",
+                Kind::Regular => "a regular file",
+            };
+            return Err(refuse(path, &format!("is not {want}")));
+        }
+        if meta.uid() != current_uid() {
+            return Err(refuse(
+                path,
+                &format!("is owned by uid {}, not this user", meta.uid()),
+            ));
+        }
+        Ok(meta)
+    }
+
+    /// `path` is a `kind` file this user owns and nobody else can reach.
+    fn check_private(path: &Path, kind: Kind) -> Result<()> {
+        let meta = check_owned(path, kind)?;
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(refuse(
+                path,
+                &format!("is reachable by others (mode {mode:o})"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The other end of `stream` runs as this user.
+    fn check_peer(stream: &UnixStream) -> Result<()> {
+        let cred = stream.peer_cred()?;
+        if cred.uid() != current_uid() {
+            return Err(Error::Forward {
+                holder: String::from(SOMEONE),
+                message: format!(
+                    "the other end of the socket runs as uid {}, not this user; refusing it",
+                    cred.uid()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// The holder's end: the socket, the token file, and the accept loop.
     /// Dropping it stops listening and removes both files.
     #[derive(Debug)]
@@ -132,13 +208,15 @@ mod unix {
     impl Listener {
         /// Listen for the workspace's reads as `holder` (the name a refused
         /// writer is told), answering them on `reader`. A socket left by a
-        /// holder that died is replaced; one that answers is an error, since
-        /// two holders cannot both have the file open.
+        /// holder of this user that died is replaced; one that answers is an
+        /// error, since two holders cannot both have the file open; one that
+        /// another user owns is an error and is left alone.
         ///
         /// # Errors
         ///
         /// Returns an error when the socket cannot be bound, the token cannot
-        /// be written, or another process already answers on the socket.
+        /// be written, another process already answers on the socket, or a
+        /// file in the way is not this user's.
         pub async fn bind(
             config: &Config,
             workspace_id: &str,
@@ -147,6 +225,7 @@ mod unix {
         ) -> Result<Self> {
             let paths = Paths::of(config, workspace_id);
             if paths.socket.exists() {
+                check_owned(&paths.socket, Kind::Socket)?;
                 if UnixStream::connect(&paths.socket).await.is_ok() {
                     return Err(Error::Forward {
                         holder: holder.to_owned(),
@@ -185,7 +264,7 @@ mod unix {
             Ok(Self { paths, accept })
         }
 
-        /// A fresh token in a 0600 file, replacing any left behind.
+        /// A fresh token in a 0600 file, replacing one this user left behind.
         fn write_token(path: &Path, holder: &str) -> Result<String> {
             let mut bytes = [0u8; 32];
             random_bytes(&mut bytes)?;
@@ -197,6 +276,7 @@ mod unix {
                 pid: std::process::id(),
             };
             if path.exists() {
+                check_owned(path, Kind::Regular)?;
                 std::fs::remove_file(path)?;
             }
             let mut file = std::fs::OpenOptions::new()
@@ -222,13 +302,18 @@ mod unix {
         }
     }
 
-    /// Answer one connection: one request line, one reply line.
+    /// Answer one connection: one request line, one reply line. A peer that
+    /// is not this user gets nothing, not even a reply.
     async fn serve_one(
         stream: UnixStream,
         token: &str,
         holder: &str,
         reader: &ReaderDb,
     ) -> Result<()> {
+        if let Err(e) = check_peer(&stream) {
+            tracing::warn!(error = %e, "refused a connection to the forwarding socket");
+            return Ok(());
+        }
         let (read, mut write) = stream.into_split();
         let mut line = String::new();
         BufReader::new(read.take(MAX_REQUEST_BYTES))
@@ -289,20 +374,29 @@ mod unix {
     }
 
     /// The other end: a connection to the holder of `workspace_id`, when one
-    /// listens. `None` when there is no token file, or nothing answers on
-    /// the socket (a holder that died leaves both behind).
+    /// listens. `None` when there is no token file or no socket, or nothing
+    /// answers on the socket (a holder that died leaves both behind).
     ///
     /// # Errors
     ///
-    /// Returns an error when the token file exists but cannot be read.
+    /// Returns an error when the token file or the socket exists but is not
+    /// a private file of this user's, cannot be read, or the process
+    /// answering runs as another user.
     pub async fn connect(config: &Config, workspace_id: &str) -> Result<Option<Client>> {
         let paths = Paths::of(config, workspace_id);
-        let Some(token) = paths.read_token() else {
-            return Ok(None);
-        };
-        if UnixStream::connect(&paths.socket).await.is_err() {
+        if !paths.token.exists() || !paths.socket.exists() {
             return Ok(None);
         }
+        check_private(&paths.token, Kind::Regular)?;
+        let text = std::fs::read_to_string(&paths.token)?;
+        let token: TokenFile = serde_json::from_str(&text)
+            .map_err(|e| refuse(&paths.token, &format!("is malformed ({e})")))?;
+        check_private(&paths.socket, Kind::Socket)?;
+        let Ok(probe) = UnixStream::connect(&paths.socket).await else {
+            return Ok(None);
+        };
+        check_peer(&probe)?;
+        drop(probe);
         Ok(Some(Client {
             paths,
             token: token.token,
@@ -330,8 +424,9 @@ mod unix {
         /// # Errors
         ///
         /// Returns [`Error::ForwardedWriteRefused`] when the statement is a
-        /// write, [`Error::Forward`] when the holder failed or the protocol
-        /// broke, and an I/O error when the socket is gone.
+        /// write, [`Error::Forward`] when the holder failed, the protocol
+        /// broke, or the other end is not this user, and an I/O error when
+        /// the socket is gone.
         pub async fn query(&self, sql: &str) -> Result<QueryResults> {
             match self
                 .send(Request::Query {
@@ -350,6 +445,7 @@ mod unix {
 
         async fn send(&self, request: Request) -> Result<Reply> {
             let stream = UnixStream::connect(&self.paths.socket).await?;
+            check_peer(&stream)?;
             let (read, mut write) = stream.into_split();
             let mut text = serde_json::to_string(&Envelope {
                 token: self.token.clone(),
@@ -456,6 +552,7 @@ pub fn socket_path(config: &Config, workspace_id: &str) -> PathBuf {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -479,6 +576,11 @@ mod tests {
             .unwrap();
         let shared: SharedDb = Arc::new(Writer::spawn(db).unwrap());
         ReaderDb::new(shared)
+    }
+
+    #[expect(clippy::unwrap_used, reason = "test")]
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     /// A read goes through the holder and comes back as the holder's rows;
@@ -510,17 +612,62 @@ mod tests {
         let failed = client.query("SELECT FROM").await.unwrap_err();
         assert!(matches!(failed, Error::Forward { .. }), "{failed}");
 
-        let socket = Paths::of(&config, "ws").socket;
-        assert_eq!(
-            std::os::unix::fs::PermissionsExt::mode(
-                &std::fs::metadata(&socket).unwrap().permissions()
-            ) & 0o777,
-            0o600
-        );
+        let paths = Paths::of(&config, "ws");
+        for path in [&paths.socket, &paths.token] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{}",
+                path.display()
+            );
+        }
         drop(listener);
-        assert!(!socket.exists());
+        assert!(!paths.socket.exists());
         assert!(!config.workspace_dir("ws").join(TOKEN_FILE).exists());
         assert!(connect(&config, "ws").await.unwrap().is_none());
+    }
+
+    /// A socket or token file that others can reach is refused, not used;
+    /// a token file that is a symlink is refused too.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn files_others_can_reach_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_in(dir.path());
+        let reader = holder_reader(&config);
+        let _listener = Listener::bind(&config, "ws", "holder", reader)
+            .await
+            .unwrap();
+        let paths = Paths::of(&config, "ws");
+
+        chmod(&paths.socket, 0o666);
+        let err = connect(&config, "ws").await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Forward { message, .. } if message.contains("reachable by others (mode 666)")),
+            "{err}"
+        );
+        chmod(&paths.socket, 0o600);
+
+        chmod(&paths.token, 0o640);
+        let err = connect(&config, "ws").await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Forward { message, .. } if message.contains("reachable by others (mode 640)")),
+            "{err}"
+        );
+        chmod(&paths.token, 0o600);
+
+        let real = paths.token.with_extension("real");
+        std::fs::rename(&paths.token, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &paths.token).unwrap();
+        let err = connect(&config, "ws").await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Forward { message, .. } if message.contains("is not a regular file")),
+            "{err}"
+        );
+        std::fs::remove_file(&paths.token).unwrap();
+        std::fs::rename(&real, &paths.token).unwrap();
+
+        assert!(connect(&config, "ws").await.unwrap().is_some());
     }
 
     /// A request whose token is not the holder's is answered with an error
@@ -544,6 +691,7 @@ mod tests {
             );
         }
         std::fs::write(&paths.token, record.to_string()).unwrap();
+        chmod(&paths.token, 0o600);
         let client = connect(&config, "ws").await.unwrap().unwrap();
         let err = client.query("SELECT 1").await.unwrap_err();
         assert!(
@@ -552,8 +700,8 @@ mod tests {
         );
     }
 
-    /// A socket a dead holder left behind is replaced, not an error; no
-    /// token file means no holder.
+    /// A socket a dead holder of this user left behind is replaced, not an
+    /// error; no token file means no holder.
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
     async fn a_stale_socket_is_replaced() {

@@ -990,10 +990,6 @@ pub(crate) struct App {
     /// The socket another `quack` process reads this workspace through
     /// while the session holds its lock (`quack_core::forward`); held for
     /// its drop, which removes the socket and token files.
-    #[expect(
-        dead_code,
-        reason = "held for its Drop: the socket and token files go when the session ends"
-    )]
     forward: Option<Listener>,
     /// `--allow-write`: the agent's writes run without asking.
     allow_write: bool,

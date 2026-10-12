@@ -265,7 +265,11 @@ the way through it is to run the second process's reads inside the holder:
   serve`, the terminal) also listens on a Unix socket in the workspace directory,
   `{workspace_dir}/quack.sock`, with a per-launch token in a 0600 file beside it; both are
   removed when the workspace closes, and a stale pair from a crash is detected by a failed
-  connect and replaced. This is a `quack-core` module, `quack_core::forward`, since every holder
+  connect and replaced. Neither side trusts the files or the peer on faith: before using the
+  socket or the token file a client checks that each is the right kind of file, owned by the
+  current user, and unreadable by anyone else, and both ends check the peer's credentials
+  (`SO_PEERCRED`, `getpeereid`) and refuse a process running as another user; the holder
+  never removes a stale socket that is not its own user's. This is a `quack-core` module, `quack_core::forward`, since every holder
   offers it: framed JSON requests over the socket, a handful of request kinds (a read
   statement with its rows streamed back, a document search, a table or document listing, a
   description, a graph query), each run on the holder's reader pool in a read-only
