@@ -39,7 +39,6 @@ env:
   # The FIPS module builds with clang on Linux (see ci.yml).
   AWS_LC_FIPS_SYS_CC: clang
   AWS_LC_FIPS_SYS_CXX: clang++
-  OLLAMA_VERSION: "0.40.2"
 
 jobs:
   eval:
@@ -75,10 +74,19 @@ jobs:
           prefix-key: "v1"
           shared-key: "debug-${{ runner.os }}"
           save-if: false
+      - name: Find the latest Ollama release
+        # setup-ollama needs a version number, not "latest"; left out, it
+        # installs the version its own release was built with.
+        id: ollama
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo ollama/ollama --json tagName --jq .tagName)
+          echo "version=${tag#v}" >> "${GITHUB_OUTPUT}"
       - name: Install and start Ollama
         uses: ai-action/setup-ollama@6782d243db5fbcbf7583532ce0b5122f64242689 # v2.1.5
         with:
-          version: ${{ env.OLLAMA_VERSION }}
+          version: ${{ steps.ollama.outputs.version }}
         env:
           # The server the action starts inherits this: the agent's prompt
           # (tables, documents, and tool guidance) runs past Ollama's default
