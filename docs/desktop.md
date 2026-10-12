@@ -1,45 +1,65 @@
-# `quack-desktop`: the web UI in a Tauri window
+# `quack-desktop`: Quack.app over `quack-core`
 
 The design for the desktop interface the design doc calls `quack desktop` (section 11.6,
 issue #35). Nothing in it is built yet. Section 10 records the decisions taken on
-2026-10-12 and the alternatives that were on the table; the rest of the document is written
-to those decisions. Where it departs from the design doc (the subcommand, the permission
-table's "native confirm dialog" row, the "not a separate binary" line in section 14), it
-says so, and those sections are updated in a follow-up PR against #35.
+2026-10-12 and what else was on the table; section 11 lists what the implementation must
+confirm with the project owner before it starts. Where this departs from the design doc
+(the subcommand, the embedded server, section 14's "not a separate binary") it says so, and
+those sections are updated in a follow-up PR against #35.
 
-The one-sentence version: a new crate, `crates/quack-desktop`, that is its own binary; it
-starts the embedded server on a random loopback port under a per-launch token, opens the
-existing web UI in a Tauri 2 webview, and adds what a browser tab cannot do: native file and
-folder pickers and OS drag-drop by path, a native confirm dialog for the agent's writes,
-downloads to a chosen file, a system tray that keeps jobs running while the window is
-hidden, single-instance focus, self-update, and installer bundles. It is one application on
-Linux, macOS, and Windows from the first release, with the platform differences named in
-section 5.6 and handled there. The web UI is served by `quack-server` exactly as `quack
-serve --local` serves it today, plus one set of desktop-only controls that the server
-renders only in Desktop mode (section 5.4).
+The one-sentence version: `Quack.app` is a Tauri 2 application whose Rust side is an
+interface crate like `quack-terminal`, calling `quack-core` in-process (the same
+`TurnRequest`, `JobQueue`, `Writer`, and storage calls the terminal makes), whose frontend
+is built for the desktop and bundled in the app, and which ships for macOS first with the
+`quack` command-line binary inside the bundle. There is no HTTP server, no listening socket,
+no token, and no cookie anywhere in it: the frontend talks to Rust over Tauri's IPC, and
+Rust talks to the engine as a library.
 
-## 1. A separate binary
+## 1. Shape
 
-Section 11.6 planned `quack desktop` as a subcommand of the one binary. The decision is a
-separate binary, for these reasons:
+```
+      +--------------------+   Tauri IPC (commands, channels, events)
+      |  Quack.app UI      | <------------------------------------------+
+      |  (TypeScript over  |                                            |
+      |   @tauri-apps/api) |                                            v
+      +--------------------+                              +---------------------------+
+                                                          |  quack-desktop (Rust)     |
+                                                          |  commands, turn bridge,   |
+                                                          |  jobs bridge, permission  |
+                                                          |  dialogs, menu, updater   |
+                                                          +-------------+-------------+
+                                                                        | in-process calls
+                                                          +-------------v-------------+
+                                                          |  quack-core (+ quack-cli) |
+                                                          +---------------------------+
+```
 
-- **Linux cannot link Tauri statically.** Tauri on Linux is GTK 3 and WebKitGTK 4.1 (plus
-  libsoup 3 and, for the tray, libayatana-appindicator), all dynamic, all glibc. The
-  release's Linux binaries are static musl built in `Dockerfile.build` and copied into a
-  `scratch` image; `tauri` in the `quack` package's dependency graph breaks both, and the
-  workspace has no Cargo features to hide behind. A second `[[bin]]` in the `quack` package
-  would still pull `tauri` into that package's graph.
-- **Tauri wants to own the binary crate.** `tauri-build` runs from the binary crate's
-  `build.rs`, `tauri.conf.json` sits beside it, and `cargo tauri build` bundles that
-  crate's binary.
-- **FIPS stays where it is.** The desktop builds are glibc on Linux, native on macOS and
-  Windows, and carry no FIPS claim; the design doc's FIPS statement is about the distributed
-  musl binaries and the image, which this crate never touches.
+- **A separate binary, `quack-desktop`**, in `crates/quack-desktop`. Tauri wants to own the
+  binary crate (`tauri-build` in its `build.rs`, `tauri.conf.json` beside it), and on Linux
+  Tauri links GTK and WebKitGTK dynamically, which the `quack` binary's static musl builds and
+  the `scratch` image cannot carry. The CLI and its release targets are unchanged.
+- **Depends on `quack-core` and `quack-cli`, never `quack-server`.** It is the fourth client
+  of the engine beside the terminal, print mode, and the server, and it reaches the engine the
+  way the terminal does. `crates/README.md`'s rule holds: behaviour more than one interface
+  needs goes in `quack-core`; what owns the screen goes here.
+- **The frontend is new**, written for a desktop window, and bundled into the app
+  (`frontendDist`). The web UI's askama pages and htmx are not reused; the two UIs share the
+  engine, its types, and its words (`Decision`, `PageCounts::note`, citation labels), not
+  markup.
+- **macOS first.** The crate is Tauri, so Windows and Linux can follow from the same code;
+  nothing in the first release is built or tested for them, and every `cfg(target_os)` in the
+  crate is listed in section 7.
 
-So `quack-desktop` is a workspace member with its own `[[bin]] name = "quack-desktop"`,
-depending on `quack-core` and `quack-server`. The `quack` binary and its five release
-targets are unchanged. There is no `quack desktop` verb; the app is launched as an app. The
-two alternatives not taken are in section 10.
+### What moves to make this possible
+
+- `OpenedWorkspace` (today private in `crates/quack/src/main.rs`: load `Config`, open the
+  `ControlPlane`, `workspace_or_default`, enter the `Egress` scope, open the `WorkspaceDb`,
+  spawn the `Writer`, open the `ReaderDb`) moves to `quack-cli`, so the binary, the terminal's
+  setup, and the app open a workspace through one function.
+- Session choice (`resolve_session`: new, latest, or by prefix, with the mode) moves beside
+  it.
+- Anything the app needs that today lives only in a `quack-server` handler moves to
+  `quack-core` first, as the architecture rule says. The known cases are listed in 3.4.
 
 ## 2. Crate layout
 
@@ -47,500 +67,424 @@ two alternatives not taken are in section 10.
 crates/quack-desktop/
   Cargo.toml          # [[bin]] quack-desktop; build = "build.rs"
   build.rs            # tauri_build::build()
-  tauri.conf.json     # identifier, window defaults, bundle targets, updater pubkey and endpoint; no frontendDist
-  capabilities/       # the static capability for the app's own windows; the loopback origin's is added at runtime (5.4)
+  tauri.conf.json     # identifier, window defaults, frontendDist = ui/dist, externalBin (the CLI), updater, bundle
+  capabilities/       # the app window's capability: the commands below, dialog, opener, process
   icons/              # generated by `cargo tauri icon` from one SVG
-  README.md           # what it holds, the manual release checklist per platform
+  README.md           # what it holds, the manual release checklist
+  ui/                 # the frontend: package.json, pnpm-lock.yaml, vite.config.ts, src/, dist/
   src/
-    main.rs           # crypto provider once, logging, Config, tokio runtime, then tauri::Builder
-    server.rs         # Embedded server: start on 127.0.0.1:0 with the LaunchToken, stop on quit
-    window.rs         # the main window: start URL, bounds remembered, /login heals, downloads, navigation policy
-    ipc.rs            # the commands the page may call (5.4): confirm_write, add_files, add_folder
-    permission.rs     # the native confirm dialog for a write (5.2), one at a time
-    tray.rs           # tray icon and menu: Open, Open data folder, Check for updates, Quit
-    drop.rs           # OS drag-drop of files and folders -> in-process ingest by path
+    main.rs           # crypto provider once, logging, Config, tokio runtime, tauri::Builder with every command
+    app.rs            # AppState: config, control plane, open workspaces, job queue, pending permissions
+    workspace.rs      # commands: list, create, rename, delete, snapshot, restore, open, close
+    chat.rs           # commands: sessions, start_turn (a Channel of TurnEvent), cancel_turn, documents scope, mode
+    permission.rs     # PermissionRequired -> the native dialog -> the oneshot; "allow for this turn"
+    documents.rs      # commands: list (paged), add paths, replace, fields, chunks (passage view), stored image
+    tables.rs         # commands: list, describe, note, retype, import, saved imports
+    sql.rs            # commands: run (read as typed), stream export to a chosen file, complete
+    search.rs         # commands: DocumentSearch with explain
+    graph.rs          # commands: search, path, status, extract, revalidate (preview then drop), merges, edits, export
+    ontology.rs       # commands: show, versions, diff, import/export, propose, review, accept/reject, rename, edit
+    saved.rs          # commands: list, add from a session's last answer, run, show, remove
+    jobs.rs           # JobQueue broadcast -> Tauri event "job"; cancel; the counts for the badge
+    audit.rs          # audit_log rows on channel `desktop` plus _quack_audit detail (section 3.5)
+    menu.rs           # the native menu bar, the Dock menu, the menu-bar extra
+    cli.rs            # "Install quack command": symlink Contents/MacOS/quack into /usr/local/bin
     update.rs         # tauri-plugin-updater: check on launch and on demand, offer, install, relaunch
+    setup.rs          # first launch: quack_core::setup's discovery without a terminal, the config write
     log.rs            # tracing to stderr and a rolling file under the data dir
 ```
-
-Roughly 900 lines of Rust in the crate, 300 in `quack-server` (section 3 and the Desktop-mode
-rendering in 5.4), 120 lines of JavaScript and template in the web UI, 250 lines of workflow
-YAML, plus docs. Section 9 gives the cost beside the slimmer cuts.
 
 ### Dependencies (added to the root `[workspace.dependencies]` menu, pinned, default features off)
 
 | Crate | Version (crates.io, 2026-10-10) | Features the crate opts into |
 |---|---|---|
-| `tauri` | `=2.12.3` | `wry`, `tray-icon`, `image-png` |
+| `tauri` | `=2.12.3` | `wry`, `tray-icon`, `image-png`, `macos-private-api` only if the menu-bar extra needs it |
 | `tauri-build` | `=2.7.2` | (build-dependency) |
-| `tauri-plugin-dialog` | `=2.8.2` | the write confirm dialog (5.2), file and folder pickers (5.1), the save dialog for downloads (section 4), the quit and update prompts |
+| `tauri-plugin-dialog` | `=2.8.2` | the write confirm dialog, file and folder pickers, save dialogs, the quit and update prompts |
 | `tauri-plugin-single-instance` | `=2.5.3` | |
-| `tauri-plugin-opener` | `=2.7.1` | external links in the system browser, "Open data folder" |
+| `tauri-plugin-opener` | `=2.7.1` | external links in the browser, "Reveal in Finder" |
 | `tauri-plugin-updater` | `=2.13.3` | self-update (7.3) |
 | `tauri-plugin-process` | `=2.4.0` | relaunch after an update |
 | `tracing-appender` | `=0.2.5` | the rolling log file |
 
 `tauri-cli` (`=2.12.2`) is a tool, installed with `cargo install tauri-cli --version
-=2.12.2 --locked` in `make setup` and the workflow, not a dependency. Every crate the code
-names by a full path goes on `.clippy.toml`'s `absolute-paths-allowed-crates`. `cargo deny`
-runs over the whole workspace; Tauri's tree is MIT/Apache with MPL-2.0 leaves, all on the
-allow-list, and nothing in it is `openssl`, `native-tls`, or `ring`. The updater plugin
-fetches its manifest with reqwest over rustls; its `rustls-tls` feature is the one that
-uses aws-lc-rs through the workspace's rustls pin, and `cargo tree -i ring` is part of the
-gate when it lands (`docs/crypto.md`).
+=2.12.2 --locked` in `make setup` and the workflow. Every crate the code names by a full
+path goes on `.clippy.toml`'s `absolute-paths-allowed-crates`. `cargo deny` covers the
+crate; Tauri's tree is MIT/Apache with MPL-2.0 leaves, all on the allow-list, with no
+`openssl`, `native-tls`, or `ring`; the updater plugin's `rustls-tls` feature rides the
+workspace's rustls pin on aws-lc-rs, and `cargo tree -i ring` is part of the gate when it
+lands (`docs/crypto.md`).
+
+### The frontend's stack
+
+The decision is "Tauri" with no framework named, read here as Tauri's own stack: TypeScript
+over `@tauri-apps/api` (and the plugins' `@tauri-apps/plugin-*` packages), Vite as the
+bundler Tauri's templates use, web components and plain DOM for the views, the same Tailwind
+the web UI uses for styling so the two UIs share a look, ECharts for charts and the graph
+(the same library the web UI vendors), and CodeMirror for the SQL editor (the same packages
+`crates/quack-server/editor` pins). pnpm with a committed lockfile, as the editor already
+does. Section 11 asks for this reading to be confirmed.
 
 ### Lints
 
 The crate declares `[lints] workspace = true` like every member. Tauri command handlers
-and event closures are ordinary functions, so the panic, indexing, and `absolute_paths`
-denials apply unchanged. `tauri::generate_context!()` and `tauri::generate_handler!()` are
-macros from an allowed crate.
+are ordinary functions, so the panic, indexing, and `absolute_paths` denials apply.
+`tauri::generate_context!()` and `tauri::generate_handler!()` are macros from an allowed
+crate. The frontend gets `tsc --strict`, ESLint, and Prettier in `ui/`, run by `make
+ui-lint` and the CI job (7.1).
 
-## 3. The embedded server (changes to `quack-server`)
+## 3. The Rust side
 
-Today `quack_server::serve(config, bind, mode)` opens the control plane, builds `AppState`,
-binds, serves until a signal, and stops. The desktop needs the same thing with three
-differences: it chooses the port after binding, it decides when to stop, and nobody logs
-in. The split:
+### 3.1 State
 
-```rust
-// quack-server, new public items
-pub struct LaunchToken(SecretString);           // 32 random bytes, base64url; generated by the caller
-pub struct Embedded { pub addr: SocketAddr, /* App, the serve future, the token */ }
+One `AppState` for the process, managed by Tauri (`app.manage`): the `Config`, the
+`ControlPlane`, the `JobQueue` (one per process, as the terminal and the server each have),
+the open workspaces, and the pending permissions.
 
-impl Embedded {
-    /// Open the control plane, bind `127.0.0.1:0`, and start serving in
-    /// Desktop mode. Returns once the listener is bound, so `addr` is known.
-    pub async fn start(config: Config, token: LaunchToken) -> anyhow::Result<Self>;
-    /// The URL a webview opens first: `http://127.0.0.1:{port}/desktop/start?token=…`.
-    pub fn start_url(&self) -> Url;
-    /// Ingest files or folders by path into a workspace, as the Documents page's
-    /// upload would, audited on channel `desktop`. Section 5.1.
-    pub async fn ingest_paths(&self, workspace: &WorkspaceId, paths: Vec<PathBuf>) -> anyhow::Result<Vec<JobId>>;
-    /// The job count the tray shows and the quit confirmation names.
-    pub fn active_jobs(&self) -> usize;
-    /// `AppState::stop`: cancel `stopping`, drain under the shutdown grace, close
-    /// the workspaces so each writer checkpoints.
-    pub async fn stop(self) -> anyhow::Result<()>;
-}
-```
+An open workspace is what `OpenedWorkspace::shared` produces today: the `SharedDb` (the
+`Writer` actor on its own thread) and the `ReaderDb` pool, plus the `Egress` scope for its
+`allowed_providers`, entered on every command that reaches a model. The app opens a workspace
+once per process and keeps it open while any window shows it (the `OnceCell`-per-workspace
+rule the server follows: DuckDB's lock is per process, so a second open inside the app
+would silently fork the database). A workspace with no window on it is closed after an idle
+period, so the `quack` command-line binary can open it (3.6).
 
-`serve` is rewritten over the same pieces (open, build, bind a given address, run, stop),
-so there is one setup path; `Embedded::start` is that path with `127.0.0.1:0`,
-`ServeMode::Desktop`, no banner, no signal handler, and no webhook (the operator settings
-`[server.webhooks]`, `[server.oidc]`, and `trusted_proxies` are ignored with one
-`tracing::info!` each, as `[server.oidc]` already is in Local mode).
+### 3.2 Commands
 
-### 3.1 `ServeMode::Desktop`
+Every frontend action is a `#[tauri::command]` in the module named in section 2, taking the
+ids the frontend holds and returning the engine's own types serialized with serde: the same
+`AgentResponseBody`, `DocumentPage`, `TableDescriptionBody`, `GraphResult`, `JobInfo`,
+`ChartSpec`, `SavedQuestion`, and `Ontology` the REST API returns, so the frontend's types
+are generated from one source and nothing is reshaped on the way. Long work (ingestion,
+import, extraction, the ontology document pass, embeddings refresh, classification) is
+submitted to the `JobQueue` with the lanes the terminal uses, and the command returns the
+`JobInfo`; progress reaches the frontend over the jobs event (3.4). A command that fails
+returns the core error's message and its `ErrorCode`-equivalent kind, so the frontend can
+tell "no chat model" from "not found".
 
-```rust
-pub enum ServeMode {
-    Login,
-    Local,
-    /// The embedded server behind a Tauri window: one implicit owner, as
-    /// `Local`, but only for a request that carries a session the launch
-    /// token opened. Loopback only, like `Local`.
-    Desktop(LaunchToken),
-}
-```
+### 3.3 A turn
 
-Identity resolution (`auth.rs`, `Identity::resolve`):
+`start_turn(workspace, session, message, documents, channel)` builds a `TurnRequest` with
+the workspace's `SharedDb` and `ReaderDb`, the session, the write policy (3.5), the person's
+document scope, `user: None` (as on the command line), the app's `LabelJobs`, a fresh
+`EventSink`, and a `CancellationToken` kept under the session so `cancel_turn` can fire it.
+The turn runs as a job in the session's serial lane, exactly as the terminal submits one, so
+a follow-up waits for the answer before it.
 
-- `Local`: every request is the implicit owner `local`. Unchanged.
-- `Desktop`: a request with a valid session cookie is the implicit owner `local` with every
-  scope and `Credential::Local` (so every existing `ServeMode::Local` branch in `web/`,
-  which decides what the console shows, becomes `mode.is_local()`, true for both). A
-  request without one is 401 on `/api/` and `/mcp/`, and the `/login` redirect on the web
-  UI, like Login mode. There is no password form: `/login` in Desktop mode renders one line
-  ("Open quack from the application") and the app heals it (section 4).
-- `GET /desktop/start?token=…` (Desktop mode only; 404 in the other modes): the peer must be
-  loopback; the token is compared in constant time (`aws_lc_rs::constant_time`); a match
-  opens a web session for `local` through the existing `WebSessions::open`, sets the same
-  cookie `password_login` sets, and redirects to `/` (or to `?next=` when it is a local
-  path). A mismatch is 401 with a denied `audit_log` row (action `session`, channel
-  `desktop`), the same row a wrong password writes, and the login rate limiter covers the
-  route. The token is not single-use: a second window, or a healed session, presents it
-  again. It lives as long as the process.
+The events reach the frontend over a Tauri `Channel<TurnEvent>`, where `TurnEvent` is a
+serializable projection of `AgentEvent`: `status`, `reasoning`, `text`, `tool_started`,
+`tool_finished` (the `ToolStep`), `permission_required` (`request`, `sql`, `reason`,
+`notice`, `heading`, `choices`, as the SSE event carries them), `complete`
+(`AgentResponseBody`), `error` (`TurnFailure`). The names are the SSE stream's names on
+purpose, so the two interfaces' event vocabularies are one and a reader of
+`docs/web-ui.md` recognizes them. `PermissionRequired` carries a `oneshot` and is not
+serializable; `permission.rs` takes it before the projection and holds it (3.5).
 
-Why a token at all, when the port is random and loopback: `--local` trusts every local
-process. On a laptop that is any other user's process and, through a browser, any site that
-guesses the port (a `form-action`-free cross-site POST reaches the API even though
-`connect-src 'self'` stops reads). A 256-bit token that only the app and the server know
-closes that, at the cost of one route. This is what VS Code's `serve-web` and Jupyter do.
+### 3.4 Jobs
 
-The user id stays `local` (`LOCAL_USER_ID`), so the audit log, sessions, and saved
-questions written from the app and from `quack serve --local` on the same data directory
-belong to the same person.
+`JobQueue::subscribe` is forwarded as a Tauri event `job` with the `JobInfo`, for every
+workspace the app has open; the frontend's job strip, the Dock badge (running jobs), and
+the finished-job notification all read it. `cancel_job(id)` is `JobQueue::cancel`. The
+workspace lanes are the terminal's: a chat session is a serial lane, uploads, graph
+extraction, and the document pass have their own.
 
-### 3.2 Cookie, limiter, and security headers
+Work that today exists only as a `quack-server` handler and that the app also needs moves
+to `quack-core` before the app calls it: the audited background runs' bookkeeping
+(`run.rs`: embeddings refresh, graph and ontology document passes as jobs that audit their
+start and end under one run id), the upload queue's spooling rules (`queue.rs`: a file's
+bytes on disk until its job ends, the per-workspace lane width), and the pending-permission
+holder (`permissions.rs`, which the terminal also has its own copy of). Each becomes a core
+module with the server and the app as its two callers.
 
-- The cookie is `HttpOnly`, `SameSite=Lax`, not `Secure` (the request is plain HTTP on
-  loopback; `Peer::needs_secure` is already false there unless `secure_cookies = "always"`,
-  which the desktop ignores with a note).
-- The desktop's sessions renew on use like the browser's, under `session_idle_minutes` and
-  `session_max_age_hours`; when one runs out, the web UI redirects to `/login` and the app
-  re-enters through the start URL (section 4). Nothing is special-cased.
-- The `tower_governor` limiter keys on the peer address, which is always `127.0.0.1`; the
-  general burst of 120 requests a second is well above what one window generates, and the
-  login limiter covers `/desktop/start`.
-- The page calls the host over Tauri's IPC (section 5.4), which on WebKitGTK and WebView2 is
-  an `http://ipc.localhost` request and on WKWebView a custom-scheme message. In Desktop
-  mode `connect-src` gains `ipc: http://ipc.localhost`, and nothing else in the CSP
-  changes. The server's security headers are otherwise the same in every mode.
+### 3.5 Writes and the native confirm dialog
 
-### 3.3 What the server exposes to the host
+The write policy is `WritePolicy::Ask` by default and `Allow(Approver::Person)` while the
+person has "Run changes without asking" on (a per-workspace toggle in the chat view, off
+again at launch), the same two settings the terminal has. Writes typed in the SQL view run
+as typed, as everywhere.
 
-`Embedded` is the whole surface. `AppState`, `Access`, and the handlers stay `pub(crate)`.
-`ingest_paths` goes through the same `Access::resolve` as an upload (identity `local`,
-channel `desktop`, action `upload`), then the upload queue with `FileData::Path`, which
-hashes the file as it streams and copies a table file into `files/` without reading it, so
-a dropped 2 GB Parquet costs no memory. The document's source is `DocumentSource::Path`,
-as from the CLI, not `Upload`. A folder goes through the same path `quack ingest DIR` takes
-(root and relative path recorded, unchanged files skipped), so a folder dropped twice
-re-ingests only what changed.
+A `PermissionRequired` event is answered in a native dialog, not in the page. `permission.rs`
+takes the `PermissionRequest`, keeps its `oneshot` under a request id, tells the frontend
+(so the transcript shows the statement under "Answer in the dialog"), and shows an NSAlert
+attached to the window, shown and focused first if it was hidden:
 
-## 4. The window
+- **Title:** `Decision::HEADING`: "This statement changes the workspace:"
+- **Body:** the `Hold::notice` sentence when there is one ("This turn read document text,
+  which may have asked for this statement. Check that it is what you asked for."), a blank
+  line, then the SQL, cut at 1,500 characters with "… and N more lines, shown in the chat".
+- **Buttons:** the three `Decision`s in order with their `label`s: **Run it**, **Allow for
+  this turn**, **Don't run it**. The words come from `Decision`, never from the app, so the
+  terminal, the web, and the dialog say the same thing.
 
-`WebviewWindowBuilder::new(app, "main", WebviewUrl::External(embedded.start_url()))`. No
-`frontendDist`, no Tauri-served assets: every byte comes from the embedded server, under its
-own CSP and security headers.
+The chosen `Decision` goes into the `oneshot`; the `Delivery` it returns says whether the
+turn still waited, and the frontend renders `Decision::reply` ("Ran it.", "Not run.",
+"Ran it; the rest of this turn's writes run too.") or "the turn stopped waiting". Closing
+the dialog any other way is `Deny`. Dialogs queue one at a time in event order, like the
+terminal's prompts. No HTTP, no request id on the wire, no timeout of the server's kind: the
+turn's own cancel token ends the wait when a turn is cancelled.
 
-- **Title:** `quack` and the workspace label once a page is open (the host watches the
-  webview's URL and reads the console's `<title>`; no page change needed).
-- **Size and position** are remembered in the app's own state file
-  (`{data_dir}/desktop.json`: window bounds, last URL), not in `control.db`.
-- **The webview's storage** (cookies, local storage) goes in Tauri's per-app data directory,
-  private to the app.
-- **Healing:** an `on_navigation` hook sees every top-level navigation; one to `/login`
-  (session gone, or the server restarted) is replaced by the start URL with
-  `?next=` set to the page it was on. The person never sees a login page.
-- **External links** (a citation's `source_url`, the docs link to Redoc) open in the system
-  browser through `tauri-plugin-opener`; the webview stays on the server's origin. The
-  `on_navigation` hook denies any other origin.
-- **Downloads.** The web UI streams files: the SQL page's export, the graph and OKF
-  exports, a workspace snapshot, a document's stored image. None of the three webviews
-  saves a download by itself the way a browser does, so the window's `on_download` hook
-  takes each one: a native save dialog (`tauri-plugin-dialog`) proposes the server's
-  `Content-Disposition` file name, and the webview writes the body to the chosen path. A
-  cancelled dialog cancels the download. Without this hook a download silently does
-  nothing on WebKitGTK and WKWebView, so it is part of the first cut, not a refinement.
+The audit: every workspace-touching command writes an `audit_log` row through
+`ControlPlane::record_audit` with `Origin::from(Channel::Desktop)` and user `local`, plus
+the `_quack_audit` detail row inside the workspace under the same id, as the design doc's
+section 12 asks of every interface and as its schema's `channel` column (`desktop`) has
+anticipated; `audit.rs` is a small copy of the server's `Access::audit` shape without the
+authorization half. Section 11 notes that the terminal and the CLI write no rows today.
 
-## 5. The native parts
+### 3.6 The app and the command line on one data directory
 
-### 5.1 Files and folders by path
+The app uses the CLI's data directory (`~/.local/share/quack`, `QUACK_DATA_DIR`, config under
+`~/.config/quack`), so `Quack.app`, `quack -p`, and `quack mcp` see one set of workspaces and
+one keychain item. DuckDB's file lock is per process: while the app holds a workspace open,
+`quack -q` on that workspace fails with "the workspace is open in another process", as it
+does today against `quack serve`. The app therefore closes a workspace it has no window on
+after an idle period (a `[desktop].close_idle_minutes` setting, default to be set), and the
+CLI's error names the app when the lock holder is `quack-desktop`. Section 11 asks whether
+that is enough or the two should share differently.
 
-Two ways in, one path through:
+### 3.7 First launch
 
-- **OS drop** lands on the window as Tauri's `DragDropEvent::Drop { paths }` (Tauri
-  intercepts OS drops before the page sees them; `dragDropEnabled` stays on). The host reads
-  the webview's current URL: on `/w/{id}/…` it calls `ingest_paths(id, paths)`; on any other
-  page (the console, settings) it shows a one-line native notice, "Open a workspace, then
-  drop files on it". No guessing a default workspace.
-- **Native pickers from the page.** In Desktop mode the Documents page renders two buttons
-  beside its upload form, **Add files…** and **Add folder…**, which call the `add_files` and
-  `add_folder` commands (5.4) with the page's workspace id; the host opens the OS picker
-  (`tauri-plugin-dialog`, multiple files, or one folder) and calls `ingest_paths`. The
-  tray's **Open…** item does the same for the window's current workspace.
+With no `config.toml`, `setup.rs` runs `quack_core::setup::Discovery::run` over
+`Environment::from_env` (Ollama, API keys, AWS credentials), builds a `SetupPlan` from what
+it found, applies it with `SetupPlan::apply` through the same `toml_edit` path `quack init`
+uses, only when `doctor`'s checks pass the result, and opens the window on the workspace
+list. When nothing is found, the window opens on Settings with `doctor`'s findings and what
+to install or set. `setup` already separates discovery, the plan, and the write from
+`init_cli`'s prompts, so no core change is needed for this.
 
-The Documents page's existing upload form keeps working too; the native path is an addition
-that records the source path and never reads the file into the page. Either way the queued
-jobs appear in the page's jobs stream and the finished toast, as an upload's do.
+## 4. The window and the screens
 
-### 5.2 Write permission: the native confirm dialog
+One main window, title `quack` or the workspace's name, bounds remembered in
+`{data_dir}/desktop.json`. A sidebar on the left, the view on the right, a job strip along
+the bottom while jobs run. Keyboard shortcuts follow macOS: ⌘N new session, ⌘O add files,
+⌘⇧O add folder, ⌘K workspace switcher, ⌘, settings, ⌘W close window, ⌘Q quit.
 
-Section 7's table promises Desktop a native confirm dialog for the agent's writes, and that
-is the design. The flow, with the words every interface already uses
-(`analysis::events::Decision`):
+| View | Shows | Core it calls |
+|---|---|---|
+| Workspaces | the list with document and table counts; New, Rename, Delete (confirm names the workspace), Snapshot to a file, Restore from one | `ControlPlane` workspaces, `storage::backup` |
+| Chat | sessions (search, rename, resume), the transcript with streamed text, each step's SQL and rows, citations opening the passage view, the chart, the document picker for scope, the mode (chat or query), "Run changes without asking" | `TurnRequest`, `storage::sessions`, `analysis::citations`, `ChartSpec` |
+| Documents | one page of `DocumentListing` with filter and "show all"; drop zone; Add files, Add folder; Replace on a row; tags, author, date; the passage view with previous and next; a stored image | `WorkspaceDb::documents`, `ingest_file`, `register_document`, `document_chunks`, `stored_image` |
+| Tables | row counts, profile warnings with the retype that fixes each, notes, Import (SQLite, URL, S3) and saved imports with Refresh | `TableProfile`, `describe_table`, `profile::Retype`, `quack_core::import` |
+| SQL | the CodeMirror editor with completion, results as a virtualized grid, Export every row to a chosen file | `WorkspaceDb::execute_query`, `stream_query`, `quack_core::completion` |
+| Search | query, documents, keyword or vector or hybrid, each hit's ranks | `analysis::search::DocumentSearch`, `explain_search` |
+| Graph | search by entity or class, paths, status (stale, provisional, drift, pending), extract, revalidate with the preview's counts before the drop, merges, add and edit forms, export | `graph::query`, `graph::store`, `Revalidation`, `graph::export` |
+| Ontology | the current version, versions and diff, import and export JSON, propose from tables or documents (cost shown, then asked), review, accept and reject, rename, the property and measure forms | `quack_core::ontology`, `induction`, `documents`, `edit` |
+| Saved | the saved questions, Run (changed or not), Add from a session's last answer, Remove | `quack_core::saved` |
+| Jobs | every job with progress, status line, outcome, Cancel | `JobQueue` |
+| Settings | the models and providers with `doctor`'s probe results, the data directory, Install quack command, Check for updates, the log | `Config`, `quack_core::setup`, `doctor` |
 
-1. A streamed turn wants a write; the server sends the `permission_required` SSE event
-   (`request`, `session_id`, `sql`, `reason`, `notice`, `expires_at`, `heading`, `choices`),
-   as it does in a browser.
-2. The chat page's handler (`static/js/app.js`) in Desktop mode renders the statement in the
-   transcript without buttons, under the line "Answer in the dialog", and calls the host's
-   `confirm_write` command with the event's fields.
-3. The host shows an OS message dialog attached to the main window (shown and focused first
-   if it was hidden to the tray), kind Warning:
-   - **Title:** the event's `heading`: "This statement changes the workspace:"
-   - **Body:** the `notice` sentence when there is one ("This turn read document text,
-     which may have asked for this statement. Check that it is what you asked for."), a
-     blank line, then the SQL, cut at 1,500 characters with "… and N more lines, shown in
-     the chat".
-   - **Buttons:** the event's `choices`, in order, with their `label`s: **Run it**,
-     **Allow for this turn**, **Don't run it**. The host never hard-codes these words;
-     they come from the event, so the terminal's `y`/`n`/`a` prompt, the browser's card,
-     and the dialog say the same thing.
-4. The command resolves with the chosen `decision`; closing the dialog any other way (Esc,
-   the close button) resolves `deny`. The page then `POST`s
-   `.../sessions/{sid}/permissions/{request}` exactly as a card button does, and renders
-   the `reply` ("Ran it.", "Not run.", "Ran it; the rest of this turn's writes run too.").
-   The audit row, the 404/409/410 answers, and the timeout are the existing ones; nothing
-   about permissions is reimplemented in the host.
-5. Dialogs queue: one is shown at a time, in event order, like the terminal's queued
-   prompts. A dialog answered after `[server].permission_timeout_seconds` gets the route's
-   404 and the page says the turn stopped waiting, as it does in a browser.
+Native menu bar: **Quack** (About, Settings…, Check for Updates…, Install quack Command…,
+Quit), **File** (New Workspace…, New Session, Add Files…, Add Folder…, Import…, Snapshot
+Workspace…, Close Window), **Edit** (the standard items), **View** (one item per view),
+**Window**, **Help** (documentation in the browser, the log folder). The Dock icon's badge
+counts running jobs and shows a dot while a write waits for an answer; the Dock menu lists
+the open workspaces. Closing the window keeps the app running, as macOS apps do; the Dock
+icon reopens it; a menu-bar extra shows the job count and offers Open and Quit. Quit with
+jobs running asks "N jobs are running. Quit and cancel them?" (**Quit** / **Keep running**),
+then `JobQueue::shutdown(grace)` and the workspace handles dropped so each writer
+checkpoints, then exit.
 
-An OS message dialog cannot be closed by the program, so a dialog left open after the turn
-stopped waiting stays until the person dismisses it; the page's state is already correct
-by then. If that proves to be a problem in use, the fallback is a small native-framed Tauri
-window loading a server page with the same three buttons, which the host can close; the
-words and the POST are the same.
+Files and folders arrive by path: an OS drop on the Documents view or the sidebar's
+workspace, Add Files… and Add Folder… (NSOpenPanel), both into `ingest_file` with
+`FileData::Path` and `DocumentSource::Path`, so nothing is read into the frontend and a
+folder gets `quack ingest DIR`'s behaviour (root recorded, unchanged files skipped). Exports
+(SQL rows, graph, OKF, snapshot) stream to a file the person chose in NSSavePanel; nothing
+is held in memory as a download.
 
-### 5.3 Tray and lifecycle
+External links open in the browser through `tauri-plugin-opener`. The frontend loads only
+from the bundle (`tauri://localhost`); its CSP allows the bundle and Tauri's IPC and nothing
+else.
 
-Menu: **Open quack** (show and focus the window), **Open…** (the file picker, 5.1), **Open
-data folder** (the platform file manager on `data_dir`, via `tauri-plugin-opener`), **Check
-for updates…** (7.3), a separator, **Quit**. The icon's tooltip names running jobs ("2 jobs
-running").
+## 5. Keychain, data directory, logging
 
-Lifecycle, under Tauri's `RunEvent`s:
+- **Keychain:** nothing new. The vault key and OAuth tokens go through
+  `KeySource::Keychain`, the macOS Keychain, named by service, so the app and the CLI share
+  the item; a signed bundle has a stable code identity, so the Keychain stops asking on
+  every launch.
+- **Data directory:** the CLI's (3.6).
+- **Logging:** `tracing` to stderr and a rolling daily file `{data_dir}/logs/desktop.log`
+  (`tracing-appender`, 7 kept), in `[server].log_format`'s text or JSON. A failure before
+  the window exists (control plane will not open, data directory unwritable) is a native
+  error dialog with the `anyhow` chain and the log path, then exit 1. The crate is `anyhow`,
+  like the other interface crates.
 
-1. Window close → `prevent_close`, hide. Jobs continue; the tray stays.
-2. Quit, with jobs running → a native confirm naming the count ("3 jobs are running. Quit
-   and cancel them?", **Quit** / **Keep running**).
-3. Quit → `ExitRequested` is held (`api.prevent_exit()`) while `Embedded::stop` runs:
-   `stopping` cancelled (streams end), `JobQueue::shutdown(grace)` under
-   `[server].shutdown_grace_seconds`, workspace handles dropped so each writer
-   checkpoints. Then `app.exit(0)`. A second Quit during the grace is ignored.
-4. A second launch (`tauri-plugin-single-instance`) focuses the running window and exits.
-   DuckDB's per-process file lock would refuse the second process anyway; the plugin makes
-   that a focus instead of an error dialog.
-5. **No tray available.** On Linux the tray depends on the desktop environment (section
-   5.6); when the icon cannot be shown, closing the window is Quit (steps 2 and 3), so the
-   process never runs on with no way to reach it. The app decides this once at start from
-   the tray's build result and says so in the log.
+## 6. The bundle: Quack.app with the CLI inside
 
-The `quack` CLI against a workspace the app has open hits the same lock (`quack -q` on that
-workspace fails while the window is up). That is today's behaviour between `quack serve` and
-the CLI and stays; the README says so.
+The macOS release package is one `.dmg` holding `Quack.app`; the `quack` command-line binary
+is inside the bundle at `Contents/MacOS/quack` as a Tauri sidecar (`bundle.externalBin`),
+signed with the app and notarized with it. **Quack › Install quack Command…** creates the
+symlink `/usr/local/bin/quack` to the binary inside the app (asking for administrator rights
+through the standard prompt when the directory is not writable), and tells the person to
+reopen their terminal, as VS Code's and Docker Desktop's install commands do; the menu item
+reads **quack Command Installed** with a Remove option when the link exists and points at
+this app. An app update updates the CLI with it, and the symlink stays valid as long as the
+app stays in `/Applications`; moving the app breaks the link, and the menu item says so and
+offers to repair it.
 
-### 5.4 What the page may call: a scoped capability
-
-The page gets Tauri IPC, scoped to named commands and to the embedded server's origin:
-
-- **The capability is built at runtime**, because the port is chosen at bind time:
-  `CapabilityBuilder::new("server").remote(format!("http://127.0.0.1:{port}"))` with the
-  permissions for the commands below, added through `Manager::add_capability` before the
-  window is created. No static capability names a remote origin, so a page from anywhere
-  else (an external link that slipped through) has no IPC.
-- **The commands** (`ipc.rs`), each taking the workspace or request ids the page already
-  holds and nothing else:
-
-  | Command | From | Does |
-  |---|---|---|
-  | `confirm_write(event)` | the chat page, on `permission_required` | the dialog of 5.2; resolves with the decision |
-  | `add_files(workspace)` | the Documents page | the OS file picker, then `ingest_paths` |
-  | `add_folder(workspace)` | the Documents page | the OS folder picker, then `ingest_paths` |
-
-  External links go through `tauri-plugin-opener`'s own permission, scoped to `http` and
-  `https`; the updater's commands are not exposed to the page (the tray drives it).
-- **The page knows it is in the app from the server, not from sniffing.** Desktop mode sets
-  `desktop: true` in the base template context; the templates render the two buttons and
-  include `static/js/desktop.js`, which holds every `invoke` call, only then. `app.js`
-  checks one flag for the permission flow. In a browser against `quack serve` nothing is
-  rendered or loaded, so the web UI stays identical there.
-- **What stays out:** no filesystem, shell, or HTTP permissions; no command takes a path
-  from the page (the picker chooses paths, the page names a workspace). A page that renders
-  workspace content gets exactly three verbs, each of which ends in a dialog the person
-  answers.
-
-### 5.5 Keychain, data directory, first launch
-
-- **Keychain:** nothing new. The vault key and OAuth tokens already go through
-  `KeySource::Keychain` (the `keyring-core` stores: macOS Keychain, Windows Credential
-  Manager, Linux keyutils). A signed macOS bundle has a stable code identity, so the
-  Keychain stops asking on every launch; the item is named by service, so the app and the
-  CLI on the same data directory share it.
-- **Data directory: the same as the CLI's.** `~/.local/share/quack` on every OS,
-  `QUACK_DATA_DIR` honoured, `config.toml` under `~/.config/quack`; the config loader is
-  used as-is. The app, `quack serve --local`, `quack -p`, and `quack mcp` see one set of
-  workspaces and one keychain item. The design doc's "platform app-data directory" is
-  not used; section 10 has the alternative.
-- **First launch with no `config.toml`:** the app runs the probe `quack init` runs
-  (`quack_core::setup` finds Ollama, API keys, AWS credentials) without a terminal, writes
-  the chosen models through the same `toml_edit` path only when `doctor` passes them, and
-  opens the window on the console. When nothing is found, the window opens on a page that
-  says what to install or set and links `doctor`'s findings; that page is the web UI's own
-  doctor view if one exists, else a new small page in `web/` (to confirm against `setup`'s
-  current API, which is written for a TTY; the probe and the write are separable).
-
-### 5.6 What differs by platform, and how each is handled
-
-Three webviews, three bundlers, three keychains. The crate has one code path with a
-`cfg(target_os)` only where the table says so; everything else is Tauri's job.
-
-| Concern | Linux | macOS | Windows |
-|---|---|---|---|
-| Webview engine | WebKitGTK 4.1, from the distribution | WKWebView, part of the OS | WebView2 (Edge), a runtime the installer ensures |
-| Runtime the installer needs | `libwebkit2gtk-4.1`, `libgtk-3`, `libayatana-appindicator3` as `.deb`/`.rpm` dependencies; the AppImage bundles its GTK libraries and needs the system WebKitGTK | none | `bundle.windows.webviewInstallMode = downloadBootstrapper`: the installer fetches WebView2 when a machine lacks it (Windows 10 and 11 normally ship it) |
-| Tray | shown where the desktop has an indicator host (KDE, XFCE, GNOME with the AppIndicator extension); absent elsewhere, so close is quit (5.3 step 5) | always | always |
-| Drag-drop by path | `DragDropEvent::Drop` gives paths on all three; on Linux under Wayland a drop from some file managers arrives as URIs, which Tauri resolves to paths | paths | paths |
-| Downloads | `on_download` (section 4) on all three; nothing saves without it | same | same |
-| IPC transport | `http://ipc.localhost` | a custom scheme message | `http://ipc.localhost` |
-| Native dialogs | GTK message and file dialogs (the portal under Flatpak-like sandboxes) | NSAlert and NSOpenPanel | Win32 task dialog and IFileDialog |
-| Keychain | `linux-keyutils` (in-kernel, per login session), already the core's store; the CLI on the same machine shares it | Keychain, shared with the CLI by service name; a signed bundle stops the per-launch prompt | Credential Manager, shared with the CLI |
-| Window chrome | GTK titlebar; the webview's dark mode follows the GTK theme | native; `prefers-color-scheme` follows the system | native; `prefers-color-scheme` follows the system |
-| Fonts and rendering | WebKitGTK renders the Tailwind UI as Safari would; the committed CSS has no vendor-specific rules to check | Safari's engine | Chromium's engine; the UI is already exercised in Chrome and Edge |
-| Single instance | the plugin uses D-Bus; without a session bus (a bare X session) it falls back to the DuckDB lock's error, shown as a dialog | the plugin | the plugin |
-| Self-update | the AppImage updates in place; `.deb` and `.rpm` installs are told the version is available from the package manager | the `.app` updates in place and relaunches | the installer runs and relaunches |
-| Signing | none (packages are attested, not signed) | codesign and notarization, the existing secrets | Azure Trusted Signing, the existing step, applied to the installer as well |
-
-The web UI has nothing platform-specific in it today (htmx, ECharts, CodeMirror, SSE, and
-plain forms), and the one thing that behaves differently across engines, saving a file, is
-handled in the host. The manual checklist in the crate's README is run on all three before
-a release; `make eval` does not cover the window.
-
-## 6. Logging and errors
-
-No terminal, so `tracing` goes to stderr (visible under `cargo run`) and to a rolling daily
-file `{data_dir}/logs/desktop.log` (`tracing-appender`, 7 files kept), in
-`[server].log_format`. A failure before the window exists (control plane will not open,
-port will not bind, the data directory is unwritable) is a native error dialog with the
-`anyhow` chain and the log path, then exit 1. The crate is `anyhow`, like the other
-interface crates.
+The Homebrew tap today installs the CLI from the macOS tarball with a formula. With the CLI
+inside the app, the tap offers a cask that installs `Quack.app` and links the binary
+(`binary "Quack.app/Contents/MacOS/quack"`), so `brew install --cask smoketurner/tap/quack`
+gives both. Whether the tarball and formula also stay is in section 11.
 
 ## 7. Build, CI, and release
 
-### 7.1 Contributors
+### 7.1 Contributors and CI
 
-`cargo clippy --workspace` and `cargo test --workspace` now compile `quack-desktop`. On
-Linux that needs the WebKitGTK development packages; `make setup` installs them
-(`libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev`, and the
-dnf and pacman equivalents), and every CI job that builds the workspace on Linux adds the
-same `apt-get` step, so CI never skips the crate. On macOS and Windows nothing is needed.
-
-For a Linux contributor who has not run `make setup`, `make lint` and `make test` check
-`pkg-config --exists webkit2gtk-4.1` first and, when it fails, pass `--exclude
-quack-desktop` and print one line saying what was skipped and how to install it. The
-pre-push hook does the same. Nobody's build breaks because the app exists, and the gate
-that matters, CI, builds everything on all three operating systems.
-
-`Dockerfile.build` and `docker-bake.hcl` build `--package quack` and are untouched; so is the
-image.
-
-A PR-time job, `desktop-check`, runs `cargo check -p quack-desktop --locked` on
-`ubuntu-latest`, `macos-latest`, and `windows-latest`, so a `cfg(target_os)` branch that
-compiles on one platform and not another fails the PR, not the release.
+- `make setup` installs `tauri-cli` and pnpm; `make ui-build` builds the frontend into
+  `ui/dist`; `make ui-lint` runs `tsc`, ESLint, and Prettier; `make desktop` runs `cargo
+  tauri dev`.
+- `cargo clippy --workspace` and `cargo test --workspace` compile the crate on macOS with no
+  extra packages. On Linux the crate needs the WebKitGTK development packages even though
+  the release does not build it there; `make lint` and `make test` check `pkg-config
+  --exists webkit2gtk-4.1` and pass `--exclude quack-desktop` with a printed note when it
+  fails. The CI lint and test jobs on Linux install the packages and never skip.
+- A PR-time `desktop` job on `macos-latest` builds the frontend, runs `make ui-lint`, runs
+  `cargo check -p quack-desktop --locked`, and runs the crate's tests.
+- `Dockerfile.build`, `docker-bake.hcl`, and the image are untouched.
 
 ### 7.2 Release
 
-A new `desktop` job in `.github/workflows/reusable-build.yml`, same shape as `binaries`,
-with every platform in the first release:
+The macOS job in `.github/workflows/reusable-build.yml` already builds, signs, and
+notarizes the `quack` binary on `macos-latest` for `aarch64-apple-darwin`. It gains, after
+that:
 
-| Runner | Target | Bundles |
-|---|---|---|
-| `macos-latest` | `aarch64-apple-darwin` | `.app` in a `.dmg` |
-| `windows-latest` | `x86_64-pc-windows-msvc` | `.msi` (WiX) and NSIS `.exe` |
-| `windows-11-arm` | `aarch64-pc-windows-msvc` | the same |
-| `ubuntu-latest` | `x86_64-unknown-linux-gnu` | `.deb`, `.rpm`, `.AppImage` |
-| `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` | the same |
+1. Build the frontend (`pnpm install --frozen-lockfile && pnpm run build` in `ui/`).
+2. Copy the signed `quack` to the sidecar path Tauri expects
+   (`binaries/quack-aarch64-apple-darwin`).
+3. `cargo tauri build --target aarch64-apple-darwin --ci`: Tauri builds `quack-desktop`,
+   assembles `Quack.app` with the sidecar, signs it with the same identity
+   (`bundle.macOS.signingIdentity` from `APPLE_CERTIFICATE_NAME`), notarizes and staples it
+   (a bundle can be stapled, unlike the bare binary), and writes the `.dmg`, the updater's
+   `Quack.app.tar.gz`, and its `.sig`.
+4. Upload `quack-${VERSION}-macos-arm64.dmg`, the `.app.tar.gz`, and the `.sig` as
+   artifacts, attested with `actions/attest-build-provenance` like the tarballs, and listed
+   in `SHA256SUMS` by `publish`.
 
-Each runs `cargo tauri build --target … --ci` with `tauri-cli` pinned. Signing reuses the
-secrets the `binaries` job already has: Tauri's `bundle.macOS.signingIdentity` and
-notarization environment take the same Apple certificate and API key, and the Windows
-bundles go through the same Azure Trusted Signing step after `tauri build` (Tauri's own
-`signCommand` hook, so the installer is signed too, not only the executable). Unsigned with
-a warning when the secrets are absent, as today. The bundles are uploaded as artifacts,
-attested with `actions/attest-build-provenance` like the tarballs, and listed in
-`SHA256SUMS` by `publish`. `aarch64-unknown-linux-gnu` with `fips` needs cmake, go, and
-clang on the ARM runner, as the musl build does in Docker; the job installs them.
-
-The matrix mirrors the CLI's five targets: Apple silicon only on macOS, as decided
-(section 10). Reproducibility is not claimed for the bundles: `.dmg` and `.msi` carry
-timestamps the bundlers set. The binary inside is built `--locked` from the same commit,
-and the attestation covers the bundle.
+Unsigned with a warning when the secrets are absent, as today. Reproducibility is not
+claimed for the `.dmg`; the binaries inside are built `--locked` from the same commit, and
+the attestation covers the image.
 
 ### 7.3 Self-update
 
-The first release updates itself through `tauri-plugin-updater`:
+`tauri-plugin-updater`, in the first release:
 
 - **Key.** One minisign key pair made once with `cargo tauri signer generate`; the public
-  key goes in `tauri.conf.json` (`plugins.updater.pubkey`), the private key and its
-  password are two repository secrets the `desktop` job reads
-  (`TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`). The job signs every
-  bundle it builds (`.sig` files beside them). Losing the key means installed apps cannot
-  verify the next release and must be reinstalled, so the key is backed up like the Apple
-  certificate.
+  key in `tauri.conf.json` (`plugins.updater.pubkey`), the private key and its password as
+  two repository secrets the macOS job reads (`TAURI_SIGNING_PRIVATE_KEY`,
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`). Losing the key means installed apps cannot verify
+  the next release and must be reinstalled, so it is backed up like the Apple certificate.
 - **Manifest.** The `publish` job, which already downloads every artifact and writes
-  `SHA256SUMS`, also assembles `latest.json` (version, notes, publish date, and per-platform
-  `url` and `signature`) from the `.sig` files and uploads it with the release. The endpoint
-  in `tauri.conf.json` is
-  `https://github.com/smoketurner/quack/releases/latest/download/latest.json`, so no other
-  server is involved. The workspace version (`2026.10.7`) parses as semver, which the plugin
-  requires.
-- **In the app.** `update.rs` checks once after the window shows and on the tray's **Check
-  for updates…**. A found update is a native dialog: "quack 2026.11.1 is available. Install
-  it and relaunch?" with **Install and relaunch** / **Later**, the release notes' first
-  lines underneath. Install downloads over rustls, verifies the signature, applies the
-  update for the platform (5.6), drains through `Embedded::stop` as a Quit would (jobs
-  running get the same confirm as 5.3 step 2), and relaunches with `tauri-plugin-process`.
-  A `.deb` or `.rpm` install, which the plugin cannot replace, gets "quack 2026.11.1 is
-  available from your package manager" with **OK**. A failed check is one log line, never a
-  dialog.
-- **Channel.** Latest only; there is no beta channel.
+  `SHA256SUMS`, also assembles `latest.json` (version, notes, date, the macOS `url` and
+  `signature`) and uploads it with the release. The endpoint in `tauri.conf.json` is
+  `https://github.com/smoketurner/quack/releases/latest/download/latest.json`. The workspace
+  version (`2026.10.7`) parses as semver, which the plugin requires.
+- **In the app.** `update.rs` checks once after the window shows and on **Check for
+  Updates…**. A found update is a native dialog, "quack 2026.11.1 is available. Install it
+  and relaunch?" with **Install and relaunch** / **Later** and the release notes' first lines.
+  Install downloads over rustls, verifies the signature, replaces the app (and so the CLI
+  inside it), quits through the same drain as ⌘Q (jobs running get the same question), and
+  relaunches with `tauri-plugin-process`. A failed check is one log line, never a dialog.
+- **Channel.** Latest only.
+
+### 7.4 Platforms after macOS
+
+The crate is Tauri, so Windows and Linux follow from the same code when wanted: a matrix row
+each in `reusable-build.yml`, WebView2's bootstrapper in the Windows installer, WebKitGTK
+packages as `.deb`/`.rpm` dependencies, the CLI as a sidecar in each bundle, and a per-platform
+"install command" path. The `cfg(target_os = "macos")` code in the first release is the
+menu-bar extra, the Dock badge and menu, `cli.rs`'s symlink path, and the NSAlert details;
+everything else is Tauri's job. None of it is built or tested until then.
 
 ## 8. Tests
 
-- `quack-server`, router tests with `tower::ServiceExt::oneshot`, no model: `Desktop` mode
-  without a cookie is 401 on the API and a `/login` redirect on the web; `/desktop/start`
-  with the token sets the cookie and redirects, with a wrong token is 401 and writes the
-  denied row, from a non-loopback peer is 404; a request with the cookie is `local` with
-  every scope; the Documents and chat pages render the desktop controls and `desktop.js`
-  in Desktop mode and not in Local or Login mode; the CSP carries `ipc:` only in Desktop
-  mode; `Local` mode is unchanged by the refactor (the existing tests).
-- `Embedded`: start on port 0, `addr` is loopback and non-zero, `ingest_paths` on a temp
-  CSV yields a `ready` document with the source path recorded and an `upload` row on channel
-  `desktop`, `stop` returns within the grace with the writer checkpointed (reopen the file).
-- `quack-desktop`: the URL-to-workspace parsing, the navigation policy (loopback origin
-  allowed, `/login` rewritten to the start URL, other origins denied and opened externally),
-  the state file round trip, the dialog text builder (heading, notice, SQL cut and the "N
-  more lines" sentence, buttons from `choices` in order), the queue of one dialog at a time,
-  the `latest.json` reader against a fixture. The three IPC commands run under
-  `tauri::test`'s mock runtime with the dialog replaced by a stub, checking that each ends
-  in `ingest_paths` or a decision and that no command accepts a path from the page. The
-  Tauri runtime itself is not driven in CI; a manual checklist in the README covers drop,
-  the pickers, the dialog, downloads, tray, quit with jobs, update, and relaunch on all
-  three platforms.
+- `quack-cli`: `OpenedWorkspace` and session choice, moved with their behaviour pinned
+  (default workspace created on first use, `-w` must exist, `--resume` by prefix).
+- `quack-core`: the modules moved out of the server (3.4) keep the server's tests and gain
+  the app as a second caller in tests.
+- `quack-desktop`, under `tauri::test`'s mock runtime with the dialogs stubbed: the
+  `AgentEvent` to `TurnEvent` projection (every variant, the permission event's fields, the
+  words from `Decision`); a scripted turn through `start_turn` against `quack-testkit`'s
+  `ScriptedOllama`, with a write that asks, answered allow, deny, and allow-for-turn, each
+  recorded in the session and audited on channel `desktop`; a turn dictated by retrieved
+  text (`seed_dictating_note`) asks even under "run without asking"; `cancel_turn`;
+  `ingest` by path yields a `ready` document with `DocumentSource::Path`; the jobs event
+  sequence for one upload; the idle close of a workspace and the CLI's lock error naming the
+  app; the install-command symlink logic against a temp directory; the state file round
+  trip; `latest.json` reading against a fixture.
+- `ui/`: `vitest` for the view models and the event reducer that turns `TurnEvent`s into
+  transcript state, with recorded event sequences as fixtures.
 - The release workflow's `latest.json` assembly runs against a fixture of `.sig` files in
-  CI, so a broken manifest never reaches a release.
-- `make eval` is untouched; the desktop drives the same server the eval already exercises
-  through `quack serve`.
+  CI.
+- A manual pre-release checklist in the README on a clean macOS account: first launch with
+  and without Ollama, drop, the pickers, the dialog, exports, the menu, quit with jobs,
+  install command, update and relaunch.
+- `make eval` is untouched; it drives the CLI, which the app ships unchanged.
 
-## 9. Cost, beside the slimmer cuts not taken
+## 9. Cost
 
-| Cut | What you get | Size |
-|---|---|---|
-| 0. No Tauri: `quack serve --local --open` | the embedded server and the system browser opened on it; no tray, no drop by path, no bundle | ~30 lines in `crates/quack`; zero new dependencies |
-| 1. Window only: `Embedded` + `ServeMode::Desktop` + a window that heals and saves downloads | a private, token-gated web UI in an app window on all three platforms, bundled | ~300 lines server, ~350 crate, the full matrix |
-| **2. This document:** + pickers and drop by path, the native confirm dialog, page IPC, tray, lifecycle, single instance, self-update, log file | everything in sections 3 to 7 | ~300 server, ~900 crate, ~120 web, ~250 YAML, docs |
+| Part | Size |
+|---|---|
+| `quack-cli`: `OpenedWorkspace` and session choice moved | ~150 lines moved |
+| `quack-core`: background runs, upload spooling, pending permissions moved from the server | ~600 lines moved, two callers each |
+| `quack-desktop` Rust: state, 11 command modules, turn and jobs bridges, permission dialog, audit, menu, install command, updater, setup, logging | ~2,000 lines |
+| `ui/`: 11 views, the transcript renderer with steps, citations, charts, the grid, the editor, the graph canvas, forms | ~6,000 lines of TypeScript and CSS |
+| Workflow, `latest.json` assembly, the cask | ~200 lines |
+| Docs: this file, `architecture.md`, `ci-cd.md`, `crates/README.md`, the crate README, design doc 11.6, 14, and the section 7 table | |
 
-Cut 0 is independent of the crate and can land at any time. Cut 2 is what was decided.
+The frontend is the bulk, and it is where a thin first release is possible without changing
+the architecture: Workspaces, Chat, Documents, and Settings first (what a person needs to
+ask a question of their files), the other seven views after, each a command module and a
+view at a time.
 
 ## 10. Decisions taken (2026-10-12)
 
-Taken by the project owner, not by this document. Each row names what was chosen and what
-else was on the table.
+Taken by the project owner, not by this document.
 
 | Decision | Chosen | Not chosen |
 |---|---|---|
-| Shape | a separate `quack-desktop` binary (section 1) | `quack desktop` inside the one binary, which makes the Linux CLI glibc-dynamic and gives up the musl and `scratch` builds; `quack desktop` exec'ing a sibling binary, with the CLI as a sidecar in the bundle |
-| Data directory | the CLI's (`~/.local/share/quack`, `QUACK_DATA_DIR`) (5.5) | the platform app-data directory the design doc named, with the CLI pointed at it by `QUACK_DATA_DIR` or by the app writing the path into `config.toml` |
-| Write prompts | a native confirm dialog (5.2) | the web chat's card alone, with an OS notification when the window is in the background; the dialog only when the window is unfocused and the card otherwise |
-| Page IPC | yes, a runtime capability scoped to the server's origin and three commands (5.4) | no IPC: every native action started by the host, the page byte-identical to the browser |
-| macOS | Apple silicon only, matching the CLI (7.2) | a universal `.app` (both halves on one runner, about twice the build time); two separate bundles |
-| Self-update | `tauri-plugin-updater` in the first release (7.3) | releases page and package managers only, no update key |
-| Tray | hide to tray on close; quit on close where the desktop has no tray (5.3) | always quit on close, the tray only a launcher; always hide, reachable by relaunching |
-| Tracking | reopen #35; a follow-up PR updates design doc sections 11.6, 14, and the section 7 permission table | a new issue; folding the design into `design-doc.md` in this PR |
+| Interface | a new desktop frontend bundled in the app, over Rust commands that call `quack-core` in-process (section 1) | the web UI served to a webview from an embedded HTTP server; the web UI served through a Tauri custom protocol without a socket; a SwiftUI shell over a core binding |
+| Frontend stack | Tauri's own: TypeScript over `@tauri-apps/api`, Vite, no framework (section 2; reading to confirm, section 11) | React, Svelte, SolidJS |
+| Shape | a separate `quack-desktop` binary | `quack desktop` inside the one binary; a subcommand exec'ing a sibling |
+| macOS package | one `.dmg` with `Quack.app`, the `quack` CLI inside it as a sidecar, and an Install quack Command menu item (section 6) | a `.pkg` installing both; a `.dmg` with the app and the binary side by side |
+| Platforms | macOS only in the first release, Windows and Linux later from the same crate (7.4) | Windows in the same release; all three now |
+| Data directory | the CLI's (3.6) | the platform app-data directory the design doc named |
+| Write prompts | a native confirm dialog built from `Decision`'s words (3.5) | an in-page card |
+| macOS hardware | Apple silicon only, matching the CLI | a universal `.app`; two bundles |
+| Self-update | `tauri-plugin-updater` in the first release (7.3) | releases page and the tap only |
+| Window on close | the app keeps running in the Dock with a menu-bar extra; Quit drains jobs (section 4) | quit on close |
+| Tracking | #35 reopened; a follow-up PR updates design doc 11.6, 14, and the section 7 table | a new issue |
 
-Two items the implementation confirms rather than decides: that `quack_core::setup`'s probe
-and config write separate from its prompts (5.5), and that Tauri's dialog plugin exposes
-three custom button labels on every platform (5.2; the fallback window is named there).
+Superseded by the architecture change: the earlier decision to give the page a scoped IPC
+capability over an embedded server. The frontend is the app's own, and its commands are
+simply its API.
 
-## 11. Where it sits
+## 11. To confirm before building
 
-In `docs/architecture.md`'s layering diagram the `quack desktop` box becomes the
-`quack-desktop` binary, the one client that reaches `quack-core` through `quack-server`'s
-in-process `Embedded` rather than over the network, and the note under the diagram ("all
-subcommands of the single `quack` binary") gains "and the desktop app, a second binary over
-the same server crate". `crates/README.md` gets an eighth row; `docs/ci-cd.md` gets the
-desktop matrix and the update manifest; `docs/web-ui.md` gets the Desktop-mode controls and
-`desktop.js`; `docs/audit.md` already lists channel `desktop`.
+Questions the implementation must not answer on its own:
+
+1. **The frontend stack reading.** "Tauri" is read as Tauri's own tooling with no
+   framework: TypeScript, Vite, web components, Tailwind, ECharts, CodeMirror. Confirm, or
+   name the stack.
+2. **Audit.** The design doc's schema names channel `desktop` and section 12 asks every
+   interface to write rows, and this document does so (3.5). The terminal and the CLI write
+   none today. Confirm the app audits, or that it matches the terminal.
+3. **The built frontend.** The repo commits built assets (the CSS, the editor bundle)
+   because rust-embed needs them and CI has no Node. For the app, `ui/dist` can be committed
+   the same way, or built by the macOS job with pnpm pinned and never committed.
+4. **The app and the CLI on one workspace.** DuckDB's lock is per process; the app closes
+   idle workspaces (3.6) so the CLI can open them. Confirm the idle close and its default, or
+   ask for another arrangement.
+5. **Homebrew.** A cask for `Quack.app` that links the CLI (section 6); whether the macOS
+   tarball and the formula also remain for people who want only the CLI.
+6. **The thin first release** (section 9): four views first, or all eleven before the first
+   tag.
+
+## 12. Where it sits
+
+In `docs/architecture.md`'s layering diagram the `quack desktop` box becomes `Quack.app`,
+a client of `quack-core` beside the terminal and the server, not of the server. The note
+under the diagram ("all subcommands of the single `quack` binary") gains "and `Quack.app`, a
+second binary that ships the first inside it". `crates/README.md` gets an eighth row;
+`docs/ci-cd.md` gets the macOS bundle steps, the update manifest, and the cask;
+`docs/audit.md` already lists channel `desktop`; design doc 11.6 is rewritten to this, 14's
+"not a separate binary" line goes, and the section 7 permission table's Desktop row reads
+"a native confirm dialog with `Decision`'s words".
