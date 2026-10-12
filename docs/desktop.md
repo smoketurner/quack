@@ -38,10 +38,13 @@ Rust talks to the engine as a library.
   binary crate (`tauri-build` in its `build.rs`, `tauri.conf.json` beside it), and on Linux
   Tauri links GTK and WebKitGTK dynamically, which the `quack` binary's static musl builds and
   the `scratch` image cannot carry. The CLI and its release targets are unchanged.
-- **Depends on `quack-core` and `quack-cli`, never `quack-server`.** It is the fourth client
-  of the engine beside the terminal, print mode, and the server, and it reaches the engine the
-  way the terminal does. `crates/README.md`'s rule holds: behaviour more than one interface
-  needs goes in `quack-core`; what owns the screen goes here.
+- **Depends on `quack-core` and `quack-cli`, and on one module of `quack-server`.** It is
+  the fourth client of the engine beside the terminal, print mode, and the server, and it
+  reaches the engine the way the terminal does. The one thing it takes from `quack-server` is
+  its MCP server, served in-process and opt-in so Claude Code and editors can reach a
+  workspace the app holds (3.7); no REST route, page, session, or `AppState` comes with it.
+  `crates/README.md`'s rule holds: behaviour more than one interface needs goes in
+  `quack-core`; what owns the screen goes here.
 - **The frontend is new**, written for a desktop window, and bundled into the app
   (`frontendDist`). The web UI's askama pages and htmx are not reused; the two UIs share the
   engine, its types, and its words (`Decision`, `PageCounts::note`, citation labels), not
@@ -87,6 +90,7 @@ crates/quack-desktop/
     saved.rs          # commands: list, add from a session's last answer, run, show, remove
     jobs.rs           # JobQueue broadcast -> Tauri event "job"; cancel; the counts for the badge
     audit.rs          # audit_log rows on channel `desktop` plus _quack_audit detail (section 3.5)
+    mcp.rs            # opt-in: quack-server's McpServer over streamable HTTP on loopback, per-launch token (3.7)
     menu.rs           # the native menu bar, the Dock menu, the menu-bar extra
     cli.rs            # "Install quack command": symlink Contents/MacOS/quack into /usr/local/bin
     update.rs         # tauri-plugin-updater: check on launch and on demand, offer, install, relaunch
@@ -252,7 +256,49 @@ after an idle period (a `[desktop].close_idle_minutes` setting, default to be se
 CLI's error names the app when the lock holder is `quack-desktop`. Section 11 asks whether
 that is enough or the two should share differently.
 
-### 3.7 First launch
+### 3.7 MCP for other tools, opt-in
+
+DuckDB's lock is per process, so while the app holds a workspace, `quack mcp` started by
+Claude Code or an editor cannot open it, and the idle close (3.6) does not help: an MCP
+client's session lasts as long as the window. The server answers this today by serving MCP
+over HTTP from the process that holds the lock, and the app does the same, as a setting
+that is off by default.
+
+**Settings › Connect Claude Code.** Switching it on, per workspace:
+
+1. Builds `quack-server`'s `McpServer` from the app's own handles: `McpSetup` takes the
+   `Config`, the workspace's `SharedDb` and `ReaderDb`, its `WorkspaceRow`, a
+   `WritePolicy` (`Deny` unless the person also turns on "Allow writes over MCP", which is
+   `quack mcp --allow-write`'s policy), `user_id: None`, the app's auditor (3.5, channel
+   `mcp`), and the app's `JobQueue`. Nothing is opened twice; the MCP tools run on the same
+   writer thread as the window's commands.
+2. Serves it over rmcp's streamable HTTP transport on `127.0.0.1:0`, under a per-launch
+   bearer token (32 random bytes from aws-lc-rs, compared in constant time) that every
+   request must carry; a request without it is 401 and nothing else listens on the port. No
+   REST, no pages, no sessions: a router of one route.
+3. Shows the URL and the one JSON snippet to paste into Claude Code's MCP configuration,
+   with a Copy button, and a line naming the policy in force ("reads only" or "writes
+   allowed, unasked").
+
+Turning it off stops the listener and ends its MCP sessions; Quit does the same through the
+app's drain. The token changes on every launch, so the snippet is a one-time paste into a
+config that reads it from a file the app writes (`{data_dir}/mcp/{workspace}.json`, mode
+0600) rather than a literal, and the Settings view says so. Writes over MCP that a turn's
+retrieved text dictated are still refused (`Approver::Nobody`), as over `quack mcp`.
+
+For this the `McpServer` and `McpSetup` types become `pub` in `quack-server`, and
+`mcp_http.rs`'s transport construction is factored so the app and `quack serve` build the
+same one. The app links `rmcp`'s server transport through `quack-server` and adds `axum`
+for the one-route router; the templates, static assets, and the rest of the server are not
+compiled in, since `quack-server`'s page and asset embedding sits behind modules the app's
+build does not reach. If that proves not to hold (rust-embed runs at compile time for the
+whole crate), the MCP server moves to its own crate, `quack-mcp`, with `quack-server` and the
+app as its two dependents; that is a refactor of module boundaries, not of behaviour.
+
+The CLI case stays as designed: the idle close, and `quack`'s lock error naming the app when
+the holder is `quack-desktop`.
+
+### 3.8 First launch
 
 With no `config.toml`, `setup.rs` runs `quack_core::setup::Discovery::run` over
 `Environment::from_env` (Ollama, API keys, AWS credentials), builds a `SetupPlan` from what
@@ -281,7 +327,7 @@ the bottom while jobs run. Keyboard shortcuts follow macOS: ⌘N new session, �
 | Ontology | the current version, versions and diff, import and export JSON, propose from tables or documents (cost shown, then asked), review, accept and reject, rename, the property and measure forms | `quack_core::ontology`, `induction`, `documents`, `edit` |
 | Saved | the saved questions, Run (changed or not), Add from a session's last answer, Remove | `quack_core::saved` |
 | Jobs | every job with progress, status line, outcome, Cancel | `JobQueue` |
-| Settings | the models and providers with `doctor`'s probe results, the data directory, Install quack command, Check for updates, the log | `Config`, `quack_core::setup`, `doctor` |
+| Settings | the models and providers with `doctor`'s probe results, the data directory, Install quack command, Connect Claude Code (3.7), Check for updates, the log | `Config`, `quack_core::setup`, `doctor`, `quack_server::McpServer` |
 
 Native menu bar: **Quack** (About, Settings…, Check for Updates…, Install quack Command…,
 Quit), **File** (New Workspace…, New Session, Add Files…, Add Folder…, Import…, Snapshot
@@ -420,7 +466,9 @@ everything else is Tauri's job. None of it is built or tested until then.
   `ingest` by path yields a `ready` document with `DocumentSource::Path`; the jobs event
   sequence for one upload; the idle close of a workspace and the CLI's lock error naming the
   app; the install-command symlink logic against a temp directory; the state file round
-  trip; `latest.json` reading against a fixture.
+  trip; `latest.json` reading against a fixture; the MCP endpoint (3.7) answers
+  `initialize` and `list_tables` with the token and 401 without it, refuses a write under the
+  default policy, and stops listening when switched off.
 - `ui/`: Vitest for the event reducer that turns `TurnEvent`s into transcript state, with
   recorded event sequences as fixtures, and React Testing Library for the views that render
   them (a step with its SQL and rows, a citation, a chart, the permission notice); a test
@@ -438,7 +486,8 @@ everything else is Tauri's job. None of it is built or tested until then.
 |---|---|
 | `quack-cli`: `OpenedWorkspace` and session choice moved | ~150 lines moved |
 | `quack-core`: background runs, upload spooling, pending permissions moved from the server | ~600 lines moved, two callers each |
-| `quack-desktop` Rust: state, 11 command modules, turn and jobs bridges, permission dialog, audit, menu, install command, updater, setup, logging | ~2,000 lines |
+| `quack-desktop` Rust: state, 11 command modules, turn and jobs bridges, permission dialog, audit, the MCP endpoint, menu, install command, updater, setup, logging | ~2,200 lines |
+| `quack-server`: `McpServer` and `McpSetup` made public, the HTTP transport factored for two callers | ~100 lines changed |
 | `ui/`: 11 views, the transcript renderer with steps, citations, charts, the grid, the editor, the graph canvas, forms | ~6,000 lines of TypeScript and CSS |
 | Workflow, `latest.json` assembly, the cask | ~200 lines |
 | Docs: this file, `architecture.md`, `ci-cd.md`, `crates/README.md`, the crate README, design doc 11.6, 14, and the section 7 table | |
@@ -455,6 +504,7 @@ Taken by the project owner, not by this document.
 | Decision | Chosen | Not chosen |
 |---|---|---|
 | Interface | a new desktop frontend bundled in the app, over Rust commands that call `quack-core` in-process (section 1) | the web UI served to a webview from an embedded HTTP server; the web UI served through a Tauri custom protocol without a socket; a SwiftUI shell over a core binding |
+| `quack-server` in the app | not for the app's own UI; its MCP server alone, in-process, opt-in per workspace, so Claude Code can reach a workspace the app holds (3.7) | embedding the whole server and pointing the window at it; no MCP while the app is open |
 | Frontend stack | React 19 with TypeScript on Vite, typed bindings from `tauri-specta` (section 2) | Svelte 5; SolidJS; no framework over `@tauri-apps/api`; Leptos or Dioxus in Rust |
 | Shape | a separate `quack-desktop` binary | `quack desktop` inside the one binary; a subcommand exec'ing a sibling |
 | macOS package | one `.dmg` with `Quack.app`, the `quack` CLI inside it as a sidecar, and an Install quack Command menu item (section 6) | a `.pkg` installing both; a `.dmg` with the app and the binary side by side |
