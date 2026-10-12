@@ -96,7 +96,7 @@ Assumptions about the current deployment, to confirm:
 ```
 +------------------------------------------------------------------------------+
 |                                Interfaces                                     |
-|  web UI (askama+htmx) | REST | MCP (stdio, HTTP) | TUI | print | desktop (planned) |
+|  web UI (askama+htmx) | REST | MCP (stdio, HTTP) | terminal | print | desktop (planned)|
 +------------------------------------------------------------------------------+
                                        |  in-process calls; no internal network hop
 +------------------------------------------------------------------------------+
@@ -2087,35 +2087,35 @@ the JSON response carries them on each step. The model is unaffected: it still s
 
 ### 7.7 Grounding
 
-`DuckDB` provides the answers; the chat model writes the SQL and the tool calls that fetch
-them (principle 8). What the model knows is never trusted, and its prose is never the record:
-the statement each `run_sql` ran and the rows it returned are kept on the step and shown in
-every interface, so an answer is checked against its query, not against its sentences. (A
-scan of the answer's numbers against the results was tried and removed: it misread ids and
-dates as figures and threw away correct answers, and it could not catch a real number from
-the wrong row, which is the failure that matters.)
+DuckDB provides the answers; the chat model writes the SQL and the tool calls that fetch them
+(principle 8). What the model knows is never trusted, and its prose is never the record. The
+statement each `run_sql` ran and the rows it returned are kept on the step and shown in every
+interface, so an answer is checked against its query, not against its sentences. A scan of
+the answer's numbers against the results was tried and removed: it misread ids and dates as
+figures and threw away correct answers, and it could not catch a real number from the wrong
+row, which is the failure that matters.
 
-The values a query filters on are held to the workspace instead (`grounding::ValueLinks`).
-A text column with at most 50 distinct values keeps all of them in its profile
-(`ColumnProfile::values`); when the turn starts, the question's words are matched to those
+The values a query filters on are held to the workspace instead (`grounding::ValueLinks`). A
+text column with at most 50 distinct values keeps all of them in its profile
+(`ColumnProfile::values`). When the turn starts, the question's words are matched to those
 values as whole words, ignoring case (`Texas` is `TEXAS` in `events.state`), and the matches
-go into the prompt after the workspace context, as the columns hold them (`The question
-names these stored values; filter on them exactly as written: events.state = 'TEXAS'
-(Texas)`), so the first query can be the right one. A read whose `column = 'value'` or
-`column IN (...)` (as `DuckDB` parses it, the column bare or inside `lower`, `upper`, or
-`trim`) uses another value of a column the question names a value of is not run: `WHERE
-state = 'TENNESSEE'` for a question about Texas, or `WHERE state = 'Texas'` when the column
-holds `TEXAS`. The model is told the value the column holds and writes the query again. And
-whatever the question names, a filter on a column whose every value is listed, with a value
-the list does not hold, is not run either: the model is given the list. A column with more
-values than the profile lists is held by the prompt's guidance alone, which tells the model
-to run `SELECT DISTINCT` before filtering on a value it has not seen; the prompt shows it
-no value to copy, only the count and the form.
+go into the prompt after the workspace context, as the columns hold them: `The question names
+these stored values; filter on them exactly as written: events.state = 'TEXAS' (Texas)`. The
+first query can then be the right one. A read whose `column = 'value'` or `column IN (...)`
+(as DuckDB parses it, the column bare or inside `lower`, `upper`, or `trim`) uses another
+value of a column the question names a value of is not run: `WHERE state = 'TENNESSEE'` for a
+question about Texas, or `WHERE state = 'Texas'` when the column holds `TEXAS`. The model is
+told the value the column holds and writes the query again. Whatever the question names, a
+filter on a column whose every value is listed, with a value the list does not hold, is not
+run either: the model is given the list. A column with more values than the profile lists is
+held by the prompt's guidance alone, which tells the model to run `SELECT DISTINCT` before
+filtering on a value it has not seen; the prompt shows it no value to copy, only the count
+and the form.
 
 An answer is shown only when the turn fetched something: a tool ran (`run_sql`, a search, a
 listing, `describe_table`; any step), or the answer cites a passage `always_retrieve` put in
-the prompt (a citation that survives validation names a chunk retrieved this turn; passages
-the answer does not cite count for nothing, since the model was told to cite what it uses). In
+the prompt. A citation that survives validation names a chunk retrieved this turn; passages
+the answer does not cite count for nothing, since the model was told to cite what it uses. In
 a workspace that holds tables or documents, a turn that ran nothing has no answer to show,
 whatever the model wrote, and the response is a fixed note instead: *quack ran no query and
 no search for this question, so there is no answer to show. The workspace holds the tables
@@ -2126,10 +2126,9 @@ rephrase is better than an answer from the model's memory.
 
 What else keeps the model to the data: a tool call repeating one the turn made, same tool and
 arguments, is not run again (`RepeatedCalls`); the graph tools register only for a question
-about the graph (7.3).
-Chat requests go out at temperature 0 with seed 7 where the API takes one (Ollama and
-`OpenAI`-compatible APIs; rig says which, and Anthropic's takes none), and an Ollama call
-writes at most 8,192 tokens (`num_predict`), so a model repeating itself stops.
+about the graph (7.3). Chat requests go out at temperature 0 with seed 7 where the API takes
+one (Ollama and OpenAI-compatible APIs; rig says which, and Anthropic's takes none), and an
+Ollama call writes at most 8,192 tokens (`num_predict`), so a model repeating itself stops.
 
 ---
 
@@ -2257,17 +2256,17 @@ in the browser from the spec, so nothing runs again.
 | `type` | Chat | Embeddings | Notes |
 |--------|------|------------|-------|
 | `ollama` | yes | yes | Offline default. `base_url` defaults to `http://localhost:11434` |
-| `openai` | yes | yes | Also OpenAI-compatible endpoints via `base_url` (vLLM, LiteLLM, Azure OpenAI). `api = "responses"` (sent with `store: false`; the default without a `base_url`, since GPT-5.6 calls tools only there) or `"chat-completions"` (the default with one, since compatible servers may offer nothing else) |
+| `openai` | yes | yes | Also OpenAI-compatible endpoints through `base_url` (vLLM, LiteLLM, Azure OpenAI). `api = "responses"` (sent with `store: false`; the default without a `base_url`, since GPT-5.6 calls tools only there) or `"chat-completions"` (the default with one, since compatible servers may offer nothing else) |
 | `anthropic` | yes | no | Native Messages API with tool use |
 | `bedrock` | yes | yes | Amazon Bedrock's `bedrock-runtime` endpoint: `api = "converse"` (default, rig-bedrock over the AWS SDK), `"chat-completions"`, or `"responses"` (OpenAI-compatible, `/openai/v1`). Embeddings are InvokeModel in Titan Text Embeddings V2's request shape. `region`, `aws_profile`, `base_url` (VPC endpoint) optional |
 | `bedrock-mantle` | yes | no | Amazon Bedrock's `bedrock-mantle` endpoint: `api = "responses"` (default) or `"chat-completions"` (`/v1`). Same `region`, `aws_profile`, `base_url` |
 
 `[general].chat_model` and `[embedding].model` each name `PROVIDER/MODEL`. A workspace's
 `allowed_providers` refuses a model on any other provider (section 5.2); the session records
-the model it used. Changing the
-embedding model, width, or prefixes leaves a workspace's vectors stale, not wrong: they are
-not searched, and their chunks are found by keyword. `quack embeddings refresh` shows what
-it will refresh, asks, and updates them in place (section 5.4).
+the model it used. Changing the embedding model, width, or prefixes leaves a workspace's
+vectors stale, not wrong: they are not searched, and their chunks are found by keyword. `quack
+embeddings refresh` shows what it will refresh, asks, and updates them in place (section
+5.4).
 
 **Proxies.** Every outbound HTTP client takes its forward proxy from `proxy::Proxies`, which
 reads `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` once. It configures reqwest and
@@ -2280,19 +2279,19 @@ server and the instance credential endpoints stay direct (`docs/providers.md`).
 with them; this section holds the design.
 
 Each provider has an `auth` mode: `none`; `api-key` (from the env var named by
-`api_key_env`); or `oauth`, an enterprise IdP access token as the provider's bearer, which
-reaches Azure OpenAI and internal gateways where static keys are forbidden. The oauth
-section's `grant` picks the flow: `authorization-code` (default; a person signs in through
-the browser with PKCE), `device-code` (a person enters a code on another device), or
-`client-credentials` (quack authenticates as itself with `client_id` and the secret in
-`client_secret_env`, required; nobody signs in, and the grant reruns whenever the token runs
-out).
+`api_key_env`); or `oauth`, an enterprise identity provider's access token as the provider's
+bearer, which reaches Azure OpenAI and internal gateways where static keys are forbidden. The
+oauth section's `grant` picks the flow: `authorization-code` (default; a person signs in
+through the browser with PKCE, Proof Key for Code Exchange), `device-code` (a person enters a
+code on another device), or `client-credentials` (quack authenticates as itself with
+`client_id` and the secret in `client_secret_env`, required; nobody signs in, and the grant
+reruns whenever the token runs out).
 
-**AWS.** `bedrock` and `bedrock-mantle` take only a fourth mode, `aws`, their default. The
-AWS SDK (`aws-config` with `sso`) signs each request with credentials from its default chain,
-as the AWS CLI finds them: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`;
-the profile named by `aws_profile` (else `AWS_PROFILE`, else `default`) in `~/.aws/config`
-and `~/.aws/credentials`, with its `source_profile`/`role_arn`, `credential_process`, and IAM
+**AWS.** `bedrock` and `bedrock-mantle` take only a fourth mode, `aws`, their default. The AWS
+SDK (`aws-config` with `sso`) signs each request with credentials from its default chain, as
+the AWS CLI finds them: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`; the
+profile named by `aws_profile` (else `AWS_PROFILE`, else `default`) in `~/.aws/config` and
+`~/.aws/credentials`, with its `source_profile`/`role_arn`, `credential_process`, and IAM
 Identity Center (`aws sso login`) settings; web identity tokens (EKS); the ECS and EC2
 instance roles. quack stores nothing; the SDK's caches and refreshes apply.
 
@@ -2309,22 +2308,22 @@ on `bedrock-mantle`) and embeddings on `bedrock-mantle`.
 
 The endpoint root is `base_url` if set, else the one AWS publishes for the region: the
 runtime's from the SDK's endpoint resolver (so `use_fips_endpoint` / `AWS_USE_FIPS_ENDPOINT`
-and dual-stack apply), mantle's `bedrock-mantle.{region}.api.aws` (FIPS is refused: mantle
-has no FIPS endpoint). `base_url` reaches a proxy or an interface VPC endpoint without
-private DNS (`https://vpce-….bedrock-mantle.us-east-1.vpce.amazonaws.com`; private DNS needs
-nothing). It is the root; quack adds `/v1` or `/openai/v1` per endpoint. An AWS host must
-name the provider's endpoint (`bedrock-runtime`, `bedrock-runtime-fips`, or
-`bedrock-mantle`), and its region is the signing region unless `region` overrides it; a
-disagreeing `region` is refused, and with FIPS required so is a non-FIPS AWS host.
-`base_url` replaces only the Bedrock endpoint, never SSO or STS.
+and dual-stack apply), mantle's `bedrock-mantle.{region}.api.aws` (FIPS is refused: mantle has
+no FIPS endpoint). `base_url` reaches a proxy or an interface VPC endpoint without private DNS
+(`https://vpce-….bedrock-mantle.us-east-1.vpce.amazonaws.com`; private DNS needs nothing). It
+is the root; quack adds `/v1` or `/openai/v1` per endpoint. An AWS host must name the
+provider's endpoint (`bedrock-runtime`, `bedrock-runtime-fips`, or `bedrock-mantle`), and its
+region is the signing region unless `region` overrides it; a disagreeing `region` is refused,
+and with FIPS required so is a non-FIPS AWS host. `base_url` replaces only the Bedrock
+endpoint, never SSO or STS.
 
 Without `base_url`, the runtime root also honors the SDK client's endpoint-URL overrides
-(`AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_BEDROCK_RUNTIME`, and the `[default]` /
-`[bedrock runtime]` profile `endpoint_url` keys), resolved as the bedrock-runtime `Config`
-builder does, so the OpenAI-compatible transports and the Converse / `InvokeModel` client
-share one host. With FIPS required, an override naming a non-FIPS AWS host is refused; the
-root resolves before the SDK client is built, so this fails the whole provider. Mantle has no
-SDK client and is unaffected.
+(`AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_BEDROCK_RUNTIME`, and the `[default]` / `[bedrock
+runtime]` profile `endpoint_url` keys), resolved as the bedrock-runtime `Config` builder does,
+so the OpenAI-compatible transports and the Converse / `InvokeModel` client share one host.
+With FIPS required, an override naming a non-FIPS AWS host is refused; the root resolves
+before the SDK client is built, so this fails the whole provider. Mantle has no SDK client
+and is unaffected.
 
 The region is `region`, else `base_url`'s, else the SDK's chain (`AWS_REGION`, the profile's
 `region`, instance metadata). A provider's first use builds its `llm::bedrock::Session`
@@ -2371,46 +2370,45 @@ pub struct CachedToken {
 when `grant = "device-code"`, with no browser, or under `SSH_CONNECTION`. Endpoints come from
 `{issuer_url}/.well-known/openid-configuration`, else RFC 8414's
 `/.well-known/oauth-authorization-server` inserted before the issuer's path; the document
-must name the configured issuer. The redirect's `iss` must match it when present, and must
-be present when the issuer advertises `authorization_response_iss_parameter_supported`
-(RFC 9207). The verifier uses aws-lc-rs randomness. The client authenticates per `client_auth`:
+must name the configured issuer. The redirect's `iss` must match it when present, and must be
+present when the issuer advertises `authorization_response_iss_parameter_supported` (RFC
+9207). The verifier uses aws-lc-rs randomness. The client authenticates per `client_auth`:
 secret in the body, HTTP Basic (`client_secret_basic`), or a client assertion
 (`private_key_jwt`, RFC 7523 2.2, below). When discovery lists a
 `pushed_authorization_request_endpoint`, the request is pushed there first (RFC 9126) and the
 browser carries only its `request_uri`. The token is reused while more than 60 s remain,
 refreshed silently under `refresh_lock`, and the flow restarts on refresh failure. In print,
-ingest, and server modes, where no flow can run, the call fails with exit 4 / HTTP 503
-naming the command to run.
+ingest, and server modes, where no flow can run, the call fails with exit 4 / HTTP 503 naming
+the command to run.
 
 The browser flow is the default because a device code can be phished: an attacker starts a
 login, sends the victim the code, and receives the victim's token on approval. The browser
 flow delivers the code only to the loopback listener that started the login.
 
 `refresh_lock` covers one process. Two processes on one data directory can both refresh an
-expiring token; an issuer that rotates refresh tokens refuses the second, which then
-rereads the stored token and uses it if another process stored a different, unexpired one
+expiring token. An issuer that rotates refresh tokens refuses the second, which then rereads
+the stored token and uses it if another process stored a different, unexpired one
 (`TokenManager::renewed_elsewhere`). An issuer with reuse detection (Okta, Auth0) instead
-revokes the whole token family, and every process needs a new login; the operator guide
-tells such deployments to make model calls through one long-lived process.
+revokes the whole token family, and every process needs a new login; the operator guide tells
+such deployments to make model calls through one long-lived process.
 
-A `client-credentials` provider needs no login: the first request runs the grant, a token
-with 60 s or less left is replaced by rerunning it under the same lock (never a refresh
-token), and a refused secret is an error naming the grant, not a login prompt. `quack auth
-login` on it runs the grant once to check the credentials.
+A `client-credentials` provider needs no login: the first request runs the grant, a token with
+60 s or less left is replaced by rerunning it under the same lock (never a refresh token), and
+a refused secret is an error naming the grant, not a login prompt. `quack auth login` on it
+runs the grant once to check the credentials.
 
-The token lives in `control.db` (`provider_tokens`, one row per provider), sealed by the
-vault (section 10.3) for the `provider-token` purpose with the provider name as subject, so a
-row copied under another name does not open. `control.db` opens on the first token read or
-write, so a command that never reaches the provider never opens it. The vault key is in the
-OS keychain where available (macOS Keychain; Windows Credential Manager; the Linux kernel
-keyring via `keyutils`, always present but in-memory, so a reboot needs a new login), else
+The token lives in `control.db` (`provider_tokens`, one row per provider), sealed by the vault
+(section 10.3) for the `provider-token` purpose with the provider name as subject, so a row
+copied under another name does not open. `control.db` opens on the first token read or write,
+so a command that never reaches the provider never opens it. The vault key is in the OS
+keychain where available (macOS Keychain; Windows Credential Manager; the Linux kernel keyring
+through `keyutils`, always present but in-memory, so a reboot needs a new login), else
 `<data_dir>/vault.key` (0600). `config::ProviderName` checks each `[providers.NAME]` key on
-read: ASCII letters, digits, `_`, `-`, at most 64; no `.`, since TOML reads
-`[providers.a.b]` as a table inside provider `a`. `quack auth status` and `logout`; logout
-deletes the row and keeps the vault key, which other tokens use. The `oauth2` crate runs
-without its bundled HTTP client (it would pull `ring`), over the same rustls + aws-lc-rs
-`reqwest` as rig. Scopes must include `offline_access` where the issuer needs it to return a
-refresh token.
+read: ASCII letters, digits, `_`, `-`, at most 64; no `.`, since TOML reads `[providers.a.b]`
+as a table inside provider `a`. `quack auth status` and `logout`; logout deletes the row and
+keeps the vault key, which other tokens use. The `oauth2` crate runs without its bundled HTTP
+client (it would pull `ring`), over the same rustls + aws-lc-rs `reqwest` as rig. Scopes must
+include `offline_access` where the issuer needs it to return a refresh token.
 
 The server shares one `TokenManager` per OAuth provider across requests. A server reaching
 Azure OpenAI this way is a confidential client and should be registered as one, with a client
@@ -2423,26 +2421,25 @@ with `kid` the key's RFC 7638 thumbprint, `iss` and `sub` the `client_id`, `aud`
 identifier from discovery (FAPI clients at Vouch accept only that), a UUID v7 `jti`, and a
 one-minute lifetime. The issuer spends each `jti`, so a retry or device-code poll signs anew:
 `OAuthHttp::sender` appends a fresh assertion to each request the `oauth2` crate sends (that
-crate sees a public client, so `client_id` goes in the body, never HTTP Basic), and
-hand-built requests (token exchange, PAR) add their own.
+crate sees a public client, so `client_id` goes in the body, never HTTP Basic), and hand-built
+requests (token exchange, PAR) add their own.
 
 The key is P-256, made with aws-lc-rs on first use (`llm::oauth::client_key`), kept PKCS#8 in
-`control.db` (`client_keys`, migration 7), sealed for the `client-key` purpose, loaded once
-per process, and named `<issuer> <client_id>`, so `[server.oidc]` and a provider registered
-as the same client share one key and one registered JWKS. `quack auth jwks [PROVIDER]` prints
-the public key set to register; `quack auth status` shows the thumbprint and any waiting
+`control.db` (`client_keys`, migration 7), sealed for the `client-key` purpose, loaded once per
+process, and named `<issuer> <client_id>`, so `[server.oidc]` and a provider registered as the
+same client share one key and one registered JWKS. `quack auth jwks [PROVIDER]` prints the
+public key set to register; `quack auth status` shows the thumbprint and any waiting
 replacement. Entra ID accepts client assertions only for uploaded certificates, named by
 thumbprint in the header, so an Entra client uses a secret. A key whose vault key is gone is
 replaced, with a warning to register the new one.
 
-Rotation takes two steps. `quack auth jwks --rotate` makes a replacement under
-`next <issuer> <client_id>` in `client_keys` and gives the issuer both keys (the same pair if
-repeated); the old key keeps signing. `--rotate --activate` moves the replacement onto the
-client's name and deletes the old key in one transaction (`ControlPlane::change_client_keys`)
-and gives the issuer the new key alone (again if repeated); every running `quack serve` must
-then restart. quack sends each set itself (RFC 7592, `Registrar::publish_keys`) for a client
-it registered and holds a registration token for, and prints it for hand registration
-otherwise.
+Rotation takes two steps. `quack auth jwks --rotate` makes a replacement under `next <issuer>
+<client_id>` in `client_keys` and gives the issuer both keys (the same pair if repeated); the
+old key keeps signing. `--rotate --activate` moves the replacement onto the client's name and
+deletes the old key in one transaction (`ControlPlane::change_client_keys`) and gives the
+issuer the new key alone (again if repeated); every running `quack serve` must then restart.
+quack sends each set itself (RFC 7592, `Registrar::publish_keys`) for a client it registered
+and holds a registration token for, and prints it for hand registration otherwise.
 
 **Registering the client** (`quack auth register`, `llm::oauth::registration`, RFC 7591 and
 7592). A `[server.oidc]` or `[providers.NAME.oauth]` section with `client_auth =
@@ -2463,18 +2460,18 @@ loopback redirect on a free port) that quack registers, signs the person in thro
 keeping the token, and deletes (RFC 7592) only after the real registration, since deleting a
 client can end its sign-ins. `--open`, after a warning and a confirmation, registers openly.
 An issuer advertising less is refused without `--token-env` or `--open`, never registered
-openly; quack never picks the flow by issuer name. Each temporary client's record
-(`sign-in <issuer> <client_id>` in `client_registrations`, registration token sealed) stays
-until the client is deleted, so an interrupted run (Ctrl-C deletes it on the way out) or a
-refused delete leaves the means to delete it: the next `quack auth register` does, and
-`quack doctor` names it.
+openly; quack never picks the flow by issuer name. Each temporary client's record (`sign-in
+<issuer> <client_id>` in `client_registrations`, registration token sealed) stays until the
+client is deleted, so an interrupted run (Ctrl-C deletes it on the way out) or a refused
+delete leaves the means to delete it: the next `quack auth register` does, and `quack doctor`
+names it.
 
 The key is made under the issuer's name alone and moves to `<issuer> <client_id>` in the
 transaction storing the registration in `control.db` (`client_registrations`, migration 8:
 `client_id`, `registration_client_uri`, and `registration_access_token` sealed for the
-`registration-token` purpose). The issuer names the record, so sections find their
-`client_id` before they know it; `quack config` shows it with origin `registration`, and
-`quack serve` refuses to start without it.
+`registration-token` purpose). The issuer names the record, so sections find their `client_id`
+before they know it; `quack config` shows it with origin `registration`, and `quack serve`
+refuses to start without it.
 
 - The record is written only while the issuer's name still holds what the command read
   (`storage::control::Previous`); of two racing registrations, the second deletes its client
@@ -2500,21 +2497,21 @@ person in memory.
 
 - `exchange` picks the wire form: `token-exchange` (RFC 8693, default; Okta, Auth0, Vouch:
   `subject_token` of type `access_token`, `requested_token_type` `access_token`, `scope`,
-  `audience`, and `resource` when set) or `entra` (the `jwt-bearer` grant with `assertion`
-  and `requested_token_use=on_behalf_of`).
+  `audience`, and `resource` when set) or `entra` (the `jwt-bearer` grant with `assertion` and
+  `requested_token_use=on_behalf_of`).
 - With `token-exchange` and `actor = true` (default), quack also sends its own
   client-credentials token as `actor_token`, so the issued token names quack as actor beside
   the person. Entra's form has no actor. With `actor = false` quack never runs the
   client-credentials grant for the provider (Vouch accepts only a user's token as actor).
-- The grant needs a confidential client: `client_secret_env` or
-  `client_auth = "private_key_jwt"`.
+- The grant needs a confidential client: `client_secret_env` or `client_auth =
+  "private_key_jwt"`.
 - A request with no signed-in person (the CLI, the terminal, local mode), or whose person has
   no current identity-provider token, is refused with `Error::Delegation` (HTTP 403, exit 4);
   nothing reaches such a provider as quack itself.
 - The acting person travels in a task-local (`llm::acting::Acting`): the server scopes an
   empty slot per request and the identity extractor fills it, the job queue carries the
-  submitter's into every job, and MCP's `query` and `search` carry the transport's user,
-  since they run in the MCP session's task.
+  submitter's into every job, and MCP's `query` and `search` carry the transport's user, since
+  they run in the MCP session's task.
 - `quack auth login` refuses the grant. `quack doctor` checks quack's own (actor) token when
   one is sent and, if the issuer lists `grant_types_supported`, that it includes the
   configured grant; with `actor = false` it requests no token.
@@ -2522,23 +2519,24 @@ person in memory.
 ### 10.3 Crypto
 
 `quack_core::crypto::install_default_provider()` runs at the top of `main`, before any TLS
-use. On Linux it installs `rustls::crypto::default_fips_provider()`: aws-lc-rs and rustls
-both carry the `fips` feature there, so every distributed Linux binary runs on the
-FIPS-validated AWS-LC module and approved cipher suites, and naming that function makes
-dropping the feature a build error. macOS and Windows install the aws-lc-sys provider,
-because a FIPS build links statically only on Linux. `--version` names the linked module,
-and `CryptoModule::log` logs it once a subscriber exists (`docs/crypto.md`).
+use. On Linux it installs `rustls::crypto::default_fips_provider()`: aws-lc-rs and rustls both
+carry the `fips` feature there, so every distributed Linux binary runs on the FIPS-validated
+AWS-LC module and approved cipher suites, and naming that function makes dropping the feature
+a build error. FIPS is the Federal Information Processing Standard 140-3. macOS and Windows
+install the aws-lc-sys provider, because a FIPS build links statically only on Linux.
+`--version` names the linked module, and `CryptoModule::log` logs it once a subscriber exists
+(`docs/crypto.md`).
 
 Data at rest that must stay unreadable without the machine's key goes through
-`quack_core::vault`: HPKE (RFC 9180) with DHKEM(P-256, HKDF-SHA256), HKDF-SHA256 and
-AES-256-GCM, from rustls's aws-lc-rs HPKE (a FIPS-kept suite), with one key pair per data
-directory in the OS keychain or a 0600 `vault.key`. Each value is sealed for a purpose (the
-HPKE `info`) and a subject (the associated data) and records its key id. The caller stores
-the sealed value where its classification says (signed-in users' tokens: `control.db`,
-section 12).
+`quack_core::vault`: HPKE (Hybrid Public Key Encryption, RFC 9180) with DHKEM(P-256,
+HKDF-SHA256), HKDF-SHA256 and AES-256-GCM, from rustls's aws-lc-rs HPKE (a FIPS-kept suite),
+with one key pair per data directory in the OS keychain or a 0600 `vault.key`. Each value is
+sealed for a purpose (the HPKE `info`) and a subject (the associated data) and records its key
+id. The caller stores the sealed value where its classification says (signed-in users'
+tokens: `control.db`, section 12).
 
-The keychain comes first, then `vault.key`. quack writes `vault.key` only where no keychain
-is usable at all (none installed, or no entry addressable, as under Docker's default seccomp
+The keychain comes first, then `vault.key`. quack writes `vault.key` only where no keychain is
+usable at all (none installed, or no entry addressable, as under Docker's default seccomp
 profile). A keychain that exists but refuses access is an error, never a fallback: tokens
 sealed under a second key would stop opening whenever the other key answered first. quack
 makes the key under an exclusive lock on `<data_dir>/vault.key.lock`, so processes starting
@@ -2546,10 +2544,10 @@ together on one data directory agree on one key; processes on different data dir
 share the keychain entry but not the lock.
 
 SHA-256, AES-256-GCM and randomness come from aws-lc-rs; password hashing is the RustCrypto
-`argon2` crate, salted from `getrandom`. No runtime code links OpenSSL or `ring`:
-`deny.toml` bans `openssl`, `openssl-sys` and `native-tls` outright and allows `ring` only as
-a build-time dependency of `libduckdb-sys`, which `make crypto-gates` re-checks with
-`cargo tree -e normal`.
+`argon2` crate, salted from `getrandom`. No runtime code links OpenSSL or `ring`: `deny.toml`
+bans `openssl`, `openssl-sys` and `native-tls` outright and allows `ring` only as a build-time
+dependency of `libduckdb-sys`, which `make crypto-gates` checks again with `cargo tree -e
+normal`.
 
 ---
 
@@ -2557,13 +2555,13 @@ a build-time dependency of `libduckdb-sys`, which `make crypto-gates` re-checks 
 
 ### 11.1 Web UI
 
-The web UI replaces today's AnythingLLM screen. Stack, all embedded with `rust-embed`:
+The web UI replaces today's AnythingLLM screen. The stack is embedded with `rust-embed`:
 askama templates; Tailwind from the standalone binary (no Node.js; the built CSS is
 committed, so `cargo build` needs no Tailwind); htmx; ECharts (the full minified build,
 vendored; a trimmed custom build needs Node and can replace it later). The chat's permission
-step is an "allow the agent to change tables" checkbox on the message, since an HTTP
-response cannot ask a question back mid-stream. A refused write tells the user to check it
-and ask again. The UI covers:
+step is an "allow the agent to change tables" checkbox on the message, since an HTTP response
+cannot ask a question back mid-stream. A refused write tells the user to check it and ask
+again. The UI covers:
 
 - Workspace list and switcher; workspace settings (classification label, allowed providers,
   members, API tokens); a separate context page with the editor and its version history.
@@ -2584,9 +2582,12 @@ and ask again. The UI covers:
   and shows each hit's fused score, its vector, keyword, and rerank rank and score, a link
   to its passage page, both legs' candidates, the phrase note, and the rerank outcome.
   Audited as `search`; the chat form's document picker lists the same documents.
-- Tables: list with schema (each column's type, meaning, present share, distinct count, and warnings, with a Fix type button for members and owners when every value converts), the table's note (editable by members and owners), its measures, sample rows, and the import form (with optional column types); a SQL page with an editor
-  that highlights SQL and completes table and column names, a result grid, and download.
-  The grid holds at most `max_query_rows`; the download streams every row
+- Tables: list with schema (each column's type, meaning, present share, distinct count,
+  range, and warnings, with a Fix type button for members and owners when every value
+  converts), the table's note (editable by members and owners), its measures, sample rows,
+  and the import form (with optional column types); a SQL page with an editor that
+  highlights SQL and completes table and column names, a result grid, and download. The grid
+  holds at most `max_query_rows`. The download streams every row
   (`WorkspaceDb::stream_query`, a read-only transaction on a reader connection, under the
   query timeout, one row in memory at a time), the same path `POST .../sql/export` serves
   scripts, and the button says "all N rows" when the grid was cut.
@@ -2602,19 +2603,19 @@ and ask again. The UI covers:
 ### 11.2 REST API
 
 The API is JSON under `/api/v1`, authenticated by a bearer token (a login session or an API
-token) or the `quack_session` cookie. Its contract is an OpenAPI 3.1 document at
-`GET /api/v1/openapi.json`, generated with `utoipa` from each handler's
-`#[utoipa::path]` annotation and the request and response types' schemas
-(`crates/quack-server/src/api/openapi.rs`), and rendered for people at `GET /api/v1/docs` by the vendored
-Redoc. Both sit beside `/healthz`: no sign-in, no audit row, no rate limit, and
+token) or the `quack_session` cookie. Its contract is an OpenAPI 3.1 document at `GET
+/api/v1/openapi.json`, generated with `utoipa` from each handler's `#[utoipa::path]`
+annotation and the request and response types' schemas
+(`crates/quack-server/src/api/openapi.rs`), and rendered for people at `GET /api/v1/docs` by
+the vendored Redoc. Both sit beside `/healthz`: no sign-in, no audit row, no rate limit, and
 `Cache-Control: no-cache`, since the document describes the routes and reveals no workspace
 content. Every path the router registers is in the document, and a test fails when one is
 not. Path and query parameters come from each handler's `Path` and `Query` extractors
-(utoipa's `axum_extras`), and a test fails when a route's path segment is missing from any
-of its operations. The two Server-Sent Events streams list their events, each with its data's schema, in
-the operation's `x-sse-events` extension, generated from the one `StreamEvent` enum. Every
-answer to a question is the same object print mode emits (`AgentResponseBody` in
-`quack_core::analysis::agent`):
+(utoipa's `axum_extras`), and a test fails when a route's path segment is missing from any of
+its operations. The two Server-Sent Events (SSE) streams list their events, each with its
+data's schema, in the operation's `x-sse-events` extension, generated from the one
+`StreamEvent` enum. Every answer to a question is the same object print mode emits
+(`AgentResponseBody` in `quack_core::analysis::agent`):
 
 ```json
 {
@@ -2751,16 +2752,17 @@ fixed-set values, and paging. The request log records each request's route templ
 Every error response under `/api/` is `{"error": "...", "code": "..."}`, and the
 `query/stream` turn's SSE `error` event carries the same object as its data. `code` is a
 stable `snake_case` value (`ErrorCode` in `server/error.rs`, listed as an enum in the
-document's components): a client branches on it, never on `error`, which is for a person
-and may change in any release. Core errors and failed turns map to specific codes
-(`auth_required`, `workspace_locked`, `no_chat_model`, `no_decision_model`, `table_taken`, `unknown_value`,
-`query_timeout`, `provider_refused`, `classify_refused`, `no_questions`, `draft_refused`, `set_columns_gone`, `classify_running`, `too_large_to_wait`, ...); an error with only a status carries that
-status's code (`bad_request`, `forbidden`, `not_found`, `conflict`, `busy`, ...). A user's
-own statement or import that fails is 422 with `sql_failed` or `import_failed` unless a
-more specific code applies. Errors the framework builds itself (a body that is not JSON, a
-method the route lacks, the rate limiter, the request timeout) get the same body through
-the `coded_errors` middleware, with codes such as `unsupported_media_type`,
-`method_not_allowed`, `rate_limited`, and `timeout`. Statuses:
+document's components). A client branches on it, never on `error`, which is for a person and
+may change in any release. Core errors and failed turns map to specific codes
+(`auth_required`, `workspace_locked`, `no_chat_model`, `no_decision_model`, `table_taken`,
+`unknown_value`, `query_timeout`, `provider_refused`, `classify_refused`, `no_questions`,
+`draft_refused`, `set_columns_gone`, `classify_running`, `too_large_to_wait`, ...). An error
+with only a status carries that status's code (`bad_request`, `forbidden`, `not_found`,
+`conflict`, `busy`, ...). A user's own statement or import that fails is 422 with `sql_failed`
+or `import_failed` unless a more specific code applies. Errors the framework builds itself (a
+body that is not JSON, a method the route lacks, the rate limiter, the request timeout) get
+the same body through the `coded_errors` middleware, with codes such as
+`unsupported_media_type`, `method_not_allowed`, `rate_limited`, and `timeout`. Statuses:
 
 - An unknown value for a fixed-set field (`mode`, `role`, `scopes`, an audit `outcome`, a
   merge or candidate `action`, an extraction `source`) is refused while the request is
@@ -2786,7 +2788,8 @@ workspace owner or admin). Other members see "a question in a private session".
 
 ### 11.3 MCP server
 
-One tool set serves two transports through `rmcp`, the official Rust SDK:
+One tool set serves two transports through `rmcp`, the official Rust SDK for the Model
+Context Protocol:
 
 - **stdio:** `quack mcp [-w NAME] [--allow-write]` for Claude Code and editors: one line in
   `.mcp.json`, no server, unaudited like the CLI.
@@ -2796,45 +2799,49 @@ One tool set serves two transports through `rmcp`, the official Rust SDK:
   write permission (the member role with the write scope). Every tool call is audited with
   channel `mcp`.
 
-Each `query` call starts a session (owned by the server user, `mode` `chat` or `query`)
-and returns its `session_id`; passing the id back continues it, and `document_ids` limits
-the question to documents. A turn that fails before recording anything leaves no session.
-`sql` answers in text with the table `run_sql` gives the agent (typed headers, values and
-rows bounded, a trailer saying what was cut) and in structured content with every kept row
-in full, `column_types`, `row_count`, and `row_count_exact`; `list_tables` answers one line
-per table or view, `orders (table, ~5000 rows): id BIGINT, ...` (the first 40 columns), with
-the same as structured content, so one call gives the schema.
-`search` takes `document_ids`, `entity`, `filters`, `mode`, and `explain`, as REST does.
+Each `query` call starts a session (owned by the server user, `mode` `chat` or `query`) and
+returns its `session_id`; passing the id back continues it, and `document_ids` limits the
+question to documents. A turn that fails before recording anything leaves no session. `sql`
+answers in text with the table `run_sql` gives the agent (typed headers, values and rows
+bounded, a trailer saying what was cut) and in structured content with every kept row in
+full, `column_types`, `row_count`, and `row_count_exact`. `list_tables` answers one line per
+table or view, `orders (table, ~5000 rows): id BIGINT, ...` (the first 40 columns), with the
+same as structured content, so one call gives the schema. `search` takes `document_ids`,
+`entity`, `filters`, `mode`, and `explain`, as REST does.
 
-Tools: `query`, `search`, `sql`, `classify` (a table's text labelled by the decision model: `preview` for any connection, a run only where the connection may write, and only up to `[decision].interactive_budget` answers), `list_tables`, `describe_table` (the REST describe shape: meanings, note, profile, warnings, measures), `list_documents` (REST's page: `after`, `limit`, and `{documents, next, total}`), and,
-once the graph has nodes, `search_graph` and `find_path`. Each answers with structured
-content plus text. Refusals (a write without permission, an internal table, a missing
-table) are tool errors the client model can read. Resources:
-`quack://workspace/tables`, `.../tables/{name}/schema`, `.../documents` (the first page, with `total` and `next`), `.../ontology`
-(JSON), `.../ontology/schema` (the interchange form's JSON Schema), `.../context` (Markdown).
+Tools: `query`, `search`, `sql`, `classify` (a table's text labelled by the decision model:
+`preview` for any connection, a run only where the connection may write, and only up to
+`[decision].interactive_budget` answers), `list_tables`, `describe_table` (the REST describe
+shape: meanings, note, profile, warnings, measures), `list_documents` (REST's page: `after`,
+`limit`, and `{documents, next, total}`), and, once the graph has nodes, `search_graph` and
+`find_path`. Each answers with structured content plus text. Refusals (a write without
+permission, an internal table, a missing table) are tool errors the client model can read.
+Resources: `quack://workspace/tables`, `.../tables/{name}/schema`, `.../documents` (the first
+page, with `total` and `next`), `.../ontology` (JSON), `.../ontology/schema` (the interchange
+form's JSON Schema), `.../context` (Markdown).
 
 ```json
 { "mcpServers": { "quack": { "command": "quack", "args": ["mcp", "-w", "logistics"] } } }
 ```
 
-### 11.4 Terminal session (TUI)
+### 11.4 Terminal session
 
 The terminal is a Claude Code-style single-pane transcript on a named workspace (`-w`,
-resolved through the control plane like every interface). It never blocks its input. It
-shows streaming answers, inline steps, citations as footnotes, and ratatui charts;
-permission prompts take `y`/`n`/`a`, one at a time, and the prompt itself shows who asks,
-the statement, and how many more wait, so clearing or scrolling the transcript never hides
-what is being approved. Input starting with `SELECT`/`WITH`/`FROM`/
-`DESCRIBE`/`SHOW`/`PIVOT`/`SUMMARIZE` is direct SQL when `DuckDB` can parse it; a line it
-cannot parse ("show me the first rows") is asked as a question when a chat model is set,
-with a note saying so, and `/sql` always runs its line as a statement. Direct SQL and `/sql` pass the agent's
-gate: internal tables refused, `max_query_rows` rows shown. A statement a person types runs as
-typed, a write included, as on the web SQL page; only the agent's writes ask. A line that
-is the path of a loadable file (or several, shell-quoted) is loaded; several names cut short
-by a word starting with `#`, which the shell split reads as a comment, are refused whole. The session turns on
-bracketed paste, so a file dropped on the terminal arrives as one paste of its path: into
-an empty input it loads at once, announced on a green `↑` line with its job number, and
-into text already typed it is inserted like any other paste.
+resolved through the control plane like every interface). It never blocks its input. It shows
+streaming answers, inline steps, citations as footnotes, and ratatui charts. Permission
+prompts take `y`/`n`/`a`, one at a time, and the prompt itself shows who asks, the statement,
+and how many more wait, so clearing or scrolling the transcript never hides what is being
+approved. Input starting with `SELECT`/`WITH`/`FROM`/`DESCRIBE`/`SHOW`/`PIVOT`/`SUMMARIZE` is
+direct SQL when DuckDB can parse it. A line it cannot parse ("show me the first rows") is
+asked as a question when a chat model is set, with a note saying so, and `/sql` always runs
+its line as a statement. Direct SQL and `/sql` pass the agent's gate: internal tables refused,
+`max_query_rows` rows shown. A statement a person types runs as typed, a write included, as
+on the web SQL page; only the agent's writes ask. A line that is the path of a loadable file
+(or several, shell-quoted) is loaded; several names cut short by a word starting with `#`,
+which the shell split reads as a comment, are refused whole. The session turns on bracketed
+paste, so a file dropped on the terminal arrives as one paste of its path: into an empty
+input it loads at once, announced on a green `↑` line with its job number; into text already
+typed it is inserted like any other paste.
 
 Slash commands: `/help`, `/tables [TABLE] [--note TEXT] [--retype COL=TYPE]` (`quack tables`'s
 arguments and output), `/sql`, `/ingest PATH` (`/attach`),
@@ -2848,10 +2855,9 @@ list deletes the highlighted session after a `y`, as the web's delete button ask
 `/resume`, `/new`, `/mode`, `/share`, `/unshare`, `/export [--sql|--markdown] [FILE]`,
 `/jobs`, `/cancel N`, `/steps`, `/model`, `/workspace`, `/clear`, `/quit`.
 `/model` shows the configured models, then lists each provider's models as a job
-(`llm::ModelCatalog`).
-`/ontology`, `/graph`, and `/saved` are the `quack ontology`, `quack graph`, and `quack
-saved` verbs, parsed by the same clap definitions; they run in the background, print to the transcript, and answer yes
-to anything that would ask on stdin.
+(`llm::ModelCatalog`). `/ontology`, `/graph`, and `/saved` are the `quack ontology`, `quack
+graph`, and `quack saved` verbs, parsed by the same clap definitions; they run in the
+background, print to the transcript, and answer yes to anything that would ask on stdin.
 
 **Command parsing.** One clap definition (`terminal::commands::SlashCommand`) drives
 dispatch, `/help`, and the completion popup. `SlashCommand::parse` reads the command and
@@ -2881,17 +2887,17 @@ read at startup and again after a statement, an ingest, an import, or a turn.
 
 **Jobs** (section 4.1). Questions, statements, files, imports, and ontology or graph verbs
 are each a job; the prompt takes the next line at once. A follow-up asked while an answer
-streams queues behind it in the session's lane and says so; SQL and file loads run
-alongside. A strip above the input shows running and queued jobs (spinner, number, kind,
-label, progress, and for a running question what it is doing: `waiting 3s`, `thinking 41s`
-once the model reports reasoning, `running run_sql`, `answering`); the status line counts them; `/jobs` opens a box over the transcript listing every job on
-record, newest first, which follows the queue while open (Up and Down move, `c` cancels the
-highlighted job, Enter posts its details, Esc closes); `/cancel N` stops one by number.
-`/sessions` opens the same box over the 200 most recent sessions, and Enter resumes the
-highlighted one. Results land in the transcript as each job finishes. A turn's text
-renders only while its session is on screen; switching sessions leaves it running, and a
-line reports its end. Write prompts from concurrent work queue and are answered one at a
-time.
+streams queues behind it in the session's lane and says so; SQL and file loads run alongside.
+A strip above the input shows running and queued jobs (spinner, number, kind, label,
+progress, and for a running question what it is doing: `waiting 3s`, `thinking 41s` once the
+model reports reasoning, `running run_sql`, `answering`), and the status line counts them.
+`/jobs` opens a box over the transcript listing every job on record, newest first, which
+follows the queue while open (Up and Down move, `c` cancels the highlighted job, Enter posts
+its details, Esc closes); `/cancel N` stops one by number. `/sessions` opens the same box over
+the 200 most recent sessions, and Enter resumes the highlighted one. Results land in the
+transcript as each job finishes. A turn's text renders only while its session is on screen;
+switching sessions leaves it running, and a line reports its end. Write prompts from
+concurrent work queue and are answered one at a time.
 
 **Event loop.** One `tokio::select!` over crossterm's `EventStream`, a single channel every
 job and turn reports on, the job queue's broadcast, and a spinner tick that runs only while
@@ -2901,8 +2907,9 @@ a job is active. Every waiting message is applied before the next draw.
 show a three-line preview until `/steps` expands them (print mode folds the same way without
 `--verbose`). An answer's chart is drawn in the transcript under its text and scrolls with it.
 Lines wrap to the terminal width before the scroll range is computed, so the end is always
-reachable. Typed input persists per workspace in `_quack_input_history` (the newest 500 lines). A relative path to an
-existing file ingests it. An embedding provider is optional (keyword search without one).
+reachable. Typed input persists per workspace in `_quack_input_history` (the newest 500
+lines). A relative path to an existing file ingests it. An embedding provider is optional
+(keyword search without one).
 
 | Key | Action |
 |---|---|
@@ -2980,13 +2987,13 @@ quack member add|remove|list ; quack audit [filters] [--format text|json|csv|ocs
 quack --version    version plus the AWS-LC module the binary links; -V is the bare version
 ```
 
-**Streams.** Non-TTY stdin is data for `-p` and `-q`: CSV, JSON, or Parquet loaded as the
-temporary table `stdin` for that invocation (a pasted document is `quack ingest -`). A pipe
-silent for a second (a supervisor's inherited stdin) is skipped with a warning; `--stdin`
-waits for it. stdout carries the answer or result set; stderr carries steps. In `-f json`
-and `-f ndjson`, same-named columns keep every value under suffixed keys (`a`, `a_1`).
-Print mode streams text only on a terminal, and reprints the validated answer when
-validation changed what streamed; a pipeline gets the validated answer alone.
+**Streams.** Non-terminal stdin is data for `-p` and `-q`: CSV, JSON, or Parquet loaded as
+the temporary table `stdin` for that invocation (a pasted document is `quack ingest -`). A
+pipe silent for a second (a supervisor's inherited stdin) is skipped with a warning; `--stdin`
+waits for it. stdout carries the answer or result set; stderr carries steps. In `-f json` and
+`-f ndjson`, same-named columns keep every value under suffixed keys (`a`, `a_1`). Print mode
+streams text only on a terminal, and prints the validated answer again when validation
+changed what streamed; a pipeline gets the validated answer alone.
 
 **Workspaces.** `-w NAME` names a workspace that exists. Any command given a name no
 workspace has stops with exit 2 and creates nothing:
@@ -3015,24 +3022,24 @@ through `WorkspaceDb::open`. Windows lets no other handle read a DuckDB file in 
 is the one path on every OS (#448). In `quack serve` the tar is spooled to an unnamed file
 under the data directory while the file is closed, and the download streams from it; the
 workspace's requests wait for the copy, not the download, and other workspaces never wait.
-`quack workspace snapshot NAME [--to FILE|-]`, the Settings page's download, and
-`GET .../snapshot` write it; `quack workspace restore FILE [--name N]` and
-`POST /api/v1/workspaces/restore` read it: a new row (the manifest's name unless given),
-the tar unpacked into the new directory (paths that leave it are refused), the settings
-applied (allowed providers this server lacks are dropped and reported), each manifest member
-this server has a user for given their role again (the rest reported), and one open of the
-file, which runs any schema upgrade; a manifest from a newer format or schema is refused with
-the quack to run, and a failure after the row exists deletes the row and directory again.
-The restore is audited as `restore` with the snapshot's date and version in the detail.
-`quack workspace rename OLD NEW` and `name` on `PATCH .../workspaces/{id}` (the Settings
-page's Name field) change the name the unique index guards. `quack workspace delete NAME`
-(asks; `-y` skips), `DELETE .../workspaces/{id}`, and the Settings page's form (the name
-typed again) delete at once: the server closes the file the same way, its connections staying
-closed, and lets go of its MCP transports (409 while a job of the workspace is queued or
-running), the row goes with its members and
-API tokens in one audited transaction, then the directory. `audit_log` has no foreign key to
-`workspaces`, so the rows stay. There is no archive state and no undo; the snapshot is the
-undo.
+
+`quack workspace snapshot NAME [--to FILE|-]`, the Settings page's download, and `GET
+.../snapshot` write it. `quack workspace restore FILE [--name N]` and `POST
+/api/v1/workspaces/restore` read it: a new row (the manifest's name unless given), the tar
+unpacked into the new directory (paths that leave it are refused), the settings applied
+(allowed providers this server lacks are dropped and reported), each manifest member this
+server has a user for given their role again (the rest reported), and one open of the file,
+which runs any schema upgrade. A manifest from a newer format or schema is refused with the
+quack to run, and a failure after the row exists deletes the row and directory again. The
+restore is audited as `restore` with the snapshot's date and version in the detail. `quack
+workspace rename OLD NEW` and `name` on `PATCH .../workspaces/{id}` (the Settings page's Name
+field) change the name the unique index guards. `quack workspace delete NAME` (asks; `-y`
+skips), `DELETE .../workspaces/{id}`, and the Settings page's form (the name typed again)
+delete at once: the server closes the file the same way, its connections staying closed, and
+lets go of its MCP transports (409 while a job of the workspace is queued or running); the
+row goes with its members and API tokens in one audited transaction, then the directory.
+`audit_log` has no foreign key to `workspaces`, so the rows stay. There is no archive state
+and no undo; the snapshot is the undo.
 
 **Exit codes:** 0 ok, 1 runtime error, 2 usage (an unknown `-w` included), 3 write refused,
 4 auth required, 5 the result of `quack saved run --exit-code` changed. A reader that closes
@@ -3040,12 +3047,12 @@ stdout early (`| head`) ends the command quietly with 0.
 
 **`quack config`** and `quack doctor` are the only commands that skip `Config::load`.
 `config` reads the file itself, so it describes even a configuration every other command
-refuses. It prints every recognized setting with its value in force and origin (built in,
-the file, or the overriding environment variable); what the file says where that differs
-from what runs; the file's unrecognized keys, each with the recognized key it resembles; and
-which environment variables the configuration reads are set, never their contents, since
-some hold credentials. `--changed` keeps only settings the file or environment sets;
-`--format json` emits one document. A rejected file exits 2 after the report.
+refuses. It prints every recognized setting with its value in force and origin (built in, the
+file, or the overriding environment variable); what the file says where that differs from
+what runs; the file's unrecognized keys, each with the recognized key it resembles; and which
+environment variables the configuration reads are set, never their contents, since some hold
+credentials. `--changed` keeps only settings the file or environment sets; `--format json`
+emits one document. A rejected file exits 2 after the report.
 
 **`quack doctor`** checks the whole setup, one line per check, with the fix under any that
 needs one:
@@ -3086,8 +3093,8 @@ there is no OS keychain, the vault key file.
 
 ### 11.6 Desktop window (`quack desktop`)
 
-Not built (#35, still open): no `desktop` subcommand and no Tauri dependency exist.
-It is the last interface on the roadmap and may never be built. The design:
+Not built (#35, still open): no `desktop` subcommand and no Tauri dependency exist. It is the
+last interface on the roadmap and may never be built. The design:
 
 `quack desktop` starts the embedded server on a random loopback port with a per-launch
 bearer token and opens the web UI in a Tauri webview with that token. The window is the web
@@ -3105,20 +3112,21 @@ installers.
 
 ## 12. Server Auth, Roles, and Audit
 
-`docs/authentication.md` is the operator's guide to each way in; this section holds the design.
+`docs/authentication.md` is the operator's guide to each way in; this section holds the
+design.
 
 - `quack serve --local`: no auth, loopback only, one implicit user. For a laptop that wants
   the browser.
-- Otherwise, users in `control.db` with argon2id password hashes and a login form that sets
-  a session cookie; API tokens (`quack token create` or the admin UI) as bearer tokens
-  scoped to a workspace with `read` / `write` / `admin` scopes.
+- Otherwise, users in `control.db` with argon2id password hashes and a login form that sets a
+  session cookie; API tokens (`quack token create` or the admin UI) as bearer tokens scoped to
+  a workspace with `read` / `write` / `admin` scopes.
 - **Sign-in through the organization's identity provider** (`[server.oidc]`, beside the
-  password form).
-  - "Sign in with <issuer>" goes to `GET /auth/oidc`: Authorization Code with PKCE, a
-    `state`, and a `nonce`. When discovery lists a `pushed_authorization_request_endpoint`,
-    quack pushes the request first (PAR, RFC 9126) with the client's credential, so the
-    browser carries only a `request_uri`. The code exchange and every renewal authenticate
-    as `client_auth` says (section 10.2).
+  password form). OIDC is OpenID Connect.
+  - "Sign in with <issuer>" goes to `GET /auth/oidc`: Authorization Code with PKCE, a `state`,
+    and a `nonce`. When discovery lists a `pushed_authorization_request_endpoint`, quack
+    pushes the request first (PAR, RFC 9126) with the client's credential, so the browser
+    carries only a `request_uri`. The code exchange and every renewal authenticate as
+    `client_auth` says (section 10.2).
   - A pending sign-in waits in memory ten minutes (at most 10,000 at once). An `HttpOnly`
     state cookie scoped to the callback ties the return to the browser that left, so a
     callback link someone else started cannot sign this browser in.
@@ -3132,14 +3140,14 @@ installers.
     takes over an account by name.
   - Both outcomes are audited as `login`; both routes share the login rate limit.
 - **A sign-in stays tied to the issuer.**
-  - The vault (`quack_core::vault`, section 10.3) seals the user's token and refresh token
-    in `control.db` (`user_tokens`, one row per user, deleted with the user) for the
+  - The vault (`quack_core::vault`, section 10.3) seals the user's token and refresh token in
+    `control.db` (`user_tokens`, one row per user, deleted with the user) for the
     `user-token` purpose with the user id as subject, so a row copied to another user does
     not open. It uses the vault's one key rather than a keychain entry per user: the Linux
     kernel keyring's default per-user quota (200 keys, 20 KB) would cap the server at a few
     dozen users. A row sealed under a key the vault no longer has reads as no token.
-  - The session records the token's renewal time; the first request after it renews under
-    a per-user lock, reusing a token another session already renewed.
+  - The session records the token's renewal time; the first request after it renews under a
+    per-user lock, reusing a token another session already renewed.
   - A refusal (`invalid_grant`: revoked, expired, account disabled) removes the stored
     token, ends all the user's sessions, and is audited as a denied `session`. An
     unreachable issuer is retried a minute later while the session continues.
@@ -3150,11 +3158,11 @@ installers.
 - **quack is an OAuth protected resource** (RFC 9728) when `[server.oidc].audience` is set.
   Without an audience nothing is published, and a JWT is an unknown API token.
   - The API and MCP then also accept the issuer's access tokens as bearers. quack verifies a
-    JWT-shaped bearer with `jsonwebtoken` (aws-lc-rs backend) against the issuer's
-    `jwks_uri` keys (cached an hour; refetched for an unknown `kid` at most once a minute):
+    JWT-shaped bearer with `jsonwebtoken` (aws-lc-rs backend) against the issuer's `jwks_uri`
+    keys (cached an hour; fetched again for an unknown `kid` at most once a minute):
     asymmetric algorithm only, `iss` the issuer, `aud` the configured audience, `exp` with a
-    minute's leeway. A token without `scp` or `scope` is refused, since an ID token can
-    carry the same `aud`.
+    minute's leeway. A token without `scp` or `scope` is refused, since an ID token can carry
+    the same `aud`.
   - `subject_claim` (default `sub`) names the user. On Entra, set it to `oid` (Entra's `sub`
     differs per application), set the API's `requestedAccessTokenVersion` (formerly
     `accessTokenAcceptedVersion`) to 2 so tokens carry the v2 issuer, and set `audience` to
@@ -3162,13 +3170,13 @@ installers.
   - The user is found or created with no access, as on sign-in, and the token carries that
     user's own access (`Credential::IdentityProvider`, channel `api`). A refused token is
     audited as a denied `token`.
-  - `/.well-known/oauth-protected-resource` describes the server (`resource` is the origin
-    of `redirect_uri`), `/.well-known/oauth-protected-resource/mcp/v1/{workspace}` each MCP
+  - `/.well-known/oauth-protected-resource` describes the server (`resource` is the origin of
+    `redirect_uri`), `/.well-known/oauth-protected-resource/mcp/v1/{workspace}` each MCP
     endpoint, and `/.well-known/oauth-protected-resource/api/v1` the API, each naming the
     issuer in `authorization_servers`.
   - Every API or MCP 401 carries `WWW-Authenticate: Bearer resource_metadata="..."` for its
-    resource, plus `error="invalid_token"` when a presented credential was refused, so an
-    MCP client can find the issuer and sign the user in itself (MCP authorization spec).
+    resource, plus `error="invalid_token"` when a presented credential was refused, so an MCP
+    client can find the issuer and sign the user in itself (MCP authorization spec).
 - **A browser session is bounded at both ends** (issue #73).
   - It dies `[server].session_max_age_hours` after login regardless of use, or
     `[server].session_idle_minutes` after its last request, whichever is first. The request
@@ -3178,9 +3186,9 @@ installers.
   - The cookie is `HttpOnly`, `SameSite=Lax`, with `Max-Age` equal to the absolute lifetime.
     It is `Secure` off loopback, and on loopback too when the public URL is https
     (`[server.oidc].redirect_uri`) or `[server].secure_cookies` is `always`. A cookie minted
-    behind a TLS-terminating proxy, even a same-host one on loopback, thus never travels
-    over a plaintext downgrade, while plain HTTP on a laptop still works. The sign-in state
-    cookie follows the same rule. `X-Forwarded-Proto` is never read (issue #246).
+    behind a TLS-terminating proxy, even a same-host one on loopback, thus never travels over
+    a plaintext downgrade, while plain HTTP on a laptop still works. The sign-in state cookie
+    follows the same rule. `X-Forwarded-Proto` is never read (issue #246).
   - A request that would change something and carries no bearer token is refused (403) when
     its `Origin`, or `Referer` without one, names another host: a page elsewhere can make the
     browser post with the session cookie, or, in local mode, with no credential at all. A
@@ -3198,24 +3206,24 @@ installers.
     (`quack_core::net`, every line, read from the right past the trusted hops); from any
     other peer the header is ignored, since any client can write it. `Forwarded` is never
     read: a proxy that writes `X-Forwarded-For` passes a client's own `Forwarded` through.
-  - `/healthz`, `/readyz`, and `/metrics` are outside every limiter: a throttled health
-    check reads as a dead server. `/readyz` answers 503 until `control.db` answers a query,
-    the data directory takes a write, and the vault key can be read; `quack ready` calls it
-    for the container image's `HEALTHCHECK`, since the image has no shell. `/metrics` is
+  - `/healthz`, `/readyz`, and `/metrics` are outside every limiter: a throttled health check
+    reads as a dead server. `/readyz` answers 503 until `control.db` answers a query, the
+    data directory takes a write, and the vault key can be read; `quack ready` calls it for
+    the container image's `HEALTHCHECK`, since the image has no shell. `/metrics` is
     Prometheus text (`quack_core::telemetry`, the `metrics` facade with the Prometheus
     exporter rendering on request, no listener of its own): provider requests, latency, and
     permit waits by provider, model, and status; retries; HTTP requests by method, route
     template, and status; jobs by kind and state; the writers' queues; open workspaces.
     Labels carry ids, kinds, and names only. It is served to loopback without a credential
     and to an admin's bearer from anywhere else.
-  - Per-key state is swept once a minute. governor keeps one entry per caller until
-    dropped, so an unswept limiter grows by one entry per address ever seen.
+  - Per-key state is swept once a minute. governor keeps one entry per caller until dropped,
+    so an unswept limiter grows by one entry per address ever seen.
 - **Nothing a caller receives is cached.** Pages, API answers, downloads, and event streams
-  carry workspace content. Every web UI, REST API, and MCP response carries
-  `Cache-Control: no-cache, no-store, must-revalidate`, `Expires: 0`, and `Pragma: no-cache`
-  unless its handler set a policy, so Back cannot restore a page after logout. Public static
-  assets keep `no-cache` with an `ETag`. A new API token appears once, in the creating
-  response's body, never in a URL, where history and access logs would keep it.
+  carry workspace content. Every web UI, REST API, and MCP response carries `Cache-Control:
+  no-cache, no-store, must-revalidate`, `Expires: 0`, and `Pragma: no-cache` unless its
+  handler set a policy, so Back cannot restore a page after logout. Public static assets keep
+  `no-cache` with an `ETag`. A new API token appears once, in the creating response's body,
+  never in a URL, where history and access logs would keep it.
 - **Roles:** `viewer` asks questions and searches. `member` also uploads, pins, deletes own
   uploads, grants write, edits the context and ontology, and runs proposals and extraction.
   `owner` manages members and tokens and sees all sessions. `is_admin` manages users and all
@@ -3237,15 +3245,15 @@ installers.
     audit write fails the request.
   - A denial writes only the `control.db` row; there is no workspace to write detail into.
     Table names are content and never appear in `control.db`.
-  - Over MCP the auditor is re-pointed at each request's identity, so a shared transport
-    audits the caller, not whoever opened it.
+  - Over MCP the auditor is pointed at each request's identity, so a shared transport audits
+    the caller, not whoever opened it.
   - An admin sees who accessed what and when in every workspace; a member sees what was done
     inside theirs.
   - Context or ontology export and import, and session export, are audited: they move
     content across the boundary.
   - Logins and failed logins carry no workspace. Membership changes carry the workspace
-    changed; a denial for an expired token carries the token's workspace. Successful token
-    use is not its own row; the action it performed is.
+    changed; a denial for an expired token carries the token's workspace. Successful token use
+    is not its own row; the action it performed is.
 
 ---
 
@@ -3256,7 +3264,7 @@ holds nothing workspace-specific; per-workspace settings live in `_quack_meta`. 
 sets `deny_unknown_fields`, so a key not listed below is a startup error, not a silent no-op.
 `quack config` (section 11.5) shows this list from the binary itself: every recognized
 setting with its value in force and origin, and every key in the file that is not one of
-them. The TUI's tick rate is a constant, not configuration.
+them. The terminal's tick rate is a constant, not configuration.
 
 ```toml
 [general]
@@ -3426,34 +3434,35 @@ redirect_uri = "https://quack.example.com/auth/oidc/callback"   # this server's 
 
 - **One binary, `quack`, no Cargo features.** Every surface is a subcommand, and every build
   contains all of them. Static musl on Linux (`x86_64`, `aarch64`), native on macOS
-  (`aarch64`) and Windows (`x86_64`, `aarch64`). DuckDB and SQLite are bundled and
-  statically linked.
-- **Released artifacts are signed and attested.** The macOS binary is signed with a
-  Developer ID certificate and submitted for notarization (a bare binary cannot be stapled,
-  so the ticket stays with Apple). Azure Artifact Signing signs the Windows binaries, on tag
-  builds only, because the federated credential trusts no other ref. Every archive, image
-  tarball, and pushed image carries a build provenance attestation naming
+  (`aarch64`) and Windows (`x86_64`, `aarch64`). DuckDB and SQLite are bundled and statically
+  linked.
+- **Released artifacts are signed and attested.** The macOS binary is signed with a Developer
+  ID certificate and submitted for notarization (a bare binary cannot be stapled, so the
+  ticket stays with Apple). Azure Artifact Signing signs the Windows binaries, on tag builds
+  only, because the federated credential trusts no other ref. Every archive, image tarball,
+  and pushed image carries a build provenance attestation naming
   `.github/workflows/reusable-build.yml` as its builder, which makes the provenance SLSA
-  Build Level 3 (`docs/ci-cd.md`).
-- **No DuckDB extension is ever installed or loaded at runtime.** A static musl binary
-  cannot `dlopen`. The only extension features quack enables are `bundled` and `json`
-  (Parquet reading is in DuckDB's core). Anything that would need another extension (`vss`,
-  `fts`, `excel`, `httpfs`, the Postgres and SQLite scanners) is implemented in Rust or not
-  built: XLSX uses a Rust reader, keyword search is quack's own BM25 index, and vector search
-  is an exact scan.
+  (Supply-chain Levels for Software Artifacts) Build Level 3 (`docs/ci-cd.md`).
+- **No DuckDB extension is ever installed or loaded at runtime.** A static musl binary cannot
+  `dlopen`. The extension features quack compiles in are `bundled`, `json`, and `parquet`;
+  nothing else is linked, and a connection that asks DuckDB to autoload an extension fails,
+  which is how a missing feature shows (Parquet reading failed that way until the feature was
+  added). Anything that would need another extension (`vss`, `fts`, `excel`, `httpfs`, the
+  Postgres and SQLite scanners) is implemented in Rust or not built: XLSX uses a Rust reader,
+  keyword search is quack's own BM25 index, and vector search is an exact scan.
 - **Desktop bundles** (section 11.6) wrap the same binary; not a separate binary.
 - **mimalloc** (`secure`) is the global allocator.
 - **Crypto:** rustls + aws-lc-rs, with both `fips` features on Linux, where aws-lc-fips-sys
-  links statically, so every distributed Linux binary and the image run on the
-  FIPS-validated module (`docs/crypto.md`). `make crypto-gates` runs `cargo tree -i ring`
-  and `-i openssl-sys` before the release builds anything.
+  links statically, so every distributed Linux binary and the image run on the FIPS-validated
+  module (`docs/crypto.md`). `make crypto-gates` runs `cargo tree -i ring` and `-i
+  openssl-sys` before the release builds anything.
 - **Container image** for `quack serve`:
   - `Dockerfile` builds from source: a CSS stage with the standalone Tailwind binary
     (checksum verified); `rust:<MSRV>-alpine` with cargo-chef for the musl build, `cmake`,
-    `clang`, `g++`, and `perl` for DuckDB and aws-lc, and `go` for the FIPS module's
-    delocate pass, which needs `AWS_LC_FIPS_SYS_CC=clang`; a `distroless/static` `nonroot`
-    runtime with `/quack` and `/data`, `QUACK_DATA_DIR=/data`, `QUACK_CONFIG_DIR=/config`,
-    port 8080.
+    `clang`, `g++`, and `perl` for DuckDB and aws-lc, and `go` for the FIPS module's delocate
+    pass, which needs `AWS_LC_FIPS_SYS_CC=clang`; a `distroless/static` `nonroot` runtime
+    with `/quack` and `/data`, `QUACK_DATA_DIR=/data`, `QUACK_CONFIG_DIR=/config`, port
+    8080.
   - `Dockerfile.release` builds the same runtime from the prebuilt musl binaries, so the
     release job never compiles under emulation.
   - The Rust image tag must track `rust-toolchain.toml`.
@@ -3463,8 +3472,8 @@ redirect_uri = "https://quack.example.com/auth/oidc/callback"   # this server's 
 - **Dependencies** follow the workspace rules in `CLAUDE.md`. This design added `argon2`,
   `rmcp` for MCP, `scraper` for HTML, `zip` + `quick-xml` for DOCX and PPTX (no `docx-rs`),
   `rust-stemmers`, and `tower_governor`. `serde-saphyr` only reads YAML files at ingest, where
-  a list of records loads as a table; JSON stays the only ontology interchange form.
-  `tauri` comes only if `quack desktop` is built.
+  a list of records loads as a table; JSON stays the only ontology interchange form. `tauri`
+  comes only if `quack desktop` is built.
 
 ---
 
@@ -3474,18 +3483,17 @@ The system being replaced runs on Postgres, so the team should accept these stor
 properties explicitly.
 
 1. **DuckDB is embedded and single-process.** One `quack serve` process owns every workspace
-   file, so scaling is vertical only; horizontal scaling or an HA (high-availability) pair
-   needs storage moved to a server database. For a single instance this is a
-   simplification, not a limitation. In-process concurrency is narrower than DuckDB's MVCC
-   allows: a workspace has one writer connection (`storage::writer::Writer`, on its own
-   thread, interactive work first), so ingestion and session writes take turns. Reads go to
-   the reader pool.
-2. **Vector search is an exact scan, not an index.** Every query computes cosine distance
-   to every stored embedding inside DuckDB. The working set is `chunks × dimension × 4`
-   bytes (about 4 GB per million 1,024-wide chunks). Measured with
-   `cargo bench -p quack-core --bench retrieval` (`make bench`; synthetic sixty-word chunks
-   from a 2,000-word vocabulary, 1,024-dimension vectors, top 8, an in-memory workspace on a
-   10-core Apple Silicon laptop, p50 / p99 per query):
+   file, so scaling is vertical only; horizontal scaling or a high-availability pair needs
+   storage moved to a server database. For a single instance this is a simplification, not a
+   limitation. In-process concurrency is narrower than DuckDB's MVCC allows: a workspace has
+   one writer connection (`storage::writer::Writer`, on its own thread, interactive work
+   first), so ingestion and session writes take turns. Reads go to the reader pool.
+2. **Vector search is an exact scan, not an index.** Every query computes cosine distance to
+   every stored embedding inside DuckDB. The working set is `chunks × dimension × 4` bytes
+   (4 GB per million 1,024-wide chunks). Measured with `cargo bench -p quack-core --bench
+   retrieval` (`make bench`; synthetic sixty-word chunks from a 2,000-word vocabulary,
+   1,024-dimension vectors, top 8, an in-memory workspace on a 10-core Apple Silicon laptop,
+   p50 / p99 per query):
 
    | chunks | vector scan | BM25 leg | fused hybrid |
    |---|---|---|---|
@@ -3493,75 +3501,74 @@ properties explicitly.
    | 100,000 | 95 / 95 ms | 36 / 37 ms | 134 / 138 ms |
    | 1,000,000 | 165 / 168 ms | 285 / 287 ms | 450 / 456 ms |
 
-   The scan is linear to 100,000 chunks (about 1 µs per chunk) and sublinear past that as
-   DuckDB spreads it across cores. Retrieval stays under the model's own time at every
-   likely workspace size, so no index is built. Decision, recorded so it is not
-   rediscovered (#32): past a million chunks, use a pure-Rust HNSW crate over the same
-   stored vectors, persisted beside `data.duckdb` and rebuilt from `_quack_chunks` when
-   missing or stale. A custom DuckDB build with `vss` and `fts` statically linked (DuckDB's
-   extension config, `DUCKDB_LIB_DIR` and `DUCKDB_STATIC`) means a C++ build pipeline per
-   release target and is not pursued.
+   The scan is linear to 100,000 chunks (1 µs per chunk) and sublinear past that as DuckDB
+   spreads it across cores. Retrieval stays under the model's own time at every likely
+   workspace size, so no index is built. Decision, recorded so it is not rediscovered (#32):
+   past a million chunks, use a pure-Rust HNSW crate over the same stored vectors, persisted
+   beside `data.duckdb` and rebuilt from `_quack_chunks` when missing or stale. A custom
+   DuckDB build with `vss` and `fts` statically linked (DuckDB's extension config,
+   `DUCKDB_LIB_DIR` and `DUCKDB_STATIC`) means a C++ build pipeline per release target and is
+   not pursued.
 
-   BM25 is an indexed join on `_quack_terms`, but its cost grows with the posting lists,
-   not the chunk count alone. At a million chunks (sixty million term rows) it is the larger
-   half of a hybrid query, so look at the term index before the vector scan at that size.
-   All requests on a workspace share one connection, so other requests queue behind these
+   BM25 is an indexed join on `_quack_terms`, but its cost grows with the posting lists, not
+   the chunk count alone. At a million chunks (sixty million term rows) it is the larger half
+   of a hybrid query, so look at the term index before the vector scan at that size. All
+   requests on a workspace share one connection, so other requests queue behind these
    latencies while a search runs.
 3. **One file is the boundary, so one file is the backup unit.** Back up a workspace with
-   `quack workspace snapshot NAME`, which checkpoints, closes the file for the length of
-   the copy, and opens it again (section 11). There is no cross-workspace transaction, and
-   none is needed.
-4. **Storage backend seam: not built.** The intent was small traits over retrieval,
-   `graph/`, and `ontology/`, so a Postgres + pgvector backend could be added without
-   touching the agent or the interfaces. The code takes `&WorkspaceDb` directly; the only
-   traits, `Reranker` and `extraction::Extract`, are not storage seams. Another backend
-   today means changing graph and ontology code.
-5. **Migration from the current deployment.** Documents are re-uploaded and re-embedded,
-   not migrated from pgvector, because chunking and metadata differ. The planned path is
-   `quack import anythingllm --url ... --key ...`, pulling workspaces, documents, system
-   prompts, and threads through the AnythingLLM API; section 19 lists it after the core is
-   stable.
+   `quack workspace snapshot NAME`, which checkpoints, closes the file for the length of the
+   copy, and opens it again (section 11). There is no cross-workspace transaction, and none
+   is needed.
+4. **Storage backend seam: not built.** The intent was small traits over retrieval, `graph/`,
+   and `ontology/`, so a Postgres + pgvector backend could be added without touching the
+   agent or the interfaces. The code takes `&WorkspaceDb` directly; the only traits,
+   `Reranker` and `extraction::Extract`, are not storage seams. Another backend today means
+   changing graph and ontology code.
+5. **Migration from the current deployment.** Documents are uploaded and embedded again, not
+   migrated from pgvector, because chunking and metadata differ. The planned path is `quack
+   import anythingllm --url ... --key ...`, pulling workspaces, documents, system prompts,
+   and threads through the AnythingLLM API; section 19 lists it after the core is stable.
 
 ---
 
 ## 16. Testing
 
-`cargo test --workspace` runs 308 tests: 209 in `quack-core`'s library, 47 in the binary
-(the server router and terminal harness among them), and 52 across two integration files.
+`cargo test --workspace --all-features` ran 1,493 tests in 21 test binaries on 2026-10-11.
 `proptest` is on the dependency menu, but no test uses it yet.
 
 **Unit.**
 
 - `storage/`: migrations and CRUD for both databases, dimension mismatch, `_quack_` tables
   hidden from listing and refused to user and agent SQL, statement classification (SELECT
-  variants and the `DESCRIBE`/`SHOW`/`SUMMARIZE`/`PIVOT`/`UNPIVOT`/`EXPLAIN` allow-list
-  read; DDL, DML, COPY, SET, ATTACH write; a parse error invalid), limits, row capping, RRF
-  fusion on fixture rankings.
+  variants and the `DESCRIBE`/`SHOW`/`SUMMARIZE`/`PIVOT`/`UNPIVOT`/`EXPLAIN` allow-list read;
+  DDL, DML, COPY, SET, ATTACH write; a parse error invalid), limits, row capping, RRF fusion
+  on fixture rankings.
 - `ingestion/`: chunking with heading and page metadata, SHA dedup.
-- `analysis/`: citation validation strips unknown markers and renumbers the rest; chart
-  spec bounds.
+- `analysis/`: citation validation strips unknown markers and renumbers the rest; chart spec
+  bounds; the prompt's column lines, the question's stored values, and the filter refusals.
 - `ontology/`: inheritance, domain/range validation, property types, mapping validation,
   versioning and stale detection, JSON round trip, table-evidence induction on fixture
   tables (key detection, overlap relation), document-evidence normalization on fixture
   extraction output (clustering, domain/range inference, hierarchy inference, support
-  thresholds), candidate actions.
+  thresholds), candidate actions, the joins the mappings imply.
 - `graph/`: extraction parsing (valid, malformed, out-of-ontology dropped and counted for
   drift), merge on normalized label, embedding merge proposals, provisional flagging,
   traversal on a fixture with a cycle, path search.
-- The agent loop against a mocked rig model with canned tool calls, including a refused
+- The agent loop against rig's scripted model with canned tool calls, including a refused
   write and a timeout; mode enforcement excluding provisional graph results; cancellation
   keeping streamed text.
 - `llm/`: `TokenManager` reuse, single refresh under concurrency, re-auth, cache round-trip
-  against a mock IdP.
+  against a mock identity provider.
 - `crypto`: the provider is FIPS exactly on Linux.
 
 **Integration.** The REST, role, audit, and queue suites live in
-`crates/quack-server/src/tests.rs`; the two files under `crates/quack-core/tests/` cover
-ingestion and the graph.
+`crates/quack-server/src/tests.rs`; the files under `crates/quack-core/tests/` cover
+ingestion, the graph, and whole agent turns.
 
 - Upload PDF -> ready -> a query-mode question returns an answer citing the right page.
-- A keyword-only question (a policy number) is answered via FTS.
+- A keyword-only question (a policy number) is answered through the term index.
 - CSV -> a question produces SQL referencing a context definition.
+- A Parquet file loads as a table.
 - `ontology propose` on a fixture workspace of two tables and ten documents yields the
   expected classes, one overlap relation, and a mapping; accepting them builds nodes with
   provenance. `--auto-accept` marks the graph provisional, and query mode ignores it.
@@ -3570,93 +3577,93 @@ ingestion and the graph.
 - Session round trip and export, with audit rows in both databases sharing an id.
 - A denied open by a non-member and an expired token each write an `audit_log` row with
   `outcome = denied`; no code path updates or deletes `audit_log` rows.
-- Workspace isolation via CLI and API; an admin without membership cannot read workspace
-  content.
+- Workspace isolation through the CLI and API; an admin without membership cannot read
+  workspace content.
 - Server token lifecycle, roles, upload queue.
 - Deleting a document takes its chunks, its graph rows, and its files with it.
 - A cancelled turn is recorded with what streamed.
-- An OKF (Open Knowledge Format) bundle exported through the API imports back as documents
-  and candidates.
+- An OKF bundle exported through the API imports back as documents and candidates.
 - An MCP stdio client lists tools and runs `query`.
 - REST and print mode return byte-identical JSON for the same question with a mocked model.
 
-**Manual.** Web UI end to end against Ollama, including the proposal review flow; TUI
-streaming and permission prompt; OAuth browser and device-code flows against a real tenant;
-the air-gapped static binary, which loads no extensions.
+**Manual.** Web UI end to end against Ollama, including the proposal review flow; the
+terminal's streaming and permission prompt; OAuth browser and device-code flows against a
+real tenant; the air-gapped static binary, which loads no extensions.
 
 **CI and local gates.** On every push and pull request, `.github/workflows/ci.yml` runs
-`cargo fmt --check`, clippy with `-D warnings` over all targets and features, and
-`cargo test --locked --workspace` on Linux, macOS, and Windows, rustdoc with broken links
-denied, plus dependency review and cargo-deny.
-Coverage (`make test-coverage`, `cargo llvm-cov`) and mutation testing (`make test-mutants`,
-the whole workspace) are local-only and not wired into a release. Every file parser and
-the chunker are fuzzed nightly (`fuzz/`, `docs/ci-cd.md`), and `cargo deny check` runs
-weekly on its own.
+`cargo fmt --check`, clippy with `-D warnings` over all targets and features, and `cargo test
+--locked --workspace` on Linux, macOS, and Windows, rustdoc with broken links denied, plus
+dependency review and cargo-deny. Coverage (`make test-coverage`, `cargo llvm-cov`) and
+mutation testing (`make test-mutants`, the whole workspace) are local-only and not wired into
+a release. Every file parser and the chunker are fuzzed nightly (`fuzz/`, `docs/ci-cd.md`),
+and `cargo deny check` runs weekly on its own.
 
 **Evaluation.** `crates/quack-eval` (issue #74) is a binary that drives the built `quack` as a
 person would, one process per command over a temporary data directory, and scores what the
-binary's own `-f json` output says; it links nothing of quack, so a bug in argument parsing,
-print mode, config loading, or the data directory layout shows in it. `make eval-offline` needs
-no model and runs in seconds: `quack ingest` of one file per format quack reads
-(`fixture/formats.json`: hand-written RTF, EML, MBOX, VTT, SRT, YAML, JSON, JSONL, TSV, text,
-and source; XLSX, PPTX, ODT, ODS, and Parquet made once and committed; a Project Gutenberg
-EPUB and the Apache POI `.doc`, `.xls`, and `.ppt` samples fetched once and committed), each
-checked by `quack search --keyword --in FILE` for a phrase or by `quack -q` for a table's rows;
-recall@1/5/8 and MRR (mean reciprocal rank) over a 32-question gold set through `quack search`
-with `--keyword` and without (`--vector` too when there is an embedding model), per question
-kind (`identifier`, `phrase`, `semantic`, `multilingual`); and precision and recall of `quack
-ontology propose --auto-accept` against a hand-written expected ontology, read back through
-`quack ontology show --format json`. With `QUACK_EVAL_OUT` set, it also writes the numbers as
-JSON for a before/after diff.
+binary's own `-f json` output says. It links nothing of quack, so a bug in argument parsing,
+print mode, config loading, or the data directory layout shows in it. `make eval-offline`
+needs no model and runs in under a minute:
+
+- `quack ingest` of one file per format quack reads (`fixture/formats.json`: hand-written
+  RTF, EML, MBOX, VTT, SRT, YAML, JSON, JSONL, TSV, text, and source; XLSX, PPTX, ODT, ODS,
+  and Parquet made once and committed; a Project Gutenberg EPUB and the Apache POI `.doc`,
+  `.xls`, and `.ppt` samples fetched once and committed), each checked by `quack search
+  --keyword --in FILE` for a phrase or by `quack -q` for a table's rows.
+- recall@1/5/8 and MRR (mean reciprocal rank) over a 32-question gold set through `quack
+  search` with `--keyword` and without (`--vector` too when there is an embedding model),
+  per question kind (`identifier`, `phrase`, `semantic`, `multilingual`).
+- precision and recall of `quack ontology propose --auto-accept` against a hand-written
+  expected ontology, read back through `quack ontology show --format json`.
+
+With `QUACK_EVAL_OUT` set, it also writes the numbers as JSON for a before/after diff.
 
 `make eval` (`--ollama`) adds what only a model shows. The agent answers
 `fixture/agent_questions.json` through `quack -p ... -f json` (a follow-up through `-r
-SESSION`), each scored by the product's own rule that `DuckDB`'s rows are the record of an
-answer: a table question names the result set one `run_sql` step must have returned (as many
-rows, each expected row's cells present in one actual row, numbers as numbers), and the prose
-is a secondary check; a question the data cannot answer expects the exit sentence of 7.5, a
-write expects `write_refused` and a statement reading the same before and after, an ambiguous
-question expects an answer and no question back. The 32 questions cover single-table figures,
-joins, date ranges, a text column with more values than the prompt lists, figures stored as
-text, unanswerable questions, ambiguity, a write, and follow-ups. The vision model reads one
-notice three ways, as an image, as the only picture on a PDF page, and as a figure inside a
-DOCX, scored by the notice's words found in the ingested text. `make eval-scale` loads the SPC
-tornado database (70,000 rows, downloaded once) and asks six questions scored by the rows of
-an `expect_sql` the harness runs itself. Wrong answers are reported, never failed: the models
-are `QUACK_EVAL_*` variables defaulting to what a developer machine runs (`gpt-oss:20b`,
-`embeddinggemma-2`, `gemma4:e4b`), and `.github/workflows/eval.yml` runs it nightly and on
-dispatch, outside CI, on smaller models it names itself, with the report in the job summary
-and the JSON as an artifact.
+SESSION`), each scored by the product's own rule that DuckDB's rows are the record of an
+answer: a table question names the result set one `run_sql` step must have returned (each
+expected row's cells present in one actual row, numbers as numbers), and the prose is a
+secondary check. A question the data cannot answer expects the exit sentence of 7.5 or the
+nothing-fetched note of 7.7; a write expects `write_refused` and a statement reading the same
+before and after; an ambiguous question expects an answer and no question back. The 34
+questions cover single-table figures, joins, date ranges, a text column with more values than
+the prompt lists, figures stored as text, unanswerable questions, ambiguity, a write, and
+follow-ups. The vision model reads one notice three ways, as an image, as the only picture on
+a PDF page, and as a figure inside a DOCX, scored by the notice's words found in the ingested
+text. `make eval-scale` loads the SPC tornado database (70,000 rows, downloaded once) and
+asks six questions scored by the rows of an `expect_sql` the harness runs itself. Wrong
+answers are reported, never failed. The models are `QUACK_EVAL_*` variables defaulting to
+what a developer machine runs (`gpt-oss:20b`, `embeddinggemma-2`, `gemma4:e4b`), and
+`.github/workflows/eval.yml` runs it nightly and on dispatch, outside CI, on smaller models it
+names itself, with the report in the job summary and the JSON as an artifact.
 
-Decoys make the fixture discriminate issue #77's identifier-joining and phrase-filter fix
-rather than score 1.000 either way. Five identifier questions (`SR-8841`, `SR-4437`,
-`SR-7765`, `SR-2214`, the `AKQ` office code) and two phrase questions (`"flash flood
-emergency"`, `"wall of water"`) have decoy documents whose split identifier pieces or
+Decoys make the retrieval fixture discriminate issue #77's identifier-joining and
+phrase-filter fix rather than score 1.000 either way. Five identifier questions (`SR-8841`,
+`SR-4437`, `SR-7765`, `SR-2214`, the `AKQ` office code) and two phrase questions (`"flash
+flood emergency"`, `"wall of water"`) have decoy documents whose split identifier pieces or
 non-adjacent phrase words outscore the true chunk under plain BM25. One phrase question
 (`"catastrophic flood damage"`) expects an empty result: every word appears somewhere, the
-exact phrase nowhere.
+exact phrase nowhere. Keyword search on 2026-10-11, no embedding model:
 
-| Measure | Baseline (before #77) | With #104 (`fix/77-identifier-and-phrase-search`) |
-|---|---|---|
-| keyword recall@1 (MRR) | 0.571 (0.762) | |
-| hybrid recall@1 (MRR) | 0.452 (0.605) | |
-| keyword identifier recall@1/MRR | 0.444/0.722 | 0.889/0.944 |
-| keyword phrase recall@1/MRR | 0.000/0.375 | 0.875/1.000 |
-| ontology induction precision / recall | 1.000 / 1.000 | |
-| graph extraction precision / recall | 1.000 / 1.000 | |
-| citation validity | 8/8 recorded answers validated as expected | |
+| kind | recall@1 | MRR | n |
+|---|---|---|---|
+| all | 0.891 | 0.953 | 32 |
+| identifier | 1.000 | 1.000 | 9 |
+| phrase | 0.900 | 1.000 | 5 |
+| semantic | 0.786 | 0.893 | 14 |
+| multilingual | 1.000 | 1.000 | 4 |
 
-With #104, the identifier-joined term and the phrase substring filter recover every decoyed
-question except the bare `AKQ` code, which has no hyphen for the joined-identifier term to
-attach to. Those are the expected numbers once #104 merges. A prompt, chunker, stemmer, or
-fusion-constant change is no longer a coin flip: this is the number that moves.
+Before #104 the identifier row read 0.444 / 0.722 and the phrase row 0.000 / 0.375. With
+embeddinggemma-2, hybrid search reads the same as keyword on every row except semantic
+(0.714 / 0.857), and the vector leg alone finds none of the five phrase questions first.
+A prompt, chunker, stemmer, or fusion-constant change is measured here, not guessed.
 
 ---
 
 ## 17. Gaps Between This Document and the Code
 
 This list maps the design to the tracker, ordered by risk, and is updated as issues close.
-Every gap is a GitHub issue unless the item says otherwise.
+Every gap is a GitHub issue unless the item says otherwise. Items struck through are done
+and kept for the record of what changed against the design.
 
 1. ~~Verify against a live model~~ (#20, closed): print mode and the terminal session are
    verified with gpt-oss:20b on Ollama. Sections 7, 8, 9.
@@ -3697,13 +3704,11 @@ Every gap is a GitHub issue unless the item says otherwise.
    PPTX through `zip` + `quick-xml`, workbooks through `calamine` as one table per sheet,
    each format carrying its own title. Sections 6.1, 6.2.
 6. ~~No `ATTACH` to external databases~~ (#21, closed): `quack import`, the Rust-side
-   replacement, snapshots a SQLite query or a data file over HTTP(S) into a
-   workspace table through the CSV path (`quack_core::import`). A live `ATTACH` (queries
-   pushed to the source) is not offered: the scanner extensions cannot ship in the static
-   binary, and a snapshot keeps the classification boundary simple, since the rows live in
-   the workspace file like any upload. Postgres and MySQL are not offered; S3 is the next
-   source. Section 6.2,
-   step 13.
+   replacement, snapshots a SQLite query or a data file over HTTP(S) into a workspace table
+   through the CSV path (`quack_core::import`). A live `ATTACH` (queries pushed to the
+   source) is not offered: the scanner extensions cannot ship in the static binary, and a
+   snapshot keeps the classification boundary simple, since the rows live in the workspace
+   file like any upload. Postgres and MySQL are not offered; S3 shipped later (section 6.2).
 7. ~~Document registry lacks `sha256` dedup, `source`, `title`~~ (#22, closed): identical
    bytes are skipped everywhere and name the existing document; `source` is `upload`,
    `paste`, `path`, or `stdin`; the title is given or parsed from the first heading;
@@ -3807,8 +3812,8 @@ Every gap is a GitHub issue unless the item says otherwise.
 - Providers: ollama, openai (and compatible), anthropic, bedrock, bedrock-mantle; auth none,
   api-key, OAuth PKCE with device code, encrypted cache, and confidential-client mode for
   the server, or the AWS SDK's credential chain (profiles, SSO, instance roles) for Bedrock
-- Interfaces, all in one binary: web UI, REST API, MCP (stdio and streamable HTTP), TUI,
-  print mode, and `quack desktop` (last, if ever)
+- Interfaces, all in one binary: web UI, REST API, MCP (stdio and streamable HTTP), the
+  terminal, print mode, and `quack desktop` (last, if ever)
 - Open Knowledge Format bundles: `quack okf export` writes one, `quack ingest DIR` and a tar
   upload read one back as documents and ontology candidates
 - Server: users with password login or sign-in through the organization's OpenID Connect
@@ -3846,8 +3851,8 @@ current deployment for document chat.
    `control.db` reduced to access control, sessions and messages with `--continue`,
    `--resume`, `quack sessions`, and `export`.~~ Done. Context landed with step 6, audit
    detail with the server.
-4. ~~Agent loop as an event stream; TUI streaming, inline steps, permission prompt, direct
-   SQL; print mode with formats and exit codes.~~ Done.
+4. ~~Agent loop as an event stream; terminal streaming, inline steps, permission prompt,
+   direct SQL; print mode with formats and exit codes.~~ Done.
 5. ~~Retrieval: chunk metadata, FTS index, RRF fusion, citations with validation, pinned
    documents, chat and query modes.~~ Done. DOCX, HTML, PPTX, XLSX parsers are issue #16.
 6. ~~Workspace context (stored, versioned, import/export), the prompt rewrite, and the
@@ -3862,10 +3867,10 @@ current deployment for document chat.
     repeat proposals and drift counting, auto-accept with provisional marking; CLI, API, and
     web hooks.~~ Done (#27), with the deviations in section 17 item 4.
 11. ~~Graph: extraction from documents and mapped tables, resolution, provenance, traversal,
-    tools, TUI tree, web graph page, stale and provisional handling.~~ Done.
+    tools, terminal tree, web graph page, stale and provisional handling.~~ Done.
 12. ~~MCP over stdio and SSE.~~ Done (streamable HTTP rather than SSE).
-13. ~~External data import (the Rust-side replacement for `ATTACH`), XLSX via a Rust
-    reader~~ Done. `workspace snapshot` is still open.
+13. ~~External data import (the Rust-side replacement for `ATTACH`), XLSX through a Rust
+    reader~~ Done. ~~`workspace snapshot`~~ Done (#504).
 14. ~~Release engineering: musl targets, macOS, Windows, container image, compose.~~ Done,
     then extended: the build split into a reusable workflow with signing and SLSA Build
     Level 3 attestations, and FIPS AWS-LC on Linux (section 14, `docs/ci-cd.md`).
