@@ -89,6 +89,7 @@ data-layer, crypto, or dependency change:
 
 ```bash
 cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # SQL, no agent
+#   on a workspace another quack process holds (the terminal, `quack serve`, the desktop app), a read runs inside that process over `{workspace}/quack.sock` (quack_core::forward) and says so on stderr; a write is refused naming the holder
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
 cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use
 cargo run --bin quack -- workspace rename OLD NEW | delete NAME [-y] | snapshot NAME [--to FILE|-] | restore FILE|- [--name N]   # storage::backup: one tar (manifest.json, data.duckdb, files/); delete is at once, the audit rows stay

@@ -44,6 +44,7 @@ pub async fn run(setup: SessionSetup) -> Result<()> {
     tui_app.load_input_history().await?;
     tui_app.note_embedding_status().await?;
     tui_app.load_sql_schema().await?;
+    tui_app.listen_for_reads().await;
 
     let mut terminal = ratatui::try_init().context("failed to initialize terminal")?;
     // Mouse capture for wheel scrolling, bracketed paste so a dropped

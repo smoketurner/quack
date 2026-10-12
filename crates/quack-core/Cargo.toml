@@ -64,7 +64,7 @@ tar           = { workspace = true }
 tempfile      = { workspace = true } # stages a CSV part in the workspace directory before it is archived
 thiserror     = { workspace = true, features = ["std"] }
 tiktoken      = { workspace = true, features = ["vocabs-all"] }
-tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
 tokio-util    = { workspace = true, features = ["rt"] }
 toml          = { workspace = true, features = ["std", "parse", "serde", "display"] }
 toml_edit     = { workspace = true, features = ["parse", "display"] }
@@ -74,6 +74,9 @@ uuid          = { workspace = true, features = ["std", "v7"] }
 whatlang      = { workspace = true }
 serde-saphyr  = { workspace = true, features = ["deserialize"] }
 zip           = { workspace = true, features = ["deflate-flate2-zlib-rs"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["std", "process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { workspace = true, features = ["keychain"] }

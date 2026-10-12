@@ -73,6 +73,7 @@ absolute-paths-allowed-crates = [
     "rig",
     "rmcp",
     "rust_embed",
+    "rustix",
     "rust_stemmers",
     "rustls",
     "schemars",

@@ -30,6 +30,7 @@ pub mod doctor;
 pub mod embedding;
 pub mod error;
 pub mod extraction;
+pub mod forward;
 pub mod graph;
 pub mod ids;
 pub mod import;

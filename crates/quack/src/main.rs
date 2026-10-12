@@ -18,6 +18,7 @@ use quack_core::config::{Config, Grant, LogFormat};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::forward;
 use quack_core::graph::export::Destination;
 use quack_core::graph::follow_up::FollowUp;
 use quack_core::ids::DocumentId;
@@ -2334,7 +2335,13 @@ async fn run_query(
     wait_for_stdin: bool,
 ) -> Result<()> {
     let opened = OpenedWorkspace::resolve(workspace_name).await?;
-    let ws_db = opened.open_db()?;
+    let ws_db = match opened.open_db() {
+        Ok(db) => db,
+        Err(e) if is_workspace_locked(&e) => {
+            return run_query_through_holder(&opened, sql, format, wait_for_stdin, e).await;
+        }
+        Err(e) => return Err(e),
+    };
     if let Some(piped) = load_piped_stdin(
         &opened.config,
         &ws_db,
@@ -2360,6 +2367,51 @@ async fn run_query(
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
+    format.write(&results, &mut out)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Whether `err` is another process's lock on the workspace file, at any
+/// depth of its chain.
+fn is_workspace_locked(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<CoreError>()
+            .is_some_and(forward::is_locked)
+    })
+}
+
+/// `-q` on a workspace another `quack` process holds: the read runs inside
+/// that process and comes back as the same rows (`quack_core::forward`),
+/// with one line on stderr saying so. Without a holder listening, `locked`
+/// is the error. Piped data cannot be loaded into a workspace this
+/// process does not hold, so a statement that names `stdin` is refused.
+async fn run_query_through_holder(
+    opened: &OpenedWorkspace,
+    sql: &str,
+    format: QueryFormat,
+    wait_for_stdin: bool,
+    locked: anyhow::Error,
+) -> Result<()> {
+    let Some(client) = forward::connect(&opened.config, opened.workspace.id.as_str()).await? else {
+        return Err(locked);
+    };
+    if wait_for_stdin || sql.to_ascii_lowercase().contains("stdin") {
+        anyhow::bail!(
+            "piped data cannot be loaded while the workspace is open in {}; run the query there, \
+             or quit it",
+            client.holder()
+        );
+    }
+    let results = client.query(sql).await?;
+    {
+        let stderr = std::io::stderr();
+        let mut err = stderr.lock();
+        writeln!(err, "read through {}", client.holder())?;
+    }
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
     format.write(&results, &mut out)?;
     out.flush()?;
     Ok(())
