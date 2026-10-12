@@ -29,6 +29,7 @@ use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
 use quack_core::classify::{self, LabelJobs};
 use quack_core::config::Config;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::forward::Listener;
 use quack_core::graph::follow_up::FollowUp;
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery, UnknownEntity};
 use quack_core::ids::{DocumentId, SessionId, WorkspaceId};
@@ -986,6 +987,9 @@ pub(crate) struct App {
     workspace_id: WorkspaceId,
     db: SharedDb,
     reader_db: ReaderDb,
+    /// The socket another `quack` process reads this workspace through
+    /// while the session holds its lock (`quack_core::forward`).
+    _forward: Option<Listener>,
     /// `--allow-write`: the agent's writes run without asking.
     allow_write: bool,
     /// `/scope`: the documents questions are limited to; every document
@@ -1056,6 +1060,7 @@ impl App {
             workspace_id,
             db,
             reader_db,
+            _forward: None,
             allow_write: writes.allows_unasked(),
             scope: DocumentScope::default(),
             expand_steps: false,
@@ -1101,6 +1106,26 @@ impl App {
     pub(crate) async fn load_sql_schema(&mut self) -> Result<()> {
         self.sql_schema = Arc::new(self.reader_db.with_db(WorkspaceDb::sql_schema).await?);
         Ok(())
+    }
+
+    /// Listen for reads from other `quack` processes while this session
+    /// holds the workspace's lock (`quack -q` on it would otherwise fail).
+    /// A failure to listen is logged, not fatal: the session works without
+    /// it.
+    pub(crate) async fn listen_for_reads(&mut self) {
+        match Listener::bind(
+            &self.config,
+            self.workspace_id.as_str(),
+            "the quack terminal session",
+            self.reader_db.clone(),
+        )
+        .await
+        {
+            Ok(listener) => self._forward = Some(listener),
+            Err(e) => {
+                tracing::warn!(error = %e, "other quack processes cannot read this workspace through the session");
+            }
+        }
     }
 
     /// Say so at startup when some vectors were made under another

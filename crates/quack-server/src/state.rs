@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
+use quack_core::forward::Listener;
 use quack_core::jobs::JobQueue;
 use quack_core::llm::oauth::KeySource;
 use quack_core::storage::audit::AuditLog;
@@ -40,6 +41,10 @@ struct WorkspaceHandle {
     writer: SharedDb,
     reader: ReaderDb,
     audit: Arc<AuditLog>,
+    /// The socket another `quack` process reads this workspace through
+    /// while this one holds its lock (`quack_core::forward`); dropped with
+    /// the handle, which removes it.
+    _forward: Option<Arc<Listener>>,
 }
 
 /// What follows work done with a workspace's file closed.
@@ -534,6 +539,7 @@ impl AppState {
         };
         let config = self.config.clone();
         let id = workspace_id.clone();
+        let (forward_config, forward_id) = (self.config.clone(), workspace_id.clone());
         let pool_size = self.config.analysis.reader_pool_size;
         cell.get_or_try_init(|| async move {
             let (db, audit) = tokio::task::spawn_blocking(move || {
@@ -555,10 +561,18 @@ impl AppState {
                 Writer::spawn(db).map_err(|e| ApiError::internal(e.to_string()))?,
             );
             let reader = ReaderDb::open(&writer, pool_size).await;
+            let forward = match Listener::bind(&forward_config, forward_id.as_str(), "quack serve", reader.clone()).await {
+                Ok(listener) => Some(Arc::new(listener)),
+                Err(e) => {
+                    tracing::warn!(workspace = %forward_id, error = %e, "other quack processes cannot read this workspace through the server");
+                    None
+                }
+            };
             Ok(WorkspaceHandle {
                 writer,
                 reader,
                 audit: Arc::new(audit),
+                _forward: forward,
             })
         })
         .await
