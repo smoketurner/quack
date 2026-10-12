@@ -25,7 +25,6 @@ ratatui          = { workspace = true, features = ["crossterm"] }
 ratatui-textarea = { workspace = true, features = ["crossterm"] }
 serde_json       = { workspace = true, features = ["std"] }
 shlex            = { workspace = true, features = ["std"] }
-sqlparser        = { workspace = true, features = ["std"] }
 tokio            = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time", "fs"] }
 tracing          = { workspace = true, features = ["std"] }
 
