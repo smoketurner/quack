@@ -436,8 +436,8 @@ mod unix {
                 Reply::Refused => Err(Error::ForwardedWriteRefused {
                     holder: self.holder.clone(),
                 }),
-                Reply::Error { message } => Err(self.failed(message)),
-                Reply::Hello { .. } => Err(self.failed(String::from("unexpected reply"))),
+                Reply::Error { message } => Err(self.failed(&message)),
+                Reply::Hello { .. } => Err(self.failed("unexpected reply")),
             }
         }
 
@@ -455,12 +455,12 @@ mod unix {
             let mut line = String::new();
             BufReader::new(read).read_line(&mut line).await?;
             if line.is_empty() {
-                return Err(self.failed(String::from("the holder closed without answering")));
+                return Err(self.failed("the holder closed without answering"));
             }
-            serde_json::from_str(&line).map_err(|e| self.failed(format!("malformed reply: {e}")))
+            serde_json::from_str(&line).map_err(|e| self.failed(&format!("malformed reply: {e}")))
         }
 
-        fn failed(&self, message: String) -> Error {
+        fn failed(&self, message: &str) -> Error {
             Error::Forward(format!("reading through {} failed: {message}", self.holder))
         }
     }
