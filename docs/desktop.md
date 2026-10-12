@@ -63,6 +63,9 @@ Rust talks to the engine as a library.
   it.
 - Anything the app needs that today lives only in a `quack-server` handler moves to
   `quack-core` first, as the architecture rule says. The known cases are listed in 3.4.
+- `storage::forward` is new in `quack-core`: the socket a workspace's holder listens on so
+  another process's reads run inside it (3.6), offered by the app, `quack serve`, and the
+  terminal alike.
 
 ## 2. Crate layout
 
@@ -161,8 +164,8 @@ An open workspace is what `OpenedWorkspace::shared` produces today: the `SharedD
 `allowed_providers`, entered on every command that reaches a model. The app opens a workspace
 once per process and keeps it open while any window shows it (the `OnceCell`-per-workspace
 rule the server follows: DuckDB's lock is per process, so a second open inside the app
-would silently fork the database). A workspace with no window on it is closed after an idle
-period, so the `quack` command-line binary can open it (3.6).
+would silently fork the database). While the app holds a workspace, the `quack` command-line
+binary's reads run inside the app over a socket (3.6).
 
 ### 3.2 Commands
 
@@ -249,20 +252,52 @@ authorization half. Section 11 notes that the terminal and the CLI write no rows
 
 The app uses the CLI's data directory (`~/.local/share/quack`, `QUACK_DATA_DIR`, config under
 `~/.config/quack`), so `Quack.app`, `quack -p`, and `quack mcp` see one set of workspaces and
-one keychain item. DuckDB's file lock is per process: while the app holds a workspace open,
-`quack -q` on that workspace fails with "the workspace is open in another process", as it
-does today against `quack serve`. The app therefore closes a workspace it has no window on
-after an idle period (a `[desktop].close_idle_minutes` setting, default to be set), and the
-CLI's error names the app when the lock holder is `quack-desktop`. Section 11 asks whether
-that is enough or the two should share differently.
+one keychain item.
+
+DuckDB allows one process with read-write access to a file, or any number of read-only
+processes, never a writer beside readers: a read-only open fails while another process holds
+the file read-write, since DuckDB has no cross-process MVCC. The app holds its workspaces
+read-write, so a second `quack` process cannot open one even for `SELECT 1`, as it cannot
+today against `quack serve`. There is one lock and one DuckDB instance per workspace, and
+the way through it is to run the second process's reads inside the holder:
+
+- **The holder listens.** Whichever process has a workspace open (`Quack.app`, `quack
+  serve`, the terminal) also listens on a Unix socket in the workspace directory,
+  `{workspace_dir}/quack.sock`, with a per-launch token in a 0600 file beside it; both are
+  removed when the workspace closes, and a stale pair from a crash is detected by a failed
+  connect and replaced. This is a `quack-core` module, `storage::forward`, since every holder
+  offers it: framed JSON requests over the socket, a handful of request kinds (a read
+  statement with its rows streamed back, a document search, a table or document listing, a
+  description, a graph query), each run on the holder's reader pool in a read-only
+  transaction as the server's `App::read` runs them, under the agent's row cap and timeout.
+- **The CLI follows the lock.** When `WorkspaceDb::open` hits the lock conflict, a
+  read-only command checks for the socket and runs there instead: `quack -q` with a read
+  statement, `search`, `tables`, `docs`, `saved run` (its statements are reads by
+  construction), `graph search` and `path`, `graph status`, `ontology show`, `sessions`,
+  `config`. The output is identical, and one line on stderr says "read through Quack.app"
+  (the holder names itself in the token file). Without the socket the error is today's.
+- **Writes stay refused.** `quack ingest`, `-q` with a write, `graph extract`, `ontology
+  accept`, and every other write fail as they do now, naming the holder: "the workspace is
+  open in Quack.app; add the file there, or quit it". A write forwarded blind would run under
+  the holder's policy with nobody to ask and no one to audit it as, which is what the design
+  keeps out. A `-p` question is a write too (its session is recorded), so it is refused the
+  same way with a pointer to the app's chat or its Connect Claude Code endpoint (3.7).
+- **The app side is one line.** The app enters `storage::forward::listen` for each workspace
+  it opens and leaves it when the workspace closes; the holder's end has no settings.
+
+This also removes today's friction between `quack serve` and the CLI on one laptop, which
+the design doc accepts as a limit, since the server is a holder like any other.
 
 ### 3.7 MCP for other tools, opt-in
 
 DuckDB's lock is per process, so while the app holds a workspace, `quack mcp` started by
-Claude Code or an editor cannot open it, and the idle close (3.6) does not help: an MCP
-client's session lasts as long as the window. The server answers this today by serving MCP
-over HTTP from the process that holds the lock, and the app does the same, as a setting
-that is off by default.
+Claude Code or an editor cannot open it. Its read tools follow the lock like the CLI's (3.6):
+`sql` with a read statement, `search`, `list_tables`, `describe_table`, and `list_documents`
+run inside the app over the socket. `query` and `classify` cannot, because an agent turn
+records its session and a labelling writes a table, so on stdio they are refused with a
+pointer to the endpoint below. The server answers the same need today by serving MCP over
+HTTP from the process that holds the lock, and the app does the same, as a setting that is
+off by default.
 
 **Settings › Connect Claude Code.** Switching it on, per workspace:
 
@@ -295,8 +330,8 @@ build does not reach. If that proves not to hold (rust-embed runs at compile tim
 whole crate), the MCP server moves to its own crate, `quack-mcp`, with `quack-server` and the
 app as its two dependents; that is a refactor of module boundaries, not of behaviour.
 
-The CLI case stays as designed: the idle close, and `quack`'s lock error naming the app when
-the holder is `quack-desktop`.
+The CLI's reads need none of this: they go through the socket (3.6). The endpoint exists for
+what a read cannot be, an agent turn or a labelling run, asked for by another process.
 
 ### 3.8 First launch
 
@@ -456,7 +491,12 @@ everything else is Tauri's job. None of it is built or tested until then.
 - `quack-cli`: `OpenedWorkspace` and session choice, moved with their behaviour pinned
   (default workspace created on first use, `-w` must exist, `--resume` by prefix).
 - `quack-core`: the modules moved out of the server (3.4) keep the server's tests and gain
-  the app as a second caller in tests.
+  the app as a second caller in tests. `storage::forward`: a holder and a second process in
+  one test binary over a temp workspace (a second `WorkspaceDb::open` fails on the lock, the
+  forwarded read returns the holder's rows, a write request is refused, a wrong token is
+  refused, a stale socket is replaced, and the socket is gone after close); `quack -q`,
+  `search`, and `tables` against a held workspace in the binary's tests, with the stderr
+  line; `quack ingest` against one, refused with the holder's name.
 - `quack-desktop`, under `tauri::test`'s mock runtime with the dialogs stubbed: the
   `AgentEvent` to `TurnEvent` projection (every variant, the permission event's fields, the
   words from `Decision`); a scripted turn through `start_turn` against `quack-testkit`'s
@@ -464,8 +504,7 @@ everything else is Tauri's job. None of it is built or tested until then.
   recorded in the session and audited on channel `desktop`; a turn dictated by retrieved
   text (`seed_dictating_note`) asks even under "run without asking"; `cancel_turn`;
   `ingest` by path yields a `ready` document with `DocumentSource::Path`; the jobs event
-  sequence for one upload; the idle close of a workspace and the CLI's lock error naming the
-  app; the install-command symlink logic against a temp directory; the state file round
+  sequence for one upload; the install-command symlink logic against a temp directory; the state file round
   trip; `latest.json` reading against a fixture; the MCP endpoint (3.7) answers
   `initialize` and `list_tables` with the token and 401 without it, refuses a write under the
   default policy, and stops listening when switched off.
@@ -486,6 +525,7 @@ everything else is Tauri's job. None of it is built or tested until then.
 |---|---|
 | `quack-cli`: `OpenedWorkspace` and session choice moved | ~150 lines moved |
 | `quack-core`: background runs, upload spooling, pending permissions moved from the server | ~600 lines moved, two callers each |
+| `quack-core`: `storage::forward`, the holder's socket and the CLI's fallback through it | ~400 lines with tests, plus the listen call in three holders |
 | `quack-desktop` Rust: state, 11 command modules, turn and jobs bridges, permission dialog, audit, the MCP endpoint, menu, install command, updater, setup, logging | ~2,200 lines |
 | `quack-server`: `McpServer` and `McpSetup` made public, the HTTP transport factored for two callers | ~100 lines changed |
 | `ui/`: 11 views, the transcript renderer with steps, citations, charts, the grid, the editor, the graph canvas, forms | ~6,000 lines of TypeScript and CSS |
@@ -510,6 +550,7 @@ Taken by the project owner, not by this document.
 | macOS package | one `.dmg` with `Quack.app`, the `quack` CLI inside it as a sidecar, and an Install quack Command menu item (section 6) | a `.pkg` installing both; a `.dmg` with the app and the binary side by side |
 | Platforms | macOS only in the first release, Windows and Linux later from the same crate (7.4) | Windows in the same release; all three now |
 | Data directory | the CLI's (3.6) | the platform app-data directory the design doc named |
+| The CLI against a held workspace | reads run inside the holder over a Unix socket, writes refused naming the holder (3.6) | the app closing idle workspaces so the CLI can take the lock; today's error alone |
 | Write prompts | a native confirm dialog built from `Decision`'s words (3.5) | an in-page card |
 | macOS hardware | Apple silicon only, matching the CLI | a universal `.app`; two bundles |
 | Self-update | `tauri-plugin-updater` in the first release (7.3) | releases page and the tap only |
@@ -530,14 +571,11 @@ Questions the implementation must not answer on its own:
 2. **The built frontend.** The repo commits built assets (the CSS, the editor bundle)
    because rust-embed needs them and CI has no Node. For the app, `ui/dist` can be committed
    the same way, or built by the macOS job with pnpm pinned and never committed.
-3. **The app and the CLI on one workspace.** DuckDB's lock is per process; the app closes
-   idle workspaces (3.6) so the CLI can open them. Confirm the idle close and its default, or
-   ask for another arrangement.
-4. **Homebrew.** A cask for `Quack.app` that links the CLI (section 6); whether the macOS
+3. **Homebrew.** A cask for `Quack.app` that links the CLI (section 6); whether the macOS
    tarball and the formula also remain for people who want only the CLI.
-5. **The thin first release** (section 9): four views first, or all eleven before the first
+4. **The thin first release** (section 9): four views first, or all eleven before the first
    tag.
-6. **`tauri-specta`'s release candidate.** Pin `=2.0.0-rc.25`, or use `ts-rs` for the types
+5. **`tauri-specta`'s release candidate.** Pin `=2.0.0-rc.25`, or use `ts-rs` for the types
    and hand-written `invoke` wrappers until it goes stable (section 2).
 
 ## 12. Where it sits
