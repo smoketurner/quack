@@ -722,6 +722,8 @@ pub enum AuditAction {
     Retype,
     /// A table's text was labelled by a decision model.
     Classify,
+    /// The SQL editor asked what a statement being typed can take.
+    Complete,
     /// A stored name this build does not define, as a newer build wrote
     /// it. Read only: the one write path refuses it.
     Unknown(String),
@@ -773,6 +775,7 @@ history_enum!(AuditAction, Unknown, {
     TableNote => "table_note",
     Retype => "retype",
     Classify => "classify",
+    Complete => "complete",
 });
 
 /// The kinds of resource an audit row names by opaque id. Like

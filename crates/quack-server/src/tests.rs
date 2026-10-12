@@ -980,6 +980,36 @@ async fn sql_respects_roles_hides_internal_tables_and_records_detail() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["columns"][0]["name"], "a");
     assert_eq!(body["sample"]["rows"].as_array().map(Vec::len), Some(1));
+    // The editor's completion: the table's columns where an expression
+    // must follow, DuckDB's own words after them; a viewer may ask.
+    let statement = "SELECT * FROM t WHERE a";
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql/complete"),
+            &viewer_token,
+            serde_json::json!({ "sql": statement, "cursor": statement.chars().count() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["start"], 22);
+    assert_eq!(body["end"], 23);
+    assert_eq!(body["items"][0]["word"], "a");
+    assert_eq!(body["items"][0]["kind"], "column");
+    assert!(
+        body["items"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|i| i["kind"] == "function" && i["word"] == "abs")),
+        "{body}"
+    );
+    let (status, body) = h
+        .post(
+            &format!("/api/v1/workspaces/{ws}/sql/complete"),
+            &viewer_token,
+            serde_json::json!({ "sql": "hello", "cursor": 5 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(0));
     let (status, _) = h
         .get(
             &format!("/api/v1/workspaces/{ws}/tables/_quack_documents"),
@@ -3842,13 +3872,13 @@ async fn web_pages_redirect_to_login_and_render_after_the_form_login() {
         "{html}"
     );
 
-    // The SQL page: the editor loads its schema from the API and enhances
+    // The SQL page: the editor asks the API for completions and enhances
     // the textarea, which stays for a browser without JavaScript.
     let (status, html, _) = h.page(&format!("/w/{ws}/sql"), Some(&cookie)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         html.contains(&format!(
-            "data-schema=\"/api/v1/workspaces/{ws}/tables/schema\""
+            "data-complete=\"/api/v1/workspaces/{ws}/sql/complete\""
         )) && html.contains("<script src=\"/static/js/sql-editor.min.js\" defer></script>")
             && html.contains("<textarea id=\"sql-input\""),
         "{html}"

@@ -39,6 +39,7 @@ API Activity event with that name.
 | `query` | An agent turn, over REST, the web chat, or MCP (`-p` and the terminal are unaudited) | `allowed`, `denied` (the provider is not allowed for the workspace), `error` | API: Read; with the content half, the `ai_operation` profile |
 | `search` | A document search without the agent (`POST .../search`, the web Search page, the MCP `search` tool); the detail holds the query and what it was limited to | `allowed`, `denied`, `error` | API: Read |
 | `sql` | A statement run directly (`/sql`, the SQL page, the MCP `sql` tool) | `allowed`, `denied` (a write without the write scope, an internal table), `error` | API: Read |
+| `complete` | The SQL page asked what a statement being typed can take (`POST .../sql/complete`); the statement is not recorded | `allowed`, `denied` | API: Read |
 | `ingest` | A file is uploaded, a document replaced, a bundle imported | `allowed`, `denied`, `error` | API: Create |
 | `import` | A SQLite, URL, or S3 import is started, saved, or refreshed | `allowed`, `error` | API: Create |
 | `export` | A workspace is exported as an OKF bundle, the graph as CSV, GraphML, or JSON-LD (the detail holds `format`, `nodes`, `edges`, `provenance`), or a statement's rows are streamed out | `allowed`, `denied` (a write statement), `error` | API: Read |
