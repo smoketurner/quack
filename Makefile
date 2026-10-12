@@ -20,7 +20,7 @@ WORKSPACE ?= storms
 # The crate whose templates Tailwind scans; its built CSS is committed.
 SERVER_CRATE ?= quack-server
 
-.PHONY: all build check clean setup doc changelog fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates eval eval-offline image hooks css-dev css-build editor-build run run-server demo-data help
+.PHONY: all build check clean setup doc changelog fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates eval eval-offline eval-scale build-debug image hooks css-dev css-build editor-build run run-server demo-data help
 
 all: build
 
@@ -70,11 +70,23 @@ test-coverage: ## Generate an HTML coverage report (requires cargo-llvm-cov)
 test-mutants: ## Run mutation testing (requires cargo-mutants)
 	$(CARGO) mutants
 
-eval: ## Run the evaluation suite against Ollama: retrieval with real embeddings, agent answers, vision (eval/README.md)
-	$(CARGO) run -p quack-core --example eval -- --ollama
+eval: build-debug ## Run the evaluation suite against Ollama: the built quack binary driven as a person would, scored from its JSON (crates/quack-eval/README.md)
+	$(CARGO) run -p quack-eval -- --ollama
 
-eval-offline: ## Run the evaluation harness with no model: retrieval, induction, extraction, citations
-	$(CARGO) run -p quack-core --example eval
+eval-offline: build-debug ## Run the evaluation suite with no model: ingestion by format, keyword and hybrid retrieval, ontology induction
+	$(CARGO) run -p quack-eval
+
+# The SPC tornado database: every US tornado since 1950, one CSV of about 8 MB, public domain.
+EVAL_SCALE_URL ?= https://www.spc.noaa.gov/wcm/data/1950-2023_all_tornadoes.csv
+EVAL_CACHE ?= target/eval-cache
+
+eval-scale: build-debug ## make eval, then the agent over a real 70,000-row table (downloads the SPC tornado database once into target/eval-cache)
+	@mkdir -p $(EVAL_CACHE)
+	@test -s $(EVAL_CACHE)/tornadoes.csv || { echo "downloading $(EVAL_SCALE_URL)"; curl -fsSL -o $(EVAL_CACHE)/tornadoes.csv.part "$(EVAL_SCALE_URL)" && mv $(EVAL_CACHE)/tornadoes.csv.part $(EVAL_CACHE)/tornadoes.csv; }
+	$(CARGO) run -p quack-eval -- --ollama --scale $(EVAL_CACHE)/tornadoes.csv
+
+build-debug: ## Build the quack binary in the dev profile (what the eval drives)
+	$(CARGO) build --bin quack
 
 crypto-gates: ## No ring or OpenSSL in the runtime dependency tree (needs no extra tools)
 	@if $(CARGO) tree -i ring -e normal 2>/dev/null | grep -q ring; then echo "ring is in the runtime dependency tree"; exit 1; fi

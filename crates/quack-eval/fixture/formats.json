@@ -1,0 +1,94 @@
+[
+  {
+    "file": "shelter-rules.rtf",
+    "phrase": "pets are admitted only in carriers"
+  },
+  {
+    "file": "office-notice.eml",
+    "phrase": "backup generator will be tested at 0900"
+  },
+  {
+    "file": "office-threads.mbox",
+    "phrase": "sandbag pallets arrive monday"
+  },
+  {
+    "file": "briefing.vtt",
+    "phrase": "wind gusts to sixty knots"
+  },
+  {
+    "file": "briefing.srt",
+    "phrase": "wind gusts to sixty knots"
+  },
+  {
+    "file": "procedures.yaml",
+    "phrase": "rotate the water supply every ninety days"
+  },
+  {
+    "file": "field-notes.txt",
+    "phrase": "culvert under mill road was clear"
+  },
+  {
+    "file": "damage_parser.py",
+    "phrase": "convert a damage string such as 4.20m to dollars"
+  },
+  {
+    "file": "briefing.pptx",
+    "phrase": "evacuation route b follows the ridge road"
+  },
+  {
+    "file": "procedures.odt",
+    "phrase": "check the sump pump before each storm season"
+  },
+  {
+    "file": "yellow-wallpaper.epub",
+    "phrase": "colonial mansion, a hereditary estate"
+  },
+  {
+    "file": "poi-sample.doc",
+    "phrase": "calibri (body) in font size 11"
+  },
+  {
+    "file": "poi-sample-show.ppt",
+    "ready": true
+  },
+  {
+    "file": "sites.yaml",
+    "table": "sites",
+    "rows": 4
+  },
+  {
+    "file": "gauge_readings.jsonl",
+    "table": "gauge_readings",
+    "rows": 5
+  },
+  {
+    "file": "stage_readings.json",
+    "table": "stage_readings",
+    "rows": 5
+  },
+  {
+    "file": "tide_readings.tsv",
+    "table": "tide_readings",
+    "rows": 5
+  },
+  {
+    "file": "river_readings.parquet",
+    "table": "river_readings",
+    "rows": 5
+  },
+  {
+    "file": "cots.xlsx",
+    "table": "cots",
+    "rows": 4
+  },
+  {
+    "file": "generators.ods",
+    "table": "generators",
+    "rows": 3
+  },
+  {
+    "file": "poi-sample-sheet.xls",
+    "table": "poi_sample_sheet_First_Sheet",
+    "rows": 1
+  }
+]

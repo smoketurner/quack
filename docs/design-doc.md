@@ -3573,38 +3573,40 @@ the whole workspace) are local-only and not wired into a release. Every file par
 the chunker are fuzzed nightly (`fuzz/`, `docs/ci-cd.md`), and `cargo deny check` runs
 weekly on its own.
 
-**Evaluation.** `make eval-offline` (`crates/quack-core/examples/eval/`, issue #74) measures
-answer quality with no model. It ingests an in-tree storms-like fixture (`crates/quack-core/eval/`: 32
-documents, one German and one Chinese among them, and three CSV tables written for the
-harness, not the NOAA download) into a temporary workspace and prints:
+**Evaluation.** `crates/quack-eval` (issue #74) is a binary that drives the built `quack` as a
+person would, one process per command over a temporary data directory, and scores what the
+binary's own `-f json` output says; it links nothing of quack, so a bug in argument parsing,
+print mode, config loading, or the data directory layout shows in it. `make eval-offline` needs
+no model and runs in seconds: `quack ingest` of one file per format quack reads
+(`fixture/formats.json`: hand-written RTF, EML, MBOX, VTT, SRT, YAML, JSON, JSONL, TSV, text,
+and source; XLSX, PPTX, ODT, ODS, and Parquet made once and committed; a Project Gutenberg
+EPUB and the Apache POI `.doc`, `.xls`, and `.ppt` samples fetched once and committed), each
+checked by `quack search --keyword --in FILE` for a phrase or by `quack -q` for a table's rows;
+recall@1/5/8 and MRR (mean reciprocal rank) over a 32-question gold set through `quack search`
+with `--keyword` and without (`--vector` too when there is an embedding model), per question
+kind (`identifier`, `phrase`, `semantic`, `multilingual`); and precision and recall of `quack
+ontology propose --auto-accept` against a hand-written expected ontology, read back through
+`quack ontology show --format json`. With `QUACK_EVAL_OUT` set, it also writes the numbers as
+JSON for a before/after diff.
 
-- recall@1/5/8 and MRR (mean reciprocal rank) over a 32-question gold set, per question kind
-  (`identifier`, `phrase`, `semantic`, `multilingual`) and per backend (`search_keyword_chunks`,
-  `search_similar_chunks`, `search_hybrid_chunks`);
-- precision and recall of `ontology::induction::propose_from_tables` against a hand-written
-  expected ontology;
-- node and edge precision and recall of `graph::extract::run` over ten hand-labelled chunks
-  through a canned `Extract<Extraction>`, so the numbers measure validation, resolution, and
-  storage rather than a model;
-- how many of a fixed set of recorded answers keep every `[n]` marker through
-  `analysis::citations::validate`.
-
-Vector search uses a deterministic hashing embedder (a bag-of-words projection, not a
-semantic one), so the run needs no Ollama and takes seconds. With `QUACK_EVAL_OUT` set, it
-also writes the numbers as JSON for a before/after diff.
-
-`make eval` (`--ollama`, `examples/eval/ollama.rs`) runs the same suite against Ollama and
-adds what only a model shows. Retrieval embeds with a real model. The agent answers
-`eval/agent_questions.json` (questions over the tables and over the documents) through
-`TurnRequest::run`, each scored on whether the answer holds the expected values, used a
-tool it should, cited a passage where the question calls for one, and leaked no `<think>`
-text. The vision model reads one notice three ways, as an image, as the only picture on a
-PDF page, and as a figure inside a DOCX, scored by the notice's words found in the chunks.
-Wrong answers are reported, never failed: the models are `QUACK_EVAL_*` variables
-defaulting to what a developer machine runs (`gpt-oss:20b`, `embeddinggemma-2`,
-`gemma4:e4b`), and `.github/workflows/eval.yml` runs it nightly and on dispatch, outside
-CI, on smaller models it names itself, with the report in the job summary and the JSON as
-an artifact.
+`make eval` (`--ollama`) adds what only a model shows. The agent answers
+`fixture/agent_questions.json` through `quack -p ... -f json` (a follow-up through `-r
+SESSION`), each scored by the product's own rule that `DuckDB`'s rows are the record of an
+answer: a table question names the result set one `run_sql` step must have returned (as many
+rows, each expected row's cells present in one actual row, numbers as numbers), and the prose
+is a secondary check; a question the data cannot answer expects the exit sentence of 7.5, a
+write expects `write_refused` and a statement reading the same before and after, an ambiguous
+question expects an answer and no question back. The 32 questions cover single-table figures,
+joins, date ranges, a text column with more values than the prompt lists, figures stored as
+text, unanswerable questions, ambiguity, a write, and follow-ups. The vision model reads one
+notice three ways, as an image, as the only picture on a PDF page, and as a figure inside a
+DOCX, scored by the notice's words found in the ingested text. `make eval-scale` loads the SPC
+tornado database (70,000 rows, downloaded once) and asks six questions scored by the rows of
+an `expect_sql` the harness runs itself. Wrong answers are reported, never failed: the models
+are `QUACK_EVAL_*` variables defaulting to what a developer machine runs (`gpt-oss:20b`,
+`embeddinggemma-2`, `gemma4:e4b`), and `.github/workflows/eval.yml` runs it nightly and on
+dispatch, outside CI, on smaller models it names itself, with the report in the job summary
+and the JSON as an artifact.
 
 Decoys make the fixture discriminate issue #77's identifier-joining and phrase-filter fix
 rather than score 1.000 either way. Five identifier questions (`SR-8841`, `SR-4437`,

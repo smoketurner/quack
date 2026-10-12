@@ -21,7 +21,7 @@ under headings, vectorized). This recipe is for the chunk kind; a table format g
    breaks (PDF). Return `Error::Ingestion` with the reason when there is no text at all.
    Declare the module in `ingestion/mod.rs`.
 3. **`crates/quack-core/tests/ingestion_integration.rs`**: a fixture file under
-   `crates/quack-core/eval/documents/` (small, redistributable) and a test that ingests it
+   `crates/quack-eval/fixture/formats/` (small, redistributable; add it to `fixture/formats.json` with the phrase its text must hold) and a test that ingests it
    and checks the title, the section headings, and that the chunks cite the right pages.
 4. **`fuzz/`**: a target for the new `TextFormat` arm (copy `fuzz/fuzz_targets/docx.rs`), a
    `[[bin]]` entry in `fuzz/Cargo.toml`, the extension in `fuzz/seed.sh`, and the target in

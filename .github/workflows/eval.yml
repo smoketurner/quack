@@ -1,6 +1,7 @@
 name: Eval
 
-# The evaluation suite against real models (`make eval`, crates/quack-core/eval/):
+# The evaluation suite against real models (`make eval`, crates/quack-eval/): the built
+# quack binary driven as a person would and scored from its JSON;
 # retrieval with a real embedding model, the agent's answers to the fixture
 # questions, and the vision model reading a notice. It never gates a pull
 # request: what a model writes varies from run to run, so each run is a sample

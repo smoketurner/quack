@@ -40,7 +40,7 @@ Cargo.toml            # virtual workspace: deps menu + strict lints + profiles
 deny.toml             # advisories, license allow-list, OpenSSL/ring bans
 rust-toolchain.toml   # pinned 1.99.0 + rustfmt + clippy
 Makefile              # build / fmt / lint / test / deny
-crates/               # quack-core (engine), quack-cli (shared command verbs), quack-server (REST, web UI, MCP), quack-terminal (the session), quack-testkit, quack (the binary) — see crates/README.md
+crates/               # quack-core (engine), quack-cli (shared command verbs), quack-server (REST, web UI, MCP), quack-terminal (the session), quack-testkit, quack (the binary), quack-eval (the harness that drives the binary) — see crates/README.md
 docs/                 # design-doc.md (the product), architecture, migrations, crypto, web-ui, ci-cd, authentication, providers
 .claude/rules/        # code-standards and development-discipline gates; branching, commits, continuous-improvement conventions
 ```
@@ -645,8 +645,9 @@ make build     # cargo build --release
 make fmt       # cargo fmt --all
 make lint      # cargo clippy --workspace --all-targets --all-features -- -D warnings
 make test      # cargo test --workspace --all-features
-make eval      # the eval suite against Ollama: real-embedding retrieval, agent answers, vision (QUACK_EVAL_* models; eval.yml runs it nightly, never gating)
-make eval-offline   # retrieval, ontology induction, graph extraction, and citation numbers; no model needed
+make eval      # the eval suite against Ollama: crates/quack-eval drives the built quack binary as a person would and scores its JSON (QUACK_EVAL_* models; eval.yml runs it nightly, never gating)
+make eval-offline   # the same with no model: ingestion by format, keyword and hybrid retrieval, ontology induction
+make eval-scale     # make eval, then the agent over the SPC tornado table (70,000 rows, downloaded once)
 make deny      # cargo deny check
 make bench     # criterion benchmarks: retrieval latency by workspace size, prompt assembly (BENCH_CHUNKS=1000000 for the 1M point)
 make release-gates   # no ring or OpenSSL in the runtime tree, then cargo deny

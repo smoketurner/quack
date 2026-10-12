@@ -1,0 +1,12 @@
+- site: Fairgrounds Pavilion
+  cots: 400
+  generator: true
+- site: Riverside Gymnasium
+  cots: 180
+  generator: false
+- site: Oak Street Church
+  cots: 90
+  generator: true
+- site: County Armory
+  cots: 250
+  generator: true

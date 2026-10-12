@@ -1,6 +1,6 @@
 # crates/
 
-Six workspace members, picked up by `members = ["crates/*"]`; no Cargo features.
+Seven workspace members, picked up by `members = ["crates/*"]`; no Cargo features.
 
 | Crate | Responsibility |
 |---|---|
@@ -10,6 +10,7 @@ Six workspace members, picked up by `members = ["crates/*"]`; no Cargo features.
 | `quack-terminal` | The interactive terminal session (ratatui); it holds no server code |
 | `quack-testkit` | Test support for the interface crates: a scripted Ollama server and a seeded workspace, kept out of `quack-core` so core does not depend on axum for tests |
 | `quack` | The one binary: print mode, `-q` SQL, the workspace commands, the server administration commands, and the `main` that wires the interface crates into subcommands |
+| `quack-eval` | The evaluation harness (`make eval`): a binary that drives the built `quack` as a person would and scores its JSON; it links nothing of quack. Its fixture lives in `fixture/` |
 
 Each crate's README says what belongs in it and where new code goes. The short rule:
 - Behavior that more than one interface needs goes in `quack-core`.

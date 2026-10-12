@@ -4530,6 +4530,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "quack-eval"
+version = "2026.10.6"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "quack-server"
 version = "2026.10.6"
 dependencies = [

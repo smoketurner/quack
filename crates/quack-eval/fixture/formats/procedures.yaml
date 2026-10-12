@@ -1,0 +1,8 @@
+title: Shelter supply procedures
+water:
+  rule: Rotate the water supply every ninety days and log the lot numbers.
+  minimum_gallons_per_person: 3
+cots:
+  rule: Inspect cot frames for cracked welds before each season.
+radios:
+  rule: Charge every handset overnight and keep two spares per shelter.

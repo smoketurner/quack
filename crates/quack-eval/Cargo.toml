@@ -1,0 +1,23 @@
+[package]
+name         = "quack-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description  = "The evaluation harness: drives the built quack binary as a person would and scores what comes back"
+
+[[bin]]
+name = "quack-eval"
+path = "src/main.rs"
+
+[dependencies]
+anyhow     = { workspace = true, features = ["std"] }
+clap       = { workspace = true, features = ["derive", "env", "error-context", "help", "std", "usage"] }
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+tempfile   = { workspace = true }
+
+[lints]
+workspace = true
