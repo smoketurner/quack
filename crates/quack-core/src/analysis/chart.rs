@@ -76,6 +76,26 @@ pub struct SeriesColumns<'a> {
     pub series_by: Option<&'a str>,
 }
 
+/// The columns a chart's query returned. Every column error names them,
+/// so the model's next call can name one of them.
+struct ReturnedColumns<'a>(&'a [String]);
+
+impl ReturnedColumns<'_> {
+    fn index(&self, name: &str) -> Result<usize> {
+        self.0
+            .iter()
+            .position(|c| c == name)
+            .ok_or_else(|| self.refuse(&format!("column '{name}' not found in query results")))
+    }
+
+    fn refuse(&self, reason: &str) -> Error {
+        Error::Analysis(format!(
+            "{reason}; the query returned columns: {}",
+            self.0.join(", ")
+        ))
+    }
+}
+
 impl ChartSpec {
     /// Number of points in the longest series.
     #[must_use]
@@ -108,27 +128,20 @@ impl ChartSpec {
         columns: SeriesColumns<'_>,
         title: &str,
     ) -> Result<Self> {
-        let column = |name: &str| {
-            results
-                .columns
-                .iter()
-                .position(|c| c == name)
-                .ok_or_else(|| {
-                    Error::Analysis(format!("column '{name}' not found in query results"))
-                })
-        };
-        let x_idx = column(x_column)?;
+        let returned = ReturnedColumns(&results.columns);
+        if x_column.trim().is_empty() {
+            return Err(returned.refuse("x names no column"));
+        }
+        let x_idx = returned.index(x_column)?;
         let y_idx: Vec<usize> = columns
             .y
             .iter()
-            .map(|name| column(name))
+            .map(|name| returned.index(name))
             .collect::<Result<_>>()?;
         let Some(&first_y) = y_idx.first() else {
-            return Err(Error::Analysis(String::from(
-                "a chart needs at least one y column",
-            )));
+            return Err(returned.refuse("a chart needs at least one y column"));
         };
-        let by_idx = columns.series_by.map(column).transpose()?;
+        let by_idx = columns.series_by.map(|by| returned.index(by)).transpose()?;
 
         // Distinct labels in first-seen order, each with its position.
         let mut labels: Vec<String> = Vec::new();
@@ -172,7 +185,8 @@ impl ChartSpec {
                 let y = row.get(idx).cloned().unwrap_or(serde_json::Value::Null);
                 let number = Cell(&y).number().ok_or_else(|| {
                     Error::Analysis(format!(
-                        "row {} of column '{}' is not numeric: {y}",
+                        "row {} of column '{}' is not numeric: {y}; chart a numeric column, or \
+                         CAST the values in the query",
                         i.saturating_add(1),
                         results.columns.get(idx).map_or("", String::as_str)
                     ))
@@ -312,30 +326,32 @@ mod tests {
 
     #[test]
     fn missing_column_and_non_numeric_values_are_errors() {
+        // Every column error names the columns the query returned.
+        let message = |x: &str, columns: SeriesColumns<'_>| {
+            ChartSpec::from_results(&sample_results(), ChartKind::Bar, x, columns, "t")
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        let returned = "the query returned columns: region, sales";
+        let missing_x = message("missing", one("sales"));
         assert!(
-            ChartSpec::from_results(
-                &sample_results(),
-                ChartKind::Bar,
-                "missing",
-                one("sales"),
-                "t"
-            )
-            .is_err()
+            missing_x.contains("column 'missing' not found"),
+            "{missing_x}"
         );
+        assert!(missing_x.contains(returned), "{missing_x}");
+        let missing_y = message("region", one("missing"));
         assert!(
-            ChartSpec::from_results(
-                &sample_results(),
-                ChartKind::Bar,
-                "region",
-                one("missing"),
-                "t"
-            )
-            .is_err()
+            missing_y.contains("column 'missing' not found"),
+            "{missing_y}"
         );
-        assert!(
-            ChartSpec::from_results(&sample_results(), ChartKind::Bar, "region", none(), "t")
-                .is_err()
-        );
+        assert!(missing_y.contains(returned), "{missing_y}");
+        let blank_x = message(" ", one("sales"));
+        assert!(blank_x.contains("x names no column"), "{blank_x}");
+        assert!(blank_x.contains(returned), "{blank_x}");
+        let no_y = message("region", none());
+        assert!(no_y.contains("at least one y column"), "{no_y}");
+        assert!(no_y.contains(returned), "{no_y}");
         let text_values = QueryResults {
             columns: vec!["a".into(), "b".into()],
             rows: vec![vec![

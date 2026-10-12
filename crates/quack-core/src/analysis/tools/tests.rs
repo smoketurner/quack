@@ -1809,6 +1809,91 @@ fn the_chart_schema_lists_every_kind() {
     );
 }
 
+/// A model that fills every field sends `""` for the series column it
+/// meant to leave out, a bare name for one y column, and stray blanks;
+/// each reads as the model meant it, and the schema still shows y as an
+/// array.
+#[test]
+fn chart_arguments_read_blanks_as_absent_and_a_bare_y_as_one_column() {
+    let args = |value: serde_json::Value| {
+        serde_json::from_value::<CreateChartArgs>(value)
+            .unwrap_or_else(|e| fail_test(&e.to_string()))
+    };
+    let filled = args(json!({
+        "sql": "SELECT 1", "kind": "bar", "x": " region ", "y": ["sales", " ", "cost"],
+        "series_by": "", "title": "t"
+    }));
+    assert_eq!(filled.y.names(), ["sales", "cost"]);
+    assert_eq!(filled.series_by.get(), None);
+    assert_eq!(filled.columns_asked(), "x 'region', y [sales, cost]");
+    let bare = args(json!({
+        "sql": "SELECT 1", "kind": "bar", "x": "region", "y": "sales",
+        "series_by": " team ", "title": "t"
+    }));
+    assert_eq!(bare.y.names(), ["sales"]);
+    assert_eq!(
+        bare.columns_asked(),
+        "x 'region', y [sales], series_by 'team'"
+    );
+    let schema = CreateChartArgs::schema();
+    assert_eq!(schema.pointer("/properties/y/type"), Some(&json!("array")));
+    assert_eq!(
+        schema.pointer("/properties/y/items/type"),
+        Some(&json!("string"))
+    );
+    assert_eq!(
+        schema.pointer("/properties/series_by/type"),
+        Some(&json!("string"))
+    );
+    let required = schema.get("required").cloned().unwrap_or_default();
+    assert!(!required.to_string().contains("series_by"), "{schema}");
+}
+
+/// A chart the query's columns cannot make fails with the columns asked
+/// for and the columns the query returned, on the step and to the model.
+#[tokio::test]
+async fn a_failed_chart_names_the_columns_asked_and_returned() {
+    let db = shared_db();
+    let reader_db = ReaderDb::open(&db, 2).await;
+    let (sink, _rx) = events::channel();
+    let recorder = TurnRecorder::new(sink);
+    let turn = Turn::new(recorder.clone(), WritePolicy::Allow(Approver::Nobody));
+    let tool = CreateChartTool::new(reader_db);
+    let result = tool
+        .call(
+            &mut turn.context(),
+            CreateChartArgs {
+                sql: String::from("SELECT 'a' AS region, 1 AS sales"),
+                kind: String::from("bar"),
+                x: String::from("region"),
+                y: ColumnNames::new(["spend"]),
+                series_by: NonBlank::default(),
+                stacked: None,
+                title: String::from("t"),
+            },
+        )
+        .await;
+    let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+    for expected in [
+        "Chart not created",
+        "x 'region', y [spend]",
+        "column 'spend' not found",
+        "the query returned columns: region, sales",
+    ] {
+        assert!(message.contains(expected), "{message}");
+    }
+    let steps = recorder.steps();
+    let summary = steps
+        .first()
+        .map(|s| s.summary.as_str())
+        .unwrap_or_default();
+    assert!(
+        summary.starts_with("error: x 'region', y [spend]: "),
+        "{summary}"
+    );
+    assert!(turn.chart.take().is_none());
+}
+
 /// Every tool schema is self-contained and names one type per argument,
 /// which servers that reject `$ref` or type arrays (Apple's `fm serve`)
 /// require.

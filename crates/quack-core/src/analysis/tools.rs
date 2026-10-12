@@ -1763,6 +1763,60 @@ impl CreateChartTool {
     }
 }
 
+/// Column names a model sends: the array the schema shows, or one name
+/// sent bare, as a small model does for a single series; each trimmed,
+/// and a blank one left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColumnNames(Vec<String>);
+
+impl ColumnNames {
+    #[must_use]
+    pub fn new<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        Self(
+            names
+                .into_iter()
+                .filter_map(str::non_blank)
+                .map(str::to_owned)
+                .collect(),
+        )
+    }
+
+    #[must_use]
+    pub fn names(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ColumnNames {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Sent {
+            One(String),
+            Many(Vec<String>),
+        }
+        Ok(match Sent::deserialize(deserializer)? {
+            Sent::One(name) => Self::new([name.as_str()]),
+            Sent::Many(names) => Self::new(names.iter().map(String::as_str)),
+        })
+    }
+}
+
+/// Shown to the model as the array of strings it is.
+impl JsonSchema for ColumnNames {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        Vec::<String>::schema_name()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        Vec::<String>::json_schema(generator)
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub struct CreateChartArgs {
     /// SQL query to get chart data (at most 200 rows; aggregate first)
@@ -1772,19 +1826,35 @@ pub struct CreateChartArgs {
     /// the model can act on rather than a rejected call.
     #[schemars(with = "ChartKind")]
     pub kind: String,
-    /// Column for the x axis (category labels; slice names for pie)
+    /// Column of the query's result for the x axis (category labels; slice
+    /// names for pie), named as the result returns it: alias with AS
     pub x: String,
-    /// Numeric column(s) for the y axis, one series each (slice values
-    /// for pie, which takes one). Several for "revenue and cost by month".
-    pub y: Vec<String>,
+    /// Numeric column(s) of the query's result for the y axis, one series
+    /// each (slice values for pie, which takes one). Several for "revenue
+    /// and cost by month".
+    pub y: ColumnNames,
     /// For long-format rows ("orders by month, one line per region"): the
     /// column whose distinct values become the series, each taking the
-    /// first y column. Leave unset for wide rows with several y columns.
-    pub series_by: Option<String>,
+    /// first y column. Leave out for wide rows with several y columns.
+    #[serde(default)]
+    pub series_by: NonBlank,
     /// Stack bars or lines on each other instead of beside each other
     pub stacked: Option<bool>,
     /// Chart title
     pub title: String,
+}
+
+impl CreateChartArgs {
+    /// The columns the call asked for, as a step's record of a failed
+    /// attempt reads: `x 'region', y [sales], series_by 'team'`.
+    #[must_use]
+    pub fn columns_asked(&self) -> String {
+        let (x, y) = (self.x.trim(), self.y.names().join(", "));
+        match self.series_by.get() {
+            Some(by) => format!("x '{x}', y [{y}], series_by '{by}'"),
+            None => format!("x '{x}', y [{y}]"),
+        }
+    }
 }
 
 impl Tool for CreateChartTool {
@@ -1796,10 +1866,11 @@ impl Tool for CreateChartTool {
     fn description(&self) -> String {
         String::from(
             "Draw a chart from a SQL query: runs the query and renders a bar, line, scatter, or pie \
-             chart of the y column(s) against column x. Several y columns are several series; \
+             chart of the y column(s) against column x. x and y name columns of the query's own \
+             result, as it returns them (alias with AS). Several y columns are several series; \
              series_by pivots long rows (one row per x and group) into one series per group, at \
-             most 8. At most 200 distinct x values; for a histogram, bin in SQL and chart the \
-             counts as bars.",
+             most 8, and is left out for wide rows. At most 200 distinct x values; for a \
+             histogram, bin in SQL and chart the counts as bars.",
         )
     }
 
@@ -1842,10 +1913,10 @@ impl Tool for CreateChartTool {
             ChartSpec::from_results(
                 &results,
                 kind,
-                &args.x,
+                args.x.trim(),
                 SeriesColumns {
-                    y: &args.y,
-                    series_by: args.series_by.as_deref(),
+                    y: args.y.names(),
+                    series_by: args.series_by.get(),
                 },
                 &args.title,
             )
@@ -1854,9 +1925,11 @@ impl Tool for CreateChartTool {
         let spec = match spec {
             Ok(spec) => spec,
             Err(e) => {
+                // The step keeps the columns asked for beside the error, since
+                // its detail is the SQL alone.
+                let failed = step.fail(format!("{}: {e}", args.columns_asked()));
                 return Err(ToolExecutionError::invalid_args(format!(
-                    "Chart not created: {}",
-                    step.fail(e)
+                    "Chart not created: {failed}"
                 )));
             }
         };
@@ -1868,7 +1941,7 @@ impl Tool for CreateChartTool {
             spec.title,
             spec.points(),
             spec.series_names().join(", "),
-            args.x
+            args.x.trim()
         );
         turn.chart.put(spec);
 
