@@ -4498,9 +4498,9 @@ dependencies = [
  "pulldown-cmark",
  "quack-testkit",
  "quick-xml 0.42.0",
+ "rclip-rtf",
  "reqwest",
  "rig",
- "rtf-parser",
  "rust-stemmers",
  "rustls",
  "schemars",
@@ -4955,6 +4955,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "rclip-codepage"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03b479f8baadf78efd25b8a252cf6e6926f53f26f25578bb0e4316e9a481abff"
+dependencies = [
+ "rclip-core",
+]
+
+[[package]]
+name = "rclip-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6414ce752a0d18ee3d000b6c76fccbc30e90b93c2a8c1e7fdd855ab9b7ea0af6"
+
+[[package]]
+name = "rclip-rtf"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e64929d6244eea54b6ae4276d5724ae8833c269b8156dd63d48b4f13d39a78ed"
+dependencies = [
+ "rclip-codepage",
+ "rclip-core",
+]
+
+[[package]]
 name = "read-fonts"
 version = "0.39.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5310,15 +5335,6 @@ dependencies = [
  "quote",
  "serde_json",
  "syn 3.0.7",
-]
-
-[[package]]
-name = "rtf-parser"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c3147b4eb521eae5e29b781bdc30ab98bbaed784bfcb8376cda60ba4b2e0e3d"
-dependencies = [
- "serde",
 ]
 
 [[package]]
