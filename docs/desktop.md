@@ -8,11 +8,14 @@ table in section 7 can be brought in line once the shape is agreed.
 
 The one-sentence version: a new crate, `crates/quack-desktop`, that is its own binary; it
 starts the embedded server on a random loopback port under a per-launch token, opens the
-existing web UI in a Tauri 2 webview, and adds the four things a browser tab cannot do
-(native drag-drop of files and folders by path, a system tray that keeps jobs running while
-the window is closed, single-instance focus, and installer bundles). The web UI itself is
-not forked or re-skinned: every page, form, and SSE stream is served by `quack-server`
-exactly as `quack serve --local` serves it today.
+existing web UI in a Tauri 2 webview, and adds the things a browser tab cannot do (native
+drag-drop of files and folders by path, downloads to a chosen file, a system tray that
+keeps jobs running while the window is closed, single-instance focus, and installer
+bundles). It is one application on Linux, macOS, and Windows from the first release: the
+same crate, the same window, the same behaviour, with the platform differences named in
+section 5.6 and handled there, not deferred. The web UI itself is not forked or re-skinned:
+every page, form, and SSE stream is served by `quack-server` exactly as `quack serve
+--local` serves it today.
 
 ## 1. Why a separate binary, not a subcommand
 
@@ -80,7 +83,7 @@ plus docs. Section 9 gives the slimmer cuts.
 | `tauri-build` | `=2.7.2` | (build-dependency) |
 | `tauri-plugin-single-instance` | `=2.5.3` | |
 | `tauri-plugin-opener` | `=2.7.1` | for "Open data folder" |
-| `tauri-plugin-dialog` | `=2.8.2` | only if the native file picker or confirm dialog is chosen (sections 5.1, 5.2) |
+| `tauri-plugin-dialog` | `=2.8.2` | the save dialog every download needs (section 4), the Open… picker (5.1), the quit confirmation (5.3) |
 | `tracing-appender` | `=0.2.5` | the rolling log file |
 
 `tauri-cli` (`=2.12.2`) is a tool, installed with `cargo install tauri-cli --version
@@ -214,6 +217,13 @@ own CSP and security headers.
 - **External links** (a citation's `source_url`, the docs link to Redoc) open in the system
   browser through `tauri-plugin-opener`; the webview stays on the server's origin. The
   `on_navigation` hook denies any other origin.
+- **Downloads.** The web UI streams files: the SQL page's export, the graph and OKF
+  exports, a workspace snapshot, a document's stored image. None of the three webviews
+  saves a download by itself the way a browser does, so the window's `on_download` hook
+  takes each one: a native save dialog (`tauri-plugin-dialog`) proposes the server's
+  `Content-Disposition` file name, and the webview writes the body to the chosen path. A
+  cancelled dialog cancels the download. Without this hook a download silently does
+  nothing on WebKitGTK and WKWebView, so it is part of the first cut, not a refinement.
 - **Reopen:** closing the window hides it; the tray's Open shows it again (section 5.3).
   Cmd-Q / the tray's Quit is the real exit.
 
@@ -272,6 +282,10 @@ Lifecycle, under Tauri's `RunEvent`s:
 4. A second launch (`tauri-plugin-single-instance`) focuses the running window and exits.
    DuckDB's per-process file lock would refuse the second process anyway; the plugin makes
    that a focus instead of an error dialog.
+5. **No tray available.** On Linux the tray depends on the desktop environment (section
+   5.6); when the icon cannot be shown, closing the window is Quit (step 2 and 3), so the
+   process never runs on with no way to reach it. The app decides this once at start from
+   the tray's build result and says so in the log.
 
 The `quack` CLI against a workspace the app has open hits the same lock (`quack -q` on that
 workspace fails while the window is up). That is today's behaviour between `quack serve` and
@@ -311,6 +325,29 @@ and commands then.
   doctor view if one exists, else a new small page in `web/` (to confirm against `setup`'s
   current API, which is written for a TTY; the probe and the write are separable).
 
+### 5.6 What differs by platform, and how each is handled
+
+Three webviews, three bundlers, three keychains. The crate has one code path with a
+`cfg(target_os)` only where the table says so; everything else is Tauri's job.
+
+| Concern | Linux | macOS | Windows |
+|---|---|---|---|
+| Webview engine | WebKitGTK 4.1, from the distribution | WKWebView, part of the OS | WebView2 (Edge), a runtime the installer ensures |
+| Runtime the installer needs | `libwebkit2gtk-4.1`, `libgtk-3`, `libayatana-appindicator3` as `.deb`/`.rpm` dependencies; the AppImage bundles its GTK libraries and needs the system WebKitGTK | none | `bundle.windows.webviewInstallMode = downloadBootstrapper`: the installer fetches WebView2 when a machine lacks it (Windows 10 and 11 normally ship it) |
+| Tray | shown where the desktop has an indicator host (KDE, XFCE, GNOME with the AppIndicator extension); absent elsewhere, so close is quit (5.3 step 5) | always | always |
+| Drag-drop by path | `DragDropEvent::Drop` gives paths on all three; on Linux under Wayland a drop from some file managers arrives as URIs, which Tauri resolves to paths | paths | paths |
+| Downloads | `on_download` (section 4) on all three; nothing saves without it | same | same |
+| Keychain | `linux-keyutils` (in-kernel, per login session), already the core's store; the CLI on the same machine shares it | Keychain, shared with the CLI by service name; a signed bundle stops the per-launch prompt | Credential Manager, shared with the CLI |
+| Window chrome | GTK titlebar; the webview's dark mode follows the GTK theme | native; `prefers-color-scheme` follows the system | native; `prefers-color-scheme` follows the system |
+| Fonts and rendering | WebKitGTK renders the Tailwind UI as Safari would; the committed CSS has no vendor-specific rules to check | Safari's engine | Chromium's engine; the UI is already exercised in Chrome and Edge |
+| Single instance | the plugin uses D-Bus; without a session bus (a bare X session) it falls back to the DuckDB lock's error, shown as a dialog | the plugin | the plugin |
+| Signing | none (packages are attested, not signed) | codesign and notarization, the existing secrets | Azure Trusted Signing, the existing step, applied to the installer as well |
+
+The web UI has nothing platform-specific in it today (htmx, ECharts, CodeMirror, SSE, and
+plain forms), and the one thing that behaves differently across engines, saving a file, is
+handled in the host. The manual checklist in the crate's README is run on all three before
+a release; `make eval` does not cover the window.
+
 ## 6. Logging and errors
 
 No terminal, so `tracing` goes to stderr (visible under `cargo run`) and to a rolling daily
@@ -327,16 +364,26 @@ interface crates.
 `cargo clippy --workspace` and `cargo test --workspace` now compile `quack-desktop`. On
 Linux that needs the WebKitGTK development packages; `make setup` installs them
 (`libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev`, and the
-dnf and pacman equivalents), and the CI lint and test jobs add the same `apt-get` step. On
-macOS and Windows nothing is needed. This is the one real cost of the crate to people who
-never build the app; section 9 lists the alternative of leaving Linux out.
+dnf and pacman equivalents), and every CI job that builds the workspace on Linux adds the
+same `apt-get` step, so CI never skips the crate. On macOS and Windows nothing is needed.
+
+For a Linux contributor who has not run `make setup`, `make lint` and `make test` check
+`pkg-config --exists webkit2gtk-4.1` first and, when it fails, pass `--exclude
+quack-desktop` and print one line saying what was skipped and how to install it. The
+pre-push hook does the same. Nobody's build breaks because the app exists, and the gate
+that matters, CI, builds everything on all three operating systems.
 
 `Dockerfile.build` and `docker-bake.hcl` build `--package quack` and are untouched; so is the
 image.
 
+A PR-time job, `desktop-check`, runs `cargo check -p quack-desktop --locked` on
+`ubuntu-latest`, `macos-latest`, and `windows-latest`, so a `cfg(target_os)` branch that
+compiles on one platform and not another fails the PR, not the release.
+
 ### 7.2 Release
 
-A new `desktop` job in `.github/workflows/reusable-build.yml`, same shape as `binaries`:
+A new `desktop` job in `.github/workflows/reusable-build.yml`, same shape as `binaries`,
+with every platform in the first release:
 
 | Runner | Target | Bundles |
 |---|---|---|
@@ -355,6 +402,13 @@ a warning when the secrets are absent, as today. The bundles are uploaded as art
 attested with `actions/attest-build-provenance` like the tarballs, and listed in
 `SHA256SUMS` by `publish`. `aarch64-unknown-linux-gnu` with `fips` needs cmake, go, and
 clang on the ARM runner, as the musl build does in Docker; the job installs them.
+
+The matrix mirrors the CLI's five targets, which is why there is no Intel macOS row: the
+`quack` binary ships for Apple silicon only today. If Intel Macs matter for the app, the
+cheapest answer is a universal `.app` (`cargo tauri build --target universal-apple-darwin`
+on the same runner, which builds both halves and `lipo`s them; DuckDB and aws-lc-rs build
+twice, so the job takes about twice as long). That is a product question, listed in section
+10.
 
 Reproducibility is not claimed for the bundles: `.dmg` and `.msi` carry timestamps the
 bundlers set. The binary inside is built `--locked` from the same commit, and the
@@ -389,14 +443,15 @@ is demand.
 | Cut | What you get | Size |
 |---|---|---|
 | **0. No Tauri:** `quack serve --local --open` | the embedded server and the system browser opened on it; no tray, no drop by path, no bundle | ~30 lines in `crates/quack`; zero new dependencies |
-| **1. Window only:** `Embedded` + `ServeMode::Desktop` + a window that heals | a private, token-gated web UI in an app window; macOS and Windows bundles | ~250 lines server, ~300 crate, workflow for two platforms |
-| **2. Full (this document):** + drop by path, tray, lifecycle, single instance, Linux bundles, log file | everything in sections 3 to 7 | ~250 server, ~700 crate, ~150 YAML, docs |
+| **1. Window only:** `Embedded` + `ServeMode::Desktop` + a window that heals and saves downloads | a private, token-gated web UI in an app window on all three platforms, bundled | ~250 lines server, ~350 crate, the full matrix |
+| **2. Full (this document):** + drop by path, tray, lifecycle, single instance, log file | everything in sections 3 to 7 | ~250 server, ~750 crate, ~200 YAML, docs |
 
 Cut 0 is worth doing regardless, and this week: it answers "I want the UI without typing a
 URL" for everyone, and it costs nothing. Cut 1 is the honest minimum that justifies the
-crate. Cut 2 is the design doc's promise. Leaving Linux out of cut 2 at first removes the
-WebKitGTK requirement from every contributor's `make lint` and is the one scope question
-that changes what other people have to install; it can be added back as a matrix row.
+crate. Cut 2 is the design doc's promise. Neither cut drops a platform: the matrix, the
+`desktop-check` job, and the Linux dependency handling in 7.1 are part of cut 1, since an
+app that ships for two operating systems and promises the third later is the thing the
+project set out not to build.
 
 ## 10. Decisions to take before building
 
@@ -405,9 +460,9 @@ that changes what other people have to install; it can be added back as a matrix
    A.
 3. **Write permission as the web card with a background notification (5.2, A) or a native
    modal (B).** Recommended: A; section 7's table row changes either way.
-4. **Linux in the first cut, or macOS and Windows only.** Recommended: macOS and Windows
-   first, Linux as a follow-up matrix row, so no contributor's lint run grows a system
-   dependency until the app exists.
+4. **Intel macOS.** The CLI ships for Apple silicon only; the app can match that, or ship
+   a universal `.app` at about twice the macOS job's build time (7.2). Recommended: match
+   the CLI until someone asks.
 5. **Issue #35** is closed "not planned". Reopen it, or file a new issue for this document,
    and update design doc sections 11.6 and 14 (one binary, subcommand, "not a separate
    binary") and section 7's permission table when the shape is agreed.
