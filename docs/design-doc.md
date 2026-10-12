@@ -920,7 +920,8 @@ table is rendered as a pipe-delimited Markdown table (`ingestion::table`), one c
 table, split by rows with the header on every piece when it is longer than the window. A
 table with at least `[ingestion].table_rows_as_table` data rows (default 20) is also loaded
 as a table of the workspace, `<stem>_tableN`, owned by the document like a workbook's sheets,
-so `run_sql` can query it.
+so `run_sql` can query it; its text cells are parsed into numbers, booleans, dates, and
+timestamps where they read as one, and the table is typed and filled like a sheet (6.2).
 
 What a file says about itself lands on the document row: `author`, `authored_at`,
 `modified_at` (what parses as a timestamp; the text otherwise under `metadata`), `tags`, and
@@ -1120,7 +1121,7 @@ would exceed what is left is skipped with a visible "(omitted)" line, not trunca
 | Type | Mechanism | Result |
 |------|-----------|--------|
 | CSV, TSV, Parquet, JSON, JSONL | `read_csv_auto` / `read_parquet` / `read_json_auto` | Table in `data.duckdb` |
-| Excel `.xlsx`, `.xls`, `.ods` | `calamine` (pure Rust) writes each sheet as CSV under `files/` for `read_csv_auto` | One table per data sheet: `<stem>` for one sheet, `<stem>_<sheet>` otherwise; recorded on the document row so deleting it drops them |
+| Excel `.xlsx`, `.xls`, `.ods` | `calamine` (pure Rust) reads each sheet's cells with their types; a column takes the one type its cells agree on (`ingestion::xlsx::TypedSheet`), the table is created with those types, and the rows go in through DuckDB's appender (`WorkspaceDb::append_rows`); no file is written | One table per data sheet: `<stem>` for one sheet, `<stem>_<sheet>` otherwise; recorded on the document row so deleting it drops them |
 | stdin (print mode) | sniffed | Temporary table `stdin` |
 | SQLite | `quack import URL --table T (--from SOURCE_TABLE \| --query SQL) [--limit N]`, `POST .../import`, the Tables page form, `/import` in the terminal (below) | Table in `data.duckdb`, a snapshot of the source at import time |
 | CSV, Parquet, JSON, workbooks over HTTP(S) | The same command with an `http(s)://` URL naming any file `quack ingest` loads as a table (`parser::table_extensions`: CSV, TSV, Parquet, JSON, JSONL, and XLSX, XLSM, XLS, ODS workbooks): reqwest fetches the file and it goes through the usual reader under the requested table name. `--header 'Name: value'` (repeatable) and `--bearer-env VAR` send headers; `--json-pointer /data/items` (RFC 6901) loads the array of rows inside an enveloped JSON response | Table in `data.duckdb` |
@@ -3600,6 +3601,7 @@ and `cargo deny check` runs weekly on its own.
 
 **Evaluation.** `crates/quack-eval` (issue #74) is a binary that drives the built `quack` as a
 person would, one process per command over a temporary data directory, and scores what the
+<<<<<<< HEAD
 binary's own `-f json` output says. It links nothing of quack, so a bug in argument parsing,
 print mode, config loading, or the data directory layout shows in it. `make eval-offline`
 needs no model and runs in under a minute:
@@ -3635,6 +3637,40 @@ answers are reported, never failed. The models are `QUACK_EVAL_*` variables defa
 what a developer machine runs (`gpt-oss:20b`, `embeddinggemma-2`, `gemma4:e4b`), and
 `.github/workflows/eval.yml` runs it nightly and on dispatch, outside CI, on smaller models it
 names itself, with the report in the job summary and the JSON as an artifact.
+=======
+binary's own `-f json` output says; it links nothing of quack, so a bug in argument parsing,
+print mode, config loading, or the data directory layout shows in it. `make eval-offline` needs
+no model and runs in seconds: `quack ingest` of one file per format quack reads
+(`fixture/formats.json`: hand-written RTF, EML, MBOX, VTT, SRT, YAML, JSON, JSONL, TSV, text,
+and source; XLSX, PPTX, ODT, ODS, and Parquet made once and committed; a Project Gutenberg
+EPUB and the Apache POI `.doc`, `.xls`, and `.ppt` samples fetched once and committed), each
+checked by `quack search --keyword --in FILE` for a phrase or by `quack -q` for a table's rows;
+recall@1/5/8 and MRR (mean reciprocal rank) over a 32-question gold set through `quack search`
+with `--keyword` and without (`--vector` too when there is an embedding model), per question
+kind (`identifier`, `phrase`, `semantic`, `multilingual`); and precision and recall of `quack
+ontology propose --auto-accept` against a hand-written expected ontology, read back through
+`quack ontology show --format json`. With `QUACK_EVAL_OUT` set, it also writes the numbers as
+JSON for a before/after diff.
+
+`make eval` (`--ollama`) adds what only a model shows. The agent answers
+`fixture/agent_questions.json` through `quack -p ... -f json` (a follow-up through `-r
+SESSION`), each scored by the product's own rule that `DuckDB`'s rows are the record of an
+answer: a table question names the result set one `run_sql` step must have returned (as many
+rows, each expected row's cells present in one actual row, numbers as numbers), and the prose
+is a secondary check; a question the data cannot answer expects the exit sentence of 7.5, a
+write expects `write_refused` and a statement reading the same before and after, an ambiguous
+question expects an answer and no question back. The 32 questions cover single-table figures,
+joins, date ranges, a text column with more values than the prompt lists, figures stored as
+text, unanswerable questions, ambiguity, a write, and follow-ups. The vision model reads one
+notice three ways, as an image, as the only picture on a PDF page, and as a figure inside a
+DOCX, scored by the notice's words found in the ingested text. `make eval-scale` loads the SPC
+tornado database (70,000 rows, downloaded once) and asks six questions scored by the rows of
+an `expect_sql` the harness runs itself. Wrong answers are reported, never failed: the models
+are `QUACK_EVAL_*` variables defaulting to what a developer machine runs (`gpt-oss:20b`,
+`embeddinggemma-2`, `gemma4:e4b`), and `.github/workflows/eval.yml` runs it nightly and on
+dispatch, outside CI, on smaller models it names itself, with the report in the job summary
+and the JSON as an artifact.
+>>>>>>> origin/main
 
 Decoys make the retrieval fixture discriminate issue #77's identifier-joining and
 phrase-filter fix rather than score 1.000 either way. Five identifier questions (`SR-8841`,
