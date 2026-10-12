@@ -147,6 +147,10 @@ mod unix {
 
     /// `path` is a `kind` file this user owns. Symlinks are not followed, so
     /// a link planted at the path is refused rather than resolved.
+    #[expect(
+        clippy::filetype_is_file,
+        reason = "a regular file is exactly what the token file must be: not a link, a directory, a device, or a pipe"
+    )]
     fn check_owned(path: &Path, kind: Kind) -> Result<std::fs::Metadata> {
         let meta = std::fs::symlink_metadata(path)?;
         let is_kind = match kind {
