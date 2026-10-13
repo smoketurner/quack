@@ -11,16 +11,14 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use quack_core::classify::{
-    self, Draft, DraftContext, Drafter, Labelling, OnEnd, Rows, RunEnded, Waiting,
-};
+use quack_core::classify::{self, Draft, DraftContext, Drafter, Labelling, Rows, Waiting};
 use quack_core::error::Error as CoreError;
-use quack_core::ids::{RunId, SessionId, WorkspaceId};
+use quack_core::ids::{RunId, WorkspaceId};
 use quack_core::jobs::JobId;
 use quack_core::llm::ChatDrafter;
 use quack_core::llm::decision::DecisionModel;
 use quack_core::progress::{ChunkDone, RunControl};
-use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
+use quack_core::storage::control::{AuditAction, Outcome};
 use quack_core::storage::writer::Writer;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -121,39 +119,6 @@ pub(crate) async fn runs(
 }
 
 impl Access {
-    /// The hook that audits a run an agent turn or an MCP call started, when
-    /// it ends and under the run's id, so a cancelled turn or a client that
-    /// left still leaves its row. `session` is the turn's, when there is one.
-    pub(crate) fn run_audit(&self, app: &App, session: Option<SessionId>) -> OnEnd {
-        let (access, app) = (self.clone(), App::clone(app));
-        OnEnd::new(move |ended: RunEnded| {
-            let (access, app, session) = (access.clone(), App::clone(&app), session.clone());
-            async move {
-                let RunEnded { run, outcome } = ended;
-                let detail = serde_json::json!({
-                    "table": run.source_table,
-                    "output_table": run.output_table,
-                    "sentence": run.sentence,
-                    "summary": run.to_string(),
-                    "session_id": session,
-                });
-                let resource = ResourceKind::ClassificationRun.id(&run.id);
-                if let Err(e) = access
-                    .audit(
-                        &app,
-                        AuditAction::Classify,
-                        Some(resource),
-                        outcome,
-                        Some(detail),
-                    )
-                    .await
-                {
-                    tracing::error!(error = %e.message, "audit write failed");
-                }
-            }
-        })
-    }
-
     /// The decision model for this workspace, or why not: a provider the
     /// allow-list refuses is 403, and either way the attempt is audited.
     async fn decision_model(&self, app: &App) -> ApiResult<DecisionModel> {

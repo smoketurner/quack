@@ -27,7 +27,7 @@ A tool is a rig `Tool` the agent may call during a turn. `read_document`
    lists every exhaustive match the new variant breaks.
 6. **`crates/quack-core/tests/agent_turn.rs`**: a whole turn through rig's scripted model
    that calls the tool and checks the step, its summary, and the response.
-7. **`crates/quack-server/src/mcp.rs`**, when the tool is also an MCP tool: its handler, audited
+7. **`crates/quack-mcp/src/lib.rs`**, when the tool is also an MCP tool: its handler, audited
    with channel `mcp`.
 8. **`docs/design-doc.md`** section 7.3's tool table, and `CLAUDE.md` where it lists the
    tools.

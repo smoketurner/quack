@@ -1,7 +1,7 @@
 # quack-server
 
-The network interfaces: `quack serve` (the REST API, the web UI, and MCP over HTTP) and
-`quack mcp` (the MCP server on stdio). Both are thin clients of `quack-core`.
+The network interface: `quack serve` (the REST API, the web UI, and `quack-mcp` over
+streamable HTTP), a thin client of `quack-core`.
 
 ## What it holds
 
@@ -15,8 +15,10 @@ The network interfaces: `quack serve` (the REST API, the web UI, and MCP over HT
   CodeMirror bundle. Rebuild them with `make css-build` and `make editor-build`, then
   commit the output (`docs/web-ui.md`).
 - **`auth.rs` and `oidc/`:** sign-in, sessions, and API tokens.
-- **`mcp.rs` and `mcp_http.rs`:** the MCP server, on stdio and over HTTP. It shares the
-  crate with the HTTP server because each uses the other.
+- **`mcp_http.rs`:** `/mcp/v1/{workspace}`: the bearer and role checks in front of
+  `quack-mcp`'s server, one transport per workspace, user, and write permission, and the
+  `McpCaller` (core's audit `Recorder`) each request carries so every call is audited as the
+  request that made it.
 - **`run.rs`, `permissions.rs`, `state.rs`:** the server's end of core's audited background
   runs (`jobs::runs`) and held write approvals (`analysis::permissions`), uploads queued
   through `ingestion::upload` with `Access` as their owner, and the shared application
@@ -31,12 +33,12 @@ The network interfaces: `quack serve` (the REST API, the web UI, and MCP over HT
 
 ## Public API
 
-`serve`, `ServeMode`, and `serve_stdio`. The binary calls them for `quack serve` and
-`quack mcp`.
+`serve`, `Server`, and `ServeMode`. The binary calls them for `quack serve`; `quack mcp`
+is `quack_mcp::serve_stdio`.
 
 ## Where new code goes
 
-- A new route, page, or MCP tool goes here.
+- A new route or page goes here; an MCP tool or resource goes in `quack-mcp`.
 - The behavior behind it goes in `quack-core`, so every interface can reach it.
 
 Depends on `quack-core` only. `quack-testkit` is a dev-dependency.

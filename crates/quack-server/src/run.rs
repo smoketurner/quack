@@ -1,7 +1,7 @@
 //! The server's end of a background run (`quack_core::jobs::runs`): the
 //! person whose request started it audits its start and its end through
-//! `Access`, and the graph follow-up after an ingest runs as one such run
-//! in the workspace's graph lane.
+//! their `Recorder`, and the graph follow-up after an ingest runs as one
+//! such run in the workspace's graph lane.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,51 +10,22 @@ use quack_core::analysis::tools::SharedDb;
 use quack_core::graph::follow_up::{FollowUp, FollowUpSummary};
 use quack_core::ids::DocumentId;
 use quack_core::jobs::JobId;
-use quack_core::jobs::runs::{self, RunAudit, RunOwner, RunRow};
+use quack_core::jobs::runs::{self, RunOwner};
 use quack_core::llm::Embeddings;
 use quack_core::ontology::store as ontology_store;
 use quack_core::progress::{ChunkDone, RunControl};
+use quack_core::storage::audit::Recorder;
 use serde_json::Value;
 
 use crate::auth::Access;
-use crate::error::{ApiError, ApiResult};
+use crate::error::ApiResult;
 use crate::state::App;
 
 pub(crate) use quack_core::jobs::runs::{GraphReport, RunKind};
 
-/// A run audited by the person whose request started it.
-#[derive(Clone)]
-pub(crate) struct Audited {
-    app: App,
-    access: Access,
-}
-
-impl RunAudit for Audited {
-    type Error = ApiError;
-
-    async fn record(&self, row: RunRow) -> Result<(), ApiError> {
-        let RunRow {
-            action,
-            resource,
-            run,
-            outcome,
-            detail,
-        } = row;
-        self.access
-            .audit(
-                &self.app,
-                action,
-                Some(resource.id(&run)),
-                outcome,
-                Some(detail),
-            )
-            .await
-            .map(drop)
-    }
-}
-
-/// One run, from its start audit row to its closing one.
-pub(crate) type BackgroundRun = runs::BackgroundRun<Audited>;
+/// One run, from its start audit row to its closing one, audited by the
+/// person whose request started it.
+pub(crate) type BackgroundRun = runs::BackgroundRun<Recorder>;
 
 /// Mint the run id and write the start audit row with `detail` as
 /// `access`; the request fails if that write does.
@@ -68,11 +39,8 @@ pub(crate) async fn start(
         workspace: access.membership.workspace.id.clone(),
         user: Some(access.identity.user_id.clone()),
     };
-    let audited = Audited {
-        app: Arc::clone(app),
-        access: access.clone(),
-    };
-    BackgroundRun::start(&app.engine.jobs, audited, owner, kind, detail).await
+    let recorder = access.recorder(app).await?;
+    Ok(BackgroundRun::start(&app.engine.jobs, recorder, owner, kind, detail).await?)
 }
 
 /// How many seconds a follow-up waits for the workspace's extraction slot

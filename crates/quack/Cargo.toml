@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 quack-cli          = { path = "../quack-cli" }
 quack-core         = { path = "../quack-core" }
+quack-mcp          = { path = "../quack-mcp" }
 quack-server       = { path = "../quack-server" }
 quack-terminal     = { path = "../quack-terminal" }
 anyhow             = { workspace = true, features = ["std"] }

@@ -4,7 +4,6 @@
 mod api;
 mod auth;
 mod error;
-mod mcp;
 mod mcp_http;
 mod oidc;
 mod permissions;
@@ -15,7 +14,6 @@ mod state;
 mod tests;
 mod web;
 
-pub use mcp::serve_stdio;
 pub use state::ServeMode;
 
 use std::fmt;

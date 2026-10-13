@@ -133,10 +133,12 @@ crates/
       print.rs         one-shot mode and output formats
       graph_cli.rs, ontology_cli.rs   the `graph` and `ontology` subcommands
   quack-terminal/  the interactive session (ratatui)
-  quack-server/    `quack serve` and the MCP server
+  quack-mcp/       the MCP server (rmcp): the tools and resources, served on stdio by
+                   `quack mcp` and over streamable HTTP by the server
+  quack-server/    `quack serve`
     src/
       lib.rs           axum router, REST, SSE
-      mcp.rs           the MCP server, served on stdio and by mcp_http.rs
+      mcp_http.rs      /mcp/v1/{workspace}: the checks in front of quack-mcp's server
     templates/, static/   askama pages and embedded assets
   quack-testkit/   a scripted Ollama for tests
   quack-eval/      the evaluation harness: drives the built binary (section 16)

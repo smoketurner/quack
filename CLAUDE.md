@@ -544,16 +544,19 @@ which as a UUID v7 is registration order), and a name resolves through
 `WorkspaceDb::find_document` (id, file name, title, id prefix) or `document_by_id_prefix`, each a
 bounded query, so no request reads every document row.
 
-The MCP server (`crates/quack-server/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `sql`,
+The MCP server (`crates/quack-mcp`, `rmcp`; `McpServer` over `McpSetup`, served by
+`serve_stdio` and `McpServer::http_transport`) exposes `query`, `search`, `sql`,
 `list_tables`, `describe_table`, `list_documents` and the `quack://workspace/...` resources.
 `query` and `classify` report through one `Progress` (`notifications/progress` to a client
 that sent a token, the first one before any work so the HTTP transport, which holds its
 response until the handler's first message, answers at once; and a task's status line), and
 for a client that declares the tasks extension `query` answers with a task (rmcp's
 `TaskManager` on the server, `tasks/get` for the answer, `tasks/cancel` cancels the turn);
-`quack mcp` serves it on stdio (unaudited, like the CLI) and `mcp_http.rs` serves it
+`quack mcp` serves it on stdio (unaudited, like the CLI) and `quack-server`'s `mcp_http.rs` serves it
 at `/mcp/v1/{workspace}` behind `Access::resolve`, one transport per workspace, user, and write
-permission, audited with channel `mcp`. With `[server.oidc].audience` set, the API and MCP also
+permission, each request carrying an `McpCaller` (core's `storage::audit::Recorder`, both audit
+halves for that person in that workspace, which `Access::audit` and background runs also record
+through), audited with channel `mcp`. With `[server.oidc].audience` set, the API and MCP also
 accept the issuer's access tokens (`SignIn::verify_bearer`, `jsonwebtoken` on aws-lc-rs), publish
 `/.well-known/oauth-protected-resource` (`server::resource`), and send `WWW-Authenticate:
 Bearer resource_metadata=...` on 401, so MCP clients can sign users in themselves.

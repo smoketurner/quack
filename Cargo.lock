@@ -4427,6 +4427,7 @@ dependencies = [
  "mimalloc",
  "quack-cli",
  "quack-core",
+ "quack-mcp",
  "quack-server",
  "quack-terminal",
  "secrecy",
@@ -4542,6 +4543,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "quack-mcp"
+version = "2026.10.7"
+dependencies = [
+ "anyhow",
+ "http",
+ "quack-core",
+ "quack-testkit",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "quack-server"
 version = "2026.10.7"
 dependencies = [
@@ -4559,8 +4578,8 @@ dependencies = [
  "mime_guess",
  "pulldown-cmark",
  "quack-core",
+ "quack-mcp",
  "quack-testkit",
- "rmcp",
  "rust-embed",
  "schemars",
  "secrecy",

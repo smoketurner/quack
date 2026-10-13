@@ -17,7 +17,7 @@ use tower::ServiceExt;
 use super::auth::{Access, Identity, Need};
 use super::error::ApiResult;
 use super::state::{App, McpKey};
-use crate::mcp::{Auditor, McpCaller, McpServer, McpSetup};
+use quack_mcp::{McpCaller, McpServer, McpSetup, Transport};
 
 pub(crate) async fn handle(
     State(app): State<App>,
@@ -44,8 +44,9 @@ pub(crate) async fn handle(
                 workspace: access.membership.workspace.clone(),
                 policy,
                 user_id: Some(access.identity.user_id.clone()),
-                auditor: Auditor::Server(std::sync::Arc::downgrade(&app)),
+                transport: Transport::Http,
                 jobs: app.engine.jobs.clone(),
+                stopping: app.engine.stopping(),
             })
         })
         .await;
@@ -53,10 +54,13 @@ pub(crate) async fn handle(
     // first opened this transport (issue #245): the transport is shared by
     // every request of this user, so the caller travels with the request.
     // rmcp hands the request's parts, extensions included, to the handler.
-    request.extensions_mut().insert(McpCaller {
-        access,
+    let caller = McpCaller {
+        recorder: access.recorder(&app).await?,
+        workspace: access.membership.workspace.clone(),
+        session_viewer: access.session_viewer(),
         acting: Acting::current(),
-    });
+    };
+    request.extensions_mut().insert(caller);
     let response = transport
         .oneshot(request)
         .await

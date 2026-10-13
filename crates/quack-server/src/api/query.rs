@@ -24,6 +24,7 @@ use quack_core::classify::LabelJobs;
 use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
+use quack_core::storage::audit::Recorder;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{self, ChatMode};
@@ -62,6 +63,9 @@ pub(crate) struct QueryRequest {
 /// A turn that has passed its checks and has its session: ready to run.
 struct PreparedTurn {
     access: Access,
+    /// Both audit halves for the caller, for the labelling runs the turn
+    /// may start.
+    recorder: Recorder,
     db: SharedDb,
     reader: ReaderDb,
     session_id: SessionId,
@@ -128,8 +132,10 @@ impl PreparedTurn {
             WritePolicy::Deny
         };
         let policy = unasked.allowed_if(body.allow_write);
+        let recorder = access.recorder(app).await?;
         Ok(Self {
             access,
+            recorder,
             db,
             reader,
             session_id,
@@ -146,6 +152,7 @@ impl PreparedTurn {
     fn start(self, app: &App) -> Turn {
         let Self {
             access,
+            recorder,
             db,
             reader,
             session_id,
@@ -170,7 +177,7 @@ impl PreparedTurn {
         let user = access.identity.user_id.clone();
         let labelling = LabelJobs::new(app.engine.jobs.clone())
             .workspace(access.membership.workspace.id.clone())
-            .on_end(access.run_audit(app, Some(session_id.clone())));
+            .on_end(recorder.on_classify_end(Some(session_id.clone())));
         let job = app
             .engine
             .jobs

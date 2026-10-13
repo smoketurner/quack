@@ -60,7 +60,7 @@ nothing in it knows about HTTP, terminals, or windows.
 | `proxy` | `Proxies`: the forward proxy from `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, read once; every reqwest client starts from `Proxies::client` and the AWS SDK connector takes `Proxies::aws`, and loopback and `169.254.0.0/16` are never proxied | 6.2, 10.1 |
 | `priority` | the interactive/background task-local that the writer line and the model limiter read | 4.1 |
 | `saved` | saved questions: an answer's read statements pinned under a name, re-run without the model with a digest of every result set and `changed` against the run before; cron is the scheduler | 8.1 |
-| `storage::sessions`, `storage::context`, `storage::audit` | conversations, the versioned workspace context, the content half of the audit (`AuditLog`: the server's insert-only audit connection) | 5.3, 8 |
+| `storage::sessions`, `storage::context`, `storage::audit` | conversations, the versioned workspace context, the content half of the audit (`AuditLog`: the insert-only audit connection; `Recorder`: both audit halves for one caller in one workspace, what the server's `Access`, an MCP call over HTTP, and a background run record through) | 5.3, 8 |
 | `embedding` | each text's embedding role (query, document, similarity), each model family's trained prefixes (`presets`) and their `[embedding]` overrides, the profile a vector is made under, the width check, `refresh` | 6.1, 5.4 |
 | `ingestion` | registration with SHA-256 dedup, parsers (`parser` for the types and dispatch; `pdf`, `markdown`, `html`, `office`, `epub`, `odt`, `mail`, `captions`, `code`, `rtf`, `xlsx`; `zipped` for the zip-of-XML formats; `table` for tables found inside documents), the decompression limit on zipped uploads (`budget`), chunking by section kind (`chunker`), embedding, tables from structured files and from inside documents, piped stdin; `upload`, a queued upload spooled on disk until its job in the workspace's ingest lane ends | 6.1, 6.2 |
 | `import` | rows from a SQLite file or an HTTP data file as a workspace table | 6.2 |
@@ -94,17 +94,28 @@ depends on `quack-core` alone.
 
 ## `quack-server`
 
-`quack serve` and the MCP server, a library of the one binary: `quack_server::serve`,
-`Server` (`start` over an engine and a bound address, `run` until the engine stops),
-`serve_stdio`, and `ServeMode` are its whole public API. It does not depend on the terminal.
+`quack serve`, a library of the one binary: `quack_server::serve`, `Server` (`start` over an
+engine and a bound address, `run` until the engine stops), and `ServeMode` are its whole
+public API. It does not depend on the terminal.
 
 | Module | Owns |
 |---|---|
-| `mcp` | the MCP server (rmcp) shared by `quack mcp` on stdio and `/mcp/v1/{workspace}` |
-| `lib` (the server) | `quack serve`: `auth` (identity and `Access::resolve`), `api` (REST handlers; `api::openapi` builds their OpenAPI 3.1 document, served at `/api/v1/openapi.json` and rendered at `/api/v1/docs`), `error` (`ApiError` and the stable `ErrorCode` every error body carries), `web` (askama pages calling the same `Access` operations as the API, [web-ui.md](web-ui.md)), `run` (`Access` as the `RunAudit` of core's `jobs::runs`, and the graph follow-up after an ingest), `permissions` (the timeout and expiry audit around core's `analysis::permissions`), `api::jobs` (the jobs API and stream), `state` (`AppState`: the engine, the control plane, sessions, sign-in, the MCP transports, held permissions), `mcp_http` |
+| `mcp_http` | `/mcp/v1/{workspace}`: `Access::resolve` in front of `quack-mcp`'s server, one `HttpTransport` per workspace, user, and write permission, and the `McpCaller` (core's audit `Recorder`, the resolved workspace, the sessions the caller may read, whom model requests act for) each request carries |
+| `lib` (the server) | `quack serve`: `auth` (identity and `Access::resolve`), `api` (REST handlers; `api::openapi` builds their OpenAPI 3.1 document, served at `/api/v1/openapi.json` and rendered at `/api/v1/docs`), `error` (`ApiError` and the stable `ErrorCode` every error body carries), `web` (askama pages calling the same `Access` operations as the API, [web-ui.md](web-ui.md)), `run` (`Access` as the `RunAudit` of core's `jobs::runs`, and the graph follow-up after an ingest), `permissions` (the timeout and expiry audit around core's `analysis::permissions`), `api::jobs` (the jobs API and stream), `state` (`AppState`: the engine, the control plane, sessions, sign-in, the MCP transports, held permissions) |
 
 The templates, static assets, stylesheet input, and the SQL editor's bundle sit beside its
 `src/`.
+
+## `quack-mcp`
+
+The workspace as an MCP server (`rmcp`), a library of the binary and the server: `McpServer`
+over a workspace's handles (`McpSetup`: the writer, reader pool, queue, write policy, the
+`Transport` served, the process's stopping token), the tools `query`, `search`, `sql`,
+`classify`, `list_tables`, `describe_table`, `list_documents`, and the `quack://workspace/...`
+resources; `serve_stdio` (`quack mcp`) and `McpServer::http_transport` (rmcp's streamable
+HTTP service, which `quack-server` keeps per user). Over `Transport::Http` every call carries
+an `McpCaller` the server built, or fails; over `Transport::Stdio` nothing is audited, like
+the CLI. It depends on `quack-core` only.
 
 ## `quack-terminal`
 
