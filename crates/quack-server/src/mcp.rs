@@ -15,11 +15,12 @@
 //! the REST API; over stdio nothing is audited, like the CLI.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::http::request::Parts;
 
 use quack_core::analysis::citations::Sources;
-use quack_core::analysis::events;
+use quack_core::analysis::events::{self, AgentEvent, EventStream};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::search::{DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{FindPathArgs, ReaderDb, Rerank, SearchGraphArgs, SharedDb};
@@ -47,15 +48,19 @@ use quack_core::storage::workspace::{
     creates_temp_object,
 };
 use quack_core::storage::writer::Writer;
+use quack_core::text::OneLine;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Extensions, Implementation, ListResourceTemplatesResult,
-    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
-    ReadResourceResult, Resource, ResourceContents, ResourceTemplate, ServerCapabilities,
-    ServerConfig,
+    CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock,
+    CreateTaskResult, Extensions, GetTaskParams, GetTaskResult, Implementation,
+    ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResourceTemplate, ServerCapabilities, ServerConfig, UpdateTaskParams,
 };
 use rmcp::model::{ProgressNotificationParam, ProgressToken};
 use rmcp::service::{Peer, RequestContext};
+use rmcp::task_manager::{TaskContext, TaskExit, TaskManager, TaskOptions};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -230,44 +235,71 @@ pub(crate) struct ClassifyToolArgs {
     pub preview: Option<u32>,
 }
 
-/// Progress notifications for a call whose client asked for them with a
-/// progress token: three steps, drafting, previewing, and labelling, the
-/// third with the rows done. Without a token nothing is sent.
-#[derive(Clone)]
-pub(crate) struct StepProgress(Option<(Peer<RoleServer>, ProgressToken)>);
+/// Where a long call reports: `notifications/progress` to a client that
+/// sent a progress token, and the status line of a task a client polls
+/// with `tasks/get`. The first notification goes out before any work, so
+/// the HTTP transport, which holds the response until the handler's
+/// first message, answers at once and a client's timer to the first byte
+/// never fires. Without a token or a task nothing is sent.
+#[derive(Clone, Default)]
+pub(crate) struct Progress {
+    peer: Option<(Peer<RoleServer>, ProgressToken)>,
+    task: Option<TaskContext>,
+}
 
-impl StepProgress {
+impl Progress {
     fn of(context: &RequestContext<RoleServer>) -> Self {
-        Self(
-            context
+        Self {
+            peer: context
                 .meta
                 .get_progress_token()
                 .map(|token| (context.peer.clone(), token)),
-        )
+            task: None,
+        }
+    }
+
+    fn for_task(task: &TaskContext) -> Self {
+        Self {
+            peer: None,
+            task: Some(task.clone()),
+        }
     }
 
     /// A call that asked for no notifications.
     #[cfg(test)]
     pub(crate) const fn none() -> Self {
-        Self(None)
+        Self {
+            peer: None,
+            task: None,
+        }
     }
 
-    /// Step `at` of 3 has begun.
-    async fn at(&self, at: f64, message: &str) {
-        let Some((peer, token)) = &self.0 else {
+    /// Progress `at` (of `total`, when the work has a known end) with a
+    /// message; the task's status line takes the message alone.
+    async fn at(&self, at: f64, total: Option<f64>, message: &str) {
+        if let Some(task) = &self.task {
+            task.set_status_message(message);
+        }
+        let Some((peer, token)) = &self.peer else {
             return;
         };
-        let param = ProgressNotificationParam::new(token.clone(), at)
-            .with_total(3.0)
-            .with_message(message);
+        let mut param = ProgressNotificationParam::new(token.clone(), at).with_message(message);
+        if let Some(total) = total {
+            param = param.with_total(total);
+        }
         if let Err(e) = peer.notify_progress(param).await {
             tracing::debug!(error = %e, "could not send a progress notification");
         }
     }
 
+    /// Step `at` of `classify`'s 3 (drafting, previewing, labelling).
+    async fn step(&self, at: f64, message: &str) {
+        self.at(at, Some(3.0), message).await;
+    }
+
     /// A page of the labelling is done; sent without waiting for the client.
     fn rows(&self, done: ChunkDone) {
-        if self.0.is_none() || done.total == 0 {
+        if (self.peer.is_none() && self.task.is_none()) || done.total == 0 {
             return;
         }
         let fraction = f64::from(done.done) / f64::from(done.total);
@@ -276,10 +308,58 @@ impl StepProgress {
             format!("labelled {} of {} rows", done.done, done.total),
         );
         tokio::spawn(async move {
-            progress.at(2.0 + fraction.min(0.99), &message).await;
+            progress.step(2.0 + fraction.min(0.99), &message).await;
         });
     }
+
+    /// Report a turn's events as they happen: what it waits on, each tool
+    /// call as it starts and ends, and the answer's length as it streams
+    /// (at most every [`TEXT_PROGRESS_INTERVAL`]). Progress counts the
+    /// reports, since a turn has no known end.
+    async fn report_turn(self, mut events: EventStream) {
+        let mut sent = 0.0_f64;
+        let mut words = 0_usize;
+        let mut last_text = Instant::now();
+        while let Some(event) = events.recv().await {
+            let message = match event {
+                AgentEvent::Status(status) => status,
+                AgentEvent::Reasoning => String::from("the model is reasoning"),
+                AgentEvent::ToolStarted { tool, detail } => {
+                    let detail: String = OneLine(&detail)
+                        .to_string()
+                        .chars()
+                        .take(TOOL_DETAIL_SHOWN)
+                        .collect();
+                    format!("{tool}: {detail}")
+                }
+                AgentEvent::ToolFinished(step) => format!("{}: {}", step.tool, step.summary),
+                AgentEvent::TextDelta(text) => {
+                    words = words.saturating_add(text.split_whitespace().count());
+                    if last_text.elapsed() < TEXT_PROGRESS_INTERVAL {
+                        continue;
+                    }
+                    last_text = Instant::now();
+                    format!("answering: {words} words so far")
+                }
+                AgentEvent::PermissionRequired(_)
+                | AgentEvent::TurnComplete(_)
+                | AgentEvent::Failed(_) => continue,
+            };
+            sent += 1.0;
+            self.at(sent, None, &message).await;
+        }
+    }
 }
+
+/// How often the answer's streaming text is reported.
+const TEXT_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Characters of a tool's detail (the SQL, the search query) a progress
+/// message carries.
+const TOOL_DETAIL_SHOWN: usize = 120;
+
+/// What a `query` call says before its turn starts.
+const TURN_STARTING: &str = "starting the turn";
 
 /// One MCP server over one workspace. The tool router comes from the
 /// `tool_router` macro (`Self::tool_router()`), which `tool_handler` wires
@@ -287,6 +367,10 @@ impl StepProgress {
 #[derive(Clone)]
 pub(crate) struct McpServer {
     inner: Arc<McpSetup>,
+    /// The `query` turns running as tasks for clients that declare the
+    /// tasks extension, polled through `tasks/get`; shared by every clone
+    /// of this server, so a task is found by whichever request asks.
+    tasks: TaskManager,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -488,6 +572,7 @@ impl McpServer {
     pub(crate) fn new(setup: McpSetup) -> Self {
         Self {
             inner: Arc::new(setup),
+            tasks: TaskManager::new(),
         }
     }
 
@@ -538,17 +623,80 @@ impl McpServer {
     async fn query(
         &self,
         Parameters(args): Parameters<QueryArgs>,
-        extensions: Extensions,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let caller = self.caller(&extensions)?;
+        self.query_for(args, &context.extensions, Progress::of(&context))
+            .await
+    }
+
+    /// `query`, for the caller the request's extensions name, reporting
+    /// through `progress`.
+    pub(crate) async fn query_for(
+        &self,
+        args: QueryArgs,
+        extensions: &Extensions,
+        progress: Progress,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = self.caller(extensions)?;
+        let cancel = caller.cancel();
         // Boxed: an agent turn's future is large (clippy::large_futures).
-        Box::pin(self.as_caller(&caller, self.ask(args, &caller))).await
+        Box::pin(self.as_caller(&caller, self.ask(args, &caller, progress, cancel))).await
+    }
+
+    /// `query` as a task (SEP-2663), for a client that declared the tasks
+    /// extension: the call answers at once with the task, the turn runs
+    /// on, its status line carries the same reports a progress token
+    /// would, and `tasks/get` returns the answer when it is done.
+    /// `tasks/cancel` cancels the turn the way a closed connection does.
+    fn query_as_task(
+        &self,
+        request: CallToolRequestParams,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let args: QueryArgs = serde_json::from_value(serde_json::Value::Object(
+            request.arguments.unwrap_or_default(),
+        ))
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let caller = self.caller(&context.extensions)?;
+        let server = self.clone();
+        let task = self.tasks.spawn(
+            TaskOptions::new().with_status_message(TURN_STARTING),
+            move |task| {
+                Box::pin(async move {
+                    let cancel = caller.cancel();
+                    let watch = tokio::spawn({
+                        let (task, cancel) = (task.clone(), cancel.clone());
+                        async move {
+                            task.cancelled().await;
+                            cancel.cancel();
+                        }
+                    });
+                    let turn = server.as_caller(
+                        &caller,
+                        server.ask(args, &caller, Progress::for_task(&task), cancel),
+                    );
+                    let result = Box::pin(turn).await;
+                    watch.abort();
+                    if task.is_cancel_requested() {
+                        return Err(TaskExit::Cancelled);
+                    }
+                    result.map_err(TaskExit::Error)
+                })
+            },
+        );
+        Ok(CallToolResponse::Task(CreateTaskResult::new(task)))
     }
 
     /// `query`, as its caller: its model requests reach an on-behalf-of
     /// provider as the request's user, and only providers the workspace
     /// allows.
-    async fn ask(&self, args: QueryArgs, caller: &Caller) -> Result<CallToolResult, McpError> {
+    async fn ask(
+        &self,
+        args: QueryArgs,
+        caller: &Caller,
+        progress: Progress,
+        cancel: llm::CancellationToken,
+    ) -> Result<CallToolResult, McpError> {
         let question = args.question.trim().to_owned();
         if question.is_empty() {
             return Ok(failure("question must not be empty"));
@@ -567,10 +715,9 @@ impl McpServer {
                 TurnSession::NotFound => return Ok(failure("that session does not exist")),
             };
         let user = caller.user_id();
-        let (sink, mut events) = events::channel();
-        // Nothing renders the stream here; drain it so the turn never
-        // blocks on a full channel.
-        let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
+        progress.at(0.0, None, TURN_STARTING).await;
+        let (sink, events) = events::channel();
+        let reporter = tokio::spawn(progress.report_turn(events));
         let outcome = llm::TurnRequest {
             db: Arc::clone(&self.inner.db),
             reader_db: self.inner.reader.clone(),
@@ -585,11 +732,13 @@ impl McpServer {
                 Some(session_id.clone()),
             ),
             sink,
-            cancel: caller.cancel(),
+            cancel,
         }
         .run(&self.inner.config)
         .await;
-        drop(drain);
+        // Every event was sent before the turn returned; the reporter ends
+        // with the channel.
+        drop(reporter);
         let detail = serde_json::json!({
             "prompt": question,
             "session_id": session_id,
@@ -809,7 +958,7 @@ impl McpServer {
         Parameters(args): Parameters<ClassifyToolArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.classify_for(args, &context.extensions, StepProgress::of(&context))
+        self.classify_for(args, &context.extensions, Progress::of(&context))
             .await
     }
 
@@ -818,7 +967,7 @@ impl McpServer {
         &self,
         args: ClassifyToolArgs,
         extensions: &Extensions,
-        progress: StepProgress,
+        progress: Progress,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(extensions)?;
         // Boxed: building the model and the run make the future large.
@@ -893,7 +1042,7 @@ impl McpServer {
         &self,
         args: ClassifyToolArgs,
         caller: &Caller,
-        progress: StepProgress,
+        progress: Progress,
     ) -> Result<CallToolResult, McpError> {
         let config = &self.inner.config;
         let ClassifyToolArgs { request, preview } = args;
@@ -925,7 +1074,7 @@ impl McpServer {
                  the questions and the labels without writing",
             ));
         }
-        progress.at(0.0, "drafting the questions").await;
+        progress.step(0.0, "drafting the questions").await;
         let draft = match self.draft_for(&request, &decision).await {
             Ok(draft) => draft,
             Err(e) => {
@@ -935,7 +1084,7 @@ impl McpServer {
             }
         };
         if let Some(rows) = preview {
-            progress.at(1.0, "previewing the labels").await;
+            progress.step(1.0, "previewing the labels").await;
             let report = self
                 .preview_report(&draft, &decision, (rows, request.rows), waiting, &cancel)
                 .await;
@@ -952,7 +1101,7 @@ impl McpServer {
                     .await;
             }
         };
-        progress.at(2.0, "labelling").await;
+        progress.step(2.0, "labelling").await;
         let run_id = RunId::generate();
         let tracked = LabellingJob {
             db: Arc::clone(&self.inner.db),
@@ -1301,6 +1450,49 @@ impl McpServer {
     reason = "the tool_handler macro emits async methods without awaits"
 )]
 impl ServerHandler for McpServer {
+    /// Every tool through the router, except `query` for a client that
+    /// declared the tasks extension, which runs as a task.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let as_task = request.name == "query"
+            && context
+                .client_capabilities()
+                .is_some_and(|capabilities| capabilities.supports_tasks());
+        if as_task {
+            return self.query_as_task(request, &context);
+        }
+        let call = ToolCallContext::new(self, request, context);
+        Self::tool_router().call(call).await
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, McpError> {
+        Ok(GetTaskResult::new(self.tasks.get_task(&request.task_id)?))
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks
+            .update_task(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.tasks.cancel_task(&request.task_id)
+    }
+
     fn get_info(&self) -> ServerConfig {
         let instructions = format!(
             "Workspace '{}': documents, tables, and an ontology behind one agent. Use `query` \
@@ -1314,6 +1506,7 @@ impl ServerHandler for McpServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                .enable_tasks()
                 .build(),
         )
         .with_server_info(
@@ -1386,7 +1579,7 @@ impl ServerHandler for McpServer {
 
 /// How long `quack mcp` waits, after the client hangs up, for a labelling
 /// run the client left behind to record its end.
-const STDIO_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+const STDIO_GRACE: Duration = Duration::from_secs(20);
 
 /// `quack mcp`: serve the workspace over stdio until the client hangs up.
 ///

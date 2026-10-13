@@ -240,11 +240,14 @@ pub(crate) fn router(app: App) -> Router {
                         .extensions()
                         .get::<MatchedPath>()
                         .map_or("-", MatchedPath::as_str);
+                    // The workspace id, recorded once `Access::resolve`
+                    // has it: an id names no content.
                     tracing::info_span!(
                         "request",
                         method = %request.method(),
                         route,
-                        request_id
+                        request_id,
+                        workspace = tracing::field::Empty
                     )
                 })
                 .on_response(

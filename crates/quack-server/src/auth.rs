@@ -643,6 +643,7 @@ impl Access {
             app.control.record_audit(&entry).await?;
             return Err(ApiError::not_found("no such workspace"));
         };
+        tracing::Span::current().record("workspace", workspace.id.as_str());
         let standing = if app.mode == ServeMode::Local {
             Standing::Member(Role::Owner)
         } else {

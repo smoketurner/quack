@@ -2807,7 +2807,18 @@ Context Protocol:
 
 Each `query` call starts a session (owned by the server user, `mode` `chat` or `query`) and
 returns its `session_id`; passing the id back continues it, and `document_ids` limits the
-question to documents. A turn that fails before recording anything leaves no session. `sql`
+question to documents. A turn that fails before recording anything leaves no session. A turn
+takes a minute or more on a local model, longer than most clients wait in silence, so `query`
+reports as it goes: to a client that sent a progress token it sends `notifications/progress`
+before the turn starts (`starting the turn`), then one per event (what the turn waits on,
+each tool call as it starts and ends, the answer's length as it streams, at most every two
+seconds), so the HTTP transport, which holds its response until the handler's first message,
+answers at once and a client that resets its idle timer on progress (Claude Code) waits as
+long as the turn takes. A client that declares the MCP tasks extension
+(`io.modelcontextprotocol/tasks`, SEP-2663; the server advertises it) gets a task back at
+once instead: the turn runs on, its status line carries the same reports, `tasks/get` returns
+the answer when it is done, and `tasks/cancel` cancels the turn as a closed connection does.
+Nothing on the client needs a longer timeout. `sql`
 answers in text with the table `run_sql` gives the agent (typed headers, values and rows
 bounded, a trailer saying what was cut) and in structured content with every kept row in
 full, `column_types`, `row_count`, and `row_count_exact`. `list_tables` answers one line per
