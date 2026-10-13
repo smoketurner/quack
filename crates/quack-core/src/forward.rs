@@ -116,7 +116,7 @@ mod unix {
     use std::io::Write as _;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
@@ -209,6 +209,12 @@ mod unix {
     pub struct Listener {
         paths: Paths,
         accept: tokio::task::JoinHandle<()>,
+        /// The reader the accept loop answers on, held here rather than in
+        /// the loop's future: an aborted task drops its future only when the
+        /// runtime next polls it, and the reader's connections must close with
+        /// the holder's, so that closing the workspace checkpoints its log.
+        /// Dropping the listener takes it out at once.
+        reader: Arc<Mutex<Option<ReaderDb>>>,
     }
 
     impl Listener {
@@ -242,12 +248,18 @@ mod unix {
             let token = Self::write_token(&paths.token, holder)?;
             let token: Arc<str> = Arc::from(token);
             let holder: Arc<str> = Arc::from(holder);
+            let reader = Arc::new(Mutex::new(Some(reader)));
+            let shared = Arc::clone(&reader);
             let accept = tokio::spawn(async move {
                 loop {
                     match listener.accept().await {
                         Ok((stream, _)) => {
-                            let (token, holder, reader) =
-                                (Arc::clone(&token), Arc::clone(&holder), reader.clone());
+                            // A connection that arrives as the holder closes
+                            // finds no reader and is dropped unanswered.
+                            let Some(reader) = shared.lock().ok().and_then(|r| r.clone()) else {
+                                return;
+                            };
+                            let (token, holder) = (Arc::clone(&token), Arc::clone(&holder));
                             tokio::spawn(async move {
                                 if let Err(e) = serve_one(stream, &token, &holder, &reader).await {
                                     tracing::debug!(error = %e, "a forwarded read ended early");
@@ -261,7 +273,11 @@ mod unix {
                     }
                 }
             });
-            Ok(Self { paths, accept })
+            Ok(Self {
+                paths,
+                accept,
+                reader,
+            })
         }
 
         /// A fresh token in a 0600 file, replacing one this user left behind.
@@ -292,6 +308,10 @@ mod unix {
     impl Drop for Listener {
         fn drop(&mut self) {
             self.accept.abort();
+            // Release the reader now, not when the aborted task is next polled.
+            if let Ok(mut reader) = self.reader.lock() {
+                drop(reader.take());
+            }
             for path in [&self.paths.socket, &self.paths.token] {
                 if let Err(e) = std::fs::remove_file(path)
                     && e.kind() != std::io::ErrorKind::NotFound
