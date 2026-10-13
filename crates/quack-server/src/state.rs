@@ -1,7 +1,9 @@
 //! What every handler shares: the config, the control plane, one open
 //! `DuckDB` handle per workspace, the browser sessions, and the work queue.
 
+use quack_core::analysis::permissions::Permissions;
 use quack_core::ids::{UserId, WorkspaceId};
+use quack_core::ingestion::upload::UploadJob;
 use quack_core::storage::writer::Writer;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -22,8 +24,6 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use super::error::{ApiError, ApiResult};
 use super::oidc::Oidc;
-use super::permissions::Permissions;
-use super::queue::UploadJob;
 use super::resource::ProtectedResource;
 use super::web::flash::Flashes;
 use crate::mcp::McpServer;

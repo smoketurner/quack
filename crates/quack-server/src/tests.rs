@@ -33,8 +33,10 @@ use tower::ServiceExt;
 
 use super::state::{App, AppState, ServeMode, with_db};
 use crate::auth::{Access, Credential, Identity, Need};
-use crate::queue::UploadJob;
-use crate::run::{BackgroundRun, RunKind, RunReport};
+use crate::permissions;
+use crate::run::{self, RunKind};
+use quack_core::ingestion::upload::UploadJob;
+use quack_core::jobs::runs::RunReport;
 use quack_core::jobs::{JobKind, LaneKey};
 use quack_core::okf::{Bundle, BundleSink, TarSink};
 use quack_core::ontology::Ontology;
@@ -7019,7 +7021,7 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
     let start = |detail: &'static str| {
         let (app, access) = (Arc::clone(&h.app), access.clone());
         async move {
-            BackgroundRun::start(
+            run::start(
                 &app,
                 &access,
                 RunKind::GRAPH,
@@ -7154,7 +7156,7 @@ async fn a_stopping_server_closes_its_runs_and_refuses_new_work_on_the_record() 
     let token = h.login("owner").await;
     let access = h.owner_access(&ws, &owner).await;
     let start = || async {
-        BackgroundRun::start(&h.app, &access, RunKind::GRAPH, serde_json::json!({}))
+        run::start(&h.app, &access, RunKind::GRAPH, serde_json::json!({}))
             .await
             .unwrap_or_else(|e| fail(&e.message))
     };
@@ -8010,11 +8012,7 @@ impl WaitingWrites {
         let Some(AgentEvent::PermissionRequired(request)) = events.recv().await else {
             fail("no permission request")
         };
-        let held =
-            self.h
-                .app
-                .permissions
-                .hold(&self.h.app, &self.access, &SessionId::from("s1"), request);
+        let held = permissions::hold(&self.h.app, &self.access, &SessionId::from("s1"), request);
         (held.request.to_string(), asked)
     }
 

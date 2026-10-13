@@ -206,13 +206,19 @@ the finished-job notification all read it. `cancel_job(id)` is `JobQueue::cancel
 workspace lanes are the terminal's: a chat session is a serial lane, uploads, graph
 extraction, and the document pass have their own.
 
-Work that today exists only as a `quack-server` handler and that the app also needs moves
-to `quack-core` before the app calls it: the audited background runs' bookkeeping
-(`run.rs`: embeddings refresh, graph and ontology document passes as jobs that audit their
-start and end under one run id), the upload queue's spooling rules (`queue.rs`: a file's
-bytes on disk until its job ends, the per-workspace lane width), and the pending-permission
-holder (`permissions.rs`, which the terminal also has its own copy of). Each becomes a core
-module with the server and the app as its two callers.
+Work that existed only as a `quack-server` handler and that the app also needs is in
+`quack-core`, with the server and the app as its two callers: the audited background
+runs' bookkeeping (`jobs::runs`: embeddings refresh, graph and ontology document passes,
+an import refresh, and a classification as jobs that audit their start and end under one
+run id, through whatever `RunAudit` the caller is: the server's `Access`, the app's
+auditor of 3.5), the upload queue's spooling rules (`ingestion::upload`: a file's bytes on
+disk until its job ends, the per-workspace lane width from `[server].workers_per_workspace`,
+the graph follow-up as a closure the caller supplies), and the pending-permission holder
+(`analysis::permissions`: `hold` under a timeout with an expiry hook to audit, `decide` by
+the `Asker` whose turn asked; the app's dialog answers through it like the web chat does,
+while the terminal keeps its on-screen prompt). The server's `run.rs` and `permissions.rs`
+are the thin ends: `Access` as the `RunAudit`, the expiry audited as a denied `permission`,
+and the follow-up after an ingest in the workspace's graph lane behind its extraction slot.
 
 ### 3.5 Writes and the native confirm dialog
 

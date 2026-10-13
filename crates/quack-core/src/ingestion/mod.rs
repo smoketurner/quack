@@ -14,6 +14,7 @@ pub mod rtf;
 pub mod sniff;
 pub mod table;
 pub mod tree;
+pub mod upload;
 pub mod xlsx;
 pub mod yaml;
 pub mod zipped;

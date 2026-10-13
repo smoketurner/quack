@@ -11,6 +11,7 @@ use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use quack_core::ids::{DocumentId, WorkspaceId};
 use quack_core::ingestion;
+use quack_core::ingestion::upload::{UploadJob, Uploads};
 use quack_core::jobs::JobId;
 use quack_core::llm::Embeddings;
 use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{Access, Identity, Need};
 use crate::error::{ApiError, ApiResult};
-use crate::queue::UploadJob;
+use crate::run;
 use crate::state::{App, with_db};
 use quack_core::analysis::tools::SharedDb;
 use quack_core::okf::{self, Bundle};
@@ -632,7 +633,6 @@ impl Lane<'_> {
             data,
         } = file;
         let (app, access) = (self.app, self.access);
-        let id = &access.membership.workspace.id;
         let filename = std::path::Path::new(&filename)
             .file_name()
             .and_then(|n| n.to_str())
@@ -706,21 +706,59 @@ impl Lane<'_> {
                 })),
             )
             .await?;
-        let job = UploadJob::spool(
-            app,
-            id,
-            self.db,
-            document_id.clone(),
-            filename.clone(),
-            &data,
-        )
-        .await?
-        .submit(app, access, Arc::clone(self.db), self.embedder);
+        let job = self
+            .queue(app, access, document_id.clone(), filename.clone(), &data)
+            .await?;
         Ok(Enqueued::Queued {
             id: document_id,
             filename,
             job,
         })
+    }
+
+    /// Spool `data` for the document just registered and queue its job in
+    /// the workspace's upload lane, as `access`'s, with the graph follow-up
+    /// `[graph].follow_ingest` asks for queued as an audited run when the
+    /// document is ready.
+    async fn queue(
+        self,
+        app: &App,
+        access: &Access,
+        document_id: DocumentId,
+        filename: String,
+        data: &[u8],
+    ) -> ApiResult<JobId> {
+        let id = &access.membership.workspace.id;
+        let uploads = Uploads {
+            config: app.config.clone(),
+            jobs: app.jobs.clone(),
+            workspace: id.clone(),
+            owner: Some(access.identity.user_id.clone()),
+        };
+        let (follow_app, follow_access, follow_db, follow_embedder) = (
+            Arc::clone(app),
+            access.clone(),
+            Arc::clone(self.db),
+            self.embedder.clone(),
+        );
+        let spooled =
+            UploadJob::spool(&app.config, id, self.db, document_id, filename, data).await?;
+        Ok(spooled.submit(
+            &uploads,
+            Arc::clone(self.db),
+            self.embedder,
+            move |ready| async move {
+                run::follow_ingest(
+                    &follow_app,
+                    &follow_access,
+                    follow_db,
+                    follow_embedder,
+                    ready,
+                )
+                .await
+                .map_err(|e| e.message)
+            },
+        ))
     }
 }
 

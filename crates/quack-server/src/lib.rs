@@ -8,7 +8,6 @@ mod mcp;
 mod mcp_http;
 mod oidc;
 mod permissions;
-mod queue;
 mod resource;
 mod run;
 mod state;

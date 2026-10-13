@@ -17,7 +17,7 @@ use utoipa::ToSchema;
 
 use crate::auth::{Access, Identity, Need};
 use crate::error::{ApiError, ApiResult, ErrorCode};
-use crate::run::{self, BackgroundRun, RunKind};
+use crate::run::{self, RunKind};
 use crate::state::{App, ServeMode};
 use std::sync::Arc;
 
@@ -273,7 +273,7 @@ impl Access {
                 Embeddings::from_config(&app.config).await,
             )
             .await?;
-        let run = BackgroundRun::start(
+        let run = run::start(
             app,
             self,
             RunKind::IMPORT_REFRESH,

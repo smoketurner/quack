@@ -1,31 +1,29 @@
-//! Background work in `quack serve` goes through the process's one
-//! [`JobQueue`](quack_core::jobs::JobQueue) (design doc 4.1): uploads,
-//! graph extraction, the ontology document pass, and agent turns. Uploads
-//! return 202 with the document id and the job id; each workspace's uploads
-//! share a lane of `[server].workers_per_workspace`. Clients poll the
-//! document, or the job (`GET .../jobs/{job}`), or follow the job stream.
+//! Uploads queued for processing (design doc 4.1). An upload is registered
+//! as `queued`, its bytes are spooled into the workspace's `uploads/`
+//! directory, and a job in the workspace's ingest lane (at most
+//! `[server].workers_per_workspace` at a time) processes it from there, so
+//! a queue of any depth costs disk rather than the process's memory. The
+//! spooled file goes when the job ends, however it ends; whatever happens,
+//! the document ends `ready` or `error`, never stuck.
 
+use std::fmt;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use quack_core::analysis::tools::SharedDb;
-use quack_core::config::Config;
-use quack_core::ids::{DocumentId, WorkspaceId};
-use quack_core::ingestion::parser::PageCounts;
-use quack_core::ingestion::{NewFile, Processing};
-use quack_core::jobs::{JobId, JobKind, JobResult, JobSpec, JobState, Lane, LaneKey};
-use quack_core::llm::Embeddings;
-use quack_core::progress::{ChunkDone, RunControl};
-
-use super::auth::Access;
-use super::error::{ApiError, ApiResult};
-use super::run;
-use super::state::App;
+use crate::analysis::tools::SharedDb;
+use crate::config::Config;
+use crate::error::Result;
+use crate::ids::{DocumentId, UserId, WorkspaceId};
+use crate::ingestion::parser::PageCounts;
+use crate::ingestion::{NewFile, Processing};
+use crate::jobs::{JobId, JobKind, JobQueue, JobResult, JobSpec, JobState, Lane, LaneKey};
+use crate::llm::Embeddings;
+use crate::progress::{ChunkDone, RunControl};
 
 /// A queued upload's bytes, kept in its workspace's `uploads/` directory
-/// from the request until its job ends, so a queue of any depth costs disk
-/// rather than the server's memory.
+/// from the request until its job ends.
 #[derive(Clone)]
 struct Spooled(PathBuf);
 
@@ -57,8 +55,19 @@ impl Spooled {
     }
 }
 
+/// Where a workspace's uploads queue: its job queue and lane width (from
+/// the configuration), and whose uploads they are.
+#[derive(Clone)]
+pub struct Uploads {
+    pub config: Config,
+    pub jobs: JobQueue,
+    pub workspace: WorkspaceId,
+    /// The person the job list shows as the owner.
+    pub owner: Option<UserId>,
+}
+
 /// One registered upload, its bytes spooled, ready to queue.
-pub(crate) struct UploadJob {
+pub struct UploadJob {
     document_id: DocumentId,
     filename: String,
     spool: Spooled,
@@ -72,7 +81,7 @@ impl UploadJob {
     /// # Errors
     ///
     /// Returns an error if the directory exists and cannot be removed.
-    pub(crate) fn clear_stale(config: &Config, workspace_id: &WorkspaceId) -> std::io::Result<()> {
+    pub fn clear_stale(config: &Config, workspace_id: &WorkspaceId) -> std::io::Result<()> {
         match std::fs::remove_dir_all(config.workspace_uploads_dir(workspace_id.as_str())) {
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
             other => other,
@@ -86,15 +95,15 @@ impl UploadJob {
     /// # Errors
     ///
     /// Returns the write's error after recording it on the document.
-    pub(crate) async fn spool(
-        app: &App,
+    pub async fn spool(
+        config: &Config,
         workspace_id: &WorkspaceId,
         db: &SharedDb,
         document_id: DocumentId,
         filename: String,
         data: &[u8],
-    ) -> ApiResult<Self> {
-        match Spooled::write(&app.config, workspace_id, &document_id, data).await {
+    ) -> Result<Self> {
+        match Spooled::write(config, workspace_id, &document_id, data).await {
             Ok(spool) => Ok(Self {
                 document_id,
                 filename,
@@ -103,7 +112,7 @@ impl UploadJob {
             Err(e) => {
                 let message = format!("the upload could not be stored for processing: {e}");
                 Self::mark_error(db, &document_id, &message).await;
-                Err(ApiError::internal(message))
+                Err(std::io::Error::new(e.kind(), message).into())
             }
         }
     }
@@ -111,30 +120,35 @@ impl UploadJob {
     /// Queue the upload for processing and return its job id. The document
     /// is already registered as `queued`; whatever happens to the job, it
     /// ends `ready` or `error`, never stuck. A document that becomes ready
-    /// queues the graph follow-up `[graph].follow_ingest` asks for, as
-    /// `access`'s run.
-    pub(crate) fn submit(
+    /// is handed to `follow`, which queues the graph follow-up
+    /// `[graph].follow_ingest` asks for (or nothing, `Ok(None)`); the job's
+    /// message notes the follow-up job or why none was queued.
+    pub fn submit<F, Fut, E>(
         self,
-        app: &App,
-        access: &Access,
+        uploads: &Uploads,
         db: SharedDb,
         embedder: Option<Embeddings>,
-    ) -> JobId {
-        let workspace_id = &access.membership.workspace.id;
+        follow: F,
+    ) -> JobId
+    where
+        F: FnOnce(Vec<DocumentId>) -> Fut + Send + 'static,
+        Fut: Future<Output = std::result::Result<Option<JobId>, E>> + Send,
+        E: fmt::Display,
+    {
+        let workspace_id = &uploads.workspace;
         let spec = JobSpec::new(JobKind::Ingest, self.filename.clone())
             .workspace(workspace_id.clone())
-            .owner(Some(access.identity.user_id.clone()))
+            .owner(uploads.owner.clone())
             .lane(Lane::new(
                 &LaneKey::Workspace(JobKind::Ingest, workspace_id.clone()),
-                app.config.server.workers_per_workspace,
+                uploads.config.server.workers_per_workspace,
             ));
-        let config = app.config.clone();
+        let config = uploads.config.clone();
         let workspace = workspace_id.to_string();
         let document_id = self.document_id.clone();
         let spool = self.spool.clone();
         let worker_db = Arc::clone(&db);
-        let (follow_app, follow_access) = (Arc::clone(app), access.clone());
-        let id = app
+        let id = uploads
             .jobs
             .submit(spec, move |ctx| async move {
                 let progress = |done: ChunkDone| ctx.progress(done.done, done.total);
@@ -147,20 +161,12 @@ impl UploadJob {
                 let mut message = self
                     .process(&config, &workspace, &worker_db, embedder.as_ref(), control)
                     .await?;
-                let followed = run::follow_ingest(
-                    &follow_app,
-                    &follow_access,
-                    Arc::clone(&worker_db),
-                    embedder,
-                    vec![ready],
-                )
-                .await;
-                let note = match followed {
+                let note = match follow(vec![ready]).await {
                     Ok(Some(job)) => format!("; graph follow-up queued as job {job}"),
                     Ok(None) => String::new(),
                     Err(e) => {
-                        tracing::warn!(error = %e.message, "the graph follow-up could not be queued");
-                        format!("; graph follow-up not queued: {}", e.message)
+                        tracing::warn!(error = %e, "the graph follow-up could not be queued");
+                        format!("; graph follow-up not queued: {e}")
                     }
                 };
                 message.push_str(&note);
@@ -170,7 +176,7 @@ impl UploadJob {
         // The work records its own outcome; a job that ends without running
         // it (cancelled while queued) or that died mid-way (a panic) must not
         // leave the document `queued` or `processing` forever.
-        app.jobs.when_ended(id, move |ended| async move {
+        uploads.jobs.when_ended(id, move |ended| async move {
             spool.remove().await;
             let message = match ended.state {
                 JobState::Cancelled if ended.never_started() => {

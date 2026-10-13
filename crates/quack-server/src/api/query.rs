@@ -38,6 +38,7 @@ use super::StreamEvent;
 use super::okf::{BodyWriter, CHUNKS_IN_FLIGHT};
 use crate::auth::{Access, Identity, Need};
 use crate::error::{ApiError, ApiResult, ErrorCode};
+use crate::permissions;
 use crate::state::{App, with_db};
 use crate::web::markdown::to_html;
 
@@ -501,9 +502,7 @@ pub(crate) async fn stream(
                 .unwrap_or_default(),
             AgentEvent::PermissionRequired(request) => {
                 let (sql, hold) = (request.sql.clone(), request.hold);
-                let held = app
-                    .permissions
-                    .hold(&app, &turn.access, &turn.session_id, request);
+                let held = permissions::hold(&app, &turn.access, &turn.session_id, request);
                 StreamEvent::PermissionRequired
                     .event()
                     .json_data(PermissionEvent {

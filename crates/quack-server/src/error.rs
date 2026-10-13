@@ -374,6 +374,13 @@ impl ApiError {
     }
 }
 
+/// The message alone, for a log line.
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(mut self) -> Response {
         if self.status.is_server_error() && self.retry_after.is_none() {

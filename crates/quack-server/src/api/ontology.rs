@@ -19,7 +19,7 @@ use utoipa::ToSchema;
 
 use crate::auth::{Access, Identity, Need};
 use crate::error::{ApiError, ApiResult};
-use crate::run::{BackgroundRun, RunKind};
+use crate::run::{self, RunKind};
 use crate::state::{App, with_db};
 use quack_core::llm::{self, Embeddings};
 use quack_core::ontology::OntologyVersion;
@@ -763,7 +763,7 @@ impl Access {
             return Err(ApiError::bad_request("no ready documents to sample"));
         }
         let db = app.workspace_db(id).await?;
-        let run = BackgroundRun::start(
+        let run = run::start(
             app,
             access,
             RunKind::ONTOLOGY,

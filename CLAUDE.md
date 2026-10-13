@@ -339,7 +339,7 @@ Every interface returns one response object, `AgentResponseBody` from `AgentResp
 labels and the document's `ingested_at`, queries, steps, graph, chart, `write_refused`, `cancelled`, `usage`, `duration_ms`, `session_id`); a write refused
 inside a turn is `write_refused: true` (REST 200, MCP structured content, print exit 3). A streamed
 web or REST turn from someone who may write asks instead: a `permission_required` SSE event, answered
-by `POST .../sessions/{sid}/permissions/{request}` (`server::permissions`, held in memory, refused after
+by `POST .../sessions/{sid}/permissions/{request}` (`quack_core::analysis::permissions`, held in memory, timed out by `server::permissions`, refused after
 `[server].permission_timeout_seconds`, 410 and a denied row when the turn had already stopped waiting, every answer audited as `permission`). `usage` is `AgentResponse::usage`, the provider's own
 `input_tokens`/`output_tokens`/`total_tokens` for the turn taken off rig's final response
 (the per-request counts summed when a turn derails first), `null` when the provider
@@ -613,7 +613,7 @@ its `_quack_audit` detail row goes to the workspace's insert-only audit connecti
 write in progress just to record itself. `query/stream` forwards the agent event stream as SSE (`text`,
 `status`, `tool_started`, `tool_finished`, `permission_required`, `complete`, `error`); uploads return 202 with a `job` id
 and run on the work queue in a lane of `[server].workers_per_workspace` per workspace
-(`queue.rs`), which locks the workspace only around each database step and keeps each queued upload's bytes on disk in the workspace's `uploads/` until its job ends; `api/jobs.rs`
+(`quack_core::ingestion::upload::UploadJob`, with the server's `Uploads` as its lane and owner), which locks the workspace only around each database step and keeps each queued upload's bytes on disk in the workspace's `uploads/` until its job ends; `api/jobs.rs`
 serves `GET .../jobs`, `.../jobs/stream` (SSE), `.../jobs/{job}`, and `POST .../cancel`,
 and `/w/{id}/jobs` is the web console's Jobs page; every workspace page carries a job strip
 (`/w/{id}/jobs/strip`) over one `jobs/stream`, with a toast when a background job finishes, and
