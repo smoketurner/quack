@@ -1,7 +1,23 @@
 # `quack-desktop`: Quack.app over `quack-core`
 
+**Set aside on 2026-10-12.** This design was built as far as a window showing the web UI
+through a Tauri custom scheme with `quack-server` in-process (PR #546, closed unmerged,
+the branch kept as the record) and stopped there. What it cost: a webview's custom scheme
+answers a request whole, so the two streaming routes needed an IPC bridge, downloads would
+load whole into memory, WebKit does not follow a redirect from a custom scheme so the
+handler followed `Location` itself and the window's URL drifted from the page, and every
+web UI change would have needed a desktop check. What it would have given over `quack
+serve --local` in a browser: a Dock icon, native pickers and drop, a native write dialog, a
+menu bar, and one install carrying the CLI. The owner judged that not worth the upkeep.
+If a desktop app is wanted later, the cheap shape is a window over a loopback listener
+(`quack serve --local` on `127.0.0.1:0` with a per-launch token), where the web UI runs
+unchanged. What stays from the work: `OpenedWorkspace` and session choice in `quack-cli`,
+the CLI's reads through a held workspace (`quack_core::forward`, #543), and the background
+runs, upload spooling, and held permissions in `quack-core` (#545). The rest of this
+document is the design as written before the attempt.
+
 The design for the desktop interface the design doc calls `quack desktop` (section 11.6,
-issue #35). Nothing in it is built yet. Section 10 records the decisions taken on
+issue #35). Nothing in it is built. Section 10 records the decisions taken on
 2026-10-12 and what else was on the table; section 11 lists what the implementation must
 confirm with the project owner before it starts. Where this departs from the design doc
 (the subcommand, the embedded server, section 14's "not a separate binary") it says so, and

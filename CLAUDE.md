@@ -10,8 +10,9 @@ A knowledge engine with many interfaces, built in Rust. A workspace holds docume
 (vectorized), tables (DuckDB), and an ontology-backed knowledge graph; one agent answers
 across all three and shows every action. The core is a library; the web UI, REST API, MCP
 server, terminal session, and print mode are thin clients of it, all subcommands of one
-`quack` binary with no Cargo features (`quack desktop`, a Tauri window over the embedded
-server, is planned: #35, not started). The
+`quack` binary with no Cargo features. There is no desktop app: it was designed and
+tried (`docs/desktop.md`, #35, PR #546) and set aside on 2026-10-12; on a Mac, `quack
+serve --local` in a browser is the window. The
 design is `docs/design-doc.md`; read it before any non-trivial change, and check its
 section 17 for where the code still lags. The chosen stack:
 

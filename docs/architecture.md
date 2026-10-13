@@ -27,14 +27,14 @@ Every interface is a thin adapter over the core. Nothing above the core owns beh
 nothing in it knows about HTTP, terminals, or windows.
 
 ```
-      +------------+  +------------+  +------------+  +------------+  +---------------+
-      |  web UI    |  |  REST API  |  |    MCP     |  | TUI/print  |  | quack desktop |
-      |  (askama,  |  |  (axum)    |  | (stdio,    |  | (ratatui,  |  | (planned, #35:|
-      |   htmx)    |  |            |  |  HTTP)     |  |  clap)     |  |  Tauri window)|
-      +------------+  +------------+  +------------+  +------------+  +---------------+
-                        all subcommands of the single `quack` binary
-             \               |               |               |                /
-              +--------------+---------------+---------------+---------------+
+      +------------+  +------------+  +------------+  +------------+
+      |  web UI    |  |  REST API  |  |    MCP     |  | TUI/print  |
+      |  (askama,  |  |  (axum)    |  | (stdio,    |  | (ratatui,  |
+      |   htmx)    |  |            |  |  HTTP)     |  |  clap)     |
+      +------------+  +------------+  +------------+  +------------+
+                 all subcommands of the single `quack` binary
+             \               |               |               /
+              +--------------+---------------+---------------+
                                              | in-process calls
                               +--------------v--------------+
                               |         quack-core          |
