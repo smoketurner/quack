@@ -28,8 +28,13 @@
 //! module is Unix-only; elsewhere [`connect`] finds no holder and
 //! [`Listener::bind`] listens on nothing.
 
+#[cfg(unix)]
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+use crate::config::Config;
 use crate::error::Error;
 use crate::storage::workspace::QueryResults;
 
@@ -92,13 +97,13 @@ struct Envelope {
 #[cfg(unix)]
 #[derive(Debug, Clone)]
 struct Paths {
-    socket: std::path::PathBuf,
-    token: std::path::PathBuf,
+    socket: PathBuf,
+    token: PathBuf,
 }
 
 #[cfg(unix)]
 impl Paths {
-    fn of(config: &crate::config::Config, workspace_id: &str) -> Self {
+    fn of(config: &Config, workspace_id: &str) -> Self {
         let dir = config.workspace_dir(workspace_id);
         Self {
             socket: dir.join(SOCKET_FILE),
