@@ -5,8 +5,15 @@
 //! resource; this row says what was done: the SQL, the file names, the
 //! context version. Members of the workspace read it; admins do not.
 
-use crate::error::Result;
-use crate::ids::{AuditId, UserId};
+use std::sync::Arc;
+
+use crate::classify::{OnEnd, RunEnded};
+use crate::error::{Error, Result};
+use crate::ids::{AuditId, SessionId, UserId, WorkspaceId};
+use crate::jobs::runs::{RunAudit, RunRow};
+use crate::storage::control::{
+    AuditAction, AuditEntry, AuditResource, ControlPlane, Origin, Outcome, ResourceKind,
+};
 use crate::storage::workspace::WorkspaceDb;
 use crate::storage::writer::{Lease, Writer};
 
@@ -244,5 +251,152 @@ mod tests {
         };
         assert_eq!(count("held"), Some(serde_json::json!(100_000)));
         assert_eq!(count("loaded"), Some(serde_json::json!(1_000_000)));
+    }
+}
+
+/// Both halves of the audit for one caller in one workspace: the access
+/// row in `control.db` and the detail row in `_quack_audit`, under one
+/// id. The server builds one per request from the caller it resolved;
+/// an MCP call over HTTP and a background run record through it, so
+/// nothing audited proceeds unlogged.
+#[derive(Clone)]
+pub struct Recorder {
+    control: ControlPlane,
+    log: Arc<AuditLog>,
+    origin: Origin,
+    user_id: UserId,
+    token_hash: Option<String>,
+    workspace_id: WorkspaceId,
+}
+
+impl Recorder {
+    #[must_use]
+    pub fn new(
+        control: ControlPlane,
+        log: Arc<AuditLog>,
+        origin: Origin,
+        user_id: UserId,
+        token_hash: Option<String>,
+        workspace_id: WorkspaceId,
+    ) -> Self {
+        Self {
+            control,
+            log,
+            origin,
+            user_id,
+            token_hash,
+            workspace_id,
+        }
+    }
+
+    /// The person every row is written for.
+    #[must_use]
+    pub fn user_id(&self) -> &UserId {
+        &self.user_id
+    }
+
+    /// An `audit_log` entry for this caller in this workspace, for a change
+    /// that commits it itself.
+    #[must_use]
+    pub fn entry(&self, action: AuditAction, outcome: Outcome) -> AuditEntry {
+        let mut entry = AuditEntry::new(action, outcome, self.origin.clone());
+        entry.user_id = Some(self.user_id.clone());
+        entry.token_hash.clone_from(&self.token_hash);
+        entry.in_workspace(&self.workspace_id)
+    }
+
+    /// Write both rows and give the id they share.
+    ///
+    /// # Errors
+    ///
+    /// Returns the control plane's or the audit connection's error.
+    pub async fn record(
+        &self,
+        action: AuditAction,
+        resource: Option<AuditResource<'_>>,
+        outcome: Outcome,
+        detail: Option<serde_json::Value>,
+    ) -> Result<AuditId> {
+        let mut entry = self.entry(action, outcome);
+        if let Some(resource) = resource {
+            entry = entry.on(resource);
+        }
+        self.control.record_audit(&entry).await?;
+        self.record_detail(&entry, detail).await?;
+        Ok(entry.id)
+    }
+
+    /// The `_quack_audit` half of an `audit_log` row already written.
+    ///
+    /// # Errors
+    ///
+    /// Returns the audit connection's error.
+    pub async fn record_detail(
+        &self,
+        entry: &AuditEntry,
+        detail: Option<serde_json::Value>,
+    ) -> Result<()> {
+        // Its own connection: a request never waits for a write in
+        // progress on the writer just to record that it happened.
+        self.log
+            .record(AuditDetail {
+                id: entry.id.clone(),
+                user_id: Some(self.user_id.clone()),
+                action: entry.action.to_string(),
+                detail: detail.unwrap_or_else(|| serde_json::json!({})),
+            })
+            .await
+    }
+
+    /// The hook that audits a labelling run an agent turn or an MCP call
+    /// started, when it ends and under the run's id, so a cancelled turn or
+    /// a client that left still leaves its row. `session` is the turn's,
+    /// when there is one.
+    #[must_use]
+    pub fn on_classify_end(&self, session: Option<SessionId>) -> OnEnd {
+        let recorder = self.clone();
+        OnEnd::new(move |ended: RunEnded| {
+            let (recorder, session) = (recorder.clone(), session.clone());
+            async move {
+                let RunEnded { run, outcome } = ended;
+                let detail = serde_json::json!({
+                    "table": run.source_table,
+                    "output_table": run.output_table,
+                    "sentence": run.sentence,
+                    "summary": run.to_string(),
+                    "session_id": session,
+                });
+                let resource = ResourceKind::ClassificationRun.id(&run.id);
+                if let Err(e) = recorder
+                    .record(AuditAction::Classify, Some(resource), outcome, Some(detail))
+                    .await
+                {
+                    tracing::error!(error = %e, "audit write failed");
+                }
+            }
+        })
+    }
+}
+
+impl RunAudit for Recorder {
+    type Error = Error;
+
+    async fn record(&self, row: RunRow) -> Result<()> {
+        let resource = row.resource();
+        let RunRow {
+            action,
+            outcome,
+            detail,
+            ..
+        } = &row;
+        Self::record(
+            self,
+            action.clone(),
+            Some(resource),
+            *outcome,
+            Some(detail.clone()),
+        )
+        .await
+        .map(drop)
     }
 }

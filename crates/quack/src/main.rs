@@ -1560,7 +1560,7 @@ async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     init_logging();
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::command("mcp")).await?;
     let policy = WritePolicy::Deny.allowed_if(allow_write);
-    quack_server::serve_stdio(opened.engine, opened.workspace, policy).await?;
+    quack_mcp::serve_stdio(opened.engine, opened.workspace, policy).await?;
     Ok(ExitCode::SUCCESS)
 }
 

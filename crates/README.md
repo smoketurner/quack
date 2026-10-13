@@ -1,12 +1,13 @@
 # crates/
 
-Seven workspace members, picked up by `members = ["crates/*"]`; no Cargo features.
+Eight workspace members, picked up by `members = ["crates/*"]`; no Cargo features.
 
 | Crate | Responsibility |
 |---|---|
 | `quack-core` | The engine: config, `control.db`, workspace DuckDB files, ingestion and import, hybrid retrieval, the agent and its tools, ontology and induction, the knowledge graph, OKF bundles, LLM providers and OAuth |
 | `quack-cli` | The command verbs the binary and the terminal session share: print mode, the saved, graph, ontology, tables, embeddings, and import commands, and the arguments they take |
-| `quack-server` | The HTTP interfaces: `quack serve` (REST API, web UI with its templates and assets, MCP over HTTP) and the MCP server on stdio; it holds no terminal code |
+| `quack-mcp` | The workspace as an MCP server (`rmcp`): the tools and resources, and how the server is served over each transport (`serve_stdio` for `quack mcp`, `McpServer::http_transport` for the server); who may connect is the transport owner's business |
+| `quack-server` | The HTTP interfaces: `quack serve` (REST API, web UI with its templates and assets, and `quack-mcp` over streamable HTTP behind the bearer and role checks); it holds no terminal code |
 | `quack-terminal` | The interactive terminal session (ratatui); it holds no server code |
 | `quack-testkit` | Test support for the interface crates: a scripted Ollama server and a seeded workspace, kept out of `quack-core` so core does not depend on axum for tests |
 | `quack` | The one binary: print mode, `-q` SQL, the workspace commands, the server administration commands, and the `main` that wires the interface crates into subcommands |
@@ -16,7 +17,7 @@ Each crate's README says what belongs in it and where new code goes. The short r
 - Behavior that more than one interface needs goes in `quack-core`.
 - A verb for both the shell and the terminal goes in `quack-cli`.
 - Anything that owns the screen goes in `quack-terminal`.
-- Routes, pages, and MCP go in `quack-server`.
+- Routes and pages go in `quack-server`; an MCP tool or resource goes in `quack-mcp`.
 - Shell-only verbs go in `quack`.
 
 The module map is in [`docs/architecture.md`](../docs/architecture.md). A new crate

@@ -19,7 +19,7 @@ use quack_core::crypto::sha256_hex;
 use quack_core::error::Error as CoreError;
 use quack_core::ids::{AuditId, UserId, WorkspaceId};
 use quack_core::llm::egress::Egress;
-use quack_core::storage::audit::AuditDetail;
+use quack_core::storage::audit::Recorder;
 use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditResource, Channel, Membership, Origin, Outcome, PasswordCheck,
     Role, Scope, Standing, TokenRow, UserKind, UserRow, WorkspaceRow,
@@ -571,13 +571,26 @@ impl Access {
         outcome: Outcome,
         detail: Option<serde_json::Value>,
     ) -> ApiResult<AuditId> {
-        let mut entry = self.entry(action, outcome);
-        if let Some(resource) = resource {
-            entry = entry.on(resource);
-        }
-        app.control.record_audit(&entry).await?;
-        self.record_detail(app, &entry, detail).await?;
-        Ok(entry.id)
+        Ok(self
+            .recorder(app)
+            .await?
+            .record(action, resource, outcome, detail)
+            .await?)
+    }
+
+    /// Both audit halves for this caller in this workspace, as core's
+    /// `Recorder`: what an MCP call over HTTP and a background run record
+    /// through.
+    pub(crate) async fn recorder(&self, app: &App) -> ApiResult<Recorder> {
+        let workspace_id = &self.membership.workspace.id;
+        Ok(Recorder::new(
+            app.control.clone(),
+            app.audit_log(workspace_id).await?,
+            self.identity.origin.clone(),
+            self.identity.user_id.clone(),
+            self.identity.token_hash(),
+            workspace_id.clone(),
+        ))
     }
 
     /// An `audit_log` entry for this caller in this workspace, for a change
@@ -595,18 +608,11 @@ impl Access {
         entry: &AuditEntry,
         detail: Option<serde_json::Value>,
     ) -> ApiResult<()> {
-        // Its own connection: a request never waits for a write in
-        // progress on the writer just to record that it happened.
-        app.audit_log(&self.membership.workspace.id)
+        Ok(self
+            .recorder(app)
             .await?
-            .record(AuditDetail {
-                id: entry.id.clone(),
-                user_id: Some(self.identity.user_id.clone()),
-                action: entry.action.to_string(),
-                detail: detail.unwrap_or_else(|| serde_json::json!({})),
-            })
-            .await?;
-        Ok(())
+            .record_detail(entry, detail)
+            .await?)
     }
 
     /// The allowed row for a read that returns a listing or a page:

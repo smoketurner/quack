@@ -16,17 +16,15 @@ use quack_core::storage::audit::AuditLog;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::telemetry;
 use quack_core::vault::Vault;
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use super::error::{ApiError, ApiResult};
 use super::oidc::Oidc;
 use super::resource::ProtectedResource;
 use super::web::flash::Flashes;
-use crate::mcp::McpServer;
 use quack_core::error::Result as CoreResult;
 use quack_core::storage::control::ControlPlane;
 use quack_core::web_sessions::WebSessions;
+use quack_mcp::{HttpTransport, McpServer};
 
 /// How the server knows who is asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +153,7 @@ impl Drop for ExtractionSlot {
     }
 }
 
-pub(crate) type McpTransport = StreamableHttpService<McpServer, LocalSessionManager>;
+pub(crate) type McpTransport = HttpTransport;
 
 /// Which MCP transport a request belongs to: one per workspace, user, and
 /// write permission, so its audit rows and its writes are that caller's.
@@ -370,22 +368,13 @@ impl AppState {
         if let Some(transport) = open.get(&key) {
             return transport.clone();
         }
-        let server = make();
-        let transport = StreamableHttpService::new(
-            move || Ok(server.clone()),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default()
-                // With logins the server may sit behind any host name, since
-                // bearer auth, not the Host header, guards it; local mode
-                // answers loopback names only.
-                .with_allowed_hosts(
-                    self.local_hosts
-                        .as_ref()
-                        .map_or_else(Vec::new, LocalHosts::names),
-                )
-                .with_json_response(true)
-                // Its standalone event streams end when the server stops.
-                .with_cancellation_token(self.engine.stopping()),
+        // With logins the server may sit behind any host name, since
+        // bearer auth, not the Host header, guards it; local mode
+        // answers loopback names only.
+        let transport = make().http_transport(
+            self.local_hosts
+                .as_ref()
+                .map_or_else(Vec::new, LocalHosts::names),
         );
         open.insert(key, transport.clone());
         transport

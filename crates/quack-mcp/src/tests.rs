@@ -47,7 +47,8 @@ fn server_on((config, db): &(Config, SharedDb), policy: WritePolicy) -> McpServe
         },
         policy,
         user_id: None,
-        auditor: Auditor::None,
+        transport: Transport::Stdio,
+        stopping: CancellationToken::new(),
         jobs: JobQueue::new(10),
     })
 }
@@ -105,7 +106,8 @@ async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
         },
         policy: WritePolicy::Allow(Approver::Nobody),
         user_id: None,
-        auditor: Auditor::None,
+        transport: Transport::Stdio,
+        stopping: CancellationToken::new(),
         jobs: JobQueue::new(10),
     });
     let result = server
@@ -362,7 +364,8 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
         },
         policy: WritePolicy::Deny,
         user_id: None,
-        auditor: Auditor::None,
+        transport: Transport::Stdio,
+        stopping: CancellationToken::new(),
         jobs: JobQueue::new(10),
     });
     let ask = |session_id: Option<&str>, mode: Option<&str>| QueryArgs {
@@ -706,7 +709,8 @@ async fn connect<H: rmcp::ClientHandler>(
         },
         policy: WritePolicy::Allow(Approver::Nobody),
         user_id: None,
-        auditor: Auditor::None,
+        transport: Transport::Stdio,
+        stopping: CancellationToken::new(),
         jobs: JobQueue::new(10),
     });
     let (server_side, client_side) = tokio::io::duplex(1 << 16);

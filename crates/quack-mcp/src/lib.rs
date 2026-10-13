@@ -11,13 +11,14 @@
 //! `quack://workspace/ontology`, `quack://workspace/ontology/schema`,
 //! `quack://workspace/context`.
 //!
-//! Over HTTP every call is audited through the request's `Access`, like
-//! the REST API; over stdio nothing is audited, like the CLI.
+//! Over HTTP every call is audited through the [`McpCaller`] the server
+//! put on the request, like the REST API; over stdio nothing is audited,
+//! like the CLI.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::http::request::Parts;
+use http::request::Parts;
 
 use quack_core::analysis::citations::Sources;
 use quack_core::analysis::events::{self, AgentEvent, EventStream};
@@ -62,34 +63,40 @@ use rmcp::model::{
 use rmcp::model::{ProgressNotificationParam, ProgressToken};
 use rmcp::service::{Peer, RequestContext};
 use rmcp::task_manager::{TaskContext, TaskExit, TaskManager, TaskOptions};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::auth::Access;
-use crate::state::{App, AppState, with_db};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::query::PathQuery;
+use quack_core::storage::audit::Recorder;
+use tokio_util::sync::CancellationToken;
 
-/// Where audit rows go: nowhere for stdio (the CLI is unaudited), or the
-/// server's access log and the workspace detail table for HTTP.
-pub(crate) enum Auditor {
-    None,
-    /// Weak, since the server's state holds this transport: a call after
-    /// the server is gone fails rather than run unaudited.
-    Server(Weak<AppState>),
+/// What the server is served over: stdio, where the client is the
+/// operating-system user and nothing is audited (like the CLI), or HTTP,
+/// where every request carries the [`McpCaller`] the server resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Stdio,
+    Http,
 }
 
-/// Who made one MCP request over HTTP: the `Access` `/mcp/v1/{workspace}`
-/// resolved for that request, and whom its model requests act for. The
-/// endpoint puts it in the HTTP request's extensions, and rmcp hands the
-/// request's `http::request::Parts` to the tool call, so every call audits
-/// and acts as the request that made it. The transport and server are
-/// shared by every request of one user (issue #245): nothing per-request
-/// lives on them.
+/// Who made one MCP request over HTTP: the recorder that writes both audit
+/// halves for that person in that workspace, which sessions they may read,
+/// and whom their model requests act for. The endpoint puts it in the HTTP
+/// request's extensions, and rmcp hands the request's `http::request::Parts`
+/// to the tool call, so every call audits and acts as the request that made
+/// it. The transport and server are shared by every request of one user
+/// (issue #245): nothing per-request lives on them.
 #[derive(Clone)]
-pub(crate) struct McpCaller {
-    pub access: Access,
+pub struct McpCaller {
+    pub recorder: Recorder,
+    /// The workspace as the request resolved it (its provider allow-list
+    /// may be newer than the transport's copy).
+    pub workspace: WorkspaceRow,
+    pub session_viewer: SessionViewer,
     pub acting: Option<Acting>,
 }
 
@@ -98,8 +105,8 @@ pub(crate) struct McpCaller {
 enum Caller {
     /// Stdio: nobody to audit or act for.
     Unaudited,
-    /// HTTP: the request's own caller, and the app to audit through.
-    Audited { app: App, caller: Box<McpCaller> },
+    /// HTTP: the request's own caller.
+    Audited(Box<McpCaller>),
 }
 
 impl Caller {
@@ -112,16 +119,16 @@ impl Caller {
         outcome: Outcome,
         detail: Option<serde_json::Value>,
     ) -> Result<(), McpError> {
-        let Self::Audited { app, caller } = self else {
+        let Self::Audited(caller) = self else {
             return Ok(());
         };
         caller
-            .access
-            .audit(app, action.clone(), resource, outcome, detail)
+            .recorder
+            .record(action.clone(), resource, outcome, detail)
             .await
             .map_err(|e| {
-                tracing::error!(error = %e.message, %action, "audit write failed");
-                internal(format!("audit write failed: {}", e.message))
+                tracing::error!(error = %e, %action, "audit write failed");
+                internal(format!("audit write failed: {e}"))
             })?;
         Ok(())
     }
@@ -131,17 +138,7 @@ impl Caller {
     fn session_viewer(&self) -> SessionViewer {
         match self {
             Self::Unaudited => SessionViewer::All,
-            Self::Audited { caller, .. } => caller.access.session_viewer(),
-        }
-    }
-
-    /// What cuts a `query` turn short: over HTTP, the server stopping.
-    /// `quack mcp` on stdio has no stop signal (it ends with its input),
-    /// so its token is never cancelled.
-    fn cancel(&self) -> llm::CancellationToken {
-        match self {
-            Self::Unaudited => llm::CancellationToken::new(),
-            Self::Audited { app, .. } => app.engine.stopping(),
+            Self::Audited(caller) => caller.session_viewer.clone(),
         }
     }
 
@@ -156,7 +153,7 @@ impl Caller {
         let jobs = LabelJobs::new(queue.clone()).workspace(workspace.clone());
         match self {
             Self::Unaudited => jobs,
-            Self::Audited { app, caller } => jobs.on_end(caller.access.run_audit(app, session)),
+            Self::Audited(caller) => jobs.on_end(caller.recorder.on_classify_end(session)),
         }
     }
 
@@ -164,7 +161,7 @@ impl Caller {
     fn user_id(&self) -> Option<UserId> {
         match self {
             Self::Unaudited => None,
-            Self::Audited { caller, .. } => Some(caller.access.identity.user_id.clone()),
+            Self::Audited(caller) => Some(caller.recorder.user_id().clone()),
         }
     }
 
@@ -173,7 +170,7 @@ impl Caller {
     fn acting(&self) -> Option<Acting> {
         match self {
             Self::Unaudited => None,
-            Self::Audited { caller, .. } => caller.acting.clone(),
+            Self::Audited(caller) => caller.acting.clone(),
         }
     }
 
@@ -213,23 +210,27 @@ impl Caller {
 
 /// What an MCP server serves: the configuration, the workspace and its
 /// handles, the write policy, the server user (for session ownership;
-/// `None` over stdio), and where audit rows go.
-pub(crate) struct McpSetup {
+/// `None` over stdio), the transport, and the process's stopping token.
+pub struct McpSetup {
     pub config: Config,
     pub db: SharedDb,
     pub reader: ReaderDb,
     pub workspace: WorkspaceRow,
     pub policy: WritePolicy,
     pub user_id: Option<UserId>,
-    pub auditor: Auditor,
+    pub transport: Transport,
     /// The queue the tables a turn or a call labels are labelled through.
     pub jobs: JobQueue,
+    /// Cancelled when the process begins to stop: a `query` turn in flight
+    /// ends as a cancelled turn. On stdio the engine stops only after the
+    /// client hangs up, so it never fires mid-call.
+    pub stopping: CancellationToken,
 }
 
 /// What the `classify` tool takes: a labelling request, or with `preview`
 /// the questions and the first rows' labels.
 #[derive(Deserialize, JsonSchema)]
-pub(crate) struct ClassifyToolArgs {
+pub struct ClassifyToolArgs {
     #[serde(flatten)]
     pub request: classify::Request,
     /// Label only this many rows (1 to 100) and show them, writing and
@@ -245,7 +246,7 @@ pub(crate) struct ClassifyToolArgs {
 /// first message, answers at once and a client's timer to the first byte
 /// never fires. Without a token or a task nothing is sent.
 #[derive(Clone, Default)]
-pub(crate) struct Progress {
+pub struct Progress {
     peer: Option<(Peer<RoleServer>, ProgressToken)>,
     task: Option<TaskContext>,
 }
@@ -270,7 +271,8 @@ impl Progress {
 
     /// A call that asked for no notifications.
     #[cfg(test)]
-    pub(crate) const fn none() -> Self {
+    #[must_use]
+    pub const fn none() -> Self {
         Self {
             peer: None,
             task: None,
@@ -368,7 +370,7 @@ const TURN_STARTING: &str = "starting the turn";
 /// `tool_router` macro (`Self::tool_router()`), which `tool_handler` wires
 /// into `list_tools` and `call_tool`.
 #[derive(Clone)]
-pub(crate) struct McpServer {
+pub struct McpServer {
     inner: Arc<McpSetup>,
     /// The `query` turns running as tasks for clients that declare the
     /// tasks extension, polled through `tasks/get`; shared by every clone
@@ -377,7 +379,7 @@ pub(crate) struct McpServer {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub(crate) struct QueryArgs {
+pub struct QueryArgs {
     /// The question, in plain language; the agent searches documents, runs
     /// SQL, and answers with citations.
     pub question: String,
@@ -398,7 +400,7 @@ pub(crate) struct QueryArgs {
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
-pub(crate) struct SearchArgs {
+pub struct SearchArgs {
     /// Words or a phrase to find in the documents; a "quoted phrase" must
     /// appear exactly.
     pub query: String,
@@ -424,13 +426,13 @@ pub(crate) struct SearchArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub(crate) struct SqlArgs {
+pub struct SqlArgs {
     /// One `DuckDB` statement over the workspace tables.
     pub sql: String,
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
-pub(crate) struct ListDocumentsArgs {
+pub struct ListDocumentsArgs {
     /// The `next` of the page before; leave it out for the newest.
     pub after: Option<String>,
     /// Documents a page holds: 100 unless given, at most 500.
@@ -438,7 +440,7 @@ pub(crate) struct ListDocumentsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub(crate) struct DescribeTableArgs {
+pub struct DescribeTableArgs {
     /// A table name from `list_tables`.
     pub table: String,
 }
@@ -570,33 +572,55 @@ impl<'a> WorkspaceResource<'a> {
     }
 }
 
+/// The server over rmcp's streamable HTTP transport, with its own MCP
+/// sessions; `quack serve` keeps one per workspace, user, and write
+/// permission behind its bearer and role checks.
+pub type HttpTransport = StreamableHttpService<McpServer, LocalSessionManager>;
+
 #[tool_router]
 impl McpServer {
-    pub(crate) fn new(setup: McpSetup) -> Self {
+    #[must_use]
+    pub fn new(setup: McpSetup) -> Self {
         Self {
             inner: Arc::new(setup),
             tasks: TaskManager::new(),
         }
     }
 
+    /// Serve over streamable HTTP. `allowed_hosts` is the `Host` values
+    /// answered, every one when empty (with logins the bearer, not the
+    /// name, guards the server). The transport's standalone event streams
+    /// end when the process stops.
+    #[must_use]
+    pub fn http_transport(self, allowed_hosts: Vec<String>) -> HttpTransport {
+        let stopping = self.inner.stopping.child_token();
+        StreamableHttpService::new(
+            move || Ok(self.clone()),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default()
+                .with_allowed_hosts(allowed_hosts)
+                .with_json_response(true)
+                .with_cancellation_token(stopping),
+        )
+    }
+
     /// The caller of the request `extensions` came with. Over HTTP it must
     /// be there: a call without one fails rather than run unaudited.
     fn caller(&self, extensions: &Extensions) -> Result<Caller, McpError> {
-        let Auditor::Server(app) = &self.inner.auditor else {
-            return Ok(Caller::Unaudited);
-        };
-        let app = app
-            .upgrade()
-            .ok_or_else(|| internal("the server is shutting down"))?;
-        let caller = extensions
-            .get::<Parts>()
-            .and_then(|parts| parts.extensions.get::<McpCaller>())
-            .cloned()
-            .ok_or_else(|| internal("the MCP request carries no authorized caller"))?;
-        Ok(Caller::Audited {
-            app,
-            caller: Box::new(caller),
-        })
+        match self.inner.transport {
+            Transport::Stdio => Ok(Caller::Unaudited),
+            Transport::Http => extensions
+                .get::<Parts>()
+                .and_then(|parts| parts.extensions.get::<McpCaller>())
+                .cloned()
+                .map(|caller| Caller::Audited(Box::new(caller)))
+                .ok_or_else(|| internal("the MCP request carries no authorized caller")),
+        }
+    }
+
+    /// What cuts a turn short: the process stopping.
+    fn cancel(&self) -> CancellationToken {
+        self.inner.stopping.child_token()
     }
 
     async fn db<T, F>(&self, f: F) -> Result<T, McpError>
@@ -604,9 +628,7 @@ impl McpServer {
         T: Send + 'static,
         F: FnOnce(&WorkspaceDb) -> CoreResult<T> + Send + 'static,
     {
-        with_db(Arc::clone(&self.inner.db), f)
-            .await
-            .map_err(|e| internal(e.message))
+        self.inner.db.run(f).await.map_err(internal)
     }
 
     /// Like [`Self::db`], but for a tool that only reads: routes through
@@ -637,14 +659,14 @@ impl McpServer {
 
     /// `query`, for the caller the request's extensions name, reporting
     /// through `progress`.
-    pub(crate) async fn query_for(
+    async fn query_for(
         &self,
         args: QueryArgs,
         extensions: &Extensions,
         progress: Progress,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(extensions)?;
-        let cancel = caller.cancel();
+        let cancel = self.cancel();
         // Boxed: an agent turn's future is large (clippy::large_futures).
         Box::pin(self.as_caller(&caller, self.ask(args, &caller, progress, cancel))).await
     }
@@ -669,7 +691,7 @@ impl McpServer {
             TaskOptions::new().with_status_message(TURN_STARTING),
             move |task| {
                 Box::pin(async move {
-                    let cancel = caller.cancel();
+                    let cancel = server.cancel();
                     let watch = tokio::spawn({
                         let (task, cancel) = (task.clone(), cancel.clone());
                         async move {
@@ -701,7 +723,7 @@ impl McpServer {
         args: QueryArgs,
         caller: &Caller,
         progress: Progress,
-        cancel: llm::CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         let question = args.question.trim().to_owned();
         if question.is_empty() {
@@ -969,7 +991,7 @@ impl McpServer {
     }
 
     /// `classify`, for the caller the request's extensions name.
-    pub(crate) async fn classify_for(
+    async fn classify_for(
         &self,
         args: ClassifyToolArgs,
         extensions: &Extensions,
@@ -1008,7 +1030,7 @@ impl McpServer {
         decision: &DecisionModel,
         (rows, which): (u32, Rows),
         waiting: Waiting,
-        cancel: &llm::CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<serde_json::Value, CoreError> {
         let db = &*self.inner.db;
         let control = RunControl {
@@ -1066,7 +1088,7 @@ impl McpServer {
             }
             Err(e) => return caller.unbuilt(AuditAction::Classify, detail, &e).await,
         };
-        let cancel = caller.cancel();
+        let cancel = self.cancel();
         let db = &*self.inner.db;
         let waiting = Waiting::Caller {
             budget: config.decision.interactive_budget,
@@ -1349,7 +1371,7 @@ impl McpServer {
     async fn as_caller<F: Future>(&self, caller: &Caller, work: F) -> F::Output {
         let workspace = match caller {
             Caller::Unaudited => &self.inner.workspace,
-            Caller::Audited { caller, .. } => &caller.access.membership.workspace,
+            Caller::Audited(caller) => &caller.workspace,
         };
         let egress = Egress::Workspace(workspace.allowed_providers.clone());
         Acting::scope(caller.acting(), Egress::scope(Some(egress), work)).await
@@ -1606,8 +1628,9 @@ pub async fn serve_stdio(
         workspace,
         policy,
         user_id: None,
-        auditor: Auditor::None,
+        transport: Transport::Stdio,
         jobs: engine.jobs.clone(),
+        stopping: engine.stopping(),
     });
     let running = rmcp::serve_server(server, rmcp::transport::stdio())
         .await

@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 quack-core         = { path = "../quack-core" }
+quack-mcp          = { path = "../quack-mcp" }
 anyhow             = { workspace = true, features = ["std"] }
 askama             = { workspace = true, features = ["derive", "std", "config"] }
 axum               = { workspace = true, features = ["http1", "json", "query", "form", "tokio", "multipart", "matched-path"] }
@@ -20,7 +21,6 @@ futures            = { workspace = true, features = ["std"] }
 jiff               = { workspace = true, features = ["serde", "std"] }
 mime_guess         = { workspace = true }
 pulldown-cmark     = { workspace = true, features = ["html"] }
-rmcp               = { workspace = true, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 rust-embed         = { workspace = true, features = ["deterministic-timestamps"] }
 schemars           = { workspace = true, features = ["derive"] }
 secrecy            = { workspace = true }
@@ -38,7 +38,6 @@ uuid               = { workspace = true, features = ["std", "v7"] }
 
 [dev-dependencies]
 quack-testkit = { path = "../quack-testkit" }
-rmcp          = { workspace = true, features = ["client"] }
 aws-lc-rs     = { workspace = true, features = ["aws-lc-sys"] }
 duckdb        = { workspace = true, features = ["bundled"] }
 ipnet         = { workspace = true, features = ["std"] }
