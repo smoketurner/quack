@@ -168,7 +168,13 @@ impl ErrorCode {
             CoreError::WorkspaceTooNew { .. } => {
                 (Self::WorkspaceTooNew, StatusCode::SERVICE_UNAVAILABLE)
             }
-            CoreError::NoWorkspaceNamed(_) => (Self::WorkspaceNotFound, StatusCode::NOT_FOUND),
+            CoreError::NoWorkspaceNamed(_) | CoreError::WorkspaceNotHeld { .. } => {
+                (Self::WorkspaceNotFound, StatusCode::NOT_FOUND)
+            }
+            CoreError::WorkspaceBusy { .. } | CoreError::WorkspaceHeld { .. } => {
+                (Self::Conflict, StatusCode::CONFLICT)
+            }
+            CoreError::EngineClosed => (Self::Busy, StatusCode::SERVICE_UNAVAILABLE),
             CoreError::NotFound { .. } => (Self::NotFound, StatusCode::NOT_FOUND),
             CoreError::SignIn(_) => (Self::SignInFailed, StatusCode::UNAUTHORIZED),
             CoreError::Bearer(_) => (Self::InvalidBearer, StatusCode::UNAUTHORIZED),

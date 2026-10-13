@@ -19,7 +19,9 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::{SignedDuration, Timestamp};
 use quack_core::config::{ClientAuth, Config, OidcConfig};
+use quack_core::engine;
 use quack_core::error::Error as CoreError;
+use quack_core::forward::Holder;
 use quack_core::ids::UserId;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::oauth::client_key::{ClientKeyName, ClientKeys, PublicJwk};
@@ -278,7 +280,7 @@ impl Harness {
         .unwrap_or_else(|e| fail(&e.to_string()));
         config.server.oidc = Some(oidc_config);
         let app = Arc::new(AppState::new(
-            config,
+            engine::Engine::new(config, Holder::Serve),
             control,
             ServeMode::Login,
             sessions,
@@ -911,7 +913,7 @@ async fn without_oidc_there_is_no_button_and_no_route() {
         .unwrap_or_else(|e| fail(&e.to_string()));
     let sessions = Arc::new(WebSessions::new(&config.server));
     let app = Arc::new(AppState::new(
-        config,
+        engine::Engine::new(config, Holder::Serve),
         control,
         ServeMode::Login,
         sessions,
@@ -1215,6 +1217,7 @@ async fn obo_token_as(app: &App, auth: ClientAuth) -> Result<String, ApiError> {
 fn obo_manager(app: &App, auth: ClientAuth) -> Result<TokenManager, ApiError> {
     use quack_core::config::{Exchange, Grant, OAuthConfig};
     let issuer = app
+        .engine
         .config
         .server
         .oidc
@@ -1239,7 +1242,7 @@ fn obo_manager(app: &App, auth: ClientAuth) -> Result<TokenManager, ApiError> {
         .parse()
         .map_err(|e: CoreError| ApiError::internal(e.to_string()))?;
     Ok(TokenManager::new(
-        &app.config,
+        &app.engine.config,
         &name,
         oauth,
         KeySource::File,
@@ -1260,11 +1263,13 @@ async fn probe_job(State(app): State<App>, _caller: Identity) -> Result<String, 
     use quack_core::jobs::{JobKind, JobSpec};
     let worker = Arc::clone(&app);
     let job = app
+        .engine
         .jobs
         .submit(JobSpec::new(JobKind::Ingest, "probe"), |_| async move {
             obo_token(&worker).await.map_err(|e| e.message)
         });
     let done = app
+        .engine
         .jobs
         .wait(job.id)
         .await
@@ -1532,7 +1537,7 @@ async fn sign_in_pushes_its_request_and_signs_every_token_request_then_exchanges
     assert!(pushed.contains_key("code_challenge"));
 
     // The key the assertions are signed with, as `quack auth jwks` prints it.
-    let key = ClientKeys::new(&h.app.config, KeySource::File)
+    let key = ClientKeys::new(&h.app.engine.config, KeySource::File)
         .existing(&ClientKeyName::new(&base, "quack"))
         .await
         .ok()

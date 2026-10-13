@@ -168,7 +168,7 @@ pub(crate) async fn run_import(
     let policy = if app.mode == ServeMode::Local {
         ImportPolicy::owner()
     } else {
-        ImportPolicy::server(&app.config)
+        ImportPolicy::server(&app.engine.config)
     };
     if let Err(refused) = request.check(kind, policy) {
         if matches!(refused, CoreError::ServerCredentials) {
@@ -201,11 +201,11 @@ pub(crate) async fn run_import(
         .model(
             app,
             AuditAction::Import,
-            Embeddings::from_config(&app.config).await,
+            Embeddings::from_config(&app.engine.config).await,
         )
         .await?;
     let outcome = import::Importing {
-        config: &app.config,
+        config: &app.engine.config,
         db: &db,
         workspace_id: access.membership.workspace.id.as_str(),
         request,
@@ -270,7 +270,7 @@ impl Access {
             .model(
                 app,
                 AuditAction::Import,
-                Embeddings::from_config(&app.config).await,
+                Embeddings::from_config(&app.engine.config).await,
             )
             .await?;
         let run = run::start(
@@ -297,15 +297,15 @@ impl Access {
             let policy = if app.mode == ServeMode::Local {
                 ImportPolicy::owner()
             } else {
-                ImportPolicy::server(&app.config)
+                ImportPolicy::server(&app.engine.config)
             };
-            let vault = Vault::new(app.config.data_dir(), KeySource::Keychain);
+            let vault = Vault::new(app.engine.config.data_dir(), KeySource::Keychain);
             let summary = access_for_job
                 .secrets(&app, &vault)
                 .refresh(
                     &saved,
                     RefreshWith {
-                        config: &app.config,
+                        config: &app.engine.config,
                         db: &db,
                         policy,
                         embedder: embeddings.as_ref(),
@@ -334,7 +334,7 @@ impl Access {
     /// Remove `saved` and its sealed secret, audited; its table stays.
     pub(crate) async fn remove_import(&self, app: &App, saved: &SavedImport) -> ApiResult<()> {
         let db = app.workspace_db(&self.membership.workspace.id).await?;
-        let vault = Vault::new(app.config.data_dir(), KeySource::Keychain);
+        let vault = Vault::new(app.engine.config.data_dir(), KeySource::Keychain);
         self.secrets(app, &vault).remove(&db, saved).await?;
         self.audit(
             app,
@@ -357,7 +357,7 @@ impl Access {
         summary: &ImportSummary,
         keep: KeepSecret,
     ) -> ApiResult<SavedImport> {
-        let vault = Vault::new(app.config.data_dir(), KeySource::Keychain);
+        let vault = Vault::new(app.engine.config.data_dir(), KeySource::Keychain);
         Ok(self
             .secrets(app, &vault)
             .save(

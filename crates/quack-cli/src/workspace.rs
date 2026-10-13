@@ -1,23 +1,37 @@
 //! Opening the workspace a command runs in: the one `-w` names, which
-//! must exist, or the default, created on first use. The binary, the
-//! terminal's setup, and the desktop app all open a workspace through
-//! this one type, so every interface resolves names, enters the
-//! provider egress scope, and starts the writer the same way.
+//! must exist, or the default, created on first use. The binary and the
+//! terminal's setup open a workspace through this one type, so every
+//! interface resolves names, enters the provider egress scope, and holds
+//! the file the same way: a one-shot command on its own connection, and a
+//! command that runs jobs through the process's [`Engine`].
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
+use quack_core::engine::Engine;
+use quack_core::forward::Holder;
+use quack_core::ids::WorkspaceId;
 use quack_core::llm::egress::Egress;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::storage::writer::Writer;
 
 /// The configuration and the workspace a command runs in.
-#[derive(Debug)]
 pub struct OpenedWorkspace {
     pub config: Config,
+    pub control: ControlPlane,
+    pub workspace: WorkspaceRow,
+    pub name: String,
+}
+
+/// A workspace held by the process's engine: the one way to open the file
+/// for a command that runs jobs (`-p`, `mcp`, `search`, `saved run`, the
+/// terminal). It consumes the [`OpenedWorkspace`], so nothing can open
+/// the same file a second time beside the engine's handle.
+pub struct HeldWorkspace {
+    pub engine: Arc<Engine>,
+    pub control: ControlPlane,
     pub workspace: WorkspaceRow,
     pub name: String,
 }
@@ -57,9 +71,29 @@ impl OpenedWorkspace {
         Egress::Workspace(workspace.allowed_providers.clone()).enter();
         Ok(Self {
             config,
+            control,
             workspace,
             name,
         })
+    }
+
+    /// Hold the workspace through an engine as `holder` (`Holder::Print`,
+    /// `Holder::Terminal`, ...), the holder named after this workspace.
+    #[must_use]
+    pub fn into_engine(self, holder: fn(WorkspaceId) -> Holder) -> HeldWorkspace {
+        let Self {
+            config,
+            control,
+            workspace,
+            name,
+        } = self;
+        let engine = Engine::new(config, holder(workspace.id.clone()));
+        HeldWorkspace {
+            engine,
+            control,
+            workspace,
+            name,
+        }
     }
 
     /// The workspace's connection.
@@ -83,19 +117,6 @@ impl OpenedWorkspace {
     /// thread does not start.
     pub fn writer(&self) -> Result<Writer> {
         Writer::spawn(self.open_db()?).context("failed to start the workspace writer")
-    }
-
-    /// `db` moved onto its writer thread, and a reader pool over it, for
-    /// the commands that run agent turns.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the writer thread does not start.
-    pub async fn shared(&self, db: WorkspaceDb) -> Result<(SharedDb, ReaderDb)> {
-        let db: SharedDb =
-            Arc::new(Writer::spawn(db).context("failed to start the workspace writer")?);
-        let reader_db = ReaderDb::open(&db, self.config.analysis.reader_pool_size).await;
-        Ok((db, reader_db))
     }
 }
 

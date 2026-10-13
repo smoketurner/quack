@@ -185,14 +185,23 @@ Background work is asynchronous everywhere (design doc 4.1): `quack_core::jobs::
 runs submitted jobs with optional lanes that keep submission order (a chat session is a
 serial lane, so a follow-up waits for the answer before it; a workspace's uploads, graph
 extraction, and document pass have their own), cancel tokens, per-chunk progress, and a
-broadcast of `JobInfo` snapshots every interface reports from. `JobQueue::shutdown(grace)` is
-the one way a process stops its jobs: a later `submit` is recorded as cancelled and never runs,
-queued and running jobs are cancelled, and it waits up to the grace for them and for what
-`when_ended` records. The terminal's quit calls it; `quack serve` calls it on SIGTERM or Ctrl-C
-beside the HTTP drain under `[server].shutdown_grace_seconds` (20), after cancelling
-`AppState::stopping` (which ends `jobs/stream` and the MCP event streams, and cancels an MCP
-`query` turn, which runs under a child of it), and then
-`AppState::close` drops the workspace handles so each writer checkpoints. There is no job pool:
+broadcast of `JobInfo` snapshots every interface reports from. The process is one
+`quack_core::engine::Engine` (its config, its one queue, its open workspaces, its stopping token):
+`quack serve`, the terminal, `-p`, `mcp`, `search`, and `saved run` each build one
+(`Engine::new(config, forward::Holder)`; the command line's `OpenedWorkspace::into_engine`
+consumes the opened workspace so nothing opens the file beside it) and `Engine::workspace(id)`
+opens a workspace file once per process (the `OnceCell` rule of `code-standards.md`), binding
+the holder's forward socket and handing back the writer, reader pool, and audit connection as a
+`WorkspaceHandle`; a holder of one workspace is refused any other. `Engine::stop_jobs(grace)` is
+the one way a process stops its jobs: it cancels the stopping token (which ends `jobs/stream` and
+the MCP event streams, and cancels an MCP `query` turn, which runs under a child of it), then
+`JobQueue::shutdown(grace)`: a later `submit` is recorded as cancelled and never runs, queued and
+running jobs are cancelled, and it waits up to the grace for them and for what `when_ended`
+records. The terminal's quit calls it; `quack serve` calls it on SIGTERM or Ctrl-C beside the
+HTTP drain under `[server].shutdown_grace_seconds` (20), and then `AppState::close` drops the
+MCP transports and `Engine::close` the workspace handles so each writer checkpoints
+(`quack_server::Server`: `start` over an engine and a bound address, `run` until the engine
+stops; `serve` wraps them with the banner and the signal). There is no job pool:
 resources are limited where they are used. Every rig HTTP client sends through
 `llm::LimitedHttp` (rig's reqwest transport over one process-wide connection pool, plus the provider's `headers`), which holds
 one permit of the process-wide gate for the provider and the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1
@@ -584,7 +593,7 @@ questions). Their runs are jobs of the process's `JobQueue` (`Draft::run_as_job`
 `TurnRequest`): listed with the other jobs, cancelled by the turn's token or the queue's shutdown,
 finished and recorded even when the turn or the MCP client is gone, and audited at their end under
 the run id by the `OnEnd` hook the server passes (`Access::run_audit`). `quack -p` and `quack mcp`
-have a queue of their own and wait for it before they exit. The CLI and the terminal share
+stop their engine before they exit, so such a run records its end. The CLI and the terminal share
 `classify_cli::Prepared` (draft, outline, preview, the question); the web section is `web::label`
 with htmx fragments; MCP sends progress notifications to a client that sent a token. The decision
 tests share `quack-testkit`'s `DecisionStub`, which `quack-core` includes by path.

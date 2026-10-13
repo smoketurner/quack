@@ -134,6 +134,24 @@ pub enum Error {
     #[error("{0}")]
     Forward(String),
 
+    /// This process opened one workspace and was asked for another
+    /// (`engine::Engine::workspace`).
+    #[error("{holder} holds one workspace and does not open another")]
+    WorkspaceNotHeld { holder: String },
+
+    /// The workspace is the one this process sits in, so it cannot be
+    /// closed under it.
+    #[error("the workspace is open in {holder}; quit it first")]
+    WorkspaceHeld { holder: String },
+
+    /// Jobs of the workspace are still queued or running.
+    #[error("{active} job(s) of this workspace are queued or running; cancel them first")]
+    WorkspaceBusy { active: usize },
+
+    /// The process has closed its workspaces (`engine::Engine::close`).
+    #[error("the process is shutting down; the workspace is closed")]
+    EngineClosed,
+
     /// A newer quack upgraded the workspace file past the schema this one
     /// knows; it is left as it was.
     #[error(

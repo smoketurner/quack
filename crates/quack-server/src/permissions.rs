@@ -24,7 +24,7 @@ pub(crate) fn hold(
     session: &SessionId,
     request: PermissionRequest,
 ) -> Held {
-    let timeout = app.config.server.permission_timeout();
+    let timeout = app.engine.config.server.permission_timeout();
     let (app, access, session) = (Arc::clone(app), access.clone(), session.clone());
     app.permissions.clone().hold(
         asker(&access, &session),

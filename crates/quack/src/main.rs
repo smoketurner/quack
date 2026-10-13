@@ -63,6 +63,7 @@ use quack_cli::{ImportAction, ImportArgs, ImportContext};
 use quack_cli::{NamedInput, StdioPath};
 use quack_cli::{OpenedWorkspace, SessionChoice, find_session, resolve_session};
 use quack_cli::{embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
+use quack_core::forward::Holder;
 
 use quack_server::ServeMode;
 use quack_terminal::SessionSetup;
@@ -696,8 +697,10 @@ impl SearchArgs {
     /// chat model; unaudited, like every command-line read.
     async fn run(&self, cli: &Cli) -> Result<ExitCode> {
         init_logging();
-        let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
-        let config = &opened.config;
+        let held = OpenedWorkspace::resolve(cli.workspace.as_deref())
+            .await?
+            .into_engine(Holder::Search);
+        let config = &held.engine.config;
         let search = DocumentSearch {
             documents: self.documents.clone(),
             mode: self.mode(),
@@ -705,15 +708,22 @@ impl SearchArgs {
         };
         let embedder = Embeddings::from_config(config).await?;
         let rerank = Rerank::from_config(config).await?;
-        let (_db, reader) = opened.shared(opened.open_db()?).await?;
+        let handle = held
+            .engine
+            .workspace(&held.workspace.id)
+            .await
+            .context("failed to open workspace database")?;
         let outcome = search
             .run(
-                &reader,
+                &handle.reader,
                 embedder.as_ref(),
                 rerank.as_ref(),
                 config.retrieval.rrf_k,
             )
-            .await?;
+            .await;
+        drop(handle);
+        held.engine.close().await;
+        let outcome = outcome?;
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
         match self.format {
@@ -1092,36 +1102,67 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         return Ok(ExitCode::from(Exit::Usage));
     };
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
-    let config = &opened.config;
     // Checked before the workspace opens, so a missing model is one line
     // on stderr rather than a failed turn, and leaves no session behind.
-    if let Err(e) = config.chat_model_ref() {
+    if let Err(e) = opened.config.chat_model_ref() {
         tracing::error!("{e}");
         return Ok(ExitCode::from(Exit::Usage));
     }
-    let ws_db = opened.open_db()?;
-    let piped = load_piped_stdin(config, &ws_db, opened.workspace.id.as_str(), cli.stdin).await?;
-    if let Some(note) = ws_db.embedding_status()?.note() {
+    // Read before the file opens, so a slow pipe never holds the workspace.
+    let piped = read_piped_stdin(cli.stdin).await?;
+    let held = opened.into_engine(Holder::Print);
+    let config = &held.engine.config;
+    let handle = held
+        .engine
+        .workspace(&held.workspace.id)
+        .await
+        .context("failed to open workspace database")?;
+    let db = Arc::clone(&handle.writer);
+    let piped = match piped {
+        Some(Stdin::Document(document)) => Some(document),
+        Some(Stdin::Table(data)) => {
+            let ws = held.workspace.id.as_str().to_owned();
+            let load_config = config.clone();
+            db.run(move |db| load_stdin_table(&load_config, db, &ws, &data))
+                .await
+                .context("failed to load stdin as a table")?;
+            // A temp table lives on the writer's connection alone; the
+            // reader pool, built at the open, routes reads there from now on.
+            handle.reader.observe_write().await;
+            None
+        }
+        None => None,
+    };
+    let note = db
+        .run(|db| db.embedding_status().map(|status| status.note()))
+        .await?;
+    if let Some(note) = note {
         tracing::warn!(
             "{note} Run `quack embeddings refresh -w {}` to update them.",
-            opened.name
+            held.name
         );
     }
-    let session_id = resolve_session(
-        config,
-        &ws_db,
-        cli.session_choice(),
-        cli.mode.map(ChatMode::from),
-    )?;
-    let (db, reader_db) = opened.shared(ws_db).await?;
+    let session_id = {
+        let config = config.clone();
+        let choice = cli.session_choice();
+        let mode = cli.mode.map(ChatMode::from);
+        db.run(move |db| Ok(resolve_session(&config, db, choice, mode)))
+            .await??
+    };
     let mut documents = cli.documents.clone();
     if let Some(piped) = piped {
-        documents.push(piped.ingest(&opened, &db).await?.to_string());
+        documents.push(
+            piped
+                .ingest(config, held.workspace.id.as_str(), &db)
+                .await?
+                .to_string(),
+        );
     }
     let outcome = PrintTurn {
         config,
         db: Arc::clone(&db),
-        reader_db,
+        reader_db: handle.reader.clone(),
+        jobs: held.engine.jobs.clone(),
         session_id: &session_id,
         policy,
         prompt,
@@ -1136,8 +1177,13 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         let id = session_id.clone();
         drop(db.run(move |db| sessions::delete_if_empty(db, &id)).await);
     }
-    // The answer is out; a title or summary the turn started finishes before exit.
+    // The answer is out; a labelling the turn started records its end, and
+    // a title or summary it started finishes, before exit.
+    held.engine.stop_jobs(FOLLOW_UP_GRACE).await;
     AfterTurn::finish(FOLLOW_UP_GRACE).await;
+    drop(handle);
+    drop(db);
+    held.engine.close().await;
     Ok(match outcome? {
         TurnOutcome::WriteRefused => ExitCode::from(Exit::WriteRefused),
         TurnOutcome::Answered => ExitCode::SUCCESS,
@@ -1152,12 +1198,9 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
 /// (issue #66): unless `wait` (`--stdin`) says so, a pipe gets
 /// [`STDIN_GRACE`] to deliver a byte or close, and is otherwise skipped
 /// with a warning.
-async fn load_piped_stdin(
-    config: &Config,
-    db: &WorkspaceDb,
-    workspace_id: &str,
-    wait: bool,
-) -> Result<Option<PipedDocument>> {
+/// What was piped in: a document to ingest, or table bytes to load as the
+/// temporary `stdin` table; nothing from a terminal or an empty pipe.
+async fn read_piped_stdin(wait: bool) -> Result<Option<Stdin>> {
     if std::io::stdin().is_terminal() {
         return Ok(None);
     }
@@ -1173,19 +1216,33 @@ async fn load_piped_stdin(
     std::io::stdin()
         .read_to_end(&mut data)
         .context("failed to read stdin")?;
-    if let Piped::Document { name } = Piped::of(&data) {
-        return Ok(Some(PipedDocument { name, data }));
-    }
-    if let Some(table) = ingestion::load_stdin_table(config, db, workspace_id, &data)
-        .context("failed to load stdin as a table")?
-    {
+    Ok(Some(match Piped::of(&data) {
+        Piped::Document { name } => Stdin::Document(PipedDocument { name, data }),
+        Piped::Table => Stdin::Table(data),
+    }))
+}
+
+/// What came in on a pipe, with its bytes.
+enum Stdin {
+    Document(PipedDocument),
+    Table(Vec<u8>),
+}
+
+/// Load piped table bytes as the temporary `stdin` table on `db`.
+fn load_stdin_table(
+    config: &Config,
+    db: &WorkspaceDb,
+    workspace_id: &str,
+    data: &[u8],
+) -> CoreResult<()> {
+    if let Some(table) = ingestion::load_stdin_table(config, db, workspace_id, data)? {
         tracing::info!(
             table,
             bytes = data.len(),
             "stdin loaded as a temporary table"
         );
     }
-    Ok(None)
+    Ok(())
 }
 
 /// A document piped into `quack -p` or `-q`, as its bytes show it.
@@ -1198,14 +1255,14 @@ struct PipedDocument {
 impl PipedDocument {
     /// Ingest the document into the workspace (or find the one already
     /// holding its bytes), for the question to be limited to.
-    async fn ingest(self, opened: &OpenedWorkspace, db: &Writer) -> Result<DocumentId> {
-        let embedder = Embeddings::from_config(&opened.config)
+    async fn ingest(self, config: &Config, workspace_id: &str, db: &Writer) -> Result<DocumentId> {
+        let embedder = Embeddings::from_config(config)
             .await
             .context("failed to build embedding model")?;
         let outcome = ingestion::ingest_file(
-            &opened.config,
+            config,
             db,
-            opened.workspace.id.as_str(),
+            workspace_id,
             &NewFile::new(&self.name, &self.data).source(DocumentSource::Stdin),
             embedder.as_ref(),
         )
@@ -1369,8 +1426,15 @@ async fn run_on_writer(cli: &Cli, command: impl WriterCommand) -> Result<ExitCod
 /// with `--exit-code`.
 async fn run_saved(cli: &Cli, action: saved_cli::SavedAction) -> Result<ExitCode> {
     init_logging();
-    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
-    let (db, reader_db) = opened.shared(opened.open_db()?).await?;
+    let held = OpenedWorkspace::resolve(cli.workspace.as_deref())
+        .await?
+        .into_engine(Holder::Saved);
+    let handle = held
+        .engine
+        .workspace(&held.workspace.id)
+        .await
+        .context("failed to open workspace database")?;
+    let db = Arc::clone(&handle.writer);
     let wants_exit_code = matches!(
         action,
         saved_cli::SavedAction::Run {
@@ -1380,14 +1444,28 @@ async fn run_saved(cli: &Cli, action: saved_cli::SavedAction) -> Result<ExitCode
     );
     let model = saved_cli::Model {
         db: Arc::clone(&db),
-        reader_db,
+        reader_db: handle.reader.clone(),
+        jobs: held.engine.jobs.clone(),
         verbose: cli.verbose,
     };
     // Not the lock: a refresh is a print-mode turn, which writes its own
     // answer to stdout before the run is printed.
     let mut out = std::io::BufWriter::new(std::io::stdout());
-    let ran = saved_cli::run(&opened.config, &db, action, None, Some(model), &mut out).await?;
+    let ran = saved_cli::run(
+        &held.engine.config,
+        &db,
+        action,
+        None,
+        Some(model),
+        &mut out,
+    )
+    .await;
     out.flush()?;
+    held.engine.stop_jobs(FOLLOW_UP_GRACE).await;
+    drop(handle);
+    drop(db);
+    held.engine.close().await;
+    let ran = ran?;
     let Some(run) = ran else {
         return Ok(ExitCode::SUCCESS);
     };
@@ -1474,13 +1552,11 @@ async fn run_graph_export(cli: &Cli, args: &graph_cli::ExportArgs) -> Result<Exi
 /// `quack mcp`: the workspace as an MCP server on stdin and stdout.
 async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     init_logging();
-    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
-    let (db, reader_db) = opened.shared(opened.open_db()?).await?;
-    let OpenedWorkspace {
-        config, workspace, ..
-    } = opened;
+    let held = OpenedWorkspace::resolve(cli.workspace.as_deref())
+        .await?
+        .into_engine(Holder::Mcp);
     let policy = WritePolicy::Deny.allowed_if(allow_write);
-    quack_server::serve_stdio(config, db, reader_db, workspace, policy).await?;
+    quack_server::serve_stdio(held.engine, held.workspace, policy).await?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1737,36 +1813,43 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     if let Some(code) = init_cli::offer_on_first_run().await? {
         return Ok(code);
     }
-    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref()).await?;
-    let ws_db = opened.open_db()?;
-    let session_id = resolve_session(
-        &opened.config,
-        &ws_db,
-        cli.session_choice(),
-        cli.mode.map(ChatMode::from),
-    )?;
-    let (db, reader_db) = opened.shared(ws_db).await?;
-    let OpenedWorkspace {
-        config,
-        workspace,
-        name,
-    } = opened;
-    quack_terminal::run(SessionSetup {
-        config,
-        workspace_name: name,
-        workspace_id: workspace.id,
-        db,
-        reader_db,
+    let held = OpenedWorkspace::resolve(cli.workspace.as_deref())
+        .await?
+        .into_engine(Holder::Terminal);
+    let handle = held
+        .engine
+        .workspace(&held.workspace.id)
+        .await
+        .context("failed to open workspace database")?;
+    let session_id = {
+        let config = held.engine.config.clone();
+        let choice = cli.session_choice();
+        let mode = cli.mode.map(ChatMode::from);
+        handle
+            .writer
+            .run(move |db| Ok(resolve_session(&config, db, choice, mode)))
+            .await??
+    };
+    let session = quack_terminal::run(SessionSetup {
+        engine: Arc::clone(&held.engine),
+        workspace_name: held.name,
+        workspace_id: held.workspace.id,
+        db: Arc::clone(&handle.writer),
+        reader_db: handle.reader.clone(),
         session_id,
         writes: WritePolicy::Ask.allowed_if(cli.allow_write),
     })
-    .await?;
+    .await;
+    // The session's quit stopped the jobs; the writer checkpoints last.
+    drop(handle);
+    held.engine.close().await;
+    session?;
     Ok(ExitCode::SUCCESS)
 }
 
 impl Cli {
-    fn session_choice(&self) -> SessionChoice<'_> {
-        match (self.resume.as_deref(), self.continue_latest) {
+    fn session_choice(&self) -> SessionChoice {
+        match (self.resume.clone(), self.continue_latest) {
             (Some(prefix), _) => SessionChoice::Resume(prefix),
             (None, true) => SessionChoice::Latest,
             (None, false) => SessionChoice::New,
@@ -2342,19 +2425,17 @@ async fn run_query(
         }
         Err(e) => return Err(e),
     };
-    if let Some(piped) = load_piped_stdin(
-        &opened.config,
-        &ws_db,
-        opened.workspace.id.as_str(),
-        wait_for_stdin,
-    )
-    .await?
-    {
-        anyhow::bail!(
+    match read_piped_stdin(wait_for_stdin).await? {
+        Some(Stdin::Document(piped)) => anyhow::bail!(
             "the piped data is a document ({}); -q runs SQL over tables: ask about it with \
              `quack -p`, or keep it with `quack ingest -`",
             piped.name
-        );
+        ),
+        Some(Stdin::Table(data)) => {
+            load_stdin_table(&opened.config, &ws_db, opened.workspace.id.as_str(), &data)
+                .context("failed to load stdin as a table")?;
+        }
+        None => {}
     }
 
     let results = ws_db.execute_query(sql).context("query execution failed")?;

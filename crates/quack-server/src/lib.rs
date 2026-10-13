@@ -32,6 +32,8 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use quack_core::DUCK;
 use quack_core::config::Config;
+use quack_core::engine::Engine;
+use quack_core::forward::Holder;
 use quack_core::jobs::webhook::Webhook;
 use quack_core::telemetry;
 use tower_governor::governor::GovernorConfigBuilder;
@@ -133,6 +135,7 @@ impl KeyExtractor for CallerKey {
             .get::<axum::extract::ConnectInfo<SocketAddr>>()
             .map_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |c| {
                 self.0
+                    .engine
                     .config
                     .server
                     .trusted_proxies
@@ -166,7 +169,7 @@ pub(crate) fn throttled_login(
 }
 
 pub(crate) fn router(app: App) -> Router {
-    let upload_limit = usize::try_from(app.config.ingestion.upload_max_mb)
+    let upload_limit = usize::try_from(app.engine.config.ingestion.upload_max_mb)
         .unwrap_or(usize::MAX)
         .saturating_mul(1024 * 1024);
     let governor = GovernorConfigBuilder::default()
@@ -457,7 +460,7 @@ async fn metrics(
             Err(e) => return e.into_response(),
         }
     }
-    app.refresh_gauges().await;
+    app.engine.refresh_gauges().await;
     let Some(text) = telemetry::render() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "metrics are not recorded").into_response();
     };
@@ -537,13 +540,114 @@ async fn request_slots(
     Acting::request(Egress::request(next.run(request))).await
 }
 
-/// Bind and serve until Ctrl-C or SIGTERM.
+/// The HTTP server over one engine: built by [`Server::start`], which binds
+/// the listener and fails for every reason it cannot serve, and driven by
+/// [`Server::run`] until the engine begins to stop.
+pub struct Server {
+    app: App,
+    listener: tokio::net::TcpListener,
+}
+
+impl Server {
+    /// Set the server up over `engine` and bind `addr`: the local-mode
+    /// loopback check, each registered OAuth client's id, the browser
+    /// sessions, `[server.oidc]` sign-in, the metrics recorder, and the
+    /// listener. Nothing is printed; every failure is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when local mode is asked to bind off loopback, a
+    /// registered client is missing, sign-in cannot be set up, or the
+    /// address cannot be bound.
+    pub async fn start(
+        engine: Arc<Engine>,
+        control: ControlPlane,
+        addr: SocketAddr,
+        mode: ServeMode,
+    ) -> anyhow::Result<Self> {
+        if mode == ServeMode::Local && !addr.ip().is_loopback() {
+            anyhow::bail!(
+                "--local serves without authentication and must bind a loopback address, not {addr}"
+            );
+        }
+        let config = &engine.config;
+        // A client without a client_id takes its registered one; without a
+        // registration it would fail on first use, so fail here instead.
+        let client_keys = ClientKeys::with_control(config, KeySource::Keychain, control.clone());
+        for registered in registered_sections(config) {
+            if mode == ServeMode::Local && registered.section == ClientSection::SignIn {
+                continue;
+            }
+            let client_id = client_keys
+                .registered_client_id(registered.issuer.as_str(), &registered.section.to_string())
+                .await?;
+            tracing::info!(section = %registered.section, issuer = %registered.issuer, client_id, "using the registered OAuth client");
+        }
+        let sessions = Arc::new(WebSessions::new(&config.server));
+        let oidc = match (&config.server.oidc, mode) {
+            (Some(oidc), ServeMode::Login) => Some(
+                Oidc::new(
+                    oidc,
+                    Vault::new(config.data_dir(), KeySource::Keychain),
+                    control.clone(),
+                    ClientKeys::with_control(config, KeySource::Keychain, control.clone()),
+                    Arc::clone(&sessions),
+                )
+                .context("failed to set up [server.oidc] sign-in")?,
+            ),
+            (Some(_), ServeMode::Local) => {
+                tracing::warn!("[server.oidc] is ignored in local mode, which has no login");
+                None
+            }
+            (None, _) => None,
+        };
+        let app = Arc::new(AppState::new(engine, control, mode, sessions, oidc));
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("cannot listen on {addr}"))?;
+        Ok(Self { app, listener })
+    }
+
+    /// Serve until the engine begins to stop, then drain under `grace`
+    /// beside the queue's shutdown and close the workspaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns the server's own error.
+    pub async fn run(self, grace: Duration) -> anyhow::Result<()> {
+        let Self { app, listener } = self;
+        let stopping = app.engine.stopping();
+        let mut server = Box::pin(
+            axum::serve(
+                listener,
+                router(Arc::clone(&app)).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(stopping.clone().cancelled_owned())
+            .into_future(),
+        );
+        // Either way the stop sequence runs whole: the drain (while the
+        // server is still up), the queue's shutdown, then the close.
+        let ended = tokio::select! {
+            served = &mut server => Some(served),
+            () = stopping.cancelled() => None,
+        };
+        let (drain, served) = match ended {
+            Some(served) => (None, Some(served)),
+            None => (Some(server), None),
+        };
+        let stopped = app.stop(drain, grace).await;
+        served.unwrap_or(stopped).context("server error")
+    }
+}
+
+/// `quack serve`: the server on its own, with the banner on stdout and
+/// SIGTERM or Ctrl-C as its stop.
 ///
 /// # Errors
 ///
-/// Returns an error when `bind` is not a socket address, `--local` is asked
-/// for on a non-loopback address, the control plane or a workspace cannot be
-/// opened, or the listener cannot bind.
+/// Returns an error when the bind address is not a socket address, local
+/// mode is asked to bind off loopback, the control plane does not open,
+/// the server cannot start, or serving fails.
 pub async fn serve(config: Config, bind: Option<String>, mode: ServeMode) -> anyhow::Result<()> {
     let mode = if config.server.local {
         ServeMode::Local
@@ -559,6 +663,9 @@ pub async fn serve(config: Config, bind: Option<String>, mode: ServeMode) -> any
             "--local serves without authentication and must bind a loopback address, not {addr}"
         );
     }
+    // A webhook that cannot sign stops the server before it listens.
+    let webhook =
+        Webhook::from_config(config.server.webhooks.as_ref()).context("[server.webhooks]")?;
     let control = ControlPlane::open(&config)
         .await
         .context("failed to open control plane")?;
@@ -569,41 +676,14 @@ pub async fn serve(config: Config, bind: Option<String>, mode: ServeMode) -> any
             "no users exist; nobody can log in until `quack user add NAME --admin` runs"
         );
     }
-    // A client without a client_id takes its registered one; without a
-    // registration it would fail on first use, so fail here instead.
-    let client_keys = ClientKeys::with_control(&config, KeySource::Keychain, control.clone());
-    for registered in registered_sections(&config) {
-        if mode == ServeMode::Local && registered.section == ClientSection::SignIn {
-            continue;
-        }
-        let client_id = client_keys
-            .registered_client_id(registered.issuer.as_str(), &registered.section.to_string())
-            .await?;
-        tracing::info!(section = %registered.section, issuer = %registered.issuer, client_id, "using the registered OAuth client");
-    }
-    let sessions = Arc::new(WebSessions::new(&config.server));
-    let oidc = match (&config.server.oidc, mode) {
-        (Some(oidc), ServeMode::Login) => Some(
-            Oidc::new(
-                oidc,
-                Vault::new(config.data_dir(), KeySource::Keychain),
-                control.clone(),
-                ClientKeys::with_control(&config, KeySource::Keychain, control.clone()),
-                Arc::clone(&sessions),
-            )
-            .context("failed to set up [server.oidc] sign-in")?,
-        ),
-        (Some(_), ServeMode::Local) => {
-            tracing::warn!("[server.oidc] is ignored in local mode, which has no login");
-            None
-        }
-        (None, _) => None,
-    };
+    let grace = config.server.shutdown_grace();
+    let engine = Engine::new(config, Holder::Serve);
+    let server = Server::start(Arc::clone(&engine), control, addr, mode).await?;
     {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         let banner = Banner {
-            config: &config,
+            config: &engine.config,
             addr,
             mode,
             users,
@@ -612,33 +692,22 @@ pub async fn serve(config: Config, bind: Option<String>, mode: ServeMode) -> any
         write!(out, "{banner}")?;
         out.flush()?;
     }
-    let app = Arc::new(AppState::new(config, control, mode, sessions, oidc));
-    // Finished jobs go to the operator's endpoint, when one is configured;
-    // a webhook that cannot sign stops the server before it listens.
-    if let Some(hook) =
-        Webhook::from_config(app.config.server.webhooks.as_ref()).context("[server.webhooks]")?
-    {
-        drop(hook.spawn(app.jobs.subscribe()));
+    // Finished jobs go to the operator's endpoint, when one is configured.
+    if let Some(hook) = webhook {
+        drop(hook.spawn(engine.jobs.subscribe()));
     }
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("cannot listen on {addr}"))?;
     tracing::info!(%addr, ?mode, "quack serve listening");
-    let mut server = Box::pin(
-        axum::serve(
-            listener,
-            router(Arc::clone(&app)).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(app.stopping.clone().cancelled_owned())
-        .into_future(),
-    );
+    // The signal begins the stop; `run` owns the drain, the queue's
+    // shutdown, and the close. A server that ends on its own returns.
+    let mut run = Box::pin(server.run(grace));
     tokio::select! {
-        served = &mut server => return served.context("server error"),
+        served = &mut run => return served,
         () = shutdown_signal() => {}
     }
-    let served = app.stop(server).await;
+    engine.begin_stop();
+    let served = run.await;
     tracing::info!("stopped");
-    served.context("server error")
+    served
 }
 
 /// Resolve on Ctrl-C or, on Unix, SIGTERM (what containers and systemd

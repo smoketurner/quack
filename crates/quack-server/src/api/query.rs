@@ -98,7 +98,7 @@ impl PreparedTurn {
         if body.prompt.trim().is_empty() {
             return Err(ApiError::bad_request("prompt must not be empty"));
         }
-        let chat = app.config.chat_model_ref()?;
+        let chat = app.engine.config.chat_model_ref()?;
         let model_names = (chat.provider_name.to_string(), chat.model.to_owned());
         let mode = body.mode;
         let db = app.workspace_db(workspace_id).await?;
@@ -156,22 +156,23 @@ impl PreparedTurn {
         } = self;
         let (sink, events) = events::channel();
         let lane = LaneKey::Session(session_id.clone());
-        if app.jobs.lane_active(&lane) > 0 {
+        if app.engine.jobs.lane_active(&lane) > 0 {
             drop(sink.send(AgentEvent::Status(String::from(
                 "Queued: this runs when the session's previous question has been answered.",
             ))));
         }
-        let config = app.config.clone();
+        let config = app.engine.config.clone();
         let (session, text) = (session_id.clone(), prompt.clone());
         let spec = JobSpec::new(JobKind::Chat, prompt.chars().take(80).collect::<String>())
             .workspace(access.membership.workspace.id.clone())
             .owner(Some(access.identity.user_id.clone()))
             .lane(Lane::serial(&lane));
         let user = access.identity.user_id.clone();
-        let labelling = LabelJobs::new(app.jobs.clone())
+        let labelling = LabelJobs::new(app.engine.jobs.clone())
             .workspace(access.membership.workspace.id.clone())
             .on_end(access.run_audit(app, Some(session_id.clone())));
         let job = app
+            .engine
             .jobs
             .submit(spec, move |ctx| async move {
                 // The turn emits TurnComplete or Failed itself.
@@ -203,7 +204,7 @@ impl PreparedTurn {
         Turn {
             events,
             guard: CancelOnDrop {
-                jobs: app.jobs.clone(),
+                jobs: app.engine.jobs.clone(),
                 job,
             },
             access,
@@ -262,7 +263,7 @@ impl Turn {
     /// (the request is fine; another server can take it), 500 when its job
     /// was cancelled while queued.
     fn unanswered(app: &App) -> ApiError {
-        if app.stopping.is_cancelled() {
+        if app.engine.is_stopping() {
             ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "the server is shutting down; the turn ended without an answer",
@@ -757,7 +758,7 @@ impl Access {
         }
         let reader_db = app.reader_db(&access.membership.workspace.id).await?;
         let sql = statement.to_owned();
-        let max_rows = app.config.analysis.max_query_rows;
+        let max_rows = app.engine.config.analysis.max_query_rows;
         let timed = move |db: &WorkspaceDb| {
             let began = Instant::now();
             db.execute_query_capped(&sql, max_rows)
@@ -821,7 +822,7 @@ impl SearchQuery {
     pub(crate) fn search(&self, app: &App) -> ApiResult<DocumentSearch> {
         let search = DocumentSearch::new(
             &self.query,
-            self.top_k.unwrap_or(app.config.retrieval.top_k),
+            self.top_k.unwrap_or(app.engine.config.retrieval.top_k),
         )
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
         Ok(DocumentSearch {
@@ -872,14 +873,14 @@ impl Access {
             .model(
                 app,
                 AuditAction::Search,
-                Embeddings::from_config(&app.config).await,
+                Embeddings::from_config(&app.engine.config).await,
             )
             .await?;
         let rerank = self
             .model(
                 app,
                 AuditAction::Search,
-                Rerank::from_config(&app.config).await,
+                Rerank::from_config(&app.engine.config).await,
             )
             .await?;
         let found = async {
@@ -889,7 +890,7 @@ impl Access {
                     &reader,
                     model.as_ref(),
                     rerank.as_ref(),
-                    app.config.retrieval.rrf_k,
+                    app.engine.config.retrieval.rrf_k,
                 )
                 .await
                 .map_err(ApiError::from)

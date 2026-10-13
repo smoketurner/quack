@@ -34,7 +34,50 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
+use crate::ids::WorkspaceId;
 use crate::storage::workspace::QueryResults;
+
+/// The process that holds workspaces open, as the token file names it to
+/// the person reading `quack -q`'s stderr, and the one workspace it holds:
+/// `quack serve` opens any workspace a request names; every other holder
+/// opened exactly one and refuses the rest (`engine::Engine::workspace`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Holder {
+    Serve,
+    Terminal(WorkspaceId),
+    Print(WorkspaceId),
+    Mcp(WorkspaceId),
+    Search(WorkspaceId),
+    Saved(WorkspaceId),
+}
+
+impl Holder {
+    /// The one workspace this holder opened, or `None` for the server.
+    #[must_use]
+    pub fn held(&self) -> Option<&WorkspaceId> {
+        match self {
+            Self::Serve => None,
+            Self::Terminal(id)
+            | Self::Print(id)
+            | Self::Mcp(id)
+            | Self::Search(id)
+            | Self::Saved(id) => Some(id),
+        }
+    }
+}
+
+impl std::fmt::Display for Holder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Serve => "quack serve",
+            Self::Terminal(_) => "the quack terminal session",
+            Self::Print(_) => "quack -p",
+            Self::Mcp(_) => "quack mcp",
+            Self::Search(_) => "quack search",
+            Self::Saved(_) => "quack saved",
+        })
+    }
+}
 
 /// The socket a workspace's holder listens on, inside the workspace
 /// directory.
@@ -121,7 +164,7 @@ mod unix {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
 
-    use super::{Envelope, MAX_REQUEST_BYTES, Paths, Reply, Request, TokenFile};
+    use super::{Envelope, Holder, MAX_REQUEST_BYTES, Paths, Reply, Request, TokenFile};
     use crate::analysis::tools::ReaderDb;
     use crate::error::{Error, Result};
     use crate::storage::control::random_bytes;
@@ -230,7 +273,8 @@ mod unix {
         /// Returns an error when the socket cannot be bound, the token cannot
         /// be written, another process already answers on the socket, or a
         /// file in the way is not this user's.
-        pub async fn bind(workspace_dir: &Path, holder: &str, reader: ReaderDb) -> Result<Self> {
+        pub async fn bind(workspace_dir: &Path, holder: &Holder, reader: ReaderDb) -> Result<Self> {
+            let holder = holder.to_string();
             let paths = Paths::of(workspace_dir);
             if paths.socket.exists() {
                 check_owned(&paths.socket, Kind::Socket)?;
@@ -244,7 +288,7 @@ mod unix {
             }
             let listener = UnixListener::bind(&paths.socket)?;
             std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
-            let token = Self::write_token(&paths.token, holder)?;
+            let token = Self::write_token(&paths.token, &holder)?;
             let token: Arc<str> = Arc::from(token);
             let holder: Arc<str> = Arc::from(holder);
             let reader = Arc::new(Mutex::new(Some(reader)));
@@ -504,6 +548,7 @@ pub use unix::{Client, Listener, connect};
 mod other {
     use std::path::Path;
 
+    use super::Holder;
     use crate::analysis::tools::ReaderDb;
     use crate::error::Result;
     use crate::storage::workspace::QueryResults;
@@ -518,7 +563,11 @@ mod other {
         /// # Errors
         ///
         /// Never fails.
-        pub async fn bind(_workspace_dir: &Path, _holder: &str, _reader: ReaderDb) -> Result<Self> {
+        pub async fn bind(
+            _workspace_dir: &Path,
+            _holder: &Holder,
+            _reader: ReaderDb,
+        ) -> Result<Self> {
             Ok(Self)
         }
     }
@@ -572,7 +621,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use super::{Listener, Paths, SOCKET_FILE, TOKEN_FILE, connect};
+    use super::{Holder, Listener, Paths, SOCKET_FILE, TOKEN_FILE, connect};
     use crate::analysis::tools::{ReaderDb, SharedDb};
     use crate::config::Config;
     use crate::error::Error;
@@ -607,11 +656,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = config_in(dir.path());
         let reader = holder_reader(&config);
-        let listener = Listener::bind(&config.workspace_dir("ws"), "the test holder", reader)
+        let listener = Listener::bind(&config.workspace_dir("ws"), &Holder::Serve, reader)
             .await
             .unwrap();
         let client = connect(&config.workspace_dir("ws")).await.unwrap().unwrap();
-        assert_eq!(client.holder(), "the test holder");
+        assert_eq!(client.holder(), "quack serve");
 
         let results = client.query("SELECT n FROM t ORDER BY n").await.unwrap();
         assert_eq!(results.columns, vec!["n"]);
@@ -622,7 +671,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&refused, Error::ForwardedWriteRefused { holder } if holder == "the test holder"),
+            matches!(&refused, Error::ForwardedWriteRefused { holder } if holder == "quack serve"),
             "{refused}"
         );
         let failed = client.query("SELECT FROM").await.unwrap_err();
@@ -656,7 +705,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = config_in(dir.path());
         let reader = holder_reader(&config);
-        let _listener = Listener::bind(&config.workspace_dir("ws"), "holder", reader)
+        let _listener = Listener::bind(&config.workspace_dir("ws"), &Holder::Serve, reader)
             .await
             .unwrap();
         let paths = Paths::of(&config.workspace_dir("ws"));
@@ -704,7 +753,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = config_in(dir.path());
         let reader = holder_reader(&config);
-        let _listener = Listener::bind(&config.workspace_dir("ws"), "holder", reader)
+        let _listener = Listener::bind(&config.workspace_dir("ws"), &Holder::Serve, reader)
             .await
             .unwrap();
         let paths = Paths::of(&config.workspace_dir("ws"));
@@ -744,10 +793,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let _listener = Listener::bind(&config.workspace_dir("ws"), "holder", reader)
+        let _listener = Listener::bind(&config.workspace_dir("ws"), &Holder::Serve, reader)
             .await
             .unwrap();
         let client = connect(&config.workspace_dir("ws")).await.unwrap().unwrap();
-        assert_eq!(client.holder(), "holder");
+        assert_eq!(client.holder(), "quack serve");
     }
 }

@@ -24,15 +24,16 @@ pub fn find_session(db: &WorkspaceDb, prefix: &str) -> CoreResult<sessions::Sess
     .one(ResourceKind::Session, prefix)
 }
 
-/// Which session a run continues.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionChoice<'a> {
+/// Which session a run continues. Owned, so it travels into the writer's
+/// closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionChoice {
     /// A new session.
     New,
     /// `--continue`: the most recent one, or a new one when there is none.
     Latest,
     /// `--resume ID`: this one (prefixes accepted).
-    Resume(&'a str),
+    Resume(String),
 }
 
 /// Pick the session for this run: the latest with [`SessionChoice::Latest`],
@@ -47,11 +48,11 @@ pub enum SessionChoice<'a> {
 pub fn resolve_session(
     config: &Config,
     db: &WorkspaceDb,
-    choice: SessionChoice<'_>,
+    choice: SessionChoice,
     mode: Option<ChatMode>,
 ) -> anyhow::Result<SessionId> {
     let existing = match choice {
-        SessionChoice::Resume(prefix) => Some(find_session(db, prefix)?.id),
+        SessionChoice::Resume(prefix) => Some(find_session(db, &prefix)?.id),
         SessionChoice::Latest => sessions::latest_session(db)?.map(|s| s.id),
         SessionChoice::New => None,
     };

@@ -216,8 +216,8 @@ pub(crate) async fn snapshot(
     let described = Described::of(&app.control, &access.membership.workspace).await?;
     let filename = format!("{}.snapshot.tar", okf::slug(&described.name));
     let manifest = app.read(&id, move |db| Manifest::of(db, described)).await?;
-    let dir = app.config.workspace_dir(id.as_str());
-    let spool_dir = app.config.data_dir().to_path_buf();
+    let dir = app.engine.config.workspace_dir(id.as_str());
+    let spool_dir = app.engine.config.data_dir().to_path_buf();
     let spooled = app
         .with_workspace_closed(&id, move || {
             let spool = tempfile::tempfile_in(&spool_dir)?;
@@ -301,7 +301,7 @@ pub(crate) async fn restore(
         owner: owner.as_ref(),
         audit: &audit,
     }
-    .run(&app.control, &app.config, move || {
+    .run(&app.control, &app.engine.config, move || {
         Ok(io::Cursor::new(body.clone()))
     })
     .await?;
@@ -369,7 +369,7 @@ impl Access {
         if let ProviderAllowList::Only(names) = &changes.allowed_providers
             && let Some(unknown) = names
                 .iter()
-                .find(|name| !app.config.providers.contains_key(name.as_str()))
+                .find(|name| !app.engine.config.providers.contains_key(name.as_str()))
         {
             return Err(ApiError::bad_request(format!(
                 "'{unknown}' is not a configured provider"
@@ -422,7 +422,7 @@ impl Access {
         app.close_workspace(id).await?;
         let entry = self.entry(AuditAction::Delete, Outcome::Allowed);
         app.control.delete_workspace(id, entry).await?;
-        let dir = app.config.workspace_dir(id.as_str());
+        let dir = app.engine.config.workspace_dir(id.as_str());
         if dir.exists()
             && let Err(e) = tokio::fs::remove_dir_all(&dir).await
         {

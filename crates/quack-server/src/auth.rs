@@ -121,7 +121,8 @@ impl Peer {
                 .extensions
                 .get::<ConnectInfo<SocketAddr>>()
                 .map(|info| {
-                    app.config
+                    app.engine
+                        .config
                         .server
                         .trusted_proxies
                         .client_ip(info.0.ip(), &parts.headers)
@@ -184,8 +185,8 @@ impl SessionCookie {
             .path("/")
             .http_only(true)
             .same_site(SameSite::Lax)
-            .secure(peer.needs_secure(&app.config.server));
-        match app.config.server.session_max_age().try_into() {
+            .secure(peer.needs_secure(&app.engine.config.server));
+        match app.engine.config.server.session_max_age().try_into() {
             Ok(max_age) => cookie.max_age(max_age).build(),
             // Out of range only for a lifetime no operator can configure. A
             // cookie without `Max-Age` still dies with the browser session,
@@ -220,7 +221,7 @@ pub(crate) async fn password_login(
 ) -> ApiResult<Login> {
     let checked = app
         .control
-        .check_password(username, password, app.config.server.lockout())
+        .check_password(username, password, app.engine.config.server.lockout())
         .await?;
     let origin = Origin {
         channel: Channel::Web,
@@ -250,7 +251,7 @@ pub(crate) async fn password_login(
         // whether the name exists, is disabled, or is locked.
         PasswordCheck::Wrong(_) | PasswordCheck::Disabled(_) | PasswordCheck::Locked { .. } => {
             return Err(ApiError::unauthorized(
-                app.config.server.lockout().refusal(),
+                app.engine.config.server.lockout().refusal(),
             ));
         }
     };

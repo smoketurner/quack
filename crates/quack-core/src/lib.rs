@@ -28,6 +28,7 @@ pub mod config;
 pub mod crypto;
 pub mod doctor;
 pub mod embedding;
+pub mod engine;
 pub mod error;
 pub mod extraction;
 pub mod forward;

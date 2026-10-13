@@ -28,8 +28,8 @@ use quack_core::analysis::search::{DocumentScope, DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
 use quack_core::classify::{self, LabelJobs};
 use quack_core::config::Config;
+use quack_core::engine::Engine;
 use quack_core::error::{Error as CoreError, Result as CoreResult};
-use quack_core::forward::Listener;
 use quack_core::graph::follow_up::FollowUp;
 use quack_core::graph::query::{GraphQuery, PathEnds, PathQuery, UnknownEntity};
 use quack_core::ids::{DocumentId, SessionId, WorkspaceId};
@@ -962,7 +962,9 @@ pub(crate) struct App {
     prompts: VecDeque<Prompt>,
     /// Agent turns queued or running, in submission order.
     turns: Vec<Turn>,
-    /// The work queue every submission goes through.
+    /// The process, whose queue every submission goes through.
+    engine: Arc<Engine>,
+    /// The engine's queue.
     jobs: JobQueue,
     job_events: broadcast::Receiver<JobInfo>,
     /// Jobs still queued or running, for the strip above the input.
@@ -987,10 +989,6 @@ pub(crate) struct App {
     workspace_id: WorkspaceId,
     db: SharedDb,
     reader_db: ReaderDb,
-    /// The socket another `quack` process reads this workspace through
-    /// while the session holds its lock (`quack_core::forward`); held for
-    /// its drop, which removes the socket and token files.
-    forward: Option<Listener>,
     /// `--allow-write`: the agent's writes run without asking.
     allow_write: bool,
     /// `/scope`: the documents questions are limited to; every document
@@ -1019,7 +1017,7 @@ pub(crate) enum Quit {
 impl App {
     pub(crate) fn new(setup: SessionSetup) -> Self {
         let SessionSetup {
-            config,
+            engine,
             workspace_name,
             workspace_id,
             db,
@@ -1027,8 +1025,9 @@ impl App {
             session_id,
             writes,
         } = setup;
+        let config = engine.config.clone();
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-        let jobs = JobQueue::from_config(&config.jobs);
+        let jobs = engine.jobs.clone();
         let job_events = jobs.subscribe();
         let mut app = Self {
             messages: Vec::new(),
@@ -1046,6 +1045,7 @@ impl App {
             session_id,
             prompts: VecDeque::new(),
             turns: Vec::new(),
+            engine,
             jobs,
             job_events,
             active_jobs: Vec::new(),
@@ -1061,7 +1061,6 @@ impl App {
             workspace_id,
             db,
             reader_db,
-            forward: None,
             allow_write: writes.allows_unasked(),
             scope: DocumentScope::default(),
             expand_steps: false,
@@ -1107,20 +1106,6 @@ impl App {
     pub(crate) async fn load_sql_schema(&mut self) -> Result<()> {
         self.sql_schema = Arc::new(self.reader_db.with_db(WorkspaceDb::sql_schema).await?);
         Ok(())
-    }
-
-    /// Listen for reads from other `quack` processes while this session
-    /// holds the workspace's lock (`quack -q` on it would otherwise fail).
-    /// A failure to listen is logged, not fatal: the session works without
-    /// it.
-    pub(crate) async fn listen_for_reads(&mut self) {
-        let dir = self.config.workspace_dir(self.workspace_id.as_str());
-        match Listener::bind(&dir, "the quack terminal session", self.reader_db.clone()).await {
-            Ok(listener) => self.forward = Some(listener),
-            Err(e) => {
-                tracing::warn!(error = %e, "other quack processes cannot read this workspace through the session");
-            }
-        }
     }
 
     /// Say so at startup when some vectors were made under another
@@ -1827,7 +1812,7 @@ impl App {
         for prompt in self.prompts.drain(..) {
             prompt.refuse();
         }
-        let left = self.jobs.shutdown(QUIT_GRACE).await;
+        let left = self.engine.stop_jobs(QUIT_GRACE).await;
         if !left.is_empty() {
             tracing::warn!(jobs = left.len(), "quit with jobs still running");
         }

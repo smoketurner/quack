@@ -70,6 +70,10 @@ pub struct PrintTurn<'a> {
     pub config: &'a Config,
     pub db: SharedDb,
     pub reader_db: ReaderDb,
+    /// The process's queue: a table the agent labels is a job of it, which
+    /// the command waits for before it exits, so an interrupted run records
+    /// its end.
+    pub jobs: JobQueue,
     pub session_id: &'a SessionId,
     pub policy: WritePolicy,
     pub prompt: &'a str,
@@ -138,8 +142,13 @@ impl PrintTurn<'_> {
     ///
     /// Returns the error from the turn, the database, or writing the answer.
     pub async fn run(self) -> Result<TurnOutcome> {
-        let (config, db, reader_db, session_id) =
-            (self.config, self.db, self.reader_db, self.session_id);
+        let (config, db, reader_db, session_id, jobs) = (
+            self.config,
+            self.db,
+            self.reader_db,
+            self.session_id,
+            self.jobs,
+        );
         let (policy, prompt, format, verbose) =
             (self.policy, self.prompt, self.format, self.verbose);
         let documents = self.documents.to_vec();
@@ -147,10 +156,7 @@ impl PrintTurn<'_> {
 
         let interrupt = CtrlCGuard::new();
         let cancel = interrupt.cancel.clone();
-        // A table the agent labels is a job of this queue, which the command
-        // waits for before it exits, so an interrupted run records its end.
-        let jobs = JobQueue::from_config(&config.jobs);
-        let labelling = LabelJobs::new(jobs.clone());
+        let labelling = LabelJobs::new(jobs);
         let turn = tokio::spawn({
             let config = config.clone();
             let prompt = prompt.to_owned();
@@ -240,7 +246,6 @@ impl PrintTurn<'_> {
         spinner.clear(&mut err)?;
 
         let turn = turn.await;
-        jobs.shutdown(FOLLOW_UP_GRACE).await;
         let response = turn
             .context("agent task panicked")?
             .context("agent turn failed")?;
@@ -460,6 +465,7 @@ mod tests {
             config: &config,
             db: Arc::clone(&db),
             reader_db: ReaderDb::open(&db, config.analysis.reader_pool_size).await,
+            jobs: JobQueue::new(10),
             session_id: &session.id,
             policy: WritePolicy::Allow(Approver::Nobody),
             prompt: "follow the maintenance note",
@@ -505,6 +511,7 @@ mod tests {
             config: &config,
             db: Arc::clone(&db),
             reader_db: reader_db.clone(),
+            jobs: JobQueue::new(10),
             session_id: &session.id,
             policy: WritePolicy::Deny,
             prompt,

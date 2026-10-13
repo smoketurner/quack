@@ -42,6 +42,7 @@ impl Access {
     /// The workspace's jobs, newest first, as the caller may see them.
     pub(crate) fn visible_jobs(&self, app: &App) -> Vec<JobInfo> {
         let mut jobs: Vec<JobInfo> = app
+            .engine
             .jobs
             .list_workspace(&self.membership.workspace.id)
             .into_iter()
@@ -61,7 +62,7 @@ impl Access {
     fn find_job(&self, app: &App, job: &str) -> ApiResult<JobInfo> {
         job.parse::<JobId>()
             .ok()
-            .and_then(|id| app.jobs.get(id))
+            .and_then(|id| app.engine.jobs.get(id))
             .filter(|j| j.workspace_id.as_ref() == Some(&self.membership.workspace.id))
             .ok_or_else(|| ApiError::not_found(format!("job '{job}' not found")))
     }
@@ -83,7 +84,7 @@ impl Access {
                 "only the job's owner, a workspace owner, or an admin may cancel it",
             ));
         }
-        let active = app.jobs.cancel(found.id);
+        let active = app.engine.jobs.cancel(found.id);
         self.audit(
             app,
             AuditAction::Cancel,
@@ -92,7 +93,7 @@ impl Access {
             Some(serde_json::json!({ "kind": found.kind, "was_active": active })),
         )
         .await?;
-        let current = app.jobs.get(found.id).unwrap_or(found);
+        let current = app.engine.jobs.get(found.id).unwrap_or(found);
         Ok(self.redact(current))
     }
 }
@@ -121,7 +122,7 @@ pub(crate) async fn list(
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::List, "jobs").await?;
     let jobs = access.visible_jobs(&app);
-    let counts = app.jobs.counts(Some(&id));
+    let counts = app.engine.jobs.counts(Some(&id));
     Ok(Json(JobList {
         jobs,
         queued: counts.queued,
@@ -188,17 +189,18 @@ pub(crate) async fn stream(
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let access = Access::resolve(&app, identity, &id, Need::READ).await?;
     access.audit_read(&app, AuditAction::Stream, "jobs").await?;
-    let receiver = app.jobs.subscribe();
+    let receiver = app.engine.jobs.subscribe();
+    let stopping = app.engine.stopping();
     let first = StreamEvent::Jobs
         .event()
         .json_data(access.visible_jobs(&app))
         .unwrap_or_default();
-    let state = (receiver, app, access, Some(first), Instant::now());
+    let state = (receiver, app, access, Some(first), Instant::now(), stopping);
     let stream = futures::stream::unfold(
         state,
-        |(mut receiver, app, access, first, checked)| async move {
+        |(mut receiver, app, access, first, checked, stopping)| async move {
             if let Some(event) = first {
-                return Some((Ok(event), (receiver, app, access, None, checked)));
+                return Some((Ok(event), (receiver, app, access, None, checked, stopping)));
             }
             let mut checked = checked;
             loop {
@@ -210,7 +212,7 @@ pub(crate) async fn stream(
                 }
                 let received = tokio::select! {
                     biased;
-                    () = app.stopping.cancelled() => return None,
+                    () = stopping.cancelled() => return None,
                     received = receiver.recv() => received,
                 };
                 match received {
@@ -221,7 +223,7 @@ pub(crate) async fn stream(
                             .event()
                             .json_data(access.redact(job))
                             .unwrap_or_default();
-                        return Some((Ok(event), (receiver, app, access, None, checked)));
+                        return Some((Ok(event), (receiver, app, access, None, checked, stopping)));
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -229,7 +231,7 @@ pub(crate) async fn stream(
                             .event()
                             .json_data(access.visible_jobs(&app))
                             .unwrap_or_default();
-                        return Some((Ok(event), (receiver, app, access, None, checked)));
+                        return Some((Ok(event), (receiver, app, access, None, checked, stopping)));
                     }
                     Err(broadcast::error::RecvError::Closed) => return None,
                 }

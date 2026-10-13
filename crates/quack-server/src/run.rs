@@ -72,7 +72,7 @@ pub(crate) async fn start(
         app: Arc::clone(app),
         access: access.clone(),
     };
-    BackgroundRun::start(&app.jobs, audited, owner, kind, detail).await
+    BackgroundRun::start(&app.engine.jobs, audited, owner, kind, detail).await
 }
 
 /// How many seconds a follow-up waits for the workspace's extraction slot
@@ -90,7 +90,7 @@ pub(crate) async fn follow_ingest(
     embedder: Option<Embeddings>,
     documents: Vec<DocumentId>,
 ) -> ApiResult<Option<JobId>> {
-    if app.config.graph.follow_ingest.is_off() || documents.is_empty() {
+    if app.engine.config.graph.follow_ingest.is_off() || documents.is_empty() {
         return Ok(None);
     }
     // Nothing to extract into without an ontology: no run, no audit rows.
@@ -108,7 +108,7 @@ pub(crate) async fn follow_ingest(
         RunKind::FOLLOW_UP,
         serde_json::json!({
             "documents": documents,
-            "follow_ingest": app.config.graph.follow_ingest.as_str(),
+            "follow_ingest": app.engine.config.graph.follow_ingest.as_str(),
         }),
     )
     .await?;
@@ -135,7 +135,7 @@ pub(crate) async fn follow_ingest(
         };
         let outcome = FollowUp {
             db: &db,
-            config: &app.config,
+            config: &app.engine.config,
             embeddings: embedder.as_ref(),
         }
         .run(&documents, control)

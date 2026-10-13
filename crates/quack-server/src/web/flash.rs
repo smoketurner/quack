@@ -154,7 +154,7 @@ pub(crate) async fn keep(
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)
-        .secure(peer.needs_secure(&app.config.server));
+        .secure(peer.needs_secure(&app.engine.config.server));
     let cookie = match Flashes::TTL.try_into() {
         Ok(max_age) => cookie.max_age(max_age).build(),
         // Unreachable for a one-minute constant; without `Max-Age` the
