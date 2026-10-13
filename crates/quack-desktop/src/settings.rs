@@ -49,6 +49,10 @@ pub(crate) struct EnvView {
 
 /// The configuration as it stands on disk and in the environment.
 #[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a command's arguments arrive by value from the frontend"
+)]
 pub(crate) fn settings(state: State<'_, AppState>, logging: State<'_, Logging>) -> SettingsView {
     let inspection = Inspection::load();
     let (file_state, file_error) = match &inspection.file_state {

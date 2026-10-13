@@ -41,6 +41,10 @@ fn emit(app: &AppHandle, info: &JobInfo) {
 
 /// Every job the queue knows, newest first; `workspace` narrows it.
 #[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a command's arguments arrive by value from the frontend"
+)]
 pub(crate) fn list_jobs(
     state: State<'_, AppState>,
     workspace: Option<WorkspaceId>,
@@ -53,6 +57,10 @@ pub(crate) fn list_jobs(
 
 /// Cancel `job`. `false` when it had already ended.
 #[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a command's arguments arrive by value from the frontend"
+)]
 pub(crate) fn cancel_job(state: State<'_, AppState>, job: String) -> CommandResult<bool> {
     let id: JobId = job
         .parse()

@@ -114,7 +114,7 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
 }
 
 /// A chosen item, handed to the frontend by id.
-pub(crate) fn on_event(app: &AppHandle, event: MenuEvent) {
+pub(crate) fn on_event(app: &AppHandle, event: &MenuEvent) {
     let id: &str = event.id().as_ref();
     if let Err(e) = app.emit(EVENT, id) {
         tracing::debug!(error = %e, id, "a menu choice could not reach the frontend");

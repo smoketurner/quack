@@ -29,9 +29,10 @@ view at a time, as `docs/desktop.md` section 4 lists them.
 
 ## The frontend's types
 
-The frontend's types come from Rust. `make ui-types` runs `quack-desktop --schema`, which
-writes the `utoipa` JSON Schema of every command's types (the same derives the REST API's
-OpenAPI document uses) to `ui/src/schema.json`, and `openapi-typescript` turns it into
+The frontend's types come from Rust. `make ui-types` writes the `utoipa` JSON Schema of
+every command's types (the same derives the REST API's OpenAPI document uses) to
+`ui/src/schema.json` (the schema test, run with `QUACK_WRITE_SCHEMA` set, writes it; the
+binary prints the same with `quack-desktop --schema`), and `openapi-typescript` turns it into
 `ui/src/schema.d.ts`; `src/commands.ts` types each `invoke` with them. Both generated files
 are committed, and a Rust test fails when `schema.json` no longer matches the commands.
 `tauri-specta`, which the design named, is still a release candidate for Tauri 2; this is

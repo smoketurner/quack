@@ -209,6 +209,10 @@ pub(crate) async fn set_session_mode(
 /// "Run changes without asking" for `workspace`: on, the agent's writes
 /// run unasked until the turn has read document text; off again at launch.
 #[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a command's arguments arrive by value from the frontend"
+)]
 pub(crate) fn set_allow_writes(state: State<'_, AppState>, workspace: WorkspaceId, allow: bool) {
     state.set_allow_writes(&workspace, allow);
 }

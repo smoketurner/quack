@@ -2,7 +2,7 @@
 //! an event carries, as the JSON Schema `utoipa` derives for the REST
 //! API's document, written to `ui/src/schema.json` and turned into
 //! TypeScript by `openapi-typescript` (`make ui-types`). A test fails when
-//! the committed file is stale, as the OpenAPI tests do.
+//! the committed file is stale, as the `OpenAPI` tests do.
 
 use quack_core::analysis::agent::AgentResponseBody;
 use quack_core::analysis::events::{ToolName, ToolStep};
@@ -63,13 +63,27 @@ pub(crate) fn json() -> String {
 
 #[cfg(test)]
 mod tests {
-    /// `ui/src/schema.json` is what the current commands generate.
+    use std::path::Path;
+
+    /// The committed file, relative to the crate.
+    const SCHEMA: &str = "ui/src/schema.json";
+
+    /// `ui/src/schema.json` is what the current commands generate. With
+    /// `QUACK_WRITE_SCHEMA` set (`make ui-types`) the test writes it
+    /// instead, so regenerating needs no separate build of the binary.
     #[test]
     fn the_committed_schema_is_current() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(SCHEMA);
+        let current = super::json();
+        if std::env::var_os("QUACK_WRITE_SCHEMA").is_some() {
+            let written = std::fs::write(&path, &current);
+            assert!(written.is_ok(), "writing {SCHEMA}: {written:?}");
+            return;
+        }
         let committed = include_str!("../ui/src/schema.json");
         assert!(
-            committed == super::json(),
-            "ui/src/schema.json is stale: run `make ui-types` and commit the result"
+            committed == current,
+            "{SCHEMA} is stale: run `make ui-types` and commit the result"
         );
     }
 }

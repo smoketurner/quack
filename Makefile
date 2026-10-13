@@ -125,9 +125,9 @@ ui-install: ## Install the desktop frontend's packages (pnpm, lockfile pinned)
 	cd $(UI_DIR) && pnpm install --frozen-lockfile
 
 ui-types: ## Regenerate the frontend's types from the commands' schema (commit the result)
-	$(CARGO) build --workspace --all-features --bin quack-desktop
-	target/debug/quack-desktop --schema > $(UI_DIR)/src/schema.json
+	QUACK_WRITE_SCHEMA=1 $(CARGO) test --workspace --all-features --bin quack-desktop the_committed_schema_is_current
 	cd $(UI_DIR) && pnpm run types
+	@echo "written $(UI_DIR)/src/schema.json and src/schema.d.ts"
 
 ui-build: ## Build the desktop frontend into crates/quack-desktop/ui/dist
 	cd $(UI_DIR) && pnpm run build

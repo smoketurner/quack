@@ -3,6 +3,8 @@
 //! statement, and the three answers in their order. Dialogs show one at a
 //! time; closing one any other way is a refusal.
 
+use std::fmt::Write;
+
 use quack_core::analysis::events::{Decision, Delivery, PermissionRequest};
 use quack_core::analysis::policy::Hold;
 use tauri::{AppHandle, Manager};
@@ -101,7 +103,10 @@ pub(crate) fn body(sql: &str, hold: Hold) -> String {
     text.push_str(&shown);
     if shown.len() < sql.len() {
         let more = sql.lines().count().saturating_sub(shown.lines().count());
-        text.push_str(&format!("\n… and {more} more lines, shown in the chat"));
+        // Writing to a String cannot fail.
+        if write!(text, "\n… and {more} more lines, shown in the chat").is_err() {
+            text.push_str("\n…");
+        }
     }
     text
 }
@@ -139,12 +144,11 @@ mod tests {
         let read = body("DELETE FROM t", Hold::ReadDocuments);
         assert!(read.starts_with("This turn read document text"));
         assert!(read.ends_with("\n\nDELETE FROM t"));
-        let long: String = (0..200)
-            .map(|i| format!("UPDATE t SET n = {i};\n"))
-            .collect();
+        let long = "UPDATE t SET n = 1;\n".repeat(200);
         let cut = body(&long, Hold::NotPermitted);
         assert!(cut.chars().count() < long.chars().count());
         assert!(cut.contains("more lines, shown in the chat"), "{cut}");
-        assert!(cut.starts_with(&long[..SQL_SHOWN.min(40)]));
+        let head: String = long.chars().take(SQL_SHOWN.min(40)).collect();
+        assert!(cut.starts_with(&head));
     }
 }

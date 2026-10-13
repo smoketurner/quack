@@ -4,6 +4,14 @@
 //! long work runs on the process's one job queue and reaches it as the
 //! `job` event.
 
+// `#[tauri::command]` expands to argument-parsing glue that reaches for
+// `unreachable!` on a path the macro has already ruled out; every async
+// command carries one. The crate's own code never uses the macro.
+#![expect(
+    clippy::unreachable,
+    reason = "inside the code `#[tauri::command]` generates for each async command"
+)]
+
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -67,7 +75,7 @@ fn start() -> Result<()> {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .menu(menu::build)
-        .on_menu_event(menu::on_event)
+        .on_menu_event(|app, event| menu::on_event(app, &event))
         .invoke_handler(tauri::generate_handler![
             workspace::list_workspaces,
             workspace::create_workspace,
