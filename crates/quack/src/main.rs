@@ -417,10 +417,10 @@ impl ReadyArgs {
             url
         } else {
             let config = Config::load().context("failed to load configuration")?;
-            let bind: SocketAddr = config.server.bind.parse().with_context(|| {
+            let bind: SocketAddr = config.server.bind_or_default().parse().with_context(|| {
                 format!(
                     "[server].bind '{}' is not a socket address",
-                    config.server.bind
+                    config.server.bind_or_default()
                 )
             })?;
             Self::url_for(bind)
@@ -1806,15 +1806,16 @@ fn open_browser(url: &str) -> bool {
 }
 
 /// Where the session serves the web UI, REST API, and MCP beside itself:
-/// `[server].bind`'s port on loopback. The host part is not used, since
-/// local mode serves without authentication and must stay on loopback; a
-/// loopback host configured there is kept as written.
+/// `[server].bind`'s port on loopback, or a random loopback port when
+/// nothing set one. The host part is not used, since local mode serves
+/// without authentication and must stay on loopback; a loopback host
+/// configured there is kept as written.
 fn local_addr(server: &ServerConfig) -> SocketAddr {
-    let configured: Option<SocketAddr> = server.bind.parse().ok();
-    let port = configured.map_or(8080, |addr| addr.port());
+    let configured: Option<SocketAddr> = server.bind.as_deref().and_then(|b| b.parse().ok());
     match configured {
         Some(addr) if addr.ip().is_loopback() => addr,
-        _ => SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+        Some(addr) => SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, addr.port())),
+        None => SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
     }
 }
 
@@ -1853,7 +1854,7 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     .await;
     let (web, server) = match started {
         Ok(server) => (
-            WebStatus::Listening(addr),
+            WebStatus::Listening(server.local_addr().unwrap_or(addr)),
             Some(tokio::spawn(server.run(QUIT_GRACE))),
         ),
         Err(e) => (WebStatus::Unavailable(format!("{e:#}")), None),

@@ -36,7 +36,7 @@ whole data directory, so quack keeps it at mode `0700`: every command that opens
 removes any group or other access, with a warning. `quack serve --local` turns
 authentication off for one person's browser and listens on loopback addresses only; the
 terminal session serves its own workspace the same way on `127.0.0.1` at `[server].bind`'s
-port. Local mode answers only loopback `Host` names on that port, so a page on another name
+port, or a random one when none is set. Local mode answers only loopback `Host` names on that port, so a page on another name
 that resolves to loopback cannot reach it; any other account on the same machine can, so a
 shared machine wants logins.
 

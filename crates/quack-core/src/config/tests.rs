@@ -80,7 +80,8 @@ fn default_config_values() {
     assert_eq!(config.ingestion.upload_max_mb, 512);
     assert_eq!(config.ingestion.max_decompressed_mb, 1024);
     assert_eq!(config.ingestion.embedding_concurrency, 2);
-    assert_eq!(config.server.bind, "127.0.0.1:8080");
+    assert_eq!(config.server.bind, None);
+    assert_eq!(config.server.bind_or_default(), "127.0.0.1:8080");
     assert!(!config.server.local);
     assert_eq!(config.server.workers_per_workspace, 1);
     assert!((config.ontology.key_overlap_threshold - 0.8).abs() < f64::EPSILON);
@@ -99,7 +100,7 @@ fn default_config_values() {
 #[test]
 fn server_section_parses_and_rejects_unknown_keys() {
     let ok = Config::parse("[server]\nbind = \"0.0.0.0:9000\"\nlocal = true\n");
-    assert!(ok.is_ok_and(|c| c.server.bind == "0.0.0.0:9000" && c.server.local));
+    assert!(ok.is_ok_and(|c| c.server.bind.as_deref() == Some("0.0.0.0:9000") && c.server.local));
     assert!(err_of("[server]\nport = 1\n").contains("port"));
 }
 
@@ -325,7 +326,7 @@ fn overrides_replace_only_what_they_set() {
     let config = Config::from_contents(Some("[general]\n"), &overrides);
     assert!(
         config.is_ok_and(|c| c.general.data_dir == Path::new("/srv/quack")
-            && c.server.bind == "0.0.0.0:9000"
+            && c.server.bind.as_deref() == Some("0.0.0.0:9000")
             && c.general.chat_model.is_none())
     );
 }

@@ -644,6 +644,15 @@ impl Server {
         Ok(Self { app, listener })
     }
 
+    /// The address the listener took (`addr`, with the port it got for 0).
+    ///
+    /// # Errors
+    ///
+    /// Returns the socket's own error.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
     /// Serve until the engine begins to stop, then drain under `grace`
     /// beside the queue's shutdown and drop the MCP transports; the
     /// engine's owner closes the workspaces after.
@@ -691,7 +700,7 @@ pub async fn serve(config: Config, bind: Option<String>, mode: ServeMode) -> any
     } else {
         mode
     };
-    let bind = bind.unwrap_or_else(|| config.server.bind.clone());
+    let bind = bind.unwrap_or_else(|| config.server.bind_or_default().to_owned());
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("'{bind}' is not a socket address"))?;

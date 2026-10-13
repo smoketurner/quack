@@ -13,8 +13,8 @@ server, terminal session, and print mode are thin clients of it, all subcommands
 `quack` binary with no Cargo features. There is no desktop app: it was designed and
 tried (`docs/desktop.md`, #35, PR #546) and set aside on 2026-10-12; bare `quack` serves
 the web UI, REST API, and MCP on loopback beside the terminal session (from the session's
-engine, its workspace alone, `127.0.0.1` at `[server].bind`'s port, a transcript line when
-the port is taken), so a browser tab is the window. The
+engine, its workspace alone, `127.0.0.1` at `[server].bind`'s port or a random one when
+none is set, a transcript line saying where or why not), so a browser tab is the window. The
 design is `docs/design-doc.md`; read it before any non-trivial change, and check its
 section 17 for where the code still lags. The chosen stack:
 
@@ -104,7 +104,7 @@ cargo run --bin quack -- tables [TABLE [--note TEXT] [--retype COL=TYPE]] [--for
 cargo run --bin quack -- docs [--tag ID TAG | --untag ID TAG | --author ID NAME | --authored ID DATE]   # a document's own fields; PATCH .../documents/{doc} over REST
 cargo run --bin quack -- -p "question" -w ws [-f text|json] [--documents DOC,..]   # one agent turn; steps on stderr; --documents limits it to those documents
 cargo run --bin quack -- search QUERY -w ws [--in DOC..] [--keyword|--vector] [--explain] [-f text|json]   # analysis::search::DocumentSearch without the model: each hit's vector, keyword, and rerank rank
-cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY); serves the web UI, REST API, and MCP for that workspace on 127.0.0.1 at [server].bind's port beside it (quack_server::Server over the session's engine; local mode answers loopback Host names only)
+cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY); serves the web UI, REST API, and MCP for that workspace on 127.0.0.1 at [server].bind's port (a random one when unset) beside it (quack_server::Server over the session's engine; local mode answers loopback Host names only)
 cargo run --bin quack -- sessions [--search TEXT] | export ID [--sql]          # sessions live in the workspace file; /rename, /sessions TEXT, and /resume TITLE in the terminal; [analysis].title_sessions has the model title them
 cargo run --bin quack -- saved list | add NAME --from-session ID | run NAME [--refresh] [--exit-code] | show NAME | remove NAME   # an answer's SQL re-run without the model; exit 5 when changed; cron schedules it
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace

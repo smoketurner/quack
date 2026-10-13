@@ -1303,8 +1303,10 @@ impl Default for JobsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Listen address. Override: `QUACK_BIND`.
-    pub bind: String,
+    /// Listen address. Override: `QUACK_BIND`. Unset, `quack serve` takes
+    /// [`ServerConfig::DEFAULT_BIND`] and the terminal session a random
+    /// loopback port.
+    pub bind: Option<String>,
     /// No authentication, one implicit user, loopback only.
     pub local: bool,
     /// Concurrent ingest workers per workspace.
@@ -1590,7 +1592,7 @@ impl TryFrom<RawOidcConfig> for OidcConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind: String::from("127.0.0.1:8080"),
+            bind: None,
             local: false,
             workers_per_workspace: 1,
             session_max_age_hours: 12,
@@ -1619,6 +1621,15 @@ impl ServerConfig {
     #[must_use]
     pub fn permission_timeout(&self) -> Duration {
         Duration::from_secs(u64::from(self.permission_timeout_seconds.max(1)))
+    }
+
+    /// Where `quack serve` listens when `bind` is unset.
+    pub const DEFAULT_BIND: &'static str = "127.0.0.1:8080";
+
+    /// The address `quack serve` listens on: `bind`, or the default.
+    #[must_use]
+    pub fn bind_or_default(&self) -> &str {
+        self.bind.as_deref().unwrap_or(Self::DEFAULT_BIND)
     }
 
     /// How long a stopping server waits for jobs and requests to end.
@@ -2022,7 +2033,7 @@ impl Overrides {
             config.general.chat_model = Some(spec);
         }
         if let Some(bind) = &self.bind {
-            config.server.bind.clone_from(bind);
+            config.server.bind = Some(bind.clone());
         }
         Ok(())
     }

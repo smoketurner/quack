@@ -2869,7 +2869,8 @@ form's JSON Schema), `.../context` (Markdown).
 The terminal is a Claude Code-style single-pane transcript on a named workspace (`-w`,
 resolved through the control plane like every interface). Bare `quack` also serves what
 `quack serve --local` serves, from the session's own engine, on `127.0.0.1` at the port of
-`[server].bind` (the host part is not used: local mode stays on loopback), so a browser and
+`[server].bind` when one is set (the host part is not used: local mode stays on loopback)
+and on a random loopback port otherwise, so a browser and
 Claude Code's MCP entry (`http://127.0.0.1:8080/mcp/v1/{workspace}`) reach the workspace the
 session holds without a second process. The transcript's first lines say where
 (`web: http://127.0.0.1:8080 serves this workspace's web UI, REST API, and MCP`; that
@@ -3471,7 +3472,7 @@ enum_max_values = 12                    # distinct values under which a column b
 history = 100                           # finished jobs kept for /jobs and the Jobs page
 
 [server]
-bind = "127.0.0.1:8080"                 # QUACK_BIND
+bind = "127.0.0.1:8080"                 # QUACK_BIND; unset: quack serve takes this, the session a random loopback port
 local = false
 workers_per_workspace = 1               # uploads processed at once per workspace (a lane)
 session_max_age_hours = 12              # a browser session dies this long after login
