@@ -114,6 +114,11 @@ sqlx                 = { version = "=0.9.0", default-features = false }
 strsim               = { version = "=0.11.1", default-features = false } # closest model ids in quack doctor
 subtp                = { version = "=0.2.0", default-features = false } # .srt and .vtt ingestion
 tar                  = { version = "=0.4.46", default-features = false } # OKF bundles over the API
+tauri                = { version = "=2.12.3", default-features = false } # the desktop app (crates/quack-desktop)
+tauri-build          = { version = "=2.7.2", default-features = false }
+tauri-plugin-dialog  = { version = "=2.8.2", default-features = false }
+tauri-plugin-opener  = { version = "=2.7.1", default-features = false }
+tauri-plugin-single-instance = { version = "=2.5.3", default-features = false }
 tempfile             = { version = "=3.27.0", default-features = false }
 thiserror            = { version = "=2.0.21", default-features = false }
 tiktoken             = { version = "=4.1.2", default-features = false }
@@ -126,6 +131,7 @@ tower                = { version = "=0.5.3", default-features = false }
 tower-http           = { version = "=0.7.1", default-features = false }
 tower_governor       = { version = "=0.8.0", default-features = false }
 tracing              = { version = "=0.1.44", default-features = false }
+tracing-appender     = { version = "=0.2.5", default-features = false }
 tracing-subscriber   = { version = "=0.3.23", default-features = false }
 unic-langid          = { version = "=0.9.6", default-features = false }
 utoipa               = { version = "=6.0.0", default-features = false } # the REST API's OpenAPI document

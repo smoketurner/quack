@@ -117,6 +117,19 @@ the server.
 | `ui`, `chart`, `markdown`, `picker`, `sql` | rendering, charts, Markdown, the pickers, and the SQL editor's parsing |
 | `selection`, `clipboard` | mouse selection copied to the system clipboard and the terminal's |
 
+## `quack-desktop`
+
+The desktop app, a second binary (`docs/desktop.md`): Tauri commands over `quack-core` and
+`quack-cli`, a React frontend in `ui/` bundled into the app. It depends on no server code.
+
+| Module | Owns |
+|---|---|
+| `app` | `AppState`: the configuration, the control plane, the one job queue, the workspaces held open (each a `SharedDb`, a `ReaderDb`, an audit connection, and a `forward::Listener`), each session's running turn, the "run without asking" toggle |
+| `workspace`, `chat`, `documents`, `jobs`, `settings` | the commands behind the first four views, each returning the engine's own types |
+| `permission` | the native dialog a `PermissionRequired` event is answered in, built from `Decision`'s words |
+| `audit` | `audit_log` rows on channel `desktop` plus the `_quack_audit` detail |
+| `menu`, `log`, `schema` | the native menu, the rolling log file, and the JSON Schema the frontend's types are generated from |
+
 ## `quack`
 
 | Module | Owns |

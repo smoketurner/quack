@@ -1,0 +1,9 @@
+@import "tailwindcss";
+
+/* The window is the app's: no page scroll, the views scroll inside. */
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+}

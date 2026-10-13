@@ -112,8 +112,7 @@ crates/quack-desktop/
 | `tauri-plugin-opener` | `=2.7.1` | external links in the browser, "Reveal in Finder" |
 | `tauri-plugin-updater` | `=2.13.3` | self-update (7.3) |
 | `tauri-plugin-process` | `=2.4.0` | relaunch after an update |
-| `tauri-specta` | `=2.0.0-rc.25` (the Tauri 2 line has no stable release yet; `1.0.2` is Tauri 1) | `derive`, `typescript`: the typed frontend client |
-| `specta` | `=2.0.0-rc.25` | `derive`; `Type` on every struct a command returns, beside `Serialize` |
+| `tauri-specta`, `specta` | not used: the Tauri 2 line is a release candidate (`2.0.0-rc.25`), so the frontend's types are generated from the `utoipa` schema instead (see "The frontend's stack") | |
 | `tracing-appender` | `=0.2.5` | the rolling log file |
 
 `tauri-cli` (`=2.12.2`) is a tool, installed with `cargo install tauri-cli --version
@@ -134,14 +133,15 @@ for the transcript; ECharts for charts and the graph canvas (the library the web
 CodeMirror 6 for the SQL editor (the packages `crates/quack-server/editor` pins), each
 attached to a `ref`. pnpm with a committed lockfile, as the editor already does.
 
-The frontend's types come from Rust. `tauri-specta` generates a typed TypeScript client
-from every `#[tauri::command]` and event (the way `utoipa` generates the OpenAPI document
-from every handler), so `AgentResponseBody`, `ToolStep`, `ChartSpec`, `JobInfo`, and the
-rest have one definition; `make ui-types` regenerates `ui/src/bindings.ts` and a test fails
-when it is stale, as the OpenAPI tests do. The Tauri 2 line of `tauri-specta` is a release
-candidate at the time of writing (see the dependency table); if that is not acceptable when
-the crate lands, `ts-rs` generates the types alone and the `invoke` wrappers are written by
-hand.
+The frontend's types come from Rust. As built: `quack-desktop --schema` writes the `utoipa`
+JSON Schema of every type a command returns or an event carries (the same derives the REST
+API's OpenAPI document uses, so `AgentResponseBody`, `ToolStep`, `ChartSpec`, `JobInfo`, and
+the rest have one definition and no core type gained a derive), `openapi-typescript` turns
+it into `ui/src/schema.d.ts`, and `ui/src/commands.ts` types each `invoke` wrapper with it
+by hand; `make ui-types` regenerates both and a Rust test fails when `schema.json` is stale,
+as the OpenAPI tests do. This is the "types alone, wrappers by hand" alternative the first
+draft kept in reserve: the Tauri 2 line of `tauri-specta` is a release candidate (see the
+dependency table), and the wrappers are one line each.
 
 ### Lints
 
@@ -521,7 +521,7 @@ everything else is Tauri's job. None of it is built or tested until then.
 - `ui/`: Vitest for the event reducer that turns `TurnEvent`s into transcript state, with
   recorded event sequences as fixtures, and React Testing Library for the views that render
   them (a step with its SQL and rows, a citation, a chart, the permission notice); a test
-  that `bindings.ts` matches what `tauri-specta` generates from the current commands.
+  (in the Rust crate) that `ui/src/schema.json` matches what the current commands generate.
 - The release workflow's `latest.json` assembly runs against a fixture of `.sig` files in
   CI.
 - A manual pre-release checklist in the README on a clean macOS account: first launch with
@@ -585,8 +585,9 @@ Questions the implementation must not answer on its own:
    tarball and the formula also remain for people who want only the CLI.
 4. **The thin first release** (section 9): four views first, or all eleven before the first
    tag.
-5. **`tauri-specta`'s release candidate.** Pin `=2.0.0-rc.25`, or use `ts-rs` for the types
-   and hand-written `invoke` wrappers until it goes stable (section 2).
+5. **`tauri-specta`'s release candidate.** Resolved as built: the types come from the
+   `utoipa` schema with hand-written `invoke` wrappers (section 2); `tauri-specta` can
+   replace them once it is stable.
 
 ## 12. Where it sits
 

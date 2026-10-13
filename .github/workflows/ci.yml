@@ -81,7 +81,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
+        # WebKitGTK is what the desktop crate (crates/quack-desktop) links on
+        # Linux; the release never builds it there, but clippy covers it.
+        run: sudo apt-get update && sudo apt-get install -y cmake clang golang-go libwebkit2gtk-4.1-dev
       - name: Setup Rust toolchain
         # rust-cache hashes every installed toolchain into its cache key, and a
         # runner image preinstalls its own stable toolchain, which changes as
@@ -121,7 +123,7 @@ jobs:
         include:
           - name: linux
             runner: ubuntu-latest
-            install-deps: sudo apt-get update && sudo apt-get install -y cmake clang golang-go
+            install-deps: sudo apt-get update && sudo apt-get install -y cmake clang golang-go libwebkit2gtk-4.1-dev
           - name: macos
             runner: macos-latest
             install-deps: ""
@@ -192,6 +194,48 @@ jobs:
           cache-on-failure: true
       - name: Run tests
         run: cargo test --locked --workspace
+
+  # The desktop app's frontend and crate, on the platform the first release
+  # ships for: the frontend's types must match the commands (a Rust test
+  # compares them), its lint and tests must pass, and the crate must build.
+  desktop:
+    name: Desktop (macos)
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pnpm
+        run: npm install -g pnpm@10.28.0
+      - name: Setup Rust toolchain
+        shell: bash
+        run: |
+          rustup show
+          pinned=$(rustup show active-toolchain | awk '{print $1}')
+          rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: "v1"
+          shared-key: "desktop-${{ runner.os }}"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Install the frontend's packages
+        run: make ui-install
+      - name: Lint and test the frontend
+        run: |
+          make ui-lint
+          make ui-test
+      - name: Build the frontend
+        run: make ui-build
+      - name: Check and test the crate
+        run: |
+          cargo check --locked -p quack-desktop --all-features --all-targets
+          cargo test --locked -p quack-desktop --all-features
 
   # A Cargo.lock or toolchain change gives every cache a new key, and the old
   # generation stays until GitHub's eviction catches up, so the repository

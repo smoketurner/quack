@@ -7,8 +7,9 @@
   built without debuginfo, and skipped in the merge queue since it is not a required check),
   `prune-caches` (on `main`, deletes all but the newest entry of each cache), `docs` (`cargo doc --no-deps` with
   `RUSTDOCFLAGS=-D warnings`, the same as `make doc`; `[workspace.lints.rustdoc]` denies
-  broken and private intra-doc links), `dependency-review` (PRs), and `license-check`
-  (`cargo-deny check`). The toolchain comes from `rust-toolchain.toml` via `rustup show`;
+  broken and private intra-doc links), `desktop` (the desktop app's frontend linted, tested,
+  and built with pnpm, and its crate checked and tested, on macOS; not required),
+  `dependency-review` (PRs), and `license-check` (`cargo-deny check`). The toolchain comes from `rust-toolchain.toml` via `rustup show`;
   `Swatinem/rust-cache` caches builds (see [Build caching](#build-caching)). Actions are
   SHA-pinned. `permissions: {}` is set at the top, with `contents: read` per job.
 - **`.github/workflows/secure_workflows.yml`**: fails CI if a third-party action lacks a
@@ -77,12 +78,16 @@ Two settings must line up, or the queue gates nothing:
    gh api repos/smoketurner/quack/rulesets/23731779 --jq '.rules'   # inspect
    ```
 
-Two jobs are **not** required. A required check that never reports deadlocks the entry for
-the full `check_response_timeout_minutes`.
+Three jobs are **not** required. A required check that never reports deadlocks the entry
+for the full `check_response_timeout_minutes`.
 
 - **`Dependency Review`** is `if: github.event_name == 'pull_request'`, and
   `dependency-review-action` works only in a pull request context, so it skips on a merge
   group.
+- **`Desktop (macos)`** lints, tests, and builds the desktop app's frontend
+  (`crates/quack-desktop/ui`, pnpm) and checks and tests the crate on the platform the
+  first release ships for. `Clippy` and `Unit Tests (linux)` cover the crate's Rust too:
+  their runners install `libwebkit2gtk-4.1-dev`, which the crate links on Linux.
 - **`Harden Security`** (`secure_workflows.yml`) filters on `paths: .github/workflows/**`,
   so it never starts for a merge group that touches no workflow file, and it has no
   `merge_group` trigger. Nothing is lost: combining pull requests cannot introduce an

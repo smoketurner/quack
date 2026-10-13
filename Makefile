@@ -20,7 +20,15 @@ WORKSPACE ?= storms
 # The crate whose templates Tailwind scans; its built CSS is committed.
 SERVER_CRATE ?= quack-server
 
-.PHONY: all build check clean setup doc fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates eval eval-offline eval-scale build-debug image hooks css-dev css-build editor-build run run-server demo-data help
+# The desktop app's frontend (crates/quack-desktop/ui), built with pnpm.
+UI_DIR ?= crates/quack-desktop/ui
+
+# On Linux the desktop crate links WebKitGTK; without its development
+# package the workspace-wide targets leave the crate out and say so. CI
+# installs the package and never skips.
+DESKTOP_EXCLUDE := $(shell if [ "$$(uname -s)" = Linux ] && ! pkg-config --exists webkit2gtk-4.1 2>/dev/null; then echo "--exclude quack-desktop"; fi)
+
+.PHONY: all build check clean setup doc fmt fmt-check lint test test-coverage test-mutants deny crypto-gates release-gates eval eval-offline eval-scale build-debug image hooks css-dev css-build editor-build ui-install ui-types ui-build ui-lint ui-test desktop run run-server demo-data help
 
 all: build
 
@@ -51,10 +59,12 @@ fmt-check: ## Verify formatting without writing
 	$(CARGO) fmt --all --check
 
 lint: ## Run clippy with warnings denied
-	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
+	@if [ -n "$(DESKTOP_EXCLUDE)" ]; then echo "note: quack-desktop skipped (install libwebkit2gtk-4.1-dev to lint it)"; fi
+	$(CARGO) clippy --workspace $(DESKTOP_EXCLUDE) --all-targets --all-features -- -D warnings
 
 test: ## Run unit tests
-	$(CARGO) test --workspace --all-features
+	@if [ -n "$(DESKTOP_EXCLUDE)" ]; then echo "note: quack-desktop skipped (install libwebkit2gtk-4.1-dev to test it)"; fi
+	$(CARGO) test --workspace $(DESKTOP_EXCLUDE) --all-features
 
 bench: ## Run the criterion benchmarks (BENCH_CHUNKS=1000000 for the 1M-chunk retrieval point)
 	QUACK_BENCH_CHUNKS=$(BENCH_CHUNKS) $(CARGO) bench --workspace
@@ -108,6 +118,28 @@ css-dev: ## Watch and rebuild Tailwind CSS for the web UI (commit the result)
 
 css-build: ## Build minified Tailwind CSS for the web UI (commit the result)
 	cd crates/$(SERVER_CRATE) && tailwindcss -i styles/input.css -o static/css/output.css --minify
+
+##@ Desktop app (crates/quack-desktop)
+
+ui-install: ## Install the desktop frontend's packages (pnpm, lockfile pinned)
+	cd $(UI_DIR) && pnpm install --frozen-lockfile
+
+ui-types: ## Regenerate the frontend's types from the commands' schema (commit the result)
+	$(CARGO) build --workspace --all-features --bin quack-desktop
+	target/debug/quack-desktop --schema > $(UI_DIR)/src/schema.json
+	cd $(UI_DIR) && pnpm run types
+
+ui-build: ## Build the desktop frontend into crates/quack-desktop/ui/dist
+	cd $(UI_DIR) && pnpm run build
+
+ui-lint: ## Type-check, lint, and check the formatting of the desktop frontend
+	cd $(UI_DIR) && pnpm run lint
+
+ui-test: ## Run the desktop frontend's tests (Vitest)
+	cd $(UI_DIR) && pnpm run test
+
+desktop: ## Run the desktop app in development (needs tauri-cli: cargo install tauri-cli --version =2.12.2 --locked)
+	cd crates/quack-desktop && cargo tauri dev
 
 editor-build: ## Bundle the web console's SQL editor (CodeMirror) with pnpm (commit the result)
 	cd crates/$(SERVER_CRATE)/editor && pnpm install --frozen-lockfile && pnpm run build

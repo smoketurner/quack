@@ -22,6 +22,11 @@
 # (crates/quack-server/static/js/sql-editor.min.js, `make editor-build`).
 crates/quack-server/editor/node_modules/
 
+# The desktop app's frontend: its packages, and its built page, which the
+# macOS release job builds (`make ui-build`) and build.rs stands in for.
+crates/quack-desktop/ui/node_modules/
+crates/quack-desktop/ui/dist/
+
 # Editor / OS
 .idea/
 .vscode/

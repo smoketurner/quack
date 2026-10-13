@@ -1,0 +1,42 @@
+[package]
+name                   = "quack-desktop"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish                = false
+build                  = "build.rs"
+
+[[bin]]
+name = "quack-desktop"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+quack-cli            = { path = "../quack-cli" }
+quack-core           = { path = "../quack-core" }
+anyhow               = { workspace = true, features = ["std"] }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true, features = ["std"] }
+tauri                = { workspace = true, features = ["wry", "image-png"] }
+tauri-plugin-dialog  = { workspace = true }
+tauri-plugin-opener  = { workspace = true }
+tokio                = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+tracing              = { workspace = true, features = ["std"] }
+tracing-appender     = { workspace = true }
+tracing-subscriber   = { workspace = true, features = ["fmt", "env-filter", "json", "std"] }
+utoipa               = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The dialog plugin's Linux backend: GTK 3 dialogs, the one the window's
+# WebKitGTK already links. (macOS and Windows use the OS's own.)
+tauri-plugin-dialog = { workspace = true, features = ["gtk3"] }
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dev-dependencies]
+quack-testkit = { path = "../quack-testkit" }
+tempfile      = { workspace = true }
