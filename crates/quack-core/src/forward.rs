@@ -29,12 +29,10 @@
 //! [`Listener::bind`] listens on nothing.
 
 #[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(unix)]
-use crate::config::Config;
 use crate::error::Error;
 use crate::storage::workspace::QueryResults;
 
@@ -103,11 +101,12 @@ struct Paths {
 
 #[cfg(unix)]
 impl Paths {
-    fn of(config: &Config, workspace_id: &str) -> Self {
-        let dir = config.workspace_dir(workspace_id);
+    /// The socket and token inside `workspace_dir`
+    /// (`Config::workspace_dir`).
+    fn of(workspace_dir: &Path) -> Self {
         Self {
-            socket: dir.join(SOCKET_FILE),
-            token: dir.join(TOKEN_FILE),
+            socket: workspace_dir.join(SOCKET_FILE),
+            token: workspace_dir.join(TOKEN_FILE),
         }
     }
 }
@@ -124,7 +123,6 @@ mod unix {
 
     use super::{Envelope, MAX_REQUEST_BYTES, Paths, Reply, Request, TokenFile};
     use crate::analysis::tools::ReaderDb;
-    use crate::config::Config;
     use crate::error::{Error, Result};
     use crate::storage::control::random_bytes;
     use crate::storage::workspace::{QueryResults, StatementKind};
@@ -214,8 +212,10 @@ mod unix {
     }
 
     impl Listener {
-        /// Listen for the workspace's reads as `holder` (the name a refused
-        /// writer is told), answering them on `reader`. A socket left by a
+        /// Listen in `workspace_dir` (`Config::workspace_dir`) for the
+        /// workspace's reads as `holder` (the name a refused writer is told),
+        /// answering them on `reader`. Takes the directory, not the `Config`,
+        /// so a caller's future holds a path, not a configuration. A socket left by a
         /// holder of this user that died is replaced; one that answers is an
         /// error, since two holders cannot both have the file open; one that
         /// another user owns is an error and is left alone.
@@ -225,13 +225,8 @@ mod unix {
         /// Returns an error when the socket cannot be bound, the token cannot
         /// be written, another process already answers on the socket, or a
         /// file in the way is not this user's.
-        pub async fn bind(
-            config: &Config,
-            workspace_id: &str,
-            holder: &str,
-            reader: ReaderDb,
-        ) -> Result<Self> {
-            let paths = Paths::of(config, workspace_id);
+        pub async fn bind(workspace_dir: &Path, holder: &str, reader: ReaderDb) -> Result<Self> {
+            let paths = Paths::of(workspace_dir);
             if paths.socket.exists() {
                 check_owned(&paths.socket, Kind::Socket)?;
                 if UnixStream::connect(&paths.socket).await.is_ok() {
@@ -378,17 +373,18 @@ mod unix {
             .await
     }
 
-    /// The other end: a connection to the holder of `workspace_id`, when one
-    /// listens. `None` when there is no token file or no socket, or nothing
-    /// answers on the socket (a holder that died leaves both behind).
+    /// The other end: a connection to the holder of the workspace in
+    /// `workspace_dir`, when one listens. `None` when there is no token file
+    /// or no socket, or nothing answers on the socket (a holder that died
+    /// leaves both behind).
     ///
     /// # Errors
     ///
     /// Returns an error when the token file or the socket exists but is not
     /// a private file of this user's, cannot be read, or the process
     /// answering runs as another user.
-    pub async fn connect(config: &Config, workspace_id: &str) -> Result<Option<Client>> {
-        let paths = Paths::of(config, workspace_id);
+    pub async fn connect(workspace_dir: &Path) -> Result<Option<Client>> {
+        let paths = Paths::of(workspace_dir);
         if !paths.token.exists() || !paths.socket.exists() {
             return Ok(None);
         }
@@ -478,8 +474,9 @@ pub use unix::{Client, Listener, connect};
 
 #[cfg(not(unix))]
 mod other {
+    use std::path::Path;
+
     use crate::analysis::tools::ReaderDb;
-    use crate::config::Config;
     use crate::error::Result;
     use crate::storage::workspace::QueryResults;
 
@@ -493,12 +490,7 @@ mod other {
         /// # Errors
         ///
         /// Never fails.
-        pub async fn bind(
-            _config: &Config,
-            _workspace_id: &str,
-            _holder: &str,
-            _reader: ReaderDb,
-        ) -> Result<Self> {
+        pub async fn bind(_workspace_dir: &Path, _holder: &str, _reader: ReaderDb) -> Result<Self> {
             Ok(Self)
         }
     }
@@ -531,7 +523,7 @@ mod other {
     /// # Errors
     ///
     /// Never fails.
-    pub async fn connect(_config: &Config, _workspace_id: &str) -> Result<Option<Client>> {
+    pub async fn connect(_workspace_dir: &Path) -> Result<Option<Client>> {
         Ok(None)
     }
 }
@@ -587,10 +579,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = config_in(dir.path());
         let reader = holder_reader(&config);
-        let listener = Listener::bind(&config, "ws", "the test holder", reader)
+        let listener = Listener::bind(&config.workspace_dir("ws"), "the test holder", reader)
             .await
             .unwrap();
-        let client = connect(&config, "ws").await.unwrap().unwrap();
+        let client = connect(&config.workspace_dir("ws")).await.unwrap().unwrap();
         assert_eq!(client.holder(), "the test holder");
 
         let results = client.query("SELECT n FROM t ORDER BY n").await.unwrap();
@@ -608,7 +600,7 @@ mod tests {
         let failed = client.query("SELECT FROM").await.unwrap_err();
         assert!(matches!(failed, Error::Forward(_)), "{failed}");
 
-        let paths = Paths::of(&config, "ws");
+        let paths = Paths::of(&config.workspace_dir("ws"));
         for path in [&paths.socket, &paths.token] {
             assert_eq!(
                 std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
@@ -620,7 +612,12 @@ mod tests {
         drop(listener);
         assert!(!paths.socket.exists());
         assert!(!config.workspace_dir("ws").join(TOKEN_FILE).exists());
-        assert!(connect(&config, "ws").await.unwrap().is_none());
+        assert!(
+            connect(&config.workspace_dir("ws"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A socket or token file that others can reach is refused, not used;
@@ -631,13 +628,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = config_in(dir.path());
         let reader = holder_reader(&config);
-        let _listener = Listener::bind(&config, "ws", "holder", reader)
+        let _listener = Listener::bind(&config.workspace_dir("ws"), "holder", reader)
             .await
             .unwrap();
-        let paths = Paths::of(&config, "ws");
+        let paths = Paths::of(&config.workspace_dir("ws"));
 
         chmod(&paths.socket, 0o666);
-        let err = connect(&config, "ws").await.unwrap_err();
+        let err = connect(&config.workspace_dir("ws")).await.unwrap_err();
         assert!(
             matches!(&err, Error::Forward(message) if message.contains("reachable by others (mode 666)")),
             "{err}"
@@ -645,7 +642,7 @@ mod tests {
         chmod(&paths.socket, 0o600);
 
         chmod(&paths.token, 0o640);
-        let err = connect(&config, "ws").await.unwrap_err();
+        let err = connect(&config.workspace_dir("ws")).await.unwrap_err();
         assert!(
             matches!(&err, Error::Forward(message) if message.contains("reachable by others (mode 640)")),
             "{err}"
@@ -655,7 +652,7 @@ mod tests {
         let real = paths.token.with_extension("real");
         std::fs::rename(&paths.token, &real).unwrap();
         std::os::unix::fs::symlink(&real, &paths.token).unwrap();
-        let err = connect(&config, "ws").await.unwrap_err();
+        let err = connect(&config.workspace_dir("ws")).await.unwrap_err();
         assert!(
             matches!(&err, Error::Forward(message) if message.contains("is not a regular file")),
             "{err}"
@@ -663,7 +660,12 @@ mod tests {
         std::fs::remove_file(&paths.token).unwrap();
         std::fs::rename(&real, &paths.token).unwrap();
 
-        assert!(connect(&config, "ws").await.unwrap().is_some());
+        assert!(
+            connect(&config.workspace_dir("ws"))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// A request whose token is not the holder's is answered with an error
@@ -674,10 +676,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = config_in(dir.path());
         let reader = holder_reader(&config);
-        let _listener = Listener::bind(&config, "ws", "holder", reader)
+        let _listener = Listener::bind(&config.workspace_dir("ws"), "holder", reader)
             .await
             .unwrap();
-        let paths = Paths::of(&config, "ws");
+        let paths = Paths::of(&config.workspace_dir("ws"));
         let mut record: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&paths.token).unwrap()).unwrap();
         if let Some(fields) = record.as_object_mut() {
@@ -688,7 +690,7 @@ mod tests {
         }
         std::fs::write(&paths.token, record.to_string()).unwrap();
         chmod(&paths.token, 0o600);
-        let client = connect(&config, "ws").await.unwrap().unwrap();
+        let client = connect(&config.workspace_dir("ws")).await.unwrap().unwrap();
         let err = client.query("SELECT 1").await.unwrap_err();
         assert!(
             matches!(&err, Error::Forward(message) if message.contains("token")),
@@ -708,11 +710,16 @@ mod tests {
         let stale = tokio::net::UnixListener::bind(&socket).unwrap();
         drop(stale);
         assert!(socket.exists());
-        assert!(connect(&config, "ws").await.unwrap().is_none());
-        let _listener = Listener::bind(&config, "ws", "holder", reader)
+        assert!(
+            connect(&config.workspace_dir("ws"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let _listener = Listener::bind(&config.workspace_dir("ws"), "holder", reader)
             .await
             .unwrap();
-        let client = connect(&config, "ws").await.unwrap().unwrap();
+        let client = connect(&config.workspace_dir("ws")).await.unwrap().unwrap();
         assert_eq!(client.holder(), "holder");
     }
 }

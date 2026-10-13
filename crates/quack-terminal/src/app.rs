@@ -1114,14 +1114,8 @@ impl App {
     /// A failure to listen is logged, not fatal: the session works without
     /// it.
     pub(crate) async fn listen_for_reads(&mut self) {
-        match Listener::bind(
-            &self.config,
-            self.workspace_id.as_str(),
-            "the quack terminal session",
-            self.reader_db.clone(),
-        )
-        .await
-        {
+        let dir = self.config.workspace_dir(self.workspace_id.as_str());
+        match Listener::bind(&dir, "the quack terminal session", self.reader_db.clone()).await {
             Ok(listener) => self.forward = Some(listener),
             Err(e) => {
                 tracing::warn!(error = %e, "other quack processes cannot read this workspace through the session");

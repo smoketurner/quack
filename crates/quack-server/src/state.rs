@@ -539,7 +539,10 @@ impl AppState {
         };
         let config = self.config.clone();
         let id = workspace_id.clone();
-        let (forward_config, forward_id) = (self.config.clone(), workspace_id.clone());
+        // The path alone: a `Config` captured here would sit in this future and
+        // in every future that awaits a workspace handle.
+        let forward_dir = self.config.workspace_dir(workspace_id.as_str());
+        let forward_id = workspace_id.clone();
         let pool_size = self.config.analysis.reader_pool_size;
         cell.get_or_try_init(|| async move {
             let (db, audit) = tokio::task::spawn_blocking(move || {
@@ -561,7 +564,7 @@ impl AppState {
                 Writer::spawn(db).map_err(|e| ApiError::internal(e.to_string()))?,
             );
             let reader = ReaderDb::open(&writer, pool_size).await;
-            let forward = match Listener::bind(&forward_config, forward_id.as_str(), "quack serve", reader.clone()).await {
+            let forward = match Listener::bind(&forward_dir, "quack serve", reader.clone()).await {
                 Ok(listener) => Some(Arc::new(listener)),
                 Err(e) => {
                     tracing::warn!(workspace = %forward_id, error = %e, "other quack processes cannot read this workspace through the server");

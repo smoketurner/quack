@@ -2394,7 +2394,8 @@ async fn run_query_through_holder(
     wait_for_stdin: bool,
     locked: anyhow::Error,
 ) -> Result<()> {
-    let Some(client) = forward::connect(&opened.config, opened.workspace.id.as_str()).await? else {
+    let workspace_dir = opened.config.workspace_dir(opened.workspace.id.as_str());
+    let Some(client) = forward::connect(&workspace_dir).await? else {
         return Err(locked);
     };
     if wait_for_stdin || sql.to_ascii_lowercase().contains("stdin") {
