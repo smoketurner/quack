@@ -42,6 +42,7 @@ async fn app() -> (tempfile::TempDir, App) {
         Engine::new(config, Holder::Serve),
         control,
         ServeMode::Login,
+        None,
         sessions,
         None,
     ));

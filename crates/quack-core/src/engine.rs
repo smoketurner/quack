@@ -164,6 +164,13 @@ impl Engine {
         })
     }
 
+    /// The one workspace this process holds, or `None` for a server that
+    /// opens any.
+    #[must_use]
+    pub fn held(&self) -> Option<&WorkspaceId> {
+        self.holder.held()
+    }
+
     /// A token cancelled when the process begins to stop: watch it, since a
     /// child cannot cancel the process.
     #[must_use]

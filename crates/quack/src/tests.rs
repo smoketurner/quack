@@ -306,6 +306,30 @@ fn auth_status_says_when_a_token_has_expired() {
 
 /// `quack search` takes documents after `--in`, one mode at most, and
 /// `-f`; `--documents` belongs to `-p`.
+/// The session's server stays on loopback whatever `[server].bind` says,
+/// keeping only its port.
+#[test]
+fn the_local_address_stays_on_loopback() {
+    let server = |bind: &str| ServerConfig {
+        bind: String::from(bind),
+        ..ServerConfig::default()
+    };
+    assert_eq!(
+        local_addr(&server("127.0.0.1:8080")).to_string(),
+        "127.0.0.1:8080"
+    );
+    assert_eq!(local_addr(&server("[::1]:9000")).to_string(), "[::1]:9000");
+    assert_eq!(
+        local_addr(&server("0.0.0.0:8080")).to_string(),
+        "127.0.0.1:8080",
+        "a public bind keeps only its port"
+    );
+    assert_eq!(
+        local_addr(&server("not an address")).to_string(),
+        "127.0.0.1:8080"
+    );
+}
+
 #[test]
 #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
 #[expect(clippy::panic, reason = "test failure path")]

@@ -45,6 +45,7 @@ use tower_http::request_id::{
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use axum::extract::State;
 use oidc::Oidc;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::egress::Egress;
@@ -54,7 +55,7 @@ use quack_core::llm::oauth::registration::{ClientSection, registered_sections};
 use quack_core::storage::control::ControlPlane;
 use quack_core::vault::Vault;
 use quack_core::web_sessions::WebSessions;
-use state::{App, AppState};
+use state::{App, AppState, LocalHosts};
 
 /// How long one request may take. Agent turns can be slow.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
@@ -204,6 +205,10 @@ pub(crate) fn router(app: App) -> Router {
         ))
         .layer(axum::middleware::map_response(no_store))
         .layer(axum::middleware::from_fn(same_origin))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&app),
+            local_host,
+        ))
         // Every request gets an empty acting slot, which the identity
         // extractor fills once it knows the caller, and an empty egress
         // slot, which `Access::resolve` fills with the workspace's
@@ -432,7 +437,7 @@ async fn record_request(
 /// `GET /readyz`: whether this server can serve, component by component:
 /// `control.db` answers, the data directory takes a write, and the vault
 /// key opens. 200 with every check `ok`, else 503 naming the failed ones.
-async fn readyz(axum::extract::State(app): axum::extract::State<App>) -> axum::response::Response {
+async fn readyz(State(app): State<App>) -> axum::response::Response {
     let readiness = app.readiness().await;
     let status = if readiness.ready() {
         StatusCode::OK
@@ -445,7 +450,7 @@ async fn readyz(axum::extract::State(app): axum::extract::State<App>) -> axum::r
 /// `GET /metrics`: the Prometheus text, to loopback or to an admin's
 /// bearer; anyone else gets 403. The gauges are read as the page is made.
 async fn metrics(
-    axum::extract::State(app): axum::extract::State<App>,
+    State(app): State<App>,
     peer: auth::Peer,
     identity: Result<auth::Identity, error::ApiError>,
 ) -> axum::response::Response {
@@ -489,6 +494,29 @@ async fn same_origin(
     if CrossSite::of(&request).is_some() {
         return error::ApiError::forbidden(
             "a request from another site may not change anything here",
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
+/// In local mode, refuse a request whose `Host` is not a loopback name on
+/// the bound port: every request there is the implicit owner, and a page
+/// on a name that resolves to loopback (DNS rebinding) carries that name
+/// as both `Origin` and `Host`, which the same-origin check cannot tell
+/// apart. A request without a `Host` header (HTTP/1.0, a test client)
+/// names nothing and passes; with logins the credential guards the server.
+async fn local_host(
+    State(app): State<App>,
+    request: Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(hosts) = &app.local_hosts
+        && let Some(host) = request.headers().get(header::HOST)
+        && !host.to_str().is_ok_and(|host| hosts.allows(host))
+    {
+        return error::ApiError::forbidden(
+            "a local server answers only 127.0.0.1, localhost, and [::1] on its port",
         )
         .into_response();
     }
@@ -601,7 +629,15 @@ impl Server {
             }
             (None, _) => None,
         };
-        let app = Arc::new(AppState::new(engine, control, mode, sessions, oidc));
+        let local_hosts = (mode == ServeMode::Local).then(|| LocalHosts::on(addr.port()));
+        let app = Arc::new(AppState::new(
+            engine,
+            control,
+            mode,
+            local_hosts,
+            sessions,
+            oidc,
+        ));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("cannot listen on {addr}"))?;
@@ -609,7 +645,8 @@ impl Server {
     }
 
     /// Serve until the engine begins to stop, then drain under `grace`
-    /// beside the queue's shutdown and close the workspaces.
+    /// beside the queue's shutdown and drop the MCP transports; the
+    /// engine's owner closes the workspaces after.
     ///
     /// # Errors
     ///
@@ -701,11 +738,15 @@ pub async fn serve(config: Config, bind: Option<String>, mode: ServeMode) -> any
     // shutdown, and the close. A server that ends on its own returns.
     let mut run = Box::pin(server.run(grace));
     tokio::select! {
-        served = &mut run => return served,
+        served = &mut run => {
+            engine.close().await;
+            return served;
+        }
         () = shutdown_signal() => {}
     }
     engine.begin_stop();
     let served = run.await;
+    engine.close().await;
     tracing::info!("stopped");
     served
 }

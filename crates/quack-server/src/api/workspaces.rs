@@ -51,6 +51,7 @@ pub(crate) async fn list(
             .list_workspaces()
             .await?
             .into_iter()
+            .filter(|w| app.serves(&w.id))
             .map(|w| Membership {
                 workspace: w,
                 standing: Standing::Member(Role::Owner),

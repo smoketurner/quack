@@ -638,7 +638,15 @@ impl Access {
         workspace_id: &WorkspaceId,
         need: Need,
     ) -> ApiResult<Self> {
-        let Some(workspace) = app.control.get_workspace(workspace_id).await? else {
+        // A terminal serving beside itself serves its own workspace alone:
+        // any other is unknown here, as it would be on a server that never
+        // held it, so nothing opens a second file under the session.
+        let workspace = if app.serves(workspace_id) {
+            app.control.get_workspace(workspace_id).await?
+        } else {
+            None
+        };
+        let Some(workspace) = workspace else {
             let mut entry = identity.audit(AuditAction::Open, Outcome::Denied);
             entry = entry.in_workspace(workspace_id);
             app.control.record_audit(&entry).await?;

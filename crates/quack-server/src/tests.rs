@@ -31,7 +31,7 @@ use quack_core::storage::writer::Claimed;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-use super::state::{App, AppState, ServeMode, with_db};
+use super::state::{App, AppState, LocalHosts, ServeMode, with_db};
 use crate::auth::{Access, Credential, Identity, Need};
 use crate::permissions;
 use crate::run::{self, RunKind};
@@ -79,7 +79,7 @@ async fn harness_with(mode: ServeMode, mut config: Config) -> Harness {
         .unwrap_or_else(|e| fail(&e.to_string()));
     let sessions = Arc::new(WebSessions::new(&config.server));
     let engine = Engine::new(config, Holder::Serve);
-    let app = Arc::new(AppState::new(engine, control, mode, sessions, None));
+    let app = Arc::new(AppState::new(engine, control, mode, None, sessions, None));
     let router = super::router(Arc::clone(&app));
     Harness {
         _dir: dir,
@@ -3035,6 +3035,134 @@ async fn ontology_page_forms_edit_property_meanings_and_measures() {
         })
         .await;
     assert_eq!(writes.len(), 5);
+}
+
+/// Local mode answers only loopback names on its port: a page on a name
+/// that resolves to loopback (DNS rebinding) sends that name as `Host` and
+/// is refused, whatever it asks; a request without a `Host` passes.
+#[tokio::test]
+async fn local_mode_refuses_a_host_that_is_not_loopback() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut config = Config::default();
+    config.general.data_dir = dir.path().to_path_buf();
+    let control = ControlPlane::open(&config)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let sessions = Arc::new(WebSessions::new(&config.server));
+    let app = Arc::new(AppState::new(
+        Engine::new(config, Holder::Serve),
+        control,
+        ServeMode::Local,
+        Some(LocalHosts::on(8080)),
+        sessions,
+        None,
+    ));
+    let router = super::router(Arc::clone(&app));
+    let ask = |host: Option<&str>| {
+        let mut builder = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/workspaces");
+        if let Some(host) = host {
+            builder = builder.header(header::HOST, host);
+        }
+        let request = builder
+            .body(Body::empty())
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let router = router.clone();
+        async move {
+            router
+                .oneshot(request)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()))
+                .status()
+        }
+    };
+    assert_eq!(ask(Some("127.0.0.1:8080")).await, StatusCode::OK);
+    assert_eq!(ask(Some("LocalHost:8080")).await, StatusCode::OK);
+    assert_eq!(ask(Some("[::1]:8080")).await, StatusCode::OK);
+    assert_eq!(ask(None).await, StatusCode::OK);
+    assert_eq!(ask(Some("evil.example:8080")).await, StatusCode::FORBIDDEN);
+    assert_eq!(ask(Some("127.0.0.1:9999")).await, StatusCode::FORBIDDEN);
+    assert_eq!(ask(Some("127.0.0.1")).await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        LocalHosts::on(80),
+        LocalHosts::on(80),
+        "port 80 also allows the bare names"
+    );
+    assert!(LocalHosts::on(80).allows("localhost"));
+    assert!(!LocalHosts::on(8080).allows("localhost"));
+}
+
+/// A terminal serving beside itself serves its own workspace alone: the
+/// list shows one, and any other id is unknown here (404, a denied row),
+/// so a browser click cannot make the session's process open another
+/// workspace's file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_server_serves_only_the_held_workspace() {
+    let h = harness(ServeMode::Local).await;
+    let create = |name: &str| {
+        let h = &h;
+        let name = name.to_owned();
+        async move {
+            let (status, body) = h
+                .call(
+                    Method::POST,
+                    "/api/v1/workspaces",
+                    None,
+                    Some(serde_json::json!({ "name": name })),
+                )
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            WorkspaceId::from(body["id"].as_str().unwrap_or_default())
+        }
+    };
+    let mine = create("mine").await;
+    let other = create("other").await;
+    // The terminal's process: one engine holding `mine`, over the same
+    // control plane.
+    let session = Arc::new(AppState::new(
+        Engine::new(h.app.engine.config.clone(), Holder::Terminal(mine.clone())),
+        h.app.control.clone(),
+        ServeMode::Local,
+        Some(LocalHosts::on(8080)),
+        Arc::new(WebSessions::new(&h.app.engine.config.server)),
+        None,
+    ));
+    let router = super::router(Arc::clone(&session));
+    let get = |path: String| {
+        let router = router.clone();
+        async move {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let response = router
+                .oneshot(request)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            (status, value)
+        }
+    };
+    let (status, list) = get(String::from("/api/v1/workspaces")).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = list["workspaces"]
+        .as_array()
+        .map(|rows| rows.iter().filter_map(|w| w["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(ids, vec![mine.as_str()], "{list}");
+    let (status, _) = get(format!("/api/v1/workspaces/{mine}/tables")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = get(format!("/api/v1/workspaces/{other}/tables")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "not_found");
+    session.close().await;
+    session.engine.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -7377,6 +7505,7 @@ async fn closing_the_state_checkpoints_each_workspace() {
     assert!(log.exists(), "the write is still in the log");
 
     h.app.close().await;
+    h.app.engine.close().await;
     assert!(!log.exists(), "the log was checkpointed into the file");
 }
 
