@@ -4501,6 +4501,7 @@ dependencies = [
  "reqwest",
  "rig",
  "rust-stemmers",
+ "rustix 1.1.5",
  "rustls",
  "schemars",
  "scraper",

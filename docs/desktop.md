@@ -63,7 +63,7 @@ Rust talks to the engine as a library.
   it.
 - Anything the app needs that today lives only in a `quack-server` handler moves to
   `quack-core` first, as the architecture rule says. The known cases are listed in 3.4.
-- `storage::forward` is new in `quack-core`: the socket a workspace's holder listens on so
+- `quack_core::forward` is new in `quack-core`: the socket a workspace's holder listens on so
   another process's reads run inside it (3.6), offered by the app, `quack serve`, and the
   terminal alike.
 
@@ -265,7 +265,11 @@ the way through it is to run the second process's reads inside the holder:
   serve`, the terminal) also listens on a Unix socket in the workspace directory,
   `{workspace_dir}/quack.sock`, with a per-launch token in a 0600 file beside it; both are
   removed when the workspace closes, and a stale pair from a crash is detected by a failed
-  connect and replaced. This is a `quack-core` module, `storage::forward`, since every holder
+  connect and replaced. Neither side trusts the files or the peer on faith: before using the
+  socket or the token file a client checks that each is the right kind of file, owned by the
+  current user, and unreadable by anyone else, and both ends check the peer's credentials
+  (`SO_PEERCRED`, `getpeereid`) and refuse a process running as another user; the holder
+  never removes a stale socket that is not its own user's. This is a `quack-core` module, `quack_core::forward`, since every holder
   offers it: framed JSON requests over the socket, a handful of request kinds (a read
   statement with its rows streamed back, a document search, a table or document listing, a
   description, a graph query), each run on the holder's reader pool in a read-only
@@ -282,7 +286,7 @@ the way through it is to run the second process's reads inside the holder:
   the holder's policy with nobody to ask and no one to audit it as, which is what the design
   keeps out. A `-p` question is a write too (its session is recorded), so it is refused the
   same way with a pointer to the app's chat or its Connect Claude Code endpoint (3.7).
-- **The app side is one line.** The app enters `storage::forward::listen` for each workspace
+- **The app side is one line.** The app enters `forward::Listener::bind` for each workspace
   it opens and leaves it when the workspace closes; the holder's end has no settings.
 
 This also removes today's friction between `quack serve` and the CLI on one laptop, which
@@ -491,7 +495,7 @@ everything else is Tauri's job. None of it is built or tested until then.
 - `quack-cli`: `OpenedWorkspace` and session choice, moved with their behaviour pinned
   (default workspace created on first use, `-w` must exist, `--resume` by prefix).
 - `quack-core`: the modules moved out of the server (3.4) keep the server's tests and gain
-  the app as a second caller in tests. `storage::forward`: a holder and a second process in
+  the app as a second caller in tests. `quack_core::forward`: a holder and a second process in
   one test binary over a temp workspace (a second `WorkspaceDb::open` fails on the lock, the
   forwarded read returns the holder's rows, a write request is refused, a wrong token is
   refused, a stale socket is replaced, and the socket is gone after close); `quack -q`,
@@ -525,7 +529,7 @@ everything else is Tauri's job. None of it is built or tested until then.
 |---|---|
 | `quack-cli`: `OpenedWorkspace` and session choice moved | ~150 lines moved |
 | `quack-core`: background runs, upload spooling, pending permissions moved from the server | ~600 lines moved, two callers each |
-| `quack-core`: `storage::forward`, the holder's socket and the CLI's fallback through it | ~400 lines with tests, plus the listen call in three holders |
+| `quack-core`: `quack_core::forward`, the holder's socket and the CLI's fallback through it | ~400 lines with tests, plus the listen call in three holders |
 | `quack-desktop` Rust: state, 11 command modules, turn and jobs bridges, permission dialog, audit, the MCP endpoint, menu, install command, updater, setup, logging | ~2,200 lines |
 | `quack-server`: `McpServer` and `McpSetup` made public, the HTTP transport factored for two callers | ~100 lines changed |
 | `ui/`: 11 views, the transcript renderer with steps, citations, charts, the grid, the editor, the graph canvas, forms | ~6,000 lines of TypeScript and CSS |

@@ -13,6 +13,10 @@ never draws a screen or reads keys.
 - **What those commands need:** `Confirm` (y/n prompts and `-y`), `TextOrJson` and
   `QueryFormat` (output formats), `ModeArg` and `ExportFlags` (shared arguments), and
   `find_session`.
+- **Opening a workspace** (`OpenedWorkspace`: the one `-w` names, which must exist, or the
+  default, created on first use; its provider egress scope, connection, writer thread, and
+  reader pool) and **choosing a session** (`SessionChoice`, `resolve_session`). Every
+  interface that runs commands against a workspace opens it through these.
 - **Print mode** (`PrintTurn`, one non-interactive agent turn) and **stdin handling**
   (`StdioPath`, `NamedInput`). Only the binary calls these directly, but they live here
   because `saved run --refresh` asks the model again through a `PrintTurn`.

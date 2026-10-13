@@ -73,6 +73,7 @@ nothing in it knows about HTTP, terminals, or windows.
 | `extraction` | what both extraction runs share: the `Extract` trait, lenient JSON answers, concurrent calls with per-chunk progress (`RunProgress`), even sampling across documents, name counts (`Tally`) | 6.4, 6.5 |
 | `progress` | the per-chunk progress report the extraction runs make to their caller | 6.5 |
 | `jobs` | the work queue every interface submits background work to: ordered lanes, cancel, progress, a broadcast of job snapshots, and `shutdown(grace)`, the one way the terminal and `quack serve` stop their jobs | 4.1 |
+| `forward` | reads through the process that holds a workspace: `DuckDB` allows one writer or many readers per file, never both, so the holder (`quack serve`, the terminal session, the desktop app) listens on a Unix socket in the workspace directory with a 0600 token file beside it (`Listener`), runs another process's read statements on its reader pool, and refuses writes naming itself; `quack -q` falls back to it (`connect`, `Client::query`) when the lock is taken | [desktop.md](desktop.md) 3.6 |
 | `llm` | rig provider construction over `limit::LimitedHttp` (each provider's process-wide request limit), `TurnRequest` (one agent turn), `SchemaCall` (one tool-less prompt whose answer a JSON schema shapes, sent as the provider's structured output and parsed whole: graph extraction against `Ontology::extraction_schema`, and the ontology's document pass), decision models over Ollama's `/v1/systemone` (`decision`: questions, the row's state, and the per-row fit search), OAuth token management (`oauth`), the person an on-behalf-of provider acts for (`acting`, a task-local), the workspace's provider allow-list and its one check (`egress`, a task-local), Amazon Bedrock over the AWS SDK's credential chain with the same limits (`bedrock`) | 4.1, 10 |
 
 ## `quack-cli`
@@ -87,7 +88,8 @@ depends on `quack-core` alone.
 | `import_cli` | `quack import` and its saved imports |
 | `classify_cli` | `quack classify` and `/classify`: the arguments, what is drafted, previewed, and asked (`Prepared`), the questions shown, and the run listing |
 | `args` | `ModeArg`, `ExportFlags`, and `QueryFormat`, the arguments the command line and the slash commands share |
-| `confirm`, `stdio`, `text_or_json`, `session` | the confirmation prompt, named stdin and file inputs, the text-or-JSON output choice, and finding a session by id prefix |
+| `workspace` | `OpenedWorkspace`: the workspace a command runs in (`-w`, which must exist, or the default, created on first use), its `Egress` scope, its connection, its writer thread and reader pool; the binary, the terminal's setup, and the desktop app open a workspace through it |
+| `confirm`, `stdio`, `text_or_json`, `session` | the confirmation prompt, named stdin and file inputs, the text-or-JSON output choice, finding a session by id prefix, and choosing the session a run continues (`SessionChoice`, `resolve_session`) |
 
 ## `quack-server`
 
