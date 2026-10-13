@@ -3,24 +3,24 @@
   "productName": "Quack",
   "identifier": "com.smoketurner.quack",
   "build": {
-    "frontendDist": "ui/dist",
-    "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "pnpm --dir ui dev",
-    "beforeBuildCommand": "pnpm --dir ui build"
+    "frontendDist": "static"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
         "title": "quack",
+        "url": "quack://localhost/",
         "width": 1200,
         "height": 800,
         "minWidth": 800,
-        "minHeight": 560
+        "minHeight": 560,
+        "dragDropEnabled": true
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost"
+      "csp": null
     }
   },
   "bundle": {

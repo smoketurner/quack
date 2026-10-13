@@ -195,9 +195,7 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace
 
-  # The desktop app's frontend and crate, on the platform the first release
-  # ships for: the frontend's types must match the commands (a Rust test
-  # compares them), its lint and tests must pass, and the crate must build.
+  # The desktop app's crate, on the platform the first release ships for.
   desktop:
     name: Desktop (macos)
     runs-on: macos-latest
@@ -209,8 +207,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install pnpm
-        run: npm install -g pnpm@10.28.0
       - name: Setup Rust toolchain
         shell: bash
         run: |
@@ -224,14 +220,6 @@ jobs:
           shared-key: "desktop-${{ runner.os }}"
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
-      - name: Install the frontend's packages
-        run: make ui-install
-      - name: Lint and test the frontend
-        run: |
-          make ui-lint
-          make ui-test
-      - name: Build the frontend
-        run: make ui-build
       - name: Check and test the crate
         run: |
           cargo check --locked -p quack-desktop --all-features --all-targets
@@ -275,6 +263,10 @@ jobs:
         with:
           vulnerability-check: true
           license-check: true
+          # glib 0.18's VariantStrIter unsoundness: Tauri 2's Linux-only GTK
+          # tree (crates/quack-desktop), which no release builds; the same
+          # advisory is ignored with its reason in deny.toml.
+          allow-ghsas: GHSA-wrw7-89jp-8q8g
 
   license-check:
     name: License, Advisory & Ban Check

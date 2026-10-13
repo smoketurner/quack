@@ -5749,21 +5749,20 @@ name = "quack-desktop"
 version = "2026.10.7"
 dependencies = [
  "anyhow",
- "quack-cli",
+ "futures",
  "quack-core",
- "quack-testkit",
+ "quack-server",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
- "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "utoipa",
 ]
 
 [[package]]

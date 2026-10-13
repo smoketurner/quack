@@ -18,6 +18,13 @@ ignore = [
     # ttf-parser is unmaintained but only used transitively by pdf-extract for
     # font parsing during PDF text extraction. No security impact.
     "RUSTSEC-2026-0192",
+    # glib 0.18's VariantStrIter is unsound on a misuse quack never makes; it is
+    # the GTK 3 tree Tauri 2 links on Linux only (crates/quack-desktop), where no
+    # release builds the app. Goes when Tauri moves to gtk-rs 0.20.
+    "RUSTSEC-2024-0429",
+    # proc-macro-error is unmaintained: a build-time macro helper in the same
+    # Linux-only GTK tree, through glib-macros.
+    "RUSTSEC-2024-0370",
 ]
 
 [licenses]

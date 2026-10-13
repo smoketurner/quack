@@ -11,8 +11,9 @@ A knowledge engine with many interfaces, built in Rust. A workspace holds docume
 across all three and shows every action. The core is a library; the web UI, REST API, MCP
 server, terminal session, and print mode are thin clients of it, all subcommands of one
 `quack` binary with no Cargo features; the desktop app (`crates/quack-desktop`, a Tauri
-window with a React frontend over the same core, `docs/desktop.md`, #35) is a second binary
-with its first four views built and no release packaging yet. The
+window showing the web UI served in-process by `quack_server::Embedded` through the
+`quack://` scheme, its two streams over IPC, `docs/desktop.md`, #35) is a second binary
+with no release packaging yet. The
 design is `docs/design-doc.md`; read it before any non-trivial change, and check its
 section 17 for where the code still lags. The chosen stack:
 
@@ -41,7 +42,7 @@ Cargo.toml            # virtual workspace: deps menu + strict lints + profiles
 deny.toml             # advisories, license allow-list, OpenSSL/ring bans
 rust-toolchain.toml   # pinned 1.99.0 + rustfmt + clippy
 Makefile              # build / fmt / lint / test / deny
-crates/               # quack-core (engine), quack-cli (shared command verbs), quack-server (REST, web UI, MCP), quack-terminal (the session), quack-desktop (the Tauri app and its ui/), quack-testkit, quack (the binary), quack-eval (the harness that drives the binary) — see crates/README.md
+crates/               # quack-core (engine), quack-cli (shared command verbs), quack-server (REST, web UI, MCP), quack-terminal (the session), quack-desktop (the Tauri app), quack-testkit, quack (the binary), quack-eval (the harness that drives the binary) — see crates/README.md
 docs/                 # design-doc.md (the product), architecture, migrations, crypto, web-ui, ci-cd, authentication, providers
 .claude/rules/        # code-standards and development-discipline gates; branching, commits, continuous-improvement conventions
 ```

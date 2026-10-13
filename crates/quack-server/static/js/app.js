@@ -346,36 +346,17 @@
       if (picked.length) body.document_ids = picked;
     }
 
-    // Stop aborts the request; the server sees the stream close and
+    // Stop ends the request; the server sees the stream close and
     // cancels the turn, recording what streamed so far.
-    var controller = new AbortController();
     var stop = form.querySelector("#stop");
-    var onStop = function () { controller.abort(); };
-    if (stop) stop.addEventListener("click", onStop);
-
-    fetch("/api/v1/workspaces/" + ws + "/query/stream", {
-      method: "POST",
-      headers: { "content-type": "application/json", "accept": "text/event-stream" },
-      body: JSON.stringify(body),
-      credentials: "same-origin",
-      signal: controller.signal
-    }).then(function (res) {
-      if (!res.ok) return errorMessage(res).then(function (message) { throw new Error(message); });
+    var stream = openStream("POST", "/api/v1/workspaces/" + ws + "/query/stream", body, function (event, data) {
       var empty = document.getElementById("empty");
       if (empty && empty.parentNode) empty.parentNode.removeChild(empty);
-      var reader = res.body.getReader();
-      var decoder = new TextDecoder();
-      var buffer = "";
-      function pump() {
-        return reader.read().then(function (r) {
-          if (r.done) return;
-          buffer += decoder.decode(r.value, { stream: true });
-          buffer = parseSse(buffer, function (event, data) { handle(event, data, view, chat, status); });
-          return pump();
-        });
-      }
-      return pump();
-    }).catch(function (err) {
+      handle(event, data, view, chat, status);
+    });
+    var onStop = function () { stream.stop(); };
+    if (stop) stop.addEventListener("click", onStop);
+    stream.done.catch(function (err) {
       if (err.name === "AbortError") {
         view.body.textContent += (view.body.textContent ? "\n\n" : "") + "(Cancelled.)";
         return;
@@ -388,6 +369,63 @@
       setBusy(form, false);
       form.prompt.focus();
     });
+  }
+
+  // Inside Quack.app the page is served through a scheme that answers a
+  // request whole, so a server-sent event route is read by the app and
+  // handed over event by event; in a browser the same route streams.
+  var desktop = window.__TAURI__ && window.__TAURI__.core;
+  var streamIds = 0;
+
+  // Open `method url` and call onEvent(name, data) for each event. The
+  // result's `done` settles when the stream ends (rejecting with an
+  // AbortError after `stop`, or with the route's error).
+  function openStream(method, url, body, onEvent) {
+    if (desktop) return desktopStream(method, url, body, onEvent);
+    var controller = new AbortController();
+    var done = fetch(url, {
+      method: method,
+      headers: body ? { "content-type": "application/json", "accept": "text/event-stream" } : { "accept": "text/event-stream" },
+      body: body ? JSON.stringify(body) : undefined,
+      credentials: "same-origin",
+      signal: controller.signal
+    }).then(function (res) {
+      if (!res.ok) return errorMessage(res).then(function (message) { throw new Error(message); });
+      var reader = res.body.getReader();
+      var decoder = new TextDecoder();
+      var buffer = "";
+      function pump() {
+        return reader.read().then(function (r) {
+          if (r.done) return;
+          buffer += decoder.decode(r.value, { stream: true });
+          buffer = parseSse(buffer, onEvent);
+          return pump();
+        });
+      }
+      return pump();
+    });
+    return { done: done, stop: function () { controller.abort(); } };
+  }
+
+  function desktopStream(method, url, body, onEvent) {
+    var id = "s" + (++streamIds);
+    var stopped = false;
+    var done = new Promise(function (resolve, reject) {
+      var channel = new desktop.Channel();
+      var failed = null;
+      channel.onmessage = function (frame) {
+        if (frame.type === "event") onEvent(frame.event, frame.data);
+        else if (frame.type === "error") failed = new Error(frame.message);
+        else if (frame.type === "close") {
+          if (stopped) { var e = new Error("stopped"); e.name = "AbortError"; reject(e); }
+          else if (failed) reject(failed);
+          else resolve();
+        }
+      };
+      desktop.invoke("stream", { open: { id: id, method: method, url: url, body: body ? JSON.stringify(body) : null }, onFrame: channel })
+        .catch(function (err) { reject(new Error(String(err))); });
+    });
+    return { done: done, stop: function () { stopped = true; desktop.invoke("stop_stream", { id: id }); } };
   }
 
   // The rows a run_sql or create_chart step kept, as a collapsed grid with
@@ -494,8 +532,14 @@
       finishWorking(view);
     } else if (event === "permission_required") {
       askPermission(view, JSON.parse(data), chat.getAttribute("data-workspace"));
+    } else if (event === "permission_answered") {
+      var answered = JSON.parse(data);
+      if (answers[answered.request]) { answers[answered.request](answered.reply); delete answers[answered.request]; }
     }
   }
+
+  // What each write prompt's card does with the app's answer, by request.
+  var answers = {};
 
   // A write the agent wants to run waits for the person: the statement,
   // the answers the server offers, and the time the turn stops waiting.
@@ -514,7 +558,14 @@
       buttons.remove();
       note.textContent = "Not run: no answer by " + expires.toLocaleTimeString() + ".";
     }, Math.max(0, expires - new Date()));
+    if (desktop) {
+      // The app shows the question in a native dialog and sends the
+      // answer itself; the card reports what it said.
+      note.textContent = "Answer in the dialog. " + note.textContent;
+      answers[p.request] = function (reply) { clearTimeout(timer); note.textContent = reply; };
+    }
     p.choices.forEach(function (choice) {
+      if (desktop) return;
       var style = choice.decision === "allow"
         ? "rounded bg-blue-600 px-3 py-2 text-white hover:bg-blue-500"
         : "rounded border border-slate-700 px-3 py-2 hover:bg-slate-800";
@@ -609,7 +660,7 @@
 
   function followJobs() {
     var rows = document.querySelector("[data-jobs-stream]");
-    if (!rows || !window.EventSource) return;
+    if (!rows || !(window.EventSource || desktop)) return;
     var pending = null;
     var lastProgress = 0;
     function refresh() {
@@ -619,21 +670,34 @@
         document.body.dispatchEvent(new CustomEvent("jobs-changed"));
       }, 250);
     }
-    var source = new EventSource(rows.getAttribute("data-jobs-stream"));
-    source.addEventListener("job", function (ev) {
-      var changed = true;
-      try { changed = noteJob(JSON.parse(ev.data)); } catch (e) { /* refresh as for a change */ }
-      if (changed) {
-        refresh();
-      } else if (Date.now() - lastProgress >= PROGRESS_REFRESH_MS) {
-        lastProgress = Date.now();
+    function onEvent(event, data) {
+      if (event === "job") {
+        var changed = true;
+        try { changed = noteJob(JSON.parse(data)); } catch (e) { /* refresh as for a change */ }
+        if (changed) {
+          refresh();
+        } else if (Date.now() - lastProgress >= PROGRESS_REFRESH_MS) {
+          lastProgress = Date.now();
+          refresh();
+        }
+      } else if (event === "jobs") {
+        try { JSON.parse(data).forEach(function (job) { jobStates[job.id] = job.state; }); } catch (e) { /* a refresh still follows */ }
         refresh();
       }
-    });
-    source.addEventListener("jobs", function (ev) {
-      try { JSON.parse(ev.data).forEach(function (job) { jobStates[job.id] = job.state; }); } catch (e) { /* a refresh still follows */ }
-      refresh();
-    });
+    }
+    var url = rows.getAttribute("data-jobs-stream");
+    if (desktop) {
+      // The app reads the stream; when it ends, open it again as a browser would.
+      (function follow() {
+        openStream("GET", url, null, onEvent).done.catch(function () { /* reopened below */ }).then(function () {
+          setTimeout(follow, 3000);
+        });
+      })();
+    } else {
+      var source = new EventSource(url);
+      source.addEventListener("job", function (ev) { onEvent("job", ev.data); });
+      source.addEventListener("jobs", function (ev) { onEvent("jobs", ev.data); });
+    }
     offerNotifications();
   }
 

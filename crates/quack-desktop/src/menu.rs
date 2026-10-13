@@ -1,12 +1,12 @@
-//! The native menu bar. Items the frontend acts on (a view, a new
-//! session, adding files) reach it as the Tauri event `menu` with the
-//! item's id; the standard items are the OS's own.
+//! The native menu bar: the app's own items, and the OS's standard ones.
 
-use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::{AppHandle, Emitter, Wry};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::{AppHandle, Wry};
 
-/// The event a chosen item goes out on, with its id as the payload.
-pub(crate) const EVENT: &str = "menu";
+/// File › Add Files…: files picked in the OS dialog go to the open workspace.
+pub(crate) const ADD_FILES: &str = "file:add-files";
+/// File › Add Folder…: every supported file under the chosen folders.
+pub(crate) const ADD_FOLDER: &str = "file:add-folder";
 
 /// Build the menu bar.
 ///
@@ -21,8 +21,7 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         &[
             &PredefinedMenuItem::about(app, None, None)?,
             &PredefinedMenuItem::separator(app)?,
-            &MenuItem::with_id(app, "settings", "Settings…", true, Some("CmdOrCtrl+,"))?,
-            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::hide(app, None)?,
             &PredefinedMenuItem::quit(app, None)?,
         ],
     )?;
@@ -31,31 +30,10 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         "File",
         true,
         &[
+            &MenuItem::with_id(app, ADD_FILES, "Add Files…", true, Some("CmdOrCtrl+O"))?,
             &MenuItem::with_id(
                 app,
-                "file:new-workspace",
-                "New Workspace…",
-                true,
-                None::<&str>,
-            )?,
-            &MenuItem::with_id(
-                app,
-                "file:new-session",
-                "New Session",
-                true,
-                Some("CmdOrCtrl+N"),
-            )?,
-            &PredefinedMenuItem::separator(app)?,
-            &MenuItem::with_id(
-                app,
-                "file:add-files",
-                "Add Files…",
-                true,
-                Some("CmdOrCtrl+O"),
-            )?,
-            &MenuItem::with_id(
-                app,
-                "file:add-folder",
+                ADD_FOLDER,
                 "Add Folder…",
                 true,
                 Some("CmdOrCtrl+Shift+O"),
@@ -78,29 +56,6 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
             &PredefinedMenuItem::select_all(app, None)?,
         ],
     )?;
-    let view = Submenu::with_items(
-        app,
-        "View",
-        true,
-        &[
-            &MenuItem::with_id(
-                app,
-                "view:workspaces",
-                "Workspaces",
-                true,
-                Some("CmdOrCtrl+1"),
-            )?,
-            &MenuItem::with_id(app, "view:chat", "Chat", true, Some("CmdOrCtrl+2"))?,
-            &MenuItem::with_id(
-                app,
-                "view:documents",
-                "Documents",
-                true,
-                Some("CmdOrCtrl+3"),
-            )?,
-            &MenuItem::with_id(app, "view:settings", "Settings", true, Some("CmdOrCtrl+4"))?,
-        ],
-    )?;
     let window = Submenu::with_items(
         app,
         "Window",
@@ -110,13 +65,5 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
             &PredefinedMenuItem::fullscreen(app, None)?,
         ],
     )?;
-    Menu::with_items(app, &[&quack, &file, &edit, &view, &window])
-}
-
-/// A chosen item, handed to the frontend by id.
-pub(crate) fn on_event(app: &AppHandle, event: &MenuEvent) {
-    let id: &str = event.id().as_ref();
-    if let Err(e) = app.emit(EVENT, id) {
-        tracing::debug!(error = %e, id, "a menu choice could not reach the frontend");
-    }
+    Menu::with_items(app, &[&quack, &file, &edit, &window])
 }

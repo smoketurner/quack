@@ -2,7 +2,7 @@
 //! directory (`{data_dir}/logs/desktop.YYYY-MM-DD.log`, seven kept), in
 //! `[server].log_format`'s text or JSON.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use quack_core::config::{Config, LogFormat};
@@ -15,10 +15,8 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 /// Log files kept before the oldest is deleted.
 const KEPT: usize = 7;
 
-/// Where the log goes, and the writer thread that must outlive every log
-/// line: drop it last.
+/// The writer thread that must outlive every log line: drop it last.
 pub(crate) struct Logging {
-    pub(crate) dir: PathBuf,
     _guard: WorkerGuard,
 }
 
@@ -44,7 +42,7 @@ pub(crate) fn init(config: &Config) -> Result<Logging> {
     // The provider was installed before any subscriber existed; this is
     // the first point where saying so reaches a log.
     CryptoModule::linked().log();
-    Ok(Logging { dir, _guard: guard })
+    Ok(Logging { _guard: guard })
 }
 
 fn appender(dir: &Path) -> Result<RollingFileAppender> {

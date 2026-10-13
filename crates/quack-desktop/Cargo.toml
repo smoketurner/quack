@@ -15,19 +15,20 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-quack-cli            = { path = "../quack-cli" }
 quack-core           = { path = "../quack-core" }
+quack-server         = { path = "../quack-server" }
 anyhow               = { workspace = true, features = ["std"] }
+futures              = { workspace = true, features = ["std"] }
 serde                = { workspace = true, features = ["derive", "std"] }
 serde_json           = { workspace = true, features = ["std"] }
 tauri                = { workspace = true, features = ["wry", "image-png"] }
 tauri-plugin-dialog  = { workspace = true }
 tauri-plugin-opener  = { workspace = true }
 tokio                = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+tokio-util           = { workspace = true }
 tracing              = { workspace = true, features = ["std"] }
 tracing-appender     = { workspace = true }
 tracing-subscriber   = { workspace = true, features = ["fmt", "env-filter", "json", "std"] }
-utoipa               = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The dialog plugin's Linux backend: GTK 3 dialogs, the one the window's
@@ -36,7 +37,3 @@ tauri-plugin-dialog = { workspace = true, features = ["gtk3"] }
 
 [build-dependencies]
 tauri-build = { workspace = true }
-
-[dev-dependencies]
-quack-testkit = { path = "../quack-testkit" }
-tempfile      = { workspace = true }

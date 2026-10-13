@@ -1,1 +1,0 @@
-{"default":{"identifier":"default","description":"The main window: the app's own commands, native dialogs, and opening links in the browser.","local":true,"windows":["main"],"permissions":["core:default","dialog:default","opener:default"]}}

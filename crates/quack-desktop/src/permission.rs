@@ -1,56 +1,26 @@
 //! A write a turn waits on, answered in a native dialog built from
 //! `Decision`'s words (design 3.5): the heading, the hold's notice, the
-//! statement, and the three answers in their order. Dialogs show one at a
-//! time; closing one any other way is a refusal.
+//! statement, and the three answers in their order. Closing the dialog
+//! any other way is a refusal.
 
 use std::fmt::Write;
 
-use quack_core::analysis::events::{Decision, Delivery, PermissionRequest};
-use quack_core::analysis::policy::Hold;
+use quack_core::analysis::events::Decision;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{
     DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
 };
 use tokio::sync::oneshot;
 
-use crate::app::AppState;
-
 /// Characters of the statement the dialog shows; the chat shows it all.
 const SQL_SHOWN: usize = 1_500;
 
-/// How the person answered, and whether the turn still waited for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Answer {
-    pub(crate) decision: Decision,
-    pub(crate) delivery: Delivery,
-}
-
-impl Answer {
-    /// What the transcript says under the statement.
-    pub(crate) fn reply(self) -> &'static str {
-        match self.delivery {
-            Delivery::Delivered => self.decision.reply(),
-            Delivery::TurnGone => Delivery::TURN_GONE,
-        }
-    }
-}
-
-/// Show the dialog for `request`, after any dialog already showing, and
-/// give the turn the answer.
-pub(crate) async fn ask(app: &AppHandle, request: PermissionRequest) -> Answer {
-    let state = app.state::<AppState>();
-    let one_at_a_time = state.dialogs.lock().await;
-    let decision = show(app, &request.sql, request.hold).await;
-    let delivery = request.answer(decision);
-    drop(one_at_a_time);
-    Answer { decision, delivery }
-}
-
-async fn show(app: &AppHandle, sql: &str, hold: Hold) -> Decision {
+/// Show the dialog for a statement and wait for the answer.
+pub(crate) async fn show(app: &AppHandle, sql: &str, notice: Option<&str>) -> Decision {
     let (tx, rx) = oneshot::channel();
     let mut dialog = app
         .dialog()
-        .message(body(sql, hold))
+        .message(body(sql, notice))
         .title(Decision::HEADING)
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::YesNoCancelCustom(
@@ -93,9 +63,9 @@ pub(crate) fn decision_of(result: &MessageDialogResult) -> Decision {
 
 /// The dialog's body: the hold's notice when there is one, then the
 /// statement, cut when long.
-pub(crate) fn body(sql: &str, hold: Hold) -> String {
+pub(crate) fn body(sql: &str, notice: Option<&str>) -> String {
     let mut text = String::new();
-    if let Some(notice) = hold.notice() {
+    if let Some(notice) = notice {
         text.push_str(notice);
         text.push_str("\n\n");
     }
@@ -103,9 +73,8 @@ pub(crate) fn body(sql: &str, hold: Hold) -> String {
     text.push_str(&shown);
     if shown.len() < sql.len() {
         let more = sql.lines().count().saturating_sub(shown.lines().count());
-        // Writing to a String cannot fail.
         if write!(text, "\n… and {more} more lines, shown in the chat").is_err() {
-            text.push_str("\n…");
+            // Writing to a String does not fail.
         }
     }
     text
@@ -139,16 +108,16 @@ mod tests {
     /// cut and says how much the chat still shows.
     #[test]
     fn the_body_carries_the_notice_and_cuts_a_long_statement() {
-        let short = body("DELETE FROM t", Hold::NotPermitted);
+        let short = body("DELETE FROM t", None);
         assert_eq!(short, "DELETE FROM t");
-        let read = body("DELETE FROM t", Hold::ReadDocuments);
+        let read = body("DELETE FROM t", Hold::ReadDocuments.notice());
         assert!(read.starts_with("This turn read document text"));
         assert!(read.ends_with("\n\nDELETE FROM t"));
         let long = "UPDATE t SET n = 1;\n".repeat(200);
-        let cut = body(&long, Hold::NotPermitted);
+        let cut = body(&long, None);
         assert!(cut.chars().count() < long.chars().count());
         assert!(cut.contains("more lines, shown in the chat"), "{cut}");
-        let head: String = long.chars().take(SQL_SHOWN.min(40)).collect();
-        assert!(cut.starts_with(&head));
+        let shown: String = long.chars().take(SQL_SHOWN).collect();
+        assert!(cut.starts_with(&shown));
     }
 }

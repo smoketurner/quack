@@ -99,7 +99,7 @@ depends on `quack-core` alone.
 | Module | Owns |
 |---|---|
 | `mcp` | the MCP server (rmcp) shared by `quack mcp` on stdio and `/mcp/v1/{workspace}` |
-| `lib` (the server) | `quack serve`: `auth` (identity and `Access::resolve`), `api` (REST handlers; `api::openapi` builds their OpenAPI 3.1 document, served at `/api/v1/openapi.json` and rendered at `/api/v1/docs`), `error` (`ApiError` and the stable `ErrorCode` every error body carries), `web` (askama pages calling the same `Access` operations as the API, [web-ui.md](web-ui.md)), `run` (`Access` as the `RunAudit` of core's `jobs::runs`, and the graph follow-up after an ingest), `permissions` (the timeout and expiry audit around core's `analysis::permissions`), `api::jobs` (the jobs API and stream), `state`, `mcp_http` |
+| `lib` (the server) | `quack serve`: `auth` (identity and `Access::resolve`), `api` (REST handlers; `api::openapi` builds their OpenAPI 3.1 document, served at `/api/v1/openapi.json` and rendered at `/api/v1/docs`), `error` (`ApiError` and the stable `ErrorCode` every error body carries), `web` (askama pages calling the same `Access` operations as the API, [web-ui.md](web-ui.md)), `run` (`Access` as the `RunAudit` of core's `jobs::runs`, and the graph follow-up after an ingest), `permissions` (the timeout and expiry audit around core's `analysis::permissions`), `api::jobs` (the jobs API and stream), `state`, `mcp_http`, `embedded` (`Embedded`: the router and `AppState` in local mode, driven by the desktop app with no listener) |
 
 The templates, static assets, stylesheet input, and the SQL editor's bundle sit beside its
 `src/`.
@@ -119,16 +119,18 @@ the server.
 
 ## `quack-desktop`
 
-The desktop app, a second binary (`docs/desktop.md`): Tauri commands over `quack-core` and
-`quack-cli`, a React frontend in `ui/` bundled into the app. It depends on no server code.
+The desktop app, a second binary (`docs/desktop.md`): a Tauri window showing the web UI,
+served in-process by `quack-server`'s `Embedded` (the router and `AppState` in local mode,
+driven with no listener) through the `quack://` scheme; the two streaming routes go over
+Tauri's IPC.
 
 | Module | Owns |
 |---|---|
-| `app` | `AppState`: the configuration, the control plane, the one job queue, the workspaces held open (each a `SharedDb`, a `ReaderDb`, an audit connection, and a `forward::Listener`), each session's running turn, the "run without asking" toggle |
-| `workspace`, `chat`, `documents`, `jobs`, `settings` | the commands behind the first four views, each returning the engine's own types |
-| `permission` | the native dialog a `PermissionRequired` event is answered in, built from `Decision`'s words |
-| `audit` | `audit_log` rows on channel `desktop` plus the `_quack_audit` detail |
-| `menu`, `log`, `schema` | the native menu, the rolling log file, and the JSON Schema the frontend's types are generated from |
+| `main` | the scheme handler that hands each request to `Embedded::handle`, the window, the menu's file pickers, quit through `Embedded::shutdown` |
+| `bridge` | the `stream` command: a streaming route parsed into server-sent events and sent down a `Channel`; `permission_required` answered in the dialog and posted back through the router |
+| `permission` | the native dialog built from `Decision`'s words |
+| `drop` | files and folders by path, uploaded through the router as the Documents form does |
+| `menu`, `log` | the native menu bar and the rolling log file |
 
 ## `quack`
 

@@ -3,6 +3,7 @@
 
 mod api;
 mod auth;
+mod embedded;
 mod error;
 mod mcp;
 mod mcp_http;
@@ -15,6 +16,7 @@ mod state;
 mod tests;
 mod web;
 
+pub use embedded::Embedded;
 pub use mcp::serve_stdio;
 pub use state::ServeMode;
 
