@@ -38,12 +38,45 @@ pub enum ServeMode {
     Local,
 }
 
+/// The `Host` values a local-mode server answers: local mode makes every
+/// request the implicit owner, and the cross-site check only compares
+/// `Origin` with `Host`, so a page on a name that resolves to loopback
+/// (DNS rebinding) would otherwise pass. Loopback names on the bound port
+/// only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalHosts(Vec<String>);
+
+impl LocalHosts {
+    /// The loopback names on `port`; on port 80 the bare names too, since a
+    /// browser omits the default port.
+    pub(crate) fn on(port: u16) -> Self {
+        let names = ["127.0.0.1", "localhost", "[::1]"];
+        let mut hosts: Vec<String> = names.iter().map(|n| format!("{n}:{port}")).collect();
+        if port == 80 {
+            hosts.extend(names.iter().map(|n| String::from(*n)));
+        }
+        Self(hosts)
+    }
+
+    /// Whether a request's `Host` header is one of them.
+    pub(crate) fn allows(&self, host: &str) -> bool {
+        self.0.iter().any(|h| h.eq_ignore_ascii_case(host))
+    }
+
+    pub(crate) fn names(&self) -> Vec<String> {
+        self.0.clone()
+    }
+}
+
 pub(crate) struct AppState {
     /// The process: its queue, its open workspaces (one handle per file),
     /// and its stopping token.
     pub engine: Arc<Engine>,
     pub control: ControlPlane,
     pub mode: ServeMode,
+    /// In local mode, the `Host` values answered; `None` with logins, where
+    /// the credential, not the name, guards the server.
+    pub local_hosts: Option<LocalHosts>,
     /// Browser and API-login sessions.
     pub sessions: Arc<WebSessions>,
     /// Sign-in through `[server.oidc]`'s issuer, when configured and not in
@@ -140,6 +173,7 @@ impl AppState {
         engine: Arc<Engine>,
         control: ControlPlane,
         mode: ServeMode,
+        local_hosts: Option<LocalHosts>,
         sessions: Arc<WebSessions>,
         oidc: Option<Oidc>,
     ) -> Self {
@@ -151,6 +185,7 @@ impl AppState {
             engine,
             control,
             mode,
+            local_hosts,
             sessions,
             resource,
             oidc,
@@ -211,16 +246,21 @@ impl AppState {
         served
     }
 
-    /// Drop every MCP transport, then every workspace handle, so each
-    /// writer finishes its queued closures and checkpoints; the last thing
-    /// the server does.
+    /// Drop every MCP transport, the last thing the server does; whoever
+    /// owns the engine closes it after (`Engine::close`), so a terminal
+    /// session serving beside itself keeps its workspace until it quits.
     pub(crate) async fn close(&self) {
         let transports = std::mem::take(&mut *self.mcp.lock().await);
         let closed = tokio::task::spawn_blocking(move || drop(transports));
         if let Err(e) = closed.await {
             tracing::error!(error = %e, "closing the MCP transports failed");
         }
-        self.engine.close().await;
+    }
+
+    /// Whether this server serves `workspace`: every one for `quack serve`,
+    /// only the session's own when a terminal serves beside itself.
+    pub(crate) fn serves(&self, workspace_id: &WorkspaceId) -> bool {
+        self.engine.held().is_none_or(|held| held == workspace_id)
     }
 
     /// Let go of one workspace before it is deleted: its MCP transports
@@ -335,9 +375,14 @@ impl AppState {
             move || Ok(server.clone()),
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default()
-                // The server may sit behind any host name; bearer auth,
-                // not the Host header, is what guards it.
-                .with_allowed_hosts(Vec::<String>::new())
+                // With logins the server may sit behind any host name, since
+                // bearer auth, not the Host header, guards it; local mode
+                // answers loopback names only.
+                .with_allowed_hosts(
+                    self.local_hosts
+                        .as_ref()
+                        .map_or_else(Vec::new, LocalHosts::names),
+                )
                 .with_json_response(true)
                 // Its standalone event streams end when the server stops.
                 .with_cancellation_token(self.engine.stopping()),

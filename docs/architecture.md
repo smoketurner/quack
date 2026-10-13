@@ -109,8 +109,10 @@ The templates, static assets, stylesheet input, and the SQL editor's bundle sit 
 ## `quack-terminal`
 
 The interactive session, a library of the one binary: `quack_terminal::run` and
-`SessionSetup` are its whole public API. It depends on `quack-core` and `quack-cli`, not on
-the server.
+`SessionSetup` (with `WebStatus`, where the binary serves the web UI beside the session, and
+`QUIT_GRACE`) are its whole public API. It depends on `quack-core` and `quack-cli`, not on
+the server: the binary starts `quack_server::Server` over the session's engine and hands the
+terminal the address.
 
 | Module | Owns |
 |---|---|

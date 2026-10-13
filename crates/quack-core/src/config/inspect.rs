@@ -892,7 +892,8 @@ fn analysis(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
 fn server(inventory: &mut Inventory<'_>, config: &Config, defaults: &Config) {
     let (server, default) = (&config.server, &defaults.server);
     let mut s = inventory.section("server");
-    s.text("bind", &server.bind, &default.bind, Some(ENV_BIND));
+    let (bind, default_bind) = (server.bind_or_default(), default.bind_or_default());
+    s.text("bind", bind, default_bind, Some(ENV_BIND));
     s.literal("local", server.local, default.local);
     s.literal(
         "workers_per_workspace",

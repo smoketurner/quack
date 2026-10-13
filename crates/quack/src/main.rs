@@ -48,6 +48,7 @@ use quack_core::storage::writer::Writer;
 use quack_core::vault::Vault;
 use quack_core::{config, doctor};
 use std::io::{IsTerminal, Read, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -64,8 +65,9 @@ use quack_cli::{OpenedWorkspace, SessionChoice, find_session, resolve_session};
 use quack_cli::{embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
 use quack_core::forward::Holder;
 
-use quack_server::ServeMode;
-use quack_terminal::SessionSetup;
+use quack_core::config::ServerConfig;
+use quack_server::{ServeMode, Server};
+use quack_terminal::{QUIT_GRACE, SessionSetup, WebStatus};
 
 use crate::progress_line::StderrProgress;
 
@@ -395,7 +397,7 @@ impl ReadyArgs {
     /// The URL a server bound to `bind` answers on: an unspecified address
     /// is reached on loopback of the same family, and an IPv6 host is
     /// written in brackets.
-    fn url_for(bind: std::net::SocketAddr) -> String {
+    fn url_for(bind: SocketAddr) -> String {
         let host = match bind.ip() {
             std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
@@ -405,7 +407,7 @@ impl ReadyArgs {
             }
             ip => ip,
         };
-        format!("http://{}", std::net::SocketAddr::new(host, bind.port()))
+        format!("http://{}", SocketAddr::new(host, bind.port()))
     }
 
     /// `quack ready`: `GET /readyz` on the server and exit by its answer. The
@@ -415,10 +417,10 @@ impl ReadyArgs {
             url
         } else {
             let config = Config::load().context("failed to load configuration")?;
-            let bind: std::net::SocketAddr = config.server.bind.parse().with_context(|| {
+            let bind: SocketAddr = config.server.bind_or_default().parse().with_context(|| {
                 format!(
                     "[server].bind '{}' is not a socket address",
-                    config.server.bind
+                    config.server.bind_or_default()
                 )
             })?;
             Self::url_for(bind)
@@ -1803,7 +1805,23 @@ fn open_browser(url: &str) -> bool {
         .is_ok()
 }
 
-/// No arguments: the interactive session, which needs a terminal.
+/// Where the session serves the web UI, REST API, and MCP beside itself:
+/// `[server].bind`'s port on loopback, or a random loopback port when
+/// nothing set one. The host part is not used, since local mode serves
+/// without authentication and must stay on loopback; a loopback host
+/// configured there is kept as written.
+fn local_addr(server: &ServerConfig) -> SocketAddr {
+    let configured: Option<SocketAddr> = server.bind.as_deref().and_then(|b| b.parse().ok());
+    match configured {
+        Some(addr) if addr.ip().is_loopback() => addr,
+        Some(addr) => SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, addr.port())),
+        None => SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+    }
+}
+
+/// No arguments: the interactive session, which needs a terminal, and the
+/// web UI, REST API, and MCP on loopback beside it from the same engine. A
+/// server that cannot start is one transcript line.
 async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode> {
     if !std::io::stdin().is_terminal() || !stdout_is_tty {
         init_logging();
@@ -1826,8 +1844,24 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
             .run(move |db| Ok(resolve_session(&config, db, choice, mode)))
             .await??
     };
+    let addr = local_addr(&opened.config().server);
+    let started = Server::start(
+        Arc::clone(&opened.engine),
+        opened.control.clone(),
+        addr,
+        ServeMode::Local,
+    )
+    .await;
+    let (web, server) = match started {
+        Ok(server) => (
+            WebStatus::Listening(server.local_addr().unwrap_or(addr)),
+            Some(tokio::spawn(server.run(QUIT_GRACE))),
+        ),
+        Err(e) => (WebStatus::Unavailable(format!("{e:#}")), None),
+    };
     let session = quack_terminal::run(SessionSetup {
         engine: Arc::clone(&opened.engine),
+        web,
         workspace_name: opened.name,
         workspace_id: opened.workspace.id,
         db: Arc::clone(&handle.writer),
@@ -1836,7 +1870,15 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
         writes: WritePolicy::Ask.allowed_if(cli.allow_write),
     })
     .await;
-    // The session's quit stopped the jobs; the writer checkpoints last.
+    // The session's quit stopped the jobs (a session that failed did not:
+    // begin the stop here, so the server drains either way), the server
+    // drains under the same grace, and the writer checkpoints last.
+    opened.engine.begin_stop();
+    if let Some(server) = server
+        && let Ok(Err(e)) = tokio::time::timeout(QUIT_GRACE, server).await
+    {
+        tracing::warn!(error = %e, "the web server beside the session ended with an error");
+    }
     drop(handle);
     opened.engine.close().await;
     session?;

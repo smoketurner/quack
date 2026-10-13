@@ -60,13 +60,13 @@ use quack_core::storage::workspace::{
 use quack_core::text::OneLine;
 use quack_core::vault::Vault;
 
-use crate::SessionSetup;
 use crate::chart::ChartData;
 use crate::clipboard::{Clipboard, CopyStatus};
 use crate::commands::{Completion, ContextAction, FileLine, GraphWalk, Input, Route, SlashCommand};
 use crate::picker::{Picked, Picker};
 use crate::selection::{Edge, Located, Selection, TranscriptView};
 use crate::ui::{self, JobRow, Scroll, Spinner, Wrapped, one_line};
+use crate::{QUIT_GRACE, SessionSetup, WebStatus};
 use quack_cli::Confirm;
 use quack_cli::ModeArg;
 use quack_cli::TextOrJson;
@@ -80,9 +80,6 @@ use quack_cli::{ImportAction, ImportContext};
 
 /// The spinner's frame interval; it ticks only while a job is active.
 const SPINNER_MS: u64 = 80;
-
-/// How long quitting waits for cancelled jobs to stop.
-const QUIT_GRACE: Duration = Duration::from_secs(3);
 
 /// Sessions `/sessions` lists at most, newest first.
 const PICKER_SESSIONS: u32 = 200;
@@ -1018,6 +1015,7 @@ impl App {
     pub(crate) fn new(setup: SessionSetup) -> Self {
         let SessionSetup {
             engine,
+            web,
             workspace_name,
             workspace_id,
             db,
@@ -1025,6 +1023,14 @@ impl App {
             session_id,
             writes,
         } = setup;
+        let web_line = match web {
+            WebStatus::Listening(addr) => {
+                format!("web: http://{addr} serves this workspace's web UI, REST API, and MCP")
+            }
+            WebStatus::Unavailable(why) => {
+                format!("web: {why}; this session runs without the web UI and MCP")
+            }
+        };
         let config = engine.config.clone();
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         let jobs = engine.jobs.clone();
@@ -1073,6 +1079,7 @@ impl App {
         if app.config.general.chat_model.is_none() {
             app.note(MessageKind::System, NO_CHAT_MODEL_TEXT);
         }
+        app.note(MessageKind::System, web_line);
         app
     }
 

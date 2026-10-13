@@ -2867,7 +2867,24 @@ form's JSON Schema), `.../context` (Markdown).
 ### 11.4 Terminal session
 
 The terminal is a Claude Code-style single-pane transcript on a named workspace (`-w`,
-resolved through the control plane like every interface). It never blocks its input. It shows
+resolved through the control plane like every interface). Bare `quack` also serves what
+`quack serve --local` serves, from the session's own engine, on `127.0.0.1` at the port of
+`[server].bind` when one is set (the host part is not used: local mode stays on loopback)
+and on a random loopback port otherwise, so a browser and
+Claude Code's MCP entry (`http://127.0.0.1:8080/mcp/v1/{workspace}`) reach the workspace the
+session holds without a second process. The transcript's first lines say where
+(`web: http://127.0.0.1:8080 serves this workspace's web UI, REST API, and MCP`; that
+address's console lists the one workspace served); a server that cannot start (the port is taken, a
+provider client has no registration) is one transcript line and the session runs without it.
+That server serves the session's workspace alone: the console lists one, and any other id is
+unknown there (404), so a browser click never makes the session's process open another
+workspace's file. One queue and one open per file: the strip and `/jobs` show the browser's
+uploads and the MCP turns beside the terminal's own, `/cancel N` stops either, and a turn on
+the same session from either side waits its turn in that session's lane. Quit gives the jobs
+and the server's drain the same three seconds. Web and MCP requests audit as the implicit
+local user; the terminal's own actions stay unaudited, as every command's do. The session
+listens on the workspace's forward socket too (`quack_core::forward`), so `quack -q` in
+another shell reads through it. It never blocks its input. It shows
 streaming answers, inline steps, citations as footnotes, and ratatui charts. Permission
 prompts take `y`/`n`/`a`, one at a time, and the prompt itself shows who asks, the statement,
 and how many more wait, so clearing or scrolling the transcript never hides what is being
@@ -3137,7 +3154,9 @@ Set aside (#35 closed 2026-10-12). `docs/desktop.md` holds the design that was t
 #546, a separate `quack-desktop` binary showing the web UI through a Tauri custom scheme,
 and the reasons it was stopped: a webview's custom scheme answers a request whole, so the
 streams went over an IPC bridge, redirects had to be followed by hand, the window's URL
-drifted from the page, and the window added little over `quack serve --local` in a browser.
+drifted from the page, and the window added little over `quack serve --local` in a browser;
+since 2026-10-13 bare `quack` serves it beside the session (11.4), so a browser tab is the
+window.
 No `desktop` subcommand and no Tauri dependency exist. The original design, kept for the
 record:
 
@@ -3161,7 +3180,14 @@ installers.
 design.
 
 - `quack serve --local`: no auth, loopback only, one implicit user. For a laptop that wants
-  the browser.
+  the browser. The terminal session serves the same way beside itself (11.4). Local mode
+  answers only `Host` values that are loopback names on its port (`127.0.0.1`, `localhost`,
+  `[::1]`; `server::local_host`, and rmcp's allowed hosts for MCP), since every request there
+  is the owner and the same-origin check cannot tell a page on a name that resolves to
+  loopback (DNS rebinding) from the server's own page. On a host with several accounts, any
+  of them reaches loopback, so a shared machine wants `quack serve` with logins instead;
+  this reverses the desktop design's opt-in endpoint with a per-launch token
+  (`docs/desktop.md` 3.7) for the one-person laptop the terminal is for.
 - Otherwise, users in `control.db` with argon2id password hashes and a login form that sets a
   session cookie; API tokens (`quack token create` or the admin UI) as bearer tokens scoped to
   a workspace with `read` / `write` / `admin` scopes.
@@ -3446,7 +3472,7 @@ enum_max_values = 12                    # distinct values under which a column b
 history = 100                           # finished jobs kept for /jobs and the Jobs page
 
 [server]
-bind = "127.0.0.1:8080"                 # QUACK_BIND
+bind = "127.0.0.1:8080"                 # QUACK_BIND; unset: quack serve takes this, the session a random loopback port
 local = false
 workers_per_workspace = 1               # uploads processed at once per workspace (a lane)
 session_max_age_hours = 12              # a browser session dies this long after login
