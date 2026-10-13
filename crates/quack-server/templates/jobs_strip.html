@@ -5,6 +5,6 @@
   <span class="truncate" title="{{ j.label }}">#{{ j.number }} {{ j.kind }} · {{ j.label }}{% if !j.progress.is_empty() %} · {{ j.progress }}{% endif %}</span>
   {% endfor %}
   {% if more > 0 %}<span class="text-slate-400">and {{ more }} more</span>{% endif %}
-  <a class="ml-auto text-blue-400 hover:underline" href="/w/{{ ws_id }}/jobs">Jobs</a>
+  <span class="ml-auto flex items-center gap-3" data-strip-links><a class="text-blue-400 hover:underline" href="/w/{{ ws_id }}/jobs">Jobs</a></span>
 </div>
 {% endif %}

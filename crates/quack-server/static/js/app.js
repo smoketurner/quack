@@ -581,13 +581,14 @@
     return before !== job.state;
   }
 
-  // The strip's "Notify me": asks once, remembered in this browser.
+  // The strip's "Notify me": offered beside its Jobs link while something
+  // runs, put back after each swap, asked once, remembered in this browser.
   function offerNotifications() {
-    var strip = document.getElementById("jobs-strip");
-    if (!strip || !window.Notification || Notification.permission === "denied" || wantsNotifications()) return;
+    var card = document.querySelector("#jobs-strip [data-strip-links]");
+    if (!card || !window.Notification || Notification.permission === "denied" || wantsNotifications()) return;
     var button = document.createElement("button");
     button.type = "button";
-    button.className = "mt-1 text-xs text-blue-400 hover:underline";
+    button.className = "text-blue-400 hover:underline";
     button.textContent = "Notify me when jobs finish";
     button.addEventListener("click", function () {
       Notification.requestPermission().then(function (answer) {
@@ -597,7 +598,7 @@
         }
       });
     });
-    strip.insertAdjacentElement("afterend", button);
+    card.appendChild(button);
   }
 
   // Every page follows the job stream instead of polling. A job that starts
@@ -634,7 +635,7 @@
       try { JSON.parse(ev.data).forEach(function (job) { jobStates[job.id] = job.state; }); } catch (e) { /* a refresh still follows */ }
       refresh();
     });
-    offerNotifications();
+    document.getElementById("jobs-strip").addEventListener("htmx:after:swap", offerNotifications);
   }
 
   // Relative times go stale; swapped-in rows arrive as UTC.
