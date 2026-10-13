@@ -1,7 +1,8 @@
 //! A workspace another `quack` holds: `-q` runs through the holder's
 //! socket, `jobs` reads through it, and `mcp` relays to it. The holder is
 //! this test's own `OpenedWorkspace` (what the terminal session and every
-//! command hold); the other side is the binary.
+//! command hold); the other side is the binary. Unix only: the socket is.
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -232,9 +233,9 @@ impl McpChild {
     }
 
     /// Send `method` with `params` and read the reply.
-    fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+    fn request(&mut self, method: &str, params: &serde_json::Value) -> serde_json::Value {
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
         let request = serde_json::json!({
             "jsonrpc": "2.0", "id": id, "method": method, "params": params,
         });
@@ -251,7 +252,7 @@ impl McpChild {
     fn initialize(&mut self) -> serde_json::Value {
         let reply = self.request(
             "initialize",
-            serde_json::json!({
+            &serde_json::json!({
                 "protocolVersion": "2025-06-18", "capabilities": {},
                 "clientInfo": {"name": "test", "version": "0"},
             }),
@@ -268,7 +269,7 @@ impl McpChild {
     fn sql(&mut self, statement: &str) -> serde_json::Value {
         self.request(
             "tools/call",
-            serde_json::json!({ "name": "sql", "arguments": { "sql": statement } }),
+            &serde_json::json!({ "name": "sql", "arguments": { "sql": statement } }),
         )
     }
 

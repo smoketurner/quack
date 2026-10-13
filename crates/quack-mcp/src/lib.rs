@@ -502,6 +502,54 @@ enum TurnSession {
     NotFound,
 }
 
+/// What one `query` turn runs with, owned, so the job's task and the
+/// fallback that records a turn the queue never ran build the same request.
+#[derive(Clone)]
+struct TurnInputs {
+    config: Config,
+    db: SharedDb,
+    reader_db: ReaderDb,
+    session: SessionId,
+    question: String,
+    documents: Vec<String>,
+    user: Option<UserId>,
+    policy: WritePolicy,
+}
+
+impl TurnInputs {
+    fn request(
+        &self,
+        labelling: LabelJobs,
+        sink: events::EventSink,
+        cancel: CancellationToken,
+    ) -> llm::TurnRequest<'_> {
+        llm::TurnRequest {
+            db: Arc::clone(&self.db),
+            reader_db: self.reader_db.clone(),
+            session_id: &self.session,
+            policy: self.policy,
+            message: &self.question,
+            documents: &self.documents,
+            user: self.user.as_ref(),
+            labelling,
+            sink,
+            cancel,
+        }
+    }
+
+    /// Record the turn as cancelled without running it: what a job the
+    /// stopping queue refused, or cancelled while queued, would have done.
+    async fn record_cancelled(&self, labelling: LabelJobs) -> Result<AgentResponse, TurnFailed> {
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let (sink, _events) = events::channel();
+        self.request(labelling, sink, cancelled)
+            .run(&self.config)
+            .await
+            .map_err(|e| TurnFailed::Failed(TurnFailure::from(&e)))
+    }
+}
+
 /// Cancels a turn's job when its handler is dropped mid-turn.
 struct CancelOnDrop {
     jobs: JobQueue,
@@ -965,38 +1013,33 @@ impl McpServer {
             &self.inner.workspace.id,
             Some(session_id.clone()),
         );
-        let (config, db, reader_db) = (
-            self.inner.config.clone(),
-            Arc::clone(&self.inner.db),
-            self.inner.reader.clone(),
-        );
-        let policy = self.inner.policy;
-        let (session, question, documents) =
-            (session_id.clone(), question.to_owned(), documents.to_vec());
-        let job = self.inner.jobs.submit(spec, move |ctx| async move {
-            // The turn emits TurnComplete or Failed itself.
-            match (llm::TurnRequest {
-                db,
-                reader_db,
-                session_id: &session,
-                policy,
-                message: &question,
-                documents: &documents,
-                user: user.as_ref(),
-                labelling,
-                sink,
-                cancel: ctx.cancel_token(),
-            })
-            .run(&config)
-            .await
-            {
-                Ok(response) if response.cancelled => Err(String::from("cancelled")),
-                Ok(response) => Ok(format!(
-                    "answered: {} steps, {} sources",
-                    response.steps.len(),
-                    response.citations.len()
-                )),
-                Err(e) => Err(e.to_string()),
+        let inputs = TurnInputs {
+            config: self.inner.config.clone(),
+            db: Arc::clone(&self.inner.db),
+            reader_db: self.inner.reader.clone(),
+            session: session_id.clone(),
+            question: question.to_owned(),
+            documents: documents.to_vec(),
+            user,
+            policy: self.inner.policy,
+        };
+        let job = self.inner.jobs.submit(spec, {
+            let inputs = inputs.clone();
+            move |ctx| async move {
+                // The turn emits TurnComplete or Failed itself.
+                match inputs
+                    .request(labelling, sink, ctx.cancel_token())
+                    .run(&inputs.config)
+                    .await
+                {
+                    Ok(response) if response.cancelled => Err(String::from("cancelled")),
+                    Ok(response) => Ok(format!(
+                        "answered: {} steps, {} sources",
+                        response.steps.len(),
+                        response.citations.len()
+                    )),
+                    Err(e) => Err(e.to_string()),
+                }
             }
         });
         let watch = tokio::spawn({
@@ -1035,16 +1078,25 @@ impl McpServer {
         if let Some(failed) = failure {
             return Err(TurnFailed::Failed(failed));
         }
-        // The stream closed without an answer: the job never ran (cancelled
-        // while queued, or refused by the stopping queue); its outcome says.
-        let outcome = self
-            .inner
-            .jobs
-            .wait(job.id)
-            .await
-            .and_then(|ended| ended.outcome)
-            .unwrap_or_else(|| String::from("the turn did not run"));
-        Err(TurnFailed::NotRun(outcome))
+        // The stream closed without an answer: the job never ran, refused by
+        // the stopping queue or cancelled while queued. The turn is still
+        // recorded as cancelled, as it would have been inside the job.
+        let Some(ended) = self.inner.jobs.wait(job.id).await else {
+            return Err(TurnFailed::NotRun(String::from("the turn did not run")));
+        };
+        if !ended.never_started() {
+            return Err(TurnFailed::NotRun(
+                ended
+                    .outcome
+                    .unwrap_or_else(|| String::from("the turn did not run")),
+            ));
+        }
+        let labelling = caller.label_jobs(
+            &self.inner.jobs,
+            &self.inner.workspace.id,
+            Some(session_id.clone()),
+        );
+        inputs.record_cancelled(labelling).await
     }
 
     /// Hybrid retrieval over the documents, no model in the loop.

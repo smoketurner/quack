@@ -132,7 +132,7 @@ fn internal(message: String) -> McpError {
 }
 
 /// The holder's failure, as the client sees it.
-fn forwarded(error: CoreError) -> McpError {
+fn forwarded(error: &CoreError) -> McpError {
     internal(error.to_string())
 }
 
@@ -167,7 +167,7 @@ impl ServerHandler for PerCallServer {
                 tokio::select! {
                     () = ct.cancelled() => Err(internal(String::from("the call was cancelled"))),
                     answered = client.call_tool(request) => {
-                        answered.map(CallToolResponse::from).map_err(forwarded)
+                        answered.map(CallToolResponse::from).map_err(|e| forwarded(&e))
                     }
                 }
             }
@@ -184,7 +184,7 @@ impl ServerHandler for PerCallServer {
     ) -> Result<ListToolsResult, McpError> {
         let backend = self.backend(&context.peer).await?;
         let result = match &backend {
-            Backend::Holder(client) => client.list_tools(request).await.map_err(forwarded),
+            Backend::Holder(client) => client.list_tools(request).await.map_err(|e| forwarded(&e)),
             Backend::Local(_) => Ok(ListToolsResult::with_all_items(McpServer::tools())),
         };
         self.release(backend).await;
@@ -198,7 +198,10 @@ impl ServerHandler for PerCallServer {
     ) -> Result<ListResourcesResult, McpError> {
         let backend = self.backend(&context.peer).await?;
         let result = match &backend {
-            Backend::Holder(client) => client.list_resources(request).await.map_err(forwarded),
+            Backend::Holder(client) => client
+                .list_resources(request)
+                .await
+                .map_err(|e| forwarded(&e)),
             Backend::Local(server) => server.list_resources(request, context).await,
         };
         self.release(backend).await;
@@ -215,7 +218,7 @@ impl ServerHandler for PerCallServer {
             Backend::Holder(client) => client
                 .list_resource_templates(request)
                 .await
-                .map_err(forwarded),
+                .map_err(|e| forwarded(&e)),
             Backend::Local(server) => server.list_resource_templates(request, context).await,
         };
         self.release(backend).await;
@@ -233,7 +236,7 @@ impl ServerHandler for PerCallServer {
                 .read_resource(request)
                 .await
                 .map(ReadResourceResponse::from)
-                .map_err(forwarded),
+                .map_err(|e| forwarded(&e)),
             Backend::Local(server) => server.read_resource(request, context).await,
         };
         self.release(backend).await;

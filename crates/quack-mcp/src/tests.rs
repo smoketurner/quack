@@ -858,6 +858,7 @@ async fn query_runs_as_a_task_for_a_client_that_declares_tasks() {
 /// holder's name, `sql` with the rows (a write refused by the holder's
 /// policy), and `quack://workspace/jobs` with the workspace's jobs; the
 /// socket file goes with the server.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_socket_serves_the_holder_to_a_client() {
     use crate::client::HolderClient;

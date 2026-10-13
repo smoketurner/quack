@@ -145,14 +145,9 @@ impl PrintTurn<'_> {
     ///
     /// Returns the error from the turn, the database, or writing the answer.
     pub async fn run(self) -> Result<TurnOutcome> {
-        let (config, db, reader_db, session_id, jobs, workspace_id) = (
-            self.config,
-            self.db,
-            self.reader_db,
-            self.session_id,
-            self.jobs,
-            self.workspace_id,
-        );
+        let labelling = LabelJobs::new(self.jobs).workspace(self.workspace_id);
+        let (config, db, reader_db, session_id) =
+            (self.config, self.db, self.reader_db, self.session_id);
         let (policy, prompt, format, verbose) =
             (self.policy, self.prompt, self.format, self.verbose);
         let documents = self.documents.to_vec();
@@ -160,7 +155,6 @@ impl PrintTurn<'_> {
 
         let interrupt = CtrlCGuard::new();
         let cancel = interrupt.cancel.clone();
-        let labelling = LabelJobs::new(jobs).workspace(workspace_id);
         let turn = tokio::spawn({
             let config = config.clone();
             let prompt = prompt.to_owned();

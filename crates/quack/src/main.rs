@@ -961,7 +961,7 @@ async fn run() -> Result<ExitCode> {
 
     match cli.command.take() {
         None => run_terminal_session(&cli, stdout_is_tty).await,
-        Some(command) => run_command(&cli, command).await,
+        Some(command) => Box::pin(run_command(&cli, command)).await,
     }
 }
 

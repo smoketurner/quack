@@ -1732,7 +1732,9 @@ impl App {
             request,
             origin: WriteOrigin::Socket {
                 shown,
-                expires: shown + self.config.server.permission_timeout(),
+                expires: shown
+                    .checked_add(self.config.server.permission_timeout())
+                    .unwrap_or(shown),
             },
         });
     }

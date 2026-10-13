@@ -270,11 +270,13 @@ beside its engine; a one-shot command runs its work as one step on the writer
 holder (the terminal session and every command, never `quack serve`) serves the workspace
 on its socket (`forward::SocketPath`: `{workspace_dir}/quack.sock`, or
 `/tmp/quack-{uid}/{id}.sock` when the data directory's path is too long for a socket
-address; a fixed path, not `TMPDIR`, so a terminal and a cron job agree), which speaks MCP
-and nothing else (`quack_mcp::socket::SocketServer`, started by `OpenedWorkspace::handle`):
+address; a fixed path, not `TMPDIR`, so a terminal and a cron job agree; on Windows a named
+pipe with a random per-launch name, written to `{workspace_dir}/quack.pipe`, which another
+user can neither read nor forge since the data directory is the user's own, and whose default
+rights refuse other users' clients), which speaks MCP and nothing else (`quack_mcp::socket::SocketServer`, started by `OpenedWorkspace::handle`):
 `quack mcp` in another shell runs its calls through it, `quack -q` calls its `sql` tool,
-and `quack jobs` reads its `quack://workspace/jobs` (section 11.3). Both ends accept only a
-socket owned by the current user, mode 0600, and a peer running as that user. `quack serve`
+and `quack jobs` reads its `quack://workspace/jobs` (section 11.3). On Unix both ends accept
+only a socket owned by the current user, mode 0600, and a peer running as that user. `quack serve`
 serves no socket: a login-mode server would hand any same-user process the whole agent with
 no audit row. `quack mcp` serves none either: it holds nothing between calls.
 
