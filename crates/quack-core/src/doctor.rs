@@ -1441,7 +1441,7 @@ async fn oauth_token(
 }
 
 async fn check_server(report: &mut Report, config: &Config, control: Option<&ControlPlane>) {
-    let bind = &config.server.bind;
+    let bind = config.server.bind_or_default();
     match bind.parse::<SocketAddr>() {
         Err(e) => report.push(
             Check::new(

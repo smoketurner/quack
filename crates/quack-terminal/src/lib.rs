@@ -10,7 +10,9 @@ mod selection;
 mod sql;
 mod ui;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use quack_core::analysis::policy::WritePolicy;
@@ -24,6 +26,9 @@ use quack_core::ids::{SessionId, WorkspaceId};
 /// tests), and the session to open.
 pub struct SessionSetup {
     pub engine: Arc<Engine>,
+    /// The web UI, REST API, and MCP the binary serves beside the session
+    /// on loopback, from the same engine.
+    pub web: WebStatus,
     pub workspace_name: String,
     pub workspace_id: WorkspaceId,
     pub db: SharedDb,
@@ -32,6 +37,22 @@ pub struct SessionSetup {
     /// `Allow` with `--allow-write`, else `Ask`.
     pub writes: WritePolicy,
 }
+
+/// Whether the binary serves the web UI, REST API, and MCP beside the
+/// session, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebStatus {
+    /// Listening on loopback; the transcript's first lines say where, and
+    /// that address's console lists the one workspace served.
+    Listening(SocketAddr),
+    /// It could not start (the port is taken, a client registration is
+    /// missing); the transcript says so once, and the session runs without.
+    Unavailable(String),
+}
+
+/// How long a quitting session gives its jobs, and the server beside it
+/// its drain, to end.
+pub const QUIT_GRACE: Duration = Duration::from_secs(3);
 
 /// Run the terminal session against a resolved workspace until the user quits.
 ///

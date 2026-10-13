@@ -1259,6 +1259,7 @@ async fn workspaces(
             .list_workspaces()
             .await?
             .into_iter()
+            .filter(|w| app.serves(&w.id))
             .map(|w| WsItem {
                 times: times.remove(&w.id),
                 membership: Membership {

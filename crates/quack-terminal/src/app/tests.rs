@@ -66,6 +66,7 @@ fn app_in(dir: &Path, workspace: &str, mut config: Config) -> App {
     let reader_db = ReaderDb::new(Arc::clone(&db));
     App::new(SessionSetup {
         engine: Engine::new(config, Holder::Terminal(WorkspaceId::from(workspace))),
+        web: WebStatus::Listening(std::net::SocketAddr::from(([127, 0, 0, 1], 8080))),
         workspace_name: String::from(workspace),
         workspace_id: WorkspaceId::from(workspace),
         db,
@@ -1886,6 +1887,42 @@ async fn without_a_chat_model_a_line_that_starts_like_sql_reports_its_syntax_err
     assert!(app.jobs.list().is_empty());
 }
 
+/// Where the web UI is served beside the session, or why it is not, is
+/// one line in the transcript after the welcome, and the session runs.
+#[test]
+fn the_web_server_beside_the_session_is_one_transcript_line() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let app = app_with(dir.path(), Config::default());
+    assert_eq!(
+        last(&app).content,
+        "web: http://127.0.0.1:8080 serves this workspace's web UI, REST API, and MCP"
+    );
+
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut config = Config::default();
+    config.general.data_dir = dir.path().to_path_buf();
+    let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+    let session = sessions::create_session(&db, "m", ChatMode::Chat, None)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
+    let app = App::new(SessionSetup {
+        engine: Engine::new(config, Holder::Terminal(WorkspaceId::from("ws"))),
+        web: WebStatus::Unavailable(String::from("cannot listen on 127.0.0.1:8080")),
+        workspace_name: String::from("ws"),
+        workspace_id: WorkspaceId::from("ws"),
+        reader_db: ReaderDb::new(Arc::clone(&db)),
+        db,
+        session_id: session.id,
+        writes: WritePolicy::Ask,
+    });
+    let last = last(&app);
+    assert_eq!(last.kind, MessageKind::System);
+    assert_eq!(
+        last.content,
+        "web: cannot listen on 127.0.0.1:8080; this session runs without the web UI and MCP"
+    );
+}
+
 /// A second session over `app`'s workspace, as the next `quack -w` sees it.
 fn next_session(app: &App) -> App {
     App::new(SessionSetup {
@@ -1893,6 +1930,7 @@ fn next_session(app: &App) -> App {
             Config::clone(&app.config),
             Holder::Terminal(app.workspace_id.clone()),
         ),
+        web: WebStatus::Listening(std::net::SocketAddr::from(([127, 0, 0, 1], 8080))),
         workspace_name: app.workspace_name.clone(),
         workspace_id: app.workspace_id.clone(),
         db: Arc::clone(&app.db),

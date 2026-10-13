@@ -24,7 +24,7 @@ provider. Design doc section 12 explains the mechanisms behind each step.
 
 | Mode | What the caller presents | How to turn it on |
 |---|---|---|
-| Local | nothing; loopback addresses only | `quack serve --local` |
+| Local | nothing; loopback addresses only | `quack serve --local`, and the terminal session (`quack`), which serves its workspace this way beside itself |
 | Password | a session cookie, or a `qs_…` bearer | `quack user add` |
 | API token | a `qk_…` bearer for one workspace | `quack token create` |
 | Identity-provider sign-in | a session cookie | `[server.oidc]` |
@@ -34,7 +34,11 @@ Only `quack serve` checks who is calling. The terminal, print mode, `quack inges
 `quack mcp` on stdio run as the operating-system user who starts them. That user can read the
 whole data directory, so quack keeps it at mode `0700`: every command that opens it
 removes any group or other access, with a warning. `quack serve --local` turns
-authentication off for one person's browser and listens on loopback addresses only.
+authentication off for one person's browser and listens on loopback addresses only; the
+terminal session serves its own workspace the same way on `127.0.0.1` at `[server].bind`'s
+port, or a random one when none is set. Local mode answers only loopback `Host` names on that port, so a page on another name
+that resolves to loopback cannot reach it; any other account on the same machine can, so a
+shared machine wants logins.
 
 A caller's role in a workspace decides what it may do there: `viewer`, `member`, or `owner`.
 The admin flag lets a user manage users, workspaces, and membership, but not read content.

@@ -283,6 +283,7 @@ impl Harness {
             engine::Engine::new(config, Holder::Serve),
             control,
             ServeMode::Login,
+            None,
             sessions,
             Some(oidc),
         ));
@@ -916,6 +917,7 @@ async fn without_oidc_there_is_no_button_and_no_route() {
         engine::Engine::new(config, Holder::Serve),
         control,
         ServeMode::Login,
+        None,
         sessions,
         None,
     ));
