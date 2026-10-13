@@ -930,10 +930,30 @@ impl<M: EmbeddingModel> Processing<'_, M> {
         let Parsed {
             title,
             pages,
-            chunks,
+            mut chunks,
             meta,
             tables: found,
         } = parse_off_runtime(move || parsing.finish(extracted)).await?;
+        // Text with no letter or digit in it (a file of NUL bytes, of
+        // punctuation, of control characters) is nothing to embed or find:
+        // its chunks are dropped before any is stored or embedded, and a
+        // document of nothing else is refused, like an empty file is.
+        let parsed = chunks.len();
+        chunks.retain(chunker::Chunk::is_readable);
+        if chunks.len() < parsed {
+            tracing::info!(
+                document = %doc_id,
+                file = %filename,
+                dropped = parsed.saturating_sub(chunks.len()),
+                "chunks without a letter or digit were not stored"
+            );
+        }
+        if chunks.is_empty() && found.is_empty() {
+            return Err(Error::Ingestion(format!(
+                "no readable text: {} holds no letters or digits",
+                OneLine(filename)
+            )));
+        }
         let (id, fields) = (doc_id.to_owned(), self.file.fields.clone());
         db.run(move |db| {
             if let Some(title) = title {

@@ -1141,5 +1141,23 @@ pub fn delete_if_empty(db: &WorkspaceDb, session_id: &SessionId) -> Result<bool>
     Ok(true)
 }
 
+/// Remove every session with no message: what a turn killed before it
+/// recorded anything leaves behind (`SIGKILL`, power loss), which no
+/// [`delete_if_empty`] ran for. Called when a workspace file is opened,
+/// when no process can own a session in it yet, the way the jobs an
+/// earlier process left active are failed. Returns how many went.
+///
+/// # Errors
+///
+/// Returns an error if the delete fails.
+pub fn delete_empty_sessions(db: &WorkspaceDb) -> Result<usize> {
+    let gone = db.connection().execute(
+        "DELETE FROM _quack_sessions WHERE NOT EXISTS \
+         (SELECT 1 FROM _quack_messages m WHERE m.session_id = _quack_sessions.id)",
+        [],
+    )?;
+    Ok(gone)
+}
+
 #[cfg(test)]
 mod tests;

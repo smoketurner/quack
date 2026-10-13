@@ -13,6 +13,10 @@ fn lane_keys_read_as_kind_and_id() {
     let id = || WorkspaceId::from("w1");
     for (key, text) in [
         (LaneKey::Session(SessionId::from("w1")), "session:w1"),
+        (
+            LaneKey::SessionTitle(SessionId::from("w1")),
+            "session:w1:title",
+        ),
         (LaneKey::Workspace(JobKind::Ingest, id()), "ingest:w1"),
         (LaneKey::Workspace(JobKind::Graph, id()), "graph:w1"),
         (LaneKey::Workspace(JobKind::Ontology, id()), "ontology:w1"),
@@ -25,6 +29,72 @@ fn lane_keys_read_as_kind_and_id() {
         assert_eq!(key.to_string(), text);
         assert_eq!(Lane::serial(&key).key(), text);
     }
+}
+
+/// Deleting a session's jobs takes its turns and its title job, by their
+/// lane keys, and leaves every other session's rows.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test")]
+fn a_sessions_job_rows_go_with_it_title_included() {
+    use crate::embedding::Dimension;
+    use crate::jobs::store;
+    use crate::storage::workspace::WorkspaceDb;
+
+    let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
+    let workspace = WorkspaceId::from("ws");
+    let (mine, other) = (SessionId::from("s1"), SessionId::from("s2"));
+    let row = |id: &str, kind: JobKind, label: &str, lane: &LaneKey| JobInfo {
+        id: id.parse().unwrap(),
+        number: JobNumber::default(),
+        kind,
+        label: String::from(label),
+        workspace_id: Some(workspace.clone()),
+        owner: None,
+        lane: Some(lane.to_string()),
+        state: JobState::Succeeded,
+        progress: None,
+        status: None,
+        outcome: None,
+        queued_at: Timestamp::now(),
+        started_at: None,
+        finished_at: Some(Timestamp::now()),
+        cancel_requested: false,
+    };
+    for job in [
+        row(
+            "0199d1f0-0000-7000-8000-000000000001",
+            JobKind::Chat,
+            "how many claims are open?",
+            &LaneKey::Session(mine.clone()),
+        ),
+        row(
+            "0199d1f0-0000-7000-8000-000000000002",
+            JobKind::Title,
+            "title session s1",
+            &LaneKey::SessionTitle(mine.clone()),
+        ),
+        row(
+            "0199d1f0-0000-7000-8000-000000000003",
+            JobKind::Chat,
+            "which vendors are late?",
+            &LaneKey::Session(other.clone()),
+        ),
+        row(
+            "0199d1f0-0000-7000-8000-000000000004",
+            JobKind::Title,
+            "title session s2",
+            &LaneKey::SessionTitle(other),
+        ),
+    ] {
+        store::upsert(&db, &job, "a test").unwrap();
+    }
+    assert_eq!(store::delete_session_jobs(&db, &mine).unwrap(), 2);
+    let left: Vec<String> = store::recent(&db, &workspace, 10)
+        .unwrap()
+        .into_iter()
+        .map(|job| job.label)
+        .collect();
+    assert_eq!(left, ["which vendors are late?", "title session s2"]);
 }
 
 #[test]

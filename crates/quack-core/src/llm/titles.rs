@@ -15,7 +15,7 @@ use super::{ChatClient, SchemaCall, Task};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::ids::{SessionId, WorkspaceId};
-use crate::jobs::{JobKind, JobQueue, JobSpec};
+use crate::jobs::{JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use crate::storage::sessions::{self, MessageRole};
 use crate::storage::writer::Writer;
 use crate::text::Fenced;
@@ -105,8 +105,11 @@ impl SessionTitler {
             .await
     }
 
-    /// Title `session` as a job on `jobs`, of `workspace`; a failure is the
-    /// job's outcome, and the session keeps its derived title.
+    /// Title `session` as a job on `jobs`, of `workspace`, in the session's
+    /// title lane (`LaneKey::SessionTitle`: its row goes with the session's
+    /// turns when the session is deleted, and it never waits behind the
+    /// next question); a failure is the job's outcome, and the session
+    /// keeps its derived title.
     pub fn spawn(
         self,
         db: Arc<Writer>,
@@ -114,7 +117,8 @@ impl SessionTitler {
         jobs: &JobQueue,
         workspace: Option<WorkspaceId>,
     ) {
-        let mut spec = JobSpec::new(JobKind::Title, format!("title session {session}"));
+        let mut spec = JobSpec::new(JobKind::Title, format!("title session {session}"))
+            .lane(Lane::serial(&LaneKey::SessionTitle(session.clone())));
         if let Some(workspace) = workspace {
             spec = spec.workspace(workspace);
         }

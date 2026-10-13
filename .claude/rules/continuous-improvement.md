@@ -55,7 +55,8 @@ Features prone to silent breakage — live-test before any PR that touches them:
 - Agent SQL read/write classification and the terminal permission prompt (y/n/a)
 - Event stream ordering: every tool call emits started then finished; `-p` steps on stderr only
 - Session recording: user, one tool message per step, assistant, in that order; a failed
-  first turn leaves no empty session behind
+  first turn leaves no empty session behind, and one killed mid-turn is removed when the
+  workspace is next opened (`sessions::delete_empty_sessions`)
 - Term index (`_quack_terms`) written on every chunk insert; no runtime DuckDB extension
   is installed or loaded anywhere (static musl cannot dlopen)
 - Workspace connection confinement: a read-classified `SELECT` over `read_text`,
