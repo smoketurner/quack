@@ -1,8 +1,9 @@
 //! A short title for a chat session, written by the chat model after the
 //! session's first turn when `[analysis].title_sessions` asks for one
-//! (issue #421). It runs after the turn at background priority
-//! ([`AfterTurn`]), never holds the answer up, and never replaces a title a
-//! person gave (`sessions::set_model_title`).
+//! (issue #421). It runs after the turn as a `title` job on the process's
+//! queue (background priority, so it never holds the answer up, and
+//! `Engine::stop_jobs` waits for it), and never replaces a title a person
+//! gave (`sessions::set_model_title`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,11 +11,11 @@ use std::time::Duration;
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 
-use super::after_turn::AfterTurn;
 use super::{ChatClient, SchemaCall, Task};
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::ids::SessionId;
+use crate::ids::{SessionId, WorkspaceId};
+use crate::jobs::{JobKind, JobQueue, JobSpec};
 use crate::storage::sessions::{self, MessageRole};
 use crate::storage::writer::Writer;
 use crate::text::Fenced;
@@ -104,12 +105,24 @@ impl SessionTitler {
             .await
     }
 
-    /// Title `session` on its own task (`AfterTurn::spawn`); a failure is
-    /// logged, and the session keeps its derived title.
-    pub fn spawn(self, db: Arc<Writer>, session: SessionId) {
-        AfterTurn::spawn(async move {
-            if let Err(e) = self.title(&db, &session).await {
-                tracing::warn!(session = %session, error = %e, "the session keeps its derived title");
+    /// Title `session` as a job on `jobs`, of `workspace`; a failure is the
+    /// job's outcome, and the session keeps its derived title.
+    pub fn spawn(
+        self,
+        db: Arc<Writer>,
+        session: SessionId,
+        jobs: &JobQueue,
+        workspace: Option<WorkspaceId>,
+    ) {
+        let mut spec = JobSpec::new(JobKind::Title, format!("title session {session}"));
+        if let Some(workspace) = workspace {
+            spec = spec.workspace(workspace);
+        }
+        jobs.submit(spec, move |_| async move {
+            match self.title(&db, &session).await {
+                Ok(true) => Ok(String::from("titled")),
+                Ok(false) => Ok(String::from("kept the person's title")),
+                Err(e) => Err(format!("the session keeps its derived title: {e}")),
             }
         });
     }
@@ -118,7 +131,13 @@ impl SessionTitler {
     /// is on and the session still carries its derived title. The stored
     /// session decides, not the replayed history, which the token window
     /// may cut; and a cancelled first turn is titled by the next.
-    pub async fn follow_turn(config: &Config, db: &Arc<Writer>, session: &SessionId) {
+    pub async fn follow_turn(
+        config: &Config,
+        db: &Arc<Writer>,
+        session: &SessionId,
+        jobs: &JobQueue,
+        workspace: Option<WorkspaceId>,
+    ) {
         if !config.analysis.title_sessions {
             return;
         }
@@ -138,7 +157,7 @@ impl SessionTitler {
             }
         }
         match Self::from_config(config).await {
-            Ok(Some(titler)) => titler.spawn(Arc::clone(db), session.clone()),
+            Ok(Some(titler)) => titler.spawn(Arc::clone(db), session.clone(), jobs, workspace),
             Ok(None) => {}
             Err(e) => tracing::warn!(error = %e, "the session keeps its derived title"),
         }

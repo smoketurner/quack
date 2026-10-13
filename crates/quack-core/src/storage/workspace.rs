@@ -24,6 +24,7 @@ use crate::graph;
 use crate::ids::{ChunkId, DocumentId, NodeId, UserId};
 use crate::ingestion::parser::{DocumentMeta, FileType, Load, PageCounts, SectionKind};
 use crate::ingestion::{StoredImage, TableName};
+use crate::jobs::store as jobs_store;
 use crate::ontology::store::{self as ontology_store, Acceptance};
 use crate::ontology::{Measure, Ontology, Property};
 use crate::saved;
@@ -1633,6 +1634,7 @@ impl WorkspaceDb {
         self.conn.execute_batch(ONTOLOGY_DDL)?;
         self.conn.execute_batch(&graph::ddl(dim))?;
         self.conn.execute_batch(profile::DDL)?;
+        self.conn.execute_batch(jobs_store::DDL)?;
         self.conn.execute_batch(table_search::DDL)?;
         self.upgrade_data(dim)?;
         if let Some(ontology) = ontology_store::current(self)? {

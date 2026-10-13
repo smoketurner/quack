@@ -17,6 +17,7 @@ use tower::ServiceExt;
 use super::auth::{Access, Identity, Need};
 use super::error::ApiResult;
 use super::state::{App, McpKey};
+use quack_core::analysis::permissions::Approvals;
 use quack_mcp::{McpCaller, McpServer, McpSetup, Transport};
 
 pub(crate) async fn handle(
@@ -47,6 +48,8 @@ pub(crate) async fn handle(
                 transport: Transport::Http,
                 jobs: app.engine.jobs.clone(),
                 stopping: app.engine.stopping(),
+                holder: app.engine.holder().to_string(),
+                approvals: Approvals::new(),
             })
         })
         .await;

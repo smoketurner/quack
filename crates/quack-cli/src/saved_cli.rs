@@ -20,11 +20,9 @@ use quack_core::storage::workspace::QueryResults;
 use quack_core::storage::writer::Writer;
 
 use crate::args::QueryFormat;
-use crate::print::FOLLOW_UP_GRACE;
 use crate::print::{AnswerTo, PrintTurn};
 use crate::session::find_session;
 use crate::text_or_json::TextOrJson;
-use quack_core::llm::after_turn::AfterTurn;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum SavedAction {
@@ -226,7 +224,6 @@ async fn refresh_pin(
     }
     .run()
     .await;
-    AfterTurn::finish(FOLLOW_UP_GRACE).await;
     if outcome.is_err() {
         let id = session_id.clone();
         drop(

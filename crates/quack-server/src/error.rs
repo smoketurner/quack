@@ -162,9 +162,9 @@ impl ErrorCode {
             // The server holds its workspaces, so it never reads through
             // another process; the forwarding errors name the same condition
             // from the other side.
-            CoreError::WorkspaceLocked { .. }
-            | CoreError::ForwardedWriteRefused { .. }
-            | CoreError::Forward(_) => (Self::WorkspaceLocked, StatusCode::SERVICE_UNAVAILABLE),
+            CoreError::WorkspaceLocked { .. } | CoreError::Forward(_) => {
+                (Self::WorkspaceLocked, StatusCode::SERVICE_UNAVAILABLE)
+            }
             CoreError::WorkspaceTooNew { .. } => {
                 (Self::WorkspaceTooNew, StatusCode::SERVICE_UNAVAILABLE)
             }

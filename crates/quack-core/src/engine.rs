@@ -9,19 +9,21 @@
 //! the stdio MCP server each build one engine and hand it to what they run.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, broadcast};
 use tokio_util::sync::CancellationToken;
 
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::forward::{Holder, Listener};
+use crate::forward::Holder;
 use crate::ids::WorkspaceId;
 use crate::ingestion::upload::UploadJob;
-use crate::jobs::{JobInfo, JobQueue};
+use crate::jobs::store as jobs_store;
+use crate::jobs::{JobId, JobInfo, JobQueue, JobState};
+use crate::priority::Priority;
 use crate::storage::audit::AuditLog;
 use crate::storage::workspace::WorkspaceDb;
 use crate::storage::writer::Writer;
@@ -31,13 +33,16 @@ use crate::telemetry;
 pub struct Engine {
     pub config: Config,
     /// Every background job: uploads, extraction and proposal runs, agent
-    /// turns. Its registry is in memory, so workspace content in a job's
-    /// label never reaches `control.db`.
+    /// turns, session titles. Its registry is in memory, so workspace
+    /// content in a job's label never reaches `control.db`; each
+    /// workspace's jobs are kept in its own file by the engine's recorder.
     pub jobs: JobQueue,
     holder: Holder,
     /// Cancelled when the process begins to stop: long-lived streams end on
     /// it, so a connection left open cannot hold the process up.
     stopping: CancellationToken,
+    /// The task writing each job's state into its workspace's file.
+    recorder: Recorder,
     /// A workspace file is opened once per process; every interface shares
     /// it. The cell is what enforces "once"; `None` once [`Engine::close`]
     /// ran, so nothing opens a file again beside a handle a straggler
@@ -56,10 +61,95 @@ pub struct WorkspaceHandle {
     /// The insert-only `_quack_audit` connection; only the server writes
     /// through it.
     pub audit: Arc<AuditLog>,
-    /// The socket another `quack` process reads this workspace through
-    /// while this one holds its lock (`forward`); dropped with the handle,
-    /// which removes it.
-    _forward: Option<Arc<Listener>>,
+}
+
+/// The task that keeps `_quack_jobs` current: it reads every snapshot the
+/// queue broadcasts and writes the job's row into its workspace's file
+/// (`jobs::store`) when the job's state changed, at background priority on
+/// that workspace's writer. A workspace that is not open gets no row (it
+/// is never opened for one: a delete's close races a last snapshot).
+/// [`Engine::close`] tells it to drain and waits for it.
+struct Recorder {
+    closing: CancellationToken,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// How long [`Engine::close`] waits for the recorder to write what is
+/// pending.
+const RECORDER_DRAIN: Duration = Duration::from_secs(5);
+
+impl Recorder {
+    /// Run over `events` until the queue closes or `closing` fires, then
+    /// write what is still pending.
+    async fn run(
+        engine: Weak<Engine>,
+        mut events: broadcast::Receiver<JobInfo>,
+        closing: CancellationToken,
+    ) {
+        // What was last written per active job: a snapshot that changed
+        // only progress or a status line is not written again.
+        let mut written: HashMap<JobId, (JobState, bool)> = HashMap::new();
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = closing.cancelled() => break,
+                next = events.recv() => next,
+            };
+            match next {
+                Ok(job) => Self::record(&engine, &mut written, job).await,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let Some(engine) = engine.upgrade() else {
+                        return;
+                    };
+                    written.clear();
+                    for job in engine.jobs.list() {
+                        Self::record(&Arc::downgrade(&engine), &mut written, job).await;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+        while let Ok(job) = events.try_recv() {
+            Self::record(&engine, &mut written, job).await;
+        }
+    }
+
+    async fn record(
+        engine: &Weak<Engine>,
+        written: &mut HashMap<JobId, (JobState, bool)>,
+        job: JobInfo,
+    ) {
+        let Some(engine) = engine.upgrade() else {
+            return;
+        };
+        let Some(workspace_id) = job.workspace_id.as_ref() else {
+            return;
+        };
+        let now = (job.state, job.cancel_requested);
+        if written.get(&job.id) == Some(&now) {
+            return;
+        }
+        let Some(handle) = engine.open_handle(workspace_id).await else {
+            return;
+        };
+        if job.state.is_finished() {
+            written.remove(&job.id);
+        } else {
+            written.insert(job.id, now);
+        }
+        let holder = engine.holder.to_string();
+        let (id, workspace) = (job.id, workspace_id.clone());
+        let wrote = Priority::Background
+            .scope(
+                handle
+                    .writer
+                    .run(move |db| jobs_store::upsert(db, &job, &holder)),
+            )
+            .await;
+        if let Err(e) = wrote {
+            tracing::debug!(job = %id, workspace = %workspace, error = %e, "the job's row was not written");
+        }
+    }
 }
 
 /// What follows work done with a workspace's file closed.
@@ -152,16 +242,42 @@ impl WorkspaceHandle {
 }
 
 impl Engine {
-    /// The process's engine, with the queue `[jobs]` configures.
+    /// The process's engine, with the queue `[jobs]` configures. The job
+    /// recorder starts here, on the Tokio runtime the caller is inside;
+    /// outside one (a test that never submits a job) nothing is recorded.
     #[must_use]
     pub fn new(config: Config, holder: Holder) -> Arc<Self> {
-        Arc::new(Self {
-            jobs: JobQueue::from_config(&config.jobs),
+        let jobs = JobQueue::from_config(&config.jobs);
+        let events = jobs.subscribe();
+        let closing = CancellationToken::new();
+        let engine = Arc::new(Self {
+            jobs,
             config,
             holder,
             stopping: CancellationToken::new(),
+            recorder: Recorder {
+                closing: closing.clone(),
+                task: std::sync::Mutex::new(None),
+            },
             workspaces: Mutex::new(Some(HashMap::new())),
-        })
+        });
+        let task = tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|runtime| runtime.spawn(Recorder::run(Arc::downgrade(&engine), events, closing)));
+        if let Ok(mut slot) = engine.recorder.task.lock() {
+            *slot = task;
+        }
+        engine
+    }
+
+    /// The handle of a workspace that is open now; `None` opens nothing.
+    async fn open_handle(&self, workspace_id: &WorkspaceId) -> Option<WorkspaceHandle> {
+        let workspaces = self.workspaces.lock().await;
+        workspaces
+            .as_ref()
+            .and_then(|map| map.get(workspace_id))
+            .and_then(|cell| cell.get())
+            .cloned()
     }
 
     /// The one workspace this process holds, or `None` for a server that
@@ -169,6 +285,12 @@ impl Engine {
     #[must_use]
     pub fn held(&self) -> Option<&WorkspaceId> {
         self.holder.held()
+    }
+
+    /// What this process is to other `quack` processes.
+    #[must_use]
+    pub fn holder(&self) -> &Holder {
+        &self.holder
     }
 
     /// A token cancelled when the process begins to stop: watch it, since a
@@ -215,11 +337,11 @@ impl Engine {
         };
         let config = self.config.clone();
         let id = workspace_id.clone();
-        let holder = self.holder.clone();
         let pool_size = self.config.analysis.reader_pool_size;
+        let jobs = self.jobs.clone();
         cell.get_or_try_init(|| async move {
-            let forward_dir = config.workspace_dir(id.as_str());
-            let (db, audit, id) = tokio::task::spawn_blocking(move || {
+            let history = config.jobs.history;
+            let (db, audit, earlier) = tokio::task::spawn_blocking(move || {
                 let db = WorkspaceDb::open(&config, id.as_str())?;
                 // Uploads a previous process took but never finished are
                 // failed, and their spooled bytes deleted: the person who
@@ -231,8 +353,15 @@ impl Engine {
                 if let Err(e) = UploadJob::clear_stale(&config, &id) {
                     tracing::warn!(workspace = %id, error = %e, "could not remove the spooled uploads an earlier process left");
                 }
+                // Jobs an earlier process left active are failed, and the
+                // newest ones come back into this process's list.
+                let interrupted = jobs_store::fail_interrupted(&db)?;
+                if interrupted > 0 {
+                    tracing::warn!(workspace = %id, interrupted, "failed jobs left active by an earlier process");
+                }
+                let earlier = jobs_store::recent(&db, &id, history)?;
                 let audit = AuditLog::open(&db)?;
-                Ok::<_, Error>((db, audit, id))
+                Ok::<_, Error>((db, audit, earlier))
             })
             .await
             .map_err(|e| {
@@ -240,20 +369,13 @@ impl Engine {
                     "workspace open task failed: {e}"
                 )))
             })??;
+            jobs.restore(earlier);
             let writer: SharedDb = Arc::new(Writer::spawn(db)?);
             let reader = ReaderDb::open(&writer, pool_size).await;
-            let forward = match Listener::bind(&forward_dir, &holder, reader.clone()).await {
-                Ok(listener) => Some(Arc::new(listener)),
-                Err(e) => {
-                    tracing::warn!(workspace = %id, %holder, error = %e, "other quack processes cannot read this workspace through the holder");
-                    None
-                }
-            };
             Ok(WorkspaceHandle {
                 writer,
                 reader,
                 audit: Arc::new(audit),
-                _forward: forward,
             })
         })
         .await
@@ -400,6 +522,19 @@ impl Engine {
     /// later [`Self::workspace`] (`Error::EngineClosed`).
     pub async fn close(&self) {
         self.begin_stop();
+        // The last snapshots reach the files before they close.
+        self.recorder.closing.cancel();
+        let task = self
+            .recorder
+            .task
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(task) = task
+            && tokio::time::timeout(RECORDER_DRAIN, task).await.is_err()
+        {
+            tracing::warn!("the job recorder did not finish writing before the workspaces closed");
+        }
         let workspaces = self.workspaces.lock().await.take();
         // A writer's drop joins its thread.
         let closed = tokio::task::spawn_blocking(move || drop(workspaces));

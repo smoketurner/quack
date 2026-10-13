@@ -5,7 +5,6 @@
 //! never build providers themselves.
 
 pub mod acting;
-pub mod after_turn;
 pub mod bedrock;
 pub mod chat_model;
 pub mod decision;
@@ -1391,6 +1390,8 @@ impl TurnRequest<'_> {
         } = self;
         let asked = Instant::now();
         let asked_at = Timestamp::now();
+        // The title a first turn starts is a job on the same queue.
+        let (jobs, workspace_id) = (labelling.queue().clone(), labelling.workspace_id().cloned());
         // A failure before the turn begins is the turn's failure too, so an
         // interface that only reads the events still sees why.
         let StartedTurn {
@@ -1462,7 +1463,7 @@ impl TurnRequest<'_> {
         db.run(move |guard| sessions::record_turn(guard, &session, &text, asked_at, &recorded))
             .await?;
         if !response.cancelled {
-            titles::SessionTitler::follow_turn(config, &db, session_id).await;
+            titles::SessionTitler::follow_turn(config, &db, session_id, &jobs, workspace_id).await;
         }
         Ok(response)
     }

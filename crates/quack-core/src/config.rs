@@ -1353,7 +1353,8 @@ pub struct WebhookConfig {
     /// The environment variable holding the secret each body is signed
     /// with (HMAC-SHA256, as the `X-Quack-Signature` header `sha256=<hex>`).
     pub secret_env: String,
-    /// The job kinds to report; every kind but chat turns when empty.
+    /// The job kinds to report; every kind but chat turns and their titles
+    /// when empty.
     #[serde(default)]
     pub kinds: Vec<JobKind>,
     /// How long one delivery may take.

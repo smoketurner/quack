@@ -23,6 +23,7 @@ use quack_core::analysis::citations::{Citation, Sources};
 use quack_core::analysis::events::{
     self, AgentEvent, Decision, Delivery, PermissionRequest, ToolName, ToolStep,
 };
+use quack_core::analysis::permissions::Asked;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::search::{DocumentScope, DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
@@ -964,6 +965,9 @@ pub(crate) struct App {
     /// The engine's queue.
     jobs: JobQueue,
     job_events: broadcast::Receiver<JobInfo>,
+    /// Writes that turns run for another process (`quack mcp` over the
+    /// workspace socket) ask this session to decide.
+    asked: mpsc::UnboundedReceiver<Asked>,
     /// Jobs still queued or running, for the strip above the input.
     pub(crate) active_jobs: Vec<JobInfo>,
     /// The `/jobs` or `/sessions` box, while it is open (and takes the keys).
@@ -1022,6 +1026,7 @@ impl App {
             reader_db,
             session_id,
             writes,
+            approvals,
         } = setup;
         let web_line = match web {
             WebStatus::Listening(addr) => {
@@ -1035,6 +1040,7 @@ impl App {
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         let jobs = engine.jobs.clone();
         let job_events = jobs.subscribe();
+        let asked = approvals.listen();
         let mut app = Self {
             messages: Vec::new(),
             textarea: TextArea::default(),
@@ -1054,6 +1060,7 @@ impl App {
             engine,
             jobs,
             job_events,
+            asked,
             active_jobs: Vec::new(),
             picker: None,
             db_steps: None,
@@ -1234,6 +1241,10 @@ impl App {
                 }
                 job = self.job_events.recv() => {
                     self.handle_job_event(&job);
+                    true
+                }
+                Some(asked) = self.asked.recv() => {
+                    self.ask_for_socket_turn(asked);
                     true
                 }
                 _ = spinner.tick(), if spinning => {
@@ -1646,6 +1657,39 @@ impl App {
         );
         self.prompts.push_back(Prompt::Write {
             job: turn.job,
+            request,
+        });
+    }
+
+    /// Queue a write that a turn run for another process (`quack mcp`
+    /// over the workspace socket) asks for, as a prompt like the
+    /// session's own: `y`, `n`, and `a` answer it, and `/cancel N` on
+    /// the job refuses it.
+    fn ask_for_socket_turn(&mut self, asked: Asked) {
+        let Asked {
+            job,
+            session,
+            request,
+        } = asked;
+        let number = self
+            .jobs
+            .get(job)
+            .map_or_else(JobNumber::default, |info| info.number);
+        let notice = request
+            .hold
+            .notice()
+            .map_or(String::new(), |notice| format!("{notice}\n"));
+        self.note(
+            MessageKind::System,
+            format!(
+                "quack mcp (job #{number}, session {session}): {}\n{}\n{notice}{}",
+                Decision::HEADING,
+                request.sql,
+                answer_keys()
+            ),
+        );
+        self.prompts.push_back(Prompt::Write {
+            job: Ticket { id: job, number },
             request,
         });
     }

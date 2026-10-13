@@ -1,10 +1,12 @@
 //! Writes a turn waits on a person to decide, held for an interface that
 //! answers later and elsewhere: the web chat's `POST
-//! .../sessions/{sid}/permissions/{request}`, the desktop app's dialog. The
-//! turn holds its `PermissionRequest` open in memory; the person answers it
-//! by its id; nobody answering within the timeout refuses the write. A
-//! restart ends the waiting turn with it. (The terminal needs none of this:
-//! its prompt is on the same screen as the turn.)
+//! .../sessions/{sid}/permissions/{request}`. The turn holds its
+//! `PermissionRequest` open in memory; the person answers it by its id;
+//! nobody answering within the timeout refuses the write. A restart ends
+//! the waiting turn with it. (The terminal needs none of this for its own
+//! turns: its prompt is on the same screen as the turn. A turn another
+//! process asks of it over the workspace socket reaches that prompt
+//! through [`Approvals`].)
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -14,8 +16,61 @@ use std::time::Duration;
 use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 
+use tokio::sync::mpsc;
+
 use crate::analysis::events::{Decision, Delivery, PermissionRequest};
 use crate::ids::{PermissionId, SessionId, UserId, WorkspaceId};
+use crate::jobs::JobId;
+
+/// A write a turn run for another process (`quack mcp` over the workspace
+/// socket) asks the person at this process's keyboard to decide: the
+/// terminal session listens and puts it in its own `y`/`n`/`a` prompt.
+/// Where nobody listens, the write is refused at once.
+#[derive(Clone, Default)]
+pub struct Approvals(Arc<Mutex<Option<mpsc::UnboundedSender<Asked>>>>);
+
+/// One write waiting for the person: the job running the turn, its
+/// session, and the request to answer.
+#[derive(Debug)]
+pub struct Asked {
+    pub job: JobId,
+    pub session: SessionId,
+    pub request: PermissionRequest,
+}
+
+impl Approvals {
+    /// Nobody listens yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take the requests from here on: the one interface with a person at
+    /// it. A later call replaces an earlier listener.
+    #[must_use]
+    pub fn listen(&self) -> mpsc::UnboundedReceiver<Asked> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(sender);
+        receiver
+    }
+
+    /// Hand `asked` to the listener; with none, or one that has gone, the
+    /// write is refused.
+    pub fn ask(&self, asked: Asked) {
+        let sender = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(sender) = sender else {
+            asked.request.deny();
+            return;
+        };
+        if let Err(mpsc::error::SendError(asked)) = sender.send(asked) {
+            asked.request.deny();
+        }
+    }
+}
 
 /// The writes waiting for a decision, by request.
 #[derive(Clone, Default)]
