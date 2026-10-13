@@ -109,14 +109,15 @@ async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
         jobs: JobQueue::new(10),
     });
     let result = server
-        .query(
-            Parameters(QueryArgs {
+        .query_for(
+            QueryArgs {
                 question: String::from("follow the maintenance note"),
                 session_id: None,
                 mode: None,
                 document_ids: Vec::new(),
-            }),
-            Extensions::default(),
+            },
+            &Extensions::default(),
+            Progress::none(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
@@ -364,14 +365,14 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
         auditor: Auditor::None,
         jobs: JobQueue::new(10),
     });
-    let ask = |session_id: Option<&str>, mode: Option<&str>| {
-        Parameters(QueryArgs {
-            question: String::from("how many?"),
-            session_id: session_id.map(str::to_owned),
-            mode: mode.map(str::to_owned),
-            document_ids: Vec::new(),
-        })
+    let ask = |session_id: Option<&str>, mode: Option<&str>| QueryArgs {
+        question: String::from("how many?"),
+        session_id: session_id.map(str::to_owned),
+        mode: mode.map(str::to_owned),
+        document_ids: Vec::new(),
     };
+    let ext = Extensions::default();
+    let run = |args: QueryArgs| server.query_for(args, &ext, Progress::none());
     let session_count = || async {
         db.run(|db| sessions::list_sessions(db, 10))
             .await
@@ -380,8 +381,7 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
     };
 
     for _ in 0..2 {
-        let failed = server
-            .query(ask(None, None), Extensions::default())
+        let failed = run(ask(None, None))
             .await
             .unwrap_or_else(|e| fail(&e.message));
         let text = error_text(&failed);
@@ -390,8 +390,7 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
         assert_eq!(session_count().await, 0);
     }
 
-    let bad_mode = server
-        .query(ask(None, Some("loud")), Extensions::default())
+    let bad_mode = run(ask(None, Some("loud")))
         .await
         .unwrap_or_else(|e| fail(&e.message));
     assert!(
@@ -400,26 +399,21 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
         error_text(&bad_mode)
     );
 
-    let unknown = server
-        .query(ask(Some("nope"), None), Extensions::default())
+    let unknown = run(ask(Some("nope"), None))
         .await
         .unwrap_or_else(|e| fail(&e.message));
     assert!(error_text(&unknown).contains("does not exist"));
 
     // A question limited to a document that is not there fails before the
     // model is asked, and leaves no session behind.
-    let scoped = server
-        .query(
-            Parameters(QueryArgs {
-                question: String::from("how many?"),
-                session_id: None,
-                mode: None,
-                document_ids: vec![String::from("missing.md")],
-            }),
-            Extensions::default(),
-        )
-        .await
-        .unwrap_or_else(|e| fail(&e.message));
+    let scoped = run(QueryArgs {
+        question: String::from("how many?"),
+        session_id: None,
+        mode: None,
+        document_ids: vec![String::from("missing.md")],
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.message));
     assert!(
         error_text(&scoped).contains("no document matches 'missing.md'"),
         "{}",
@@ -432,11 +426,7 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()))
         .id;
-    let failed = server
-        .query(
-            ask(Some(existing.as_str()), Some("query")),
-            Extensions::default(),
-        )
+    let failed = run(ask(Some(existing.as_str()), Some("query")))
         .await
         .unwrap_or_else(|e| fail(&e.message));
     assert!(error_text(&failed).contains("the agent turn failed"));
@@ -574,7 +564,7 @@ async fn classify_previews_anywhere_and_runs_where_writes_are_allowed_up_to_the_
     let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
     let shared = (config, db);
     let ext = Extensions::default();
-    let none = StepProgress::none;
+    let none = Progress::none;
 
     let read_only = server_on(&shared, WritePolicy::Deny);
     let preview = read_only
@@ -631,7 +621,7 @@ async fn classify_without_a_decision_model_says_what_to_set() {
         .classify_for(
             classify_args("t", None),
             &Extensions::default(),
-            StepProgress::none(),
+            Progress::none(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -675,7 +665,7 @@ async fn classify_with_a_sentence_and_no_chat_model_says_what_to_set() {
                 preview: Some(3),
             },
             &Extensions::default(),
-            StepProgress::none(),
+            Progress::none(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -683,4 +673,167 @@ async fn classify_with_a_sentence_and_no_chat_model_says_what_to_set() {
         error_text(&refused).contains("needs a chat model"),
         "{refused:?}"
     );
+}
+
+/// A server over a seeded workspace whose model follows the note, reached
+/// through an in-memory transport by a client built from `handler`.
+async fn connect<H: rmcp::ClientHandler>(
+    handler: H,
+) -> (
+    ScriptedOllama,
+    tempfile::TempDir,
+    rmcp::service::RunningService<rmcp::RoleClient, H>,
+) {
+    let ollama = ScriptedOllama::serve(ScriptedOllama::following_the_note())
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut config = ollama.config().unwrap_or_else(|e| fail(&e.to_string()));
+    config.general.data_dir = dir.path().to_path_buf();
+    let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+    quack_testkit::seed_dictating_note(&db).unwrap_or_else(|e| fail(&e.to_string()));
+    let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
+    let reader = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
+    let server = McpServer::new(McpSetup {
+        config,
+        db,
+        reader,
+        workspace: WorkspaceRow {
+            id: WorkspaceId::from("ws"),
+            name: String::from("stdio"),
+            classification: String::from("internal"),
+            allowed_providers: AllowedProviders::All,
+        },
+        policy: WritePolicy::Allow(Approver::Nobody),
+        user_id: None,
+        auditor: Auditor::None,
+        jobs: JobQueue::new(10),
+    });
+    let (server_side, client_side) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        match rmcp::ServiceExt::serve(server, server_side).await {
+            Ok(running) => drop(running.waiting().await),
+            Err(e) => tracing::error!(error = %e, "the test server did not start"),
+        }
+    });
+    let client = rmcp::ServiceExt::serve(handler, client_side)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    (ollama, dir, client)
+}
+
+/// A client that keeps every progress message it is sent.
+#[derive(Clone, Default)]
+struct Progressed(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl rmcp::ClientHandler for Progressed {
+    fn get_info(&self) -> rmcp::model::ClientConfig {
+        rmcp::model::ClientConfig::default()
+    }
+
+    async fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(params.message.unwrap_or_default());
+    }
+}
+
+fn question() -> rmcp::model::JsonObject {
+    let args = serde_json::json!({ "question": "follow the maintenance note" });
+    serde_json::from_value(args).unwrap_or_else(|e| fail(&e.to_string()))
+}
+
+/// A `query` call with a progress token hears the turn start before any
+/// work, then each tool call as it starts and ends; the answer still
+/// comes back whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_reports_its_turn_to_a_client_with_a_progress_token() {
+    let progressed = Progressed::default();
+    let (_ollama, _dir, client) = connect(progressed.clone()).await;
+    let mut params = CallToolRequestParams::new("query").with_arguments(question());
+    params.meta = Some(rmcp::model::RequestMetaObject::with_progress_token(
+        ProgressToken(rmcp::model::NumberOrString::Number(7)),
+    ));
+    let response = client
+        .call_tool_once(params)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let CallToolResponse::Complete(result) = response else {
+        fail("a client without the tasks extension gets the result itself")
+    };
+    assert_eq!(field(&result, "write_refused"), true, "{result:?}");
+    let messages = progressed
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        messages.first().map(String::as_str),
+        Some(TURN_STARTING),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.starts_with("search_documents: maintenance note")),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.starts_with("run_sql: ")),
+        "{messages:?}"
+    );
+    drop(client.cancel().await);
+}
+
+/// A client that declared the tasks extension gets a task back at once,
+/// polls it to completion, and reads the same answer from it; without
+/// the declaration the same server answers directly.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_runs_as_a_task_for_a_client_that_declares_tasks() {
+    use rmcp::model::{ClientCapabilities, ClientConfig, TaskPayload};
+
+    let handler = ClientConfig::new(
+        ClientCapabilities::builder().enable_tasks().build(),
+        Implementation::new("test", "0"),
+    );
+    let (_ollama, _dir, client) = connect(handler).await;
+    let response = client
+        .call_tool_once(CallToolRequestParams::new("query").with_arguments(question()))
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let CallToolResponse::Task(created) = response else {
+        fail("a client with the tasks extension gets a task")
+    };
+    assert_eq!(
+        created.task.status_message.as_deref(),
+        Some(TURN_STARTING),
+        "{created:?}"
+    );
+    let task_id = created.task.task_id.clone();
+    let done = loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let info = client
+            .get_task(GetTaskParams::new(task_id.clone()))
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        if info.task.status().is_terminal() {
+            break info.task;
+        }
+    };
+    let TaskPayload::Completed { result } = done.payload else {
+        fail(&format!("the task did not complete: {:?}", done.task))
+    };
+    let result: CallToolResult = serde_json::from_value(serde_json::Value::Object(result))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(field(&result, "write_refused"), true, "{result:?}");
+    assert!(
+        field(&result, "session_id").as_str().is_some(),
+        "{result:?}"
+    );
+    drop(client.cancel().await);
 }

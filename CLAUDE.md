@@ -535,7 +535,12 @@ which as a UUID v7 is registration order), and a name resolves through
 bounded query, so no request reads every document row.
 
 The MCP server (`crates/quack-server/src/mcp.rs`, `rmcp`) exposes `query`, `search`, `sql`,
-`list_tables`, `describe_table`, `list_documents` and the `quack://workspace/...` resources;
+`list_tables`, `describe_table`, `list_documents` and the `quack://workspace/...` resources.
+`query` and `classify` report through one `Progress` (`notifications/progress` to a client
+that sent a token, the first one before any work so the HTTP transport, which holds its
+response until the handler's first message, answers at once; and a task's status line), and
+for a client that declares the tasks extension `query` answers with a task (rmcp's
+`TaskManager` on the server, `tasks/get` for the answer, `tasks/cancel` cancels the turn);
 `quack mcp` serves it on stdio (unaudited, like the CLI) and `mcp_http.rs` serves it
 at `/mcp/v1/{workspace}` behind `Access::resolve`, one transport per workspace, user, and write
 permission, audited with channel `mcp`. With `[server.oidc].audience` set, the API and MCP also

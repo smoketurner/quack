@@ -38,6 +38,7 @@ uuid               = { workspace = true, features = ["std", "v7"] }
 
 [dev-dependencies]
 quack-testkit = { path = "../quack-testkit" }
+rmcp          = { workspace = true, features = ["client"] }
 aws-lc-rs     = { workspace = true, features = ["aws-lc-sys"] }
 duckdb        = { workspace = true, features = ["bundled"] }
 ipnet         = { workspace = true, features = ["std"] }
