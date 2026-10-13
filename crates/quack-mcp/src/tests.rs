@@ -14,7 +14,6 @@ use quack_core::classify::LabelSet;
 use quack_core::ids::WorkspaceId;
 use quack_core::jobs::JobState;
 use quack_core::storage::control::AllowedProviders;
-use quack_core::storage::workspace::STRUCTURED_CELL_CHARS;
 use quack_testkit::{self, ScriptedOllama};
 
 #[expect(clippy::panic, reason = "test failure path")]
@@ -866,6 +865,7 @@ async fn the_socket_serves_the_holder_to_a_client() {
     use crate::socket::SocketServer;
     use quack_core::forward::Listener;
     use quack_core::jobs::{JobKind, JobSpec};
+    use quack_core::storage::workspace::STRUCTURED_CELL_CHARS;
 
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let (config, db) = workspace(dir.path());
