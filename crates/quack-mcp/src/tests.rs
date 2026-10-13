@@ -1019,8 +1019,14 @@ async fn a_socket_turns_write_asks_the_listener_or_is_refused() {
             let delivery = answering.await.unwrap_or_else(|e| fail(&e.to_string()));
             assert_eq!(delivery, Delivery::Delivered);
         }
-        let finished = jobs.list();
-        assert_eq!(finished.len(), 1, "{finished:?}");
-        assert_eq!(finished[0].state, JobState::Succeeded);
+        // The answer comes off the events a moment before the job records
+        // its end.
+        let listed = jobs.list();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let ended = jobs
+            .wait(listed[0].id)
+            .await
+            .unwrap_or_else(|| fail("the turn's job vanished"));
+        assert_eq!(ended.state, JobState::Succeeded, "{ended:?}");
     }
 }
