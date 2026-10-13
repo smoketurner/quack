@@ -28,11 +28,8 @@
 //! module is Unix-only; elsewhere [`connect`] finds no holder and
 //! [`Listener::bind`] listens on nothing.
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
 use crate::error::Error;
 use crate::storage::workspace::QueryResults;
 
@@ -42,9 +39,11 @@ pub const SOCKET_FILE: &str = "quack.sock";
 /// The token a request must carry, beside the socket, mode 0600.
 pub const TOKEN_FILE: &str = "quack.sock.token";
 /// The most bytes one request line may run to.
+#[cfg(unix)]
 const MAX_REQUEST_BYTES: u64 = 1 << 20;
 
 /// What the token file holds: the token, and who listens.
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 struct TokenFile {
     token: String,
@@ -82,6 +81,7 @@ pub enum Reply {
     },
 }
 
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 struct Envelope {
     token: String,
@@ -89,14 +89,16 @@ struct Envelope {
 }
 
 /// Where a workspace's socket and token live.
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 struct Paths {
-    socket: PathBuf,
-    token: PathBuf,
+    socket: std::path::PathBuf,
+    token: std::path::PathBuf,
 }
 
+#[cfg(unix)]
 impl Paths {
-    fn of(config: &Config, workspace_id: &str) -> Self {
+    fn of(config: &crate::config::Config, workspace_id: &str) -> Self {
         let dir = config.workspace_dir(workspace_id);
         Self {
             socket: dir.join(SOCKET_FILE),
@@ -537,12 +539,6 @@ pub use other::{Client, Listener, connect};
 #[must_use]
 pub fn is_locked(err: &Error) -> bool {
     matches!(err, Error::WorkspaceLocked { .. })
-}
-
-/// The socket path a holder of `workspace_id` would listen on.
-#[must_use]
-pub fn socket_path(config: &Config, workspace_id: &str) -> PathBuf {
-    Paths::of(config, workspace_id).socket
 }
 
 #[cfg(all(test, unix))]
