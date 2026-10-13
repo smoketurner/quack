@@ -3099,8 +3099,13 @@ there is no OS keychain, the vault key file.
 
 ### 11.6 Desktop window (`quack desktop`)
 
-Not built (#35, still open): no `desktop` subcommand and no Tauri dependency exist. It is the
-last interface on the roadmap and may never be built. The design:
+Set aside (#35 closed 2026-10-12). `docs/desktop.md` holds the design that was tried in PR
+#546, a separate `quack-desktop` binary showing the web UI through a Tauri custom scheme,
+and the reasons it was stopped: a webview's custom scheme answers a request whole, so the
+streams went over an IPC bridge, redirects had to be followed by hand, the window's URL
+drifted from the page, and the window added little over `quack serve --local` in a browser.
+No `desktop` subcommand and no Tauri dependency exist. The original design, kept for the
+record:
 
 `quack desktop` starts the embedded server on a random loopback port with a per-launch
 bearer token and opens the web UI in a Tauri webview with that token. The window is the web
