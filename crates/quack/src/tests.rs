@@ -3,6 +3,7 @@ use quack_core::embedding::Dimension;
 use quack_core::error::AuthReason;
 use quack_core::ingestion::parser::PageCounts;
 use quack_core::llm::oauth::{Lifetime, Renewal};
+use quack_core::storage::control::ControlPlane;
 use quack_core::storage::workspace::{DocumentStatus, NewDocument};
 
 /// A closed reader surfaces as an `io::Error`, a `serde_json` or `csv`
@@ -183,7 +184,7 @@ fn config_in(dir: &Path) -> Config {
 async fn an_unknown_workspace_is_a_usage_error_and_creates_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let config = config_in(dir.path());
-    let refused = OpenedWorkspace::in_config(config.clone(), Some("slaes"))
+    let refused = OpenedWorkspace::in_config(config.clone(), Some("slaes"), Holder::Terminal)
         .await
         .err()
         .unwrap();
@@ -207,11 +208,12 @@ async fn a_created_workspace_opens_by_name() {
         name: "sales".parse().unwrap(),
     };
     create().run(&config).await.unwrap();
-    let opened = OpenedWorkspace::in_config(config.clone(), Some("sales"))
+    let opened = OpenedWorkspace::in_config(config.clone(), Some("sales"), Holder::Terminal)
         .await
         .unwrap();
     assert_eq!(opened.name, "sales");
-    opened.open_db().unwrap();
+    drop(opened.handle().await.unwrap());
+    opened.finish(Duration::ZERO).await;
 
     let again = create().run(&config).await.unwrap_err();
     assert_eq!(again.to_string(), "workspace 'sales' already exists");

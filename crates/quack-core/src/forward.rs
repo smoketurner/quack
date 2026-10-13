@@ -39,43 +39,44 @@ use crate::storage::workspace::QueryResults;
 
 /// The process that holds workspaces open, as the token file names it to
 /// the person reading `quack -q`'s stderr, and the one workspace it holds:
-/// `quack serve` opens any workspace a request names; every other holder
-/// opened exactly one and refuses the rest (`engine::Engine::workspace`).
+/// `quack serve` opens any workspace a request names; the terminal session
+/// and every command opened exactly one and refuse the rest
+/// (`engine::Engine::workspace`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Holder {
     Serve,
     Terminal(WorkspaceId),
-    Print(WorkspaceId),
-    Mcp(WorkspaceId),
-    Search(WorkspaceId),
-    Saved(WorkspaceId),
+    /// A `quack` command, named by its verb (`-p`, `ingest`, `mcp`, ...).
+    Command {
+        workspace: WorkspaceId,
+        verb: &'static str,
+    },
 }
 
 impl Holder {
+    /// The holder a command with `verb` becomes once its workspace is
+    /// known: `OpenedWorkspace::resolve(name, Holder::command("ingest"))`.
+    pub fn command(verb: &'static str) -> impl FnOnce(WorkspaceId) -> Self {
+        move |workspace| Self::Command { workspace, verb }
+    }
+
     /// The one workspace this holder opened, or `None` for the server.
     #[must_use]
     pub fn held(&self) -> Option<&WorkspaceId> {
         match self {
             Self::Serve => None,
-            Self::Terminal(id)
-            | Self::Print(id)
-            | Self::Mcp(id)
-            | Self::Search(id)
-            | Self::Saved(id) => Some(id),
+            Self::Terminal(id) | Self::Command { workspace: id, .. } => Some(id),
         }
     }
 }
 
 impl std::fmt::Display for Holder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Serve => "quack serve",
-            Self::Terminal(_) => "the quack terminal session",
-            Self::Print(_) => "quack -p",
-            Self::Mcp(_) => "quack mcp",
-            Self::Search(_) => "quack search",
-            Self::Saved(_) => "quack saved",
-        })
+        match self {
+            Self::Serve => f.write_str("quack serve"),
+            Self::Terminal(_) => f.write_str("the quack terminal session"),
+            Self::Command { verb, .. } => write!(f, "quack {verb}"),
+        }
     }
 }
 

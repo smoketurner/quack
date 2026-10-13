@@ -75,9 +75,9 @@ and code — this file is the gate, the doc is the detail.
       confinement sequence, and produce two independent `DatabaseInstance`s that cannot
       see each other's commits and silently overwrite each other's writes. In-process
       single-open is therefore ours to enforce — the per-workspace `OnceCell` in
-      `quack_core::engine::Engine::workspace`, the one open path of every interface that
-      runs jobs (the command line's `OpenedWorkspace::into_engine` consumes the opened
-      workspace so nothing opens the file beside the engine). The opened connection then moves onto
+      `quack_core::engine::Engine::workspace`, the one open path of every interface (the
+      command line's `OpenedWorkspace` holds the engine, so no command opens the file beside
+      it). The opened connection then moves onto
       its workspace's writer thread (`storage::writer::Writer::spawn`) and is reached only
       by closures sent there; reader clones are made on that thread (or, for
       `explain_search`'s vector leg, from the searching connection on its own thread). The one other writing

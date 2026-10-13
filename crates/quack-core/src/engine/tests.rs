@@ -143,7 +143,10 @@ async fn a_temp_table_loaded_after_the_open_reaches_the_readers() {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(
         config_in(dir.path()),
-        Holder::Print(WorkspaceId::from("ws")),
+        Holder::Command {
+            workspace: WorkspaceId::from("ws"),
+            verb: "-p",
+        },
     );
     let handle = engine.workspace(&WorkspaceId::from("ws")).await.unwrap();
     handle

@@ -1,35 +1,23 @@
 //! Opening the workspace a command runs in: the one `-w` names, which
 //! must exist, or the default, created on first use. The binary and the
 //! terminal's setup open a workspace through this one type, so every
-//! interface resolves names, enters the provider egress scope, and holds
-//! the file the same way: a one-shot command on its own connection, and a
-//! command that runs jobs through the process's [`Engine`].
+//! command resolves names, enters the provider egress scope, and holds the
+//! file the same way: through the process's [`Engine`], the one open path.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use quack_core::config::Config;
-use quack_core::engine::Engine;
+use quack_core::engine::{Engine, WorkspaceHandle};
 use quack_core::forward::Holder;
 use quack_core::ids::WorkspaceId;
 use quack_core::llm::egress::Egress;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::workspace::WorkspaceDb;
-use quack_core::storage::writer::Writer;
 
-/// The configuration and the workspace a command runs in.
+/// The engine and the workspace a command runs in.
 pub struct OpenedWorkspace {
-    pub config: Config,
-    pub control: ControlPlane,
-    pub workspace: WorkspaceRow,
-    pub name: String,
-}
-
-/// A workspace held by the process's engine: the one way to open the file
-/// for a command that runs jobs (`-p`, `mcp`, `search`, `saved run`, the
-/// terminal). It consumes the [`OpenedWorkspace`], so nothing can open
-/// the same file a second time beside the engine's handle.
-pub struct HeldWorkspace {
     pub engine: Arc<Engine>,
     pub control: ControlPlane,
     pub workspace: WorkspaceRow,
@@ -40,15 +28,20 @@ impl OpenedWorkspace {
     /// Load the configuration and open the workspace `workspace_name`
     /// selects: the named one, which must exist
     /// (`Error::NoWorkspaceNamed`), or with `None` the
-    /// `[general].default_workspace`, created on first use.
+    /// `[general].default_workspace`, created on first use. `holder` names
+    /// the command to other processes (`Holder::Terminal`,
+    /// `Holder::command("ingest")`).
     ///
     /// # Errors
     ///
     /// Returns an error when the configuration does not load, the control
     /// plane does not open, or the named workspace does not exist.
-    pub async fn resolve(workspace_name: Option<&str>) -> Result<Self> {
+    pub async fn resolve(
+        workspace_name: Option<&str>,
+        holder: impl FnOnce(WorkspaceId) -> Holder,
+    ) -> Result<Self> {
         let config = Config::load().context("failed to load configuration")?;
-        Self::in_config(config, workspace_name).await
+        Self::in_config(config, workspace_name, holder).await
     }
 
     /// The workspace `workspace_name` selects under `config`. Enters the
@@ -59,7 +52,11 @@ impl OpenedWorkspace {
     ///
     /// Returns an error when the control plane does not open or the named
     /// workspace does not exist.
-    pub async fn in_config(config: Config, workspace_name: Option<&str>) -> Result<Self> {
+    pub async fn in_config(
+        config: Config,
+        workspace_name: Option<&str>,
+        holder: impl FnOnce(WorkspaceId) -> Holder,
+    ) -> Result<Self> {
         let control = ControlPlane::open(&config)
             .await
             .context("failed to open control plane")?;
@@ -69,54 +66,56 @@ impl OpenedWorkspace {
         let name = workspace.name.clone();
         // The command sends only to the model providers the workspace allows.
         Egress::Workspace(workspace.allowed_providers.clone()).enter();
+        let engine = Engine::new(config, holder(workspace.id.clone()));
         Ok(Self {
-            config,
+            engine,
             control,
             workspace,
             name,
         })
     }
 
-    /// Hold the workspace through an engine as `holder` (`Holder::Print`,
-    /// `Holder::Terminal`, ...), the holder named after this workspace.
+    /// The configuration the engine runs under.
     #[must_use]
-    pub fn into_engine(self, holder: fn(WorkspaceId) -> Holder) -> HeldWorkspace {
-        let Self {
-            config,
-            control,
-            workspace,
-            name,
-        } = self;
-        let engine = Engine::new(config, holder(workspace.id.clone()));
-        HeldWorkspace {
-            engine,
-            control,
-            workspace,
-            name,
-        }
+    pub fn config(&self) -> &Config {
+        &self.engine.config
     }
 
-    /// The workspace's connection.
+    /// The workspace's writer, reader pool, and audit connection, the file
+    /// opened on first call (`Engine::workspace`).
     ///
     /// # Errors
     ///
-    /// Returns an error when the workspace database does not open.
-    pub fn open_db(&self) -> Result<WorkspaceDb> {
-        WorkspaceDb::open(&self.config, self.workspace.id.as_str())
+    /// Returns an error when the workspace database does not open (another
+    /// process holds it, the file is too new, ...).
+    pub async fn handle(&self) -> Result<WorkspaceHandle> {
+        self.engine
+            .workspace(&self.workspace.id)
+            .await
             .context("failed to open workspace database")
     }
 
-    /// The workspace's connection on a writer thread of its own: the
-    /// commands that run core's multi-step work (ingestion, import, graph
-    /// and ontology commands) send it their steps exactly as the server
-    /// and the terminal do.
+    /// Run `f` on the workspace's writer connection and await it: what a
+    /// one-shot command does with the database, in one step on the
+    /// writer's thread (a `-q` statement, a listing written to stdout).
     ///
     /// # Errors
     ///
-    /// Returns an error when the database does not open or the writer
-    /// thread does not start.
-    pub fn writer(&self) -> Result<Writer> {
-        Writer::spawn(self.open_db()?).context("failed to start the workspace writer")
+    /// Returns the open's error or `f`'s own.
+    pub async fn with_db<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&WorkspaceDb) -> Result<T> + Send + 'static,
+    {
+        self.handle().await?.writer.run(move |db| Ok(f(db))).await?
+    }
+
+    /// Stop the engine's jobs under `grace` and close the workspace, so a
+    /// run the command started records its end and the writer checkpoints
+    /// before the process exits. Every handle must be dropped first.
+    pub async fn finish(self, grace: Duration) {
+        self.engine.stop_jobs(grace).await;
+        self.engine.close().await;
     }
 }
 
@@ -126,6 +125,7 @@ mod tests {
 
     use quack_core::config::Config;
     use quack_core::error::Error as CoreError;
+    use quack_core::forward::Holder;
     use quack_core::storage::control::ControlPlane;
 
     use super::OpenedWorkspace;
@@ -143,7 +143,7 @@ mod tests {
     async fn an_unknown_workspace_is_refused_and_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_in(dir.path());
-        let refused = OpenedWorkspace::in_config(config.clone(), Some("slaes"))
+        let refused = OpenedWorkspace::in_config(config.clone(), Some("slaes"), Holder::Terminal)
             .await
             .err()
             .unwrap();
@@ -159,21 +159,28 @@ mod tests {
         assert!(control.list_workspaces().await.unwrap().is_empty());
     }
 
-    /// With no `-w`, a new data directory gets the default workspace, and
-    /// naming it afterwards opens the same one.
+    /// With no `-w` the default workspace is created on first use, held by
+    /// the command's engine, and reached through one writer.
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
-    async fn no_workspace_name_creates_the_default_on_a_fresh_data_dir() {
+    async fn the_default_workspace_is_created_and_held() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_in(dir.path());
-        let opened = OpenedWorkspace::in_config(config.clone(), None)
+        let opened = OpenedWorkspace::in_config(config_in(dir.path()), None, Holder::command("-q"))
             .await
             .unwrap();
-        assert_eq!(opened.name, "default");
-        opened.open_db().unwrap();
-        let again = OpenedWorkspace::in_config(config, Some("default"))
+        assert_eq!(
+            opened.name,
+            opened.config().general.default_workspace.to_string()
+        );
+        let n = opened
+            .with_db(|db| Ok(db.execute_query("SELECT 1 AS n")?.rows.len()))
             .await
             .unwrap();
-        assert_eq!(again.workspace.id, opened.workspace.id);
+        assert_eq!(n, 1);
+        let first = opened.handle().await.unwrap();
+        let second = opened.handle().await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first.writer, &second.writer));
+        drop((first, second));
+        opened.finish(std::time::Duration::ZERO).await;
     }
 }

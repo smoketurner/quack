@@ -25,4 +25,4 @@ pub use print::{AnswerTo, FOLLOW_UP_GRACE, PrintTurn, TurnOutcome};
 pub use session::{SessionChoice, find_session, resolve_session};
 pub use stdio::{NamedInput, StdioPath};
 pub use text_or_json::TextOrJson;
-pub use workspace::{HeldWorkspace, OpenedWorkspace};
+pub use workspace::OpenedWorkspace;

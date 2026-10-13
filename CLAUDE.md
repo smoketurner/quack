@@ -187,9 +187,9 @@ serial lane, so a follow-up waits for the answer before it; a workspace's upload
 extraction, and document pass have their own), cancel tokens, per-chunk progress, and a
 broadcast of `JobInfo` snapshots every interface reports from. The process is one
 `quack_core::engine::Engine` (its config, its one queue, its open workspaces, its stopping token):
-`quack serve`, the terminal, `-p`, `mcp`, `search`, and `saved run` each build one
-(`Engine::new(config, forward::Holder)`; the command line's `OpenedWorkspace::into_engine`
-consumes the opened workspace so nothing opens the file beside it) and `Engine::workspace(id)`
+`quack serve`, the terminal, and every command build one (`Engine::new(config,
+forward::Holder)`; the command line's `OpenedWorkspace` holds it, `with_db` runs a one-shot
+command's step on the writer, `finish` stops and closes) and `Engine::workspace(id)`
 opens a workspace file once per process (the `OnceCell` rule of `code-standards.md`), binding
 the holder's forward socket and handing back the writer, reader pool, and audit connection as a
 `WorkspaceHandle`; a holder of one workspace is refused any other. `Engine::stop_jobs(grace)` is

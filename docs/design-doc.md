@@ -260,9 +260,11 @@ process behind a cell (section 7.4), binds the holder's forward socket (`forward
 names the holder in the token file), and gives back the writer, the reader pool, and the
 audit connection; a holder of one workspace (every one but `quack serve`) is refused any
 other (`Error::WorkspaceNotHeld`), and `close_workspace` refuses the held one
-(`Error::WorkspaceHeld`) and a busy one (`Error::WorkspaceBusy`). The command line's
-`OpenedWorkspace::into_engine` consumes the opened workspace, so a command holding an
-engine cannot open the same file beside it.
+(`Error::WorkspaceHeld`) and a busy one (`Error::WorkspaceBusy`). Every command line
+command opens its workspace through `OpenedWorkspace`, which holds the engine
+(`Holder::Terminal`, or `Holder::command("ingest")`), so there is one open path and no
+command can open the file beside its engine; a one-shot command runs its work as one step on
+the writer (`OpenedWorkspace::with_db`) and closes (`finish`).
 
 **Stopping.** `Engine::stop_jobs(grace)` is the one way a process stops its jobs: it cancels
 the engine's stopping token (`Engine::begin_stop`, which a signal handler may call alone to
