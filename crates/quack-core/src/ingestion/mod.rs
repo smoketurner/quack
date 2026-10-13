@@ -937,7 +937,9 @@ impl<M: EmbeddingModel> Processing<'_, M> {
         // Text with no letter or digit in it (a file of NUL bytes, of
         // punctuation, of control characters) is nothing to embed or find:
         // its chunks are dropped before any is stored or embedded, and a
-        // document of nothing else is refused, like an empty file is.
+        // document whose every chunk went that way is refused, like an
+        // empty file is. A document that parsed to no chunks at all (a
+        // heading and nothing under it) is stored as it always was.
         let parsed = chunks.len();
         chunks.retain(chunker::Chunk::is_readable);
         if chunks.len() < parsed {
@@ -948,7 +950,7 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 "chunks without a letter or digit were not stored"
             );
         }
-        if chunks.is_empty() && found.is_empty() {
+        if parsed > 0 && chunks.is_empty() && found.is_empty() {
             return Err(Error::Ingestion(format!(
                 "no readable text: {} holds no letters or digits",
                 OneLine(filename)
