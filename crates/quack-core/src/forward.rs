@@ -205,7 +205,6 @@ mod unix {
 
     /// The holder's end: the socket, the token file, and the accept loop.
     /// Dropping it stops listening and removes both files.
-    #[derive(Debug)]
     pub struct Listener {
         paths: Paths,
         accept: tokio::task::JoinHandle<()>,
@@ -302,6 +301,15 @@ mod unix {
                 .open(path)?;
             file.write_all(serde_json::to_string(&record)?.as_bytes())?;
             Ok(token)
+        }
+    }
+
+    impl std::fmt::Debug for Listener {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Listener")
+                .field("socket", &self.paths.socket)
+                .field("token", &self.paths.token)
+                .finish_non_exhaustive()
         }
     }
 
