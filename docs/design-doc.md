@@ -3146,7 +3146,7 @@ no workspace named 'slaes'; create it with: quack workspace create slaes
 `[general].default_workspace`, and the first command to use it creates it (audited the same
 way), so a new install needs no setup step. Naming the default with `-w` does the same.
 `ControlPlane::workspace_or_default` is the one place this is decided. A new workspace's
-name is a `WorkspaceName`: trimmed, non-empty, and without `/`, `\`, or `.`. The CLI verb,
+name is a `WorkspaceName`: trimmed, non-empty, and without `/`, `\`, `.`, or a control character. The CLI verb,
 `POST /api/v1/workspaces`, the web console, and `default_workspace` in `config.toml` all go
 through that type. Workspaces created before the rule keep their names and still open.
 

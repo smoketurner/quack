@@ -66,7 +66,7 @@ impl AdminCommand {
 pub(crate) enum WorkspaceAction {
     /// Create a workspace; `-w NAME` then names it on every command
     Create {
-        /// Non-empty, with no slashes or dots
+        /// Non-empty, with no slashes, dots, or control characters
         name: WorkspaceName,
     },
     /// List workspaces
@@ -79,7 +79,7 @@ pub(crate) enum WorkspaceAction {
     Rename {
         /// The workspace's current name
         name: String,
-        /// Non-empty, with no slashes or dots
+        /// Non-empty, with no slashes, dots, or control characters
         new_name: WorkspaceName,
     },
     /// Delete a workspace: its file, its members, and its API tokens;
