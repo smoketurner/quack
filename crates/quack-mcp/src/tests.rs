@@ -126,6 +126,7 @@ async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
             },
             &Extensions::default(),
             Progress::none(),
+            CancellationToken::new(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
@@ -383,7 +384,8 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
         document_ids: Vec::new(),
     };
     let ext = Extensions::default();
-    let run = |args: QueryArgs| server.query_for(args, &ext, Progress::none());
+    let run =
+        |args: QueryArgs| server.query_for(args, &ext, Progress::none(), CancellationToken::new());
     let session_count = || async {
         db.run(|db| sessions::list_sessions(db, 10))
             .await
@@ -1007,6 +1009,7 @@ async fn a_socket_turns_write_asks_the_listener_or_is_refused() {
                 },
                 &Extensions::default(),
                 Progress::none(),
+                CancellationToken::new(),
             )
             .await
             .unwrap_or_else(|e| fail(&e.to_string()));

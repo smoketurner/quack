@@ -18,6 +18,7 @@
 //! is audited, like the CLI.
 
 pub mod client;
+pub mod relay;
 pub mod socket;
 
 use std::sync::Arc;
@@ -38,7 +39,7 @@ use quack_core::classify::{
 use quack_core::config::Config;
 use quack_core::engine::Engine;
 use quack_core::ids::{DocumentId, RunId, SessionId, UserId, WorkspaceId};
-use quack_core::jobs::{JobKind, JobQueue, JobSpec, Lane, LaneKey};
+use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::ChatDrafter;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::decision::DecisionModel;
@@ -238,7 +239,7 @@ pub struct McpSetup {
     /// client hangs up, so it never fires mid-call.
     pub stopping: CancellationToken,
     /// The process, as `initialize` names it to the client
-    /// (`serverInfo.title`): `quack -q` says it read through it.
+    /// (`serverInfo.description`): `quack -q` says it read through it.
     pub holder: String,
     /// Where a `query` turn's write asks a person: the terminal session's
     /// prompt, over the socket. Nobody listening refuses the write.
@@ -501,6 +502,21 @@ enum TurnSession {
     NotFound,
 }
 
+/// Cancels a turn's job when its handler is dropped mid-turn.
+struct CancelOnDrop {
+    jobs: JobQueue,
+    id: JobId,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.jobs.cancel(self.id);
+        }
+    }
+}
+
 /// Why a `query` turn gave no answer.
 #[derive(Debug)]
 enum TurnFailed {
@@ -744,20 +760,33 @@ impl McpServer {
         Parameters(args): Parameters<QueryArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.query_for(args, &context.extensions, Progress::of(&context))
-            .await
+        let cancel = self.cancel();
+        // The client's `notifications/cancelled` ends the turn too.
+        let requested = context.ct.clone();
+        let watch = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                requested.cancelled().await;
+                cancel.cancel();
+            }
+        });
+        let result = self
+            .query_for(args, &context.extensions, Progress::of(&context), cancel)
+            .await;
+        watch.abort();
+        result
     }
 
     /// `query`, for the caller the request's extensions name, reporting
-    /// through `progress`.
+    /// through `progress`; `cancel` ends the turn.
     async fn query_for(
         &self,
         args: QueryArgs,
         extensions: &Extensions,
         progress: Progress,
+        cancel: CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(extensions)?;
-        let cancel = self.cancel();
         // Boxed: an agent turn's future is large (clippy::large_futures).
         Box::pin(self.as_caller(&caller, self.ask(args, &caller, progress, cancel))).await
     }
@@ -977,6 +1006,13 @@ impl McpServer {
                 jobs.cancel(id);
             }
         });
+        // A handler dropped before the turn ends (the client hung up)
+        // cancels the job.
+        let mut guard = CancelOnDrop {
+            jobs: self.inner.jobs.clone(),
+            id: job.id,
+            armed: true,
+        };
         let mut complete = None;
         let mut failure = None;
         while let Some(event) = events.recv().await {
@@ -992,6 +1028,7 @@ impl McpServer {
             }
         }
         watch.abort();
+        guard.armed = false;
         if let Some(response) = complete {
             return Ok(response);
         }
@@ -1615,6 +1652,24 @@ impl McpServer {
         Ok(TurnSession::Created(id))
     }
 
+    /// Whether `resource` is served here: the jobs only over stdio and the
+    /// socket, where the client is the owner, since over HTTP the jobs API
+    /// hides other members' questions and this resource would not.
+    fn offers(&self, resource: WorkspaceResource<'_>) -> bool {
+        match resource {
+            WorkspaceResource::Jobs => match self.inner.transport {
+                Transport::Stdio | Transport::Socket => true,
+                Transport::Http => false,
+            },
+            WorkspaceResource::Tables
+            | WorkspaceResource::Documents
+            | WorkspaceResource::Ontology
+            | WorkspaceResource::OntologySchema
+            | WorkspaceResource::Context
+            | WorkspaceResource::Schema(_) => true,
+        }
+    }
+
     async fn describe(&self, name: &str) -> Result<Option<serde_json::Value>, McpError> {
         let table = name.to_owned();
         let described = self
@@ -1715,14 +1770,7 @@ impl ServerHandler for McpServer {
     }
 
     fn get_info(&self) -> ServerConfig {
-        let instructions = format!(
-            "Workspace '{}': documents, tables, and an ontology behind one agent. Use `query` \
-             for questions in plain language (it searches and runs SQL for you and cites \
-             sources), `search` for raw retrieval, `sql` for a statement you already know, and \
-             the resources for the table list, schemas, documents, ontology, and the owner's \
-             context.",
-            self.inner.workspace.name
-        );
+        let instructions = instructions(&self.inner.workspace.name);
         ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -1732,7 +1780,8 @@ impl ServerHandler for McpServer {
         )
         .with_server_info(
             Implementation::new("quack", env!("CARGO_PKG_VERSION"))
-                .with_title(self.inner.holder.clone()),
+                .with_title("quack")
+                .with_description(self.inner.holder.clone()),
         )
         .with_instructions(instructions)
     }
@@ -1744,6 +1793,7 @@ impl ServerHandler for McpServer {
     ) -> Result<ListResourcesResult, McpError> {
         let mut resources: Vec<Resource> = WorkspaceResource::FIXED
             .into_iter()
+            .filter(|resource| self.offers(*resource))
             .map(WorkspaceResource::listing)
             .collect();
         for table in self.reader_db(WorkspaceDb::list_tables).await? {
@@ -1784,7 +1834,7 @@ impl ServerHandler for McpServer {
             )
             .await?;
         let not_found = || McpError::resource_not_found(format!("no resource at {uri}"), None);
-        let resource = parsed.ok_or_else(not_found)?;
+        let resource = parsed.filter(|r| self.offers(*r)).ok_or_else(not_found)?;
         let text = self.resource_text(resource).await?.ok_or_else(not_found)?;
         let mime = resource.mime_type();
         Ok(
@@ -1799,13 +1849,44 @@ impl ServerHandler for McpServer {
     }
 }
 
+/// What `initialize` tells a client about the workspace.
+fn instructions(workspace_name: &str) -> String {
+    format!(
+        "Workspace '{workspace_name}': documents, tables, and an ontology behind one agent. Use \
+         `query` for questions in plain language (it searches and runs SQL for you and cites \
+         sources), `search` for raw retrieval, `sql` for a statement you already know, and the \
+         resources for the table list, schemas, documents, ontology, and the owner's context."
+    )
+}
+
+impl McpServer {
+    /// Run a tool now, through the router, never as a task: what the
+    /// per-call server (`relay`) does, since it drops this server after
+    /// the call.
+    pub(crate) async fn call_tool_now(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        Self::tool_router()
+            .call(ToolCallContext::new(self, request, context))
+            .await
+    }
+
+    /// Every tool, as `tools/list` lists them.
+    pub(crate) fn tools() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
+    }
+}
+
 /// How long `quack mcp` waits, after the client hangs up, for a labelling
 /// run the client left behind to record its end.
 pub const STDIO_GRACE: Duration = Duration::from_secs(20);
 
-/// `quack mcp`: serve the workspace over stdio until the client hangs up.
-/// The caller then stops the engine's jobs under [`STDIO_GRACE`] and
-/// closes it.
+/// `quack mcp`: serve the workspace over stdio until the client hangs up,
+/// one call at a time through the holder's socket or an open of the
+/// workspace for that call (`relay::PerCallServer`). The caller then lets
+/// the engine's jobs end under [`STDIO_GRACE`] and closes it.
 ///
 /// # Errors
 ///
@@ -1816,20 +1897,7 @@ pub async fn serve_stdio(
     workspace: WorkspaceRow,
     policy: WritePolicy,
 ) -> anyhow::Result<()> {
-    let handle = engine.workspace(&workspace.id).await?;
-    let server = McpServer::new(McpSetup {
-        config: engine.config.clone(),
-        db: handle.writer,
-        reader: handle.reader,
-        workspace,
-        policy,
-        user_id: None,
-        transport: Transport::Stdio,
-        jobs: engine.jobs.clone(),
-        stopping: engine.stopping(),
-        holder: engine.holder().to_string(),
-        approvals: Approvals::new(),
-    });
+    let server = relay::PerCallServer::new(engine, workspace, policy);
     let running = rmcp::serve_server(server, rmcp::transport::stdio())
         .await
         .map_err(|e| anyhow::anyhow!("MCP initialization failed: {e}"))?;

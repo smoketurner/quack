@@ -128,7 +128,7 @@ cargo run --bin quack -- doctor [--offline] [--format json]                     
 cargo run --bin quack -- ready [--url URL] ; vault export-key [--to FILE|-] [-y]          # GET /readyz (the image's HEALTHCHECK); the vault key to a 0600 file or stdout
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit [-w ws --detail --format ocsf [--with-prompt]]   # server admin; --detail joins the workspace's own audit (OCSF ai_operation on queries)
 cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1 (its OpenAPI 3.1 document at /api/v1/openapi.json, rendered at /api/v1/docs), MCP under /mcp/v1/{workspace}; /readyz and /metrics (quack_core::telemetry) outside the limiter; [server].log_format = "json" for a collector; every provider request retried under [providers.NAME].max_retries / retry_backoff_ms (llm::limit::Attempts)
-cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors; relays to the holder's socket when another quack holds the workspace (the turn then runs there, a write asks at the terminal's prompt)
+cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors; holds nothing between calls: each call runs through the holder's socket (the terminal, a command; a write then asks at the terminal's prompt) or opens the workspace for that call
 ```
 
 A saved question (`quack_core::saved`, design doc 8.1) is an answered turn's `run_sql`
@@ -200,7 +200,8 @@ reader pool, and audit connection as a `WorkspaceHandle`; a holder of one worksp
 any other. Every holder but `quack serve` serves the workspace on its socket
 (`forward::SocketPath`, MCP and nothing else: `quack_mcp::socket`, started by
 `OpenedWorkspace::handle`; `quack mcp` relays to it, `quack -q` and `quack jobs` read through
-it; a `query` turn's write asks the terminal's prompt through `analysis::permissions::Approvals`).
+it; a `query` turn's write asks the terminal's prompt through `analysis::permissions::Approvals`;
+`quack mcp` holds nothing between calls: `quack_mcp::relay::PerCallServer`).
 A session's title after a turn is a `title` job on the same queue. `Engine::stop_jobs(grace)` is
 the one way a process stops its jobs: it cancels the stopping token (which ends `jobs/stream` and
 the MCP event streams, and cancels an MCP `query` turn, which runs under a child of it), then

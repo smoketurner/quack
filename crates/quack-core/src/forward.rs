@@ -38,11 +38,14 @@ use crate::ids::WorkspaceId;
 pub enum Holder {
     Serve,
     Terminal(WorkspaceId),
-    /// A `quack` command, named by its verb (`-p`, `ingest`, `mcp`, ...).
+    /// A `quack` command, named by its verb (`-p`, `ingest`, ...).
     Command {
         workspace: WorkspaceId,
         verb: &'static str,
     },
+    /// `quack mcp`, which holds nothing between calls: it opens the
+    /// workspace for one call and closes it after, or reaches the holder.
+    Mcp,
 }
 
 impl Holder {
@@ -56,8 +59,20 @@ impl Holder {
     #[must_use]
     pub fn held(&self) -> Option<&WorkspaceId> {
         match self {
-            Self::Serve => None,
+            Self::Serve | Self::Mcp => None,
             Self::Terminal(id) | Self::Command { workspace: id, .. } => Some(id),
+        }
+    }
+
+    /// Whether this holder serves the workspace socket while it holds the
+    /// file: the session and every command; not the server (a login-mode
+    /// server would hand any same-user process the agent with no audit
+    /// row) and not `quack mcp`, which holds nothing between calls.
+    #[must_use]
+    pub fn serves_socket(&self) -> bool {
+        match self {
+            Self::Terminal(_) | Self::Command { .. } => true,
+            Self::Serve | Self::Mcp => false,
         }
     }
 }
@@ -68,6 +83,7 @@ impl std::fmt::Display for Holder {
             Self::Serve => f.write_str("quack serve"),
             Self::Terminal(_) => f.write_str("the quack terminal session"),
             Self::Command { verb, .. } => write!(f, "quack {verb}"),
+            Self::Mcp => f.write_str("quack mcp"),
         }
     }
 }
@@ -79,15 +95,15 @@ pub const SOCKET_FILE: &str = "quack.sock";
 /// Where a workspace's socket is. A Unix socket address holds about a
 /// hundred bytes of path (104 on macOS, 108 on Linux), and a data
 /// directory under a long path leaves no room beside the workspace file,
-/// so the socket then goes under a per-user directory in the temp
-/// directory instead. One rule, worked out by both ends from the same
-/// inputs.
+/// so the socket then goes under a per-user directory in `/tmp` instead.
+/// One rule, worked out by both ends from the same inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SocketPath {
     /// `{workspace_dir}/quack.sock`.
     Beside(PathBuf),
-    /// `{temp_dir}/quack-{uid}/{workspace_id}.sock`, since the workspace
-    /// directory's path is too long for a socket address.
+    /// `/tmp/quack-{uid}/{workspace_id}.sock`, since the workspace
+    /// directory's path is too long for a socket address. A fixed path,
+    /// not `TMPDIR`: a terminal and a cron job must compute the same one.
     Fallback(PathBuf),
 }
 
@@ -147,9 +163,11 @@ mod unix {
         rustix::net::SocketAddrUnix::new(path).is_ok()
     }
 
-    /// The per-user directory a fallback socket goes in.
+    /// The per-user directory a fallback socket goes in: under `/tmp`,
+    /// never `TMPDIR`, which differs between a terminal and a job cron
+    /// or launchd started.
     pub(super) fn fallback_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("quack-{}", current_uid()))
+        PathBuf::from("/tmp").join(format!("quack-{}", current_uid()))
     }
 
     /// Which kind of file a path must be to be used.

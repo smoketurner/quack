@@ -11,7 +11,7 @@ use clap::Subcommand;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
-use quack_core::ids::SessionId;
+use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::jobs::JobQueue;
 use quack_core::saved::{self, Answer, RunStatus, SavedQuestion, SavedRun, StatementRun};
 use quack_core::storage::control::ResourceKind;
@@ -80,6 +80,8 @@ pub struct Model {
     pub reader_db: ReaderDb,
     /// The process's queue, for the labelling a refreshed turn may start.
     pub jobs: JobQueue,
+    /// The workspace the saved questions belong to.
+    pub workspace_id: WorkspaceId,
     /// Full tool inputs on stderr.
     pub verbose: bool,
 }
@@ -213,6 +215,7 @@ async fn refresh_pin(
         db: Arc::clone(&model.db),
         reader_db: model.reader_db.clone(),
         jobs: model.jobs.clone(),
+        workspace_id: model.workspace_id.clone(),
         session_id: &session_id,
         policy: WritePolicy::Deny,
         prompt: &question.question,
@@ -651,6 +654,7 @@ mod tests {
             db: Arc::clone(&db),
             reader_db: ReaderDb::open(&db, config.analysis.reader_pool_size).await,
             jobs: JobQueue::new(10),
+            workspace_id: WorkspaceId::from("ws"),
             verbose: false,
         };
         let mut out = Vec::new();

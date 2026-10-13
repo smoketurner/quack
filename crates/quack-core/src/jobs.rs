@@ -821,9 +821,14 @@ impl JobQueue {
     /// (`store::recent`), as finished entries with fresh numbers, in the
     /// order given; one already known (the file was opened again in this
     /// process) is skipped. An active one is recorded as failed: the
-    /// process that ran it is gone.
+    /// process that ran it is gone. They go before every job this process
+    /// has, so the history bound evicts them first, and nothing is
+    /// broadcast: they ended long ago.
     pub fn restore(&self, jobs: Vec<JobInfo>) {
         let mut registry = self.inner.registry();
+        // Numbered oldest first, like jobs submitted here; placed in front
+        // in that same order.
+        let mut numbered = Vec::with_capacity(jobs.len());
         for mut info in jobs {
             if registry.jobs.contains_key(&info.id) {
                 continue;
@@ -836,7 +841,10 @@ impl JobQueue {
             }
             registry.last_number = registry.last_number.next();
             info.number = registry.last_number;
-            registry.order.push_back(info.id);
+            numbered.push(info);
+        }
+        for info in numbered.into_iter().rev() {
+            registry.order.push_front(info.id);
             registry.jobs.insert(
                 info.id,
                 Entry {
@@ -915,20 +923,36 @@ impl JobQueue {
     /// them. Returns the jobs still active when the grace ran out, which
     /// the runtime drops at their next await.
     pub async fn shutdown(&self, grace: Duration) -> Vec<JobInfo> {
+        self.end(grace, Ending::Cancel).await
+    }
+
+    /// Close the queue and wait up to `grace` for what is queued and
+    /// running to end on its own, cancelling nothing: a command that
+    /// answered and exits (`quack -p`) lets the title and labelling its
+    /// turn started finish. Returns the jobs still active when the grace
+    /// ran out.
+    pub async fn drain(&self, grace: Duration) -> Vec<JobInfo> {
+        self.end(grace, Ending::Wait).await
+    }
+
+    async fn end(&self, grace: Duration, ending: Ending) -> Vec<JobInfo> {
         let mut events = self.subscribe();
         let tokens: Vec<CancellationToken> = {
             let mut registry = self.inner.registry();
             registry.closed = true;
-            registry
-                .jobs
-                .values_mut()
-                .filter(|entry| !entry.info.state.is_finished())
-                .map(|entry| {
-                    entry.info.cancel_requested = true;
-                    drop(self.inner.events.send(entry.info.clone()));
-                    entry.cancel.clone()
-                })
-                .collect()
+            match ending {
+                Ending::Cancel => registry
+                    .jobs
+                    .values_mut()
+                    .filter(|entry| !entry.info.state.is_finished())
+                    .map(|entry| {
+                        entry.info.cancel_requested = true;
+                        drop(self.inner.events.send(entry.info.clone()));
+                        entry.cancel.clone()
+                    })
+                    .collect(),
+                Ending::Wait => Vec::new(),
+            }
         };
         for token in tokens {
             token.cancel();
@@ -1052,6 +1076,13 @@ impl JobQueue {
 
 /// The outcome of a job submitted after [`JobQueue::shutdown`].
 const REFUSED_BY_SHUTDOWN: &str = "refused: the queue is shutting down";
+
+/// How the queue ends: cancelling what runs, or waiting for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Cancel,
+    Wait,
+}
 
 impl JobInfo {
     /// Cancelled while still queued: its work never ran.

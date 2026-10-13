@@ -1166,6 +1166,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         db: Arc::clone(&db),
         reader_db: handle.reader.clone(),
         jobs: opened.engine.jobs.clone(),
+        workspace_id: opened.workspace.id.clone(),
         session_id: &session_id,
         policy,
         prompt,
@@ -1456,6 +1457,7 @@ async fn run_saved(cli: &Cli, action: saved_cli::SavedAction) -> Result<ExitCode
         db: Arc::clone(&db),
         reader_db: handle.reader.clone(),
         jobs: opened.engine.jobs.clone(),
+        workspace_id: opened.workspace.id.clone(),
         verbose: cli.verbose,
     };
     // Not the lock: a refresh is a print-mode turn, which writes its own
@@ -1566,48 +1568,20 @@ async fn run_graph_export(cli: &Cli, args: &graph_cli::ExportArgs) -> Result<Exi
     Ok(ExitCode::SUCCESS)
 }
 
-/// `quack mcp`: the workspace as an MCP server on stdin and stdout, or,
-/// when another `quack` holds the workspace, a relay to that process's
-/// socket, so Claude Code's entry works whether the terminal session was
-/// started before or after it.
+/// `quack mcp`: the workspace as an MCP server on stdin and stdout. It
+/// holds nothing between calls: each call runs in the process that holds
+/// the workspace (the terminal session, a command) over its socket, or
+/// opens the workspace for that call and closes it after, so Claude
+/// Code's entry works whether the terminal session was started before or
+/// after it.
 async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     init_logging();
-    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::command("mcp")).await?;
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), |_| Holder::Mcp).await?;
     let policy = WritePolicy::Deny.allowed_if(allow_write);
-    match opened.handle().await {
-        Ok(handle) => {
-            drop(handle);
-            quack_mcp::serve_stdio(Arc::clone(&opened.engine), opened.workspace.clone(), policy)
-                .await?;
-            // A run the client left behind finishes and records its end first.
-            opened.finish(quack_mcp::STDIO_GRACE).await;
-        }
-        Err(e) if is_workspace_locked(&e) => relay_mcp(&opened, e).await?,
-        Err(e) => return Err(e),
-    }
+    quack_mcp::serve_stdio(Arc::clone(&opened.engine), opened.workspace.clone(), policy).await?;
+    // A run the client left behind finishes and records its end first.
+    opened.finish(quack_mcp::STDIO_GRACE).await;
     Ok(ExitCode::SUCCESS)
-}
-
-/// Pass the client's MCP requests on stdin to the holder's socket and
-/// its answers back to stdout, until either side closes. `--allow-write`
-/// has no say: the holder's own policy decides, and a write asks at the
-/// terminal session's prompt.
-async fn relay_mcp(opened: &OpenedWorkspace, locked: anyhow::Error) -> Result<()> {
-    let workspace_dir = opened.config().workspace_dir(opened.workspace.id.as_str());
-    let Some(stream) = forward::connect(&workspace_dir, &opened.workspace.id).await? else {
-        return Err(locked);
-    };
-    let (mut from_holder, mut to_holder) = tokio::io::split(stream);
-    let (mut stdin, mut stdout) = (tokio::io::stdin(), tokio::io::stdout());
-    tokio::select! {
-        sent = tokio::io::copy(&mut stdin, &mut to_holder) => {
-            sent.context("relaying to the holder failed")?;
-        }
-        received = tokio::io::copy(&mut from_holder, &mut stdout) => {
-            received.context("relaying from the holder failed")?;
-        }
-    }
-    Ok(())
 }
 
 /// `quack jobs`: the workspace's jobs as this process restores them from
@@ -1932,9 +1906,6 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     }
     let mut opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::Terminal).await?;
     let writes = WritePolicy::Ask.allowed_if(cli.allow_write);
-    // A turn `quack mcp` asks of this session writes as the session's own
-    // turns do, approved at its prompt.
-    opened.socket_writes(writes);
     let handle = opened.handle().await?;
     let session_id = {
         let config = opened.config().clone();

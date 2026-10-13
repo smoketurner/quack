@@ -29,9 +29,6 @@ pub struct OpenedWorkspace {
     pub control: ControlPlane,
     pub workspace: WorkspaceRow,
     pub name: String,
-    /// What the socket's `query` turns may write: nothing for a command;
-    /// the session's own policy for the terminal (`socket_writes`).
-    socket_writes: WritePolicy,
     /// Where a socket turn's write asks: the terminal session listens
     /// (`SessionSetup::approvals`); for a command nobody does, so a write
     /// is refused.
@@ -89,18 +86,9 @@ impl OpenedWorkspace {
             control,
             workspace,
             name,
-            socket_writes: WritePolicy::Deny,
             approvals: Approvals::new(),
             socket: OnceCell::new(),
         })
-    }
-
-    /// Let the socket's `query` turns write under `policy` (the terminal
-    /// session hands over its own, so a turn `quack mcp` asks of it is
-    /// approved at its prompt like the session's own). Before the first
-    /// `handle()`.
-    pub fn socket_writes(&mut self, policy: WritePolicy) {
-        self.socket_writes = policy;
     }
 
     /// The configuration the engine runs under.
@@ -126,10 +114,18 @@ impl OpenedWorkspace {
         Ok(handle)
     }
 
-    /// Serve the workspace on its socket for other `quack` processes
-    /// (writes as `socket_writes`, unaudited like stdio). A socket that
-    /// cannot be bound is logged once; the command runs without it.
+    /// Serve the workspace on its socket for other `quack` processes,
+    /// unaudited like stdio. Under the terminal session a `query` turn's
+    /// write asks at the session's prompt (`Ask`, whatever `--allow-write`
+    /// said: the asker is another process); under a command it is refused.
+    /// A socket that cannot be bound is logged once; the command runs
+    /// without it.
     async fn serve_socket(&self, handle: &WorkspaceHandle) -> Option<SocketServer> {
+        let policy = match self.engine.holder() {
+            Holder::Terminal(_) => WritePolicy::Ask,
+            Holder::Command { .. } => WritePolicy::Deny,
+            Holder::Serve | Holder::Mcp => return None,
+        };
         let dir = self.engine.config.workspace_dir(self.workspace.id.as_str());
         let listener = match Listener::bind(&dir, &self.workspace.id).await {
             Ok(listener) => listener,
@@ -143,7 +139,7 @@ impl OpenedWorkspace {
             db: Arc::clone(&handle.writer),
             reader: handle.reader.clone(),
             workspace: self.workspace.clone(),
-            policy: self.socket_writes,
+            policy,
             user_id: None,
             transport: Transport::Socket,
             jobs: self.engine.jobs.clone(),
@@ -178,12 +174,12 @@ impl OpenedWorkspace {
         self.handle().await?.writer.run(move |db| Ok(f(db))).await?
     }
 
-    /// Stop the engine's jobs under `grace`, end the socket's sessions,
-    /// and close the workspace, so a run the command started records its
-    /// end and the writer checkpoints before the process exits. Every
-    /// handle must be dropped first.
+    /// Let the engine's jobs end under `grace` (a labelling or a title the
+    /// command started finishes; nothing is cancelled), end the socket's
+    /// sessions, and close the workspace, so the writer checkpoints before
+    /// the process exits. Every handle must be dropped first.
     pub async fn finish(mut self, grace: Duration) {
-        self.engine.stop_jobs(grace).await;
+        self.engine.drain_jobs(grace).await;
         self.close_socket(grace).await;
         self.engine.close().await;
     }

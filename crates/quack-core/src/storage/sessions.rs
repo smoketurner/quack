@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use jiff::Timestamp;
 
+use crate::jobs::store as jobs_store;
+
 use crate::analysis::agent::{AgentResponse, TokenUsage};
 use crate::analysis::chart::ChartSpec;
 use crate::analysis::citations::Citation;
@@ -1114,6 +1116,8 @@ pub fn delete_session(db: &WorkspaceDb, session_id: &SessionId) -> Result<bool> 
         "DELETE FROM _quack_sessions WHERE id = ?",
         duckdb::params![session_id],
     )?;
+    // Its turns' job rows quote the questions.
+    jobs_store::delete_session_jobs(db, session_id)?;
     Ok(true)
 }
 

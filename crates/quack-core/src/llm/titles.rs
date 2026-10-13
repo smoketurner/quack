@@ -118,8 +118,14 @@ impl SessionTitler {
         if let Some(workspace) = workspace {
             spec = spec.workspace(workspace);
         }
-        jobs.submit(spec, move |_| async move {
-            match self.title(&db, &session).await {
+        jobs.submit(spec, move |ctx| async move {
+            let cancel = ctx.cancel_token();
+            let titled = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(String::from("cancelled")),
+                titled = self.title(&db, &session) => titled,
+            };
+            match titled {
                 Ok(true) => Ok(String::from("titled")),
                 Ok(false) => Ok(String::from("kept the person's title")),
                 Err(e) => Err(format!("the session keeps its derived title: {e}")),

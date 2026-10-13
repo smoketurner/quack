@@ -12,9 +12,9 @@ use jiff::Timestamp;
 use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
 
-use super::{JobId, JobInfo, JobKind, JobNumber, JobProgress, JobState};
+use super::{JobId, JobInfo, JobKind, JobNumber, JobProgress, JobState, LaneKey};
 use crate::error::{Error, Result};
-use crate::ids::{UserId, WorkspaceId};
+use crate::ids::{SessionId, UserId, WorkspaceId};
 use crate::storage::workspace::WorkspaceDb;
 
 /// The table, created at open.
@@ -113,6 +113,34 @@ pub fn fail_interrupted(db: &WorkspaceDb) -> Result<usize> {
         ],
     )?;
     Ok(changed)
+}
+
+/// Keep the newest `keep` jobs and delete the rest. Returns how many went.
+///
+/// # Errors
+///
+/// Returns the statement's error.
+pub fn prune(db: &WorkspaceDb, keep: u32) -> Result<usize> {
+    let gone = db.connection().execute(
+        "DELETE FROM _quack_jobs WHERE id NOT IN \
+         (SELECT id FROM _quack_jobs ORDER BY queued_at DESC, id DESC LIMIT ?)",
+        duckdb::params![keep],
+    )?;
+    Ok(gone)
+}
+
+/// Delete the jobs of one chat session (its turns, whose labels quote the
+/// questions), when the session goes.
+///
+/// # Errors
+///
+/// Returns the statement's error.
+pub fn delete_session_jobs(db: &WorkspaceDb, session: &SessionId) -> Result<usize> {
+    let gone = db.connection().execute(
+        "DELETE FROM _quack_jobs WHERE lane = ?",
+        duckdb::params![LaneKey::Session(session.clone()).to_string()],
+    )?;
+    Ok(gone)
 }
 
 /// The newest `limit` jobs, oldest first, each for `workspace`; a job's

@@ -78,6 +78,11 @@ struct Recorder {
 /// pending.
 const RECORDER_DRAIN: Duration = Duration::from_secs(5);
 
+/// The most jobs one workspace's file puts back into the queue at open:
+/// the queue's history bound is per process, and a server opens many
+/// workspaces. The file keeps `[jobs].history` of them.
+const RESTORED_PER_WORKSPACE: u32 = 20;
+
 impl Recorder {
     /// Run over `events` until the queue closes or `closing` fires, then
     /// write what is still pending.
@@ -359,7 +364,9 @@ impl Engine {
                 if interrupted > 0 {
                     tracing::warn!(workspace = %id, interrupted, "failed jobs left active by an earlier process");
                 }
-                let earlier = jobs_store::recent(&db, &id, history)?;
+                jobs_store::prune(&db, history)?;
+                let earlier =
+                    jobs_store::recent(&db, &id, history.min(RESTORED_PER_WORKSPACE))?;
                 let audit = AuditLog::open(&db)?;
                 Ok::<_, Error>((db, audit, earlier))
             })
@@ -514,6 +521,15 @@ impl Engine {
     pub async fn stop_jobs(&self, grace: Duration) -> Vec<JobInfo> {
         self.begin_stop();
         self.jobs.shutdown(grace).await
+    }
+
+    /// Begin to stop, and let the queue's jobs end on their own under
+    /// `grace` (a later submit is refused; nothing running is cancelled):
+    /// what a command that answered one question does before it exits, so
+    /// the title and labelling its turn started finish.
+    pub async fn drain_jobs(&self, grace: Duration) -> Vec<JobInfo> {
+        self.begin_stop();
+        self.jobs.drain(grace).await
     }
 
     /// Drop every workspace handle, so each writer finishes its queued
