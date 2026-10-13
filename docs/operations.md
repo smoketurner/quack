@@ -17,7 +17,9 @@ this order and know what each step leaves.
    text and the citation's excerpt (the first 500 characters of the chunk) in
    `_quack_messages`; delete those sessions (`quack sessions`, the chat page, or
    `DELETE .../sessions/{sid}`). A `search` or `query` audit detail row inside the workspace
-   quotes the question, not the document. A saved question holds SQL, not rows.
+   quotes the question, not the document. A saved question holds SQL, not rows. A job row in
+   `_quack_jobs` names the file an ingest loaded and quotes a turn's question; deleting the
+   session deletes its turns' rows, and the table keeps at most `[jobs].history` rows.
 3. **Reclaim the blocks.** DuckDB marks deleted rows free and reuses the space; the bytes
    stay in `data.duckdb` until the blocks are rewritten. To force it, take a snapshot
    (`quack workspace snapshot NAME --to FILE`) and restore it as a new workspace, or export

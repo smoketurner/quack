@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 quack-core = { path = "../quack-core" }
+quack-mcp  = { path = "../quack-mcp" }
 anyhow     = { workspace = true, features = ["std"] }
 clap       = { workspace = true, features = ["derive", "error-context", "help", "std", "usage"] }
 serde      = { workspace = true, features = ["derive", "std"] }

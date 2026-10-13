@@ -1,20 +1,27 @@
 //! Opening the workspace a command runs in: the one `-w` names, which
 //! must exist, or the default, created on first use. The binary and the
 //! terminal's setup open a workspace through this one type, so every
-//! command resolves names, enters the provider egress scope, and holds the
-//! file the same way: through the process's [`Engine`], the one open path.
+//! command resolves names, enters the provider egress scope, holds the
+//! file the same way (through the process's [`Engine`], the one open
+//! path), and serves it on the workspace socket while it holds it, so
+//! `quack mcp` and `quack -q` in another shell reach it (`quack_mcp::socket`).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use quack_core::analysis::permissions::Approvals;
+use quack_core::analysis::policy::WritePolicy;
 use quack_core::config::Config;
 use quack_core::engine::{Engine, WorkspaceHandle};
-use quack_core::forward::Holder;
+use quack_core::forward::{Holder, Listener};
 use quack_core::ids::WorkspaceId;
 use quack_core::llm::egress::Egress;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::workspace::WorkspaceDb;
+use quack_mcp::socket::SocketServer;
+use quack_mcp::{McpServer, McpSetup, Transport};
+use tokio::sync::OnceCell;
 
 /// The engine and the workspace a command runs in.
 pub struct OpenedWorkspace {
@@ -22,6 +29,13 @@ pub struct OpenedWorkspace {
     pub control: ControlPlane,
     pub workspace: WorkspaceRow,
     pub name: String,
+    /// Where a socket turn's write asks: the terminal session listens
+    /// (`SessionSetup::approvals`); for a command nobody does, so a write
+    /// is refused.
+    pub approvals: Approvals,
+    /// The socket server, started by the first `handle()`; `None` when the
+    /// socket could not be bound (said once in the log).
+    socket: OnceCell<Option<SocketServer>>,
 }
 
 impl OpenedWorkspace {
@@ -72,6 +86,8 @@ impl OpenedWorkspace {
             control,
             workspace,
             name,
+            approvals: Approvals::new(),
+            socket: OnceCell::new(),
         })
     }
 
@@ -89,10 +105,58 @@ impl OpenedWorkspace {
     /// Returns an error when the workspace database does not open (another
     /// process holds it, the file is too new, ...).
     pub async fn handle(&self) -> Result<WorkspaceHandle> {
-        self.engine
+        let handle = self
+            .engine
             .workspace(&self.workspace.id)
             .await
-            .context("failed to open workspace database")
+            .context("failed to open workspace database")?;
+        self.socket.get_or_init(|| self.serve_socket(&handle)).await;
+        Ok(handle)
+    }
+
+    /// Serve the workspace on its socket for other `quack` processes,
+    /// unaudited like stdio. Under the terminal session a `query` turn's
+    /// write asks at the session's prompt (`Ask`, whatever `--allow-write`
+    /// said: the asker is another process); under a command it is refused.
+    /// A socket that cannot be bound is logged once; the command runs
+    /// without it.
+    async fn serve_socket(&self, handle: &WorkspaceHandle) -> Option<SocketServer> {
+        let policy = match self.engine.holder() {
+            Holder::Terminal(_) => WritePolicy::Ask,
+            Holder::Command { .. } => WritePolicy::Deny,
+            Holder::Serve | Holder::Mcp => return None,
+        };
+        let dir = self.engine.config.workspace_dir(self.workspace.id.as_str());
+        let listener = match Listener::bind(&dir, &self.workspace.id).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                tracing::warn!(workspace = %self.workspace.id, error = %e, "other quack processes cannot reach this workspace through this one");
+                return None;
+            }
+        };
+        let server = McpServer::new(McpSetup {
+            config: self.engine.config.clone(),
+            db: Arc::clone(&handle.writer),
+            reader: handle.reader.clone(),
+            workspace: self.workspace.clone(),
+            policy,
+            user_id: None,
+            transport: Transport::Socket,
+            jobs: self.engine.jobs.clone(),
+            stopping: self.engine.stopping(),
+            holder: self.engine.holder().to_string(),
+            approvals: self.approvals.clone(),
+        });
+        Some(SocketServer::serve(listener, server))
+    }
+
+    /// Stop serving the socket and wait up to `grace` for its sessions;
+    /// the socket file goes with it. Before the engine closes, so a
+    /// session in flight ends on an open workspace.
+    pub async fn close_socket(&mut self, grace: Duration) {
+        if let Some(Some(socket)) = self.socket.take() {
+            socket.close(grace).await;
+        }
     }
 
     /// Run `f` on the workspace's writer connection and await it: what a
@@ -110,11 +174,13 @@ impl OpenedWorkspace {
         self.handle().await?.writer.run(move |db| Ok(f(db))).await?
     }
 
-    /// Stop the engine's jobs under `grace` and close the workspace, so a
-    /// run the command started records its end and the writer checkpoints
-    /// before the process exits. Every handle must be dropped first.
-    pub async fn finish(self, grace: Duration) {
-        self.engine.stop_jobs(grace).await;
+    /// Let the engine's jobs end under `grace` (a labelling or a title the
+    /// command started finishes; nothing is cancelled), end the socket's
+    /// sessions, and close the workspace, so the writer checkpoints before
+    /// the process exits. Every handle must be dropped first.
+    pub async fn finish(mut self, grace: Duration) {
+        self.engine.drain_jobs(grace).await;
+        self.close_socket(grace).await;
         self.engine.close().await;
     }
 }

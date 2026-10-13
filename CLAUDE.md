@@ -92,7 +92,8 @@ data-layer, crypto, or dependency change:
 
 ```bash
 cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # SQL, no agent
-#   on a workspace another quack process holds (the terminal, `quack serve`, the desktop app), a read runs inside that process over `{workspace}/quack.sock` (quack_core::forward) and says so on stderr; a write is refused naming the holder
+#   on a workspace another quack process holds (the terminal, a command), the statement runs through that process's MCP `sql` tool over its workspace socket (quack_core::forward, quack_mcp::client) and says so on stderr; a write is the holder's refusal, naming it
+cargo run --bin quack -- jobs [--format json]                                 # the workspace's jobs: what runs, what ran and how it ended (_quack_jobs; restored on open); through the holder's quack://workspace/jobs when another quack holds it
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
 cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use
 cargo run --bin quack -- workspace rename OLD NEW | delete NAME [-y] | snapshot NAME [--to FILE|-] | restore FILE|- [--name N]   # storage::backup: one tar (manifest.json, data.duckdb, files/); delete is at once, the audit rows stay
@@ -127,7 +128,7 @@ cargo run --bin quack -- doctor [--offline] [--format json]                     
 cargo run --bin quack -- ready [--url URL] ; vault export-key [--to FILE|-] [-y]          # GET /readyz (the image's HEALTHCHECK); the vault key to a 0600 file or stdout
 cargo run --bin quack -- user add|list ; token create|list|revoke ; member add|remove|list ; audit [-w ws --detail --format ocsf [--with-prompt]]   # server admin; --detail joins the workspace's own audit (OCSF ai_operation on queries)
 cargo run --bin quack -- serve [--bind ADDR] [--local]                          # web UI, REST API under /api/v1 (its OpenAPI 3.1 document at /api/v1/openapi.json, rendered at /api/v1/docs), MCP under /mcp/v1/{workspace}; /readyz and /metrics (quack_core::telemetry) outside the limiter; [server].log_format = "json" for a collector; every provider request retried under [providers.NAME].max_retries / retry_backoff_ms (llm::limit::Attempts)
-cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors
+cargo run --bin quack -- mcp [-w ws] [--allow-write]                            # MCP server on stdio for Claude Code and editors; holds nothing between calls: each call runs through the holder's socket (the terminal, a command; a write then asks at the terminal's prompt) or opens the workspace for that call
 ```
 
 A saved question (`quack_core::saved`, design doc 8.1) is an answered turn's `run_sql`
@@ -192,9 +193,16 @@ broadcast of `JobInfo` snapshots every interface reports from. The process is on
 `quack serve`, the terminal, and every command build one (`Engine::new(config,
 forward::Holder)`; the command line's `OpenedWorkspace` holds it, `with_db` runs a one-shot
 command's step on the writer, `finish` stops and closes) and `Engine::workspace(id)`
-opens a workspace file once per process (the `OnceCell` rule of `code-standards.md`), binding
-the holder's forward socket and handing back the writer, reader pool, and audit connection as a
-`WorkspaceHandle`; a holder of one workspace is refused any other. `Engine::stop_jobs(grace)` is
+opens a workspace file once per process (the `OnceCell` rule of `code-standards.md`), restores
+the jobs the file remembers (`_quack_jobs`, written by the engine's recorder as a job's state
+changes; a job an earlier process left active is marked failed), and hands back the writer,
+reader pool, and audit connection as a `WorkspaceHandle`; a holder of one workspace is refused
+any other. Every holder but `quack serve` serves the workspace on its socket
+(`forward::SocketPath`, MCP and nothing else: `quack_mcp::socket`, started by
+`OpenedWorkspace::handle`; `quack mcp` relays to it, `quack -q` and `quack jobs` read through
+it; a `query` turn's write asks the terminal's prompt through `analysis::permissions::Approvals`;
+`quack mcp` holds nothing between calls: `quack_mcp::relay::PerCallServer`).
+A session's title after a turn is a `title` job on the same queue. `Engine::stop_jobs(grace)` is
 the one way a process stops its jobs: it cancels the stopping token (which ends `jobs/stream` and
 the MCP event streams, and cancels an MCP `query` turn, which runs under a child of it), then
 `JobQueue::shutdown(grace)`: a later `submit` is recorded as cancelled and never runs, queued and
@@ -231,7 +239,7 @@ through rig-bedrock and the AWS SDK, whose HTTPS client is wrapped to take the s
 `LimitedHttp` that SigV4-signs each request after its permit; Responses always sends
 `store: false`). Credentials come from `aws_config::defaults` (env, `aws_profile`, SSO,
 instance roles; `auth = "aws"`, the type's default); `base_url` is the endpoint root (a VPC
-endpoint), checked against the type; one cached `Session` per provider. The registry is in memory only (labels can be workspace content).
+endpoint), checked against the type; one cached `Session` per provider. The job registry is in memory (labels can be workspace content); each workspace's jobs are kept in its own file (`_quack_jobs`) and restored at open.
 The terminal is one async loop (`tokio::select!` over crossterm's `EventStream`, one
 `AppMsg` channel, the job broadcast, a spinner tick) and submits every question,
 statement, file, import, and ontology or graph verb as a job, so it never blocks its input:
@@ -554,7 +562,7 @@ that sent a token, the first one before any work so the HTTP transport, which ho
 response until the handler's first message, answers at once; and a task's status line), and
 for a client that declares the tasks extension `query` answers with a task (rmcp's
 `TaskManager` on the server, `tasks/get` for the answer, `tasks/cancel` cancels the turn);
-`quack mcp` serves it on stdio (unaudited, like the CLI) and `quack-server`'s `mcp_http.rs` serves it
+`quack mcp` serves it on stdio (unaudited, like the CLI; or relays to the holder's socket), and `quack-server`'s `mcp_http.rs` serves it
 at `/mcp/v1/{workspace}` behind `Access::resolve`, one transport per workspace, user, and write
 permission, each request carrying an `McpCaller` (core's `storage::audit::Recorder`, both audit
 halves for that person in that workspace, which `Access::audit` and background runs also record

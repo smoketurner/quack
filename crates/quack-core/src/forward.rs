@@ -1,56 +1,54 @@
-//! Reads through the process that holds a workspace (`docs/desktop.md`,
-//! section 3.6).
+//! The socket a workspace's holder serves the workspace on (design doc
+//! 4.1 and 11.3).
 //!
 //! `DuckDB` allows one process with read-write access to a file, or any
 //! number of read-only processes, never a writer beside readers: a second
-//! `quack` cannot open a workspace the terminal, `quack serve`, or the
-//! desktop app holds, even for `SELECT 1`. There is one lock and one
-//! `DuckDB` instance per workspace, and the way through it is to run the
-//! second process's reads inside the holder.
+//! `quack` cannot open a workspace the terminal session or a command
+//! holds, even for `SELECT 1`. There is one lock and one `DuckDB` instance
+//! per workspace, and the way through it is to reach the holder.
 //!
 //! Whichever process holds a workspace open also listens on a Unix socket
-//! in the workspace directory ([`SOCKET_FILE`]) with a per-launch token in
-//! a 0600 file beside it ([`TOKEN_FILE`]); both go when the workspace
-//! closes. A command that hits the lock ([`Error::WorkspaceLocked`]) looks
-//! for the socket and runs its read there, on the holder's reader pool in
-//! a read-only transaction, and gets the same rows it would have read
-//! itself. A write is refused naming the holder: forwarded blind it would
-//! run under the holder's policy with nobody to ask and no one to audit it
-//! as.
+//! ([`SocketPath`]) and serves MCP on it, nothing else: `quack mcp` relays
+//! a client's requests to it, and `quack -q` calls its `sql` tool
+//! (`quack_mcp`). The socket goes when the workspace closes. `quack serve`
+//! serves no socket: a login-mode server would hand any same-user process
+//! the whole agent with no audit row.
 //!
-//! Neither end trusts the files or the peer on faith. A client uses the
-//! socket and the token file only when each is the right kind of file,
-//! owned by the current user, and unreachable by anyone else; both ends
-//! check the peer's credentials and refuse a process running as another
-//! user; a holder never removes a stale socket that is not its own user's.
+//! Neither end trusts the file or the peer on faith. A client uses the
+//! socket only when it is a socket, owned by the current user, and
+//! unreachable by anyone else; both ends check the peer's credentials and
+//! refuse a process running as another user; a holder never removes a
+//! stale socket that is not its own user's.
 //!
-//! One request per connection, one JSON object per line each way. The
-//! module is Unix-only; elsewhere [`connect`] finds no holder and
-//! [`Listener::bind`] listens on nothing.
+//! This module is the transport: who binds, who connects, and the checks.
+//! On Unix it is a socket file; on Windows a named pipe, whose random
+//! name the holder writes to a file beside the workspace file (the data
+//! directory is the user's own, so that file is what another user cannot
+//! read or forge), with the pipe's default access rights (full for its
+//! creator, read-only for everyone else) refusing other users' clients.
 
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
-
-use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::ids::WorkspaceId;
-use crate::storage::workspace::QueryResults;
 
-/// The process that holds workspaces open, as the token file names it to
-/// the person reading `quack -q`'s stderr, and the one workspace it holds:
-/// `quack serve` opens any workspace a request names; the terminal session
-/// and every command opened exactly one and refuse the rest
-/// (`engine::Engine::workspace`).
+/// The process that holds workspaces open, as the MCP `initialize` reply
+/// names it to the person reading `quack -q`'s stderr, and the one
+/// workspace it holds: `quack serve` opens any workspace a request names;
+/// the terminal session and every command opened exactly one and refuse
+/// the rest (`engine::Engine::workspace`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Holder {
     Serve,
     Terminal(WorkspaceId),
-    /// A `quack` command, named by its verb (`-p`, `ingest`, `mcp`, ...).
+    /// A `quack` command, named by its verb (`-p`, `ingest`, ...).
     Command {
         workspace: WorkspaceId,
         verb: &'static str,
     },
+    /// `quack mcp`, which holds nothing between calls: it opens the
+    /// workspace for one call and closes it after, or reaches the holder.
+    Mcp,
 }
 
 impl Holder {
@@ -64,8 +62,20 @@ impl Holder {
     #[must_use]
     pub fn held(&self) -> Option<&WorkspaceId> {
         match self {
-            Self::Serve => None,
+            Self::Serve | Self::Mcp => None,
             Self::Terminal(id) | Self::Command { workspace: id, .. } => Some(id),
+        }
+    }
+
+    /// Whether this holder serves the workspace socket while it holds the
+    /// file: the session and every command; not the server (a login-mode
+    /// server would hand any same-user process the agent with no audit
+    /// row) and not `quack mcp`, which holds nothing between calls.
+    #[must_use]
+    pub fn serves_socket(&self) -> bool {
+        match self {
+            Self::Terminal(_) | Self::Command { .. } => true,
+            Self::Serve | Self::Mcp => false,
         }
     }
 }
@@ -76,6 +86,7 @@ impl std::fmt::Display for Holder {
             Self::Serve => f.write_str("quack serve"),
             Self::Terminal(_) => f.write_str("the quack terminal session"),
             Self::Command { verb, .. } => write!(f, "quack {verb}"),
+            Self::Mcp => f.write_str("quack mcp"),
         }
     }
 }
@@ -83,96 +94,80 @@ impl std::fmt::Display for Holder {
 /// The socket a workspace's holder listens on, inside the workspace
 /// directory.
 pub const SOCKET_FILE: &str = "quack.sock";
-/// The token a request must carry, beside the socket, mode 0600.
-pub const TOKEN_FILE: &str = "quack.sock.token";
-/// The most bytes one request line may run to.
-#[cfg(unix)]
-const MAX_REQUEST_BYTES: u64 = 1 << 20;
 
-/// What the token file holds: the token, and who listens.
-#[cfg(unix)]
-#[derive(Debug, Serialize, Deserialize)]
-struct TokenFile {
-    token: String,
-    /// The holder as a person reads it: `quack serve`, `Quack.app`, the
-    /// terminal session.
-    holder: String,
-    pid: u32,
+/// The file beside the workspace file that names the holder's pipe on
+/// Windows.
+pub const PIPE_FILE: &str = "quack.pipe";
+
+/// Where a workspace's socket is. On Unix, a socket address holds about a
+/// hundred bytes of path (104 on macOS, 108 on Linux), and a data
+/// directory under a long path leaves no room beside the workspace file,
+/// so the socket then goes under a per-user directory in `/tmp` instead.
+/// On Windows it is a named pipe, named in a file beside the workspace
+/// file. One rule, worked out by both ends from the same inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocketPath {
+    /// `{workspace_dir}/quack.sock`.
+    Beside(PathBuf),
+    /// `/tmp/quack-{uid}/{workspace_id}.sock`, since the workspace
+    /// directory's path is too long for a socket address. A fixed path,
+    /// not `TMPDIR`: a terminal and a cron job must compute the same one.
+    Fallback(PathBuf),
+    /// `{workspace_dir}/quack.pipe`, holding the name of the holder's
+    /// named pipe (Windows).
+    Pipe(PathBuf),
 }
 
-/// One request from a process that could not take the lock.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "request", rename_all = "snake_case")]
-pub enum Request {
-    /// Who holds the workspace.
-    Hello,
-    /// A read statement, run as `quack -q` would run it.
-    Query { sql: String },
-}
-
-/// The holder's answer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "reply", rename_all = "snake_case")]
-pub enum Reply {
-    Hello {
-        holder: String,
-    },
-    Results {
-        results: QueryResults,
-    },
-    /// The request was a write, which the holder runs for nobody else.
-    Refused,
-    /// The request failed on the holder's side.
-    Error {
-        message: String,
-    },
-}
-
-#[cfg(unix)]
-#[derive(Debug, Serialize, Deserialize)]
-struct Envelope {
-    token: String,
-    request: Request,
-}
-
-/// Where a workspace's socket and token live.
-#[cfg(unix)]
-#[derive(Debug, Clone)]
-struct Paths {
-    socket: PathBuf,
-    token: PathBuf,
-}
-
-#[cfg(unix)]
-impl Paths {
-    /// The socket and token inside `workspace_dir`
+impl SocketPath {
+    /// The socket for the workspace in `workspace_dir`
     /// (`Config::workspace_dir`).
-    fn of(workspace_dir: &Path) -> Self {
-        Self {
-            socket: workspace_dir.join(SOCKET_FILE),
-            token: workspace_dir.join(TOKEN_FILE),
+    #[must_use]
+    pub fn of(workspace_dir: &Path, workspace_id: &WorkspaceId) -> Self {
+        platform::socket_path(workspace_dir, workspace_id)
+    }
+
+    /// The file: the socket, or the one naming the pipe.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Beside(path) | Self::Fallback(path) | Self::Pipe(path) => path,
+        }
+    }
+
+    /// The directory a fallback socket is in, which the holder creates
+    /// private to this user; `None` otherwise.
+    #[must_use]
+    pub fn fallback_dir(&self) -> Option<&Path> {
+        match self {
+            Self::Beside(_) | Self::Pipe(_) => None,
+            Self::Fallback(path) => path.parent(),
         }
     }
 }
 
 #[cfg(unix)]
-mod unix {
-    use std::io::Write as _;
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-    use std::path::Path;
-    use std::sync::{Arc, Mutex};
+mod platform {
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
 
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
 
-    use super::{Envelope, Holder, MAX_REQUEST_BYTES, Paths, Reply, Request, TokenFile};
-    use crate::analysis::tools::ReaderDb;
+    use super::{SOCKET_FILE, SocketPath};
     use crate::error::{Error, Result};
-    use crate::storage::control::random_bytes;
-    use crate::storage::workspace::{QueryResults, StatementKind};
+    use crate::ids::WorkspaceId;
 
-    /// What a refusal names as the holder before the token file has been
-    /// read, or when the other end is not who it should be.
+    /// Beside the workspace file when that fits a socket address, else
+    /// under the per-user directory.
+    pub(super) fn socket_path(workspace_dir: &Path, workspace_id: &WorkspaceId) -> SocketPath {
+        let beside = workspace_dir.join(SOCKET_FILE);
+        if fits_socket_address(&beside) {
+            return SocketPath::Beside(beside);
+        }
+        SocketPath::Fallback(fallback_dir().join(format!("{workspace_id}.sock")))
+    }
+
+    /// What a refusal names as the holder when the other end is not who it
+    /// should be.
     const SOMEONE: &str = "another process";
 
     /// The user this process runs as.
@@ -180,11 +175,23 @@ mod unix {
         rustix::process::getuid().as_raw()
     }
 
+    /// Whether `path` fits a Unix socket address on this platform.
+    fn fits_socket_address(path: &Path) -> bool {
+        rustix::net::SocketAddrUnix::new(path).is_ok()
+    }
+
+    /// The per-user directory a fallback socket goes in: under `/tmp`,
+    /// never `TMPDIR`, which differs between a terminal and a job cron
+    /// or launchd started.
+    fn fallback_dir() -> PathBuf {
+        PathBuf::from("/tmp").join(format!("quack-{}", current_uid()))
+    }
+
     /// Which kind of file a path must be to be used.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Kind {
         Socket,
-        Regular,
+        Directory,
     }
 
     fn refuse(path: &Path, what: &str) -> Error {
@@ -196,20 +203,16 @@ mod unix {
 
     /// `path` is a `kind` file this user owns. Symlinks are not followed, so
     /// a link planted at the path is refused rather than resolved.
-    #[expect(
-        clippy::filetype_is_file,
-        reason = "a regular file is exactly what the token file must be: not a link, a directory, a device, or a pipe"
-    )]
     fn check_owned(path: &Path, kind: Kind) -> Result<std::fs::Metadata> {
         let meta = std::fs::symlink_metadata(path)?;
         let is_kind = match kind {
             Kind::Socket => meta.file_type().is_socket(),
-            Kind::Regular => meta.file_type().is_file(),
+            Kind::Directory => meta.file_type().is_dir(),
         };
         if !is_kind {
             let want = match kind {
                 Kind::Socket => "a socket",
-                Kind::Regular => "a regular file",
+                Kind::Directory => "a directory",
             };
             return Err(refuse(path, &format!("is not {want}")));
         }
@@ -247,401 +250,401 @@ mod unix {
         Ok(())
     }
 
-    /// The holder's end: the socket, the token file, and the accept loop.
-    /// Dropping it stops listening and removes both files.
+    /// A connection to or from a holder.
+    pub type Stream = UnixStream;
+
+    /// The holder's end: the bound socket. Dropping it stops listening
+    /// and removes the file.
     pub struct Listener {
-        paths: Paths,
-        accept: tokio::task::JoinHandle<()>,
-        /// The reader the accept loop answers on, held here rather than in
-        /// the loop's future: an aborted task drops its future only when the
-        /// runtime next polls it, and the reader's connections must close with
-        /// the holder's, so that closing the workspace checkpoints its log.
-        /// Dropping the listener takes it out at once.
-        reader: Arc<Mutex<Option<ReaderDb>>>,
+        at: SocketPath,
+        listener: UnixListener,
     }
 
     impl Listener {
-        /// Listen in `workspace_dir` (`Config::workspace_dir`) for the
-        /// workspace's reads as `holder` (the name a refused writer is told),
-        /// answering them on `reader`. Takes the directory, not the `Config`,
-        /// so a caller's future holds a path, not a configuration. A socket left by a
-        /// holder of this user that died is replaced; one that answers is an
-        /// error, since two holders cannot both have the file open; one that
-        /// another user owns is an error and is left alone.
+        /// Listen for the workspace in `workspace_dir`
+        /// (`Config::workspace_dir`). A socket left by a holder of this
+        /// user that died is replaced; one that answers is an error, since
+        /// two holders cannot both have the file open; one that another
+        /// user owns is an error and is left alone.
         ///
         /// # Errors
         ///
-        /// Returns an error when the socket cannot be bound, the token cannot
-        /// be written, another process already answers on the socket, or a
-        /// file in the way is not this user's.
-        pub async fn bind(workspace_dir: &Path, holder: &Holder, reader: ReaderDb) -> Result<Self> {
-            let holder = holder.to_string();
-            let paths = Paths::of(workspace_dir);
-            if paths.socket.exists() {
-                check_owned(&paths.socket, Kind::Socket)?;
-                if UnixStream::connect(&paths.socket).await.is_ok() {
+        /// Returns an error when the socket cannot be bound, another
+        /// process already answers on it, or a file in the way is not this
+        /// user's.
+        pub async fn bind(workspace_dir: &Path, workspace_id: &WorkspaceId) -> Result<Self> {
+            let at = SocketPath::of(workspace_dir, workspace_id);
+            if let Some(dir) = at.fallback_dir() {
+                let created = std::fs::DirBuilder::new().mode(0o700).create(dir);
+                if let Err(e) = created
+                    && e.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    return Err(Error::Io(e));
+                }
+                check_private(dir, Kind::Directory)?;
+            }
+            let path = at.path();
+            if path.exists() {
+                check_owned(path, Kind::Socket)?;
+                if UnixStream::connect(path).await.is_ok() {
                     return Err(Error::Forward(format!(
-                        "{holder} cannot listen: another process already answers on {}",
-                        paths.socket.display()
+                        "another process already answers on {}",
+                        path.display()
                     )));
                 }
-                std::fs::remove_file(&paths.socket)?;
-            }
-            let listener = UnixListener::bind(&paths.socket)?;
-            std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
-            let token = Self::write_token(&paths.token, &holder)?;
-            let token: Arc<str> = Arc::from(token);
-            let holder: Arc<str> = Arc::from(holder);
-            let reader = Arc::new(Mutex::new(Some(reader)));
-            let shared = Arc::clone(&reader);
-            let accept = tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _)) => {
-                            // A connection that arrives as the holder closes
-                            // finds no reader and is dropped unanswered.
-                            let Some(reader) = shared.lock().ok().and_then(|r| r.clone()) else {
-                                return;
-                            };
-                            let (token, holder) = (Arc::clone(&token), Arc::clone(&holder));
-                            tokio::spawn(async move {
-                                if let Err(e) = serve_one(stream, &token, &holder, &reader).await {
-                                    tracing::debug!(error = %e, "a forwarded read ended early");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "accepting a forwarded read failed");
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                    }
-                }
-            });
-            Ok(Self {
-                paths,
-                accept,
-                reader,
-            })
-        }
-
-        /// A fresh token in a 0600 file, replacing one this user left behind.
-        fn write_token(path: &Path, holder: &str) -> Result<String> {
-            let mut bytes = [0u8; 32];
-            random_bytes(&mut bytes)?;
-            let token =
-                base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes);
-            let record = TokenFile {
-                token: token.clone(),
-                holder: holder.to_owned(),
-                pid: std::process::id(),
-            };
-            if path.exists() {
-                check_owned(path, Kind::Regular)?;
                 std::fs::remove_file(path)?;
             }
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
-            file.write_all(serde_json::to_string(&record)?.as_bytes())?;
-            Ok(token)
+            let listener = UnixListener::bind(path)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            Ok(Self { at, listener })
+        }
+
+        /// Where it listens.
+        #[must_use]
+        pub fn at(&self) -> &SocketPath {
+            &self.at
+        }
+
+        /// The next connection, from a process running as this user. One
+        /// from another user is refused here and never seen by the caller.
+        ///
+        /// # Errors
+        ///
+        /// Returns the accept's own error.
+        pub async fn accept(&self) -> Result<UnixStream> {
+            loop {
+                let (stream, _) = self.listener.accept().await?;
+                match check_peer(&stream) {
+                    Ok(()) => return Ok(stream),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "refused a connection to the workspace socket");
+                    }
+                }
+            }
         }
     }
 
     impl std::fmt::Debug for Listener {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("Listener")
-                .field("socket", &self.paths.socket)
-                .field("token", &self.paths.token)
+                .field("at", &self.at)
                 .finish_non_exhaustive()
         }
     }
 
     impl Drop for Listener {
         fn drop(&mut self) {
-            self.accept.abort();
-            // Release the reader now, not when the aborted task is next polled.
-            if let Ok(mut reader) = self.reader.lock() {
-                drop(reader.take());
-            }
-            for path in [&self.paths.socket, &self.paths.token] {
-                if let Err(e) = std::fs::remove_file(path)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::warn!(path = %path.display(), error = %e, "could not remove the forwarding file");
-                }
+            if let Err(e) = std::fs::remove_file(self.at.path())
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %self.at.path().display(), error = %e, "could not remove the workspace socket");
             }
         }
-    }
-
-    /// Answer one connection: one request line, one reply line. A peer that
-    /// is not this user gets nothing, not even a reply.
-    async fn serve_one(
-        stream: UnixStream,
-        token: &str,
-        holder: &str,
-        reader: &ReaderDb,
-    ) -> Result<()> {
-        if let Err(e) = check_peer(&stream) {
-            tracing::warn!(error = %e, "refused a connection to the forwarding socket");
-            return Ok(());
-        }
-        let (read, mut write) = stream.into_split();
-        let mut line = String::new();
-        BufReader::new(read.take(MAX_REQUEST_BYTES))
-            .read_line(&mut line)
-            .await?;
-        if line.trim().is_empty() {
-            // A probe (`connect` checking that someone answers), not a request.
-            return Ok(());
-        }
-        let reply = match serde_json::from_str::<Envelope>(&line) {
-            Ok(envelope) if token_matches(token, &envelope.token) => {
-                answer(envelope.request, holder, reader).await
-            }
-            Ok(_) => Reply::Error {
-                message: String::from("the token does not match the holder's"),
-            },
-            Err(e) => Reply::Error {
-                message: format!("malformed request: {e}"),
-            },
-        };
-        let mut text = serde_json::to_string(&reply)?;
-        text.push('\n');
-        write.write_all(text.as_bytes()).await?;
-        write.shutdown().await?;
-        Ok(())
-    }
-
-    fn token_matches(expected: &str, presented: &str) -> bool {
-        aws_lc_rs::constant_time::verify_slices_are_equal(expected.as_bytes(), presented.as_bytes())
-            .is_ok()
-    }
-
-    async fn answer(request: Request, holder: &str, reader: &ReaderDb) -> Reply {
-        match request {
-            Request::Hello => Reply::Hello {
-                holder: holder.to_owned(),
-            },
-            Request::Query { sql } => match read(reader, sql).await {
-                Ok(Some(results)) => Reply::Results { results },
-                Ok(None) => Reply::Refused,
-                Err(e) => Reply::Error {
-                    message: e.to_string(),
-                },
-            },
-        }
-    }
-
-    /// Run a read on the holder's reader pool; `None` when the statement
-    /// is a write.
-    async fn read(reader: &ReaderDb, sql: String) -> Result<Option<QueryResults>> {
-        reader
-            .with_db(move |db| match db.classify_statement(&sql)? {
-                StatementKind::Read => db.execute_query(&sql).map(Some),
-                StatementKind::Write => Ok(None),
-                StatementKind::Invalid(message) => Err(Error::Analysis(message)),
-            })
-            .await
     }
 
     /// The other end: a connection to the holder of the workspace in
-    /// `workspace_dir`, when one listens. `None` when there is no token file
-    /// or no socket, or nothing answers on the socket (a holder that died
-    /// leaves both behind).
+    /// `workspace_dir`, when one listens. `None` when there is no socket
+    /// or nothing answers on it (a holder that died leaves it behind).
     ///
     /// # Errors
     ///
-    /// Returns an error when the token file or the socket exists but is not
-    /// a private file of this user's, cannot be read, or the process
-    /// answering runs as another user.
-    pub async fn connect(workspace_dir: &Path) -> Result<Option<Client>> {
-        let paths = Paths::of(workspace_dir);
-        if !paths.token.exists() || !paths.socket.exists() {
+    /// Returns an error when the socket or its directory exists but is not
+    /// a private file of this user's, or the process answering runs as
+    /// another user.
+    pub async fn connect(
+        workspace_dir: &Path,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<UnixStream>> {
+        let at = SocketPath::of(workspace_dir, workspace_id);
+        if let Some(dir) = at.fallback_dir() {
+            if !dir.exists() {
+                return Ok(None);
+            }
+            check_private(dir, Kind::Directory)?;
+        }
+        let path = at.path();
+        if !path.exists() {
             return Ok(None);
         }
-        check_private(&paths.token, Kind::Regular)?;
-        let text = std::fs::read_to_string(&paths.token)?;
-        let token: TokenFile = serde_json::from_str(&text)
-            .map_err(|e| refuse(&paths.token, &format!("is malformed ({e})")))?;
-        check_private(&paths.socket, Kind::Socket)?;
-        let Ok(probe) = UnixStream::connect(&paths.socket).await else {
+        check_private(path, Kind::Socket)?;
+        let Ok(stream) = UnixStream::connect(path).await else {
             return Ok(None);
         };
-        check_peer(&probe)?;
-        drop(probe);
-        Ok(Some(Client {
-            paths,
-            token: token.token,
-            holder: token.holder,
-        }))
-    }
-
-    /// A process that could not take the lock, reading through the holder.
-    #[derive(Debug)]
-    pub struct Client {
-        paths: Paths,
-        token: String,
-        holder: String,
-    }
-
-    impl Client {
-        /// Who holds the workspace, as the token file names it.
-        #[must_use]
-        pub fn holder(&self) -> &str {
-            &self.holder
-        }
-
-        /// Run a read statement inside the holder and get its rows.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`Error::ForwardedWriteRefused`] when the statement is a
-        /// write, [`Error::Forward`] when the holder failed, the protocol
-        /// broke, or the other end is not this user, and an I/O error when
-        /// the socket is gone.
-        pub async fn query(&self, sql: &str) -> Result<QueryResults> {
-            match self
-                .send(Request::Query {
-                    sql: sql.to_owned(),
-                })
-                .await?
-            {
-                Reply::Results { results } => Ok(results),
-                Reply::Refused => Err(Error::ForwardedWriteRefused {
-                    holder: self.holder.clone(),
-                }),
-                Reply::Error { message } => Err(self.failed(&message)),
-                Reply::Hello { .. } => Err(self.failed("unexpected reply")),
-            }
-        }
-
-        async fn send(&self, request: Request) -> Result<Reply> {
-            let stream = UnixStream::connect(&self.paths.socket).await?;
-            check_peer(&stream)?;
-            let (read, mut write) = stream.into_split();
-            let mut text = serde_json::to_string(&Envelope {
-                token: self.token.clone(),
-                request,
-            })?;
-            text.push('\n');
-            write.write_all(text.as_bytes()).await?;
-            write.shutdown().await?;
-            let mut line = String::new();
-            BufReader::new(read).read_line(&mut line).await?;
-            if line.is_empty() {
-                return Err(self.failed("the holder closed without answering"));
-            }
-            serde_json::from_str(&line).map_err(|e| self.failed(&format!("malformed reply: {e}")))
-        }
-
-        fn failed(&self, message: &str) -> Error {
-            Error::Forward(format!("reading through {} failed: {message}", self.holder))
-        }
+        check_peer(&stream)?;
+        Ok(Some(stream))
     }
 }
 
 #[cfg(unix)]
-pub use unix::{Client, Listener, connect};
+pub use platform::{Listener, Stream, connect};
 
-#[cfg(not(unix))]
-mod other {
+#[cfg(windows)]
+mod platform {
     use std::path::Path;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
 
-    use super::Holder;
-    use crate::analysis::tools::ReaderDb;
-    use crate::error::Result;
-    use crate::storage::workspace::QueryResults;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::net::windows::named_pipe::{
+        ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+    };
 
-    /// No holder listens on this platform.
-    #[derive(Debug)]
-    pub struct Listener;
+    use super::{PIPE_FILE, SocketPath};
+    use crate::error::{Error, Result};
+    use crate::ids::WorkspaceId;
+
+    /// `ERROR_PIPE_BUSY`: every instance is taken; the holder makes a new
+    /// one as soon as it accepts.
+    const PIPE_BUSY: i32 = 231;
+    /// How long a client waits between tries while the pipe is busy, and
+    /// how many times.
+    const BUSY_WAIT: Duration = Duration::from_millis(50);
+    const BUSY_TRIES: u32 = 40;
+
+    /// The file naming the pipe, beside the workspace file.
+    pub(super) fn socket_path(workspace_dir: &Path, _workspace_id: &WorkspaceId) -> SocketPath {
+        SocketPath::Pipe(workspace_dir.join(PIPE_FILE))
+    }
+
+    /// A connection to or from a holder: either end of a named pipe.
+    pub enum Stream {
+        Server(NamedPipeServer),
+        Client(NamedPipeClient),
+    }
+
+    impl AsyncRead for Stream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            match self.get_mut() {
+                Self::Server(pipe) => Pin::new(pipe).poll_read(cx, buf),
+                Self::Client(pipe) => Pin::new(pipe).poll_read(cx, buf),
+            }
+        }
+    }
+
+    impl AsyncWrite for Stream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            match self.get_mut() {
+                Self::Server(pipe) => Pin::new(pipe).poll_write(cx, buf),
+                Self::Client(pipe) => Pin::new(pipe).poll_write(cx, buf),
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            match self.get_mut() {
+                Self::Server(pipe) => Pin::new(pipe).poll_flush(cx),
+                Self::Client(pipe) => Pin::new(pipe).poll_flush(cx),
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            match self.get_mut() {
+                Self::Server(pipe) => Pin::new(pipe).poll_shutdown(cx),
+                Self::Client(pipe) => Pin::new(pipe).poll_shutdown(cx),
+            }
+        }
+    }
+
+    /// The holder's end: the pipe, named at random per launch, and the
+    /// file naming it. Dropping it closes the pipe and removes the file.
+    pub struct Listener {
+        at: SocketPath,
+        name: String,
+        /// The instance waiting for the next client.
+        waiting: Mutex<Option<NamedPipeServer>>,
+    }
 
     impl Listener {
-        /// Listens on nothing: Unix sockets are the only transport so far.
+        /// Create the pipe and write its name beside the workspace file.
+        /// A pipe of the name already existing is another process's
+        /// (names are random, so only a live one is in the way).
         ///
         /// # Errors
         ///
-        /// Never fails.
-        pub async fn bind(
-            _workspace_dir: &Path,
-            _holder: &Holder,
-            _reader: ReaderDb,
-        ) -> Result<Self> {
-            Ok(Self)
+        /// Returns an error when the pipe cannot be created or the name
+        /// file cannot be written.
+        pub async fn bind(workspace_dir: &Path, workspace_id: &WorkspaceId) -> Result<Self> {
+            let at = socket_path(workspace_dir, workspace_id);
+            let name = format!("\\\\.\\pipe\\quack-{}", uuid::Uuid::now_v7());
+            let first = ServerOptions::new()
+                .first_pipe_instance(true)
+                .reject_remote_clients(true)
+                .create(&name)?;
+            std::fs::write(at.path(), &name)?;
+            Ok(Self {
+                at,
+                name,
+                waiting: Mutex::new(Some(first)),
+            })
         }
-    }
 
-    /// A holder's client; never constructed on this platform.
-    #[derive(Debug)]
-    pub struct Client {
-        holder: String,
-    }
-
-    impl Client {
+        /// Where it listens.
         #[must_use]
-        pub fn holder(&self) -> &str {
-            &self.holder
+        pub fn at(&self) -> &SocketPath {
+            &self.at
         }
 
+        /// The next connection. Another user's client is refused by the
+        /// pipe itself: its default rights give everyone but the creator
+        /// read access alone, and a client needs both ways.
+        ///
         /// # Errors
         ///
-        /// Never constructed, so never called.
-        pub async fn query(&self, _sql: &str) -> Result<QueryResults> {
-            Err(crate::error::Error::Forward(format!(
-                "reading through {} failed: read forwarding needs Unix sockets",
-                self.holder
-            )))
+        /// Returns the pipe's error.
+        pub async fn accept(&self) -> Result<Stream> {
+            let instance = self
+                .waiting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let instance = match instance {
+                Some(instance) => instance,
+                None => ServerOptions::new()
+                    .reject_remote_clients(true)
+                    .create(&self.name)?,
+            };
+            instance.connect().await?;
+            // The next client finds an instance waiting.
+            let next = ServerOptions::new()
+                .reject_remote_clients(true)
+                .create(&self.name)?;
+            *self
+                .waiting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next);
+            Ok(Stream::Server(instance))
         }
     }
 
-    /// No holder is ever found on this platform.
+    impl std::fmt::Debug for Listener {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Listener")
+                .field("at", &self.at)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            if let Err(e) = std::fs::remove_file(self.at.path())
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %self.at.path().display(), error = %e, "could not remove the pipe name file");
+            }
+        }
+    }
+
+    /// The other end: a connection to the holder of the workspace in
+    /// `workspace_dir`, when one listens. `None` when there is no name
+    /// file or no pipe of that name (a holder that died leaves the file
+    /// behind; its pipe went with it).
     ///
     /// # Errors
     ///
-    /// Never fails.
-    pub async fn connect(_workspace_dir: &Path) -> Result<Option<Client>> {
-        Ok(None)
+    /// Returns an error when the name file cannot be read or the pipe
+    /// refuses the connection.
+    pub async fn connect(
+        workspace_dir: &Path,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<Stream>> {
+        let at = socket_path(workspace_dir, workspace_id);
+        let name = match std::fs::read_to_string(at.path()) {
+            Ok(name) => name,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        let name = name.trim();
+        if !name.starts_with("\\\\.\\pipe\\quack-") {
+            return Err(Error::Forward(format!(
+                "{} does not name a quack pipe; refusing to use it",
+                at.path().display()
+            )));
+        }
+        let mut tries = 0_u32;
+        loop {
+            match ClientOptions::new().open(name) {
+                Ok(client) => return Ok(Some(Stream::Client(client))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) if e.raw_os_error() == Some(PIPE_BUSY) && tries < BUSY_TRIES => {
+                    tries = tries.saturating_add(1);
+                    tokio::time::sleep(BUSY_WAIT).await;
+                }
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
     }
 }
 
-#[cfg(not(unix))]
-pub use other::{Client, Listener, connect};
+#[cfg(windows)]
+pub use platform::{Listener, Stream, connect};
 
 /// Whether `err` is the lock another process holds on the workspace file:
-/// the case a command answers by reading through the holder.
+/// the case a command answers by reaching the holder.
 #[must_use]
 pub fn is_locked(err: &Error) -> bool {
     matches!(err, Error::WorkspaceLocked { .. })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
-    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{Holder, Listener, Paths, SOCKET_FILE, TOKEN_FILE, connect};
-    use crate::analysis::tools::{ReaderDb, SharedDb};
-    use crate::config::Config;
-    use crate::error::Error;
-    use crate::storage::workspace::WorkspaceDb;
-    use crate::storage::writer::Writer;
+    use super::{Listener, SocketPath, connect};
+    use crate::ids::WorkspaceId;
 
-    fn config_in(dir: &Path) -> Config {
-        let mut config = Config::default();
-        config.general.data_dir = dir.join("data");
-        config
+    fn id() -> WorkspaceId {
+        WorkspaceId::from("0199d1f0-0000-7000-8000-000000000001")
     }
 
+    /// A connection reaches the holder and carries bytes both ways; the
+    /// socket (or the pipe's name file) goes with the listener.
+    #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
-    fn holder_reader(config: &Config) -> ReaderDb {
-        let db = WorkspaceDb::open(config, "ws").unwrap();
-        db.execute_query("CREATE TABLE t AS SELECT 1 AS n UNION ALL SELECT 2")
-            .unwrap();
-        let shared: SharedDb = Arc::new(Writer::spawn(db).unwrap());
-        ReaderDb::new(shared)
+    async fn a_connection_reaches_the_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = Listener::bind(dir.path(), &id()).await.unwrap();
+        let at = listener.at().clone();
+        assert_eq!(at, SocketPath::of(dir.path(), &id()));
+        assert!(at.path().exists());
+        let echo = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut line = [0_u8; 5];
+            stream.read_exact(&mut line).await.unwrap();
+            stream.write_all(&line).await.unwrap();
+            listener
+        });
+        let mut client = connect(dir.path(), &id()).await.unwrap().unwrap();
+        client.write_all(b"hello").await.unwrap();
+        let mut back = [0_u8; 5];
+        client.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"hello");
+        let listener = echo.await.unwrap();
+        drop(listener);
+        assert!(!at.path().exists());
+        assert!(connect(dir.path(), &id()).await.unwrap().is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    use super::{Listener, SOCKET_FILE, SocketPath, connect};
+    use crate::error::Error;
+    use crate::ids::WorkspaceId;
+
+    fn id() -> WorkspaceId {
+        WorkspaceId::from("0199d1f0-0000-7000-8000-000000000001")
     }
 
     #[expect(clippy::unwrap_used, reason = "test")]
@@ -649,155 +652,80 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
-    /// A read goes through the holder and comes back as the holder's rows;
-    /// a write is refused naming the holder.
+    /// The socket is beside the workspace file, private to this user.
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
-    async fn reads_go_through_and_writes_are_refused() {
+    async fn the_socket_is_beside_the_file_and_private() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_in(dir.path());
-        let reader = holder_reader(&config);
-        let listener = Listener::bind(&config.workspace_dir("ws"), &Holder::Serve, reader)
-            .await
-            .unwrap();
-        let client = connect(&config.workspace_dir("ws")).await.unwrap().unwrap();
-        assert_eq!(client.holder(), "quack serve");
-
-        let results = client.query("SELECT n FROM t ORDER BY n").await.unwrap();
-        assert_eq!(results.columns, vec!["n"]);
-        assert_eq!(results.rows.len(), 2);
-
-        let refused = client
-            .query("CREATE TABLE u (x INTEGER)")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&refused, Error::ForwardedWriteRefused { holder } if holder == "quack serve"),
-            "{refused}"
-        );
-        let failed = client.query("SELECT FROM").await.unwrap_err();
-        assert!(matches!(failed, Error::Forward(_)), "{failed}");
-
-        let paths = Paths::of(&config.workspace_dir("ws"));
-        for path in [&paths.socket, &paths.token] {
-            assert_eq!(
-                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                0o600,
-                "{}",
-                path.display()
-            );
-        }
-        drop(listener);
-        assert!(!paths.socket.exists());
-        assert!(!config.workspace_dir("ws").join(TOKEN_FILE).exists());
-        assert!(
-            connect(&config.workspace_dir("ws"))
-                .await
-                .unwrap()
-                .is_none()
+        let listener = Listener::bind(dir.path(), &id()).await.unwrap();
+        let at = listener.at().clone();
+        assert_eq!(at, SocketPath::Beside(dir.path().join(SOCKET_FILE)));
+        assert_eq!(
+            std::fs::metadata(at.path()).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 
-    /// A socket or token file that others can reach is refused, not used;
-    /// a token file that is a symlink is refused too.
+    /// A socket that others can reach is refused, not used.
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
-    async fn files_others_can_reach_are_refused() {
+    async fn a_socket_others_can_reach_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_in(dir.path());
-        let reader = holder_reader(&config);
-        let _listener = Listener::bind(&config.workspace_dir("ws"), &Holder::Serve, reader)
-            .await
-            .unwrap();
-        let paths = Paths::of(&config.workspace_dir("ws"));
-
-        chmod(&paths.socket, 0o666);
-        let err = connect(&config.workspace_dir("ws")).await.unwrap_err();
+        let listener = Listener::bind(dir.path(), &id()).await.unwrap();
+        chmod(listener.at().path(), 0o666);
+        let err = connect(dir.path(), &id()).await.unwrap_err();
         assert!(
             matches!(&err, Error::Forward(message) if message.contains("reachable by others (mode 666)")),
             "{err}"
         );
-        chmod(&paths.socket, 0o600);
-
-        chmod(&paths.token, 0o640);
-        let err = connect(&config.workspace_dir("ws")).await.unwrap_err();
-        assert!(
-            matches!(&err, Error::Forward(message) if message.contains("reachable by others (mode 640)")),
-            "{err}"
-        );
-        chmod(&paths.token, 0o600);
-
-        let real = paths.token.with_extension("real");
-        std::fs::rename(&paths.token, &real).unwrap();
-        std::os::unix::fs::symlink(&real, &paths.token).unwrap();
-        let err = connect(&config.workspace_dir("ws")).await.unwrap_err();
-        assert!(
-            matches!(&err, Error::Forward(message) if message.contains("is not a regular file")),
-            "{err}"
-        );
-        std::fs::remove_file(&paths.token).unwrap();
-        std::fs::rename(&real, &paths.token).unwrap();
-
-        assert!(
-            connect(&config.workspace_dir("ws"))
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    /// A request whose token is not the holder's is answered with an error
-    /// and runs nothing.
-    #[tokio::test]
-    #[expect(clippy::unwrap_used, reason = "test")]
-    async fn a_wrong_token_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = config_in(dir.path());
-        let reader = holder_reader(&config);
-        let _listener = Listener::bind(&config.workspace_dir("ws"), &Holder::Serve, reader)
-            .await
-            .unwrap();
-        let paths = Paths::of(&config.workspace_dir("ws"));
-        let mut record: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&paths.token).unwrap()).unwrap();
-        if let Some(fields) = record.as_object_mut() {
-            fields.insert(
-                String::from("token"),
-                serde_json::Value::String(String::from("not-it")),
-            );
-        }
-        std::fs::write(&paths.token, record.to_string()).unwrap();
-        chmod(&paths.token, 0o600);
-        let client = connect(&config.workspace_dir("ws")).await.unwrap().unwrap();
-        let err = client.query("SELECT 1").await.unwrap_err();
-        assert!(
-            matches!(&err, Error::Forward(message) if message.contains("token")),
-            "{err}"
-        );
+        chmod(listener.at().path(), 0o600);
+        assert!(connect(dir.path(), &id()).await.unwrap().is_some());
     }
 
     /// A socket a dead holder of this user left behind is replaced, not an
-    /// error; no token file means no holder.
+    /// error; one a live holder answers on is an error.
     #[tokio::test]
     #[expect(clippy::unwrap_used, reason = "test")]
-    async fn a_stale_socket_is_replaced() {
+    async fn a_stale_socket_is_replaced_and_a_live_one_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let config = config_in(dir.path());
-        let reader = holder_reader(&config);
-        let socket = config.workspace_dir("ws").join(SOCKET_FILE);
+        let socket = dir.path().join(SOCKET_FILE);
         let stale = tokio::net::UnixListener::bind(&socket).unwrap();
         drop(stale);
+        chmod(&socket, 0o600);
         assert!(socket.exists());
+        assert!(connect(dir.path(), &id()).await.unwrap().is_none());
+        let listener = Listener::bind(dir.path(), &id()).await.unwrap();
+        let err = Listener::bind(dir.path(), &id()).await.unwrap_err();
         assert!(
-            connect(&config.workspace_dir("ws"))
-                .await
-                .unwrap()
-                .is_none()
+            matches!(&err, Error::Forward(message) if message.contains("already answers")),
+            "{err}"
         );
-        let _listener = Listener::bind(&config.workspace_dir("ws"), &Holder::Serve, reader)
-            .await
-            .unwrap();
-        let client = connect(&config.workspace_dir("ws")).await.unwrap().unwrap();
-        assert_eq!(client.holder(), "quack serve");
+        drop(listener);
+    }
+
+    /// A workspace directory whose path is too long for a socket address
+    /// gets its socket in the per-user temp directory, found by both ends.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn a_long_path_falls_back_to_the_temp_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = dir.path().join("x".repeat(120));
+        std::fs::create_dir(&long).unwrap();
+        let at = SocketPath::of(&long, &id());
+        assert!(matches!(at, SocketPath::Fallback(_)), "{at:?}");
+        assert!(at.path().ends_with(format!("{}.sock", id())));
+        let listener = Listener::bind(&long, &id()).await.unwrap();
+        assert_eq!(listener.at(), &at);
+        assert_eq!(
+            std::fs::metadata(at.fallback_dir().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(connect(&long, &id()).await.unwrap().is_some());
+        drop(listener);
+        assert!(!at.path().exists());
     }
 }

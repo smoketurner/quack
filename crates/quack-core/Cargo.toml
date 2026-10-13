@@ -76,7 +76,7 @@ serde-saphyr  = { workspace = true, features = ["deserialize"] }
 zip           = { workspace = true, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { workspace = true, features = ["std", "process"] }
+rustix = { workspace = true, features = ["std", "process", "net"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { workspace = true, features = ["keychain"] }

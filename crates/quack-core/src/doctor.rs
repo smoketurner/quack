@@ -22,6 +22,8 @@ use crate::config::{
 use crate::crypto::CryptoModule;
 use crate::embedding::{Dimension, PromptSource, ResolvedPrompts};
 use crate::error::{Error, Result as CoreResult};
+use crate::forward::SocketPath;
+use crate::ids::WorkspaceId;
 use crate::llm::bedrock;
 use crate::llm::chat_model::{ChatSettings, Wire, check_tool_calls};
 use crate::llm::decision::{DecisionModel, Instructions, Question, QuestionName, Questions};
@@ -599,6 +601,25 @@ async fn check_control(report: &mut Report, config: &Config) -> Option<ControlPl
     }
 }
 
+/// Where other quack processes reach this one while it holds the file
+/// (`forward::SocketPath`): worth a line only when it is not beside it.
+fn socket_check(config: &Config, name: &str, workspace_id: &WorkspaceId) -> Option<Check> {
+    let SocketPath::Fallback(path) =
+        SocketPath::of(&config.workspace_dir(workspace_id.as_str()), workspace_id)
+    else {
+        return None;
+    };
+    Some(Check::new(
+        Area::Workspace,
+        Status::Info,
+        format!(
+            "'{name}' is served to other quack processes on {}: the data directory's path is \
+             too long for a socket beside the workspace file",
+            path.display()
+        ),
+    ))
+}
+
 async fn check_workspace(
     report: &mut Report,
     config: &Config,
@@ -701,6 +722,9 @@ async fn check_workspace(
                 .fix("check the file under the data directory, or restore a backup"),
             );
         }
+    }
+    if let Some(check) = socket_check(config, name, &row.id) {
+        report.push(check);
     }
 }
 

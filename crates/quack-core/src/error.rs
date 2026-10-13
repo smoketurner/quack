@@ -120,17 +120,10 @@ pub enum Error {
     #[error("workspace file {} is open in another quack process", path.display())]
     WorkspaceLocked { path: PathBuf },
 
-    /// The workspace is open in another process, which runs reads for
-    /// this one but no writes (`forward`).
-    #[error(
-        "the workspace is open in {holder}, which runs only reads for other processes; run the \
-         change there, or quit it"
-    )]
-    ForwardedWriteRefused { holder: String },
-
-    /// A read sent to the process holding the workspace failed there, or
-    /// the exchange broke; the message names the holder. One field, so the
-    /// variant does not grow `Error` (and every future holding a `Result`).
+    /// Reaching the process holding the workspace failed: its socket is not
+    /// this user's, the exchange broke, or the holder answered with an
+    /// error; the message names the holder. One field, so the variant does
+    /// not grow `Error` (and every future holding a `Result`).
     #[error("{0}")]
     Forward(String),
 

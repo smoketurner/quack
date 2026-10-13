@@ -13,15 +13,14 @@ workspace = true
 quack-core = { path = "../quack-core" }
 anyhow     = { workspace = true, features = ["std"] }
 http       = { workspace = true, features = ["std"] }
-rmcp       = { workspace = true, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rmcp       = { workspace = true, features = ["server", "client", "macros", "transport-io", "transport-streamable-http-server"] }
 schemars   = { workspace = true, features = ["derive"] }
 serde      = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
-tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
-tokio-util = { workspace = true }
+tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+tokio-util = { workspace = true, features = ["rt"] }
 tracing    = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 quack-testkit = { path = "../quack-testkit" }
-rmcp          = { workspace = true, features = ["client"] }
 tempfile      = { workspace = true }

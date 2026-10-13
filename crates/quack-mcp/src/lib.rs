@@ -1,7 +1,9 @@
 //! The workspace as an MCP server: the same tools over stdio (`quack mcp`,
-//! for Claude Code and editors) and over streamable HTTP under `quack
-//! serve` (`/mcp/v1/{workspace}`, with the workspace token). Design doc
-//! section 11.3.
+//! for Claude Code and editors), over the workspace socket every holder
+//! serves ([`socket`]; `quack mcp` relays to it and `quack -q` reads
+//! through it, [`client`]), and over streamable HTTP under `quack serve`
+//! (`/mcp/v1/{workspace}`, with the workspace token). Design doc section
+//! 11.3.
 //!
 //! Tools: `query` (one agent turn), `search` (hybrid retrieval, no model),
 //! `sql` (classified, writes need permission), `classify` (a table's text
@@ -12,16 +14,22 @@
 //! `quack://workspace/context`.
 //!
 //! Over HTTP every call is audited through the [`McpCaller`] the server
-//! put on the request, like the REST API; over stdio nothing is audited,
-//! like the CLI.
+//! put on the request, like the REST API; over stdio and the socket nothing
+//! is audited, like the CLI.
+
+pub mod client;
+pub mod relay;
+pub mod socket;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use http::request::Parts;
 
+use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::citations::Sources;
-use quack_core::analysis::events::{self, AgentEvent, EventStream};
+use quack_core::analysis::events::{self, AgentEvent, FailureKind, TurnFailure};
+use quack_core::analysis::permissions::{Approvals, Asked};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::search::{DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{FindPathArgs, ReaderDb, Rerank, SearchGraphArgs, SharedDb};
@@ -31,7 +39,7 @@ use quack_core::classify::{
 use quack_core::config::Config;
 use quack_core::engine::Engine;
 use quack_core::ids::{DocumentId, RunId, SessionId, UserId, WorkspaceId};
-use quack_core::jobs::JobQueue;
+use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::ChatDrafter;
 use quack_core::llm::acting::Acting;
 use quack_core::llm::decision::DecisionModel;
@@ -74,12 +82,15 @@ use quack_core::graph::query::PathQuery;
 use quack_core::storage::audit::Recorder;
 use tokio_util::sync::CancellationToken;
 
-/// What the server is served over: stdio, where the client is the
-/// operating-system user and nothing is audited (like the CLI), or HTTP,
-/// where every request carries the [`McpCaller`] the server resolved.
+/// What the server is served over: stdio or the workspace socket, where
+/// the client is the operating-system user and nothing is audited (like
+/// the CLI), or HTTP, where every request carries the [`McpCaller`] the
+/// server resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Stdio,
+    /// The workspace socket a holder serves (`socket::SocketServer`).
+    Socket,
     Http,
 }
 
@@ -103,7 +114,7 @@ pub struct McpCaller {
 /// The caller of one tool call or resource read.
 #[derive(Clone)]
 enum Caller {
-    /// Stdio: nobody to audit or act for.
+    /// Stdio or the socket: nobody to audit or act for.
     Unaudited,
     /// HTTP: the request's own caller.
     Audited(Box<McpCaller>),
@@ -210,7 +221,8 @@ impl Caller {
 
 /// What an MCP server serves: the configuration, the workspace and its
 /// handles, the write policy, the server user (for session ownership;
-/// `None` over stdio), the transport, and the process's stopping token.
+/// `None` over stdio and the socket), the transport, and the process's
+/// stopping token.
 pub struct McpSetup {
     pub config: Config,
     pub db: SharedDb,
@@ -219,12 +231,19 @@ pub struct McpSetup {
     pub policy: WritePolicy,
     pub user_id: Option<UserId>,
     pub transport: Transport,
-    /// The queue the tables a turn or a call labels are labelled through.
+    /// The queue a `query` turn runs on, and the tables a turn or a call
+    /// labels are labelled through.
     pub jobs: JobQueue,
     /// Cancelled when the process begins to stop: a `query` turn in flight
     /// ends as a cancelled turn. On stdio the engine stops only after the
     /// client hangs up, so it never fires mid-call.
     pub stopping: CancellationToken,
+    /// The process, as `initialize` names it to the client
+    /// (`serverInfo.description`): `quack -q` says it read through it.
+    pub holder: String,
+    /// Where a `query` turn's write asks a person: the terminal session's
+    /// prompt, over the socket. Nobody listening refuses the write.
+    pub approvals: Approvals,
 }
 
 /// What the `classify` tool takes: a labelling request, or with `preview`
@@ -317,42 +336,69 @@ impl Progress {
         });
     }
 
-    /// Report a turn's events as they happen: what it waits on, each tool
-    /// call as it starts and ends, and the answer's length as it streams
-    /// (at most every [`TEXT_PROGRESS_INTERVAL`]). Progress counts the
-    /// reports, since a turn has no known end.
-    async fn report_turn(self, mut events: EventStream) {
-        let mut sent = 0.0_f64;
-        let mut words = 0_usize;
-        let mut last_text = Instant::now();
-        while let Some(event) = events.recv().await {
-            let message = match event {
-                AgentEvent::Status(status) => status,
-                AgentEvent::Reasoning => String::from("the model is reasoning"),
-                AgentEvent::ToolStarted { tool, detail } => {
-                    let detail: String = OneLine(&detail)
-                        .to_string()
-                        .chars()
-                        .take(TOOL_DETAIL_SHOWN)
-                        .collect();
-                    format!("{tool}: {detail}")
-                }
-                AgentEvent::ToolFinished(step) => format!("{}: {}", step.tool, step.summary),
-                AgentEvent::TextDelta(text) => {
-                    words = words.saturating_add(text.split_whitespace().count());
-                    if last_text.elapsed() < TEXT_PROGRESS_INTERVAL {
-                        continue;
-                    }
-                    last_text = Instant::now();
-                    format!("answering: {words} words so far")
-                }
-                AgentEvent::PermissionRequired(_)
-                | AgentEvent::TurnComplete(_)
-                | AgentEvent::Failed(_) => continue,
-            };
-            sent += 1.0;
-            self.at(sent, None, &message).await;
+    /// A reporter of one turn's events.
+    fn turn(self) -> TurnReporter {
+        TurnReporter {
+            progress: self,
+            sent: 0.0,
+            words: 0,
+            last_text: Instant::now(),
         }
+    }
+}
+
+/// Reports a turn's events as they happen: what it waits on, each tool
+/// call as it starts and ends, and the answer's length as it streams (at
+/// most every [`TEXT_PROGRESS_INTERVAL`]). Progress counts the reports,
+/// since a turn has no known end.
+struct TurnReporter {
+    progress: Progress,
+    sent: f64,
+    words: usize,
+    last_text: Instant,
+}
+
+impl TurnReporter {
+    /// Report `event`; the three that end or hold a turn are the caller's.
+    async fn event(&mut self, event: AgentEvent) {
+        let message = match event {
+            AgentEvent::Status(status) => status,
+            AgentEvent::Reasoning => String::from("the model is reasoning"),
+            AgentEvent::ToolStarted { tool, detail } => {
+                let detail: String = OneLine(&detail)
+                    .to_string()
+                    .chars()
+                    .take(TOOL_DETAIL_SHOWN)
+                    .collect();
+                format!("{tool}: {detail}")
+            }
+            AgentEvent::ToolFinished(step) => format!("{}: {}", step.tool, step.summary),
+            AgentEvent::TextDelta(text) => {
+                self.words = self.words.saturating_add(text.split_whitespace().count());
+                if self.last_text.elapsed() < TEXT_PROGRESS_INTERVAL {
+                    return;
+                }
+                self.last_text = Instant::now();
+                format!("answering: {} words so far", self.words)
+            }
+            AgentEvent::PermissionRequired(_)
+            | AgentEvent::TurnComplete(_)
+            | AgentEvent::Failed(_) => return,
+        };
+        self.sent += 1.0;
+        self.progress.at(self.sent, None, &message).await;
+    }
+
+    /// Say the turn waits in its session's lane.
+    async fn queued(&mut self) {
+        self.sent += 1.0;
+        self.progress
+            .at(
+                self.sent,
+                None,
+                "queued: this runs when the session's previous question has been answered",
+            )
+            .await;
     }
 }
 
@@ -456,6 +502,103 @@ enum TurnSession {
     NotFound,
 }
 
+/// What one `query` turn runs with, owned, so the job's task and the
+/// fallback that records a turn the queue never ran build the same request.
+#[derive(Clone)]
+struct TurnInputs {
+    config: Config,
+    db: SharedDb,
+    reader_db: ReaderDb,
+    session: SessionId,
+    question: String,
+    documents: Vec<String>,
+    user: Option<UserId>,
+    policy: WritePolicy,
+}
+
+impl TurnInputs {
+    fn request(
+        &self,
+        labelling: LabelJobs,
+        sink: events::EventSink,
+        cancel: CancellationToken,
+    ) -> llm::TurnRequest<'_> {
+        llm::TurnRequest {
+            db: Arc::clone(&self.db),
+            reader_db: self.reader_db.clone(),
+            session_id: &self.session,
+            policy: self.policy,
+            message: &self.question,
+            documents: &self.documents,
+            user: self.user.as_ref(),
+            labelling,
+            sink,
+            cancel,
+        }
+    }
+
+    /// Record the turn as cancelled without running it: what a job the
+    /// stopping queue refused, or cancelled while queued, would have done.
+    async fn record_cancelled(&self, labelling: LabelJobs) -> Result<AgentResponse, TurnFailed> {
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let (sink, _events) = events::channel();
+        self.request(labelling, sink, cancelled)
+            .run(&self.config)
+            .await
+            .map_err(|e| TurnFailed::Failed(TurnFailure::from(&e)))
+    }
+}
+
+/// Cancels a turn's job when its handler is dropped mid-turn.
+struct CancelOnDrop {
+    jobs: JobQueue,
+    id: JobId,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.jobs.cancel(self.id);
+        }
+    }
+}
+
+/// Why a `query` turn gave no answer.
+#[derive(Debug)]
+enum TurnFailed {
+    /// The turn ran and failed; its event says why.
+    Failed(TurnFailure),
+    /// The turn never ran: the job's outcome.
+    NotRun(String),
+}
+
+impl TurnFailed {
+    /// How the audit log records it.
+    fn outcome(&self) -> Outcome {
+        match self {
+            Self::Failed(failed) => match failed.kind {
+                FailureKind::ProviderNotAllowed => Outcome::Denied,
+                FailureKind::AuthRequired
+                | FailureKind::NoChatModel
+                | FailureKind::NotFound
+                | FailureKind::Other => Outcome::Error,
+            },
+            Self::NotRun(_) => Outcome::Error,
+        }
+    }
+}
+
+impl std::fmt::Display for TurnFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(failed) => f.write_str(&failed.message),
+            Self::NotRun(outcome) => f.write_str(outcome),
+        }
+    }
+}
+
 fn internal(e: impl std::fmt::Display) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
@@ -464,7 +607,7 @@ fn failure(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
 
-/// A `quack://workspace/...` resource: five fixed ones and one schema per table.
+/// A `quack://workspace/...` resource: six fixed ones and one schema per table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceResource<'a> {
     Tables,
@@ -472,18 +615,22 @@ enum WorkspaceResource<'a> {
     Ontology,
     OntologySchema,
     Context,
+    /// The workspace's jobs as this process knows them: what runs, what
+    /// ran and how it ended, the earlier processes' included.
+    Jobs,
     Schema(&'a str),
 }
 
 impl<'a> WorkspaceResource<'a> {
     const PREFIX: &'static str = "quack://workspace/";
     const SCHEMA_TEMPLATE: &'static str = "quack://workspace/tables/{name}/schema";
-    const FIXED: [WorkspaceResource<'static>; 5] = [
+    const FIXED: [WorkspaceResource<'static>; 6] = [
         WorkspaceResource::Tables,
         WorkspaceResource::Documents,
         WorkspaceResource::Ontology,
         WorkspaceResource::OntologySchema,
         WorkspaceResource::Context,
+        WorkspaceResource::Jobs,
     ];
 
     fn parse(uri: &'a str) -> Option<Self> {
@@ -494,6 +641,7 @@ impl<'a> WorkspaceResource<'a> {
             "ontology" => Some(Self::Ontology),
             "ontology/schema" => Some(Self::OntologySchema),
             "context" => Some(Self::Context),
+            "jobs" => Some(Self::Jobs),
             _ => path
                 .strip_prefix("tables/")?
                 .strip_suffix("/schema")
@@ -510,7 +658,8 @@ impl<'a> WorkspaceResource<'a> {
             | Self::Documents
             | Self::Ontology
             | Self::OntologySchema
-            | Self::Context => self.uri(),
+            | Self::Context
+            | Self::Jobs => self.uri(),
         }
     }
 
@@ -518,7 +667,7 @@ impl<'a> WorkspaceResource<'a> {
         match self {
             Self::Schema(table) => format!("{}tables/{table}/schema", Self::PREFIX),
             Self::OntologySchema => format!("{}ontology/schema", Self::PREFIX),
-            Self::Tables | Self::Documents | Self::Ontology | Self::Context => {
+            Self::Tables | Self::Documents | Self::Ontology | Self::Context | Self::Jobs => {
                 format!("{}{}", Self::PREFIX, self.name())
             }
         }
@@ -531,6 +680,7 @@ impl<'a> WorkspaceResource<'a> {
             Self::Ontology => String::from("ontology"),
             Self::OntologySchema => String::from("ontology schema"),
             Self::Context => String::from("context"),
+            Self::Jobs => String::from("jobs"),
             Self::Schema(table) => format!("{table} schema"),
         }
     }
@@ -550,6 +700,10 @@ impl<'a> WorkspaceResource<'a> {
             Self::Context => {
                 String::from("The owner's instructions and definitions for the agent, as Markdown")
             }
+            Self::Jobs => String::from(
+                "The workspace's jobs (uploads, turns, runs): queued, running, and how the \
+                 finished ones ended, as JSON",
+            ),
             Self::Schema(table) => format!("Columns, row count, and sample rows of {table}"),
         }
     }
@@ -561,6 +715,7 @@ impl<'a> WorkspaceResource<'a> {
             | Self::Documents
             | Self::Ontology
             | Self::OntologySchema
+            | Self::Jobs
             | Self::Schema(_) => "application/json",
         }
     }
@@ -608,7 +763,7 @@ impl McpServer {
     /// be there: a call without one fails rather than run unaudited.
     fn caller(&self, extensions: &Extensions) -> Result<Caller, McpError> {
         match self.inner.transport {
-            Transport::Stdio => Ok(Caller::Unaudited),
+            Transport::Stdio | Transport::Socket => Ok(Caller::Unaudited),
             Transport::Http => extensions
                 .get::<Parts>()
                 .and_then(|parts| parts.extensions.get::<McpCaller>())
@@ -653,20 +808,33 @@ impl McpServer {
         Parameters(args): Parameters<QueryArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.query_for(args, &context.extensions, Progress::of(&context))
-            .await
+        let cancel = self.cancel();
+        // The client's `notifications/cancelled` ends the turn too.
+        let requested = context.ct.clone();
+        let watch = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                requested.cancelled().await;
+                cancel.cancel();
+            }
+        });
+        let result = self
+            .query_for(args, &context.extensions, Progress::of(&context), cancel)
+            .await;
+        watch.abort();
+        result
     }
 
     /// `query`, for the caller the request's extensions name, reporting
-    /// through `progress`.
+    /// through `progress`; `cancel` ends the turn.
     async fn query_for(
         &self,
         args: QueryArgs,
         extensions: &Extensions,
         progress: Progress,
+        cancel: CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(extensions)?;
-        let cancel = self.cancel();
         // Boxed: an agent turn's future is large (clippy::large_futures).
         Box::pin(self.as_caller(&caller, self.ask(args, &caller, progress, cancel))).await
     }
@@ -744,29 +912,17 @@ impl McpServer {
             };
         let user = caller.user_id();
         progress.at(0.0, None, TURN_STARTING).await;
-        let (sink, events) = events::channel();
-        let reporter = tokio::spawn(progress.report_turn(events));
-        let outcome = llm::TurnRequest {
-            db: Arc::clone(&self.inner.db),
-            reader_db: self.inner.reader.clone(),
-            session_id: &session_id,
-            policy: self.inner.policy,
-            message: &question,
-            documents: &args.document_ids,
-            user: user.as_ref(),
-            labelling: caller.label_jobs(
-                &self.inner.jobs,
-                &self.inner.workspace.id,
-                Some(session_id.clone()),
-            ),
-            sink,
-            cancel,
-        }
-        .run(&self.inner.config)
-        .await;
-        // Every event was sent before the turn returned; the reporter ends
-        // with the channel.
-        drop(reporter);
+        let outcome = self
+            .run_turn(
+                &question,
+                &session_id,
+                &args.document_ids,
+                user,
+                caller,
+                progress,
+                cancel,
+            )
+            .await;
         let detail = serde_json::json!({
             "prompt": question,
             "session_id": session_id,
@@ -806,7 +962,7 @@ impl McpServer {
                     .record(
                         AuditAction::Query,
                         Some(ResourceKind::Session.id(&session_id)),
-                        Outcome::of_failure(&e),
+                        e.outcome(),
                         Some(detail),
                     )
                     .await?;
@@ -819,6 +975,128 @@ impl McpServer {
                 Ok(failure(format!("the agent turn failed: {e}")))
             }
         }
+    }
+
+    /// Run the turn as a `chat` job in its session's lane, like every
+    /// other interface's turns (the strip and `/jobs` show it, `/cancel`
+    /// stops it, the engine's stop covers it), and read its answer off its
+    /// events. `cancel` (the process stopping, the task cancelled, the
+    /// connection closed) cancels the job. A write the turn wants goes to
+    /// the approvals; nobody listening refuses it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one turn's inputs, each needed; a struct would be built and taken apart here alone"
+    )]
+    async fn run_turn(
+        &self,
+        question: &str,
+        session_id: &SessionId,
+        documents: &[String],
+        user: Option<UserId>,
+        caller: &Caller,
+        progress: Progress,
+        cancel: CancellationToken,
+    ) -> Result<AgentResponse, TurnFailed> {
+        let (sink, mut events) = events::channel();
+        let lane = LaneKey::Session(session_id.clone());
+        let mut reporter = progress.turn();
+        if self.inner.jobs.lane_active(&lane) > 0 {
+            reporter.queued().await;
+        }
+        let label: String = OneLine(question).to_string().chars().take(80).collect();
+        let spec = JobSpec::new(JobKind::Chat, format!("mcp: {label}"))
+            .workspace(self.inner.workspace.id.clone())
+            .owner(user.clone())
+            .lane(Lane::serial(&lane));
+        let labelling = caller.label_jobs(
+            &self.inner.jobs,
+            &self.inner.workspace.id,
+            Some(session_id.clone()),
+        );
+        let inputs = TurnInputs {
+            config: self.inner.config.clone(),
+            db: Arc::clone(&self.inner.db),
+            reader_db: self.inner.reader.clone(),
+            session: session_id.clone(),
+            question: question.to_owned(),
+            documents: documents.to_vec(),
+            user,
+            policy: self.inner.policy,
+        };
+        let job = self.inner.jobs.submit(spec, {
+            let inputs = inputs.clone();
+            move |ctx| async move {
+                // The turn emits TurnComplete or Failed itself.
+                match inputs
+                    .request(labelling, sink, ctx.cancel_token())
+                    .run(&inputs.config)
+                    .await
+                {
+                    Ok(response) if response.cancelled => Err(String::from("cancelled")),
+                    Ok(response) => Ok(format!(
+                        "answered: {} steps, {} sources",
+                        response.steps.len(),
+                        response.citations.len()
+                    )),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        });
+        let watch = tokio::spawn({
+            let (jobs, id) = (self.inner.jobs.clone(), job.id);
+            async move {
+                cancel.cancelled().await;
+                jobs.cancel(id);
+            }
+        });
+        // A handler dropped before the turn ends (the client hung up)
+        // cancels the job.
+        let mut guard = CancelOnDrop {
+            jobs: self.inner.jobs.clone(),
+            id: job.id,
+            armed: true,
+        };
+        let mut complete = None;
+        let mut failure = None;
+        while let Some(event) = events.recv().await {
+            match event {
+                AgentEvent::TurnComplete(response) => complete = Some(response),
+                AgentEvent::Failed(failed) => failure = Some(failed),
+                AgentEvent::PermissionRequired(request) => self.inner.approvals.ask(Asked {
+                    job: job.id,
+                    session: session_id.clone(),
+                    request,
+                }),
+                other => reporter.event(other).await,
+            }
+        }
+        watch.abort();
+        guard.armed = false;
+        if let Some(response) = complete {
+            return Ok(response);
+        }
+        if let Some(failed) = failure {
+            return Err(TurnFailed::Failed(failed));
+        }
+        // The stream closed without an answer: the job never ran, refused by
+        // the stopping queue or cancelled while queued. The turn is still
+        // recorded as cancelled, as it would have been inside the job.
+        let Some(ended) = self.inner.jobs.wait(job.id).await else {
+            return Err(TurnFailed::NotRun(String::from("the turn did not run")));
+        };
+        if !ended.never_started() {
+            return Err(TurnFailed::NotRun(
+                ended
+                    .outcome
+                    .unwrap_or_else(|| String::from("the turn did not run")),
+            ));
+        }
+        let labelling = caller.label_jobs(
+            &self.inner.jobs,
+            &self.inner.workspace.id,
+            Some(session_id.clone()),
+        );
+        inputs.record_cancelled(labelling).await
     }
 
     /// Hybrid retrieval over the documents, no model in the loop.
@@ -1426,6 +1704,24 @@ impl McpServer {
         Ok(TurnSession::Created(id))
     }
 
+    /// Whether `resource` is served here: the jobs only over stdio and the
+    /// socket, where the client is the owner, since over HTTP the jobs API
+    /// hides other members' questions and this resource would not.
+    fn offers(&self, resource: WorkspaceResource<'_>) -> bool {
+        match resource {
+            WorkspaceResource::Jobs => match self.inner.transport {
+                Transport::Stdio | Transport::Socket => true,
+                Transport::Http => false,
+            },
+            WorkspaceResource::Tables
+            | WorkspaceResource::Documents
+            | WorkspaceResource::Ontology
+            | WorkspaceResource::OntologySchema
+            | WorkspaceResource::Context
+            | WorkspaceResource::Schema(_) => true,
+        }
+    }
+
     async fn describe(&self, name: &str) -> Result<Option<serde_json::Value>, McpError> {
         let table = name.to_owned();
         let described = self
@@ -1464,6 +1760,10 @@ impl McpServer {
             WorkspaceResource::Context => {
                 let current = self.reader_db(context::current).await?;
                 current.map(|c| c.content).unwrap_or_default()
+            }
+            WorkspaceResource::Jobs => {
+                let jobs = self.inner.jobs.list_workspace(&self.inner.workspace.id);
+                serde_json::json!({ "jobs": jobs }).to_string()
             }
             WorkspaceResource::Schema(table) => {
                 return Ok(self.describe(table).await?.map(|d| d.to_string()));
@@ -1522,14 +1822,7 @@ impl ServerHandler for McpServer {
     }
 
     fn get_info(&self) -> ServerConfig {
-        let instructions = format!(
-            "Workspace '{}': documents, tables, and an ontology behind one agent. Use `query` \
-             for questions in plain language (it searches and runs SQL for you and cites \
-             sources), `search` for raw retrieval, `sql` for a statement you already know, and \
-             the resources for the table list, schemas, documents, ontology, and the owner's \
-             context.",
-            self.inner.workspace.name
-        );
+        let instructions = instructions(&self.inner.workspace.name);
         ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -1538,7 +1831,9 @@ impl ServerHandler for McpServer {
                 .build(),
         )
         .with_server_info(
-            Implementation::new("quack", env!("CARGO_PKG_VERSION")).with_title("quack"),
+            Implementation::new("quack", env!("CARGO_PKG_VERSION"))
+                .with_title("quack")
+                .with_description(self.inner.holder.clone()),
         )
         .with_instructions(instructions)
     }
@@ -1550,6 +1845,7 @@ impl ServerHandler for McpServer {
     ) -> Result<ListResourcesResult, McpError> {
         let mut resources: Vec<Resource> = WorkspaceResource::FIXED
             .into_iter()
+            .filter(|resource| self.offers(*resource))
             .map(WorkspaceResource::listing)
             .collect();
         for table in self.reader_db(WorkspaceDb::list_tables).await? {
@@ -1590,7 +1886,7 @@ impl ServerHandler for McpServer {
             )
             .await?;
         let not_found = || McpError::resource_not_found(format!("no resource at {uri}"), None);
-        let resource = parsed.ok_or_else(not_found)?;
+        let resource = parsed.filter(|r| self.offers(*r)).ok_or_else(not_found)?;
         let text = self.resource_text(resource).await?.ok_or_else(not_found)?;
         let mime = resource.mime_type();
         Ok(
@@ -1605,11 +1901,44 @@ impl ServerHandler for McpServer {
     }
 }
 
+/// What `initialize` tells a client about the workspace.
+fn instructions(workspace_name: &str) -> String {
+    format!(
+        "Workspace '{workspace_name}': documents, tables, and an ontology behind one agent. Use \
+         `query` for questions in plain language (it searches and runs SQL for you and cites \
+         sources), `search` for raw retrieval, `sql` for a statement you already know, and the \
+         resources for the table list, schemas, documents, ontology, and the owner's context."
+    )
+}
+
+impl McpServer {
+    /// Run a tool now, through the router, never as a task: what the
+    /// per-call server (`relay`) does, since it drops this server after
+    /// the call.
+    pub(crate) async fn call_tool_now(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        Self::tool_router()
+            .call(ToolCallContext::new(self, request, context))
+            .await
+    }
+
+    /// Every tool, as `tools/list` lists them.
+    pub(crate) fn tools() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
+    }
+}
+
 /// How long `quack mcp` waits, after the client hangs up, for a labelling
 /// run the client left behind to record its end.
-const STDIO_GRACE: Duration = Duration::from_secs(20);
+pub const STDIO_GRACE: Duration = Duration::from_secs(20);
 
-/// `quack mcp`: serve the workspace over stdio until the client hangs up.
+/// `quack mcp`: serve the workspace over stdio until the client hangs up,
+/// one call at a time through the holder's socket or an open of the
+/// workspace for that call (`relay::PerCallServer`). The caller then lets
+/// the engine's jobs end under [`STDIO_GRACE`] and closes it.
 ///
 /// # Errors
 ///
@@ -1620,26 +1949,14 @@ pub async fn serve_stdio(
     workspace: WorkspaceRow,
     policy: WritePolicy,
 ) -> anyhow::Result<()> {
-    let handle = engine.workspace(&workspace.id).await?;
-    let server = McpServer::new(McpSetup {
-        config: engine.config.clone(),
-        db: handle.writer,
-        reader: handle.reader,
-        workspace,
-        policy,
-        user_id: None,
-        transport: Transport::Stdio,
-        jobs: engine.jobs.clone(),
-        stopping: engine.stopping(),
-    });
+    let server = relay::PerCallServer::new(engine, workspace, policy);
     let running = rmcp::serve_server(server, rmcp::transport::stdio())
         .await
         .map_err(|e| anyhow::anyhow!("MCP initialization failed: {e}"))?;
-    let served = running.waiting().await;
-    // A run the client left behind finishes and records its end first.
-    engine.stop_jobs(STDIO_GRACE).await;
-    engine.close().await;
-    served.map_err(|e| anyhow::anyhow!("MCP server task failed: {e}"))?;
+    running
+        .waiting()
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP server task failed: {e}"))?;
     Ok(())
 }
 

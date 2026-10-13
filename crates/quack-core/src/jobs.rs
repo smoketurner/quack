@@ -17,10 +17,11 @@
 //!
 //! Every change of a job's state goes out on a broadcast channel as a
 //! [`JobInfo`] snapshot, so the terminal's job strip and the web console's
-//! Jobs page report the same status. The registry is in memory only: a job
-//! label can name a file or quote a question, which is workspace content,
-//! so it never reaches `control.db`, and a restart forgets it (the durable
-//! record of what a job did is the document, table, or session it wrote).
+//! Jobs page report the same status. The registry is in memory; the engine
+//! keeps each workspace's jobs in that workspace's file ([`store`]), since a
+//! job label can name a file or quote a question, which is workspace
+//! content and never reaches `control.db`, and restores them when it opens
+//! the file ([`JobQueue::restore`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -76,6 +77,13 @@ impl Serialize for JobId {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for JobId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// Serialized as its UUID text.
 impl utoipa::PartialSchema for JobId {
     fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
@@ -92,7 +100,18 @@ impl utoipa::ToSchema for JobId {}
 /// A job's short number, counting from 1 per queue, for people to type
 /// (`/cancel 3`): v7 ids submitted together share their first digits.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, utoipa::ToSchema,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
 )]
 #[serde(transparent)]
 pub struct JobNumber(u64);
@@ -157,6 +176,8 @@ pub enum JobKind {
     Search,
     /// A table's text labelled by a decision model.
     Classify,
+    /// A session's title, written by the model after its first turn.
+    Title,
 }
 
 impl JobKind {
@@ -173,6 +194,7 @@ impl JobKind {
         Self::Models,
         Self::Search,
         Self::Classify,
+        Self::Title,
     ];
 
     /// The kind as it serializes.
@@ -190,6 +212,7 @@ impl JobKind {
             Self::Models => "models",
             Self::Search => "search",
             Self::Classify => "classify",
+            Self::Title => "title",
         }
     }
 }
@@ -208,7 +231,8 @@ impl JobKind {
             | Self::Graph
             | Self::Embeddings
             | Self::Export
-            | Self::Classify => Priority::Background,
+            | Self::Classify
+            | Self::Title => Priority::Background,
         }
     }
 }
@@ -221,7 +245,19 @@ impl fmt::Display for JobKind {
 
 /// Where a job is in its life. `Queued` and `Running` are active; the other
 /// three are final.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, utoipa::ToSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     /// Waiting for its lane or a worker slot.
@@ -367,7 +403,7 @@ impl JobSpec {
 }
 
 /// How far along a job with countable work is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct JobProgress {
     pub done: u32,
     pub total: u32,
@@ -404,8 +440,9 @@ impl fmt::Display for JobProgress {
     }
 }
 
-/// A job as it stands: what every subscriber receives on each change.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+/// A job as it stands: what every subscriber receives on each change
+/// (and what `quack jobs` reads back from a holder's `quack://workspace/jobs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct JobInfo {
     pub id: JobId,
     pub number: JobNumber,
@@ -780,6 +817,45 @@ impl JobQueue {
         snapshot
     }
 
+    /// Add jobs an earlier process ran, read back from a workspace file
+    /// (`store::recent`), as finished entries with fresh numbers, in the
+    /// order given; one already known (the file was opened again in this
+    /// process) is skipped. An active one is recorded as failed: the
+    /// process that ran it is gone. They go before every job this process
+    /// has, so the history bound evicts them first, and nothing is
+    /// broadcast: they ended long ago.
+    pub fn restore(&self, jobs: Vec<JobInfo>) {
+        let mut registry = self.inner.registry();
+        // Numbered oldest first, like jobs submitted here; placed in front
+        // in that same order.
+        let mut numbered = Vec::with_capacity(jobs.len());
+        for mut info in jobs {
+            if registry.jobs.contains_key(&info.id) {
+                continue;
+            }
+            if !info.state.is_finished() {
+                info.state = JobState::Failed;
+                info.outcome = Some(String::from(store::INTERRUPTED));
+                info.finished_at = Some(Timestamp::now());
+                info.cancel_requested = true;
+            }
+            registry.last_number = registry.last_number.next();
+            info.number = registry.last_number;
+            numbered.push(info);
+        }
+        for info in numbered.into_iter().rev() {
+            registry.order.push_front(info.id);
+            registry.jobs.insert(
+                info.id,
+                Entry {
+                    info,
+                    cancel: CancellationToken::new(),
+                },
+            );
+        }
+        registry.evict_past(self.inner.history);
+    }
+
     /// Every job remembered, in submission order.
     #[must_use]
     pub fn list(&self) -> Vec<JobInfo> {
@@ -847,20 +923,36 @@ impl JobQueue {
     /// them. Returns the jobs still active when the grace ran out, which
     /// the runtime drops at their next await.
     pub async fn shutdown(&self, grace: Duration) -> Vec<JobInfo> {
+        self.end(grace, Ending::Cancel).await
+    }
+
+    /// Close the queue and wait up to `grace` for what is queued and
+    /// running to end on its own, cancelling nothing: a command that
+    /// answered and exits (`quack -p`) lets the title and labelling its
+    /// turn started finish. Returns the jobs still active when the grace
+    /// ran out.
+    pub async fn drain(&self, grace: Duration) -> Vec<JobInfo> {
+        self.end(grace, Ending::Wait).await
+    }
+
+    async fn end(&self, grace: Duration, ending: Ending) -> Vec<JobInfo> {
         let mut events = self.subscribe();
         let tokens: Vec<CancellationToken> = {
             let mut registry = self.inner.registry();
             registry.closed = true;
-            registry
-                .jobs
-                .values_mut()
-                .filter(|entry| !entry.info.state.is_finished())
-                .map(|entry| {
-                    entry.info.cancel_requested = true;
-                    drop(self.inner.events.send(entry.info.clone()));
-                    entry.cancel.clone()
-                })
-                .collect()
+            match ending {
+                Ending::Cancel => registry
+                    .jobs
+                    .values_mut()
+                    .filter(|entry| !entry.info.state.is_finished())
+                    .map(|entry| {
+                        entry.info.cancel_requested = true;
+                        drop(self.inner.events.send(entry.info.clone()));
+                        entry.cancel.clone()
+                    })
+                    .collect(),
+                Ending::Wait => Vec::new(),
+            }
         };
         for token in tokens {
             token.cancel();
@@ -985,6 +1077,13 @@ impl JobQueue {
 /// The outcome of a job submitted after [`JobQueue::shutdown`].
 const REFUSED_BY_SHUTDOWN: &str = "refused: the queue is shutting down";
 
+/// How the queue ends: cancelling what runs, or waiting for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Cancel,
+    Wait,
+}
+
 impl JobInfo {
     /// Cancelled while still queued: its work never ran.
     #[must_use]
@@ -1100,6 +1199,7 @@ impl Inner {
 }
 
 pub mod runs;
+pub mod store;
 pub mod webhook;
 
 #[cfg(test)]

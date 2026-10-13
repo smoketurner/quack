@@ -4446,6 +4446,7 @@ dependencies = [
  "clap",
  "jiff",
  "quack-core",
+ "quack-mcp",
  "quack-testkit",
  "serde",
  "serde_json",

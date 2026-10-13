@@ -5,8 +5,8 @@ Eight workspace members, picked up by `members = ["crates/*"]`; no Cargo feature
 | Crate | Responsibility |
 |---|---|
 | `quack-core` | The engine: config, `control.db`, workspace DuckDB files, ingestion and import, hybrid retrieval, the agent and its tools, ontology and induction, the knowledge graph, OKF bundles, LLM providers and OAuth |
-| `quack-cli` | The command verbs the binary and the terminal session share: print mode, the saved, graph, ontology, tables, embeddings, and import commands, and the arguments they take |
-| `quack-mcp` | The workspace as an MCP server (`rmcp`): the tools and resources, and how the server is served over each transport (`serve_stdio` for `quack mcp`, `McpServer::http_transport` for the server); who may connect is the transport owner's business |
+| `quack-cli` | The command verbs the binary and the terminal session share: print mode, the saved, graph, ontology, tables, embeddings, and import commands, and the arguments they take; `OpenedWorkspace`, the one open path, which serves the held workspace on its socket through `quack-mcp` |
+| `quack-mcp` | The workspace as an MCP server (`rmcp`): the tools and resources, how the server is served over each transport (`serve_stdio` for `quack mcp`, `socket::SocketServer` on the workspace socket, `McpServer::http_transport` for the server), and the client of a holder's socket (`client::HolderClient`, for `quack -q` and `quack jobs`); who may connect is the transport owner's business |
 | `quack-server` | The HTTP interfaces: `quack serve` (REST API, web UI with its templates and assets, and `quack-mcp` over streamable HTTP behind the bearer and role checks); it holds no terminal code |
 | `quack-terminal` | The interactive terminal session (ratatui); it holds no server code |
 | `quack-testkit` | Test support for the interface crates: a scripted Ollama server and a seeded workspace, kept out of `quack-core` so core does not depend on axum for tests |

@@ -3,6 +3,7 @@ use quack_core::storage::writer::Writer;
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::chart::ChartSpec;
 use quack_core::analysis::events::ToolStep;
+use quack_core::analysis::permissions::Approvals;
 use quack_core::analysis::policy::Hold;
 use quack_core::ingestion::parser::SectionKind;
 use quack_core::storage::profile::{TableNote, TableProfile};
@@ -73,6 +74,7 @@ fn app_in(dir: &Path, workspace: &str, mut config: Config) -> App {
         reader_db,
         session_id: session.id,
         writes: WritePolicy::Ask,
+        approvals: Approvals::new(),
     })
 }
 
@@ -1914,6 +1916,7 @@ fn the_web_server_beside_the_session_is_one_transcript_line() {
         db,
         session_id: session.id,
         writes: WritePolicy::Ask,
+        approvals: Approvals::new(),
     });
     let last = last(&app);
     assert_eq!(last.kind, MessageKind::System);
@@ -1937,6 +1940,7 @@ fn next_session(app: &App) -> App {
         reader_db: app.reader_db.clone(),
         session_id: app.session_id.clone(),
         writes: WritePolicy::Ask,
+        approvals: Approvals::new(),
     })
 }
 

@@ -197,7 +197,7 @@ quack graph extract -y                   # build the knowledge graph
 
 ```bash
 quack serve --local                      # web UI, REST API, and MCP on http://127.0.0.1:8080
-quack mcp -w sales                       # MCP over stdio for Claude Code and editors
+quack mcp -w sales                       # MCP over stdio for Claude Code and editors (relays to a running session)
 quack user add alice --admin             # users, tokens, members, and the audit log for `quack serve`
 quack workspace list                     # every workspace in the data directory
 ```

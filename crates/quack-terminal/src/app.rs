@@ -23,6 +23,7 @@ use quack_core::analysis::citations::{Citation, Sources};
 use quack_core::analysis::events::{
     self, AgentEvent, Decision, Delivery, PermissionRequest, ToolName, ToolStep,
 };
+use quack_core::analysis::permissions::Asked;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::search::{DocumentScope, DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
@@ -110,9 +111,19 @@ pub(crate) const fn answer_key(decision: Decision) -> char {
 
 /// Every answer with its key, as `[y] Run it   [n] Don't run it   ...`.
 pub(crate) fn answer_keys() -> String {
-    Decision::CHOICES
-        .into_iter()
-        .map(|decision| format!("[{}] {}", answer_key(decision), decision.label()))
+    keys_of(&Decision::CHOICES)
+}
+
+/// The answers a socket turn's write takes: `y` and `n`, never `a` (a
+/// grant for the rest of a turn is for the session's own turns).
+fn socket_answer_keys() -> String {
+    keys_of(&[Decision::Allow, Decision::Deny])
+}
+
+fn keys_of(choices: &[Decision]) -> String {
+    choices
+        .iter()
+        .map(|decision| format!("[{}] {}", answer_key(*decision), decision.label()))
         .collect::<Vec<_>>()
         .join("   ")
 }
@@ -300,6 +311,7 @@ enum Prompt {
     Write {
         job: Ticket,
         request: PermissionRequest,
+        origin: WriteOrigin,
     },
     /// A deletion the person asked for, held until they confirm it, as the
     /// web asks before its delete buttons.
@@ -308,6 +320,19 @@ enum Prompt {
     /// say yes.
     Label(Box<Prepared>),
 }
+
+/// Whose turn asked for a write: this session's own, or another
+/// process's over the workspace socket (`quack mcp`), whose prompt takes
+/// no key for a moment after it appears (a key typed as it lands must not
+/// approve it), offers no `a`, and times out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOrigin {
+    Session,
+    Socket { shown: Instant, expires: Instant },
+}
+
+/// How long a socket turn's prompt ignores the keys after it appears.
+const SOCKET_PROMPT_GUARD: Duration = Duration::from_secs(1);
 
 impl Prompt {
     /// Whether it is a write the turn run by `job` asked for.
@@ -964,6 +989,9 @@ pub(crate) struct App {
     /// The engine's queue.
     jobs: JobQueue,
     job_events: broadcast::Receiver<JobInfo>,
+    /// Writes that turns run for another process (`quack mcp` over the
+    /// workspace socket) ask this session to decide.
+    asked: mpsc::UnboundedReceiver<Asked>,
     /// Jobs still queued or running, for the strip above the input.
     pub(crate) active_jobs: Vec<JobInfo>,
     /// The `/jobs` or `/sessions` box, while it is open (and takes the keys).
@@ -1022,6 +1050,7 @@ impl App {
             reader_db,
             session_id,
             writes,
+            approvals,
         } = setup;
         let web_line = match web {
             WebStatus::Listening(addr) => {
@@ -1035,6 +1064,7 @@ impl App {
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         let jobs = engine.jobs.clone();
         let job_events = jobs.subscribe();
+        let asked = approvals.listen();
         let mut app = Self {
             messages: Vec::new(),
             textarea: TextArea::default(),
@@ -1054,6 +1084,7 @@ impl App {
             engine,
             jobs,
             job_events,
+            asked,
             active_jobs: Vec::new(),
             picker: None,
             db_steps: None,
@@ -1236,11 +1267,16 @@ impl App {
                     self.handle_job_event(&job);
                     true
                 }
+                Some(asked) = self.asked.recv() => {
+                    self.ask_for_socket_turn(asked);
+                    true
+                }
                 _ = spinner.tick(), if spinning => {
                     self.spinner.advance();
                     true
                 }
             };
+            self.expire_socket_prompts();
             if let Some(text) = self.to_copy.take() {
                 self.copy_status = Some(clipboard.copy(&text));
             }
@@ -1464,20 +1500,32 @@ impl App {
     pub(crate) fn pending_prompt(&self) -> Option<PendingPrompt<'_>> {
         let waiting = self.prompts.len().saturating_sub(1);
         Some(match self.prompts.front()? {
-            Prompt::Write { job, request } => {
-                let speaker = self
-                    .turns
-                    .iter()
-                    .find(|turn| turn.job.id == job.id)
-                    .map_or_else(
-                        || String::from("The agent"),
-                        |turn| turn.speaker(&self.session_id),
-                    );
+            Prompt::Write {
+                job,
+                request,
+                origin,
+            } => {
+                let (speaker, keys) = match origin {
+                    WriteOrigin::Session => (
+                        self.turns
+                            .iter()
+                            .find(|turn| turn.job.id == job.id)
+                            .map_or_else(
+                                || String::from("The agent"),
+                                |turn| turn.speaker(&self.session_id),
+                            ),
+                        answer_keys(),
+                    ),
+                    WriteOrigin::Socket { .. } => (
+                        format!("quack mcp (job #{})", job.number),
+                        socket_answer_keys(),
+                    ),
+                };
                 PendingPrompt {
                     heading: format!("{speaker}: {}", Decision::HEADING),
                     body: &request.sql,
                     notice: request.hold.notice(),
-                    keys: answer_keys(),
+                    keys,
                     waiting,
                 }
             }
@@ -1647,7 +1695,76 @@ impl App {
         self.prompts.push_back(Prompt::Write {
             job: turn.job,
             request,
+            origin: WriteOrigin::Session,
         });
+    }
+
+    /// Queue a write that a turn run for another process (`quack mcp`
+    /// over the workspace socket) asks for, as a prompt like the
+    /// session's own: `y`, `n`, and `a` answer it, and `/cancel N` on
+    /// the job refuses it.
+    fn ask_for_socket_turn(&mut self, asked: Asked) {
+        let Asked {
+            job,
+            session,
+            request,
+        } = asked;
+        let number = self
+            .jobs
+            .get(job)
+            .map_or_else(JobNumber::default, |info| info.number);
+        let notice = request
+            .hold
+            .notice()
+            .map_or(String::new(), |notice| format!("{notice}\n"));
+        self.note(
+            MessageKind::System,
+            format!(
+                "quack mcp (job #{number}, session {session}): {}\n{}\n{notice}{}",
+                Decision::HEADING,
+                request.sql,
+                socket_answer_keys()
+            ),
+        );
+        let shown = Instant::now();
+        self.prompts.push_back(Prompt::Write {
+            job: Ticket { id: job, number },
+            request,
+            origin: WriteOrigin::Socket {
+                shown,
+                expires: shown
+                    .checked_add(self.config.server.permission_timeout())
+                    .unwrap_or(shown),
+            },
+        });
+    }
+
+    /// Refuse the socket turns' writes nobody answered in time
+    /// (`[server].permission_timeout_seconds`), wherever they stand in the
+    /// line.
+    fn expire_socket_prompts(&mut self) {
+        let now = Instant::now();
+        let mut kept = VecDeque::new();
+        for prompt in self.prompts.drain(..) {
+            match prompt {
+                Prompt::Write {
+                    job,
+                    request,
+                    origin: WriteOrigin::Socket { expires, .. },
+                } if expires <= now => {
+                    request.deny();
+                    self.messages.push(Message::new(
+                        MessageKind::System,
+                        format!(
+                            "quack mcp (job #{}): nobody answered in time; not run.",
+                            job.number
+                        ),
+                    ));
+                }
+                other => kept.push_back(other),
+            }
+        }
+        self.prompts = kept;
     }
 
     /// Put the validated answer, its sources, chart, and graph results in
@@ -1946,8 +2063,24 @@ impl App {
         if answer == Decision::AllowTurn
             && matches!(
                 self.prompts.front(),
-                Some(Prompt::Delete(_) | Prompt::Label(_))
+                Some(
+                    Prompt::Delete(_)
+                        | Prompt::Label(_)
+                        | Prompt::Write {
+                            origin: WriteOrigin::Socket { .. },
+                            ..
+                        }
+                )
             )
+        {
+            return;
+        }
+        // A key typed as another process's prompt landed is not its answer.
+        if let Some(Prompt::Write {
+            origin: WriteOrigin::Socket { shown, .. },
+            ..
+        }) = self.prompts.front()
+            && shown.elapsed() < SOCKET_PROMPT_GUARD
         {
             return;
         }

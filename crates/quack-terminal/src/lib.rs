@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use quack_core::analysis::permissions::Approvals;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::engine::Engine;
@@ -36,6 +37,10 @@ pub struct SessionSetup {
     pub session_id: SessionId,
     /// `Allow` with `--allow-write`, else `Ask`.
     pub writes: WritePolicy,
+    /// Writes that `query` turns asked of this process over the workspace
+    /// socket (`quack mcp` in another shell) wait on: the session answers
+    /// them at its own `y`/`n`/`a` prompt.
+    pub approvals: Approvals,
 }
 
 /// Whether the binary serves the web UI, REST API, and MCP beside the

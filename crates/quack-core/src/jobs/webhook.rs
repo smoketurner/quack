@@ -110,11 +110,11 @@ impl Webhook {
     }
 
     /// Whether `job` is one this webhook reports: finished, and of a kind it
-    /// names (every kind but chat turns when it names none).
+    /// names (every kind but chat turns and their titles when it names none).
     fn reports(&self, job: &JobInfo) -> bool {
         job.state.is_finished()
             && if self.kinds.is_empty() {
-                job.kind != JobKind::Chat
+                !matches!(job.kind, JobKind::Chat | JobKind::Title)
             } else {
                 self.kinds.contains(&job.kind)
             }

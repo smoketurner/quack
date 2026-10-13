@@ -26,7 +26,6 @@ use quack_core::ingestion::parser::PageCounts;
 use quack_core::ingestion::tree::{FileResult, Folder, Outcome, Prune};
 use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile, Piped};
 use quack_core::llm::Embeddings;
-use quack_core::llm::after_turn::AfterTurn;
 use quack_core::llm::egress::Egress;
 use quack_core::llm::oauth::{
     KeySource, Lifetime, LoginFlow, LoginPrompt, Renewal, TokenManager, TokenStatus,
@@ -64,6 +63,7 @@ use quack_cli::{NamedInput, StdioPath};
 use quack_cli::{OpenedWorkspace, SessionChoice, find_session, resolve_session};
 use quack_cli::{embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
 use quack_core::forward::Holder;
+use quack_mcp::client::HolderClient;
 
 use quack_core::config::ServerConfig;
 use quack_server::{ServeMode, Server};
@@ -235,8 +235,13 @@ enum Commands {
     Ready(ReadyArgs),
 
     /// Serve the workspace as an MCP server over stdio (for Claude Code
-    /// and editors); logs go to stderr
+    /// and editors), or relay to the quack process that holds it; logs go
+    /// to stderr
     Mcp(McpArgs),
+
+    /// List the workspace's jobs: what runs, what ran and how it ended;
+    /// on a workspace another quack holds, as that process lists them
+    Jobs(JobsArgs),
 
     /// Show, install, import, export, diff, or restore the ontology
     #[command(subcommand)]
@@ -574,6 +579,13 @@ struct McpArgs {
     /// Let the `sql` and `query` tools run statements that modify data
     #[arg(long)]
     allow_write: bool,
+}
+
+#[derive(clap::Args)]
+struct JobsArgs {
+    /// `json` prints one JSON object per job
+    #[arg(long, value_enum, default_value_t = TextOrJson::Text)]
+    format: TextOrJson,
 }
 
 #[derive(clap::Args)]
@@ -949,7 +961,7 @@ async fn run() -> Result<ExitCode> {
 
     match cli.command.take() {
         None => run_terminal_session(&cli, stdout_is_tty).await,
-        Some(command) => run_command(&cli, command).await,
+        Some(command) => Box::pin(run_command(&cli, command)).await,
     }
 }
 
@@ -992,6 +1004,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Mcp(args) => run_mcp(cli, args.allow_write).await,
+        Commands::Jobs(args) => run_jobs(cli, args).await,
         Commands::Serve(args) => {
             // The server logs at info in the file's format; other commands
             // stay quiet. Each request's access line is `quack::access` at
@@ -1153,6 +1166,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         db: Arc::clone(&db),
         reader_db: handle.reader.clone(),
         jobs: opened.engine.jobs.clone(),
+        workspace_id: opened.workspace.id.clone(),
         session_id: &session_id,
         policy,
         prompt,
@@ -1168,12 +1182,10 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         drop(db.run(move |db| sessions::delete_if_empty(db, &id)).await);
     }
     // The answer is out; a labelling the turn started records its end, and
-    // a title or summary it started finishes, before exit.
-    opened.engine.stop_jobs(FOLLOW_UP_GRACE).await;
-    AfterTurn::finish(FOLLOW_UP_GRACE).await;
+    // the title it started finishes, before exit.
     drop(handle);
     drop(db);
-    opened.engine.close().await;
+    opened.finish(FOLLOW_UP_GRACE).await;
     Ok(match outcome? {
         TurnOutcome::WriteRefused => ExitCode::from(Exit::WriteRefused),
         TurnOutcome::Answered => ExitCode::SUCCESS,
@@ -1445,6 +1457,7 @@ async fn run_saved(cli: &Cli, action: saved_cli::SavedAction) -> Result<ExitCode
         db: Arc::clone(&db),
         reader_db: handle.reader.clone(),
         jobs: opened.engine.jobs.clone(),
+        workspace_id: opened.workspace.id.clone(),
         verbose: cli.verbose,
     };
     // Not the lock: a refresh is a print-mode turn, which writes its own
@@ -1555,12 +1568,70 @@ async fn run_graph_export(cli: &Cli, args: &graph_cli::ExportArgs) -> Result<Exi
     Ok(ExitCode::SUCCESS)
 }
 
-/// `quack mcp`: the workspace as an MCP server on stdin and stdout.
+/// `quack mcp`: the workspace as an MCP server on stdin and stdout. It
+/// holds nothing between calls: each call runs in the process that holds
+/// the workspace (the terminal session, a command) over its socket, or
+/// opens the workspace for that call and closes it after, so Claude
+/// Code's entry works whether the terminal session was started before or
+/// after it.
 async fn run_mcp(cli: &Cli, allow_write: bool) -> Result<ExitCode> {
     init_logging();
-    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::command("mcp")).await?;
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), |_| Holder::Mcp).await?;
     let policy = WritePolicy::Deny.allowed_if(allow_write);
-    quack_mcp::serve_stdio(opened.engine, opened.workspace, policy).await?;
+    quack_mcp::serve_stdio(Arc::clone(&opened.engine), opened.workspace.clone(), policy).await?;
+    // A run the client left behind finishes and records its end first.
+    opened.finish(quack_mcp::STDIO_GRACE).await;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `quack jobs`: the workspace's jobs as this process restores them from
+/// the file, or as the process holding the workspace lists them.
+async fn run_jobs(cli: &Cli, args: JobsArgs) -> Result<ExitCode> {
+    let opened =
+        OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::command("jobs")).await?;
+    let mut jobs = match opened.handle().await {
+        Ok(handle) => {
+            let jobs = opened.engine.jobs.list_workspace(&opened.workspace.id);
+            drop(handle);
+            opened.finish(Duration::ZERO).await;
+            jobs
+        }
+        Err(e) if is_workspace_locked(&e) => {
+            let workspace_dir = opened.config().workspace_dir(opened.workspace.id.as_str());
+            let Some(client) = HolderClient::connect(&workspace_dir, &opened.workspace.id).await?
+            else {
+                return Err(e);
+            };
+            let jobs = client.jobs().await?;
+            {
+                let stderr = std::io::stderr();
+                let mut err = stderr.lock();
+                writeln!(err, "read through {}", client.holder())?;
+            }
+            client.close().await;
+            jobs
+        }
+        Err(e) => return Err(e),
+    };
+    jobs.reverse();
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    args.format
+        .write_rows(&mut out, &jobs, "No jobs on record.", |out, job| {
+            writeln!(
+                out,
+                "#{:<4} {:<9} {:<10} {}  {}{}",
+                job.number,
+                job.state,
+                job.kind,
+                job.queued_at,
+                job.label,
+                job.outcome
+                    .as_deref()
+                    .map_or(String::new(), |outcome| format!("  ({outcome})"))
+            )
+        })?;
+    out.flush()?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1833,7 +1904,8 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     if let Some(code) = init_cli::offer_on_first_run().await? {
         return Ok(code);
     }
-    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::Terminal).await?;
+    let mut opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::Terminal).await?;
+    let writes = WritePolicy::Ask.allowed_if(cli.allow_write);
     let handle = opened.handle().await?;
     let session_id = {
         let config = opened.config().clone();
@@ -1862,23 +1934,26 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     let session = quack_terminal::run(SessionSetup {
         engine: Arc::clone(&opened.engine),
         web,
-        workspace_name: opened.name,
-        workspace_id: opened.workspace.id,
+        workspace_name: opened.name.clone(),
+        workspace_id: opened.workspace.id.clone(),
         db: Arc::clone(&handle.writer),
         reader_db: handle.reader.clone(),
         session_id,
-        writes: WritePolicy::Ask.allowed_if(cli.allow_write),
+        writes,
+        approvals: opened.approvals.clone(),
     })
     .await;
     // The session's quit stopped the jobs (a session that failed did not:
     // begin the stop here, so the server drains either way), the server
-    // drains under the same grace, and the writer checkpoints last.
+    // and the socket drain under the same grace, and the writer
+    // checkpoints last.
     opened.engine.begin_stop();
     if let Some(server) = server
         && let Ok(Err(e)) = tokio::time::timeout(QUIT_GRACE, server).await
     {
         tracing::warn!(error = %e, "the web server beside the session ended with an error");
     }
+    opened.close_socket(QUIT_GRACE).await;
     drop(handle);
     opened.engine.close().await;
     session?;
@@ -2517,11 +2592,14 @@ fn is_workspace_locked(err: &anyhow::Error) -> bool {
     })
 }
 
-/// `-q` on a workspace another `quack` process holds: the read runs inside
-/// that process and comes back as the same rows (`quack_core::forward`),
-/// with one line on stderr saying so. Without a holder listening, `locked`
-/// is the error. Piped data cannot be loaded into a workspace this
-/// process does not hold, so a statement that names `stdin` is refused.
+/// `-q` on a workspace another `quack` process holds: the statement runs
+/// through that process's `sql` tool over the workspace socket
+/// (`quack_mcp::client`) and comes back as the same rows, with one line on
+/// stderr saying so, and one more when the holder capped them at its
+/// `[analysis].max_query_rows`. A write is the holder's own refusal.
+/// Without a holder listening, `locked` is the error. Piped data cannot
+/// be loaded into a workspace this process does not hold, so a statement
+/// that names `stdin` is refused.
 async fn run_query_through_holder(
     opened: &OpenedWorkspace,
     sql: &str,
@@ -2530,7 +2608,7 @@ async fn run_query_through_holder(
     locked: anyhow::Error,
 ) -> Result<()> {
     let workspace_dir = opened.config().workspace_dir(opened.workspace.id.as_str());
-    let Some(client) = forward::connect(&workspace_dir).await? else {
+    let Some(client) = HolderClient::connect(&workspace_dir, &opened.workspace.id).await? else {
         return Err(locked);
     };
     if wait_for_stdin || sql.to_ascii_lowercase().contains("stdin") {
@@ -2540,15 +2618,23 @@ async fn run_query_through_holder(
             client.holder()
         );
     }
-    let results = client.query(sql).await?;
+    let rows = client.sql(sql).await?;
     {
         let stderr = std::io::stderr();
         let mut err = stderr.lock();
         writeln!(err, "read through {}", client.holder())?;
+        if rows.truncated {
+            writeln!(
+                err,
+                "{} capped the rows at its [analysis].max_query_rows",
+                client.holder()
+            )?;
+        }
     }
+    client.close().await;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    format.write(&results, &mut out)?;
+    format.write(&rows.results, &mut out)?;
     out.flush()?;
     Ok(())
 }

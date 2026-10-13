@@ -736,6 +736,19 @@ impl LabelJobs {
         self.on_end = Some(hook);
         self
     }
+
+    /// The queue the runs go through: what else a turn starts (its
+    /// session's title) goes through it too.
+    #[must_use]
+    pub const fn queue(&self) -> &JobQueue {
+        &self.queue
+    }
+
+    /// The workspace the jobs belong to, when one was named.
+    #[must_use]
+    pub const fn workspace_id(&self) -> Option<&WorkspaceId> {
+        self.workspace.as_ref()
+    }
 }
 
 /// A run for a caller that waits (an agent turn, an MCP call).

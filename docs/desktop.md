@@ -278,6 +278,12 @@ The app uses the CLI's data directory (`~/.local/share/quack`, `QUACK_DATA_DIR`,
 `~/.config/quack`), so `Quack.app`, `quack -p`, and `quack mcp` see one set of workspaces and
 one keychain item.
 
+> What landed (2026-10-13, after the app was set aside): the socket exists, beside the
+> workspace file or under the per-user temp directory when the path is too long, and it
+> speaks MCP and nothing else; the token file and the request kinds below were not kept.
+> `quack -q` runs through the holder's `sql` tool, `quack jobs` reads its jobs resource, and
+> `quack mcp` relays a client to it. Design doc 4.1 and 11.3.
+
 DuckDB allows one process with read-write access to a file, or any number of read-only
 processes, never a writer beside readers: a read-only open fails while another process holds
 the file read-write, since DuckDB has no cross-process MVCC. The app holds its workspaces
@@ -317,6 +323,10 @@ This also removes today's friction between `quack serve` and the CLI on one lapt
 the design doc accepts as a limit, since the server is a holder like any other.
 
 ### 3.7 MCP for other tools, opt-in
+
+> What landed (2026-10-13): `quack mcp` relays every tool, `query` included, to the holder's
+> socket, where the turn runs on the holder's queue and a write asks at the terminal
+> session's prompt; no endpoint or setting is needed. Design doc 11.3.
 
 DuckDB's lock is per process, so while the app holds a workspace, `quack mcp` started by
 Claude Code or an editor cannot open it. Its read tools follow the lock like the CLI's (3.6):

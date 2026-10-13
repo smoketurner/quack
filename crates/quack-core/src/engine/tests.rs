@@ -216,3 +216,94 @@ async fn stop_jobs_ends_what_watches_stopping() {
         });
     assert_eq!(later.state, JobState::Cancelled);
 }
+
+/// A job's end is kept in its workspace's file: the next process to open
+/// the file lists it, finished, with a fresh number; one an earlier
+/// process left running is listed as failed.
+#[tokio::test]
+#[expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "test: the labels assertion fixes the length"
+)]
+async fn jobs_survive_the_process_in_the_workspace_file() {
+    use crate::jobs::store;
+    use crate::jobs::{JobId, JobInfo, JobNumber, JobProgress};
+    use crate::storage::workspace::WorkspaceDb;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(dir.path());
+    let id = WorkspaceId::from("ws");
+    let first = Engine::new(config.clone(), Holder::Serve);
+    first.workspace(&id).await.unwrap();
+    let done = first.jobs.submit(
+        JobSpec::new(JobKind::Ingest, "notes.md").workspace(id.clone()),
+        |_| async { Ok(String::from("1 chunk")) },
+    );
+    let failed = first.jobs.submit(
+        JobSpec::new(JobKind::Import, "orders.csv").workspace(id.clone()),
+        |_| async { Err(String::from("404")) },
+    );
+    first.jobs.wait(done.id).await;
+    first.jobs.wait(failed.id).await;
+    // No workspace: never written anywhere.
+    let homeless = first
+        .jobs
+        .submit(JobSpec::new(JobKind::Models, "models"), |_| async {
+            Ok(String::new())
+        });
+    first.jobs.wait(homeless.id).await;
+    first.close().await;
+
+    // A job another process left running.
+    {
+        let db = WorkspaceDb::open(&config, "ws").unwrap();
+        let running: JobId = "0199d1f0-0000-7000-8000-00000000abcd".parse().unwrap();
+        store::upsert(
+            &db,
+            &JobInfo {
+                id: running,
+                number: JobNumber::default(),
+                kind: JobKind::Graph,
+                label: String::from("graph extraction"),
+                workspace_id: Some(id.clone()),
+                owner: None,
+                lane: Some(String::from("graph:ws")),
+                state: JobState::Running,
+                progress: Some(JobProgress { done: 3, total: 9 }),
+                status: Some(String::from("chunk 3")),
+                outcome: None,
+                queued_at: jiff::Timestamp::now(),
+                started_at: Some(jiff::Timestamp::now()),
+                finished_at: None,
+                cancel_requested: false,
+            },
+            "a crashed process",
+        )
+        .unwrap();
+    }
+
+    let second = Engine::new(config, Holder::Serve);
+    assert!(second.jobs.list().is_empty());
+    second.workspace(&id).await.unwrap();
+    let restored = second.jobs.list_workspace(&id);
+    let labels: Vec<&str> = restored.iter().map(|j| j.label.as_str()).collect();
+    assert_eq!(labels, vec!["notes.md", "orders.csv", "graph extraction"]);
+    assert_eq!(restored[0].state, JobState::Succeeded);
+    assert_eq!(restored[0].outcome.as_deref(), Some("1 chunk"));
+    assert_eq!(restored[0].number.to_string(), "1");
+    assert_eq!(restored[1].state, JobState::Failed);
+    assert_eq!(restored[1].outcome.as_deref(), Some("404"));
+    assert_eq!(restored[2].state, JobState::Failed);
+    assert_eq!(restored[2].outcome.as_deref(), Some(store::INTERRUPTED));
+    assert!(restored[2].finished_at.is_some());
+    assert_eq!(
+        restored[2].progress,
+        Some(JobProgress { done: 3, total: 9 })
+    );
+    assert_eq!(second.jobs.list().len(), 3);
+    // Opening again in the same process adds nothing twice.
+    second.workspace(&id).await.unwrap();
+    assert_eq!(second.jobs.list().len(), 3);
+    second.close().await;
+}

@@ -238,8 +238,8 @@ only while the page is hidden. The Documents page refreshes on job events instea
 (aws-lc-rs) under the secret `secret_env` names, over `<timestamp>.<body>`, as
 `X-Quack-Signature: sha256=<hex>`, with the Unix timestamp in `X-Quack-Timestamp`; a receiver
 that refuses an old timestamp refuses a replayed delivery. `quack serve` refuses to start
-when that variable is unset. `kinds` narrows the report (every kind but chat turns by
-default). Each delivery runs on its own task, four at a time, so a slow endpoint never makes
+when that variable is unset. `kinds` narrows the report (every kind but chat turns and their
+`title` jobs by default). Each delivery runs on its own task, four at a time, so a slow endpoint never makes
 the reader of job events fall behind. Deliveries go through `Proxies::client`, with one retry
 after two seconds, and a failure is logged. Jobs that end while the server stops are
 reported too.
@@ -258,15 +258,46 @@ workspaces, and its stopping token. `quack serve`, the terminal session, `quack 
 mcp`, `quack search`, and `quack saved run` each build one (`Engine::new(config, holder)`)
 and hand it to what they run, so every interface in a process submits to one queue and
 shares one handle per workspace file. `Engine::workspace(id)` opens a workspace file once per
-process behind a cell (section 7.4), binds the holder's forward socket (`forward::Holder`
-names the holder in the token file), and gives back the writer, the reader pool, and the
-audit connection; a holder of one workspace (every one but `quack serve`) is refused any
-other (`Error::WorkspaceNotHeld`), and `close_workspace` refuses the held one
-(`Error::WorkspaceHeld`) and a busy one (`Error::WorkspaceBusy`). Every command line
-command opens its workspace through `OpenedWorkspace`, which holds the engine
-(`Holder::Terminal`, or `Holder::command("ingest")`), so there is one open path and no
-command can open the file beside its engine; a one-shot command runs its work as one step on
-the writer (`OpenedWorkspace::with_db`) and closes (`finish`).
+process behind a cell (section 7.4), restores the jobs the file remembers (below), and gives
+back the writer, the reader pool, and the audit connection; a holder of one workspace (every
+one but `quack serve`) is refused any other (`Error::WorkspaceNotHeld`), and
+`close_workspace` refuses the held one (`Error::WorkspaceHeld`) and a busy one
+(`Error::WorkspaceBusy`). Every command line command opens its workspace through
+`OpenedWorkspace`, which holds the engine (`Holder::Terminal`, or
+`Holder::command("ingest")`), so there is one open path and no command can open the file
+beside its engine; a one-shot command runs its work as one step on the writer
+(`OpenedWorkspace::with_db`) and closes (`finish`). While it holds the file, every such
+holder (the terminal session and every command, never `quack serve`) serves the workspace
+on its socket (`forward::SocketPath`: `{workspace_dir}/quack.sock`, or
+`/tmp/quack-{uid}/{id}.sock` when the data directory's path is too long for a socket
+address; a fixed path, not `TMPDIR`, so a terminal and a cron job agree; on Windows a named
+pipe with a random per-launch name, written to `{workspace_dir}/quack.pipe`, which another
+user can neither read nor forge since the data directory is the user's own, and whose default
+rights refuse other users' clients), which speaks MCP and nothing else (`quack_mcp::socket::SocketServer`, started by `OpenedWorkspace::handle`):
+`quack mcp` in another shell runs its calls through it, `quack -q` calls its `sql` tool,
+and `quack jobs` reads its `quack://workspace/jobs` (section 11.3). On Unix both ends accept
+only a socket owned by the current user, mode 0600, and a peer running as that user. `quack serve`
+serves no socket: a login-mode server would hand any same-user process the whole agent with
+no audit row. `quack mcp` serves none either: it holds nothing between calls.
+
+**Jobs survive the process.** A job label can quote a question or name a file, which is
+workspace content, so the queue's registry stays in memory and its durable record is
+`_quack_jobs` in each workspace's file (`jobs::store`), never `control.db`. The engine's
+recorder task reads every snapshot the queue broadcasts and writes the job's row into its
+workspace's file when the job's state changed (a snapshot that changed only progress or a
+status line is not written), at background priority on that workspace's writer, and only
+while the workspace is open (it is never opened for a row). Opening a file marks the jobs
+an earlier process left `queued` or `running` as failed ("the process running it ended
+before it finished") and restores the newest `[jobs].history` rows into the queue as
+finished entries with fresh numbers (at most 20 per workspace, placed before this
+process's own jobs so the history bound evicts them first; the file keeps
+`[jobs].history` rows and is pruned to that at open), so `/jobs`, the Jobs page, `GET
+.../jobs`, and `quack jobs` show what ran and how it ended after a restart. Deleting a
+session deletes its turns' rows, whose labels quote the questions. A session's title is a
+`title` job on the same queue (background priority, no lane; it honours a cancel), so
+`Engine::stop_jobs` cancels it with the rest; a command that answered one question and
+exits (`quack -p`, `saved run --refresh`) drains the queue instead (`Engine::drain_jobs`),
+letting the title and labelling its turn started finish under the grace.
 
 **Stopping.** `Engine::stop_jobs(grace)` is the one way a process stops its jobs: it cancels
 the engine's stopping token (`Engine::begin_stop`, which a signal handler may call alone to
@@ -296,8 +327,8 @@ straggler's handle is never joined by a second instance of the same file.
   checkpoints before the process exits. A supervisor's kill timeout must be longer than the
   grace: `docker-compose.yml` sets `stop_grace_period: 30s`.
 - `quack -p`, `quack saved run`, and `quack mcp` stop their engine the same way once the
-  turn, the run, or the client is done, so a labelling a turn started records its end
-  first.
+  turn, the run, or the client is done, so a labelling a turn started, and the session
+  title it started, record their end first; the socket's sessions end under the same grace.
 - A background run that wrote its opening audit row writes its closing one before the
   shutdown returns. A running graph extraction, document pass, or embeddings refresh returns
   `Error::Cancelled` and closes inside its job; a queued or refused one closes through
@@ -305,10 +336,11 @@ straggler's handle is never joined by a second instance of the same file.
   way. A run that ignores its cancel token past the grace is logged by job id and leaves no
   closing row.
 
-The registry is in memory only. A job's label can name a file or quote a question, which is
-workspace content (section 5), so it never reaches `control.db`. A restart forgets it; the
-durable record is the document, table, session, or audit row the job wrote. Uploads a
-previous process left `queued` are marked failed when the workspace next opens. Jobs share
+The registry is in memory; its durable record is `_quack_jobs` in each workspace's file,
+written by the engine and restored when the file opens ("Jobs survive the process", above).
+A job's label can name a file or quote a question, which is workspace content (section 5),
+so it never reaches `control.db`. Uploads a previous process left `queued` are marked
+failed when the workspace next opens, as are the jobs it left active. Jobs share
 the one writer connection (section 7.4). Long work (graph extraction, the document pass,
 ingestion) sends one step at a time, so a question asked meanwhile records its turn between
 steps.
@@ -681,6 +713,27 @@ CREATE TABLE _quack_audit (
     user_id   TEXT,
     action    TEXT NOT NULL,
     detail    JSON                          -- SQL executed, file names, context diff, ...
+);
+
+-- The jobs that ran on this workspace (section 4.1): written by the engine as a job's
+-- state changes, read back when the file opens; a label can quote a question, so never
+-- in control.db.
+CREATE TABLE _quack_jobs (
+    id               TEXT PRIMARY KEY,      -- UUID v7, the job's id
+    kind             TEXT NOT NULL,         -- chat | sql | ingest | import | ... | title
+    label            TEXT NOT NULL,
+    owner            TEXT,                  -- the server user who submitted it
+    lane             TEXT,
+    state            TEXT NOT NULL,         -- queued | running | succeeded | failed | cancelled
+    progress_done    INTEGER,
+    progress_total   INTEGER,
+    status           TEXT,                  -- the last status line
+    outcome          TEXT,                  -- the summary, or the error
+    queued_at        TIMESTAMP NOT NULL,
+    started_at       TIMESTAMP,
+    finished_at      TIMESTAMP,
+    cancel_requested BOOLEAN NOT NULL,
+    holder           TEXT NOT NULL          -- the process that ran it
 );
 ```
 
@@ -2819,11 +2872,34 @@ workspace owner or admin). Other members see "a question in a private session".
 
 ### 11.3 MCP server
 
-One tool set serves two transports through `rmcp`, the official Rust SDK for the Model
+One tool set serves three transports through `rmcp`, the official Rust SDK for the Model
 Context Protocol:
 
 - **stdio:** `quack mcp [-w NAME] [--allow-write]` for Claude Code and editors: one line in
-  `.mcp.json`, no server, unaudited like the CLI.
+  `.mcp.json`, no server, no port, unaudited like the CLI. It holds nothing between calls
+  (`quack_mcp::relay::PerCallServer`): each call runs in the process that holds the
+  workspace, over its socket (the terminal session, a command; the call's progress comes
+  back through it, and `--allow-write` has no say there), or, when nobody holds it, in
+  `quack mcp` itself, which opens the workspace for that call and lets it go after (a job
+  the call left running, a title, keeps it open until the next call or the exit). So the
+  terminal session can start before or after Claude Code, and a session started while
+  `quack mcp` is idle takes the file. A workspace `quack serve` holds cannot be reached this
+  way, since the server serves no socket; its `/mcp/v1/{workspace}` endpoint is the way in.
+- **The workspace socket** (`quack_core::forward`, section 4.1): every holder but `quack
+  serve` and `quack mcp` serves the same tool set there, unaudited like stdio, writes under
+  the holder's own policy: `Deny` for a command, `Ask` for the terminal session whatever
+  its `--allow-write` said, since the asker is another process. `initialize` names the
+  holder (`serverInfo.description`, "the quack terminal session", "quack ingest"), which
+  `quack -q` and `quack jobs` print as "read through ...".
+  A `query` turn that wants a write reaches the terminal session's own prompt
+  (`analysis::permissions::Approvals`: the session listens; a write nobody listens for is
+  refused), so Claude Code's question can change the workspace only with the person at the
+  keyboard saying so. That prompt names `quack mcp` and the job, takes `y` or `n` (never
+  `a`: a grant for the rest of a turn is for the session's own turns), ignores keys for a
+  second after it appears (a key typed as it lands is not its answer), and refuses the
+  write when nobody answers within `[server].permission_timeout_seconds`. A `query` turn is a `chat` job in its session's
+  lane like every other interface's, labelled `mcp: <question>`, so the session's strip and
+  `/jobs` show it and `/cancel N` stops it.
 - **Streamable HTTP** (the successor of MCP's HTTP+SSE pair; responses stream as SSE):
   `/mcp/v1/{workspace}` under `quack serve`, with the REST API's bearer. Every request
   passes `Access::resolve`. Each caller gets a transport keyed by workspace, user, and
@@ -2849,7 +2925,10 @@ bounded, a trailer saying what was cut) and in structured content with every kep
 full, `column_types`, `row_count`, and `row_count_exact`. `list_tables` answers one line per
 table or view, `orders (table, ~5000 rows): id BIGINT, ...` (the first 40 columns), with the
 same as structured content, so one call gives the schema. `search` takes `document_ids`,
-`entity`, `filters`, `mode`, and `explain`, as REST does.
+`entity`, `filters`, `mode`, and `explain`, as REST does. `quack://workspace/jobs` is the
+workspace's jobs as this process knows them (`JobInfo` each: what runs, what ran and how it
+ended, earlier processes' included), which `quack jobs` reads through a holder; it is served
+over stdio and the socket only, since over HTTP the jobs API hides other members' questions.
 
 Tools: `query`, `search`, `sql`, `classify` (a table's text labelled by the decision model:
 `preview` for any connection, a run only where the connection may write, and only up to
@@ -2860,10 +2939,10 @@ shape: meanings, note, profile, warnings, measures), `list_documents` (REST's pa
 permission, an internal table, a missing table) are tool errors the client model can read.
 Resources: `quack://workspace/tables`, `.../tables/{name}/schema`, `.../documents` (the first
 page, with `total` and `next`), `.../ontology` (JSON), `.../ontology/schema` (the interchange
-form's JSON Schema), `.../context` (Markdown).
+form's JSON Schema), `.../context` (Markdown), `.../jobs` (JSON).
 
 ```json
-{ "mcpServers": { "quack": { "command": "quack", "args": ["mcp", "-w", "logistics"] } } }
+{ "mcpServers": { "quack": { "command": "quack", "args": ["mcp"] } } }
 ```
 
 ### 11.4 Terminal session
@@ -2885,8 +2964,9 @@ uploads and the MCP turns beside the terminal's own, `/cancel N` stops either, a
 the same session from either side waits its turn in that session's lane. Quit gives the jobs
 and the server's drain the same three seconds. Web and MCP requests audit as the implicit
 local user; the terminal's own actions stay unaudited, as every command's do. The session
-listens on the workspace's forward socket too (`quack_core::forward`), so `quack -q` in
-another shell reads through it. It never blocks its input. It shows
+serves the workspace socket too (`quack_core::forward`, section 11.3), so `quack mcp` and
+`quack -q` in another shell reach it, and a write a `quack mcp` turn wants shows up in the
+session's own prompt. It never blocks its input. It shows
 streaming answers, inline steps, citations as footnotes, and ratatui charts. Permission
 prompts take `y`/`n`/`a`, one at a time, and the prompt itself shows who asks, the statement,
 and how many more wait, so clearing or scrolling the transcript never hides what is being
@@ -3487,7 +3567,7 @@ log_format = "text"                     # "json": one JSON object per line for a
 [server.webhooks]        # optional: a signed POST when a background job finishes
 url = "https://hooks.example.com/quack"
 secret_env = "QUACK_WEBHOOK_SECRET"     # the HMAC-SHA256 key; quack serve will not start without it
-kinds = ["ingest", "import"]            # default: every kind but chat
+kinds = ["ingest", "import"]            # default: every kind but chat and title
 timeout_seconds = 10
 
 [server.oidc]            # optional: "Sign in with <issuer>" beside the password form

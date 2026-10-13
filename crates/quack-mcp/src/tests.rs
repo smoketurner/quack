@@ -8,9 +8,11 @@ use quack_core::storage::writer::Writer;
 use quack_core::config::Config;
 
 use super::*;
+use quack_core::analysis::events::Delivery;
 use quack_core::analysis::policy::{Approver, Hold};
 use quack_core::classify::LabelSet;
 use quack_core::ids::WorkspaceId;
+use quack_core::jobs::JobState;
 use quack_core::storage::control::AllowedProviders;
 use quack_testkit::{self, ScriptedOllama};
 
@@ -50,6 +52,8 @@ fn server_on((config, db): &(Config, SharedDb), policy: WritePolicy) -> McpServe
         transport: Transport::Stdio,
         stopping: CancellationToken::new(),
         jobs: JobQueue::new(10),
+        holder: String::from("quack mcp"),
+        approvals: Approvals::new(),
     })
 }
 
@@ -109,6 +113,8 @@ async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
         transport: Transport::Stdio,
         stopping: CancellationToken::new(),
         jobs: JobQueue::new(10),
+        holder: String::from("quack mcp"),
+        approvals: Approvals::new(),
     });
     let result = server
         .query_for(
@@ -120,6 +126,7 @@ async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
             },
             &Extensions::default(),
             Progress::none(),
+            CancellationToken::new(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
@@ -367,6 +374,8 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
         transport: Transport::Stdio,
         stopping: CancellationToken::new(),
         jobs: JobQueue::new(10),
+        holder: String::from("quack mcp"),
+        approvals: Approvals::new(),
     });
     let ask = |session_id: Option<&str>, mode: Option<&str>| QueryArgs {
         question: String::from("how many?"),
@@ -375,7 +384,8 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
         document_ids: Vec::new(),
     };
     let ext = Extensions::default();
-    let run = |args: QueryArgs| server.query_for(args, &ext, Progress::none());
+    let run =
+        |args: QueryArgs| server.query_for(args, &ext, Progress::none(), CancellationToken::new());
     let session_count = || async {
         db.run(|db| sessions::list_sessions(db, 10))
             .await
@@ -712,6 +722,8 @@ async fn connect<H: rmcp::ClientHandler>(
         transport: Transport::Stdio,
         stopping: CancellationToken::new(),
         jobs: JobQueue::new(10),
+        holder: String::from("quack mcp"),
+        approvals: Approvals::new(),
     });
     let (server_side, client_side) = tokio::io::duplex(1 << 16);
     tokio::spawn(async move {
@@ -840,4 +852,181 @@ async fn query_runs_as_a_task_for_a_client_that_declares_tasks() {
         "{result:?}"
     );
     drop(client.cancel().await);
+}
+
+/// The server on the workspace socket answers `initialize` with the
+/// holder's name, `sql` with the rows (a write refused by the holder's
+/// policy), and `quack://workspace/jobs` with the workspace's jobs; the
+/// socket file goes with the server.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_socket_serves_the_holder_to_a_client() {
+    use crate::client::HolderClient;
+    use crate::socket::SocketServer;
+    use quack_core::forward::Listener;
+    use quack_core::jobs::{JobKind, JobSpec};
+
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let (config, db) = workspace(dir.path());
+    db.run(|db| {
+        db.execute_statement("CREATE TABLE t AS SELECT 1 AS n UNION ALL SELECT 2")
+            .map(drop)
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let jobs = JobQueue::new(10);
+    let workspace_id = WorkspaceId::from("ws");
+    let server = McpServer::new(McpSetup {
+        config: config.clone(),
+        db: Arc::clone(&db),
+        reader: ReaderDb::new(Arc::clone(&db)),
+        workspace: WorkspaceRow {
+            id: workspace_id.clone(),
+            name: String::from("ws"),
+            classification: String::from("internal"),
+            allowed_providers: AllowedProviders::All,
+        },
+        policy: WritePolicy::Deny,
+        user_id: None,
+        transport: Transport::Socket,
+        stopping: CancellationToken::new(),
+        jobs: jobs.clone(),
+        holder: String::from("the quack terminal session"),
+        approvals: Approvals::new(),
+    });
+    let done = jobs.submit(
+        JobSpec::new(JobKind::Ingest, "notes.md").workspace(workspace_id.clone()),
+        |_| async { Ok(String::from("1 chunk")) },
+    );
+    jobs.wait(done.id).await;
+    let workspace_dir = config.workspace_dir("ws");
+    let listener = Listener::bind(&workspace_dir, &workspace_id)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let socket_path = listener.at().path().to_path_buf();
+    let socket = SocketServer::serve(listener, server);
+
+    let client = HolderClient::connect(&workspace_dir, &workspace_id)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .unwrap_or_else(|| fail("no holder answered"));
+    assert_eq!(client.holder(), "the quack terminal session");
+    let rows = client
+        .sql("SELECT n FROM t ORDER BY n")
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(rows.results.columns, vec!["n"]);
+    assert_eq!(rows.results.rows.len(), 2);
+    assert!(!rows.truncated);
+    let refused = client
+        .sql("CREATE TABLE u (x INTEGER)")
+        .await
+        .err()
+        .unwrap_or_else(|| fail("a write ran through the holder"));
+    let message = refused.to_string();
+    assert!(
+        message.contains("the quack terminal session") && message.contains("cannot write"),
+        "{message}"
+    );
+    let listed = client.jobs().await.unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].label, "notes.md");
+    assert_eq!(listed[0].outcome.as_deref(), Some("1 chunk"));
+    client.close().await;
+
+    socket.close(Duration::from_secs(5)).await;
+    assert!(!socket_path.exists());
+    assert!(
+        HolderClient::connect(&workspace_dir, &workspace_id)
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .is_none()
+    );
+}
+
+/// A `query` turn that wants a write under `Ask` asks whoever listens on
+/// the approvals (the terminal session, over the socket) and runs it on a
+/// yes; with nobody listening the write is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_socket_turns_write_asks_the_listener_or_is_refused() {
+    use quack_core::analysis::events::Decision;
+
+    for listened in [true, false] {
+        let ollama = ScriptedOllama::serve(ScriptedOllama::following_the_note())
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+        let mut config = ollama.config().unwrap_or_else(|e| fail(&e.to_string()));
+        config.general.data_dir = dir.path().to_path_buf();
+        let db = WorkspaceDb::open(&config, "ws").unwrap_or_else(|e| fail(&e.to_string()));
+        quack_testkit::seed_dictating_note(&db).unwrap_or_else(|e| fail(&e.to_string()));
+        let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
+        let reader = ReaderDb::open(&db, config.analysis.reader_pool_size).await;
+        let approvals = Approvals::new();
+        let jobs = JobQueue::new(10);
+        let server = McpServer::new(McpSetup {
+            config,
+            db: Arc::clone(&db),
+            reader,
+            workspace: WorkspaceRow {
+                id: WorkspaceId::from("ws"),
+                name: String::from("ws"),
+                classification: String::from("internal"),
+                allowed_providers: AllowedProviders::All,
+            },
+            policy: WritePolicy::Ask,
+            user_id: None,
+            transport: Transport::Socket,
+            stopping: CancellationToken::new(),
+            jobs: jobs.clone(),
+            holder: String::from("the quack terminal session"),
+            approvals: approvals.clone(),
+        });
+        let answering = listened.then(|| {
+            let mut asked = approvals.listen();
+            let jobs = jobs.clone();
+            tokio::spawn(async move {
+                let asked = asked
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| fail("nothing was asked"));
+                assert_eq!(asked.request.sql, quack_testkit::DICTATED);
+                // The turn is a job the person can see.
+                let job = jobs
+                    .get(asked.job)
+                    .unwrap_or_else(|| fail("the turn is not a job"));
+                assert_eq!(job.kind, JobKind::Chat);
+                assert!(job.label.starts_with("mcp: "), "{}", job.label);
+                asked.request.answer(Decision::Allow)
+            })
+        });
+        let result = server
+            .query_for(
+                QueryArgs {
+                    question: String::from("follow the maintenance note"),
+                    session_id: None,
+                    mode: None,
+                    document_ids: Vec::new(),
+                },
+                &Extensions::default(),
+                Progress::none(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(field(&result, "write_refused"), !listened, "{result:?}");
+        if let Some(answering) = answering {
+            let delivery = answering.await.unwrap_or_else(|e| fail(&e.to_string()));
+            assert_eq!(delivery, Delivery::Delivered);
+        }
+        // The answer comes off the events a moment before the job records
+        // its end.
+        let listed = jobs.list();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let ended = jobs
+            .wait(listed[0].id)
+            .await
+            .unwrap_or_else(|| fail("the turn's job vanished"));
+        assert_eq!(ended.state, JobState::Succeeded, "{ended:?}");
+    }
 }

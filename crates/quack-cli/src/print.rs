@@ -15,7 +15,7 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::classify::LabelJobs;
 use quack_core::config::Config;
-use quack_core::ids::SessionId;
+use quack_core::ids::{SessionId, WorkspaceId};
 use quack_core::jobs::JobQueue;
 use quack_core::llm;
 use quack_core::llm::egress::Egress;
@@ -74,6 +74,9 @@ pub struct PrintTurn<'a> {
     /// the command waits for before it exits, so an interrupted run records
     /// its end.
     pub jobs: JobQueue,
+    /// The workspace the turn runs in: its title and labelling jobs are
+    /// listed under it and kept in its file.
+    pub workspace_id: WorkspaceId,
     pub session_id: &'a SessionId,
     pub policy: WritePolicy,
     pub prompt: &'a str,
@@ -142,13 +145,9 @@ impl PrintTurn<'_> {
     ///
     /// Returns the error from the turn, the database, or writing the answer.
     pub async fn run(self) -> Result<TurnOutcome> {
-        let (config, db, reader_db, session_id, jobs) = (
-            self.config,
-            self.db,
-            self.reader_db,
-            self.session_id,
-            self.jobs,
-        );
+        let labelling = LabelJobs::new(self.jobs).workspace(self.workspace_id);
+        let (config, db, reader_db, session_id) =
+            (self.config, self.db, self.reader_db, self.session_id);
         let (policy, prompt, format, verbose) =
             (self.policy, self.prompt, self.format, self.verbose);
         let documents = self.documents.to_vec();
@@ -156,7 +155,6 @@ impl PrintTurn<'_> {
 
         let interrupt = CtrlCGuard::new();
         let cancel = interrupt.cancel.clone();
-        let labelling = LabelJobs::new(jobs);
         let turn = tokio::spawn({
             let config = config.clone();
             let prompt = prompt.to_owned();
@@ -466,6 +464,7 @@ mod tests {
             db: Arc::clone(&db),
             reader_db: ReaderDb::open(&db, config.analysis.reader_pool_size).await,
             jobs: JobQueue::new(10),
+            workspace_id: WorkspaceId::from("ws"),
             session_id: &session.id,
             policy: WritePolicy::Allow(Approver::Nobody),
             prompt: "follow the maintenance note",
@@ -512,6 +511,7 @@ mod tests {
             db: Arc::clone(&db),
             reader_db: reader_db.clone(),
             jobs: JobQueue::new(10),
+            workspace_id: WorkspaceId::from("ws"),
             session_id: &session.id,
             policy: WritePolicy::Deny,
             prompt,
