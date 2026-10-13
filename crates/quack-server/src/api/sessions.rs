@@ -16,6 +16,7 @@ use utoipa::ToSchema;
 
 use crate::auth::{Access, Identity, Need};
 use crate::error::{ApiError, ApiResult};
+use crate::permissions;
 use crate::state::{App, with_db};
 
 #[derive(Deserialize, utoipa::IntoParams)]
@@ -470,7 +471,7 @@ pub(crate) async fn decide(
     let access = Access::resolve(&app, identity, &id, Need::WRITE).await?;
     let answer = body.decision;
     let resource = Some(ResourceKind::Session.id(&sid));
-    match app.permissions.decide(&request, &access, &sid, answer) {
+    match permissions::decide(&app, &access, &sid, &request, answer) {
         Ok(sql) => {
             access
                 .audit(

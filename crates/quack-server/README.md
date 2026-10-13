@@ -17,8 +17,10 @@ The network interfaces: `quack serve` (the REST API, the web UI, and MCP over HT
 - **`auth.rs` and `oidc/`:** sign-in, sessions, and API tokens.
 - **`mcp.rs` and `mcp_http.rs`:** the MCP server, on stdio and over HTTP. It shares the
   crate with the HTTP server because each uses the other.
-- **`queue.rs`, `permissions.rs`, `state.rs`:** uploads on the job queue, held write
-  approvals, and the shared application state.
+- **`run.rs`, `permissions.rs`, `state.rs`:** the server's end of core's audited background
+  runs (`jobs::runs`) and held write approvals (`analysis::permissions`), uploads queued
+  through `ingestion::upload` with `Access` as their owner, and the shared application
+  state.
 
 ## What it does not hold
 

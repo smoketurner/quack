@@ -27,7 +27,7 @@ use utoipa::ToSchema;
 
 use crate::auth::{Access, Identity, Need};
 use crate::error::{ApiError, ApiResult};
-use crate::run::{BackgroundRun, RunKind};
+use crate::run::{self, RunKind};
 use crate::state::App;
 
 /// Runs the listing shows at most.
@@ -323,7 +323,7 @@ impl Access {
             Ok(planned) => planned,
             Err(error) => return Err(self.classify_failed(app, error).await),
         };
-        let run = BackgroundRun::start(
+        let run = run::start(
             app,
             self,
             RunKind::CLASSIFY,

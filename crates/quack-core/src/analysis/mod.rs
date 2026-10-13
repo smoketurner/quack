@@ -4,6 +4,7 @@ pub mod citations;
 pub mod events;
 mod grounding;
 mod hooks;
+pub mod permissions;
 pub mod policy;
 pub mod rerank;
 pub mod search;

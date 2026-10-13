@@ -18,7 +18,7 @@ use quack_core::storage::workspace::WorkspaceDb;
 
 use crate::auth::{Access, Identity, Need};
 use crate::error::ApiResult;
-use crate::run::{BackgroundRun, RunKind};
+use crate::run::{self, BackgroundRun, RunKind};
 use crate::state::App;
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -130,7 +130,7 @@ impl Access {
             .await?;
             return Ok(RefreshStarted::Current { plan });
         }
-        let run = BackgroundRun::start(
+        let run = run::start(
             app,
             self,
             RunKind::EMBEDDINGS,

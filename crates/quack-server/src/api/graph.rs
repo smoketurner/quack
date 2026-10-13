@@ -31,7 +31,7 @@ use utoipa::ToSchema;
 use crate::api::okf::Download;
 use crate::auth::{Access, Identity, Need};
 use crate::error::{ApiError, ApiResult};
-use crate::run::{BackgroundRun, GraphReport, RunKind};
+use crate::run::{self, BackgroundRun, GraphReport, RunKind};
 use crate::state::{App, ExtractionSlot, with_db};
 use quack_core::analysis::tools::{FindPathArgs, SearchGraphArgs, SharedDb};
 use quack_core::jobs::JobId;
@@ -381,7 +381,7 @@ impl Access {
             chunks: chunks.len(),
             model: app.config.chat_model_ref()?.to_string(),
         };
-        let run = BackgroundRun::start(
+        let run = run::start(
             app,
             access,
             RunKind::GRAPH,
