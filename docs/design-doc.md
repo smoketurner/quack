@@ -275,10 +275,17 @@ pipe with a random per-launch name, written to `{workspace_dir}/quack.pipe`, whi
 user can neither read nor forge since the data directory is the user's own, and whose default
 rights refuse other users' clients), which speaks MCP and nothing else (`quack_mcp::socket::SocketServer`, started by `OpenedWorkspace::handle`):
 `quack mcp` in another shell runs its calls through it, `quack -q` calls its `sql` tool,
-and `quack jobs` reads its `quack://workspace/jobs` (section 11.3). On Unix both ends accept
+and `quack jobs` reads its `quack://workspace/jobs` (section 11.3). Every other command a
+lock refuses asks the socket once who holds the file and says so
+(`quack_cli::HeldElsewhere`: "the workspace is open in the quack terminal session; `quack -q`
+and `quack jobs` read through it; quit it to run `quack ingest`"), and when no socket answers
+says what that means (`quack serve`, which serves none, or a process starting or stopping).
+On Unix both ends accept
 only a socket owned by the current user, mode 0600, and a peer running as that user. `quack serve`
 serves no socket: a login-mode server would hand any same-user process the whole agent with
-no audit row. `quack mcp` serves none either: it holds nothing between calls.
+no audit row. `quack mcp` holds nothing between calls, and serves the socket only while a
+call holds the file (`quack_mcp::relay`), so two of them on one workspace, or `quack -q`
+beside one, reach whichever holds it.
 
 **Jobs survive the process.** A job label can quote a question or name a file, which is
 workspace content, so the queue's registry stays in memory and its durable record is
@@ -2881,16 +2888,33 @@ Context Protocol:
   workspace, over its socket (the terminal session, a command; the call's progress comes
   back through it, and `--allow-write` has no say there), or, when nobody holds it, in
   `quack mcp` itself, which opens the workspace for that call and lets it go after (a job
-  the call left running, a title, keeps it open until the next call or the exit). So the
-  terminal session can start before or after Claude Code, and a session started while
-  `quack mcp` is idle takes the file. A workspace `quack serve` holds cannot be reached this
-  way, since the server serves no socket; its `/mcp/v1/{workspace}` endpoint is the way in.
+  the call left running, a title, keeps it open until the next call or the exit). While it
+  holds the file it serves the workspace socket like any holder, under its own
+  `--allow-write` policy, so a second `quack mcp` on the workspace (another editor, another
+  Claude Code session) relays through it; a lock no socket answers for yet (the other
+  process between opening the file and binding the socket) is tried again for a few
+  seconds before it is reported. So the terminal session can start before or after Claude
+  Code, and a session started while `quack mcp` is idle takes the file. A workspace
+  `quack serve` holds cannot be reached this way, since the server serves no socket; its
+  `/mcp/v1/{workspace}` endpoint is the way in, and the refusal says so. Every call without
+  a holder runs the whole open sequence (the migration check, `fail_stale_uploads`, the
+  jobs' prune and restore) and then closes the file: the price of holding nothing between
+  calls, and correct, since the restore deduplicates by id.
 - **The workspace socket** (`quack_core::forward`, section 4.1): every holder but `quack
   serve` and `quack mcp` serves the same tool set there, unaudited like stdio, writes under
   the holder's own policy: `Deny` for a command, `Ask` for the terminal session whatever
-  its `--allow-write` said, since the asker is another process. `initialize` names the
+  its `--allow-write` said, since the asker is another process. A `sql` write sent to the
+  session is a `sql` job that asks at the same prompt (the strip and `/jobs` show it,
+  `/cancel N` refuses it) and runs on a yes; sent to a command, it is refused naming the
+  command, and `quack mcp` says once in its log that `--allow-write` has no say while
+  another process holds the workspace. `initialize` names the
   holder (`serverInfo.description`, "the quack terminal session", "quack ingest"), which
-  `quack -q` and `quack jobs` print as "read through ...".
+  `quack -q` and `quack jobs` print as "read through ...". A `sql` answer is bounded in
+  bytes as well as rows (`CappedResults::bound_bytes`: a value past `STRUCTURED_CELL_CHARS`
+  is cut with how much was left out and counted in `cells_cut`, rows past
+  `STRUCTURED_RESULT_BYTES` are dropped and `truncated` says so), since the answer goes
+  whole through the socket and is buffered at both ends: a statement typed in another
+  shell never has the holder serialize and send a value of any width.
   A `query` turn that wants a write reaches the terminal session's own prompt
   (`analysis::permissions::Approvals`: the session listens; a write nobody listens for is
   refused), so Claude Code's question can change the workspace only with the person at the

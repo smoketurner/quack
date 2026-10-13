@@ -28,9 +28,11 @@ use http::request::Parts;
 
 use quack_core::analysis::agent::AgentResponse;
 use quack_core::analysis::citations::Sources;
-use quack_core::analysis::events::{self, AgentEvent, FailureKind, TurnFailure};
+use quack_core::analysis::events::{
+    self, AgentEvent, Decision, FailureKind, PermissionRequest, TurnFailure,
+};
 use quack_core::analysis::permissions::{Approvals, Asked};
-use quack_core::analysis::policy::WritePolicy;
+use quack_core::analysis::policy::{Hold, WritePolicy};
 use quack_core::analysis::search::{DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{FindPathArgs, ReaderDb, Rerank, SearchGraphArgs, SharedDb};
 use quack_core::classify::{
@@ -54,8 +56,8 @@ use quack_core::storage::control::{
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{self, ChatMode, SessionViewer};
 use quack_core::storage::workspace::{
-    DocumentFilter, DocumentListing, SearchMode, TEMP_OBJECT_REFUSED, WorkspaceDb,
-    creates_temp_object,
+    CappedResults, DocumentFilter, DocumentListing, STRUCTURED_CELL_CHARS, STRUCTURED_RESULT_BYTES,
+    SearchMode, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
 };
 use quack_core::storage::writer::Writer;
 use quack_core::text::OneLine;
@@ -1064,7 +1066,7 @@ impl McpServer {
                 AgentEvent::Failed(failed) => failure = Some(failed),
                 AgentEvent::PermissionRequired(request) => self.inner.approvals.ask(Asked {
                     job: job.id,
-                    session: session_id.clone(),
+                    session: Some(session_id.clone()),
                     request,
                 }),
                 other => reporter.event(other).await,
@@ -1167,11 +1169,72 @@ impl McpServer {
         }
     }
 
+    /// A write another process sent over the workspace socket, under
+    /// `Ask`: a `sql` job on the holder's queue (so the person sees it in
+    /// the strip and `/jobs`, and `/cancel N` refuses it) that asks at the
+    /// holder's prompt through the approvals and runs the statement on a
+    /// yes. Nobody listening, a no, a cancel, or a client that hung up is
+    /// the refusal.
+    async fn ask_statement(&self, statement: String) -> Result<CoreResult<CappedResults>, String> {
+        let label: String = OneLine(&statement).to_string().chars().take(80).collect();
+        let spec = JobSpec::new(JobKind::Sql, label).workspace(self.inner.workspace.id.clone());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let (approvals, db, max_rows) = (
+            self.inner.approvals.clone(),
+            Arc::clone(&self.inner.db),
+            self.inner.config.analysis.max_query_rows,
+        );
+        let holder = self.inner.holder.clone();
+        let asked_at = holder.clone();
+        let job = self.inner.jobs.submit(spec, move |ctx| async move {
+            let (request, decision) = PermissionRequest::new(statement.clone(), Hold::NotPermitted);
+            approvals.ask(Asked {
+                job: ctx.id(),
+                session: None,
+                request,
+            });
+            let cancel = ctx.cancel_token();
+            let decision = tokio::select! {
+                biased;
+                () = cancel.cancelled() => Decision::Deny,
+                decision = decision => decision.unwrap_or(Decision::Deny),
+            };
+            if matches!(decision, Decision::Deny) {
+                drop(send.send(Err(format!(
+                    "this statement modifies data and was not approved at {asked_at}"
+                ))));
+                return Err(String::from("not approved"));
+            }
+            let ran = db
+                .run(move |db| db.execute_query_capped(&statement, max_rows))
+                .await;
+            let outcome = match &ran {
+                Ok(_) => Ok(String::from("ran")),
+                Err(e) => Err(e.to_string()),
+            };
+            drop(send.send(Ok(ran)));
+            outcome
+        });
+        // A handler dropped before the answer (the client hung up) cancels
+        // the job, which refuses the write.
+        let mut guard = CancelOnDrop {
+            jobs: self.inner.jobs.clone(),
+            id: job.id,
+            armed: true,
+        };
+        let answered = receive
+            .await
+            .map_err(|_| format!("this statement modifies data and was not approved at {holder}"));
+        guard.armed = false;
+        answered?
+    }
+
     /// Run one SQL statement. Reads always run; writes need this
-    /// connection's write permission.
+    /// connection's write permission (over the workspace socket, the
+    /// holder's: the terminal session asks at its prompt).
     #[tool(
         name = "sql",
-        description = "Run one DuckDB SQL statement over the workspace tables and return the rows as a Markdown table whose headers carry each column's type. A long value is cut and says how much was left out, and a result past the row or byte limit ends with how many rows were not shown: aggregate, filter, or LIMIT in one statement rather than paging. Reads always run; statements that modify data need write permission on this connection."
+        description = "Run one DuckDB SQL statement over the workspace tables and return the rows as a Markdown table whose headers carry each column's type. A long value is cut and says how much was left out, and a result past the row or byte limit ends with how many rows were not shown: aggregate, filter, or LIMIT in one statement rather than paging. The structured rows are bounded too: `truncated` says rows were dropped and `cells_cut` counts values cut at 65,536 characters. Reads always run; statements that modify data need write permission on this connection."
     )]
     async fn sql(
         &self,
@@ -1199,17 +1262,44 @@ impl McpServer {
                 .await?;
             return Ok(failure(TEMP_OBJECT_REFUSED));
         }
-        if is_write && !self.inner.policy.allows_unasked() {
-            caller
-                .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
-                .await?;
-            return Ok(failure(
-                "this statement modifies data and this connection cannot write",
-            ));
-        }
         let sql = statement.clone();
         let max_rows = self.inner.config.analysis.max_query_rows;
-        let result = if is_write {
+        let result = if is_write && !self.inner.policy.allows_unasked() {
+            // Over the socket, the holder's policy decides: the terminal
+            // session asks at its prompt; a command refuses. Over stdio
+            // and HTTP the connection simply cannot write.
+            let refused = match self.inner.policy {
+                WritePolicy::Ask => match self.ask_statement(statement.clone()).await {
+                    Ok(result) => Some(result.map_err(internal)),
+                    Err(refusal) => {
+                        caller
+                            .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
+                            .await?;
+                        return Ok(failure(refusal));
+                    }
+                },
+                WritePolicy::Deny | WritePolicy::Allow(_) => None,
+            };
+            let Some(result) = refused else {
+                caller
+                    .record(AuditAction::Sql, None, Outcome::Denied, Some(detail))
+                    .await?;
+                return Ok(failure(match self.inner.transport {
+                    Transport::Socket => format!(
+                        "this statement modifies data; {} does not run writes for another \
+                         process (`quack mcp --allow-write` has no effect while it holds the \
+                         workspace): run it there, or quit it and run the statement again",
+                        self.inner.holder
+                    ),
+                    Transport::Stdio | Transport::Http => String::from(
+                        "this statement modifies data and this connection cannot write",
+                    ),
+                }));
+            };
+            self.inner.reader.observe_write().await;
+            TableProfile::after_write(&self.inner.db).await;
+            result
+        } else if is_write {
             let result = self
                 .db(move |db| db.execute_query_capped(&sql, max_rows))
                 .await;
@@ -1235,16 +1325,22 @@ impl McpServer {
         caller
             .record(AuditAction::Sql, None, outcome, Some(detail))
             .await?;
-        let capped = match result {
+        let mut capped = match result {
             Ok(capped) => capped,
             Err(e) => return Ok(failure(e.message)),
         };
         // The model reads the text: the table `run_sql` gives the agent,
         // bounded in bytes and saying what was cut. A program reads the
-        // structured rows, every kept one in full.
-        let mut out = CallToolResult::success(vec![ContentBlock::text(capped.to_model_text())]);
+        // structured rows, every kept one, bounded in bytes too: a value
+        // past `STRUCTURED_CELL_CHARS` is cut and counted in `cells_cut`,
+        // and rows past `STRUCTURED_RESULT_BYTES` are dropped, since the
+        // answer goes whole through the socket and the client's buffer.
+        let text = capped.to_model_text();
+        let cut = capped.bound_bytes(STRUCTURED_RESULT_BYTES, STRUCTURED_CELL_CHARS);
+        let mut out = CallToolResult::success(vec![ContentBlock::text(text)]);
         out.structured_content = Some(serde_json::json!({
             "truncated": capped.truncated(),
+            "cells_cut": cut.cells,
             "row_count": capped.total_rows,
             "row_count_exact": !capped.stopped_early,
             "columns": capped.results.columns,
@@ -1950,14 +2046,22 @@ pub async fn serve_stdio(
     policy: WritePolicy,
 ) -> anyhow::Result<()> {
     let server = relay::PerCallServer::new(engine, workspace, policy);
+    let socket = server.socket();
     let running = rmcp::serve_server(server, rmcp::transport::stdio())
         .await
         .map_err(|e| anyhow::anyhow!("MCP initialization failed: {e}"))?;
-    running
+    let served = running
         .waiting()
         .await
-        .map_err(|e| anyhow::anyhow!("MCP server task failed: {e}"))?;
-    Ok(())
+        .map_err(|e| anyhow::anyhow!("MCP server task failed: {e}"));
+    // The socket this process served while a call held the file goes before
+    // the engine closes it: a call another process relayed through it gets
+    // the grace to end on an open workspace.
+    let socket = socket.lock().await.take();
+    if let Some(socket) = socket {
+        socket.close(STDIO_GRACE).await;
+    }
+    served.map(drop)
 }
 
 #[cfg(test)]

@@ -12,7 +12,8 @@
 //! a client's requests to it, and `quack -q` calls its `sql` tool
 //! (`quack_mcp`). The socket goes when the workspace closes. `quack serve`
 //! serves no socket: a login-mode server would hand any same-user process
-//! the whole agent with no audit row.
+//! the whole agent with no audit row. `quack mcp` serves one only while a
+//! call holds the file, so two of them on one workspace reach each other.
 //!
 //! Neither end trusts the file or the peer on faith. A client uses the
 //! socket only when it is a socket, owned by the current user, and
@@ -47,7 +48,9 @@ pub enum Holder {
         verb: &'static str,
     },
     /// `quack mcp`, which holds nothing between calls: it opens the
-    /// workspace for one call and closes it after, or reaches the holder.
+    /// workspace for one call and closes it after, or reaches the holder;
+    /// while a call holds the file it serves the socket itself
+    /// (`quack_mcp::relay`), not through `OpenedWorkspace`.
     Mcp,
 }
 
@@ -67,10 +70,12 @@ impl Holder {
         }
     }
 
-    /// Whether this holder serves the workspace socket while it holds the
-    /// file: the session and every command; not the server (a login-mode
-    /// server would hand any same-user process the agent with no audit
-    /// row) and not `quack mcp`, which holds nothing between calls.
+    /// Whether `OpenedWorkspace` serves the workspace socket for this
+    /// holder while it holds the file: the session and every command; not
+    /// the server (a login-mode server would hand any same-user process
+    /// the agent with no audit row) and not `quack mcp`, which holds
+    /// nothing between calls and serves its own socket only while a call
+    /// holds the file (`quack_mcp::relay`).
     #[must_use]
     pub fn serves_socket(&self) -> bool {
         match self {
