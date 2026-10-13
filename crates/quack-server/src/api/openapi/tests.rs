@@ -12,6 +12,8 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use quack_core::config::Config;
+use quack_core::engine::Engine;
+use quack_core::forward::Holder;
 use quack_core::storage::control::{AuditFilter, ControlPlane};
 use quack_core::web_sessions::WebSessions;
 use tower::ServiceExt;
@@ -37,7 +39,7 @@ async fn app() -> (tempfile::TempDir, App) {
         .unwrap_or_else(|e| fail(&e.to_string()));
     let sessions = Arc::new(WebSessions::new(&config.server));
     let app = Arc::new(AppState::new(
-        config,
+        Engine::new(config, Holder::Serve),
         control,
         ServeMode::Login,
         sessions,

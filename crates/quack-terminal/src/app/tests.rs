@@ -10,6 +10,8 @@ use quack_core::storage::profile::{TableNote, TableProfile};
 use super::*;
 use crate::commands::Suggestion;
 use crate::selection::{Position, Row};
+use quack_core::engine::Engine;
+use quack_core::forward::Holder;
 use quack_core::ids::{ChunkId, DocumentId};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -63,7 +65,7 @@ fn app_in(dir: &Path, workspace: &str, mut config: Config) -> App {
     let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
     let reader_db = ReaderDb::new(Arc::clone(&db));
     App::new(SessionSetup {
-        config,
+        engine: Engine::new(config, Holder::Terminal(WorkspaceId::from(workspace))),
         workspace_name: String::from(workspace),
         workspace_id: WorkspaceId::from(workspace),
         db,
@@ -1886,9 +1888,11 @@ async fn without_a_chat_model_a_line_that_starts_like_sql_reports_its_syntax_err
 
 /// A second session over `app`'s workspace, as the next `quack -w` sees it.
 fn next_session(app: &App) -> App {
-    let config = Config::clone(&app.config);
     App::new(SessionSetup {
-        config,
+        engine: Engine::new(
+            Config::clone(&app.config),
+            Holder::Terminal(app.workspace_id.clone()),
+        ),
         workspace_name: app.workspace_name.clone(),
         workspace_id: app.workspace_id.clone(),
         db: Arc::clone(&app.db),

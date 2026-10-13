@@ -14,7 +14,7 @@
 //! Over HTTP every call is audited through the request's `Access`, like
 //! the REST API; over stdio nothing is audited, like the CLI.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use axum::http::request::Parts;
@@ -28,6 +28,7 @@ use quack_core::classify::{
     self, Draft, DraftContext, Drafter, LabelJobs, LabellingJob, Rows, Waiting,
 };
 use quack_core::config::Config;
+use quack_core::engine::Engine;
 use quack_core::ids::{DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use quack_core::jobs::JobQueue;
 use quack_core::llm::ChatDrafter;
@@ -66,7 +67,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::auth::Access;
-use crate::state::{App, with_db};
+use crate::state::{App, AppState, with_db};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
 use quack_core::graph::query::PathQuery;
 
@@ -74,7 +75,9 @@ use quack_core::graph::query::PathQuery;
 /// server's access log and the workspace detail table for HTTP.
 pub(crate) enum Auditor {
     None,
-    Server(App),
+    /// Weak, since the server's state holds this transport: a call after
+    /// the server is gone fails rather than run unaudited.
+    Server(Weak<AppState>),
 }
 
 /// Who made one MCP request over HTTP: the `Access` `/mcp/v1/{workspace}`
@@ -138,7 +141,7 @@ impl Caller {
     fn cancel(&self) -> llm::CancellationToken {
         match self {
             Self::Unaudited => llm::CancellationToken::new(),
-            Self::Audited { app, .. } => app.stopping.child_token(),
+            Self::Audited { app, .. } => app.engine.stopping(),
         }
     }
 
@@ -582,13 +585,16 @@ impl McpServer {
         let Auditor::Server(app) = &self.inner.auditor else {
             return Ok(Caller::Unaudited);
         };
+        let app = app
+            .upgrade()
+            .ok_or_else(|| internal("the server is shutting down"))?;
         let caller = extensions
             .get::<Parts>()
             .and_then(|parts| parts.extensions.get::<McpCaller>())
             .cloned()
             .ok_or_else(|| internal("the MCP request carries no authorized caller"))?;
         Ok(Caller::Audited {
-            app: Arc::clone(app),
+            app,
             caller: Box::new(caller),
         })
     }
@@ -1588,29 +1594,28 @@ const STDIO_GRACE: Duration = Duration::from_secs(20);
 /// Returns an error when the stdio transport cannot start or fails while
 /// serving.
 pub async fn serve_stdio(
-    config: Config,
-    db: SharedDb,
-    reader: ReaderDb,
+    engine: Arc<Engine>,
     workspace: WorkspaceRow,
     policy: WritePolicy,
 ) -> anyhow::Result<()> {
-    let jobs = JobQueue::from_config(&config.jobs);
+    let handle = engine.workspace(&workspace.id).await?;
     let server = McpServer::new(McpSetup {
-        config,
-        db,
-        reader,
+        config: engine.config.clone(),
+        db: handle.writer,
+        reader: handle.reader,
         workspace,
         policy,
         user_id: None,
         auditor: Auditor::None,
-        jobs: jobs.clone(),
+        jobs: engine.jobs.clone(),
     });
     let running = rmcp::serve_server(server, rmcp::transport::stdio())
         .await
         .map_err(|e| anyhow::anyhow!("MCP initialization failed: {e}"))?;
     let served = running.waiting().await;
     // A run the client left behind finishes and records its end first.
-    jobs.shutdown(STDIO_GRACE).await;
+    engine.stop_jobs(STDIO_GRACE).await;
+    engine.close().await;
     served.map_err(|e| anyhow::anyhow!("MCP server task failed: {e}"))?;
     Ok(())
 }

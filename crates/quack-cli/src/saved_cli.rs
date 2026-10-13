@@ -12,6 +12,7 @@ use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
 use quack_core::config::Config;
 use quack_core::ids::SessionId;
+use quack_core::jobs::JobQueue;
 use quack_core::saved::{self, Answer, RunStatus, SavedQuestion, SavedRun, StatementRun};
 use quack_core::storage::control::ResourceKind;
 use quack_core::storage::sessions;
@@ -79,6 +80,8 @@ pub enum SavedAction {
 pub struct Model {
     pub db: SharedDb,
     pub reader_db: ReaderDb,
+    /// The process's queue, for the labelling a refreshed turn may start.
+    pub jobs: JobQueue,
     /// Full tool inputs on stderr.
     pub verbose: bool,
 }
@@ -211,6 +214,7 @@ async fn refresh_pin(
         config,
         db: Arc::clone(&model.db),
         reader_db: model.reader_db.clone(),
+        jobs: model.jobs.clone(),
         session_id: &session_id,
         policy: WritePolicy::Deny,
         prompt: &question.question,
@@ -649,6 +653,7 @@ mod tests {
         let model = Model {
             db: Arc::clone(&db),
             reader_db: ReaderDb::open(&db, config.analysis.reader_pool_size).await,
+            jobs: JobQueue::new(10),
             verbose: false,
         };
         let mut out = Vec::new();

@@ -1,19 +1,16 @@
-//! What every handler shares: the config, the control plane, one open
-//! `DuckDB` handle per workspace, the browser sessions, and the work queue.
+//! What every handler shares: the engine (its work queue and open
+//! workspaces), the control plane, the browser sessions, and the MCP
+//! transports.
 
 use quack_core::analysis::permissions::Permissions;
 use quack_core::ids::{UserId, WorkspaceId};
-use quack_core::ingestion::upload::UploadJob;
-use quack_core::storage::writer::Writer;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
-use quack_core::config::Config;
-use quack_core::forward::Listener;
-use quack_core::jobs::JobQueue;
+use quack_core::engine::Engine;
 use quack_core::llm::oauth::KeySource;
 use quack_core::storage::audit::AuditLog;
 use quack_core::storage::workspace::WorkspaceDb;
@@ -27,114 +24,9 @@ use super::oidc::Oidc;
 use super::resource::ProtectedResource;
 use super::web::flash::Flashes;
 use crate::mcp::McpServer;
-use quack_core::error::{Error as CoreError, Result as CoreResult};
+use quack_core::error::Result as CoreResult;
 use quack_core::storage::control::ControlPlane;
 use quack_core::web_sessions::WebSessions;
-use tokio_util::sync::CancellationToken;
-
-/// A workspace's writer connection plus its reader pool and its audit
-/// connection, opened together so each is built once per workspace handle
-/// rather than once per request (a request must never wait behind a slow
-/// write on the writer to read or to record its audit detail).
-#[derive(Clone)]
-struct WorkspaceHandle {
-    writer: SharedDb,
-    reader: ReaderDb,
-    audit: Arc<AuditLog>,
-    /// The socket another `quack` process reads this workspace through
-    /// while this one holds its lock (`quack_core::forward`); dropped with
-    /// the handle, which removes it.
-    _forward: Option<Arc<Listener>>,
-}
-
-/// What follows work done with a workspace's file closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AfterClose {
-    /// Open the file again for the handle's connections (a snapshot).
-    Reopen,
-    /// Leave it closed: the workspace is going (a delete).
-    StayClosed,
-}
-
-/// Whether a handle's connections are open after [`WorkspaceHandle::with_file_closed`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileState {
-    Open,
-    Closed,
-}
-
-impl WorkspaceHandle {
-    /// Run `work` with every connection to the workspace file closed (the
-    /// writer, the reader pool, the audit connection), since Windows lets no
-    /// other handle open a `DuckDB` file in use (#448); then, for
-    /// [`AfterClose::Reopen`], open it again through `WorkspaceDb::open` in
-    /// place, so whoever holds this handle carries on with the new
-    /// connections. Meanwhile writes and audit rows wait on their threads
-    /// and reads on their locked connections.
-    async fn with_file_closed<T, F>(
-        &self,
-        config: &Config,
-        workspace_id: &WorkspaceId,
-        after: AfterClose,
-        work: F,
-    ) -> (CoreResult<T>, FileState)
-    where
-        T: Send + 'static,
-        F: FnOnce() -> CoreResult<T> + Send + 'static,
-    {
-        // Always writer, then audit, then readers, so two of these never
-        // wait on each other.
-        let mut writer = match self.writer.lend().await {
-            Ok(lease) => lease,
-            Err(e) => return (Err(e), FileState::Open),
-        };
-        let mut audit = match self.audit.lend().await {
-            Ok(lease) => lease,
-            Err(e) => return (Err(e), FileState::Open),
-        };
-        let reader = self.reader.clone();
-        let config = config.clone();
-        let id = workspace_id.clone();
-        let closed = tokio::task::spawn_blocking(move || {
-            let mut readers = reader.lend();
-            // A lease dropped unchanged gives its connection back.
-            if let Err(e) = writer.db().and_then(WorkspaceDb::checkpoint) {
-                return (Err(e), FileState::Open);
-            }
-            readers.close();
-            audit.close();
-            writer.close();
-            let worked = work();
-            if after == AfterClose::StayClosed {
-                return (worked, FileState::Closed);
-            }
-            // On a failure everything stays closed, so a fresh open is the
-            // only one in the process.
-            let reopened = WorkspaceDb::open(&config, id.as_str())
-                .and_then(|db| db.try_clone_reader().map(|clone| (db, clone)));
-            let state = match reopened {
-                Ok((db, clone)) => {
-                    readers.restore(&db);
-                    audit.restore(clone);
-                    writer.restore(db);
-                    FileState::Open
-                }
-                Err(e) => {
-                    tracing::error!(workspace = %id, error = %e, "the workspace did not reopen");
-                    FileState::Closed
-                }
-            };
-            (worked, state)
-        })
-        .await;
-        // Release builds abort on a panic, so a failed join is the runtime
-        // shutting down, and each lease's drop hands back what it held.
-        closed.unwrap_or_else(|e| {
-            let failed = std::io::Error::other(format!("the closed-file task failed: {e}"));
-            (Err(CoreError::Io(failed)), FileState::Open)
-        })
-    }
-}
 
 /// How the server knows who is asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,15 +39,11 @@ pub enum ServeMode {
 }
 
 pub(crate) struct AppState {
-    pub config: Config,
+    /// The process: its queue, its open workspaces (one handle per file),
+    /// and its stopping token.
+    pub engine: Arc<Engine>,
     pub control: ControlPlane,
     pub mode: ServeMode,
-    /// A workspace file is opened once per process; every request shares it.
-    /// The cell is what enforces "once": `DuckDB`'s file lock is advisory
-    /// and per-process, so two concurrent opens of one file both succeed
-    /// and yield independent databases whose writes overwrite each other.
-    workspaces:
-        tokio::sync::Mutex<HashMap<WorkspaceId, Arc<tokio::sync::OnceCell<WorkspaceHandle>>>>,
     /// Browser and API-login sessions.
     pub sessions: Arc<WebSessions>,
     /// Sign-in through `[server.oidc]`'s issuer, when configured and not in
@@ -164,10 +52,6 @@ pub(crate) struct AppState {
     /// What quack publishes as a protected resource, when it accepts the
     /// issuer's access tokens (`[server.oidc].audience`).
     pub resource: Option<ProtectedResource>,
-    /// Every background job: uploads, extraction and proposal runs, agent
-    /// turns. Its registry is in memory, so workspace content in a job's
-    /// label never reaches `control.db`.
-    pub jobs: JobQueue,
     /// One MCP transport per workspace, user, and write permission; each
     /// carries its own MCP sessions. See `mcp_http`.
     mcp: tokio::sync::Mutex<HashMap<McpKey, McpTransport>>,
@@ -178,9 +62,6 @@ pub(crate) struct AppState {
     pub flashes: Flashes,
     /// Writes streamed turns are waiting on a person to decide.
     pub permissions: Permissions,
-    /// Cancelled when the server begins to stop: long-lived streams end on
-    /// it, so a connection left open cannot hold the process up.
-    pub stopping: CancellationToken,
     /// The last readiness answer and when it was worked out: `/readyz` is
     /// open to anyone and outside the limiter, so its checks run at most
     /// once per [`READINESS_FRESH`].
@@ -256,22 +137,20 @@ pub(crate) type App = Arc<AppState>;
 
 impl AppState {
     pub(crate) fn new(
-        config: Config,
+        engine: Arc<Engine>,
         control: ControlPlane,
         mode: ServeMode,
         sessions: Arc<WebSessions>,
         oidc: Option<Oidc>,
     ) -> Self {
-        let resource = ProtectedResource::of(&config, mode);
-        // The recorder lives for the process; a second state in one
-        // process (tests) keeps the first.
+        let resource = ProtectedResource::of(&engine.config, mode);
+        // The recorder lives for the process, and only `/metrics` reads
+        // it; a second state in one process (tests) keeps the first.
         telemetry::install();
         Self {
-            jobs: JobQueue::from_config(&config.jobs),
-            config,
+            engine,
             control,
             mode,
-            workspaces: tokio::sync::Mutex::new(HashMap::new()),
             sessions,
             resource,
             oidc,
@@ -279,27 +158,35 @@ impl AppState {
             extractions: Mutex::new(HashSet::new()),
             flashes: Flashes::default(),
             permissions: Permissions::default(),
-            stopping: CancellationToken::new(),
             readiness: tokio::sync::Mutex::new(None),
         }
     }
 
     /// Stop the server whose HTTP drain is `server`: streams end and the
-    /// job queue shuts down beside the drain, under one grace of
-    /// `[server].shutdown_grace_seconds`, and the workspaces close last.
+    /// job queue shuts down beside the drain, under one `grace`, and the
+    /// workspaces close last.
     ///
     /// # Errors
     ///
     /// Returns the drain's own error.
-    pub(crate) async fn stop<S>(self: Arc<Self>, mut server: S) -> std::io::Result<()>
+    pub(crate) async fn stop<S>(
+        self: Arc<Self>,
+        mut server: Option<S>,
+        grace: Duration,
+    ) -> std::io::Result<()>
     where
         S: Future<Output = std::io::Result<()>> + Unpin,
     {
-        self.stopping.cancel();
-        let grace = self.config.server.shutdown_grace();
         let deadline = Instant::now().checked_add(grace);
         let drain = async {
-            let (served, _) = tokio::join!(&mut server, self.jobs.shutdown(grace));
+            // `None`: the server already ended on its own; nothing to drain.
+            let drained = async {
+                match server.as_mut() {
+                    Some(server) => server.await,
+                    None => Ok(()),
+                }
+            };
+            let (served, _) = tokio::join!(drained, self.engine.stop_jobs(grace));
             served
         };
         let served = tokio::time::timeout(grace, drain)
@@ -317,41 +204,31 @@ impl AppState {
         let left = deadline.map_or(Duration::ZERO, |at| {
             at.saturating_duration_since(Instant::now())
         });
-        for job in self.jobs.shutdown(left).await {
+        for job in self.engine.stop_jobs(left).await {
             tracing::warn!(job = %job.id, kind = %job.kind, state = %job.state, "job still active at exit");
         }
         self.close().await;
         served
     }
 
-    /// Let go of every MCP transport and workspace, once requests and jobs
-    /// have ended: each workspace's writer finishes its queued closures and
-    /// checkpoints as its last handle drops. The transports go explicitly
-    /// because their servers hold this state, which would otherwise never
-    /// drop.
+    /// Drop every MCP transport, then every workspace handle, so each
+    /// writer finishes its queued closures and checkpoints; the last thing
+    /// the server does.
     pub(crate) async fn close(&self) {
         let transports = std::mem::take(&mut *self.mcp.lock().await);
-        let workspaces = std::mem::take(&mut *self.workspaces.lock().await);
-        // A writer's drop joins its thread.
-        let closed = tokio::task::spawn_blocking(move || {
-            drop(transports);
-            drop(workspaces);
-        });
+        let closed = tokio::task::spawn_blocking(move || drop(transports));
         if let Err(e) = closed.await {
-            tracing::error!(error = %e, "closing the workspaces failed");
+            tracing::error!(error = %e, "closing the MCP transports failed");
         }
+        self.engine.close().await;
     }
 
     /// Let go of one workspace before it is deleted: its MCP transports
     /// and its open file, once no job of it is queued or running. A
     /// request that still holds a handle finishes on the unlinked file.
     pub(crate) async fn close_workspace(&self, workspace_id: &WorkspaceId) -> ApiResult<()> {
-        let active = self.jobs.counts(Some(workspace_id)).active();
-        if active > 0 {
-            return Err(ApiError::conflict(format!(
-                "{active} job(s) of this workspace are queued or running; cancel them first"
-            )));
-        }
+        // Refused (held, or a job still running): its MCP sessions live on.
+        self.engine.closable(workspace_id)?;
         let transports = {
             let mut mcp = self.mcp.lock().await;
             let keys: Vec<McpKey> = mcp
@@ -363,33 +240,16 @@ impl AppState {
                 .filter_map(|key| mcp.remove(key))
                 .collect::<Vec<_>>()
         };
-        let cell = self.workspaces.lock().await.remove(workspace_id);
-        // A request that still holds the handle fails from here on rather
-        // than keep the file open under the delete.
-        if let Some(handle) = cell.as_ref().and_then(|cell| cell.get()) {
-            let (closed, _) = handle
-                .with_file_closed(
-                    &self.config,
-                    workspace_id,
-                    AfterClose::StayClosed,
-                    || Ok(()),
-                )
-                .await;
-            closed?;
-        }
-        let closed = tokio::task::spawn_blocking(move || {
-            drop(transports);
-            drop(cell);
-        });
-        closed
+        let closed = self.engine.close_workspace(workspace_id).await;
+        let dropped = tokio::task::spawn_blocking(move || drop(transports));
+        closed?;
+        dropped
             .await
             .map_err(|e| ApiError::internal(format!("closing the workspace failed: {e}")))
     }
 
-    /// Run `work` with the workspace's file closed, then reopen it (see
-    /// [`WorkspaceHandle::with_file_closed`]): this workspace's requests
-    /// wait for it, other workspaces do not. A file that does not reopen
-    /// is forgotten, so the next request opens it afresh.
+    /// Run `work` with the workspace's file closed, then reopen it: this
+    /// workspace's requests wait for it, other workspaces do not.
     pub(crate) async fn with_workspace_closed<T, F>(
         &self,
         workspace_id: &WorkspaceId,
@@ -399,15 +259,10 @@ impl AppState {
         T: Send + 'static,
         F: FnOnce() -> CoreResult<T> + Send + 'static,
     {
-        let handle = self.workspace_handle(workspace_id).await?;
-        let (done, state) = handle
-            .with_file_closed(&self.config, workspace_id, AfterClose::Reopen, work)
-            .await;
-        if state == FileState::Closed {
-            let cell = self.workspaces.lock().await.remove(workspace_id);
-            drop(tokio::task::spawn_blocking(move || drop(cell)));
-        }
-        Ok(done?)
+        Ok(self
+            .engine
+            .with_workspace_closed(workspace_id, work)
+            .await?)
     }
 
     /// Whether this server can serve: `control.db` answers, the data
@@ -428,6 +283,7 @@ impl AppState {
         let control_db = self.control.ping().await.map_err(|e| e.to_string());
         let data_dir = {
             let probe = self
+                .engine
                 .config
                 .data_dir()
                 .join(format!(".readyz-{}", uuid::Uuid::now_v7()));
@@ -436,7 +292,7 @@ impl AppState {
                 .and_then(|()| std::fs::remove_file(&probe))
                 .map_err(|e| e.to_string())
         };
-        let vault_key = Vault::new(self.config.data_dir(), KeySource::Keychain)
+        let vault_key = Vault::new(self.engine.config.data_dir(), KeySource::Keychain)
             .key_location()
             .await
             .map(|_| ())
@@ -446,31 +302,6 @@ impl AppState {
             data_dir: Probe::of("data_dir", data_dir),
             vault_key: Probe::of("vault_key", vault_key),
         }
-    }
-
-    /// Read the gauges `GET /metrics` reports: jobs by kind and state, the
-    /// writers' queues, and the open workspaces.
-    pub(crate) async fn refresh_gauges(&self) {
-        for (kind, state, count) in self.jobs.tally() {
-            telemetry::set_jobs(kind.as_str(), state.as_str(), count);
-        }
-        let (mut interactive, mut background) = (0_usize, 0_usize);
-        let open = {
-            let workspaces = self.workspaces.lock().await;
-            let mut open = 0_usize;
-            for cell in workspaces.values() {
-                if let Some(handle) = cell.get() {
-                    open = open.saturating_add(1);
-                    let (i, b) = handle.writer.waiting();
-                    interactive = interactive.saturating_add(i);
-                    background = background.saturating_add(b);
-                }
-            }
-            open
-        };
-        telemetry::set_writer_waiting("interactive", interactive);
-        telemetry::set_writer_waiting("background", background);
-        telemetry::set_open_workspaces(open);
     }
 
     /// Claim the workspace's extraction slot, or `None` while another
@@ -509,94 +340,28 @@ impl AppState {
                 .with_allowed_hosts(Vec::<String>::new())
                 .with_json_response(true)
                 // Its standalone event streams end when the server stops.
-                .with_cancellation_token(self.stopping.child_token()),
+                .with_cancellation_token(self.engine.stopping()),
         );
         open.insert(key, transport.clone());
         transport
     }
 
-    /// The writer and reader for a workspace, opening the file and building
-    /// the reader once on first use.
-    ///
-    /// The map lock is held only long enough to hand out the workspace's
-    /// cell; opening the file and cloning the reader pool happen outside
-    /// it, so one workspace's first access never blocks another's. The cell
-    /// is what makes the open happen exactly once — concurrent first-time
-    /// callers await the same initialization instead of each opening the
-    /// file. De-duplicating afterwards would not do: two opens would both
-    /// have already run, and both would have written.
-    ///
-    /// A failed open is never remembered. `get_or_try_init` leaves the cell
-    /// empty on error, so the next request retries rather than inheriting a
-    /// permanent failure; nothing here may cache the error alongside it.
-    async fn workspace_handle(&self, workspace_id: &WorkspaceId) -> ApiResult<WorkspaceHandle> {
-        let cell = {
-            let mut open = self.workspaces.lock().await;
-            Arc::clone(
-                open.entry(workspace_id.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
-            )
-        };
-        let config = self.config.clone();
-        let id = workspace_id.clone();
-        // The path alone: a `Config` captured here would sit in this future and
-        // in every future that awaits a workspace handle.
-        let forward_dir = self.config.workspace_dir(workspace_id.as_str());
-        let forward_id = workspace_id.clone();
-        let pool_size = self.config.analysis.reader_pool_size;
-        cell.get_or_try_init(|| async move {
-            let (db, audit) = tokio::task::spawn_blocking(move || {
-                let db = WorkspaceDb::open(&config, id.as_str())?;
-                // Uploads a previous process took but never finished are
-                // failed, and their spooled bytes deleted: the person who
-                // sent them is told to send them again.
-                let stale = db.fail_stale_uploads()?;
-                if stale > 0 {
-                    tracing::warn!(workspace = %id, stale, "failed uploads left queued by an earlier process");
-                }
-                UploadJob::clear_stale(&config, &id)?;
-                let audit = AuditLog::open(&db)?;
-                Ok::<_, CoreError>((db, audit))
-            })
-            .await
-            .map_err(|e| ApiError::internal(format!("workspace open task failed: {e}")))??;
-            let writer: SharedDb = Arc::new(
-                Writer::spawn(db).map_err(|e| ApiError::internal(e.to_string()))?,
-            );
-            let reader = ReaderDb::open(&writer, pool_size).await;
-            let forward = match Listener::bind(&forward_dir, "quack serve", reader.clone()).await {
-                Ok(listener) => Some(Arc::new(listener)),
-                Err(e) => {
-                    tracing::warn!(workspace = %forward_id, error = %e, "other quack processes cannot read this workspace through the server");
-                    None
-                }
-            };
-            Ok(WorkspaceHandle {
-                writer,
-                reader,
-                audit: Arc::new(audit),
-                _forward: forward,
-            })
-        })
-        .await
-        .cloned()
-    }
-
-    /// The writer handle for a workspace, opening the file on first use.
+    /// The writer handle for a workspace, opening the file on first use
+    /// (`Engine::workspace`, which is where one open per file is enforced).
     pub(crate) async fn workspace_db(&self, workspace_id: &WorkspaceId) -> ApiResult<SharedDb> {
-        Ok(self.workspace_handle(workspace_id).await?.writer)
+        Ok(self.engine.workspace(workspace_id).await?.writer)
     }
 
     /// The reader handle for a workspace (built once, alongside the
     /// writer, on first use): every read-only handler should prefer this
     /// over [`Self::workspace_db`] so it never queues behind a write.
     pub(crate) async fn reader_db(&self, workspace_id: &WorkspaceId) -> ApiResult<ReaderDb> {
-        Ok(self.workspace_handle(workspace_id).await?.reader)
+        Ok(self.engine.workspace(workspace_id).await?.reader)
     }
 
     /// The workspace's insert-only audit connection, opened with its writer.
     pub(crate) async fn audit_log(&self, workspace_id: &WorkspaceId) -> ApiResult<Arc<AuditLog>> {
-        Ok(self.workspace_handle(workspace_id).await?.audit)
+        Ok(self.engine.workspace(workspace_id).await?.audit)
     }
 
     /// Run a read on one of the workspace's reader connections, inside a

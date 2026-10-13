@@ -173,9 +173,11 @@ Prettier in `ui/`, run by `make ui-lint` and the CI job (7.1).
 
 One `AppState` for the process, managed by Tauri (`app.manage`): the `Config`, the
 `ControlPlane`, the `JobQueue` (one per process, as the terminal and the server each have),
-the open workspaces, and the pending permissions.
+the open workspaces, and the pending permissions. (Since then this became
+`quack_core::engine::Engine`, which every interface builds and shares.)
 
-An open workspace is what `OpenedWorkspace::shared` produces today: the `SharedDb` (the
+An open workspace is what `OpenedWorkspace::shared` produced then (today the engine's
+`WorkspaceHandle`): the `SharedDb` (the
 `Writer` actor on its own thread) and the `ReaderDb` pool, plus the `Egress` scope for its
 `allowed_providers`, entered on every command that reaches a model. The app opens a workspace
 once per process and keeps it open while any window shows it (the `OnceCell`-per-workspace

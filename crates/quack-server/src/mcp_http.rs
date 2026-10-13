@@ -38,14 +38,14 @@ pub(crate) async fn handle(
     let transport = app
         .mcp_transport(key, || {
             McpServer::new(McpSetup {
-                config: app.config.clone(),
+                config: app.engine.config.clone(),
                 db,
                 reader,
                 workspace: access.membership.workspace.clone(),
                 policy,
                 user_id: Some(access.identity.user_id.clone()),
-                auditor: Auditor::Server(std::sync::Arc::clone(&app)),
-                jobs: app.jobs.clone(),
+                auditor: Auditor::Server(std::sync::Arc::downgrade(&app)),
+                jobs: app.engine.jobs.clone(),
             })
         })
         .await;

@@ -488,7 +488,7 @@ impl Access {
         app: &App,
         auto_accept: bool,
     ) -> ApiResult<TableProposal> {
-        let options = app.config.ontology.table_evidence();
+        let options = app.engine.config.ontology.table_evidence();
         let db = app.workspace_db(&self.membership.workspace.id).await?;
         let author = self.identity.username.clone();
         let proposed = with_db(db, move |db| {
@@ -733,7 +733,7 @@ impl Access {
         sample: Option<u32>,
     ) -> ApiResult<DocumentRunStarted> {
         let (access, id) = (self, &self.membership.workspace.id);
-        let mut options = app.config.ontology.document_evidence();
+        let mut options = app.engine.config.ontology.document_evidence();
         if let Some(n) = sample {
             options.sample_chunks = n;
         }
@@ -742,14 +742,14 @@ impl Access {
             .model(
                 app,
                 AuditAction::Propose,
-                llm::chat_extractor(&app.config).await,
+                llm::chat_extractor(&app.engine.config).await,
             )
             .await?;
         let embeddings = access
             .model(
                 app,
                 AuditAction::Propose,
-                Embeddings::from_config(&app.config).await,
+                Embeddings::from_config(&app.engine.config).await,
             )
             .await?;
         let (cost, chunks, current) = app
@@ -771,7 +771,7 @@ impl Access {
         )
         .await?;
         let run_id = run.id().clone();
-        let concurrency = app.config.analysis.extraction_concurrency;
+        let concurrency = app.engine.config.analysis.extraction_concurrency;
         let progress_run = run_id.clone();
         let job = run.submit(move |ctx| async move {
             let run_id = progress_run;

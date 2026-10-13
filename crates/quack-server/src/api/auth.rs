@@ -163,7 +163,7 @@ pub(crate) async fn change_password(
         .check_password(
             &identity.username,
             &body.current,
-            app.config.server.lockout(),
+            app.engine.config.server.lockout(),
         )
         .await?;
     let outcome = match &checked {

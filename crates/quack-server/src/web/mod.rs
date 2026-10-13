@@ -1221,7 +1221,8 @@ async fn login_submit(
         Ok(login) => login.token,
         Err(e) if e.status == StatusCode::UNAUTHORIZED => {
             return Ok(
-                Flash::error("/login", app.config.server.lockout().refusal()).into_response(),
+                Flash::error("/login", app.engine.config.server.lockout().refusal())
+                    .into_response(),
             );
         }
         Err(e) => return Err(e.into()),
@@ -2701,6 +2702,7 @@ impl SettingsPage {
     ) -> WebResult<Self> {
         let allowed = &access.membership.workspace.allowed_providers;
         let providers = app
+            .engine
             .config
             .providers
             .keys()
@@ -2719,6 +2721,7 @@ impl SettingsPage {
             (Vec::new(), Vec::new())
         };
         let reads_groups = app
+            .engine
             .config
             .server
             .oidc
@@ -2779,7 +2782,7 @@ async fn settings_save(
     // The form is one checkbox per configured provider, so it cannot say
     // "every provider, including ones added later" other than by ticking
     // all of them or none.
-    let configured = &app.config.providers;
+    let configured = &app.engine.config.providers;
     let every = form.providers.len() == configured.len()
         && configured
             .keys()
@@ -3144,7 +3147,7 @@ async fn render_graph(
 ) -> WebResult<Response> {
     let access = Access::resolve(app, identity, id, Need::READ).await?;
     access.audit_read(app, AuditAction::Page, "graph").await?;
-    let options = app.config.graph;
+    let options = app.engine.config.graph;
     let query = GraphQueryView::from_query(q);
     let ask = GraphAsk::of(q, app, &access).await?;
     let data = app
@@ -3215,7 +3218,7 @@ impl GraphAsk {
             .model(
                 app,
                 AuditAction::Graph,
-                Embeddings::from_config(&app.config).await,
+                Embeddings::from_config(&app.engine.config).await,
             )
             .await?;
         Ok(match (path, search) {

@@ -61,13 +61,13 @@ pub(crate) async fn search(
     let query = q
         .query()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let options = app.config.graph;
+    let options = app.engine.config.graph;
     let detail = serde_json::to_value(&query)?;
     let model = access
         .model(
             &app,
             AuditAction::Graph,
-            Embeddings::from_config(&app.config).await,
+            Embeddings::from_config(&app.engine.config).await,
         )
         .await?;
     // Run, audit the outcome, then propagate, so a failure after
@@ -109,13 +109,13 @@ pub(crate) async fn path(
     let query = q
         .query()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let options = app.config.graph;
+    let options = app.engine.config.graph;
     let detail = serde_json::to_value(&query)?;
     let model = access
         .model(
             &app,
             AuditAction::Graph,
-            Embeddings::from_config(&app.config).await,
+            Embeddings::from_config(&app.engine.config).await,
         )
         .await?;
     // Run, audit the outcome, then propagate (see `search`).
@@ -328,12 +328,12 @@ impl Access {
             .await?;
         let ontology = ontology.ok_or_else(|| ApiError::bad_request("no ontology yet"))?;
         let version = ontology.saved_version()?;
-        let options = app.config.graph;
+        let options = app.engine.config.graph;
         let embeddings = access
             .model(
                 app,
                 AuditAction::GraphExtract,
-                Embeddings::from_config(&app.config).await,
+                Embeddings::from_config(&app.engine.config).await,
             )
             .await?;
         if let Some(keep) = reset {
@@ -374,12 +374,12 @@ impl Access {
             .model(
                 app,
                 AuditAction::GraphExtract,
-                llm::graph_extractor(&app.config, &ontology).await,
+                llm::graph_extractor(&app.engine.config, &ontology).await,
             )
             .await?;
         let cost = ExtractionCost {
             chunks: chunks.len(),
-            model: app.config.chat_model_ref()?.to_string(),
+            model: app.engine.config.chat_model_ref()?.to_string(),
         };
         let run = run::start(
             app,
@@ -497,7 +497,7 @@ impl DocumentJob {
                 standing,
                 ExtractionRun {
                     extractor: extractor.as_ref(),
-                    concurrency: app.config.analysis.extraction_concurrency,
+                    concurrency: app.engine.config.analysis.extraction_concurrency,
                     control,
                 },
             )

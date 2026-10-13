@@ -112,7 +112,7 @@ impl Access {
             .model(
                 app,
                 AuditAction::EmbeddingsRefresh,
-                Embeddings::require(&app.config).await,
+                Embeddings::require(&app.engine.config).await,
             )
             .await?;
         let status = app
@@ -170,7 +170,7 @@ fn refresh_in_background(
             Ok(db) => refresh::run(
                 &db,
                 &embedder,
-                app.config.ingestion.embedding_batch_size,
+                app.engine.config.ingestion.embedding_batch_size,
                 control,
             )
             .await

@@ -157,7 +157,7 @@ impl Access {
     /// The decision model for this workspace, or why not: a provider the
     /// allow-list refuses is 403, and either way the attempt is audited.
     async fn decision_model(&self, app: &App) -> ApiResult<DecisionModel> {
-        let built = DecisionModel::from_config(&app.config)
+        let built = DecisionModel::from_config(&app.engine.config)
             .await
             .and_then(|model| model.ok_or(CoreError::NoDecisionModel));
         self.model(app, AuditAction::Classify, built).await
@@ -191,7 +191,7 @@ impl Access {
         decision: &DecisionModel,
         request: &classify::Request,
     ) -> Result<Draft, CoreError> {
-        let drafter = ChatDrafter::from_config(&app.config);
+        let drafter = ChatDrafter::from_config(&app.engine.config);
         let context = DraftContext {
             db,
             decision,
@@ -254,7 +254,7 @@ impl Access {
         let decision = self.decision_model(app).await?;
         let db = app.workspace_db(&self.membership.workspace.id).await?;
         let waiting = Waiting::Caller {
-            budget: app.config.decision.interactive_budget,
+            budget: app.engine.config.decision.interactive_budget,
         };
         let report = async {
             let draft = self.draft_of(app, &db, &decision, request).await?;

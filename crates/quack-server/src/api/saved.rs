@@ -217,7 +217,7 @@ impl Access {
     pub(crate) async fn run_saved(&self, app: &App, saved: &SavedId) -> ApiResult<RunOf> {
         let question = self.saved_question(app, saved).await?;
         let db = app.workspace_db(&self.membership.workspace.id).await?;
-        let max_rows = app.config.analysis.max_query_rows;
+        let max_rows = app.engine.config.analysis.max_query_rows;
         let resource = Some(ResourceKind::SavedQuestion.id(saved));
         let ran = question.clone();
         let run = match with_db(db, move |db| saved::run(db, &ran, max_rows)).await {

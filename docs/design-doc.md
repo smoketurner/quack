@@ -251,16 +251,36 @@ statement holds it. Work whose end records something (an upload's document statu
 extraction's closing audit row) records it for a job cancelled while queued too, so nothing
 is left `queued`.
 
-**Stopping.** `JobQueue::shutdown(grace)` is the one way a process stops its jobs. It closes
-the queue, so a job submitted afterwards is recorded as `cancelled` ("refused: the queue is
-shutting down") and never runs. It cancels every queued and running job, then waits up to
+**The engine.** `quack_core::engine::Engine` is the process: its one `JobQueue`, its open
+workspaces, and its stopping token. `quack serve`, the terminal session, `quack -p`, `quack
+mcp`, `quack search`, and `quack saved run` each build one (`Engine::new(config, holder)`)
+and hand it to what they run, so every interface in a process submits to one queue and
+shares one handle per workspace file. `Engine::workspace(id)` opens a workspace file once per
+process behind a cell (section 7.4), binds the holder's forward socket (`forward::Holder`
+names the holder in the token file), and gives back the writer, the reader pool, and the
+audit connection; a holder of one workspace (every one but `quack serve`) is refused any
+other (`Error::WorkspaceNotHeld`), and `close_workspace` refuses the held one
+(`Error::WorkspaceHeld`) and a busy one (`Error::WorkspaceBusy`). Every command line
+command opens its workspace through `OpenedWorkspace`, which holds the engine
+(`Holder::Terminal`, or `Holder::command("ingest")`), so there is one open path and no
+command can open the file beside its engine; a one-shot command runs its work as one step on
+the writer (`OpenedWorkspace::with_db`) and closes (`finish`).
+
+**Stopping.** `Engine::stop_jobs(grace)` is the one way a process stops its jobs: it cancels
+the engine's stopping token (`Engine::begin_stop`, which a signal handler may call alone to
+let whoever owns the queue's shutdown run it), then `JobQueue::shutdown(grace)` closes the
+queue, so a job submitted afterwards is recorded as `cancelled` ("refused: the queue is
+shutting down") and never runs, cancels every queued and running job, and waits up to
 `grace` for them to end and for what their ends record (`when_ended`). It returns the jobs
 still active when the grace ran out; the runtime drops those at their next await.
+`Engine::close` then drops every workspace handle, so each writer finishes its queued
+closures and checkpoints, and refuses every later open (`Error::EngineClosed`), so a
+straggler's handle is never joined by a second instance of the same file.
 
 - The terminal calls it on quit with a 3-second grace. Work without a checkpoint runs on a
   detached thread and never holds the process open.
 - `quack serve` calls it on SIGTERM or Ctrl-C with `[server].shutdown_grace_seconds` (20).
-  The signal cancels `AppState::stopping`. New connections are refused, and the HTTP drain
+  The stopping token fires. New connections are refused, and the HTTP drain
   and the queue shutdown run side by side under that one grace. `GET .../jobs/stream` and
   the MCP event streams end when the token fires. A streamed turn ends as any cancelled turn
   does: `complete` with `cancelled: true`, or an `error` event ("the server is shutting down;
@@ -269,10 +289,13 @@ still active when the grace ran out; the runtime drops those at their next await
   of the same token, so it ends as a cancelled turn too: the session keeps the question and
   the cancelled answer, and the turn is audited. The transport stops on the same signal, so
   the client may not receive that reply. `quack mcp` on stdio has no stop signal; it ends
-  when its input closes. Then `AppState::close` drops every MCP transport and workspace
-  handle, so each writer finishes its queued closures and checkpoints before the process
-  exits. A supervisor's kill timeout must be longer than the grace: `docker-compose.yml` sets
-  `stop_grace_period: 30s`.
+  when its input closes. Then the server drops every MCP transport and the engine closes
+  (`AppState::close`, `Engine::close`), so each writer finishes its queued closures and
+  checkpoints before the process exits. A supervisor's kill timeout must be longer than the
+  grace: `docker-compose.yml` sets `stop_grace_period: 30s`.
+- `quack -p`, `quack saved run`, and `quack mcp` stop their engine the same way once the
+  turn, the run, or the client is done, so a labelling a turn started records its end
+  first.
 - A background run that wrote its opening audit row writes its closing one before the
   shutdown returns. A running graph extraction, document pass, or embeddings refresh returns
   `Error::Cancelled` and closes inside its job; a queued or refused one closes through

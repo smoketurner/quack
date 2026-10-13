@@ -72,8 +72,9 @@ nothing in it knows about HTTP, terminals, or windows.
 | `okf` | Open Knowledge Format bundles in and out | 17 |
 | `extraction` | what both extraction runs share: the `Extract` trait, lenient JSON answers, concurrent calls with per-chunk progress (`RunProgress`), even sampling across documents, name counts (`Tally`) | 6.4, 6.5 |
 | `progress` | the per-chunk progress report the extraction runs make to their caller | 6.5 |
-| `jobs` | the work queue every interface submits background work to: ordered lanes, cancel, progress, a broadcast of job snapshots, and `shutdown(grace)`, the one way the terminal and `quack serve` stop their jobs; `jobs::runs`, a background run audited at its start and end under one run id by whoever holds the workspace (`RunAudit`) | 4.1 |
-| `forward` | reads through the process that holds a workspace: `DuckDB` allows one writer or many readers per file, never both, so the holder (`quack serve`, the terminal session, the desktop app) listens on a Unix socket in the workspace directory with a 0600 token file beside it (`Listener`), runs another process's read statements on its reader pool, and refuses writes naming itself; `quack -q` falls back to it (`connect`, `Client::query`) when the lock is taken | [desktop.md](desktop.md) 3.6 |
+| `engine` | the process: `Engine`, its one `JobQueue`, its open workspaces (`workspace(id)` opens a file once per process behind a cell and gives back a `WorkspaceHandle`: writer, reader pool, audit connection, forward socket), its stopping token (`stopping()`, `begin_stop`, `stop_jobs(grace)`), `closable` and `close_workspace` (a delete's refusals: the holder's own workspace, a busy one), and `close` (after which every open is refused); `quack serve`, the terminal, `-p`, `mcp`, `search`, and `saved run` each build one and hand it to what they run | 4.1, 7.4 |
+| `jobs` | the work queue every interface submits background work to: ordered lanes, cancel, progress, a broadcast of job snapshots, and `shutdown(grace)`, which `Engine::stop_jobs` calls; `jobs::runs`, a background run audited at its start and end under one run id by whoever holds the workspace (`RunAudit`) | 4.1 |
+| `forward` | reads through the process that holds a workspace: `DuckDB` allows one writer or many readers per file, never both, so the holder (`Holder`: `quack serve`, the terminal session, or a command by its verb, each but the server naming the one workspace it holds) listens on a Unix socket in the workspace directory with a 0600 token file beside it (`Listener`), runs another process's read statements on its reader pool, and refuses writes naming itself; `quack -q` falls back to it (`connect`, `Client::query`) when the lock is taken | [desktop.md](desktop.md) 3.6 |
 | `llm` | rig provider construction over `limit::LimitedHttp` (each provider's process-wide request limit), `TurnRequest` (one agent turn), `SchemaCall` (one tool-less prompt whose answer a JSON schema shapes, sent as the provider's structured output and parsed whole: graph extraction against `Ontology::extraction_schema`, and the ontology's document pass), decision models over Ollama's `/v1/systemone` (`decision`: questions, the row's state, and the per-row fit search), OAuth token management (`oauth`), the person an on-behalf-of provider acts for (`acting`, a task-local), the workspace's provider allow-list and its one check (`egress`, a task-local), Amazon Bedrock over the AWS SDK's credential chain with the same limits (`bedrock`) | 4.1, 10 |
 
 ## `quack-cli`
@@ -88,18 +89,19 @@ depends on `quack-core` alone.
 | `import_cli` | `quack import` and its saved imports |
 | `classify_cli` | `quack classify` and `/classify`: the arguments, what is drafted, previewed, and asked (`Prepared`), the questions shown, and the run listing |
 | `args` | `ModeArg`, `ExportFlags`, and `QueryFormat`, the arguments the command line and the slash commands share |
-| `workspace` | `OpenedWorkspace`: the workspace a command runs in (`-w`, which must exist, or the default, created on first use), its `Egress` scope, its connection, its writer thread and reader pool; the binary, the terminal's setup, and the desktop app open a workspace through it |
+| `workspace` | `OpenedWorkspace`: the workspace a command runs in (`-w`, which must exist, or the default, created on first use), its `Egress` scope, and the engine that holds its file (`Holder::Terminal` or `Holder::command(verb)`): `handle()` for a command that runs jobs, `with_db` for a one-shot command's step on the writer, `finish(grace)` to stop and close |
 | `confirm`, `stdio`, `text_or_json`, `session` | the confirmation prompt, named stdin and file inputs, the text-or-JSON output choice, finding a session by id prefix, and choosing the session a run continues (`SessionChoice`, `resolve_session`) |
 
 ## `quack-server`
 
 `quack serve` and the MCP server, a library of the one binary: `quack_server::serve`,
+`Server` (`start` over an engine and a bound address, `run` until the engine stops),
 `serve_stdio`, and `ServeMode` are its whole public API. It does not depend on the terminal.
 
 | Module | Owns |
 |---|---|
 | `mcp` | the MCP server (rmcp) shared by `quack mcp` on stdio and `/mcp/v1/{workspace}` |
-| `lib` (the server) | `quack serve`: `auth` (identity and `Access::resolve`), `api` (REST handlers; `api::openapi` builds their OpenAPI 3.1 document, served at `/api/v1/openapi.json` and rendered at `/api/v1/docs`), `error` (`ApiError` and the stable `ErrorCode` every error body carries), `web` (askama pages calling the same `Access` operations as the API, [web-ui.md](web-ui.md)), `run` (`Access` as the `RunAudit` of core's `jobs::runs`, and the graph follow-up after an ingest), `permissions` (the timeout and expiry audit around core's `analysis::permissions`), `api::jobs` (the jobs API and stream), `state`, `mcp_http` |
+| `lib` (the server) | `quack serve`: `auth` (identity and `Access::resolve`), `api` (REST handlers; `api::openapi` builds their OpenAPI 3.1 document, served at `/api/v1/openapi.json` and rendered at `/api/v1/docs`), `error` (`ApiError` and the stable `ErrorCode` every error body carries), `web` (askama pages calling the same `Access` operations as the API, [web-ui.md](web-ui.md)), `run` (`Access` as the `RunAudit` of core's `jobs::runs`, and the graph follow-up after an ingest), `permissions` (the timeout and expiry audit around core's `analysis::permissions`), `api::jobs` (the jobs API and stream), `state` (`AppState`: the engine, the control plane, sessions, sign-in, the MCP transports, held permissions), `mcp_http` |
 
 The templates, static assets, stylesheet input, and the SQL editor's bundle sit beside its
 `src/`.

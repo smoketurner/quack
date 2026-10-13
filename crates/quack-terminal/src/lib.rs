@@ -10,16 +10,20 @@ mod selection;
 mod sql;
 mod ui;
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
-use quack_core::config::Config;
+use quack_core::engine::Engine;
 use quack_core::ids::{SessionId, WorkspaceId};
 
-/// Everything a terminal session starts from: the resolved workspace, its
-/// writer and reader pool, and the session to open.
+/// Everything a terminal session starts from: the process's engine (its
+/// configuration and queue), the resolved workspace, its writer and
+/// reader pool (the engine's handle, in the binary; a test's own in
+/// tests), and the session to open.
 pub struct SessionSetup {
-    pub config: Config,
+    pub engine: Arc<Engine>,
     pub workspace_name: String,
     pub workspace_id: WorkspaceId,
     pub db: SharedDb,
@@ -44,7 +48,6 @@ pub async fn run(setup: SessionSetup) -> Result<()> {
     tui_app.load_input_history().await?;
     tui_app.note_embedding_status().await?;
     tui_app.load_sql_schema().await?;
-    tui_app.listen_for_reads().await;
 
     let mut terminal = ratatui::try_init().context("failed to initialize terminal")?;
     // Mouse capture for wheel scrolling, bracketed paste so a dropped

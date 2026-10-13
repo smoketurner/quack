@@ -34,7 +34,7 @@ const MOST_ROWS: usize = 16;
 /// decision model its provider list allows. A setting that cannot be used
 /// hides the form and is logged, not raised on a page about something else.
 pub(super) async fn offered(app: &App) -> Option<String> {
-    match DecisionModel::offered(&app.config).await {
+    match DecisionModel::offered(&app.engine.config).await {
         Ok(model) => model.map(|model| model.label().to_owned()),
         Err(e) => {
             tracing::warn!(error = %e, "the Label rows form is not offered");

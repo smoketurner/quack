@@ -35,6 +35,8 @@ use super::state::{App, AppState, ServeMode, with_db};
 use crate::auth::{Access, Credential, Identity, Need};
 use crate::permissions;
 use crate::run::{self, RunKind};
+use quack_core::engine::Engine;
+use quack_core::forward::Holder;
 use quack_core::ingestion::upload::UploadJob;
 use quack_core::jobs::runs::RunReport;
 use quack_core::jobs::{JobKind, LaneKey};
@@ -76,7 +78,8 @@ async fn harness_with(mode: ServeMode, mut config: Config) -> Harness {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let sessions = Arc::new(WebSessions::new(&config.server));
-    let app = Arc::new(AppState::new(config, control, mode, sessions, None));
+    let engine = Engine::new(config, Holder::Serve);
+    let app = Arc::new(AppState::new(engine, control, mode, sessions, None));
     let router = super::router(Arc::clone(&app));
     Harness {
         _dir: dir,
@@ -6157,7 +6160,7 @@ async fn external_rows_import_over_the_api_and_the_web_form_with_the_source_reda
 
     // The server's own control database stays out, even for the owner
     // (issue #69).
-    let control = h.app.config.general.data_dir.join("control.db");
+    let control = h.app.engine.config.general.data_dir.join("control.db");
     let (status, body) = h
         .call(
             Method::POST,
@@ -6610,6 +6613,7 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
     // A member's question, waiting on its cancel token.
     let question = h
         .app
+        .engine
         .jobs
         .submit(
             JobSpec::new(JobKind::Chat, "what is our churn?")
@@ -6650,11 +6654,14 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["cancel_requested"], true);
-    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), h.app.jobs.wait(question))
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| fail("the question never ended"));
+    let ended = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.app.engine.jobs.wait(question),
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| fail("the question never ended"));
     assert_eq!(ended.state, JobState::Cancelled);
     let denied = h
         .audit(AuditFilter {
@@ -6736,14 +6743,14 @@ async fn a_large_batch_of_uploads_is_spooled_and_processed() {
     }
     let lane = LaneKey::Workspace(JobKind::Ingest, ws.clone());
     for _ in 0..100 {
-        if h.app.jobs.lane_active(&lane) == 0 {
+        if h.app.engine.jobs.lane_active(&lane) == 0 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     // The spooled bytes go in each job's `when_ended` hook, which runs on
     // its own task after the lane slot is released: wait for it.
-    let spool = h.app.config.workspace_uploads_dir(ws.as_str());
+    let spool = h.app.engine.config.workspace_uploads_dir(ws.as_str());
     let mut left = usize::MAX;
     for _ in 0..200 {
         left = std::fs::read_dir(&spool).map_or(0, Iterator::count);
@@ -7045,14 +7052,20 @@ async fn background_runs_audit_their_start_and_end_under_one_id() {
     let queued = start("is cancelled").await;
     let queued_id = queued.id().to_owned();
     let third = queued.submit(|_| async { Ok(Done) });
-    assert!(h.app.jobs.cancel(third), "the third run is still queued");
+    assert!(
+        h.app.engine.jobs.cancel(third),
+        "the third run is still queued"
+    );
     assert!(
         release.send(()).is_ok(),
         "the first run is waiting for the release"
     );
     for job in [first, second, third] {
-        let ended =
-            tokio::time::timeout(std::time::Duration::from_secs(10), h.app.jobs.wait(job)).await;
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            h.app.engine.jobs.wait(job),
+        )
+        .await;
         assert!(ended.is_ok_and(|info| info.is_some()), "{job:?} ended");
     }
 
@@ -7128,7 +7141,7 @@ async fn the_jobs_stream_ends_when_the_server_begins_to_stop() {
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert_eq!(response.status(), StatusCode::OK);
 
-    h.app.stopping.cancel();
+    h.app.engine.stop_jobs(std::time::Duration::ZERO).await;
     let body = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         axum::body::to_bytes(response.into_body(), usize::MAX),
@@ -7189,9 +7202,8 @@ async fn a_stopping_server_closes_its_runs_and_refuses_new_work_on_the_record() 
     queued.submit(|_| async { Ok(Done) });
     assert!(has_started.await.is_ok(), "the first run holds the lane");
 
-    h.app.stopping.cancel();
     let grace = std::time::Duration::from_secs(10);
-    let left = h.app.jobs.shutdown(grace).await;
+    let left = h.app.engine.stop_jobs(grace).await;
     assert!(left.is_empty(), "{left:?}");
     assert_eq!(closing_rows(running_id).await, 1, "the running run closed");
     assert_eq!(closing_rows(queued_id).await, 1, "the queued run closed");
@@ -7209,7 +7221,7 @@ async fn a_stopping_server_closes_its_runs_and_refuses_new_work_on_the_record() 
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     let document = body["documents"][0]["id"].as_str().unwrap_or_default();
-    assert!(h.app.jobs.shutdown(grace).await.is_empty());
+    assert!(h.app.engine.jobs.shutdown(grace).await.is_empty());
     assert_eq!(closing_rows(late_id).await, 1, "the refused run closed");
     let (_, body) = h
         .get(
@@ -7299,7 +7311,7 @@ async fn a_stopping_server_cancels_an_mcp_query_turn_on_the_record() {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        h.app.stopping.cancel();
+        h.app.engine.stop_jobs(std::time::Duration::ZERO).await;
     };
     let within = std::time::Duration::from_secs(30);
     let ended = tokio::time::timeout(within, async { tokio::join!(asked, stopped) }).await;
@@ -7354,7 +7366,12 @@ async fn closing_the_state_checkpoints_each_workspace() {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     drop(db);
-    let mut log = h.app.config.workspace_db_path(ws.as_str()).into_os_string();
+    let mut log = h
+        .app
+        .engine
+        .config
+        .workspace_db_path(ws.as_str())
+        .into_os_string();
     log.push(".wal");
     let log = std::path::PathBuf::from(log);
     assert!(log.exists(), "the write is still in the log");
@@ -7740,7 +7757,13 @@ async fn a_logout_whose_audit_row_cannot_be_written_leaves_the_session_open() {
     let session = h.login("owner").await;
     let url = format!(
         "sqlite:{}",
-        h.app.config.general.data_dir.join("control.db").display()
+        h.app
+            .engine
+            .config
+            .general
+            .data_dir
+            .join("control.db")
+            .display()
     );
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
@@ -10243,7 +10266,7 @@ async fn a_snapshot_copies_the_file_closed_and_the_workspace_reopens() {
         .post(&path, &token, sql("CREATE TABLE t AS SELECT 7 AS a"))
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let file = h.app.config.workspace_db_path(ws.as_str());
+    let file = h.app.engine.config.workspace_db_path(ws.as_str());
     assert!(
         !opens_in_another_process(&file),
         "the open workspace let another process in"
@@ -10448,7 +10471,7 @@ async fn a_workspace_round_trips_through_a_snapshot_and_is_renamed_and_deleted()
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let dir = h.app.config.workspace_dir(&copy);
+    let dir = h.app.engine.config.workspace_dir(&copy);
     assert!(dir.join("data.duckdb").exists());
     let (status, body) = h
         .call(

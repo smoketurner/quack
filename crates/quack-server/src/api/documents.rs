@@ -594,7 +594,7 @@ pub(crate) async fn enqueue(
         .model(
             app,
             AuditAction::Ingest,
-            Embeddings::from_config(&app.config).await,
+            Embeddings::from_config(&app.engine.config).await,
         )
         .await?;
     let db = app.workspace_db(&id).await?;
@@ -656,7 +656,7 @@ impl Lane<'_> {
             | DocumentSource::Classify => None,
         };
         let (source, old) = (self.source, self.replaces.cloned());
-        let config = app.config.clone();
+        let config = app.engine.config.clone();
         let registration = with_db(Arc::clone(self.db), move |db| {
             ingestion::register_document(
                 db,
@@ -730,8 +730,8 @@ impl Lane<'_> {
     ) -> ApiResult<JobId> {
         let id = &access.membership.workspace.id;
         let uploads = Uploads {
-            config: app.config.clone(),
-            jobs: app.jobs.clone(),
+            config: app.engine.config.clone(),
+            jobs: app.engine.jobs.clone(),
             workspace: id.clone(),
             owner: Some(access.identity.user_id.clone()),
         };
@@ -742,7 +742,7 @@ impl Lane<'_> {
             self.embedder.clone(),
         );
         let spooled =
-            UploadJob::spool(&app.config, id, self.db, document_id, filename, data).await?;
+            UploadJob::spool(&app.engine.config, id, self.db, document_id, filename, data).await?;
         Ok(spooled.submit(
             &uploads,
             Arc::clone(self.db),
