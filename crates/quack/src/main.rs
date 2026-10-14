@@ -2753,6 +2753,19 @@ impl IngestArgs {
 }
 
 async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
+    let opened =
+        OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::command("ingest")).await?;
+    let ran = ingest(&opened, args).await;
+    // The file or folder is done, whatever the outcome: the recorded run's
+    // last snapshot reaches the file, a graph follow-up the ingest queued
+    // finishes, the socket closes, and the writer checkpoints.
+    opened.finish(FOLLOW_UP_GRACE).await;
+    ran
+}
+
+/// `quack ingest` on an open workspace: one file, a folder, or a bundle.
+/// Every handle is dropped by the time it returns.
+async fn ingest(opened: &OpenedWorkspace, args: IngestArgs) -> Result<()> {
     let per_file = args.per_file();
     let IngestArgs {
         file,
@@ -2767,14 +2780,12 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         tags,
         types,
     } = args;
-    let opened =
-        OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::command("ingest")).await?;
     let config = opened.config();
 
     if let StdioPath::Path(dir) = &file
         && dir.is_dir()
     {
-        return ingest_dir(&opened, dir, per_file, no_embed, prune).await;
+        return ingest_dir(opened, dir, per_file, no_embed, prune).await;
     }
     if prune {
         anyhow::bail!("--prune goes with a folder");
@@ -2837,7 +2848,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     .await;
     let outcome = outcome.context("ingestion failed")?;
     finish_file_ingest(
-        &opened,
+        opened,
         ws_db,
         embedding_model.as_ref(),
         outcome,

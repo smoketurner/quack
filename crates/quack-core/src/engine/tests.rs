@@ -261,6 +261,35 @@ async fn shutdown_runs_the_drains_ends_the_jobs_and_closes() {
     ));
 }
 
+/// A one-shot command stops under a zero grace, and its drain (the
+/// workspace socket's close, which awaits its accept task) still runs
+/// whole: the engine puts no timeout of its own on the drains.
+#[tokio::test]
+#[expect(clippy::unwrap_used, reason = "test")]
+async fn shutdown_runs_a_drain_whole_under_a_zero_grace() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{Drain, Stop};
+
+    let dir = tempfile::tempdir().unwrap();
+    let id = WorkspaceId::from("ws");
+    let engine = Engine::new(config_in(dir.path()), Holder::command("-q")(id.clone()));
+    engine.workspace(&id).await.unwrap();
+    let drained = Arc::new(AtomicBool::new(false));
+    let drain: Drain = {
+        let drained = Arc::clone(&drained);
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drained.store(true, Ordering::SeqCst);
+        })
+    };
+    let left = engine
+        .shutdown(Stop::Drain, Duration::ZERO, vec![drain])
+        .await;
+    assert!(left.is_empty(), "{left:?}");
+    assert!(drained.load(Ordering::SeqCst), "the drain was cut short");
+}
+
 /// A session a killed first turn left without a message (nothing ran
 /// `delete_if_empty` for it) is removed when the file is next opened, the
 /// way the jobs it left active are failed; a session with a turn stays.

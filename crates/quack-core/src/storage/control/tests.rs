@@ -964,17 +964,48 @@ async fn audit_rows_append_and_filter() {
 }
 
 /// A new workspace's name is trimmed, and refused when empty or when it
-/// holds a slash, a backslash, a dot, or a control character (a newline,
-/// a tab, NUL, an escape, a C1 control), which would break every one-line
-/// rendering of it.
+/// holds a slash, a backslash, a dot, or a character that is not printable
+/// on one line: a control (a newline, a tab, NUL, an escape, a C1 control),
+/// the Unicode line and paragraph separators, a format character (a bidi
+/// override, a zero-width space, a soft hyphen, a byte order mark), a
+/// private-use or an unassigned code point. Letters, marks, numbers,
+/// punctuation, symbols, and spaces of every script stay.
 #[test]
-fn a_workspace_name_is_trimmed_and_refuses_empty_slashes_dots_and_controls() {
+fn a_workspace_name_is_trimmed_and_refuses_empty_slashes_dots_and_unprintables() {
     assert!(matches!(" sales ".parse::<WorkspaceName>(), Ok(name) if name.as_str() == "sales"));
-    assert!(
-        matches!("ventes régionales".parse::<WorkspaceName>(), Ok(name) if name.as_str() == "ventes régionales")
-    );
+    for accepted in [
+        "ventes régionales",
+        "日本語 データ",
+        "ventes – 2026 (été)",
+        "sales & marketing",
+        "e\u{301}t\u{e9}",
+    ] {
+        assert!(
+            matches!(accepted.parse::<WorkspaceName>(), Ok(name) if name.as_str() == accepted),
+            "{accepted:?}"
+        );
+    }
     for refused in [
-        "", "   ", "a/b", "a\\b", "a.b", "..", "a\nb", "a\tb", "a\0b", "a\x1bb", "a\u{85}b", "a\rb",
+        "",
+        "   ",
+        "a/b",
+        "a\\b",
+        "a.b",
+        "..",
+        "a\nb",
+        "a\tb",
+        "a\0b",
+        "a\x1bb",
+        "a\u{85}b",
+        "a\rb",
+        "z\u{2028}y",
+        "z\u{2029}y",
+        "a\u{202e}b",
+        "a\u{200b}b",
+        "a\u{ad}b",
+        "\u{feff}a",
+        "a\u{e000}b",
+        "a\u{378}b",
     ] {
         assert!(
             matches!(
