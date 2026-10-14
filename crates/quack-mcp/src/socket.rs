@@ -93,19 +93,27 @@ impl SocketServer {
         stopper.abort();
     }
 
+    /// Whether a connection's session is in progress: a call relayed
+    /// through this process is running.
+    #[must_use]
+    pub fn has_sessions(&self) -> bool {
+        !self.sessions.is_empty()
+    }
+
     /// Stop accepting, end every session, and wait up to `grace` for them.
+    /// The accept loop is awaited whatever the grace: it ends at its next
+    /// poll (at most the accept retry away), and its end drops the listener,
+    /// which removes the socket file, so a one-shot command that held the
+    /// workspace for milliseconds leaves no file behind and no warning.
     pub async fn close(mut self, grace: Duration) {
         self.stop.cancel();
         self.sessions.close();
-        let accept = self.accept.take();
-        if tokio::time::timeout(grace, async {
-            if let Some(accept) = accept {
-                drop(accept.await);
-            }
-            self.sessions.wait().await;
-        })
-        .await
-        .is_err()
+        if let Some(accept) = self.accept.take() {
+            drop(accept.await);
+        }
+        if tokio::time::timeout(grace, self.sessions.wait())
+            .await
+            .is_err()
         {
             tracing::warn!("the workspace socket's sessions did not end within the grace");
         }

@@ -14,12 +14,45 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResult, ListResourceTemplatesResult, ListResourcesResult,
     ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
 };
-use rmcp::service::RunningService;
-use rmcp::{ClientHandler, RoleClient, ServiceExt};
+use rmcp::service::{RunningService, ServiceError};
+use rmcp::{ClientHandler, ErrorData as McpError, RoleClient, ServiceExt};
 use serde::Deserialize;
 
 /// What a refusal names as the holder before `initialize` named it.
 const SOMEONE: &str = "another process";
+
+/// Who holds the workspace in `workspace_dir`, as its socket's
+/// `initialize` names it ("the quack terminal session", "quack ingest"):
+/// one connection, closed again. `None` when nothing answers on the
+/// socket, which a command refused by the file's lock turns into
+/// [`locked_without_socket`].
+///
+/// # Errors
+///
+/// Returns `forward::connect`'s refusals, or an `initialize` that failed.
+pub async fn holder_of(workspace_dir: &Path, workspace_id: &WorkspaceId) -> Result<Option<String>> {
+    let Some(client) = HolderClient::connect(workspace_dir, workspace_id).await? else {
+        return Ok(None);
+    };
+    let holder = client.holder().to_owned();
+    client.close().await;
+    Ok(Some(holder))
+}
+
+/// What the lock on the workspace file at `path` means when no socket
+/// answers for it: every holder but `quack serve` serves the socket while
+/// it holds the file, so the holder is the server (whose `/mcp/v1`
+/// endpoint is the way in) or a process between opening the file and
+/// binding the socket, or between closing them.
+#[must_use]
+pub fn locked_without_socket(path: &Path) -> String {
+    format!(
+        "the workspace file {} is open in another quack process that answers on no socket: \
+         quack serve (reach the workspace through its /mcp/v1 endpoint), or a process that is \
+         starting or stopping; try again, or stop it",
+        path.display()
+    )
+}
 
 /// An MCP session with the process holding a workspace. `H` hears the
 /// holder's notifications: `()` ignores them; the per-call server passes
@@ -27,6 +60,37 @@ const SOMEONE: &str = "another process";
 pub struct HolderClient<H: ClientHandler = ()> {
     service: RunningService<RoleClient, H>,
     holder: String,
+}
+
+/// How an exchange with the holder failed: the holder answered the request
+/// with a JSON-RPC error of its own (no tool by that name, no resource at
+/// that URI, a refused argument), which keeps its code and message so a
+/// relay can pass it on as it is; or the exchange itself failed (the
+/// socket closed, the request timed out), which is this process's own
+/// error, naming the holder.
+#[derive(Debug)]
+pub enum HolderError {
+    /// The holder's own error, as it sent it (boxed: the error data is
+    /// wide, and every exchange carries this type in its `Result`).
+    Answered {
+        /// Who answered, as `initialize` named it.
+        holder: String,
+        error: Box<McpError>,
+    },
+    /// The exchange failed before the holder answered.
+    Unreachable(Error),
+}
+
+impl From<HolderError> for Error {
+    fn from(failure: HolderError) -> Self {
+        match failure {
+            HolderError::Answered { holder, error } => Self::Forward(format!(
+                "{holder} answered an error: {}: {}",
+                error.code.0, error.message
+            )),
+            HolderError::Unreachable(error) => error,
+        }
+    }
 }
 
 /// What `quack://workspace/jobs` holds.
@@ -40,8 +104,12 @@ struct Jobs {
 pub struct HolderRows {
     #[serde(flatten)]
     pub results: QueryResults,
-    /// Whether the holder cut the rows at its `[analysis].max_query_rows`.
+    /// Whether the holder cut the rows at its `[analysis].max_query_rows`
+    /// or at the structured answer's byte limit.
     pub truncated: bool,
+    /// Values the holder cut at `STRUCTURED_CELL_CHARS` characters.
+    #[serde(default)]
+    pub cells_cut: usize,
 }
 
 impl HolderClient {
@@ -93,72 +161,80 @@ impl<H: ClientHandler> HolderClient<H> {
     ///
     /// # Errors
     ///
-    /// Returns the exchange's failure as [`Error::Forward`].
-    pub async fn call_tool(&self, params: CallToolRequestParams) -> Result<CallToolResult> {
+    /// Returns the holder's own error, or the exchange's failure
+    /// ([`HolderError`]).
+    pub async fn call_tool(
+        &self,
+        params: CallToolRequestParams,
+    ) -> std::result::Result<CallToolResult, HolderError> {
         self.service
             .call_tool(params)
             .await
-            .map_err(|e| self.failed(&format!("the tool call failed: {e}")))
+            .map_err(|e| self.exchange("the tool call failed", e))
     }
 
     /// `tools/list`, as the holder answers it.
     ///
     /// # Errors
     ///
-    /// Returns the exchange's failure as [`Error::Forward`].
+    /// Returns the holder's own error, or the exchange's failure
+    /// ([`HolderError`]).
     pub async fn list_tools(
         &self,
         params: Option<PaginatedRequestParams>,
-    ) -> Result<ListToolsResult> {
+    ) -> std::result::Result<ListToolsResult, HolderError> {
         self.service
             .list_tools(params)
             .await
-            .map_err(|e| self.failed(&format!("listing the tools failed: {e}")))
+            .map_err(|e| self.exchange("listing the tools failed", e))
     }
 
     /// `resources/list`, as the holder answers it.
     ///
     /// # Errors
     ///
-    /// Returns the exchange's failure as [`Error::Forward`].
+    /// Returns the holder's own error, or the exchange's failure
+    /// ([`HolderError`]).
     pub async fn list_resources(
         &self,
         params: Option<PaginatedRequestParams>,
-    ) -> Result<ListResourcesResult> {
+    ) -> std::result::Result<ListResourcesResult, HolderError> {
         self.service
             .list_resources(params)
             .await
-            .map_err(|e| self.failed(&format!("listing the resources failed: {e}")))
+            .map_err(|e| self.exchange("listing the resources failed", e))
     }
 
     /// `resources/templates/list`, as the holder answers it.
     ///
     /// # Errors
     ///
-    /// Returns the exchange's failure as [`Error::Forward`].
+    /// Returns the holder's own error, or the exchange's failure
+    /// ([`HolderError`]).
     pub async fn list_resource_templates(
         &self,
         params: Option<PaginatedRequestParams>,
-    ) -> Result<ListResourceTemplatesResult> {
+    ) -> std::result::Result<ListResourceTemplatesResult, HolderError> {
         self.service
             .list_resource_templates(params)
             .await
-            .map_err(|e| self.failed(&format!("listing the resource templates failed: {e}")))
+            .map_err(|e| self.exchange("listing the resource templates failed", e))
     }
 
     /// `resources/read`, as the holder answers it.
     ///
     /// # Errors
     ///
-    /// Returns the exchange's failure as [`Error::Forward`].
+    /// Returns the holder's own error, or the exchange's failure
+    /// ([`HolderError`]).
     pub async fn read_resource(
         &self,
         params: ReadResourceRequestParams,
-    ) -> Result<ReadResourceResult> {
+    ) -> std::result::Result<ReadResourceResult, HolderError> {
         self.service
             .read_resource(params)
             .await
-            .map_err(|e| self.failed(&format!("reading the resource failed: {e}")))
+            .map_err(|e| self.exchange("reading the resource failed", e))
     }
 
     /// Who holds the workspace, as its `initialize` reply named it.
@@ -227,5 +303,17 @@ impl<H: ClientHandler> HolderClient<H> {
 
     fn failed(&self, message: &str) -> Error {
         Error::Forward(format!("reaching {} failed: {message}", self.holder))
+    }
+
+    /// Sort one exchange's failure: the holder's own answer keeps its code;
+    /// anything else (`what` failed) is this process's error.
+    fn exchange(&self, what: &str, error: ServiceError) -> HolderError {
+        match error {
+            ServiceError::McpError(error) => HolderError::Answered {
+                holder: self.holder.clone(),
+                error: Box::new(error),
+            },
+            other => HolderError::Unreachable(self.failed(&format!("{what}: {other}"))),
+        }
     }
 }

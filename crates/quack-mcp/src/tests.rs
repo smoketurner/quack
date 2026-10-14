@@ -865,6 +865,7 @@ async fn the_socket_serves_the_holder_to_a_client() {
     use crate::socket::SocketServer;
     use quack_core::forward::Listener;
     use quack_core::jobs::{JobKind, JobSpec};
+    use quack_core::storage::workspace::STRUCTURED_CELL_CHARS;
 
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let (config, db) = workspace(dir.path());
@@ -918,6 +919,26 @@ async fn the_socket_serves_the_holder_to_a_client() {
     assert_eq!(rows.results.columns, vec!["n"]);
     assert_eq!(rows.results.rows.len(), 2);
     assert!(!rows.truncated);
+    assert_eq!(rows.cells_cut, 0);
+    // A wide value comes back bounded, not whole: the holder cut it and
+    // says so.
+    let wide = client
+        .sql("SELECT repeat('x', 200000) AS big")
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(wide.cells_cut, 1);
+    let cell = wide
+        .results
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| fail("no cell"));
+    assert_eq!(
+        cell.len(),
+        STRUCTURED_CELL_CHARS + "\u{2026}(+134464 chars)".len()
+    );
+    assert!(cell.ends_with("\u{2026}(+134464 chars)"), "{}", cell.len());
     let refused = client
         .sql("CREATE TABLE u (x INTEGER)")
         .await
@@ -925,7 +946,9 @@ async fn the_socket_serves_the_holder_to_a_client() {
         .unwrap_or_else(|| fail("a write ran through the holder"));
     let message = refused.to_string();
     assert!(
-        message.contains("the quack terminal session") && message.contains("cannot write"),
+        message.contains("the quack terminal session")
+            && message.contains("does not run writes for another process")
+            && message.contains("--allow-write"),
         "{message}"
     );
     let listed = client.jobs().await.unwrap_or_else(|e| fail(&e.to_string()));
@@ -942,6 +965,128 @@ async fn the_socket_serves_the_holder_to_a_client() {
             .unwrap_or_else(|e| fail(&e.to_string()))
             .is_none()
     );
+}
+
+/// Closing the socket server with no grace at all, before its accept loop
+/// was ever polled (a one-shot command that held the workspace for
+/// milliseconds), still removes the socket file: the accept loop's end is
+/// awaited whatever the grace, and only the sessions are given up on.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_the_socket_at_once_leaves_no_socket_file() {
+    use crate::socket::SocketServer;
+    use quack_core::forward::Listener;
+
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let (config, db) = workspace(dir.path());
+    let server = server_on(&(config.clone(), db), WritePolicy::Deny);
+    let workspace_id = WorkspaceId::from("ws");
+    let listener = Listener::bind(&config.workspace_dir("ws"), &workspace_id)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let socket_path = listener.at().path().to_path_buf();
+    assert!(socket_path.exists());
+    SocketServer::serve(listener, server)
+        .close(Duration::ZERO)
+        .await;
+    assert!(!socket_path.exists(), "the socket file was left behind");
+}
+
+/// A `sql` write sent over the socket under `Ask` (the terminal session
+/// holds the workspace) is a `sql` job that asks at the session's prompt
+/// through the approvals: a yes runs it, a no refuses it, and with nobody
+/// listening it is refused at once.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_socket_sql_write_asks_the_listener_or_is_refused() {
+    use crate::client::HolderClient;
+    use crate::socket::SocketServer;
+    use quack_core::analysis::events::Decision;
+    use quack_core::forward::Listener;
+
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let (config, db) = workspace(dir.path());
+    let approvals = Approvals::new();
+    let jobs = JobQueue::new(10);
+    let workspace_id = WorkspaceId::from("ws");
+    let server = McpServer::new(McpSetup {
+        config: config.clone(),
+        db: Arc::clone(&db),
+        reader: ReaderDb::new(Arc::clone(&db)),
+        workspace: WorkspaceRow {
+            id: workspace_id.clone(),
+            name: String::from("ws"),
+            classification: String::from("internal"),
+            allowed_providers: AllowedProviders::All,
+        },
+        policy: WritePolicy::Ask,
+        user_id: None,
+        transport: Transport::Socket,
+        stopping: CancellationToken::new(),
+        jobs: jobs.clone(),
+        holder: String::from("the quack terminal session"),
+        approvals: approvals.clone(),
+    });
+    let workspace_dir = config.workspace_dir("ws");
+    let listener = Listener::bind(&workspace_dir, &workspace_id)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let socket = SocketServer::serve(listener, server);
+    let client = HolderClient::connect(&workspace_dir, &workspace_id)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .unwrap_or_else(|| fail("no holder answered"));
+
+    // Nobody listens: refused at once, and audited as a job that did not run.
+    let refused = client
+        .sql("CREATE TABLE u (x INTEGER)")
+        .await
+        .err()
+        .unwrap_or_else(|| fail("a write ran with nobody to approve it"));
+    assert!(
+        refused
+            .to_string()
+            .contains("not approved at the quack terminal session"),
+        "{refused}"
+    );
+
+    // The session listens: the first ask is a yes, the second a no.
+    let mut asked = approvals.listen();
+    let answering = tokio::spawn({
+        let jobs = jobs.clone();
+        async move {
+            let first = asked.recv().await.unwrap_or_else(|| fail("nothing asked"));
+            assert_eq!(first.request.sql, "CREATE TABLE u (x INTEGER)");
+            assert!(first.session.is_none());
+            let job = jobs
+                .get(first.job)
+                .unwrap_or_else(|| fail("the statement is not a job"));
+            assert_eq!(job.kind, JobKind::Sql);
+            assert_eq!(job.label, "CREATE TABLE u (x INTEGER)");
+            assert_eq!(first.request.answer(Decision::Allow), Delivery::Delivered);
+            let second = asked.recv().await.unwrap_or_else(|| fail("nothing asked"));
+            assert_eq!(second.request.answer(Decision::Deny), Delivery::Delivered);
+        }
+    });
+    let ran = client
+        .sql("CREATE TABLE u (x INTEGER)")
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert!(ran.results.rows.is_empty(), "{ran:?}");
+    let refused = client
+        .sql("CREATE TABLE v (x INTEGER)")
+        .await
+        .err()
+        .unwrap_or_else(|| fail("a refused write ran"));
+    assert!(refused.to_string().contains("not approved"), "{refused}");
+    answering.await.unwrap_or_else(|e| fail(&e.to_string()));
+    let tables = client
+        .sql("SELECT table_name FROM information_schema.tables WHERE table_name IN ('u', 'v') ORDER BY 1")
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(tables.results.rows, vec![vec![serde_json::json!("u")]]);
+    client.close().await;
+    socket.close(Duration::from_secs(5)).await;
 }
 
 /// A `query` turn that wants a write under `Ask` asks whoever listens on

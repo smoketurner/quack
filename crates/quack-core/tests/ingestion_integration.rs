@@ -1090,6 +1090,75 @@ async fn ingest_empty_text_file_is_refused() {
     );
 }
 
+/// A text file whose bytes are valid UTF-8 but hold no letter or digit
+/// (NUL bytes, punctuation, zero-width characters) is refused: nothing in
+/// it could be found, and every chunk of it would have cost an embedding
+/// call. The document records the failure; a file with one readable line
+/// among such noise keeps that line alone.
+#[tokio::test]
+async fn ingest_text_without_letters_or_digits_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let workspace_id = "ws-unreadable";
+    let db = WorkspaceDb::open(&config, workspace_id).unwrap();
+    let writer = writer_of(&db);
+    let embedder = embedder(MockEmbeddingModel { dim: TEST_DIM });
+
+    let zeros = vec![0_u8; 100_000];
+    let punctuation = "-- ... --- ,,, ;;; !!! \u{200b}\u{200b}\n".repeat(2_000);
+    for (name, bytes) in [
+        ("zero.txt", zeros.as_slice()),
+        ("noise.md", punctuation.as_bytes()),
+    ] {
+        let refused = ingestion::ingest_file(
+            &config,
+            &writer,
+            workspace_id,
+            &ingestion::NewFile::new(name, bytes),
+            Some(&embedder),
+        )
+        .await;
+        assert!(refused.is_err(), "{name} was ingested");
+        let refused = refused.err().unwrap();
+        assert!(
+            matches!(&refused, Error::Ingestion(m) if m.contains("no readable text") && m.contains(name)),
+            "{name}: {refused}"
+        );
+    }
+    let docs = db.documents(&DocumentListing::default()).unwrap().documents;
+    assert_eq!(docs.len(), 2, "{docs:?}");
+    for doc in &docs {
+        assert_eq!(doc.status, DocumentStatus::Error, "{doc:?}");
+        assert!(
+            doc.error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("no readable text")),
+            "{doc:?}"
+        );
+    }
+    let stored = db
+        .execute_query("SELECT count(*) AS n FROM _quack_chunks")
+        .unwrap();
+    assert_eq!(stored.rows, vec![vec![serde_json::json!(0)]]);
+
+    let mut mixed = vec![0_u8; 50_000];
+    mixed.extend_from_slice(b"\nFlood is excluded.\n");
+    mixed.extend(vec![0_u8; 50_000]);
+    let kept = ingestion::ingest_file(
+        &config,
+        &writer,
+        workspace_id,
+        &ingestion::NewFile::new("mixed.txt", &mixed),
+        Some(&embedder),
+    )
+    .await
+    .unwrap()
+    .ingested()
+    .unwrap();
+    // The line sits in one window, or in two where the windows overlap.
+    assert!((1..=2).contains(&kept.chunks_stored), "{kept:?}");
+}
+
 #[tokio::test]
 async fn ingest_markdown_as_unstructured() {
     let dir = tempfile::tempdir().unwrap();

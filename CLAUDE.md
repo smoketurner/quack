@@ -521,8 +521,8 @@ not rig's client, so they carry `keep_alive` and a chunk-sized `num_ctx`.
 Every command resolves its workspace through `ControlPlane::workspace_or_default`: `-w NAME`
 must name a workspace that exists (`Error::NoWorkspaceNamed`, exit 2, nothing created), and
 with no `-w` the `[general].default_workspace` is created, audited, on first use. A new
-workspace's name is a `storage::control::WorkspaceName` (trimmed, non-empty, no `/`, `\`, or
-`.`), the one rule `quack workspace create`, the API, the web console, and the config key share.
+workspace's name is a `storage::control::WorkspaceName` (trimmed, non-empty, no `/`, `\`, `.`,
+or control character), the one rule `quack workspace create`, the API, the web console, and the config key share.
 
 Server access control lives in `quack_core::storage::control`: users (argon2id), workspace
 membership with `Role` (viewer, member, owner), API tokens stored as SHA-256 hashes with

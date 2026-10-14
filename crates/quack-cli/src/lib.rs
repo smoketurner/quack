@@ -27,4 +27,4 @@ pub use recorded::RecordedRun;
 pub use session::{SessionChoice, find_session, resolve_session};
 pub use stdio::{NamedInput, StdioPath};
 pub use text_or_json::TextOrJson;
-pub use workspace::OpenedWorkspace;
+pub use workspace::{HeldElsewhere, OpenedWorkspace};

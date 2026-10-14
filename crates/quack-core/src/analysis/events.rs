@@ -231,6 +231,15 @@ impl Decision {
 }
 
 impl PermissionRequest {
+    /// A request outside a turn (a statement another process sent over the
+    /// workspace socket), and the answer's end: `Deny` when the request
+    /// is dropped unanswered.
+    #[must_use]
+    pub fn new(sql: String, hold: Hold) -> (Self, oneshot::Receiver<Decision>) {
+        let (reply, answer) = oneshot::channel();
+        (Self { sql, hold, reply }, answer)
+    }
+
     /// Run this statement. `TurnGone` means it was not run.
     pub fn allow(self) -> Delivery {
         self.answer(Decision::Allow)

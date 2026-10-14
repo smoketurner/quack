@@ -41,8 +41,8 @@ use quack_core::storage::sessions::{
     self, ChatMode, ExportFormat, SessionViewer, Sharing, Transcript,
 };
 use quack_core::storage::workspace::{
-    DocumentFields, DocumentInfo, DocumentListing, DocumentSource, Pinning, SearchMode, Shown,
-    StatementKind, WorkspaceDb,
+    DocumentFields, DocumentInfo, DocumentListing, DocumentSource, Pinning, STRUCTURED_CELL_CHARS,
+    SearchMode, Shown, StatementKind, WorkspaceDb,
 };
 use quack_core::storage::writer::Writer;
 use quack_core::vault::Vault;
@@ -1004,7 +1004,7 @@ async fn run_command(cli: &Cli, command: Commands) -> Result<ExitCode> {
             run_auth(&config, action).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Mcp(args) => run_mcp(cli, args.allow_write).await,
+        Commands::Mcp(args) => Box::pin(run_mcp(cli, args.allow_write)).await,
         Commands::Jobs(args) => run_jobs(cli, args).await,
         Commands::Serve(args) => {
             // The server logs at info in the file's format; other commands
@@ -1110,6 +1110,13 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         tracing::error!("-p accepts only --format text or json");
         return Ok(ExitCode::from(Exit::Usage));
     };
+    // An empty question is a usage error, decided before the workspace
+    // opens: no session is created, no model is called, and no title job is
+    // queued to fail on a session with nothing to title.
+    if prompt.trim().is_empty() {
+        tracing::error!("-p needs a question: the prompt is empty");
+        return Ok(ExitCode::from(Exit::Usage));
+    }
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::command("-p")).await?;
     let config = opened.config();
     // Checked before the workspace opens, so a missing model is one line
@@ -2676,8 +2683,10 @@ fn is_workspace_locked(err: &anyhow::Error) -> bool {
 /// `-q` on a workspace another `quack` process holds: the statement runs
 /// through that process's `sql` tool over the workspace socket
 /// (`quack_mcp::client`) and comes back as the same rows, with one line on
-/// stderr saying so, and one more when the holder capped them at its
-/// `[analysis].max_query_rows`. A write is the holder's own refusal.
+/// stderr saying so, one more when the holder capped them at its
+/// `[analysis].max_query_rows` or its byte limit, and one more when it cut
+/// a wide value (`STRUCTURED_CELL_CHARS`). A write is the holder's own
+/// refusal.
 /// Without a holder listening, `locked` is the error. Piped data cannot
 /// be loaded into a workspace this process does not hold, so a statement
 /// that names `stdin` is refused.
@@ -2707,8 +2716,17 @@ async fn run_query_through_holder(
         if rows.truncated {
             writeln!(
                 err,
-                "{} capped the rows at its [analysis].max_query_rows",
+                "{} capped the rows at its [analysis].max_query_rows or its byte limit",
                 client.holder()
+            )?;
+        }
+        if rows.cells_cut > 0 {
+            writeln!(
+                err,
+                "{} cut {} long value{} at {STRUCTURED_CELL_CHARS} characters",
+                client.holder(),
+                rows.cells_cut,
+                if rows.cells_cut == 1 { "" } else { "s" }
             )?;
         }
     }

@@ -935,6 +935,46 @@ fn model_text_is_a_compact_typed_markdown_table() {
     assert_eq!(statement.to_model_text(), "OK\n");
 }
 
+/// A structured answer is bounded in bytes as well as rows: a value past
+/// the character limit is cut with how much was left out, rows past the
+/// byte limit are dropped (the first always kept), the total still counts
+/// them, and the cut is reported. A result within both limits is untouched.
+#[test]
+fn bound_bytes_cuts_wide_values_and_drops_rows_past_the_limit() {
+    let wide = "x".repeat(1_000);
+    let mut result = capped(
+        &["t"],
+        &["VARCHAR"],
+        (0..10).map(|_| vec![serde_json::json!(wide)]).collect(),
+    );
+    let cut = result.bound_bytes(2_500, 300);
+    // Each kept row is `["xxx…(+700 chars)"]`, 319 bytes: seven fit.
+    assert_eq!(cut, Cut { cells: 7, rows: 3 });
+    assert_eq!(result.results.rows.len(), 7);
+    assert_eq!(result.total_rows, 10);
+    assert!(result.truncated());
+    let expected = format!("{}\u{2026}(+700 chars)", "x".repeat(300));
+    for row in &result.results.rows {
+        assert_eq!(row, &vec![serde_json::json!(expected)]);
+    }
+
+    // One value wider than the whole budget is still kept, cut.
+    let mut single = capped(&["t"], &["VARCHAR"], vec![vec![serde_json::json!(wide)]]);
+    assert_eq!(single.bound_bytes(100, 300), Cut { cells: 1, rows: 0 });
+    assert_eq!(single.results.rows.len(), 1);
+
+    let mut small = capped(
+        &["n", "t"],
+        &["BIGINT", "VARCHAR"],
+        vec![vec![serde_json::json!(1), serde_json::json!("short")]],
+    );
+    assert_eq!(small.bound_bytes(2_500, 300), Cut::default());
+    assert_eq!(
+        small.results.rows,
+        vec![vec![serde_json::json!(1), serde_json::json!("short")]]
+    );
+}
+
 #[test]
 fn model_text_cuts_long_values_and_says_how_much() {
     let long = "x".repeat(MODEL_CELL_CHARS + 4500);

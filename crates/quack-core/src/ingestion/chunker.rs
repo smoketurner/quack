@@ -397,6 +397,15 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    /// Whether the chunk holds anything to find: at least one letter or
+    /// digit. A chunk of NUL bytes, of punctuation, of zero-width or other
+    /// control characters is valid UTF-8 that reads as nothing, and would
+    /// only cost an embedding call and a row nothing ever matches.
+    #[must_use]
+    pub fn is_readable(&self) -> bool {
+        self.content.chars().any(char::is_alphanumeric)
+    }
+
     /// What the embedding model is given: the text, under its heading.
     #[must_use]
     pub fn embedding_input(&self) -> Input {
