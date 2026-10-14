@@ -125,7 +125,7 @@ async fn a_turn_that_read_a_document_is_refused_its_write_under_allow_write() {
                 document_ids: Vec::new(),
             },
             &Extensions::default(),
-            Progress::none(),
+            Requester::default(),
             CancellationToken::new(),
         )
         .await
@@ -171,6 +171,7 @@ async fn list_tables_and_sql_answer_in_typed_text() {
                 sql: String::from("CREATE TABLE t AS SELECT 1 AS n UNION ALL SELECT 2"),
             }),
             Extensions::default(),
+            Requester::default(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -194,6 +195,7 @@ async fn list_tables_and_sql_answer_in_typed_text() {
                 sql: String::from("SELECT n, n * 1.5 AS half FROM t ORDER BY n"),
             }),
             Extensions::default(),
+            Requester::default(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -219,6 +221,7 @@ async fn stdio_tools_gate_writes_and_serve_resources() {
                 sql: String::from("CREATE TABLE t AS SELECT 1 AS n"),
             }),
             Extensions::default(),
+            Requester::default(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -229,6 +232,7 @@ async fn stdio_tools_gate_writes_and_serve_resources() {
                 sql: String::from("SELECT * FROM _quack_documents"),
             }),
             Extensions::default(),
+            Requester::default(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -239,6 +243,7 @@ async fn stdio_tools_gate_writes_and_serve_resources() {
                 sql: String::from("SELEC 1"),
             }),
             Extensions::default(),
+            Requester::default(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -251,6 +256,7 @@ async fn stdio_tools_gate_writes_and_serve_resources() {
                 sql: String::from("CREATE TABLE t AS SELECT 1 AS n UNION ALL SELECT 2"),
             }),
             Extensions::default(),
+            Requester::default(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -384,8 +390,9 @@ async fn query_failures_leave_no_session_and_named_sessions_are_checked() {
         document_ids: Vec::new(),
     };
     let ext = Extensions::default();
-    let run =
-        |args: QueryArgs| server.query_for(args, &ext, Progress::none(), CancellationToken::new());
+    let run = |args: QueryArgs| {
+        server.query_for(args, &ext, Requester::default(), CancellationToken::new())
+    };
     let session_count = || async {
         db.run(|db| sessions::list_sessions(db, 10))
             .await
@@ -461,6 +468,7 @@ async fn stdio_resources_render_tables_context_and_schemas() {
                 sql: String::from("CREATE TABLE t AS SELECT 1 AS n UNION ALL SELECT 2"),
             }),
             Extensions::default(),
+            Requester::default(),
         )
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -999,7 +1007,7 @@ async fn closing_the_socket_at_once_leaves_no_socket_file() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_socket_sql_write_asks_the_listener_or_is_refused() {
-    use crate::client::HolderClient;
+    use crate::client::{CommandClient, HolderClient};
     use crate::socket::SocketServer;
     use quack_core::analysis::events::Decision;
     use quack_core::forward::Listener;
@@ -1032,10 +1040,19 @@ async fn a_socket_sql_write_asks_the_listener_or_is_refused() {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     let socket = SocketServer::serve(listener, server);
-    let client = HolderClient::connect(&workspace_dir, &workspace_id)
-        .await
-        .unwrap_or_else(|e| fail(&e.to_string()))
-        .unwrap_or_else(|| fail("no holder answered"));
+    // The client names itself, and hears where its write waits.
+    let reports: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let client = HolderClient::connect_with(&workspace_dir, &workspace_id, {
+        let reports = Arc::clone(&reports);
+        CommandClient::new("quack -q", move |message| {
+            if let Ok(mut reports) = reports.lock() {
+                reports.push(message.to_owned());
+            }
+        })
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()))
+    .unwrap_or_else(|| fail("no holder answered"));
 
     // Nobody listens: refused at once, and audited as a job that did not run.
     let refused = client
@@ -1058,6 +1075,7 @@ async fn a_socket_sql_write_asks_the_listener_or_is_refused() {
             let first = asked.recv().await.unwrap_or_else(|| fail("nothing asked"));
             assert_eq!(first.request.sql, "CREATE TABLE u (x INTEGER)");
             assert!(first.session.is_none());
+            assert_eq!(first.client, "quack -q");
             let job = jobs
                 .get(first.job)
                 .unwrap_or_else(|| fail("the statement is not a job"));
@@ -1087,6 +1105,13 @@ async fn a_socket_sql_write_asks_the_listener_or_is_refused() {
     assert_eq!(tables.results.rows, vec![vec![serde_json::json!("u")]]);
     client.close().await;
     socket.close(Duration::from_secs(5)).await;
+    let reported = reports.lock().map(|r| r.clone()).unwrap_or_default();
+    assert!(
+        reported.iter().any(|message| {
+            message.contains("waiting for approval at the quack terminal session (up to 300 s)")
+        }),
+        "{reported:?}"
+    );
 }
 
 /// A `query` turn that wants a write under `Ask` asks whoever listens on
@@ -1154,7 +1179,7 @@ async fn a_socket_turns_write_asks_the_listener_or_is_refused() {
                     document_ids: Vec::new(),
                 },
                 &Extensions::default(),
-                Progress::none(),
+                Requester::default(),
                 CancellationToken::new(),
             )
             .await

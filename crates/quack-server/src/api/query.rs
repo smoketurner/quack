@@ -21,6 +21,7 @@ use quack_core::analysis::policy::{Hold, WritePolicy};
 use quack_core::analysis::search::{DocumentSearch, SearchBody, SearchDetail, SearchOutcome};
 use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
 use quack_core::classify::LabelJobs;
+use quack_core::error::Error as CoreError;
 use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
@@ -29,7 +30,8 @@ use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{
-    DocumentFilter, ExportFormat, SearchMode, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
+    DocumentFilter, ExportFormat, STRUCTURED_CELL_CHARS, STRUCTURED_RESULT_BYTES, SearchMode,
+    TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -593,6 +595,17 @@ pub(crate) async fn export(
     access.export_sql(&app, body.sql, body.format).await
 }
 
+/// What classifying a typed statement answered with: the classifier's own
+/// refusal (an internal table, transaction control, the server's catalog)
+/// is forbidden; `DuckDB` failing to parse it (out of memory on a huge
+/// literal) keeps its own code, a resource error, not a permission.
+fn classification_failed(e: CoreError) -> ApiError {
+    match e {
+        CoreError::Analysis(_) => ApiError::forbidden(e.to_string()),
+        other => ApiError::from(other),
+    }
+}
+
 /// Direct SQL. Reads need the viewer role; anything that mutates needs the
 /// member role and the write scope. `_quack_` tables are never reachable.
 /// A capped result set for the API and the web grid.
@@ -609,7 +622,12 @@ pub(crate) struct SqlOutcome {
     /// the statement with it.
     pub row_count: usize,
     pub row_count_exact: bool,
+    /// Rows were dropped: at the row cap, or at the byte bound of the
+    /// response (4 MiB, as the MCP `sql` tool's); `/sql/export` streams
+    /// every row.
     pub truncated: bool,
+    /// Values cut at 65,536 characters among the rows kept.
+    pub cells_cut: usize,
     /// How long the statement ran, timed on its connection's thread, so a
     /// wait for the writer is not counted.
     pub duration_ms: u64,
@@ -651,21 +669,29 @@ impl Access {
     ) -> ApiResult<Response> {
         let workspace_id = self.membership.workspace.id.clone();
         let sql = statement.clone();
+        // The open's own failure (a locked file) keeps its code; only a
+        // statement the classifier refuses is forbidden.
         let kind = match app
-            .read(&workspace_id, move |db| db.classify_user_statement(&sql))
-            .await
+            .read(
+                &workspace_id,
+                move |db| Ok(db.classify_user_statement(&sql)),
+            )
+            .await?
         {
             Ok(kind) => kind,
             Err(e) => {
+                let message = e.to_string();
                 self.audit(
                     app,
                     AuditAction::Export,
                     None,
                     Outcome::Denied,
-                    Some(serde_json::json!({ "sql": statement, "format": format, "error": e.message })),
+                    Some(
+                        serde_json::json!({ "sql": statement, "format": format, "error": message }),
+                    ),
                 )
                 .await?;
-                return Err(ApiError::forbidden(e.message));
+                return Err(classification_failed(e));
             }
         };
         if kind.writes().map_err(ApiError::bad_request)? {
@@ -741,12 +767,14 @@ impl Access {
         let access = self;
         let sql = statement.to_owned();
         // Classifying parses the statement: a read, never in the writer's line.
+        // The open's own failure (a locked file) keeps its code; only a
+        // statement the classifier refuses is forbidden.
         let kind = app
             .read(&access.membership.workspace.id, move |db| {
-                db.classify_user_statement(&sql)
+                Ok(db.classify_user_statement(&sql))
             })
-            .await
-            .map_err(|e| ApiError::forbidden(e.message))?;
+            .await?
+            .map_err(classification_failed)?;
         let is_write = kind.writes().map_err(ApiError::bad_request)?;
         let detail = serde_json::json!({ "sql": statement });
         if is_write && creates_temp_object(statement) {
@@ -791,9 +819,14 @@ impl Access {
         access
             .audit(app, AuditAction::Sql, None, outcome, Some(detail))
             .await?;
-        let (capped, took) = result.map_err(|e| e.unprocessable_as(ErrorCode::SqlFailed))?;
+        let (mut capped, took) = result.map_err(|e| e.unprocessable_as(ErrorCode::SqlFailed))?;
+        // The row cap bounds nothing by itself: a wide cell or a few wide
+        // rows would be buffered and sent whole. The same byte bound as the
+        // MCP tool's; `/sql/export` streams every row.
+        let cut = capped.bound_bytes(STRUCTURED_RESULT_BYTES, STRUCTURED_CELL_CHARS);
         Ok(SqlOutcome {
             truncated: capped.truncated(),
+            cells_cut: cut.cells,
             row_count_exact: !capped.stopped_early,
             columns: capped.results.columns,
             column_types: capped.column_types,

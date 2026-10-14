@@ -390,9 +390,17 @@ workspace: an earlier design had the terminal walk up to a `.quack/` folder as `
 
 One DuckDB file per workspace; queries cannot cross workspaces. `ATTACH` is impossible, not
 discouraged: `WorkspaceDb::confine_to` sets `allowed_directories` to the workspace directory
-alone, turns off `enable_external_access` and `allow_persistent_secrets`, applies the
-`memory_limit` and `threads` caps, then sets `lock_configuration` before any user or agent
-statement runs. External data arrives through `quack import`, which snapshots rows into an
+alone, turns off `enable_external_access`, `allow_persistent_secrets`,
+`autoinstall_known_extensions`, `autoload_known_extensions`, and `allow_community_extensions`
+(so a statement that needs an extension fails as unloaded whatever the directories allow),
+applies the `memory_limit` and `threads` caps, then sets `lock_configuration` before any user or
+agent statement runs. Typed SQL is also refused by its tokens (`TypedSql::refusal`) when it is
+transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`: every client's writes share one connection,
+so one client's `ROLLBACK` would discard the others' work) or names the server's catalog
+(`database_list`, `duckdb_databases`, `duckdb_settings`, `current_setting`,
+`duckdb_extensions`: each carries the workspace file's host path or the server's settings).
+The REST `/sql` answer is bounded in bytes like the MCP `sql` tool's (4 MiB, 64 KiB a value,
+`cells_cut`); `/sql/export` streams every row. External data arrives through `quack import`, which snapshots rows into an
 ordinary table (section 6.2).
 
 A workspace's `allowed_providers` limits which LLM providers see its data, so a workspace
@@ -1070,7 +1078,10 @@ model`: `quack ingest`, `quack docs`, the terminal's `/docs` and load message, t
 Documents row, an upload job's result, the agent's `list_documents` output, and the documents
 block of the system prompt.
 
-**Decompression limit.** `[ingestion].upload_max_mb` counts compressed bytes. A DOCX, a PPTX,
+**Decompression limit.** `[ingestion].upload_max_mb` counts compressed bytes. It is the body
+limit of the routes that take a file (`POST .../documents`, `.../restore`, the Documents page's
+upload and replace forms) alone; every other route, a statement or a question, takes at most
+`JSON_BODY_BYTES` (1 MiB) and answers 413 before reading more. A DOCX, a PPTX,
 and a zipped workbook (XLSX, XLSM, XLSB, ODS) are zip archives, so a second limit,
 `[ingestion].max_decompressed_mb` (default 1024), bounds what one file may inflate to. Every
 part is read through one `ingestion::budget::DecompressionBudget` for the file. DOCX and PPTX
@@ -2897,7 +2908,9 @@ Context Protocol:
   `.mcp.json`, no server, no port, unaudited like the CLI. It holds nothing between calls
   (`quack_mcp::relay::PerCallServer`): each call runs in the process that holds the
   workspace, over its socket (the terminal session, a command; the call's progress comes
-  back through it, and `--allow-write` has no say there), or, when nobody holds it, in
+  back through it, and `--allow-write` has no say there: the holder's own policy decides,
+  so a write asks at the terminal session's prompt, which names the client as its MCP
+  `initialize` did, and a command refuses it), or, when nobody holds it, in
   `quack mcp` itself, which opens the workspace for that call and lets it go after (a job
   the call left running, a title, keeps it open until the next call or the exit). While it
   holds the file it serves the workspace socket like any holder, under its own
@@ -3189,7 +3202,10 @@ no workspace named 'slaes'; create it with: quack workspace create slaes
 `[general].default_workspace`, and the first command to use it creates it (audited the same
 way), so a new install needs no setup step. Naming the default with `-w` does the same.
 `ControlPlane::workspace_or_default` is the one place this is decided. A new workspace's
-name is a `WorkspaceName`: trimmed, non-empty, and without `/`, `\`, `.`, or a control character. The CLI verb,
+name is a `WorkspaceName`: trimmed, non-empty, and without `/`, `\`, `.`, or a character that is not
+printable on one line (a control, the Unicode line and paragraph separators, a format character such as a
+bidi override or a zero-width space, a private-use or unassigned code point; `unicode-properties`' general
+category decides). The CLI verb,
 `POST /api/v1/workspaces`, the web console, and `default_workspace` in `config.toml` all go
 through that type. Workspaces created before the rule keep their names and still open. The
 server a terminal session runs beside itself serves that one workspace, so it refuses to
@@ -3220,7 +3236,10 @@ workspace rename OLD NEW` and `name` on `PATCH .../workspaces/{id}` (the Setting
 field) change the name the unique index guards. `quack workspace delete NAME` (asks; `-y`
 skips), `DELETE .../workspaces/{id}`, and the Settings page's form (the name typed again)
 delete at once: the server closes the file the same way, its connections staying closed, and
-lets go of its MCP transports (409 while a job of the workspace is queued or running); the
+lets go of its MCP transports (409 while a job of the workspace is queued or running, and 409
+naming the holder, exit 1 from the CLI, while another process holds the file:
+`HeldElsewhere::before_delete` asks the workspace socket, and with no answer tries the file's
+lock, so a session is never left on an unlinked file); the
 row goes with its members and API tokens in one audited transaction, then the directory.
 `audit_log` has no foreign key to `workspaces`, so the rows stay. There is no archive state
 and no undo; the snapshot is the undo.

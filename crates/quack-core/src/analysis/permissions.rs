@@ -46,13 +46,16 @@ impl Default for Approvals {
 
 /// One write waiting for the person: the job running it (a turn, or a
 /// statement another process sent over the workspace socket), the turn's
-/// session when it is a turn, the request to answer, and when the answer
-/// stops mattering: at `expires_at` the write is refused here, and an
-/// answer after that is [`Delivery::TurnGone`].
+/// session when it is a turn, who asked (the client as its MCP
+/// `initialize` named it: `quack -q`, `quack mcp`, an editor's own name),
+/// the request to answer, and when the answer stops mattering: at
+/// `expires_at` the write is refused here, and an answer after that is
+/// [`Delivery::TurnGone`].
 #[derive(Debug)]
 pub struct Asked {
     pub job: JobId,
     pub session: Option<SessionId>,
+    pub client: String,
     pub request: PermissionRequest,
     pub expires_at: std::time::Instant,
 }
@@ -83,12 +86,25 @@ impl Approvals {
         receiver
     }
 
-    /// Hand `job`'s write to the listener, with the deadline: the listener
-    /// gets a stand-in request, and the turn's own is answered here with
-    /// whatever the listener decides within the timeout, else refused. With
-    /// no listener, or one that has gone, the write is refused at once.
-    /// Runs on the Tokio runtime the caller is inside.
-    pub fn ask(&self, job: JobId, session: Option<SessionId>, request: PermissionRequest) {
+    /// How long an ask waits for its answer before it is refused.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Hand `job`'s write, asked by `client`, to the listener, with the
+    /// deadline: the listener gets a stand-in request, and the turn's own
+    /// is answered here with whatever the listener decides within the
+    /// timeout, else refused. With no listener, or one that has gone, the
+    /// write is refused at once. Runs on the Tokio runtime the caller is
+    /// inside.
+    pub fn ask(
+        &self,
+        job: JobId,
+        session: Option<SessionId>,
+        client: String,
+        request: PermissionRequest,
+    ) {
         let sender = self
             .listener
             .lock()
@@ -113,6 +129,7 @@ impl Approvals {
         let asked = Asked {
             job,
             session,
+            client,
             request: stand_in,
             expires_at: std::time::Instant::now()
                 .checked_add(timeout)
@@ -333,9 +350,10 @@ mod approvals_tests {
 
         let (request, answer) =
             PermissionRequest::new(String::from("DELETE FROM t"), Hold::NotPermitted);
-        approvals.ask(job, None, request);
+        approvals.ask(job, None, String::from("quack -q"), request);
         let shown = asked.recv().await.unwrap();
         assert_eq!(shown.request.sql, "DELETE FROM t");
+        assert_eq!(shown.client, "quack -q");
         assert!(shown.expires_at > std::time::Instant::now());
         // Nobody answers: the turn is told no at the deadline.
         assert_eq!(answer.await.unwrap(), Decision::Deny);
@@ -344,7 +362,7 @@ mod approvals_tests {
 
         let (request, answer) =
             PermissionRequest::new(String::from("INSERT INTO t VALUES (1)"), Hold::NotPermitted);
-        approvals.ask(job, None, request);
+        approvals.ask(job, None, String::from("quack -q"), request);
         let shown = asked.recv().await.unwrap();
         assert_eq!(shown.request.answer(Decision::Allow), Delivery::Delivered);
         assert_eq!(answer.await.unwrap(), Decision::Allow);
@@ -353,7 +371,7 @@ mod approvals_tests {
         let quiet = Approvals::new();
         let (request, answer) =
             PermissionRequest::new(String::from("DROP TABLE t"), Hold::NotPermitted);
-        quiet.ask(job, None, request);
+        quiet.ask(job, None, String::from("quack -q"), request);
         assert_eq!(answer.await.unwrap(), Decision::Deny);
     }
 }

@@ -65,8 +65,17 @@ struct Bridge {
 }
 
 impl ClientHandler for Bridge {
+    /// The holder sees the relay's own client (an editor, Claude Code) by
+    /// the name it gave `quack mcp`, so its prompt says who asked for a
+    /// write; `quack mcp` itself when the client gave none.
     fn get_info(&self) -> ClientConfig {
-        ClientConfig::default()
+        let client_info = self.peer.peer_info().map_or_else(
+            || Implementation::new("quack mcp", env!("CARGO_PKG_VERSION")),
+            |info| info.client_info.clone(),
+        );
+        let mut config = ClientConfig::default();
+        config.client_info = client_info;
+        config
     }
 
     async fn on_progress(
@@ -140,7 +149,10 @@ impl PerCallServer {
                     tokio::time::sleep(LOCK_RETRY).await;
                 }
                 Err(CoreError::WorkspaceLocked { path }) => {
-                    return Err(internal(client::locked_without_socket(&path)));
+                    return Err(internal(client::locked_without_socket(&format!(
+                        "the workspace file {}",
+                        path.display()
+                    ))));
                 }
                 Err(e) => return Err(internal(e.to_string())),
             }

@@ -964,17 +964,48 @@ async fn audit_rows_append_and_filter() {
 }
 
 /// A new workspace's name is trimmed, and refused when empty or when it
-/// holds a slash, a backslash, a dot, or a control character (a newline,
-/// a tab, NUL, an escape, a C1 control), which would break every one-line
-/// rendering of it.
+/// holds a slash, a backslash, a dot, or a character that is not printable
+/// on one line: a control (a newline, a tab, NUL, an escape, a C1 control),
+/// the Unicode line and paragraph separators, a format character (a bidi
+/// override, a zero-width space, a soft hyphen, a byte order mark), a
+/// private-use or an unassigned code point. Letters, marks, numbers,
+/// punctuation, symbols, and spaces of every script stay.
 #[test]
-fn a_workspace_name_is_trimmed_and_refuses_empty_slashes_dots_and_controls() {
+fn a_workspace_name_is_trimmed_and_refuses_empty_slashes_dots_and_unprintables() {
     assert!(matches!(" sales ".parse::<WorkspaceName>(), Ok(name) if name.as_str() == "sales"));
-    assert!(
-        matches!("ventes régionales".parse::<WorkspaceName>(), Ok(name) if name.as_str() == "ventes régionales")
-    );
+    for accepted in [
+        "ventes régionales",
+        "日本語 データ",
+        "ventes – 2026 (été)",
+        "sales & marketing",
+        "e\u{301}t\u{e9}",
+    ] {
+        assert!(
+            matches!(accepted.parse::<WorkspaceName>(), Ok(name) if name.as_str() == accepted),
+            "{accepted:?}"
+        );
+    }
     for refused in [
-        "", "   ", "a/b", "a\\b", "a.b", "..", "a\nb", "a\tb", "a\0b", "a\x1bb", "a\u{85}b", "a\rb",
+        "",
+        "   ",
+        "a/b",
+        "a\\b",
+        "a.b",
+        "..",
+        "a\nb",
+        "a\tb",
+        "a\0b",
+        "a\x1bb",
+        "a\u{85}b",
+        "a\rb",
+        "z\u{2028}y",
+        "z\u{2029}y",
+        "a\u{202e}b",
+        "a\u{200b}b",
+        "a\u{ad}b",
+        "\u{feff}a",
+        "a\u{e000}b",
+        "a\u{378}b",
     ] {
         assert!(
             matches!(
@@ -1016,8 +1047,8 @@ async fn first_uses_of_the_default_workspace_that_race_share_one_row() {
 }
 
 /// A workspace a command names must exist, and nothing is created when
-/// it does not; the default one is created, audited, by its first use,
-/// whether or not the command names it.
+/// it does not, the configured default included; only a command that
+/// names none creates the default, audited, on its first use.
 #[tokio::test]
 #[expect(clippy::unwrap_used, reason = "test setup")]
 async fn a_named_workspace_must_exist_and_the_default_is_created_on_first_use() {
@@ -1072,13 +1103,14 @@ async fn a_named_workspace_must_exist_and_the_default_is_created_on_first_use() 
     assert_eq!(found.id, sales.id);
     assert_eq!(cp.list_workspaces().await.unwrap().len(), 2);
 
-    // Naming the default explicitly creates it too.
+    // Naming the default explicitly creates nothing: after a rename, `-w
+    // default` is a mistake to refuse, not a second workspace to make.
     let (_dir, fresh) = open().await;
-    let named = fresh
-        .workspace_or_default(Some("default"), &default)
-        .await
-        .unwrap();
-    assert_eq!(named.name, "default");
+    assert!(matches!(
+        fresh.workspace_or_default(Some("default"), &default).await,
+        Err(Error::NoWorkspaceNamed(name)) if name == "default"
+    ));
+    assert!(fresh.list_workspaces().await.unwrap().is_empty());
 }
 
 #[tokio::test]

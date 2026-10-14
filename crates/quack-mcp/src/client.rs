@@ -3,18 +3,24 @@
 //! through the holder's `sql` tool, `quack jobs` reads the holder's
 //! `quack://workspace/jobs`.
 
+use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
+use quack_core::config::Config;
+use quack_core::engine::Holder;
 use quack_core::error::{Error, Result};
 use quack_core::forward;
 use quack_core::ids::WorkspaceId;
 use quack_core::jobs::JobInfo;
-use quack_core::storage::workspace::QueryResults;
+use quack_core::storage::workspace::{QueryResults, WorkspaceDb};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ListResourceTemplatesResult, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
+    CallToolRequestParams, CallToolResult, ClientConfig, Implementation,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, NumberOrString,
+    PaginatedRequestParams, ProgressNotificationParam, ProgressToken, ReadResourceRequestParams,
+    ReadResourceResult, RequestMetaObject,
 };
-use rmcp::service::{RunningService, ServiceError};
+use rmcp::service::{NotificationContext, RunningService, ServiceError};
 use rmcp::{ClientHandler, ErrorData as McpError, RoleClient, ServiceExt};
 use serde::Deserialize;
 
@@ -39,18 +45,185 @@ pub async fn holder_of(workspace_dir: &Path, workspace_id: &WorkspaceId) -> Resu
     Ok(Some(holder))
 }
 
-/// What the lock on the workspace file at `path` means when no socket
-/// answers for it: every holder but `quack serve` serves the socket while
-/// it holds the file, so the holder is the server (whose `/mcp/v1`
-/// endpoint is the way in) or a process between opening the file and
-/// binding the socket, or between closing them.
+/// The refusal for a workspace file another process holds: who, when its
+/// socket answers (`initialize` names the holder), and what still works.
+/// `Error::WorkspaceLocked` stays its source, so `-q` and `jobs`, which
+/// answer a lock by reaching the holder, still recognize it.
+#[derive(Debug)]
+pub struct HeldElsewhere {
+    /// Who holds the file, as its socket named it; `None` when no socket
+    /// answered.
+    pub holder: Option<String>,
+    /// What was refused.
+    wanted: Wanted,
+    /// The file, as this process may name it: its path on the command
+    /// line, the workspace's id from the server (an API body never
+    /// carries a host path).
+    file: String,
+    locked: Error,
+}
+
+/// What a holder's refusal stood in the way of.
+#[derive(Debug)]
+enum Wanted {
+    /// Opening the workspace, as this holder.
+    Open(Holder),
+    /// Deleting the workspace.
+    Delete,
+}
+
+impl HeldElsewhere {
+    /// Whether another process holds the workspace, before it is deleted
+    /// from under it: the socket's answer names the holder; with no socket
+    /// the file's own lock decides (`quack serve`, or a process starting
+    /// or stopping). `None` when nothing holds it, or it has no file yet.
+    /// A delete that went ahead would leave the holder on an unlinked
+    /// file, losing every write at its quit.
+    pub async fn before_delete(config: &Config, workspace_id: &WorkspaceId) -> Option<Self> {
+        let id = workspace_id.as_str();
+        let path = config.workspace_db_path(id);
+        if !path.exists() {
+            return None;
+        }
+        let locked = Error::WorkspaceLocked { path: path.clone() };
+        let file = format!("the file of workspace {workspace_id}");
+        match holder_of(&config.workspace_dir(id), workspace_id).await {
+            Ok(Some(holder)) => {
+                return Some(Self {
+                    holder: Some(holder),
+                    wanted: Wanted::Delete,
+                    file,
+                    locked,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "could not ask the workspace socket who holds the file");
+            }
+        }
+        let probe = {
+            let (config, id) = (config.clone(), id.to_owned());
+            tokio::task::spawn_blocking(move || WorkspaceDb::recorded_schema(&config, &id)).await
+        };
+        match probe {
+            Ok(Err(Error::WorkspaceLocked { .. })) => Some(Self {
+                holder: None,
+                wanted: Wanted::Delete,
+                file,
+                locked,
+            }),
+            Ok(_) | Err(_) => None,
+        }
+    }
+
+    /// Ask the socket of the workspace in `workspace_dir` who holds the
+    /// file (`file` names it as this process may: a path on the command
+    /// line, the workspace's id from the server), for `wanted`, which
+    /// `locked` refused. A socket that does not answer is logged and names
+    /// nobody.
+    pub async fn find(
+        workspace_dir: &Path,
+        workspace_id: &WorkspaceId,
+        file: String,
+        wanted: Holder,
+        locked: Error,
+    ) -> Self {
+        let holder = match holder_of(workspace_dir, workspace_id).await {
+            Ok(holder) => holder,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not ask the workspace socket who holds the file");
+                None
+            }
+        };
+        Self {
+            holder,
+            wanted: Wanted::Open(wanted),
+            file,
+            locked,
+        }
+    }
+}
+
+impl fmt::Display for HeldElsewhere {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(holder) = &self.holder else {
+            return f.write_str(&locked_without_socket(&self.file));
+        };
+        write!(f, "the workspace is open in {holder}; ")?;
+        match &self.wanted {
+            Wanted::Open(Holder::Command { verb, .. }) => {
+                write!(
+                    f,
+                    "`quack -q` and `quack jobs` read through it; quit it to run `quack {verb}`"
+                )
+            }
+            Wanted::Open(Holder::Terminal(_)) => f.write_str(
+                "`quack -q` and `quack jobs` read through it; quit it to start a session here",
+            ),
+            Wanted::Open(Holder::Serve | Holder::Mcp) => {
+                f.write_str("`quack -q` and `quack jobs` read through it; quit it to open it here")
+            }
+            Wanted::Delete => f.write_str("quit it before deleting the workspace"),
+        }
+    }
+}
+
+impl std::error::Error for HeldElsewhere {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.locked)
+    }
+}
+
+/// A command as the holder's client: `initialize` names it (`quack -q`,
+/// `quack jobs`), so the holder's prompt says who asked for a write, and
+/// the holder's progress messages (a write waiting for approval at its
+/// prompt) go to `report`, which a command writes to stderr.
+#[derive(Clone)]
+pub struct CommandClient {
+    name: &'static str,
+    report: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl CommandClient {
+    #[must_use]
+    pub fn new(name: &'static str, report: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self {
+            name,
+            report: Arc::new(report),
+        }
+    }
+}
+
+impl ClientHandler for CommandClient {
+    fn get_info(&self) -> ClientConfig {
+        let mut config = ClientConfig::default();
+        config.client_info = Implementation::new(self.name, env!("CARGO_PKG_VERSION"));
+        config
+    }
+
+    fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        if let Some(message) = &params.message {
+            (self.report)(message);
+        }
+        std::future::ready(())
+    }
+}
+
+/// What the lock on the workspace `file` (named as the caller may name
+/// it) means when no socket answers for it: every holder but `quack serve`
+/// serves the socket while it holds the file, so the holder is the server
+/// (whose `/mcp/v1` endpoint is the way in) or a process between opening
+/// the file and binding the socket, or between closing them.
 #[must_use]
-pub fn locked_without_socket(path: &Path) -> String {
+pub fn locked_without_socket(file: &str) -> String {
     format!(
-        "the workspace file {} is open in another quack process that answers on no socket: \
-         quack serve (reach the workspace through its /mcp/v1 endpoint), or a process that is \
-         starting or stopping; try again, or stop it",
-        path.display()
+        "{file} is open in another quack process that answers on no socket: quack serve (reach \
+         the workspace through its /mcp/v1 endpoint), or a process that is starting or \
+         stopping; try again, or stop it"
     )
 }
 
@@ -253,7 +426,12 @@ impl<H: ClientHandler> HolderClient<H> {
     pub async fn sql(&self, statement: &str) -> Result<HolderRows> {
         let mut arguments = serde_json::Map::new();
         arguments.insert(String::from("sql"), serde_json::Value::from(statement));
-        let params = CallToolRequestParams::new("sql").with_arguments(arguments);
+        // A progress token, so the holder reports a write waiting at its
+        // prompt (`CommandClient::on_progress`).
+        let mut params = CallToolRequestParams::new("sql").with_arguments(arguments);
+        params.meta = Some(RequestMetaObject::with_progress_token(ProgressToken(
+            NumberOrString::String(Arc::from("sql")),
+        )));
         let result = self.call_tool(params).await?;
         if result.is_error.unwrap_or(false) {
             let text: String = result
@@ -313,6 +491,12 @@ impl<H: ClientHandler> HolderClient<H> {
                 holder: self.holder.clone(),
                 error: Box::new(error),
             },
+            // The holder ended the session before answering: it quit (the
+            // terminal session's Ctrl-C), or its stop cut the call short.
+            ServiceError::TransportClosed => HolderError::Unreachable(Error::Forward(format!(
+                "{} closed the connection before answering: it quit before the statement finished",
+                self.holder
+            ))),
             other => HolderError::Unreachable(self.failed(&format!("{what}: {other}"))),
         }
     }

@@ -63,11 +63,11 @@ use quack_cli::{NamedInput, StdioPath};
 use quack_cli::{OpenedWorkspace, RecordedRun, SessionChoice, find_session, resolve_session};
 use quack_cli::{embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
 use quack_core::engine::{Drain, Holder, Stop};
-use quack_mcp::client::HolderClient;
+use quack_mcp::client::{CommandClient, HolderClient};
 
 use quack_core::config::ServerConfig;
 use quack_server::{ServeMode, Server};
-use quack_terminal::{QUIT_GRACE, SessionSetup, WebStatus};
+use quack_terminal::{QUIT_GRACE, Quitting, SessionSetup, WebStatus};
 
 use crate::progress_line::StderrProgress;
 
@@ -1657,7 +1657,12 @@ async fn run_jobs(cli: &Cli, args: JobsArgs) -> Result<ExitCode> {
         }
         Err(e) if is_workspace_locked(&e) => {
             let workspace_dir = opened.config().workspace_dir(opened.workspace.id.as_str());
-            let Some(client) = HolderClient::connect(&workspace_dir, &opened.workspace.id).await?
+            let Some(client) = HolderClient::connect_with(
+                &workspace_dir,
+                &opened.workspace.id,
+                CommandClient::new("quack jobs", report_to_stderr),
+            )
+            .await?
             else {
                 return Err(e);
             };
@@ -1990,7 +1995,7 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
         ),
         Err(e) => (WebStatus::Unavailable(format!("{e:#}")), None),
     };
-    let session = quack_terminal::run(SessionSetup {
+    let setup = SessionSetup {
         engine: Arc::clone(&opened.engine),
         web,
         workspace_name: opened.workspace.name.clone(),
@@ -2000,22 +2005,40 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
         session_id,
         writes,
         approvals: opened.approvals.clone(),
-    })
-    .await;
+    };
     // The session's quit stopped the jobs (a session that failed did not:
     // the stop sequence cancels them either way); the server and the
     // socket drain under the same grace, and the writer checkpoints last
-    // (`Engine::shutdown`).
-    drop(handle);
-    let server = server.map(|server| -> Drain {
-        Box::pin(async move {
-            if let Ok(Err(e)) = server.await {
-                tracing::warn!(error = %e, "the web server beside the session ended with an error");
-            }
-        })
+    // (`Engine::shutdown`), all before the tty is handed back.
+    let quitting: Quitting = Box::new(move || {
+        let socket = if opened.socket_busy() {
+            ", and a statement another process sent over the workspace socket"
+        } else {
+            ""
+        };
+        let line = format!(
+            "Quitting: finishing the jobs{socket}{} (up to {} s), then closing the workspace.",
+            if server.is_some() {
+                ", and the web server's requests"
+            } else {
+                ""
+            },
+            QUIT_GRACE.as_secs()
+        );
+        let server = server.map(|server| -> Drain {
+            Box::pin(async move {
+                if let Ok(Err(e)) = server.await {
+                    tracing::warn!(error = %e, "the web server beside the session ended with an error");
+                }
+            })
+        });
+        let stop: Drain = Box::pin(async move {
+            drop(handle);
+            opened.stop(Stop::Cancel, QUIT_GRACE, server).await;
+        });
+        (line, stop)
     });
-    opened.stop(Stop::Cancel, QUIT_GRACE, server).await;
-    session?;
+    quack_terminal::run(setup, quitting).await?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2680,13 +2703,24 @@ fn is_workspace_locked(err: &anyhow::Error) -> bool {
     })
 }
 
+/// What the holder reports while a command waits on it (a write waiting
+/// for approval at the terminal's prompt, and for how long), on stderr,
+/// so a person or a script knows where the statement is.
+fn report_to_stderr(message: &str) {
+    let stderr = std::io::stderr();
+    let mut err = stderr.lock();
+    drop(writeln!(err, "{message}"));
+}
+
 /// `-q` on a workspace another `quack` process holds: the statement runs
 /// through that process's `sql` tool over the workspace socket
 /// (`quack_mcp::client`) and comes back as the same rows, with one line on
 /// stderr saying so, one more when the holder capped them at its
 /// `[analysis].max_query_rows` or its byte limit, and one more when it cut
-/// a wide value (`STRUCTURED_CELL_CHARS`). A write is the holder's own
-/// refusal.
+/// a wide value (`STRUCTURED_CELL_CHARS`). A write waits for the holder's
+/// own decision (the terminal session asks at its prompt and says so here
+/// through the holder's progress report; a command refuses), and comes
+/// back as the holder's refusal when it is not approved.
 /// Without a holder listening, `locked` is the error. Piped data cannot
 /// be loaded into a workspace this process does not hold, so a statement
 /// that names `stdin` is refused.
@@ -2698,7 +2732,13 @@ async fn run_query_through_holder(
     locked: anyhow::Error,
 ) -> Result<()> {
     let workspace_dir = opened.config().workspace_dir(opened.workspace.id.as_str());
-    let Some(client) = HolderClient::connect(&workspace_dir, &opened.workspace.id).await? else {
+    let Some(client) = HolderClient::connect_with(
+        &workspace_dir,
+        &opened.workspace.id,
+        CommandClient::new("quack -q", report_to_stderr),
+    )
+    .await?
+    else {
         return Err(locked);
     };
     if wait_for_stdin || sql.to_ascii_lowercase().contains("stdin") {
@@ -2753,6 +2793,19 @@ impl IngestArgs {
 }
 
 async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
+    let opened =
+        OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::command("ingest")).await?;
+    let ran = ingest(&opened, args).await;
+    // The file or folder is done, whatever the outcome: the recorded run's
+    // last snapshot reaches the file, a graph follow-up the ingest queued
+    // finishes, the socket closes, and the writer checkpoints.
+    opened.finish(FOLLOW_UP_GRACE).await;
+    ran
+}
+
+/// `quack ingest` on an open workspace: one file, a folder, or a bundle.
+/// Every handle is dropped by the time it returns.
+async fn ingest(opened: &OpenedWorkspace, args: IngestArgs) -> Result<()> {
     let per_file = args.per_file();
     let IngestArgs {
         file,
@@ -2767,14 +2820,12 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
         tags,
         types,
     } = args;
-    let opened =
-        OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::command("ingest")).await?;
     let config = opened.config();
 
     if let StdioPath::Path(dir) = &file
         && dir.is_dir()
     {
-        return ingest_dir(&opened, dir, per_file, no_embed, prune).await;
+        return ingest_dir(opened, dir, per_file, no_embed, prune).await;
     }
     if prune {
         anyhow::bail!("--prune goes with a folder");
@@ -2837,7 +2888,7 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     .await;
     let outcome = outcome.context("ingestion failed")?;
     finish_file_ingest(
-        &opened,
+        opened,
         ws_db,
         embedding_model.as_ref(),
         outcome,

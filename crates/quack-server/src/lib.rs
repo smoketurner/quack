@@ -166,10 +166,13 @@ pub(crate) fn throttled_login(
     route.layer(GovernorLayer::new(config))
 }
 
+/// The most a request body may carry unless its route takes a file: a
+/// statement, a question, a form, an ontology, the workspace context. A
+/// larger body is 413 before anything reads it; the upload routes carry
+/// `App::upload_body_limit` instead.
+pub(crate) const JSON_BODY_BYTES: usize = 1024 * 1024;
+
 pub(crate) fn router(app: App) -> Router {
-    let upload_limit = usize::try_from(app.engine.config.ingestion.upload_max_mb)
-        .unwrap_or(usize::MAX)
-        .saturating_mul(1024 * 1024);
     let governor = GovernorConfigBuilder::default()
         .period(RATE_PERIOD)
         .burst_size(RATE_BURST)
@@ -224,7 +227,7 @@ pub(crate) fn router(app: App) -> Router {
         .merge(web::assets())
         .merge(limited)
         .layer(axum::middleware::map_response(security_headers))
-        .layer(DefaultBodyLimit::max(upload_limit))
+        .layer(DefaultBodyLimit::max(JSON_BODY_BYTES))
         .layer(axum::middleware::from_fn(record_request))
         // One span per request, carrying the id the request-id layer set
         // (it is the outer layer, so the header exists here); the response

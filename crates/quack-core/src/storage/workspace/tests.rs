@@ -334,6 +334,75 @@ fn workspace_connection_is_confined_to_its_directory_and_locked() {
     // Ordinary statements are untouched.
     assert!(db.execute_statement("CREATE TABLE t(a INT)").is_ok());
     assert!(db.execute_query("SELECT * FROM t").is_ok());
+    // No extension is fetched or loaded on a statement's behalf.
+    for setting in [
+        "autoinstall_known_extensions",
+        "autoload_known_extensions",
+        "allow_community_extensions",
+    ] {
+        let value = db
+            .execute_query(&format!(
+                "SELECT value FROM duckdb_settings() WHERE name = '{setting}'"
+            ))
+            .unwrap_or_else(|e| fail(&e.to_string()));
+        assert_eq!(
+            value.rows.first().and_then(|r| r.first()),
+            Some(&serde_json::Value::String(String::from("false"))),
+            "{setting}"
+        );
+    }
+}
+
+/// Typed SQL may not control the shared writer's transaction (a `ROLLBACK`
+/// would discard other clients' writes) or read the server's catalog (the
+/// workspace file's path, the settings); a name inside a string literal
+/// is text, not a call. The statement's own classification is untouched.
+#[test]
+fn typed_sql_refuses_transaction_control_and_the_servers_catalog() {
+    use crate::storage::workspace::TypedSql;
+
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let db =
+        WorkspaceDb::open(&config_in(dir.path()), "ws").unwrap_or_else(|e| fail(&e.to_string()));
+    for (sql, why) in [
+        ("BEGIN TRANSACTION", TypedSql::TransactionControl),
+        ("begin", TypedSql::TransactionControl),
+        ("START TRANSACTION", TypedSql::TransactionControl),
+        ("COMMIT", TypedSql::TransactionControl),
+        ("ROLLBACK;", TypedSql::TransactionControl),
+        ("SELECT 1; ROLLBACK", TypedSql::TransactionControl),
+        ("-- a comment\nABORT", TypedSql::TransactionControl),
+        ("PRAGMA database_list", TypedSql::ServerCatalog),
+        ("SELECT * FROM duckdb_databases()", TypedSql::ServerCatalog),
+        (
+            "SELECT current_setting('allowed_directories')",
+            TypedSql::ServerCatalog,
+        ),
+        (
+            "SELECT name FROM duckdb_settings()",
+            TypedSql::ServerCatalog,
+        ),
+        ("CALL pragma_database_list()", TypedSql::ServerCatalog),
+        ("SELECT * FROM duckdb_extensions()", TypedSql::ServerCatalog),
+    ] {
+        assert_eq!(TypedSql::refusal(sql), Some(why), "{sql}");
+        let refused = db.classify_user_statement(sql).err().map(|e| e.to_string());
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|e| e.ends_with(&why.to_string())),
+            "{sql}: {refused:?}"
+        );
+    }
+    for sql in [
+        "SELECT 'BEGIN' AS word",
+        "SELECT 'duckdb_settings()' AS text",
+        "SELECT * FROM beginnings",
+        "SELECT end_date FROM t",
+        "DESCRIBE t",
+    ] {
+        assert_eq!(TypedSql::refusal(sql), None, "{sql}");
+    }
 }
 
 /// Proof-of-concept for the reader connection: `try_clone`

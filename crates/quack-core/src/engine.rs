@@ -154,7 +154,11 @@ pub enum Stop {
 
 /// Something a stopping process waits for beside its jobs: the workspace
 /// socket's sessions, an HTTP server's open requests. The crate that owns
-/// it is above `quack-core`, so it is passed in as a future.
+/// it is above `quack-core`, so it is passed in as a future. A drain
+/// bounds itself (the socket's close waits for its sessions under the
+/// grace, the HTTP drain under the server's): [`Engine::shutdown`] awaits
+/// it whole, with no timeout of its own, since a stop under a zero grace
+/// (every one-shot command) must still close the socket cleanly.
 pub type Drain = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// How long [`Engine::close`] waits for the recorder to write what is
@@ -608,12 +612,13 @@ impl Engine {
     /// The one stop sequence of a process (design doc 4.1): begin the stop
     /// (everything watching [`Self::stopping`] ends: a server's drain
     /// starts, its streams and the MCP event streams end), then end the
-    /// jobs as `how` says while `drains` run (the workspace socket's
-    /// sessions, the HTTP server's open requests, in that order), both
-    /// under `grace`, then close the workspaces so each writer checkpoints.
-    /// Every entry point calls this: a command's `OpenedWorkspace::finish`,
-    /// the terminal session's quit, `quack serve`'s signal. Returns the jobs
-    /// still active when the grace ran out.
+    /// jobs as `how` says under `grace` while `drains` run whole (the
+    /// workspace socket's sessions, the HTTP server's open requests, in
+    /// that order; each bounds itself, see [`Drain`]), then close the
+    /// workspaces so each writer checkpoints. Every entry point calls this:
+    /// a command's `OpenedWorkspace::finish`, the terminal session's quit,
+    /// `quack serve`'s signal. Returns the jobs still active when the grace
+    /// ran out.
     pub async fn shutdown(&self, how: Stop, grace: Duration, drains: Vec<Drain>) -> Vec<JobInfo> {
         self.begin_stop();
         let jobs = async {
@@ -627,13 +632,7 @@ impl Engine {
                 drain.await;
             }
         };
-        let (left, drained) = tokio::join!(jobs, tokio::time::timeout(grace, drained));
-        if drained.is_err() {
-            tracing::warn!(
-                grace_seconds = grace.as_secs(),
-                "the stop's drains did not end within the grace"
-            );
-        }
+        let (left, ()) = tokio::join!(jobs, drained);
         self.close().await;
         left
     }

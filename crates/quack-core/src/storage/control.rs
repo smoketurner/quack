@@ -15,6 +15,7 @@ use sqlx::{FromRow, Row, SqlitePool};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
+use unicode_properties::{GeneralCategory, GeneralCategoryGroup, UnicodeGeneralCategory};
 
 use jiff::{SignedDuration, Timestamp};
 
@@ -43,10 +44,13 @@ use crate::vault::Sealed;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// A name a new workspace may take: trimmed, non-empty, and without `/`,
-/// `\`, `.`, or a control character (a newline would break every one-line
-/// rendering of it: `quack workspace list`'s columns, the banner, the
-/// console, the audit rows). Lookups take plain text, since older rows
-/// predate the rule.
+/// `\`, `.`, or a character that is not printable on one line: a control
+/// (a newline would break every one-line rendering of it: `quack workspace
+/// list`'s columns, the banner, the console, the audit rows), the Unicode
+/// line and paragraph separators (line breaks to JavaScript and JSON), a
+/// format character (a bidi override or a zero-width space makes two names
+/// look alike), a surrogate, a private-use or an unassigned code point.
+/// Lookups take plain text, since older rows predate the rule.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct WorkspaceName(String);
@@ -56,6 +60,24 @@ impl WorkspaceName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether `c` has no printable one-line form: Unicode general
+    /// category `Cc`, `Cf`, `Cs`, `Co`, `Cn` (the `Other` group), `Zl`,
+    /// or `Zp`.
+    fn unprintable(c: char) -> bool {
+        match c.general_category_group() {
+            GeneralCategoryGroup::Other => true,
+            GeneralCategoryGroup::Separator => matches!(
+                c.general_category(),
+                GeneralCategory::LineSeparator | GeneralCategory::ParagraphSeparator
+            ),
+            GeneralCategoryGroup::Letter
+            | GeneralCategoryGroup::Mark
+            | GeneralCategoryGroup::Number
+            | GeneralCategoryGroup::Punctuation
+            | GeneralCategoryGroup::Symbol => false,
+        }
+    }
 }
 
 impl FromStr for WorkspaceName {
@@ -63,7 +85,7 @@ impl FromStr for WorkspaceName {
 
     fn from_str(name: &str) -> Result<Self> {
         let name = name.trim();
-        if name.is_empty() || name.contains(['/', '\\', '.']) || name.contains(char::is_control) {
+        if name.is_empty() || name.contains(['/', '\\', '.']) || name.contains(Self::unprintable) {
             return Err(Error::InvalidWorkspaceName);
         }
         Ok(Self(name.to_owned()))
@@ -1522,30 +1544,31 @@ impl ControlPlane {
     }
 
     /// The workspace a command line runs in: the one it `named`, which
-    /// must exist, or `default`. The default is created, audited on the
-    /// `cli` channel, the first time it is used, so a new install needs no
-    /// setup step. When two processes use it first at once, one creates it
-    /// and the other opens that row.
+    /// must exist (whatever the name, the configured default's included:
+    /// after a rename, `-w default` must not quietly make a second one), or
+    /// with no name `default`, created, audited on the `cli` channel, the
+    /// first time it is used, so a new install needs no setup step. When
+    /// two processes use it first at once, one creates it and the other
+    /// opens that row.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NoWorkspaceNamed`] for a named workspace other than
-    /// the default that does not exist, or an error if a query fails.
+    /// Returns [`Error::NoWorkspaceNamed`] for a named workspace that does
+    /// not exist, or an error if a query fails.
     pub async fn workspace_or_default(
         &self,
         named: Option<&str>,
         default: &WorkspaceName,
     ) -> Result<WorkspaceRow> {
-        let name = named.unwrap_or(default.as_str());
-        if name != default.as_str() {
+        if let Some(name) = named {
             return self.workspace_named(name).await;
         }
-        if let Some(ws) = self.find_workspace_by_name(name).await? {
+        if let Some(ws) = self.find_workspace_by_name(default.as_str()).await? {
             return Ok(ws);
         }
         let audit = AuditEntry::new(AuditAction::Workspace, Outcome::Allowed, Channel::Cli);
         match self.create_workspace(default, None, audit).await {
-            Err(Error::WorkspaceExists(_)) => self.workspace_named(name).await,
+            Err(Error::WorkspaceExists(_)) => self.workspace_named(default.as_str()).await,
             created => created,
         }
     }

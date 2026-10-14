@@ -97,6 +97,57 @@ fn a_sessions_job_rows_go_with_it_title_included() {
     assert_eq!(left, ["which vendors are late?", "title session s2"]);
 }
 
+/// The process that deleted a session stops listing its finished jobs at
+/// once (its turns quote the questions), by the same lane keys the file's
+/// rows go by; another session's jobs stay.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test")]
+fn forgetting_a_session_drops_its_finished_jobs_from_the_listing() {
+    let workspace = WorkspaceId::from("ws");
+    let (mine, other) = (SessionId::from("s1"), SessionId::from("s2"));
+    let row = |id: &str, kind: JobKind, label: &str, lane: &LaneKey| JobInfo {
+        id: id.parse().unwrap(),
+        number: JobNumber::default(),
+        kind,
+        label: String::from(label),
+        workspace_id: Some(workspace.clone()),
+        owner: None,
+        lane: Some(lane.to_string()),
+        state: JobState::Succeeded,
+        progress: None,
+        status: None,
+        outcome: None,
+        queued_at: Timestamp::now(),
+        started_at: None,
+        finished_at: Some(Timestamp::now()),
+        cancel_requested: false,
+    };
+    let queue = JobQueue::new(10);
+    queue.restore(vec![
+        row(
+            "0199d1f0-0000-7000-8000-000000000001",
+            JobKind::Chat,
+            "how many claims are open?",
+            &LaneKey::Session(mine.clone()),
+        ),
+        row(
+            "0199d1f0-0000-7000-8000-000000000002",
+            JobKind::Title,
+            "title session s1",
+            &LaneKey::SessionTitle(mine.clone()),
+        ),
+        row(
+            "0199d1f0-0000-7000-8000-000000000003",
+            JobKind::Chat,
+            "which vendors are late?",
+            &LaneKey::Session(other),
+        ),
+    ]);
+    queue.forget_session(&mine);
+    let left: Vec<String> = queue.list().into_iter().map(|job| job.label).collect();
+    assert_eq!(left, ["which vendors are late?"]);
+}
+
 #[test]
 fn progress_ratio_stays_between_zero_and_one() {
     let ratio = |done, total| JobProgress { done, total }.ratio();

@@ -115,9 +115,13 @@ pub(crate) fn answer_keys() -> String {
 }
 
 /// The answers a socket turn's write takes: `y` and `n`, never `a` (a
-/// grant for the rest of a turn is for the session's own turns).
+/// grant for the rest of a turn is for the session's own turns), typed on
+/// an empty line; a command or question typed meanwhile goes through.
 fn socket_answer_keys() -> String {
-    keys_of(&[Decision::Allow, Decision::Deny])
+    format!(
+        "{}   (on an empty line; /cancel N and other commands work meanwhile)",
+        keys_of(&[Decision::Allow, Decision::Deny])
+    )
 }
 
 fn keys_of(choices: &[Decision]) -> String {
@@ -322,16 +326,19 @@ enum Prompt {
 }
 
 /// Whose turn asked for a write: this session's own, or another
-/// process's over the workspace socket (`quack mcp`), whose prompt takes
+/// process's over the workspace socket (`quack -q`, `quack mcp`), whose prompt takes
 /// no key for a moment after it appears (a key typed as it lands must not
 /// approve it), offers no `a`, and times out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WriteOrigin {
     Session,
-    /// A write another process asked over the workspace socket: `shown`
-    /// guards the keys for a moment after it appears; `expires` is the
-    /// deadline core put on the ask, after which it is already refused.
+    /// A write another process asked over the workspace socket: `client`
+    /// is who, as its MCP `initialize` named it (`quack -q`, `quack mcp`,
+    /// an editor's own name); `shown` guards the keys for a moment after
+    /// it appears; `expires` is the deadline core put on the ask, after
+    /// which it is already refused.
     Socket {
+        client: String,
         shown: Instant,
         expires: Instant,
     },
@@ -1522,8 +1529,8 @@ impl App {
                             ),
                         answer_keys(),
                     ),
-                    WriteOrigin::Socket { .. } => (
-                        format!("quack mcp (job #{})", job.number),
+                    WriteOrigin::Socket { client, .. } => (
+                        format!("{client} (job #{})", job.number),
                         socket_answer_keys(),
                     ),
                 };
@@ -1713,6 +1720,7 @@ impl App {
         let Asked {
             job,
             session,
+            client,
             request,
             expires_at,
         } = asked;
@@ -1730,7 +1738,7 @@ impl App {
         self.note(
             MessageKind::System,
             format!(
-                "quack mcp (job #{number}{session}): {}\n{}\n{notice}{}",
+                "{client} (job #{number}{session}): {}\n{}\n{notice}{}",
                 Decision::HEADING,
                 request.sql,
                 socket_answer_keys()
@@ -1740,6 +1748,7 @@ impl App {
             job: Ticket { id: job, number },
             request,
             origin: WriteOrigin::Socket {
+                client,
                 shown: Instant::now(),
                 expires: expires_at,
             },
@@ -1758,13 +1767,16 @@ impl App {
                 Prompt::Write {
                     job,
                     request,
-                    origin: WriteOrigin::Socket { expires, .. },
+                    origin:
+                        WriteOrigin::Socket {
+                            client, expires, ..
+                        },
                 } if expires <= now => {
                     request.deny();
                     self.messages.push(Message::new(
                         MessageKind::System,
                         format!(
-                            "quack mcp (job #{}): nobody answered in time; not run.",
+                            "{client} (job #{}): nobody answered in time; not run.",
                             job.number
                         ),
                     ));
@@ -1991,7 +2003,7 @@ impl App {
                 }
             }
         }
-        if self.awaiting_permission() {
+        if self.awaiting_permission() && self.prompt_takes(code) {
             self.handle_permission_key(code);
             return;
         }
@@ -2050,6 +2062,34 @@ impl App {
                 self.history.leave();
             }
         }
+    }
+
+    /// Whether the front prompt takes `code`. The session's own prompts
+    /// take every key. Another process's write (over the workspace socket)
+    /// takes only its answer, `y`, `n`, or Esc, typed on an empty input
+    /// line: anything else is the person's own command or question
+    /// (`/cancel N` refuses the write), which goes to the input as usual,
+    /// so a `/cancel` is never cut at its `n` and the rest sent to the
+    /// model.
+    fn prompt_takes(&self, code: KeyCode) -> bool {
+        let socket = matches!(
+            self.prompts.front(),
+            Some(Prompt::Write {
+                origin: WriteOrigin::Socket { .. },
+                ..
+            })
+        );
+        if !socket {
+            return true;
+        }
+        let answer = match code {
+            KeyCode::Esc => true,
+            KeyCode::Char(key) => [Decision::Allow, Decision::Deny]
+                .into_iter()
+                .any(|decision| answer_key(decision) == key.to_ascii_lowercase()),
+            _ => false,
+        };
+        answer && self.textarea.is_empty()
     }
 
     /// The answer a key gives to the front prompt, if it is one: `y`,
@@ -2845,10 +2885,12 @@ impl App {
             ),
             Deletion::Session { id, title } => {
                 let current = id == self.session_id;
+                let forget = id.clone();
                 self.on_db_ok(
                     Side::Write,
                     move |db| sessions::delete_session(db, &id),
                     move |app, _| {
+                        app.jobs.forget_session(&forget);
                         app.note(
                             MessageKind::System,
                             format!("Deleted the session '{title}'."),

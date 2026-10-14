@@ -19,6 +19,7 @@ use quack_core::storage::control::{
     AuditAction, Membership, Outcome, ProviderAllowList, ResourceKind, Role, Standing, UserKind,
     WorkspaceChanges, WorkspaceName, WorkspaceRow,
 };
+use quack_mcp::client::HeldElsewhere;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use utoipa::ToSchema;
@@ -432,6 +433,11 @@ impl Access {
     pub(crate) async fn delete_workspace(&self, app: &App) -> ApiResult<()> {
         let id = &self.membership.workspace.id;
         app.close_workspace(id).await?;
+        // The server's own hold is closed above; another process's is a
+        // refusal naming it, since a delete under it would lose its writes.
+        if let Some(held) = HeldElsewhere::before_delete(&app.engine.config, id).await {
+            return Err(ApiError::conflict(held.to_string()));
+        }
         let entry = self.entry(AuditAction::Delete, Outcome::Allowed);
         app.control.delete_workspace(id, entry).await?;
         let dir = app.engine.config.workspace_dir(id.as_str());

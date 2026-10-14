@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use quack_core::analysis::permissions::Approvals;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
-use quack_core::engine::Engine;
+use quack_core::engine::{Drain, Engine};
 use quack_core::ids::{SessionId, WorkspaceId};
 
 /// Everything a terminal session starts from: the process's engine (its
@@ -59,7 +59,17 @@ pub enum WebStatus {
 /// its drain, to end.
 pub const QUIT_GRACE: Duration = Duration::from_secs(3);
 
-/// Run the terminal session against a resolved workspace until the user quits.
+/// What a quitting session waits for before the tty is handed back: one
+/// line saying what, and the process's stop sequence (`OpenedWorkspace::stop`:
+/// the jobs, the socket's statements, the web server's requests, the
+/// writer's checkpoint). Built when the loop ends, so the line counts what
+/// is in flight then.
+pub type Quitting = Box<dyn FnOnce() -> (String, Drain) + Send>;
+
+/// Run the terminal session against a resolved workspace until the user
+/// quits, then `quitting`'s stop sequence with the tty still raw: a key
+/// typed meanwhile (a second Ctrl-C) is a key, not a signal to the
+/// process group, and nothing is echoed to the restored shell.
 ///
 /// # Errors
 ///
@@ -68,7 +78,7 @@ pub const QUIT_GRACE: Duration = Duration::from_secs(3);
 /// and every slash command, and a question says how to configure one;
 /// without an embedding model document search is keyword-only, as in print
 /// mode and the web.
-pub async fn run(setup: SessionSetup) -> Result<()> {
+pub async fn run(setup: SessionSetup, quitting: Quitting) -> Result<()> {
     let mut tui_app = app::App::new(setup);
     tui_app.load_current_session().await?;
     tui_app.load_input_history().await?;
@@ -84,6 +94,8 @@ pub async fn run(setup: SessionSetup) -> Result<()> {
     let paste =
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste).is_ok();
     let result = tui_app.run(&mut terminal).await;
+    let (waiting_for, stop) = quitting();
+    wait_to_quit(&mut terminal, &waiting_for, stop).await;
     if paste {
         drop(crossterm::execute!(
             std::io::stdout(),
@@ -98,4 +110,40 @@ pub async fn run(setup: SessionSetup) -> Result<()> {
     }
     drop(ratatui::try_restore());
     result
+}
+
+/// Show what the quit waits for and await `stop`, reading the keys
+/// meanwhile so none reaches the shell; a Ctrl-C typed now says the stop
+/// is still finishing (it ends under its own grace; nothing cuts the
+/// writer's checkpoint short).
+async fn wait_to_quit(terminal: &mut ratatui::DefaultTerminal, waiting_for: &str, stop: Drain) {
+    use futures::StreamExt as _;
+    use ratatui::widgets::Paragraph;
+
+    let show = |terminal: &mut ratatui::DefaultTerminal, line: &str| {
+        drop(terminal.draw(|frame| {
+            frame.render_widget(Paragraph::new(line), frame.area());
+        }));
+    };
+    show(terminal, waiting_for);
+    let mut input = crossterm::event::EventStream::new();
+    tokio::pin!(stop);
+    loop {
+        tokio::select! {
+            () = &mut stop => break,
+            event = input.next() => match event {
+                Some(Ok(crossterm::event::Event::Key(key)))
+                    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                        && matches!(key.code, crossterm::event::KeyCode::Char('c' | 'q')) =>
+                {
+                    show(terminal, &format!("{waiting_for}\nStill finishing; a moment more."));
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => {
+                    stop.await;
+                    break;
+                }
+            },
+        }
+    }
 }

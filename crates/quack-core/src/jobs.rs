@@ -863,6 +863,31 @@ impl JobQueue {
         registry.evict_past(self.inner.history);
     }
 
+    /// Forget a deleted session's finished jobs (its turns, whose labels
+    /// quote the questions, and its title), the way
+    /// `jobs::store::delete_session_jobs` removes their rows from the
+    /// file, so the process that deleted the session stops listing them
+    /// at once. A job of the session still active ends normally and is
+    /// evicted with the rest of the history.
+    pub fn forget_session(&self, session: &SessionId) {
+        let lanes = [
+            LaneKey::Session(session.clone()).to_string(),
+            LaneKey::SessionTitle(session.clone()).to_string(),
+        ];
+        let mut registry = self.inner.registry();
+        let Registry { order, jobs, .. } = &mut *registry;
+        order.retain(|id| {
+            let forget = jobs.get(id).is_some_and(|e| {
+                e.info.state.is_finished()
+                    && e.info.lane.as_ref().is_some_and(|l| lanes.contains(l))
+            });
+            if forget {
+                jobs.remove(id);
+            }
+            !forget
+        });
+    }
+
     /// Every job remembered, in submission order.
     #[must_use]
     pub fn list(&self) -> Vec<JobInfo> {

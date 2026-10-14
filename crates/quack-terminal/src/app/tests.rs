@@ -677,6 +677,58 @@ async fn the_overlay_shows_a_pending_agent_write_after_the_transcript_clears() {
     assert!(!pending.await.unwrap_or_else(|e| fail(&e.to_string())));
 }
 
+/// Another process's write waits at the prompt without taking the
+/// keyboard: `/cancel N` typed meanwhile reaches the input whole (its
+/// `n` is not the answer), and `y` or `n` on an empty line answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_socket_prompt_takes_its_answer_only_on_an_empty_line() {
+    use quack_core::analysis::events::PermissionRequest;
+
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut app = app(dir.path());
+    let (request, answered) =
+        PermissionRequest::new(String::from("DROP TABLE t"), Hold::NotPermitted);
+    let job = "0199d1f0-0000-7000-8000-0000000000bb"
+        .parse::<JobId>()
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    app.prompts.push_back(Prompt::Write {
+        job: Ticket {
+            id: job,
+            number: JobNumber::default(),
+        },
+        request,
+        origin: WriteOrigin::Socket {
+            client: String::from("quack -q"),
+            shown: Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now),
+            expires: Instant::now()
+                .checked_add(Duration::from_secs(60))
+                .unwrap_or_else(Instant::now),
+        },
+    });
+    let drawn = overlay(&app);
+    assert!(drawn.contains("quack -q (job #"), "{drawn}");
+
+    for key in "/cancel 30".chars() {
+        app.handle_key_event(KeyCode::Char(key), KeyModifiers::NONE);
+    }
+    assert!(
+        app.awaiting_permission(),
+        "the n in cancel answered the prompt"
+    );
+    assert_eq!(app.textarea.lines(), ["/cancel 30"]);
+
+    app.handle_key_event(KeyCode::Char('u'), KeyModifiers::CONTROL);
+    assert!(app.textarea.is_empty());
+    app.handle_key_event(KeyCode::Char('n'), KeyModifiers::NONE);
+    assert!(!app.awaiting_permission());
+    assert_eq!(
+        answered.await.unwrap_or_else(|e| fail(&e.to_string())),
+        Decision::Deny
+    );
+}
+
 /// Writes allowed for the session (`--allow-write`) still ask once a turn
 /// has read document text, and the prompt says why.
 #[tokio::test(flavor = "multi_thread")]

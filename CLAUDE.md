@@ -92,11 +92,11 @@ data-layer, crypto, or dependency change:
 
 ```bash
 cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # SQL, no agent
-#   on a workspace another quack process holds (the terminal, a command), the statement runs through that process's MCP `sql` tool over its workspace socket (quack_core::forward, quack_mcp::client) and says so on stderr; a write is the holder's refusal, naming it
+#   on a workspace another quack process holds (the terminal, a command), the statement runs through that process's MCP `sql` tool over its workspace socket (quack_core::forward, quack_mcp::client) and says so on stderr; a write waits for the holder's decision (the terminal session asks at its prompt, named for the client, and -q says on stderr where it waits and for how long; a command refuses) and comes back as the holder's refusal when not approved
 cargo run --bin quack -- jobs [--format json]                                 # the workspace's jobs: what runs, what ran and how it ended (_quack_jobs; restored on open); through the holder's quack://workspace/jobs when another quack holds it
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
 cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use
-cargo run --bin quack -- workspace rename OLD NEW | delete NAME [-y] | snapshot NAME [--to FILE|-] | restore FILE|- [--name N]   # storage::backup: one tar (manifest.json, data.duckdb, files/); delete is at once, the audit rows stay
+cargo run --bin quack -- workspace rename OLD NEW | delete NAME [-y] | snapshot NAME [--to FILE|-] | restore FILE|- [--name N]   # storage::backup: one tar (manifest.json, data.duckdb, files/); delete is at once (refused, naming the holder, while another process holds the workspace: the socket's answer, else the file's lock), the audit rows stay; rename notes a holder, which keeps the old name until restarted
 cargo run --bin quack -- ingest sales.csv -w ws [--replace [ID]] [--types amount=DOUBLE]   # file -> table(s) or chunks; --replace supersedes the document with the same name (or ID) once the new one is ready; --types retypes columns strictly after the load; an image needs [ingestion].vision_model
 cargo run --bin quack -- ingest DIR -w ws [--prune]                            # every supported file under DIR (not a bundle), root and path recorded; re-run skips unchanged, replaces changed, reports gone files of that root (--prune deletes them)
 #   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet), YAML that is a list of records; chunks: PDF, Markdown, text, HTML, DOCX/DOC, PPTX/PPT, EPUB, ODT, EML/MBOX, VTT/SRT, source code, RTF, other YAML
@@ -105,7 +105,7 @@ cargo run --bin quack -- tables [TABLE [--note TEXT] [--retype COL=TYPE]] [--for
 cargo run --bin quack -- docs [--tag ID TAG | --untag ID TAG | --author ID NAME | --authored ID DATE]   # a document's own fields; PATCH .../documents/{doc} over REST
 cargo run --bin quack -- -p "question" -w ws [-f text|json] [--documents DOC,..]   # one agent turn; steps on stderr; --documents limits it to those documents
 cargo run --bin quack -- search QUERY -w ws [--in DOC..] [--keyword|--vector] [--explain] [-f text|json]   # analysis::search::DocumentSearch without the model: each hit's vector, keyword, and rerank rank
-cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY); serves the web UI, REST API, and MCP for that workspace on 127.0.0.1 at [server].bind's port (a random one when unset) beside it (quack_server::Server over the session's engine; local mode answers loopback Host names only)
+cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY); serves the web UI, REST API, and MCP for that workspace on 127.0.0.1 at [server].bind's port (a random one when unset) beside it (quack_server::Server over the session's engine; local mode answers loopback Host names only); its quit keeps the tty raw, showing what it waits for, until the stop sequence ends, so a second Ctrl-C is a key and not a signal to the shell
 cargo run --bin quack -- sessions [--search TEXT] | export ID [--sql]          # sessions live in the workspace file; /rename, /sessions TEXT, and /resume TITLE in the terminal; [analysis].title_sessions has the model title them
 cargo run --bin quack -- saved list | add NAME --from-session ID | run NAME [--refresh] [--exit-code] | show NAME | remove NAME   # an answer's SQL re-run without the model; exit 5 when changed; cron schedules it
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
@@ -482,7 +482,9 @@ table, BM25 with `tokenize`, plus cosine over card vectors in `_quack_table_card
 refreshed at turn start, which hands its cards to the ranking, fused by RRF). The graph is readable in SQL through `graph::views` (issue #406):
 `graph_<class>` with one typed column per property and `graph_edges`, made by `views::ensure` at
 every ontology save and open, marked by a comment; `table_search::user_tables` is
-`list_tables` without them. A write naming `graph_` is refused (`views::write_names_reserved`),
+`list_tables` without them. A write naming `graph_` is refused (`views::write_names_reserved`), and typed SQL that is transaction
+control or names the server's catalog (`database_list`, `duckdb_settings`, `current_setting`, ...) is refused by
+its tokens (`storage::workspace::TypedSql`),
 and ingest and import refuse `graph_` and `_quack_` table names (`TableName::check_unreserved`).
 
 Every embedding goes through `quack_core::embedding::Embedder` as an `Input`, which names
