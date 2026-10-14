@@ -3161,6 +3161,57 @@ async fn a_session_server_serves_only_the_held_workspace() {
     let (status, body) = get(format!("/api/v1/workspaces/{other}/tables")).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["code"], "not_found");
+    // Creating a workspace here is refused: this server could never serve
+    // it. The console hides its form the same way.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/workspaces")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"name":"viaweb"}"#))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert_eq!(body["code"], "conflict", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("quack workspace create")),
+        "{body}"
+    );
+    let names: Vec<String> = h
+        .app
+        .control
+        .list_workspaces()
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .into_iter()
+        .map(|w| w.name)
+        .collect();
+    assert_eq!(names, vec!["mine", "other"], "nothing was created");
+    let page = Request::builder()
+        .method(Method::GET)
+        .uri("/workspaces")
+        .body(Body::empty())
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let response = router
+        .oneshot(page)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let html = String::from_utf8_lossy(&html);
+    assert!(!html.contains("New workspace"), "the create form is shown");
+    assert!(html.contains("quack workspace create"), "{html}");
     session.close().await;
     session.engine.close().await;
 }

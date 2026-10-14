@@ -298,6 +298,9 @@ struct WorkspacesPage {
     page: Page,
     workspaces: Vec<WsItem>,
     can_create: bool,
+    /// A terminal session serving beside itself: its one workspace, and
+    /// no form to create another, which it could never serve.
+    serves_one: bool,
     error: Option<String>,
 }
 
@@ -1286,7 +1289,8 @@ async fn workspaces(
             .collect()
     };
     html(&WorkspacesPage {
-        can_create: identity.kind == UserKind::Admin,
+        can_create: identity.kind == UserKind::Admin && app.engine.held().is_none(),
+        serves_one: app.engine.held().is_some(),
         page: Page::new(&app, &identity, Tab::Workspaces),
         workspaces: items,
         error: flash.error(),

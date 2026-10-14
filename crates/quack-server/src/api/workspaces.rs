@@ -125,6 +125,17 @@ impl Identity {
     /// (in local mode everyone already is).
     pub(crate) async fn create_workspace(&self, app: &App, name: &str) -> ApiResult<WorkspaceRow> {
         self.require_admin()?;
+        // A terminal session serving beside itself serves its one workspace:
+        // a workspace created here could never be reached here.
+        if let Some(held) = app.engine.held() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "this server serves the workspace of the terminal session ({held}) alone; \
+                     create workspaces with `quack workspace create`"
+                ),
+            ));
+        }
         let name: WorkspaceName = name.parse()?;
         let owner = (app.mode == ServeMode::Login).then_some(&self.user_id);
         let entry = self.audit(AuditAction::Workspace, Outcome::Allowed);

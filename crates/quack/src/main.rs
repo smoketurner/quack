@@ -23,8 +23,9 @@ use quack_core::graph::export::Destination;
 use quack_core::graph::follow_up::FollowUp;
 use quack_core::ids::DocumentId;
 use quack_core::ingestion::parser::PageCounts;
-use quack_core::ingestion::tree::{FileResult, Folder, Outcome, Prune};
+use quack_core::ingestion::tree::{FileResult, Folder, FolderReport, Outcome, Prune};
 use quack_core::ingestion::{self, IngestOutcome, IngestResult, NewFile, Piped};
+use quack_core::jobs::JobKind;
 use quack_core::llm::Embeddings;
 use quack_core::llm::egress::Egress;
 use quack_core::llm::oauth::{
@@ -60,7 +61,7 @@ use quack_cli::{AnswerTo, FOLLOW_UP_GRACE, PrintTurn, TurnOutcome};
 use quack_cli::{ExportFlags, ModeArg, QueryFormat};
 use quack_cli::{ImportAction, ImportArgs, ImportContext};
 use quack_cli::{NamedInput, StdioPath};
-use quack_cli::{OpenedWorkspace, SessionChoice, find_session, resolve_session};
+use quack_cli::{OpenedWorkspace, RecordedRun, SessionChoice, find_session, resolve_session};
 use quack_cli::{embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
 use quack_core::forward::Holder;
 use quack_mcp::client::HolderClient;
@@ -1357,6 +1358,9 @@ async fn run_export(cli: &Cli, session_id: String, format: ExportFormat) -> Resu
 /// A subcommand whose steps run on the workspace writer and whose report
 /// goes to stdout: the graph, ontology, and embeddings commands.
 trait WriterCommand {
+    /// What the run is recorded as in the workspace's jobs.
+    fn kind(&self) -> JobKind;
+
     async fn run(
         self,
         config: &Config,
@@ -1367,6 +1371,10 @@ trait WriterCommand {
 }
 
 impl WriterCommand for graph_cli::GraphAction {
+    fn kind(&self) -> JobKind {
+        JobKind::Graph
+    }
+
     async fn run(
         self,
         config: &Config,
@@ -1379,6 +1387,10 @@ impl WriterCommand for graph_cli::GraphAction {
 }
 
 impl WriterCommand for ontology_cli::OntologyAction {
+    fn kind(&self) -> JobKind {
+        JobKind::Ontology
+    }
+
     async fn run(
         self,
         config: &Config,
@@ -1391,6 +1403,10 @@ impl WriterCommand for ontology_cli::OntologyAction {
 }
 
 impl WriterCommand for embeddings_cli::EmbeddingsAction {
+    fn kind(&self) -> JobKind {
+        JobKind::Embeddings
+    }
+
     async fn run(
         self,
         config: &Config,
@@ -1403,6 +1419,10 @@ impl WriterCommand for embeddings_cli::EmbeddingsAction {
 }
 
 impl WriterCommand for ClassifyCommand {
+    fn kind(&self) -> JobKind {
+        JobKind::Classify
+    }
+
     async fn run(
         self,
         config: &Config,
@@ -1415,7 +1435,9 @@ impl WriterCommand for ClassifyCommand {
 }
 
 /// Run a writer command in the command line's workspace, its progress on
-/// stderr.
+/// stderr, recorded as a job of the workspace (`RecordedRun`), so `quack
+/// jobs` from another shell shows it running and the file keeps how it
+/// ended.
 async fn run_on_writer(
     cli: &Cli,
     verb: &'static str,
@@ -1424,6 +1446,12 @@ async fn run_on_writer(
     init_logging();
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::command(verb)).await?;
     let handle = opened.handle().await?;
+    let run = RecordedRun::start(
+        &opened.engine.jobs,
+        command.kind(),
+        RecordedRun::command_line(),
+        opened.workspace.id.clone(),
+    );
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     let progress = StderrProgress::new();
@@ -1433,15 +1461,32 @@ async fn run_on_writer(
             &handle.writer,
             &mut out,
             RunControl {
-                progress: &|done| progress.report(done),
+                progress: &|done| {
+                    progress.report(done);
+                    run.report(done);
+                },
                 cancel: None,
             },
         )
         .await;
+    drop(out);
+    run.finish(outcome_of(&ran, || String::from("done"))).await;
     drop(handle);
     opened.finish(Duration::ZERO).await;
     ran?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// A command's outcome as its job records it: `done` on success, the
+/// error's chain on failure.
+fn outcome_of<T, E: std::fmt::Display>(
+    ran: &std::result::Result<T, E>,
+    done: impl FnOnce() -> String,
+) -> std::result::Result<String, String> {
+    match ran {
+        Ok(_) => Ok(done()),
+        Err(e) => Err(format!("{e:#}")),
+    }
 }
 
 /// `quack saved ...`: the saved questions. A run that failed is the
@@ -1507,6 +1552,13 @@ impl ImportCommand {
             vault: &vault,
             db: &handle.writer,
         };
+        // Recorded as an `import` job of the workspace, like the server's.
+        let run = RecordedRun::start(
+            &opened.engine.jobs,
+            JobKind::Import,
+            RecordedRun::command_line(),
+            opened.workspace.id.clone(),
+        );
         let ran = match self.action {
             // Written to a buffer, then to stdout: the stdout lock is never
             // held across the action's awaits, and what it reported before
@@ -1519,6 +1571,7 @@ impl ImportCommand {
             }
             None => self.run.run(&context).await,
         };
+        run.finish(outcome_of(&ran, || String::from("done"))).await;
         drop(handle);
         opened.finish(Duration::ZERO).await;
         ran?;
@@ -2296,46 +2349,9 @@ async fn ingest_dir(
     ingest_folder(opened, dir, no_embed, prune).await
 }
 
-/// `quack ingest DIR` on a folder of files: every file quack can load
-/// becomes a document, one line each; a changed file replaces the document
-/// at its path, an unchanged one is skipped, unsupported files are listed,
-/// and documents whose file is gone are reported, or deleted with
-/// `--prune`. A file that fails is reported and fails the command once
-/// the rest have run.
-async fn ingest_folder(
-    opened: &OpenedWorkspace,
-    dir: &Path,
-    no_embed: bool,
-    prune: Prune,
-) -> Result<()> {
-    let (config, workspace_id) = (opened.config(), opened.workspace.id.as_str());
-    let handle = opened.handle().await?;
-    let ws_db: &Writer = &handle.writer;
-    let embedding_model = if no_embed {
-        None
-    } else {
-        Embeddings::from_config(config)
-            .await
-            .context("failed to build embedding model")?
-    };
-    let progress = StderrProgress::new();
-    let report = Folder {
-        config,
-        db: ws_db,
-        workspace_id,
-        root: dir,
-        embedder: embedding_model.as_ref(),
-        control: RunControl {
-            progress: &|done| progress.report(done),
-            cancel: None,
-        },
-        prune,
-    }
-    .run()
-    .await
-    .with_context(|| format!("ingesting {}", dir.display()))?;
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
+/// The lines `quack ingest DIR` prints for a folder: one per file, then
+/// the unsupported files and the documents whose file is gone.
+fn report_folder(out: &mut impl Write, dir: &Path, report: &FolderReport) -> Result<()> {
     for FileResult { relative, outcome } in &report.results {
         match outcome {
             Outcome::Ingested(id) => writeln!(out, "ingested  {relative} ({id})")?,
@@ -2382,6 +2398,65 @@ async fn ingest_folder(
             )?,
         }
     }
+    Ok(())
+}
+
+/// `quack ingest DIR` on a folder of files: every file quack can load
+/// becomes a document, one line each; a changed file replaces the document
+/// at its path, an unchanged one is skipped, unsupported files are listed,
+/// and documents whose file is gone are reported, or deleted with
+/// `--prune`. A file that fails is reported and fails the command once
+/// the rest have run.
+async fn ingest_folder(
+    opened: &OpenedWorkspace,
+    dir: &Path,
+    no_embed: bool,
+    prune: Prune,
+) -> Result<()> {
+    let (config, workspace_id) = (opened.config(), opened.workspace.id.as_str());
+    let handle = opened.handle().await?;
+    let ws_db: &Writer = &handle.writer;
+    let embedding_model = if no_embed {
+        None
+    } else {
+        Embeddings::from_config(config)
+            .await
+            .context("failed to build embedding model")?
+    };
+    let progress = StderrProgress::new();
+    let run = RecordedRun::start(
+        &opened.engine.jobs,
+        JobKind::Ingest,
+        format!("folder {}", dir.display()),
+        opened.workspace.id.clone(),
+    );
+    let report = Folder {
+        config,
+        db: ws_db,
+        workspace_id,
+        root: dir,
+        embedder: embedding_model.as_ref(),
+        control: RunControl {
+            progress: &|done| {
+                progress.report(done);
+                run.report(done);
+            },
+            cancel: None,
+        },
+        prune,
+    }
+    .run()
+    .await;
+    run.finish(outcome_of(&report, || {
+        report.as_ref().map_or(String::new(), |report| {
+            format!("{} files", report.results.len())
+        })
+    }))
+    .await;
+    let report = report.with_context(|| format!("ingesting {}", dir.display()))?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    report_folder(&mut out, dir, &report)?;
     out.flush()?;
     let stored: Vec<DocumentId> = report
         .results
@@ -2557,7 +2632,12 @@ async fn run_query(
         None => None,
     };
     // One step on the writer: the temp `stdin` table lives on that
-    // connection, so the statement runs where it was loaded.
+    // connection, so the statement runs where it was loaded. The statement
+    // passes the gate every typed statement passes (the terminal's direct
+    // SQL, the web SQL page, the holder's `sql` tool): internal tables and
+    // the reserved `graph_` and `_quack_` names are refused. Every row is
+    // written, since `-q` is the pipeline's export; the row cap is the
+    // interactive interfaces' (design doc 11).
     let config = opened.config().clone();
     let workspace_id = opened.workspace.id.as_str().to_owned();
     let sql = sql.to_owned();
@@ -2567,8 +2647,9 @@ async fn run_query(
             if let Some(data) = piped {
                 load_stdin_table(&config, db, &workspace_id, &data)?;
             }
+            let kind = db.classify_user_statement(&sql)?;
             let results = db.execute_query(&sql)?;
-            if db.classify_statement(&sql)? != StatementKind::Read
+            if kind != StatementKind::Read
                 && let Err(e) = TableProfile::refresh_stale(db)
             {
                 tracing::warn!(error = %e, "could not refresh table profiles after a write");
@@ -2716,6 +2797,14 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
             .context("failed to build embedding model")?
     };
 
+    // Recorded as an `ingest` job of the workspace, like an upload or the
+    // terminal's load, so `quack jobs` shows it and the file keeps its end.
+    let run = RecordedRun::start(
+        &opened.engine.jobs,
+        JobKind::Ingest,
+        effective_filename.clone(),
+        opened.workspace.id.clone(),
+    );
     let outcome = ingestion::ingest_file(
         config,
         ws_db,
@@ -2730,11 +2819,44 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
                 author,
                 authored_at: authored,
                 tags: (!tags.is_empty()).then_some(tags),
+            })
+            .control(RunControl {
+                progress: &|done| run.report(done),
+                cancel: None,
             }),
         embedding_model.as_ref(),
     )
+    .await;
+    run.finish(outcome_of(&outcome, || {
+        String::from(match &outcome {
+            Ok(IngestOutcome::Ingested(_)) => "ingested",
+            Ok(IngestOutcome::Duplicate(_)) => "skipped: identical bytes are already stored",
+            Err(_) => "",
+        })
+    }))
+    .await;
+    let outcome = outcome.context("ingestion failed")?;
+    finish_file_ingest(
+        &opened,
+        ws_db,
+        embedding_model.as_ref(),
+        outcome,
+        &effective_filename,
+        pin,
+    )
     .await
-    .context("ingestion failed")?;
+}
+
+/// After one file was ingested: say so (or that identical bytes were
+/// already stored), pin it when asked, and run the graph follow-up.
+async fn finish_file_ingest(
+    opened: &OpenedWorkspace,
+    ws_db: &Writer,
+    embedding_model: Option<&Embeddings>,
+    outcome: IngestOutcome,
+    effective_filename: &str,
+    pin: bool,
+) -> Result<()> {
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     let result = match outcome {
         IngestOutcome::Ingested(result) => result,
@@ -2758,9 +2880,9 @@ async fn run_ingest(cli: &Cli, args: IngestArgs) -> Result<()> {
     report_ingested(&mut out, &result, pin)?;
     out.flush()?;
     follow_ingest(
-        &opened,
+        opened,
         ws_db,
-        embedding_model.as_ref(),
+        embedding_model,
         &[result.document_id],
         &mut out,
     )
