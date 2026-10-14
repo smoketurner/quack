@@ -1298,22 +1298,27 @@ const STDIN_GRACE: Duration = Duration::from_secs(1);
 /// (a regular file, `/dev/null`) answers a read at once.
 #[cfg(unix)]
 async fn stdin_has_data() -> Result<bool> {
-    use std::os::fd::{AsFd, BorrowedFd};
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    use std::os::fd::AsFd;
     use std::os::unix::fs::FileTypeExt;
-    let stdin = std::io::stdin();
-    let kind = std::fs::File::from(stdin.as_fd().try_clone_to_owned()?)
+    let stdin = std::fs::File::from(std::io::stdin().as_fd().try_clone_to_owned()?);
+    let kind = stdin
         .metadata()
         .context("failed to inspect stdin")?
         .file_type();
     if !kind.is_fifo() && !kind.is_socket() {
         return Ok(true);
     }
-    let fd: BorrowedFd<'_> = stdin.as_fd();
-    let watch = tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE)
-        .context("failed to watch stdin")?;
-    Ok(tokio::time::timeout(STDIN_GRACE, watch.readable())
-        .await
-        .is_ok())
+    let grace = Timespec::try_from(STDIN_GRACE).context("stdin grace out of range")?;
+    // tokio's `AsyncFd` has only unsafe constructors; a blocking poll on a
+    // duplicate of stdin needs none.
+    let ready = tokio::task::spawn_blocking(move || {
+        rustix::event::poll(&mut [PollFd::new(&stdin, PollFlags::IN)], Some(&grace))
+    })
+    .await
+    .context("stdin poll stopped")?
+    .context("failed to watch stdin")?;
+    Ok(ready > 0)
 }
 
 /// Windows has no readiness poll for stdin: read it as before.

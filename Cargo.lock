@@ -4431,6 +4431,7 @@ dependencies = [
  "quack-mcp",
  "quack-server",
  "quack-terminal",
+ "rustix 1.1.5",
  "secrecy",
  "serde_json",
  "tempfile",
