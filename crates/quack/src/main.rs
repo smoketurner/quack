@@ -63,7 +63,7 @@ use quack_cli::{NamedInput, StdioPath};
 use quack_cli::{OpenedWorkspace, RecordedRun, SessionChoice, find_session, resolve_session};
 use quack_cli::{embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
 use quack_core::engine::{Drain, Holder, Stop};
-use quack_mcp::client::HolderClient;
+use quack_mcp::client::{CommandClient, HolderClient};
 
 use quack_core::config::ServerConfig;
 use quack_server::{ServeMode, Server};
@@ -1657,7 +1657,12 @@ async fn run_jobs(cli: &Cli, args: JobsArgs) -> Result<ExitCode> {
         }
         Err(e) if is_workspace_locked(&e) => {
             let workspace_dir = opened.config().workspace_dir(opened.workspace.id.as_str());
-            let Some(client) = HolderClient::connect(&workspace_dir, &opened.workspace.id).await?
+            let Some(client) = HolderClient::connect_with(
+                &workspace_dir,
+                &opened.workspace.id,
+                CommandClient::new("quack jobs", report_to_stderr),
+            )
+            .await?
             else {
                 return Err(e);
             };
@@ -2680,13 +2685,24 @@ fn is_workspace_locked(err: &anyhow::Error) -> bool {
     })
 }
 
+/// What the holder reports while a command waits on it (a write waiting
+/// for approval at the terminal's prompt, and for how long), on stderr,
+/// so a person or a script knows where the statement is.
+fn report_to_stderr(message: &str) {
+    let stderr = std::io::stderr();
+    let mut err = stderr.lock();
+    drop(writeln!(err, "{message}"));
+}
+
 /// `-q` on a workspace another `quack` process holds: the statement runs
 /// through that process's `sql` tool over the workspace socket
 /// (`quack_mcp::client`) and comes back as the same rows, with one line on
 /// stderr saying so, one more when the holder capped them at its
 /// `[analysis].max_query_rows` or its byte limit, and one more when it cut
-/// a wide value (`STRUCTURED_CELL_CHARS`). A write is the holder's own
-/// refusal.
+/// a wide value (`STRUCTURED_CELL_CHARS`). A write waits for the holder's
+/// own decision (the terminal session asks at its prompt and says so here
+/// through the holder's progress report; a command refuses), and comes
+/// back as the holder's refusal when it is not approved.
 /// Without a holder listening, `locked` is the error. Piped data cannot
 /// be loaded into a workspace this process does not hold, so a statement
 /// that names `stdin` is refused.
@@ -2698,7 +2714,13 @@ async fn run_query_through_holder(
     locked: anyhow::Error,
 ) -> Result<()> {
     let workspace_dir = opened.config().workspace_dir(opened.workspace.id.as_str());
-    let Some(client) = HolderClient::connect(&workspace_dir, &opened.workspace.id).await? else {
+    let Some(client) = HolderClient::connect_with(
+        &workspace_dir,
+        &opened.workspace.id,
+        CommandClient::new("quack -q", report_to_stderr),
+    )
+    .await?
+    else {
         return Err(locked);
     };
     if wait_for_stdin || sql.to_ascii_lowercase().contains("stdin") {

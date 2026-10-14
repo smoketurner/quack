@@ -2897,7 +2897,9 @@ Context Protocol:
   `.mcp.json`, no server, no port, unaudited like the CLI. It holds nothing between calls
   (`quack_mcp::relay::PerCallServer`): each call runs in the process that holds the
   workspace, over its socket (the terminal session, a command; the call's progress comes
-  back through it, and `--allow-write` has no say there), or, when nobody holds it, in
+  back through it, and `--allow-write` has no say there: the holder's own policy decides,
+  so a write asks at the terminal session's prompt, which names the client as its MCP
+  `initialize` did, and a command refuses it), or, when nobody holds it, in
   `quack mcp` itself, which opens the workspace for that call and lets it go after (a job
   the call left running, a title, keeps it open until the next call or the exit). While it
   holds the file it serves the workspace socket like any holder, under its own

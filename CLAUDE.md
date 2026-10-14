@@ -92,7 +92,7 @@ data-layer, crypto, or dependency change:
 
 ```bash
 cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # SQL, no agent
-#   on a workspace another quack process holds (the terminal, a command), the statement runs through that process's MCP `sql` tool over its workspace socket (quack_core::forward, quack_mcp::client) and says so on stderr; a write is the holder's refusal, naming it
+#   on a workspace another quack process holds (the terminal, a command), the statement runs through that process's MCP `sql` tool over its workspace socket (quack_core::forward, quack_mcp::client) and says so on stderr; a write waits for the holder's decision (the terminal session asks at its prompt, named for the client, and -q says on stderr where it waits and for how long; a command refuses) and comes back as the holder's refusal when not approved
 cargo run --bin quack -- jobs [--format json]                                 # the workspace's jobs: what runs, what ran and how it ended (_quack_jobs; restored on open); through the holder's quack://workspace/jobs when another quack holds it
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
 cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use

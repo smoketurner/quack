@@ -61,6 +61,7 @@ use quack_core::storage::workspace::{
 };
 use quack_core::storage::writer::Writer;
 use quack_core::text::OneLine;
+use rmcp::handler::server::common::{AsRequestContext, FromContextPart};
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -439,6 +440,49 @@ impl TurnReporter {
 
 /// How often the answer's streaming text is reported.
 const TEXT_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Who asked and where to report to them: the client as its `initialize`
+/// named it (`quack -q`, `quack mcp`, an editor's own name; the holder's
+/// prompt says who wants a write) and its [`Progress`]. A tool takes it as
+/// an argument, extracted from the request; a test passes
+/// `Requester::default()`, which names nobody and reports nowhere.
+#[derive(Clone, Default)]
+pub struct Requester {
+    client: Option<String>,
+    progress: Progress,
+}
+
+/// What a prompt calls a client that did not name itself.
+const ANOTHER_PROCESS: &str = "another process";
+
+impl Requester {
+    fn of(context: &RequestContext<RoleServer>) -> Self {
+        Self {
+            client: client_name(&context.peer),
+            progress: Progress::of(context),
+        }
+    }
+
+    /// Who asked, for the holder's prompt.
+    fn client(&self) -> String {
+        self.client
+            .clone()
+            .unwrap_or_else(|| String::from(ANOTHER_PROCESS))
+    }
+}
+
+impl<C: AsRequestContext> FromContextPart<C> for Requester {
+    fn from_context_part(context: &mut C) -> Result<Self, McpError> {
+        Ok(Self::of(context.as_request_context()))
+    }
+}
+
+/// The client's name from its `initialize`, when it gave one.
+fn client_name(peer: &Peer<RoleServer>) -> Option<String> {
+    peer.peer_info()
+        .map(|info| info.client_info.name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
 
 /// Characters of a tool's detail (the SQL, the search query) a progress
 /// message carries.
@@ -854,24 +898,24 @@ impl McpServer {
             }
         });
         let result = self
-            .query_for(args, &context.extensions, Progress::of(&context), cancel)
+            .query_for(args, &context.extensions, Requester::of(&context), cancel)
             .await;
         watch.abort();
         result
     }
 
     /// `query`, for the caller the request's extensions name, reporting
-    /// through `progress`; `cancel` ends the turn.
+    /// to `requester`; `cancel` ends the turn.
     async fn query_for(
         &self,
         args: QueryArgs,
         extensions: &Extensions,
-        progress: Progress,
+        requester: Requester,
         cancel: CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(extensions)?;
         // Boxed: an agent turn's future is large (clippy::large_futures).
-        Box::pin(self.as_caller(&caller, self.ask(args, &caller, progress, cancel))).await
+        Box::pin(self.as_caller(&caller, self.ask(args, &caller, requester, cancel))).await
     }
 
     /// `query` as a task (SEP-2663), for a client that declared the tasks
@@ -889,6 +933,7 @@ impl McpServer {
         ))
         .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let caller = self.caller(&context.extensions)?;
+        let client = client_name(&context.peer);
         let server = self.clone();
         let task = self.tasks.spawn(
             TaskOptions::new().with_status_message(TURN_STARTING),
@@ -902,10 +947,12 @@ impl McpServer {
                             cancel.cancel();
                         }
                     });
-                    let turn = server.as_caller(
-                        &caller,
-                        server.ask(args, &caller, Progress::for_task(&task), cancel),
-                    );
+                    let requester = Requester {
+                        client,
+                        progress: Progress::for_task(&task),
+                    };
+                    let turn =
+                        server.as_caller(&caller, server.ask(args, &caller, requester, cancel));
                     let result = Box::pin(turn).await;
                     watch.abort();
                     if task.is_cancel_requested() {
@@ -925,7 +972,7 @@ impl McpServer {
         &self,
         args: QueryArgs,
         caller: &Caller,
-        progress: Progress,
+        requester: Requester,
         cancel: CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         let question = args.question.trim().to_owned();
@@ -946,7 +993,7 @@ impl McpServer {
                 TurnSession::NotFound => return Ok(failure("that session does not exist")),
             };
         let user = caller.user_id();
-        progress.at(0.0, None, TURN_STARTING).await;
+        requester.progress.at(0.0, None, TURN_STARTING).await;
         let outcome = self
             .run_turn(
                 &question,
@@ -954,7 +1001,7 @@ impl McpServer {
                 &args.document_ids,
                 user,
                 caller,
-                progress,
+                requester,
                 cancel,
             )
             .await;
@@ -1029,12 +1076,13 @@ impl McpServer {
         documents: &[String],
         user: Option<UserId>,
         caller: &Caller,
-        progress: Progress,
+        requester: Requester,
         cancel: CancellationToken,
     ) -> Result<AgentResponse, TurnFailed> {
         let (sink, mut events) = events::channel();
         let lane = LaneKey::Session(session_id.clone());
-        let mut reporter = progress.turn();
+        let client = requester.client();
+        let mut reporter = requester.progress.turn();
         if self.inner.jobs.lane_active(&lane) > 0 {
             reporter.queued().await;
         }
@@ -1098,9 +1146,12 @@ impl McpServer {
                 AgentEvent::TurnComplete(response) => complete = Some(response),
                 AgentEvent::Failed(failed) => failure = Some(failed),
                 AgentEvent::PermissionRequired(request) => {
-                    self.inner
-                        .approvals
-                        .ask(job.id, Some(session_id.clone()), request);
+                    self.inner.approvals.ask(
+                        job.id,
+                        Some(session_id.clone()),
+                        client.clone(),
+                        request,
+                    );
                 }
                 other => reporter.event(other).await,
             }
@@ -1207,8 +1258,14 @@ impl McpServer {
     /// the strip and `/jobs`, and `/cancel N` refuses it) that asks at the
     /// holder's prompt through the approvals and runs the statement on a
     /// yes. Nobody listening, a no, a cancel, or a client that hung up is
-    /// the refusal.
-    async fn ask_statement(&self, statement: String) -> Result<CoreResult<CappedResults>, String> {
+    /// the refusal. The prompt names the `requester`, and the wait is
+    /// reported to it (a progress notification), so `quack -q` can say on
+    /// stderr where the statement waits and for how long.
+    async fn ask_statement(
+        &self,
+        statement: String,
+        requester: Requester,
+    ) -> Result<CoreResult<CappedResults>, String> {
         let label: String = OneLine(&statement).to_string().chars().take(80).collect();
         let spec = JobSpec::new(JobKind::Sql, label).workspace(self.inner.workspace.id.clone());
         let (send, receive) = tokio::sync::oneshot::channel();
@@ -1221,7 +1278,19 @@ impl McpServer {
         let asked_at = holder.clone();
         let job = self.inner.jobs.submit(spec, move |ctx| async move {
             let (request, decision) = PermissionRequest::new(statement.clone(), Hold::NotPermitted);
-            approvals.ask(ctx.id(), None, request);
+            requester
+                .progress
+                .at(
+                    0.0,
+                    None,
+                    &format!(
+                        "this statement changes the workspace; waiting for approval at \
+                         {asked_at} (up to {} s)",
+                        approvals.timeout().as_secs()
+                    ),
+                )
+                .await;
+            approvals.ask(ctx.id(), None, requester.client(), request);
             let cancel = ctx.cancel_token();
             let decision = tokio::select! {
                 biased;
@@ -1269,6 +1338,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SqlArgs>,
         extensions: Extensions,
+        requester: Requester,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.caller(&extensions)?;
         let statement = args.sql.trim().to_owned();
@@ -1298,7 +1368,7 @@ impl McpServer {
             // session asks at its prompt; a command refuses. Over stdio
             // and HTTP the connection simply cannot write.
             let refused = match self.inner.policy {
-                WritePolicy::Ask => match self.ask_statement(statement.clone()).await {
+                WritePolicy::Ask => match self.ask_statement(statement.clone(), requester).await {
                     Ok(result) => Some(result.map_err(internal)),
                     Err(refusal) => {
                         caller

@@ -330,6 +330,15 @@ impl ApiError {
         }
     }
 
+    /// 503 `workspace_locked`: another process holds the workspace file.
+    pub(crate) fn workspace_locked(message: impl Into<String>) -> Self {
+        Self::coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::WorkspaceLocked,
+            message,
+        )
+    }
+
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }

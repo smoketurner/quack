@@ -322,16 +322,19 @@ enum Prompt {
 }
 
 /// Whose turn asked for a write: this session's own, or another
-/// process's over the workspace socket (`quack mcp`), whose prompt takes
+/// process's over the workspace socket (`quack -q`, `quack mcp`), whose prompt takes
 /// no key for a moment after it appears (a key typed as it lands must not
 /// approve it), offers no `a`, and times out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WriteOrigin {
     Session,
-    /// A write another process asked over the workspace socket: `shown`
-    /// guards the keys for a moment after it appears; `expires` is the
-    /// deadline core put on the ask, after which it is already refused.
+    /// A write another process asked over the workspace socket: `client`
+    /// is who, as its MCP `initialize` named it (`quack -q`, `quack mcp`,
+    /// an editor's own name); `shown` guards the keys for a moment after
+    /// it appears; `expires` is the deadline core put on the ask, after
+    /// which it is already refused.
     Socket {
+        client: String,
         shown: Instant,
         expires: Instant,
     },
@@ -1522,8 +1525,8 @@ impl App {
                             ),
                         answer_keys(),
                     ),
-                    WriteOrigin::Socket { .. } => (
-                        format!("quack mcp (job #{})", job.number),
+                    WriteOrigin::Socket { client, .. } => (
+                        format!("{client} (job #{})", job.number),
                         socket_answer_keys(),
                     ),
                 };
@@ -1713,6 +1716,7 @@ impl App {
         let Asked {
             job,
             session,
+            client,
             request,
             expires_at,
         } = asked;
@@ -1730,7 +1734,7 @@ impl App {
         self.note(
             MessageKind::System,
             format!(
-                "quack mcp (job #{number}{session}): {}\n{}\n{notice}{}",
+                "{client} (job #{number}{session}): {}\n{}\n{notice}{}",
                 Decision::HEADING,
                 request.sql,
                 socket_answer_keys()
@@ -1740,6 +1744,7 @@ impl App {
             job: Ticket { id: job, number },
             request,
             origin: WriteOrigin::Socket {
+                client,
                 shown: Instant::now(),
                 expires: expires_at,
             },
@@ -1758,13 +1763,16 @@ impl App {
                 Prompt::Write {
                     job,
                     request,
-                    origin: WriteOrigin::Socket { expires, .. },
+                    origin:
+                        WriteOrigin::Socket {
+                            client, expires, ..
+                        },
                 } if expires <= now => {
                     request.deny();
                     self.messages.push(Message::new(
                         MessageKind::System,
                         format!(
-                            "quack mcp (job #{}): nobody answered in time; not run.",
+                            "{client} (job #{}): nobody answered in time; not run.",
                             job.number
                         ),
                     ));

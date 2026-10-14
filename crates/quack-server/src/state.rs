@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::analysis::tools::{ReaderDb, SharedDb};
-use quack_core::engine::Engine;
+use quack_core::engine::{Engine, WorkspaceHandle};
+use quack_core::error::Error as CoreError;
 use quack_core::llm::oauth::KeySource;
 use quack_core::storage::audit::AuditLog;
 use quack_core::storage::workspace::WorkspaceDb;
@@ -24,6 +25,7 @@ use super::web::flash::Flashes;
 use quack_core::error::Result as CoreResult;
 use quack_core::storage::control::ControlPlane;
 use quack_core::web_sessions::WebSessions;
+use quack_mcp::client::HeldElsewhere;
 use quack_mcp::{HttpTransport, McpServer};
 
 /// How the server knows who is asking.
@@ -383,19 +385,43 @@ impl AppState {
     /// The writer handle for a workspace, opening the file on first use
     /// (`Engine::workspace`, which is where one open per file is enforced).
     pub(crate) async fn workspace_db(&self, workspace_id: &WorkspaceId) -> ApiResult<SharedDb> {
-        Ok(self.engine.workspace(workspace_id).await?.writer)
+        Ok(self.open_workspace(workspace_id).await?.writer)
+    }
+
+    /// The workspace's handle (`Engine::workspace`). A file another
+    /// process holds is 503 `workspace_locked` on every route, naming the
+    /// holder the way the command line does when its socket answers
+    /// (`HeldElsewhere`), since the server never reads through another
+    /// process.
+    async fn open_workspace(&self, workspace_id: &WorkspaceId) -> ApiResult<WorkspaceHandle> {
+        match self.engine.workspace(workspace_id).await {
+            Ok(handle) => Ok(handle),
+            Err(locked @ CoreError::WorkspaceLocked { .. }) => {
+                let config = &self.engine.config;
+                let held = HeldElsewhere::find(
+                    &config.workspace_dir(workspace_id.as_str()),
+                    workspace_id,
+                    config.workspace_db_path(workspace_id.as_str()),
+                    self.engine.holder().clone(),
+                    locked,
+                )
+                .await;
+                Err(ApiError::workspace_locked(held.to_string()))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The reader handle for a workspace (built once, alongside the
     /// writer, on first use): every read-only handler should prefer this
     /// over [`Self::workspace_db`] so it never queues behind a write.
     pub(crate) async fn reader_db(&self, workspace_id: &WorkspaceId) -> ApiResult<ReaderDb> {
-        Ok(self.engine.workspace(workspace_id).await?.reader)
+        Ok(self.open_workspace(workspace_id).await?.reader)
     }
 
     /// The workspace's insert-only audit connection, opened with its writer.
     pub(crate) async fn audit_log(&self, workspace_id: &WorkspaceId) -> ApiResult<Arc<AuditLog>> {
-        Ok(self.engine.workspace(workspace_id).await?.audit)
+        Ok(self.open_workspace(workspace_id).await?.audit)
     }
 
     /// Run a read on one of the workspace's reader connections, inside a

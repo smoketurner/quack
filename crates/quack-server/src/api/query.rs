@@ -651,21 +651,29 @@ impl Access {
     ) -> ApiResult<Response> {
         let workspace_id = self.membership.workspace.id.clone();
         let sql = statement.clone();
+        // The open's own failure (a locked file) keeps its code; only a
+        // statement the classifier refuses is forbidden.
         let kind = match app
-            .read(&workspace_id, move |db| db.classify_user_statement(&sql))
-            .await
+            .read(
+                &workspace_id,
+                move |db| Ok(db.classify_user_statement(&sql)),
+            )
+            .await?
         {
             Ok(kind) => kind,
             Err(e) => {
+                let message = e.to_string();
                 self.audit(
                     app,
                     AuditAction::Export,
                     None,
                     Outcome::Denied,
-                    Some(serde_json::json!({ "sql": statement, "format": format, "error": e.message })),
+                    Some(
+                        serde_json::json!({ "sql": statement, "format": format, "error": message }),
+                    ),
                 )
                 .await?;
-                return Err(ApiError::forbidden(e.message));
+                return Err(ApiError::forbidden(message));
             }
         };
         if kind.writes().map_err(ApiError::bad_request)? {
@@ -741,12 +749,14 @@ impl Access {
         let access = self;
         let sql = statement.to_owned();
         // Classifying parses the statement: a read, never in the writer's line.
+        // The open's own failure (a locked file) keeps its code; only a
+        // statement the classifier refuses is forbidden.
         let kind = app
             .read(&access.membership.workspace.id, move |db| {
-                db.classify_user_statement(&sql)
+                Ok(db.classify_user_statement(&sql))
             })
-            .await
-            .map_err(|e| ApiError::forbidden(e.message))?;
+            .await?
+            .map_err(|e| ApiError::forbidden(e.to_string()))?;
         let is_write = kind.writes().map_err(ApiError::bad_request)?;
         let detail = serde_json::json!({ "sql": statement });
         if is_write && creates_temp_object(statement) {

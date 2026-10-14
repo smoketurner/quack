@@ -3,18 +3,23 @@
 //! through the holder's `sql` tool, `quack jobs` reads the holder's
 //! `quack://workspace/jobs`.
 
-use std::path::Path;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use quack_core::engine::Holder;
 use quack_core::error::{Error, Result};
 use quack_core::forward;
 use quack_core::ids::WorkspaceId;
 use quack_core::jobs::JobInfo;
 use quack_core::storage::workspace::QueryResults;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ListResourceTemplatesResult, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
+    CallToolRequestParams, CallToolResult, ClientConfig, Implementation,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, NumberOrString,
+    PaginatedRequestParams, ProgressNotificationParam, ProgressToken, ReadResourceRequestParams,
+    ReadResourceResult, RequestMetaObject,
 };
-use rmcp::service::{RunningService, ServiceError};
+use rmcp::service::{NotificationContext, RunningService, ServiceError};
 use rmcp::{ClientHandler, ErrorData as McpError, RoleClient, ServiceExt};
 use serde::Deserialize;
 
@@ -37,6 +42,111 @@ pub async fn holder_of(workspace_dir: &Path, workspace_id: &WorkspaceId) -> Resu
     let holder = client.holder().to_owned();
     client.close().await;
     Ok(Some(holder))
+}
+
+/// The refusal for a workspace file another process holds: who, when its
+/// socket answers (`initialize` names the holder), and what still works.
+/// `Error::WorkspaceLocked` stays its source, so `-q` and `jobs`, which
+/// answer a lock by reaching the holder, still recognize it.
+#[derive(Debug)]
+pub struct HeldElsewhere {
+    /// Who holds the file, as its socket named it; `None` when no socket
+    /// answered.
+    pub holder: Option<String>,
+    /// What this process is: the command or server that was refused.
+    wanted: Holder,
+    path: PathBuf,
+    locked: Error,
+}
+
+impl HeldElsewhere {
+    /// Ask the socket of the workspace in `workspace_dir` who holds the
+    /// file at `path`, for `wanted`, which `locked` refused. A socket that
+    /// does not answer is logged and names nobody.
+    pub async fn find(
+        workspace_dir: &Path,
+        workspace_id: &WorkspaceId,
+        path: PathBuf,
+        wanted: Holder,
+        locked: Error,
+    ) -> Self {
+        let holder = match holder_of(workspace_dir, workspace_id).await {
+            Ok(holder) => holder,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not ask the workspace socket who holds the file");
+                None
+            }
+        };
+        Self {
+            holder,
+            wanted,
+            path,
+            locked,
+        }
+    }
+}
+
+impl fmt::Display for HeldElsewhere {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(holder) = &self.holder else {
+            return f.write_str(&locked_without_socket(&self.path));
+        };
+        write!(
+            f,
+            "the workspace is open in {holder}; `quack -q` and `quack jobs` read through it; \
+             quit it to "
+        )?;
+        match &self.wanted {
+            Holder::Command { verb, .. } => write!(f, "run `quack {verb}`"),
+            Holder::Terminal(_) => f.write_str("start a session here"),
+            Holder::Serve | Holder::Mcp => f.write_str("open it here"),
+        }
+    }
+}
+
+impl std::error::Error for HeldElsewhere {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.locked)
+    }
+}
+
+/// A command as the holder's client: `initialize` names it (`quack -q`,
+/// `quack jobs`), so the holder's prompt says who asked for a write, and
+/// the holder's progress messages (a write waiting for approval at its
+/// prompt) go to `report`, which a command writes to stderr.
+#[derive(Clone)]
+pub struct CommandClient {
+    name: &'static str,
+    report: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl CommandClient {
+    #[must_use]
+    pub fn new(name: &'static str, report: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self {
+            name,
+            report: Arc::new(report),
+        }
+    }
+}
+
+impl ClientHandler for CommandClient {
+    fn get_info(&self) -> ClientConfig {
+        let mut config = ClientConfig::default();
+        config.client_info = Implementation::new(self.name, env!("CARGO_PKG_VERSION"));
+        config
+    }
+
+    fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        if let Some(message) = &params.message {
+            (self.report)(message);
+        }
+        std::future::ready(())
+    }
 }
 
 /// What the lock on the workspace file at `path` means when no socket
@@ -253,7 +363,12 @@ impl<H: ClientHandler> HolderClient<H> {
     pub async fn sql(&self, statement: &str) -> Result<HolderRows> {
         let mut arguments = serde_json::Map::new();
         arguments.insert(String::from("sql"), serde_json::Value::from(statement));
-        let params = CallToolRequestParams::new("sql").with_arguments(arguments);
+        // A progress token, so the holder reports a write waiting at its
+        // prompt (`CommandClient::on_progress`).
+        let mut params = CallToolRequestParams::new("sql").with_arguments(arguments);
+        params.meta = Some(RequestMetaObject::with_progress_token(ProgressToken(
+            NumberOrString::String(Arc::from("sql")),
+        )));
         let result = self.call_tool(params).await?;
         if result.is_error.unwrap_or(false) {
             let text: String = result
