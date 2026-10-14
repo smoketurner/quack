@@ -389,6 +389,8 @@ impl Access {
         let db = app.workspace_db(&self.membership.workspace.id).await?;
         let session_id = session.id;
         with_db(db, move |db| sessions::delete_session(db, &session_id)).await?;
+        // The file's rows went with the session; the live listing follows.
+        app.engine.jobs.forget_session(sid);
         self.audit(
             app,
             AuditAction::Delete,

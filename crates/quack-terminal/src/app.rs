@@ -2845,10 +2845,12 @@ impl App {
             ),
             Deletion::Session { id, title } => {
                 let current = id == self.session_id;
+                let forget = id.clone();
                 self.on_db_ok(
                     Side::Write,
                     move |db| sessions::delete_session(db, &id),
                     move |app, _| {
+                        app.jobs.forget_session(&forget);
                         app.note(
                             MessageKind::System,
                             format!("Deleted the session '{title}'."),

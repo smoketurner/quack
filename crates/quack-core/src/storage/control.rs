@@ -1544,30 +1544,31 @@ impl ControlPlane {
     }
 
     /// The workspace a command line runs in: the one it `named`, which
-    /// must exist, or `default`. The default is created, audited on the
-    /// `cli` channel, the first time it is used, so a new install needs no
-    /// setup step. When two processes use it first at once, one creates it
-    /// and the other opens that row.
+    /// must exist (whatever the name, the configured default's included:
+    /// after a rename, `-w default` must not quietly make a second one), or
+    /// with no name `default`, created, audited on the `cli` channel, the
+    /// first time it is used, so a new install needs no setup step. When
+    /// two processes use it first at once, one creates it and the other
+    /// opens that row.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NoWorkspaceNamed`] for a named workspace other than
-    /// the default that does not exist, or an error if a query fails.
+    /// Returns [`Error::NoWorkspaceNamed`] for a named workspace that does
+    /// not exist, or an error if a query fails.
     pub async fn workspace_or_default(
         &self,
         named: Option<&str>,
         default: &WorkspaceName,
     ) -> Result<WorkspaceRow> {
-        let name = named.unwrap_or(default.as_str());
-        if name != default.as_str() {
+        if let Some(name) = named {
             return self.workspace_named(name).await;
         }
-        if let Some(ws) = self.find_workspace_by_name(name).await? {
+        if let Some(ws) = self.find_workspace_by_name(default.as_str()).await? {
             return Ok(ws);
         }
         let audit = AuditEntry::new(AuditAction::Workspace, Outcome::Allowed, Channel::Cli);
         match self.create_workspace(default, None, audit).await {
-            Err(Error::WorkspaceExists(_)) => self.workspace_named(name).await,
+            Err(Error::WorkspaceExists(_)) => self.workspace_named(default.as_str()).await,
             created => created,
         }
     }

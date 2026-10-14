@@ -1047,8 +1047,8 @@ async fn first_uses_of_the_default_workspace_that_race_share_one_row() {
 }
 
 /// A workspace a command names must exist, and nothing is created when
-/// it does not; the default one is created, audited, by its first use,
-/// whether or not the command names it.
+/// it does not, the configured default included; only a command that
+/// names none creates the default, audited, on its first use.
 #[tokio::test]
 #[expect(clippy::unwrap_used, reason = "test setup")]
 async fn a_named_workspace_must_exist_and_the_default_is_created_on_first_use() {
@@ -1103,13 +1103,14 @@ async fn a_named_workspace_must_exist_and_the_default_is_created_on_first_use() 
     assert_eq!(found.id, sales.id);
     assert_eq!(cp.list_workspaces().await.unwrap().len(), 2);
 
-    // Naming the default explicitly creates it too.
+    // Naming the default explicitly creates nothing: after a rename, `-w
+    // default` is a mistake to refuse, not a second workspace to make.
     let (_dir, fresh) = open().await;
-    let named = fresh
-        .workspace_or_default(Some("default"), &default)
-        .await
-        .unwrap();
-    assert_eq!(named.name, "default");
+    assert!(matches!(
+        fresh.workspace_or_default(Some("default"), &default).await,
+        Err(Error::NoWorkspaceNamed(name)) if name == "default"
+    ));
+    assert!(fresh.list_workspaces().await.unwrap().is_empty());
 }
 
 #[tokio::test]
