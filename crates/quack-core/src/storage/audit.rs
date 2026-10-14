@@ -305,11 +305,16 @@ impl Recorder {
         entry.in_workspace(&self.workspace_id)
     }
 
-    /// Write both rows and give the id they share.
+    /// Write both rows and give the id they share: the detail first, in the
+    /// workspace file the work it records has just changed, then the access
+    /// row in `control.db`. The two cannot share a transaction, so a failed
+    /// access row leaves the work standing (#600): the detail still names
+    /// who did it, and the access row is logged whole, content-free, for the
+    /// operator to restore.
     ///
     /// # Errors
     ///
-    /// Returns the control plane's or the audit connection's error.
+    /// Returns the audit connection's or the control plane's error.
     pub async fn record(
         &self,
         action: AuditAction,
@@ -321,8 +326,16 @@ impl Recorder {
         if let Some(resource) = resource {
             entry = entry.on(resource);
         }
-        self.control.record_audit(&entry).await?;
         self.record_detail(&entry, detail).await?;
+        if let Err(e) = self.control.record_audit(&entry).await {
+            let row = serde_json::to_string(&entry).unwrap_or_else(|_| entry.id.to_string());
+            tracing::error!(
+                error = %e,
+                row,
+                "the access audit row could not be written; the work it records stands"
+            );
+            return Err(e);
+        }
         Ok(entry.id)
     }
 

@@ -123,7 +123,7 @@ impl Access {
         note: &'static str,
     ) -> ApiResult<Ontology> {
         let ontology = Ontology::from_json(json)?;
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let author = self.identity.username.clone();
         let stored = with_db(db, move |db| {
             store::save(db, &ontology, Revision::reviewed(Some(&author), Some(note)))
@@ -143,7 +143,7 @@ impl Access {
     /// Apply one form edit to the current ontology and store the result as
     /// the next version; the save validates it as it does any other.
     pub(crate) async fn edit_ontology(&self, app: &App, edit: Edit) -> ApiResult<Ontology> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let author = self.identity.username.clone();
         let note = format!("{edit} in the web UI");
         let detail = serde_json::to_value(&edit)?;
@@ -171,7 +171,7 @@ impl Access {
 
     /// Install the built-in ontology as version 1; 409 once one exists.
     pub(crate) async fn init_ontology(&self, app: &App) -> ApiResult<Ontology> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let author = self.identity.username.clone();
         let stored = with_db(db, move |db| {
             if store::latest_version(db)?.is_some() {
@@ -205,7 +205,7 @@ impl Access {
         rename: &RenameRequest,
     ) -> ApiResult<Ontology> {
         let renames = IdRenames::one(rename.kind, &rename.from, &rename.to)?;
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let author = self.identity.username.clone();
         let stored = with_db(db, move |db| store::rename(db, &renames, Some(&author))).await?;
         self.audit(
@@ -225,7 +225,7 @@ impl Access {
         app: &App,
         version: OntologyVersion,
     ) -> ApiResult<Ontology> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let author = self.identity.username.clone();
         let stored = with_db(db, move |db| store::restore(db, version, Some(&author))).await?;
         self.audit(
@@ -489,7 +489,7 @@ impl Access {
         auto_accept: bool,
     ) -> ApiResult<TableProposal> {
         let options = app.engine.config.ontology.table_evidence();
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let author = self.identity.username.clone();
         let proposed = with_db(db, move |db| {
             let current = store::current(db)?;
@@ -537,7 +537,7 @@ impl Access {
         target: Option<&str>,
     ) -> ApiResult<CandidateDecided> {
         let decision = action.decision(target)?;
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let author = self.identity.username.clone();
         let candidate_id = candidate.to_owned();
         let version = with_db(db, move |db| {
@@ -577,7 +577,7 @@ impl Access {
                 "choose at least one candidate to accept or reject",
             ));
         }
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let author = self.identity.username.clone();
         let (accepting, rejecting) = (accept.clone(), reject.clone());
         let (version, rejected) = with_db(db, move |db| {
@@ -762,7 +762,7 @@ impl Access {
         if chunks.is_empty() {
             return Err(ApiError::bad_request("no ready documents to sample"));
         }
-        let db = app.workspace_db(id).await?;
+        let db = app.workspace(id).await?.writer;
         let run = run::start(
             app,
             access,

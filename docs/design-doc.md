@@ -2871,7 +2871,8 @@ may change in any release. Core errors and failed turns map to specific codes
 `unknown_value`, `query_timeout`, `provider_refused`, `classify_refused`, `no_questions`,
 `draft_refused`, `set_columns_gone`, `classify_running`, `too_large_to_wait`, ...). An error
 with only a status carries that status's code (`bad_request`, `forbidden`, `not_found`,
-`conflict`, `busy`, ...). A user's own statement or import that fails is 422 with `sql_failed`
+`conflict`, `busy`, ...). A request whose work was done and whose audit row could not be
+written is 500 `unaudited`: the change stands (`docs/audit.md`). A user's own statement or import that fails is 422 with `sql_failed`
 or `import_failed` unless a more specific code applies. Errors the framework builds itself (a
 body that is not JSON, a method the route lacks, the rate limiter, the request timeout) get
 the same body through the `coded_errors` middleware, with codes such as

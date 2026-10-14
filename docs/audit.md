@@ -9,6 +9,14 @@ and the work failed). Rows are never updated or deleted. The content half of eac
 was read or run, lives inside the workspace file (`_quack_audit`) under the same id and is
 visible to the workspace's members only (design doc section 12).
 
+A change to users, workspaces, membership, or tokens commits its row in the change's own
+transaction. A change to workspace content commits in the workspace file first, and the two
+files share no transaction, so its rows are written after it: the content half first, in the
+file the change just went into, then the access row. When the access row cannot be written
+(a full disk, a read-only `control.db`), the change stands, the server log has the row as
+JSON (`the access audit row could not be written`), and the request answers 500 with code
+`unaudited`, never as if the change had failed.
+
 `quack audit` and `GET /api/v1/admin/audit` read the access log; `--format ocsf` and
 `?format=ocsf` render each row as an OCSF 1.9.0 event (`quack_core::ocsf`):
 Authentication [3002] for sign-ins and sign-outs, API Activity [6003] for everything else,

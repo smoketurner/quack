@@ -202,7 +202,7 @@ impl Access {
     /// Set or remove a table's note, from the API or the web console, and
     /// audit it; the note itself goes in the workspace detail.
     pub(crate) async fn set_table_note(&self, app: &App, name: &str, note: &str) -> ApiResult<()> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let (table, text, editor) = (
             name.to_owned(),
             note.to_owned(),
@@ -236,7 +236,7 @@ impl Access {
         if name.starts_with(INTERNAL_PREFIX) || views::is_reserved(name) {
             return Err(ApiError::not_found("no such table"));
         }
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let (table, col) = (name.to_owned(), column.to_owned());
         let result = with_db(db, move |db| {
             if !table_search::user_tables(db)?.contains(&table) {

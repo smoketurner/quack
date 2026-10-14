@@ -290,7 +290,7 @@ impl Access {
                 "only the session's creator or an owner may change its mode",
             )
             .await?;
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let session_id = session.id;
         let updated = with_db(db, move |db| {
             sessions::set_session_mode(db, &session_id, mode)?;
@@ -324,7 +324,7 @@ impl Access {
                 "only the session's creator or an owner may share it",
             )
             .await?;
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let session_id = session.id;
         let updated = with_db(db, move |db| {
             sessions::set_session_sharing(db, &session_id, sharing)?;
@@ -359,7 +359,7 @@ impl Access {
                 "only the session's creator or an owner may rename it",
             )
             .await?;
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let (session_id, title) = (session.id, title.to_owned());
         let updated = with_db(db, move |db| {
             sessions::set_session_title(db, &session_id, &title)
@@ -386,7 +386,7 @@ impl Access {
                 "only the session's creator or an owner may delete it",
             )
             .await?;
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let session_id = session.id;
         with_db(db, move |db| sessions::delete_session(db, &session_id)).await?;
         // The file's rows went with the session; the live listing follows.
