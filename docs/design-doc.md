@@ -282,7 +282,12 @@ no audit row. `quack mcp` serves none either: it holds nothing between calls.
 
 **Jobs survive the process.** A job label can quote a question or name a file, which is
 workspace content, so the queue's registry stays in memory and its durable record is
-`_quack_jobs` in each workspace's file (`jobs::store`), never `control.db`. The engine's
+`_quack_jobs` in each workspace's file (`jobs::store`), never `control.db`. The command
+line's long runs are recorded there too (`quack_cli::RecordedRun`: `ingest`, `import`,
+`graph`, `ontology`, `embeddings`, `classify`): the command runs on its own task with its
+output and prompts, and a job mirrors it on the engine's queue (queued at the start, the
+run's progress, the command's outcome), so `quack jobs` from another shell shows an ingest
+running and the file keeps how it ended. `-q` and the listings are not recorded. The engine's
 recorder task reads every snapshot the queue broadcasts and writes the job's row into its
 workspace's file when the job's state changed (a snapshot that changed only progress or a
 status line is not written), at background priority on that workspace's writer, and only
@@ -3126,6 +3131,13 @@ quack member add|remove|list ; quack audit [filters] [--format text|json|csv|ocs
 quack --version    version plus the AWS-LC module the binary links; -V is the bare version
 ```
 
+**Typed SQL.** `-q` passes the gate every typed statement passes (the terminal's direct SQL
+and `/sql`, the web SQL page, a holder's `sql` tool): internal `_quack_` tables are refused,
+and so is a write that names a reserved `graph_` or `_quack_` table. It then writes every
+row: `-q` is the pipeline's export (`-f csv`, `-f ndjson`), so the `max_query_rows` cap is
+the interactive interfaces' alone. Whether another process holds the workspace changes
+nothing about what is refused.
+
 **Streams.** Non-terminal stdin is data for `-p` and `-q`: CSV, JSON, or Parquet loaded as
 the temporary table `stdin` for that invocation (a pasted document is `quack ingest -`). A
 pipe silent for a second (a supervisor's inherited stdin) is skipped with a warning; `--stdin`
@@ -3148,7 +3160,9 @@ way), so a new install needs no setup step. Naming the default with `-w` does th
 `ControlPlane::workspace_or_default` is the one place this is decided. A new workspace's
 name is a `WorkspaceName`: trimmed, non-empty, and without `/`, `\`, or `.`. The CLI verb,
 `POST /api/v1/workspaces`, the web console, and `default_workspace` in `config.toml` all go
-through that type. Workspaces created before the rule keep their names and still open.
+through that type. Workspaces created before the rule keep their names and still open. The
+server a terminal session runs beside itself serves that one workspace, so it refuses to
+create another (409, naming `quack workspace create`) and the console shows no create form.
 
 **Snapshot, restore, rename, delete.** A workspace is one directory under
 `{data_dir}/workspaces/{id}` plus a `control.db` row, and `storage::backup` moves the pair as
