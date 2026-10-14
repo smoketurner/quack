@@ -998,31 +998,47 @@ fn refuse_private(host: &str, ip: IpAddr) -> Result<()> {
     Ok(())
 }
 
-/// Loopback, unspecified, link-local (cloud metadata lives at
-/// 169.254.169.254), RFC 1918 and carrier-grade NAT ranges, multicast, and
-/// their IPv6 counterparts, including IPv4-mapped addresses.
+/// Loopback, unspecified, "this network" (0/8), link-local (cloud metadata
+/// lives at 169.254.169.254), RFC 1918, carrier-grade NAT, IETF protocol
+/// (192.0.0/24), benchmarking (198.18/15), reserved (240/4), multicast, and
+/// their IPv6 counterparts. An IPv6 address that carries an IPv4 one
+/// (mapped, compatible, NAT64, 6to4) is judged by that IPv4 address, since a
+/// gateway may deliver it there; Teredo and local-use NAT64 are refused whole.
 fn is_private_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let [a, b, _, _] = v4.octets();
+            let [a, b, c, _] = v4.octets();
             v4.is_loopback()
-                || v4.is_unspecified()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_broadcast()
                 || v4.is_multicast()
+                || a == 0
+                || a >= 240
                 || (a == 100 && (64..=127).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && (18..=19).contains(&b))
         }
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => is_private_address(IpAddr::V4(v4)),
-            None => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_unique_local()
-                    || v6.is_unicast_link_local()
-                    || v6.is_multicast()
+        IpAddr::V6(v6) => {
+            let [s0, s1, s2, s3, s4, s5, ..] = v6.segments();
+            let [_, _, o2, o3, o4, o5, _, _, _, _, _, _, o12, o13, o14, o15] = v6.octets();
+            let embedded = match (s0, s1) {
+                (0x0064, 0xff9b) if [s2, s3, s4, s5] == [0; 4] => Some([o12, o13, o14, o15]),
+                (0x2002, _) => Some([o2, o3, o4, o5]),
+                _ => v6.to_ipv4().map(|v4| v4.octets()),
+            };
+            if let Some(v4) = embedded {
+                return is_private_address(IpAddr::from(v4));
             }
-        },
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+                || (s0 & 0xffc0) == 0xfec0
+                || (s0, s1) == (0x2001, 0x0000)
+                || (s0, s1, s2) == (0x0064, 0xff9b, 0x0001)
+        }
     }
 }
 
