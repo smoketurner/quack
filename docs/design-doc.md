@@ -390,9 +390,17 @@ workspace: an earlier design had the terminal walk up to a `.quack/` folder as `
 
 One DuckDB file per workspace; queries cannot cross workspaces. `ATTACH` is impossible, not
 discouraged: `WorkspaceDb::confine_to` sets `allowed_directories` to the workspace directory
-alone, turns off `enable_external_access` and `allow_persistent_secrets`, applies the
-`memory_limit` and `threads` caps, then sets `lock_configuration` before any user or agent
-statement runs. External data arrives through `quack import`, which snapshots rows into an
+alone, turns off `enable_external_access`, `allow_persistent_secrets`,
+`autoinstall_known_extensions`, `autoload_known_extensions`, and `allow_community_extensions`
+(so a statement that needs an extension fails as unloaded whatever the directories allow),
+applies the `memory_limit` and `threads` caps, then sets `lock_configuration` before any user or
+agent statement runs. Typed SQL is also refused by its tokens (`TypedSql::refusal`) when it is
+transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`: every client's writes share one connection,
+so one client's `ROLLBACK` would discard the others' work) or names the server's catalog
+(`database_list`, `duckdb_databases`, `duckdb_settings`, `current_setting`,
+`duckdb_extensions`: each carries the workspace file's host path or the server's settings).
+The REST `/sql` answer is bounded in bytes like the MCP `sql` tool's (4 MiB, 64 KiB a value,
+`cells_cut`); `/sql/export` streams every row. External data arrives through `quack import`, which snapshots rows into an
 ordinary table (section 6.2).
 
 A workspace's `allowed_providers` limits which LLM providers see its data, so a workspace

@@ -67,7 +67,7 @@ use quack_mcp::client::{CommandClient, HolderClient};
 
 use quack_core::config::ServerConfig;
 use quack_server::{ServeMode, Server};
-use quack_terminal::{QUIT_GRACE, SessionSetup, WebStatus};
+use quack_terminal::{QUIT_GRACE, Quitting, SessionSetup, WebStatus};
 
 use crate::progress_line::StderrProgress;
 
@@ -1995,7 +1995,7 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
         ),
         Err(e) => (WebStatus::Unavailable(format!("{e:#}")), None),
     };
-    let session = quack_terminal::run(SessionSetup {
+    let setup = SessionSetup {
         engine: Arc::clone(&opened.engine),
         web,
         workspace_name: opened.workspace.name.clone(),
@@ -2005,22 +2005,40 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
         session_id,
         writes,
         approvals: opened.approvals.clone(),
-    })
-    .await;
+    };
     // The session's quit stopped the jobs (a session that failed did not:
     // the stop sequence cancels them either way); the server and the
     // socket drain under the same grace, and the writer checkpoints last
-    // (`Engine::shutdown`).
-    drop(handle);
-    let server = server.map(|server| -> Drain {
-        Box::pin(async move {
-            if let Ok(Err(e)) = server.await {
-                tracing::warn!(error = %e, "the web server beside the session ended with an error");
-            }
-        })
+    // (`Engine::shutdown`), all before the tty is handed back.
+    let quitting: Quitting = Box::new(move || {
+        let socket = if opened.socket_busy() {
+            ", and a statement another process sent over the workspace socket"
+        } else {
+            ""
+        };
+        let line = format!(
+            "Quitting: finishing the jobs{socket}{} (up to {} s), then closing the workspace.",
+            if server.is_some() {
+                ", and the web server's requests"
+            } else {
+                ""
+            },
+            QUIT_GRACE.as_secs()
+        );
+        let server = server.map(|server| -> Drain {
+            Box::pin(async move {
+                if let Ok(Err(e)) = server.await {
+                    tracing::warn!(error = %e, "the web server beside the session ended with an error");
+                }
+            })
+        });
+        let stop: Drain = Box::pin(async move {
+            drop(handle);
+            opened.stop(Stop::Cancel, QUIT_GRACE, server).await;
+        });
+        (line, stop)
     });
-    opened.stop(Stop::Cancel, QUIT_GRACE, server).await;
-    session?;
+    quack_terminal::run(setup, quitting).await?;
     Ok(ExitCode::SUCCESS)
 }
 

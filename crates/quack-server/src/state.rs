@@ -401,7 +401,7 @@ impl AppState {
                 let held = HeldElsewhere::find(
                     &config.workspace_dir(workspace_id.as_str()),
                     workspace_id,
-                    config.workspace_db_path(workspace_id.as_str()),
+                    format!("the file of workspace {workspace_id}"),
                     self.engine.holder().clone(),
                     locked,
                 )

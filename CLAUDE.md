@@ -105,7 +105,7 @@ cargo run --bin quack -- tables [TABLE [--note TEXT] [--retype COL=TYPE]] [--for
 cargo run --bin quack -- docs [--tag ID TAG | --untag ID TAG | --author ID NAME | --authored ID DATE]   # a document's own fields; PATCH .../documents/{doc} over REST
 cargo run --bin quack -- -p "question" -w ws [-f text|json] [--documents DOC,..]   # one agent turn; steps on stderr; --documents limits it to those documents
 cargo run --bin quack -- search QUERY -w ws [--in DOC..] [--keyword|--vector] [--explain] [-f text|json]   # analysis::search::DocumentSearch without the model: each hit's vector, keyword, and rerank rank
-cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY); serves the web UI, REST API, and MCP for that workspace on 127.0.0.1 at [server].bind's port (a random one when unset) beside it (quack_server::Server over the session's engine; local mode answers loopback Host names only)
+cargo run --bin quack -- -w ws                                                 # terminal session (needs a TTY); serves the web UI, REST API, and MCP for that workspace on 127.0.0.1 at [server].bind's port (a random one when unset) beside it (quack_server::Server over the session's engine; local mode answers loopback Host names only); its quit keeps the tty raw, showing what it waits for, until the stop sequence ends, so a second Ctrl-C is a key and not a signal to the shell
 cargo run --bin quack -- sessions [--search TEXT] | export ID [--sql]          # sessions live in the workspace file; /rename, /sessions TEXT, and /resume TITLE in the terminal; [analysis].title_sessions has the model title them
 cargo run --bin quack -- saved list | add NAME --from-session ID | run NAME [--refresh] [--exit-code] | show NAME | remove NAME   # an answer's SQL re-run without the model; exit 5 when changed; cron schedules it
 cargo run --bin quack -- ontology show|init|import|export|versions|diff|restore   # the graph schema, versioned in the workspace
@@ -482,7 +482,9 @@ table, BM25 with `tokenize`, plus cosine over card vectors in `_quack_table_card
 refreshed at turn start, which hands its cards to the ranking, fused by RRF). The graph is readable in SQL through `graph::views` (issue #406):
 `graph_<class>` with one typed column per property and `graph_edges`, made by `views::ensure` at
 every ontology save and open, marked by a comment; `table_search::user_tables` is
-`list_tables` without them. A write naming `graph_` is refused (`views::write_names_reserved`),
+`list_tables` without them. A write naming `graph_` is refused (`views::write_names_reserved`), and typed SQL that is transaction
+control or names the server's catalog (`database_list`, `duckdb_settings`, `current_setting`, ...) is refused by
+its tokens (`storage::workspace::TypedSql`),
 and ingest and import refuse `graph_` and `_quack_` table names (`TableName::check_unreserved`).
 
 Every embedding goes through `quack_core::embedding::Embedder` as an `Input`, which names

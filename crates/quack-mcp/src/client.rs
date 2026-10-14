@@ -4,7 +4,7 @@
 //! `quack://workspace/jobs`.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use quack_core::config::Config;
@@ -56,7 +56,10 @@ pub struct HeldElsewhere {
     pub holder: Option<String>,
     /// What was refused.
     wanted: Wanted,
-    path: PathBuf,
+    /// The file, as this process may name it: its path on the command
+    /// line, the workspace's id from the server (an API body never
+    /// carries a host path).
+    file: String,
     locked: Error,
 }
 
@@ -83,12 +86,13 @@ impl HeldElsewhere {
             return None;
         }
         let locked = Error::WorkspaceLocked { path: path.clone() };
+        let file = format!("the file of workspace {workspace_id}");
         match holder_of(&config.workspace_dir(id), workspace_id).await {
             Ok(Some(holder)) => {
                 return Some(Self {
                     holder: Some(holder),
                     wanted: Wanted::Delete,
-                    path,
+                    file,
                     locked,
                 });
             }
@@ -105,7 +109,7 @@ impl HeldElsewhere {
             Ok(Err(Error::WorkspaceLocked { .. })) => Some(Self {
                 holder: None,
                 wanted: Wanted::Delete,
-                path,
+                file,
                 locked,
             }),
             Ok(_) | Err(_) => None,
@@ -113,12 +117,14 @@ impl HeldElsewhere {
     }
 
     /// Ask the socket of the workspace in `workspace_dir` who holds the
-    /// file at `path`, for `wanted`, which `locked` refused. A socket that
-    /// does not answer is logged and names nobody.
+    /// file (`file` names it as this process may: a path on the command
+    /// line, the workspace's id from the server), for `wanted`, which
+    /// `locked` refused. A socket that does not answer is logged and names
+    /// nobody.
     pub async fn find(
         workspace_dir: &Path,
         workspace_id: &WorkspaceId,
-        path: PathBuf,
+        file: String,
         wanted: Holder,
         locked: Error,
     ) -> Self {
@@ -132,7 +138,7 @@ impl HeldElsewhere {
         Self {
             holder,
             wanted: Wanted::Open(wanted),
-            path,
+            file,
             locked,
         }
     }
@@ -141,7 +147,7 @@ impl HeldElsewhere {
 impl fmt::Display for HeldElsewhere {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Some(holder) = &self.holder else {
-            return f.write_str(&locked_without_socket(&self.path));
+            return f.write_str(&locked_without_socket(&self.file));
         };
         write!(f, "the workspace is open in {holder}; ")?;
         match &self.wanted {
@@ -207,18 +213,17 @@ impl ClientHandler for CommandClient {
     }
 }
 
-/// What the lock on the workspace file at `path` means when no socket
-/// answers for it: every holder but `quack serve` serves the socket while
-/// it holds the file, so the holder is the server (whose `/mcp/v1`
-/// endpoint is the way in) or a process between opening the file and
-/// binding the socket, or between closing them.
+/// What the lock on the workspace `file` (named as the caller may name
+/// it) means when no socket answers for it: every holder but `quack serve`
+/// serves the socket while it holds the file, so the holder is the server
+/// (whose `/mcp/v1` endpoint is the way in) or a process between opening
+/// the file and binding the socket, or between closing them.
 #[must_use]
-pub fn locked_without_socket(path: &Path) -> String {
+pub fn locked_without_socket(file: &str) -> String {
     format!(
-        "the workspace file {} is open in another quack process that answers on no socket: \
-         quack serve (reach the workspace through its /mcp/v1 endpoint), or a process that is \
-         starting or stopping; try again, or stop it",
-        path.display()
+        "{file} is open in another quack process that answers on no socket: quack serve (reach \
+         the workspace through its /mcp/v1 endpoint), or a process that is starting or \
+         stopping; try again, or stop it"
     )
 }
 
@@ -486,6 +491,12 @@ impl<H: ClientHandler> HolderClient<H> {
                 holder: self.holder.clone(),
                 error: Box::new(error),
             },
+            // The holder ended the session before answering: it quit (the
+            // terminal session's Ctrl-C), or its stop cut the call short.
+            ServiceError::TransportClosed => HolderError::Unreachable(Error::Forward(format!(
+                "{} closed the connection before answering: it quit before the statement finished",
+                self.holder
+            ))),
             other => HolderError::Unreachable(self.failed(&format!("{what}: {other}"))),
         }
     }

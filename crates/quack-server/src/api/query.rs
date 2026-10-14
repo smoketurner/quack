@@ -29,7 +29,8 @@ use quack_core::storage::control::{AuditAction, Outcome, ResourceKind};
 use quack_core::storage::profile::TableProfile;
 use quack_core::storage::sessions::{self, ChatMode};
 use quack_core::storage::workspace::{
-    DocumentFilter, ExportFormat, SearchMode, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
+    DocumentFilter, ExportFormat, STRUCTURED_CELL_CHARS, STRUCTURED_RESULT_BYTES, SearchMode,
+    TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -609,7 +610,12 @@ pub(crate) struct SqlOutcome {
     /// the statement with it.
     pub row_count: usize,
     pub row_count_exact: bool,
+    /// Rows were dropped: at the row cap, or at the byte bound of the
+    /// response (4 MiB, as the MCP `sql` tool's); `/sql/export` streams
+    /// every row.
     pub truncated: bool,
+    /// Values cut at 65,536 characters among the rows kept.
+    pub cells_cut: usize,
     /// How long the statement ran, timed on its connection's thread, so a
     /// wait for the writer is not counted.
     pub duration_ms: u64,
@@ -801,9 +807,14 @@ impl Access {
         access
             .audit(app, AuditAction::Sql, None, outcome, Some(detail))
             .await?;
-        let (capped, took) = result.map_err(|e| e.unprocessable_as(ErrorCode::SqlFailed))?;
+        let (mut capped, took) = result.map_err(|e| e.unprocessable_as(ErrorCode::SqlFailed))?;
+        // The row cap bounds nothing by itself: a wide cell or a few wide
+        // rows would be buffered and sent whole. The same byte bound as the
+        // MCP tool's; `/sql/export` streams every row.
+        let cut = capped.bound_bytes(STRUCTURED_RESULT_BYTES, STRUCTURED_CELL_CHARS);
         Ok(SqlOutcome {
             truncated: capped.truncated(),
+            cells_cut: cut.cells,
             row_count_exact: !capped.stopped_early,
             columns: capped.results.columns,
             column_types: capped.column_types,

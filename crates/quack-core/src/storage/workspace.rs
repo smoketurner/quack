@@ -5,6 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use sqlparser::dialect::DuckDbDialect;
+use sqlparser::tokenizer::{Token, Tokenizer};
+
 use aws_lc_rs::digest;
 use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
 use jiff::civil::DateTime;
@@ -1397,9 +1400,15 @@ impl WorkspaceDb {
         // and audit clones included): it keeps the names `DuckDB` suggests
         // apart from the message, so `DuckDbMessage` can leave quack's
         // internal tables out of them.
+        // No extension is ever fetched or loaded: a statement that needs one
+        // fails as unloaded whatever the directories allow, not only because
+        // the extension directory is outside them.
         self.conn.execute_batch(
             "SET enable_external_access = false;\n\
              SET allow_persistent_secrets = false;\n\
+             SET autoinstall_known_extensions = false;\n\
+             SET autoload_known_extensions = false;\n\
+             SET allow_community_extensions = false;\n\
              SET GLOBAL errors_as_json = true;\n\
              SET lock_configuration = true;",
         )?;
@@ -1569,6 +1578,9 @@ impl WorkspaceDb {
             return Err(Error::Analysis(String::from(
                 "internal tables are not accessible",
             )));
+        }
+        if let Some(refused) = TypedSql::refusal(sql) {
+            return Err(Error::Analysis(refused.to_string()));
         }
         let kind = self.classify_statement(sql)?;
         if graph::views::write_names_reserved(sql, &kind) {
@@ -5983,6 +5995,86 @@ fn text_constant(node: &serde_json::Value) -> Option<String> {
         .then(|| value.get("value").and_then(serde_json::Value::as_str))
         .flatten()
         .map(str::to_owned)
+}
+
+/// What typed SQL may not do on the shared writer or learn about the
+/// host, found by the statement's tokens (`sqlparser`'s `DuckDB` dialect,
+/// so a name inside a string literal does not count).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedSql {
+    /// `BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`, `ABORT`, `END`:
+    /// every client's writes share one writer connection, so a transaction
+    /// one client opens turns autocommit off for all of them, and its
+    /// `ROLLBACK` discards the others' work.
+    TransactionControl,
+    /// `PRAGMA database_list`, `duckdb_databases()`, `duckdb_settings()`,
+    /// `current_setting()`, `duckdb_extensions()`: each carries the
+    /// workspace file's path or the server's settings, which tell a remote
+    /// user where `control.db` and every workspace live on the host.
+    ServerCatalog,
+}
+
+impl TypedSql {
+    /// Statement-leading keywords of transaction control.
+    const TRANSACTION_CONTROL: &[&str] = &["BEGIN", "START", "COMMIT", "ROLLBACK", "ABORT", "END"];
+    /// Functions and pragmas that reveal the host.
+    const SERVER_CATALOG: &[&str] = &[
+        "database_list",
+        "pragma_database_list",
+        "duckdb_databases",
+        "duckdb_settings",
+        "current_setting",
+        "duckdb_extensions",
+    ];
+
+    /// Why `sql` is refused, if it is: the first word of any statement in
+    /// it is transaction control, or any word in it names the server's
+    /// catalog. A statement the tokenizer cannot read is left to the
+    /// parser, which refuses it as a syntax error.
+    #[must_use]
+    pub fn refusal(sql: &str) -> Option<Self> {
+        let tokens = Tokenizer::new(&DuckDbDialect {}, sql).tokenize().ok()?;
+        let mut statement_start = true;
+        for token in &tokens {
+            match token {
+                Token::Whitespace(_) => {}
+                Token::SemiColon => statement_start = true,
+                Token::Word(word) => {
+                    if statement_start
+                        && Self::TRANSACTION_CONTROL
+                            .iter()
+                            .any(|k| k.eq_ignore_ascii_case(&word.value))
+                    {
+                        return Some(Self::TransactionControl);
+                    }
+                    if Self::SERVER_CATALOG
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(&word.value))
+                    {
+                        return Some(Self::ServerCatalog);
+                    }
+                    statement_start = false;
+                }
+                _ => statement_start = false,
+            }
+        }
+        None
+    }
+}
+
+impl fmt::Display for TypedSql {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::TransactionControl => {
+                "transaction control (BEGIN, COMMIT, ROLLBACK) is not accepted: every \
+                 statement runs in its own transaction on the workspace's shared connection"
+            }
+            Self::ServerCatalog => {
+                "the server's catalog (database_list, duckdb_databases, duckdb_settings, \
+                 current_setting, duckdb_extensions) is not accessible"
+            }
+        })
+    }
 }
 
 /// Conservative token scan used for statements the parser will not serialize.

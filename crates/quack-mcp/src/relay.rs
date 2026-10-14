@@ -149,7 +149,10 @@ impl PerCallServer {
                     tokio::time::sleep(LOCK_RETRY).await;
                 }
                 Err(CoreError::WorkspaceLocked { path }) => {
-                    return Err(internal(client::locked_without_socket(&path)));
+                    return Err(internal(client::locked_without_socket(&format!(
+                        "the workspace file {}",
+                        path.display()
+                    ))));
                 }
                 Err(e) => return Err(internal(e.to_string())),
             }

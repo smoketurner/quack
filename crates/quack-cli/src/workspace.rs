@@ -127,7 +127,10 @@ impl OpenedWorkspace {
         HeldElsewhere::find(
             &self.engine.config.workspace_dir(id),
             &self.workspace.id,
-            self.engine.config.workspace_db_path(id),
+            format!(
+                "the workspace file {}",
+                self.engine.config.workspace_db_path(id).display()
+            ),
             self.engine.holder().clone(),
             locked,
         )
@@ -167,6 +170,16 @@ impl OpenedWorkspace {
             Some(self.approvals.clone()),
         ));
         Some(SocketServer::serve(listener, server))
+    }
+
+    /// Whether a statement or call another process sent over the workspace
+    /// socket is in progress, so a quit can say what it waits for.
+    #[must_use]
+    pub fn socket_busy(&self) -> bool {
+        self.socket
+            .get()
+            .and_then(Option::as_ref)
+            .is_some_and(SocketServer::has_sessions)
     }
 
     /// The socket's drain for [`Engine::shutdown`]: stop serving it and
