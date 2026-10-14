@@ -1078,3 +1078,77 @@ async fn a_job_cancelled_before_its_task_first_runs_never_starts() {
     assert!(ended.never_started(), "{ended:?}");
     assert!(!ran.load(Ordering::SeqCst));
 }
+
+/// A title job an earlier quack wrote with no lane gets the lane its label
+/// names at open, so deleting its session takes it like a new one; a row
+/// of another kind, or another session's, stays as it was.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test")]
+fn a_title_row_written_without_a_lane_goes_with_its_session() {
+    use crate::embedding::Dimension;
+    use crate::jobs::store;
+    use crate::storage::workspace::WorkspaceDb;
+
+    let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
+    let workspace = WorkspaceId::from("ws");
+    let mine = SessionId::from("s1");
+    let row = |id: &str, kind: JobKind, label: &str| JobInfo {
+        id: id.parse().unwrap(),
+        number: JobNumber::default(),
+        kind,
+        label: String::from(label),
+        workspace_id: Some(workspace.clone()),
+        owner: None,
+        lane: None,
+        state: JobState::Succeeded,
+        progress: None,
+        status: None,
+        outcome: None,
+        queued_at: Timestamp::now(),
+        started_at: None,
+        finished_at: Some(Timestamp::now()),
+        cancel_requested: false,
+    };
+    for job in [
+        row(
+            "0199d1f0-0000-7000-8000-000000000001",
+            JobKind::Title,
+            "title session s1",
+        ),
+        row(
+            "0199d1f0-0000-7000-8000-000000000002",
+            JobKind::Title,
+            "title session s2",
+        ),
+        row(
+            "0199d1f0-0000-7000-8000-000000000003",
+            JobKind::Chat,
+            "title session s1",
+        ),
+    ] {
+        store::upsert(&db, &job, "a test").unwrap();
+    }
+    assert_eq!(store::lane_untitled_rows(&db).unwrap(), 2);
+    assert_eq!(store::lane_untitled_rows(&db).unwrap(), 0);
+    let restored = store::recent(&db, &workspace, 10).unwrap();
+    let lanes: Vec<Option<String>> = restored.iter().map(|job| job.lane.clone()).collect();
+    assert_eq!(
+        lanes,
+        [
+            Some(String::from("session:s1:title")),
+            Some(String::from("session:s2:title")),
+            None,
+        ]
+    );
+    let queue = JobQueue::new(10);
+    queue.restore(restored);
+    queue.forget_session(&mine);
+    assert_eq!(queue.list().len(), 2);
+    assert_eq!(store::delete_session_jobs(&db, &mine).unwrap(), 1);
+    let left: Vec<String> = store::recent(&db, &workspace, 10)
+        .unwrap()
+        .into_iter()
+        .map(|job| job.label)
+        .collect();
+    assert_eq!(left, ["title session s2", "title session s1"]);
+}

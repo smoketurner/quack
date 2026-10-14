@@ -166,9 +166,9 @@ fn refresh_in_background(
             progress: &progress,
             cancel: Some(&cancel),
         };
-        match app.workspace_db(&workspace_id).await {
-            Ok(db) => refresh::run(
-                &db,
+        match app.workspace(&workspace_id).await {
+            Ok(handle) => refresh::run(
+                &handle.writer,
                 &embedder,
                 app.engine.config.ingestion.embedding_batch_size,
                 control,

@@ -451,6 +451,9 @@ impl Engine {
                 if interrupted > 0 {
                     tracing::warn!(workspace = %id, interrupted, "failed jobs left active by an earlier process");
                 }
+                // Title jobs an earlier quack wrote without a lane get the
+                // one their label names, so deleting the session takes them.
+                jobs_store::lane_untitled_rows(&db)?;
                 // Sessions a killed first turn left without a message go
                 // the same way: no process owns a session in a file that
                 // is only now being opened.

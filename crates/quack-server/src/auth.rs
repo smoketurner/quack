@@ -563,6 +563,11 @@ impl Access {
     /// halves, every time; a failed write fails the request). `resource`
     /// carries an opaque id only, never a table name or content; those
     /// go in `detail`, which stays inside the workspace.
+    ///
+    /// It runs after the work it records, which a change has already
+    /// committed in the workspace file, so a failed write is `unaudited`
+    /// (#600): a 500 saying the work stands, never one that reads as the
+    /// work having failed.
     pub(crate) async fn audit(
         &self,
         app: &App,
@@ -571,11 +576,15 @@ impl Access {
         outcome: Outcome,
         detail: Option<serde_json::Value>,
     ) -> ApiResult<AuditId> {
-        Ok(self
-            .recorder(app)
+        let what = action.to_string();
+        self.recorder(app)
             .await?
             .record(action, resource, outcome, detail)
-            .await?)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, action = what, "audit write failed after the work it records");
+                ApiError::unaudited()
+            })
     }
 
     /// Both audit halves for this caller in this workspace, as core's
@@ -585,7 +594,7 @@ impl Access {
         let workspace_id = &self.membership.workspace.id;
         Ok(Recorder::new(
             app.control.clone(),
-            app.audit_log(workspace_id).await?,
+            app.workspace(workspace_id).await?.audit,
             self.identity.origin.clone(),
             self.identity.user_id.clone(),
             self.identity.token_hash(),

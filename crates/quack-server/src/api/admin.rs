@@ -185,8 +185,9 @@ impl Identity {
         for workspace in app.control.list_workspaces().await? {
             let (id, name) = (user.clone(), row.username.clone());
             let changed = app
-                .workspace_db(&workspace.id)
+                .workspace(&workspace.id)
                 .await?
+                .writer
                 .run(move |db| db.forget_user(&id, &name))
                 .await?;
             forgotten = forgotten.saturating_add(changed);

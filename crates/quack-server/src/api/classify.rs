@@ -178,7 +178,7 @@ impl Access {
         sentence: Option<&str>,
     ) -> ApiResult<Draft> {
         let decision = self.decision_model(app).await?;
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let request = classify::Request {
             table: table.to_owned(),
             sentence: sentence.map(str::to_owned),
@@ -217,7 +217,7 @@ impl Access {
         rows: u32,
     ) -> ApiResult<classify::Report> {
         let decision = self.decision_model(app).await?;
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let waiting = Waiting::Caller {
             budget: app.engine.config.decision.interactive_budget,
         };
@@ -277,7 +277,7 @@ impl Access {
         request: classify::Request,
     ) -> ApiResult<Started> {
         let decision = self.decision_model(app).await?;
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let planned = async {
             let draft = self.draft_of(app, &db, &decision, &request).await?;
             let outline = draft.outline(&db, &decision, request.rows).await?;

@@ -93,7 +93,7 @@ impl Access {
         message: Option<i64>,
     ) -> ApiResult<SavedQuestion> {
         let session = self.visible_session(app, session).await?;
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let answer = message.map_or(Answer::Last, Answer::Seq);
         let creator = self.identity.user_id.clone();
         let session_id = session.id.clone();
@@ -195,7 +195,7 @@ impl Access {
                 "only the saved question's creator or an owner may remove it",
             ));
         }
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         if let Err(e) = with_db(db, move |db| saved::remove(db, &question.id)).await {
             self.audit(
                 app,
@@ -216,7 +216,7 @@ impl Access {
     /// with the run id, its status, and `changed`.
     pub(crate) async fn run_saved(&self, app: &App, saved: &SavedId) -> ApiResult<RunOf> {
         let question = self.saved_question(app, saved).await?;
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let max_rows = app.engine.config.analysis.max_query_rows;
         let resource = Some(ResourceKind::SavedQuestion.id(saved));
         let ran = question.clone();

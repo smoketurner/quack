@@ -232,11 +232,13 @@ pub(crate) async fn snapshot(
     let dir = app.engine.config.workspace_dir(id.as_str());
     let spool_dir = app.engine.config.data_dir().to_path_buf();
     let spooled = app
+        .engine
         .with_workspace_closed(&id, move || {
             let spool = tempfile::tempfile_in(&spool_dir)?;
             manifest.write(&dir, spool)
         })
-        .await;
+        .await
+        .map_err(ApiError::from);
     let mut spool = match spooled {
         Ok(spool) => spool,
         Err(e) => {

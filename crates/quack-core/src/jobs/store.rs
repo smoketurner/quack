@@ -129,6 +129,42 @@ pub fn prune(db: &WorkspaceDb, keep: u32) -> Result<usize> {
     Ok(gone)
 }
 
+/// What a title job's label starts with; the session id follows.
+pub const TITLE_LABEL: &str = "title session ";
+
+/// Give the title jobs an earlier quack wrote without a lane (before title
+/// jobs had `LaneKey::SessionTitle`) the lane their label names, so
+/// [`delete_session_jobs`] and `JobQueue::forget_session` find them as they
+/// find new ones. Returns how many rows changed.
+///
+/// # Errors
+///
+/// Returns the query's or an update's error.
+pub fn lane_untitled_rows(db: &WorkspaceDb) -> Result<usize> {
+    let mut statement = db.connection().prepare(
+        "SELECT id, label FROM _quack_jobs WHERE lane IS NULL AND kind = ? \
+         AND starts_with(label, ?)",
+    )?;
+    let rows = statement
+        .query_map(
+            duckdb::params![JobKind::Title.as_str(), TITLE_LABEL],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut changed = 0_usize;
+    for (id, label) in rows {
+        let Some(session) = label.strip_prefix(TITLE_LABEL).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let lane = LaneKey::SessionTitle(SessionId::from(session)).to_string();
+        changed = changed.saturating_add(db.connection().execute(
+            "UPDATE _quack_jobs SET lane = ? WHERE id = ?",
+            duckdb::params![lane, id],
+        )?);
+    }
+    Ok(changed)
+}
+
 /// Delete the jobs of one chat session when the session goes: its turns,
 /// whose labels quote the questions, and its title jobs, which name a
 /// session that no longer exists.

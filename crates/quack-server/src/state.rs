@@ -198,55 +198,6 @@ impl AppState {
         }
     }
 
-    /// Stop the server whose HTTP drain is `server`: streams end and the
-    /// job queue shuts down beside the drain, under one `grace`, and the
-    /// workspaces close last.
-    ///
-    /// # Errors
-    ///
-    /// Returns the drain's own error.
-    pub(crate) async fn stop<S>(
-        self: Arc<Self>,
-        mut server: Option<S>,
-        grace: Duration,
-    ) -> std::io::Result<()>
-    where
-        S: Future<Output = std::io::Result<()>> + Unpin,
-    {
-        let deadline = Instant::now().checked_add(grace);
-        let drain = async {
-            // `None`: the server already ended on its own; nothing to drain.
-            let drained = async {
-                match server.as_mut() {
-                    Some(server) => server.await,
-                    None => Ok(()),
-                }
-            };
-            let (served, _) = tokio::join!(drained, self.engine.stop_jobs(grace));
-            served
-        };
-        let served = tokio::time::timeout(grace, drain)
-            .await
-            .unwrap_or_else(|_| {
-                tracing::warn!(
-                    grace_seconds = grace.as_secs(),
-                    "requests were still open when the shutdown grace ran out"
-                );
-                Ok(())
-            });
-        drop(server);
-        // A request that ended during the drain may have been refused a job;
-        // what that job's end records is awaited in what is left of the grace.
-        let left = deadline.map_or(Duration::ZERO, |at| {
-            at.saturating_duration_since(Instant::now())
-        });
-        for job in self.engine.stop_jobs(left).await {
-            tracing::warn!(job = %job.id, kind = %job.kind, state = %job.state, "job still active at exit");
-        }
-        self.close().await;
-        served
-    }
-
     /// Drop every MCP transport, the last thing the server does; whoever
     /// owns the engine closes it after (`Engine::close`), so a terminal
     /// session serving beside itself keeps its workspace until it quits.
@@ -287,23 +238,6 @@ impl AppState {
         dropped
             .await
             .map_err(|e| ApiError::internal(format!("closing the workspace failed: {e}")))
-    }
-
-    /// Run `work` with the workspace's file closed, then reopen it: this
-    /// workspace's requests wait for it, other workspaces do not.
-    pub(crate) async fn with_workspace_closed<T, F>(
-        &self,
-        workspace_id: &WorkspaceId,
-        work: F,
-    ) -> ApiResult<T>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> CoreResult<T> + Send + 'static,
-    {
-        Ok(self
-            .engine
-            .with_workspace_closed(workspace_id, work)
-            .await?)
     }
 
     /// Whether this server can serve: `control.db` answers, the data
@@ -383,8 +317,6 @@ impl AppState {
         transport
     }
 
-    /// The writer handle for a workspace, opening the file on first use
-    /// (`Engine::workspace`, which is where one open per file is enforced).
     /// The body limit of a route that takes a file (`[ingestion].upload_max_mb`):
     /// a document upload, a snapshot to restore. Every other route keeps
     /// the router's small default (`JSON_BODY_BYTES`), so a statement or a
@@ -396,16 +328,16 @@ impl AppState {
         DefaultBodyLimit::max(bytes)
     }
 
-    pub(crate) async fn workspace_db(&self, workspace_id: &WorkspaceId) -> ApiResult<SharedDb> {
-        Ok(self.open_workspace(workspace_id).await?.writer)
-    }
-
-    /// The workspace's handle (`Engine::workspace`). A file another
+    /// The workspace's handle (`Engine::workspace`, which opens the file on
+    /// first use and is where one open per file is enforced): its writer,
+    /// its reader pool, which every read-only handler should prefer so it
+    /// never queues behind a write, and its insert-only audit connection.
+    /// A file another
     /// process holds is 503 `workspace_locked` on every route, naming the
     /// holder the way the command line does when its socket answers
     /// (`HeldElsewhere`), since the server never reads through another
     /// process.
-    async fn open_workspace(&self, workspace_id: &WorkspaceId) -> ApiResult<WorkspaceHandle> {
+    pub(crate) async fn workspace(&self, workspace_id: &WorkspaceId) -> ApiResult<WorkspaceHandle> {
         match self.engine.workspace(workspace_id).await {
             Ok(handle) => Ok(handle),
             Err(locked @ CoreError::WorkspaceLocked { .. }) => {
@@ -424,18 +356,6 @@ impl AppState {
         }
     }
 
-    /// The reader handle for a workspace (built once, alongside the
-    /// writer, on first use): every read-only handler should prefer this
-    /// over [`Self::workspace_db`] so it never queues behind a write.
-    pub(crate) async fn reader_db(&self, workspace_id: &WorkspaceId) -> ApiResult<ReaderDb> {
-        Ok(self.open_workspace(workspace_id).await?.reader)
-    }
-
-    /// The workspace's insert-only audit connection, opened with its writer.
-    pub(crate) async fn audit_log(&self, workspace_id: &WorkspaceId) -> ApiResult<Arc<AuditLog>> {
-        Ok(self.open_workspace(workspace_id).await?.audit)
-    }
-
     /// Run a read on one of the workspace's reader connections, inside a
     /// read-only transaction: it never waits for a write in progress, and
     /// anything that would write is refused. Every read-only handler reads
@@ -445,8 +365,9 @@ impl AppState {
         T: Send + 'static,
         F: FnOnce(&WorkspaceDb) -> CoreResult<T> + Send + 'static,
     {
-        self.reader_db(workspace_id)
+        self.workspace(workspace_id)
             .await?
+            .reader
             .with_db(f)
             .await
             .map_err(ApiError::from)

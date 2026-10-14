@@ -659,9 +659,11 @@ impl Server {
         self.listener.local_addr()
     }
 
-    /// Serve until the engine begins to stop, then drain under `grace`
-    /// beside the queue's shutdown and drop the MCP transports; the
-    /// engine's owner closes the workspaces after.
+    /// Serve until the engine begins to stop, then drain the open requests
+    /// under `grace` and drop the MCP transports. This is the server's drain
+    /// alone: the queue's shutdown and the workspaces' close belong to the
+    /// engine's one stop sequence (`Engine::shutdown`), which its owner runs
+    /// with this as a drain.
     ///
     /// # Errors
     ///
@@ -677,18 +679,21 @@ impl Server {
             .with_graceful_shutdown(stopping.clone().cancelled_owned())
             .into_future(),
         );
-        // Either way the stop sequence runs whole: the drain (while the
-        // server is still up), the queue's shutdown, then the close.
-        let ended = tokio::select! {
-            served = &mut server => Some(served),
-            () = stopping.cancelled() => None,
+        let served = tokio::select! {
+            served = &mut server => served,
+            () = stopping.cancelled() => {
+                tokio::time::timeout(grace, &mut server).await.unwrap_or_else(|_| {
+                    tracing::warn!(
+                        grace_seconds = grace.as_secs(),
+                        "requests were still open when the shutdown grace ran out"
+                    );
+                    Ok(())
+                })
+            }
         };
-        let (drain, served) = match ended {
-            Some(served) => (None, Some(served)),
-            None => (Some(server), None),
-        };
-        let stopped = app.stop(drain, grace).await;
-        served.unwrap_or(stopped).context("server error")
+        drop(server);
+        app.close().await;
+        served.context("server error")
     }
 }
 
@@ -749,10 +754,11 @@ pub async fn serve(config: Config, bind: Option<String>, mode: ServeMode) -> any
         drop(hook.spawn(engine.jobs.subscribe()));
     }
     tracing::info!(%addr, ?mode, "quack serve listening");
-    // The signal begins the stop sequence (`Engine::shutdown`): `run`
-    // drains the open requests and drops the MCP transports as the stopping
-    // token fires, while the queue shuts down, and the workspaces close
-    // last. A server that ends on its own goes through the same sequence.
+    // The signal begins the stop sequence (`Engine::shutdown`): `run` is
+    // its drain, ending the open requests and dropping the MCP transports
+    // as the stopping token fires, while the queue shuts down; the
+    // workspaces close last. A server that ends on its own goes through the
+    // same sequence with nothing left to drain.
     let mut run = Box::pin(server.run(grace));
     tokio::select! {
         served = &mut run => {
@@ -771,7 +777,9 @@ pub async fn serve(config: Config, bind: Option<String>, mode: ServeMode) -> any
             }
         })
     };
-    engine.shutdown(Stop::Cancel, grace, vec![drain]).await;
+    for job in engine.shutdown(Stop::Cancel, grace, vec![drain]).await {
+        tracing::warn!(job = %job.id, kind = %job.kind, state = %job.state, "job still active at exit");
+    }
     tracing::info!("stopped");
     served
         .lock()

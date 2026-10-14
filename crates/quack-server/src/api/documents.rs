@@ -441,7 +441,7 @@ async fn import_bundle(
     } else {
         enqueue(app, access, DocumentSource::Upload, files, None).await?
     };
-    let db = app.workspace_db(&access.membership.workspace.id).await?;
+    let db = app.workspace(&access.membership.workspace.id).await?.writer;
     let for_candidates = bundle.clone();
     let author = access.identity.username.clone();
     let report = with_db(db, move |db| {
@@ -597,7 +597,7 @@ pub(crate) async fn enqueue(
             Embeddings::from_config(&app.engine.config).await,
         )
         .await?;
-    let db = app.workspace_db(&id).await?;
+    let db = app.workspace(&id).await?.writer;
     let mut queued = Vec::with_capacity(files.len());
     for file in files {
         let lane = Lane {
@@ -826,7 +826,7 @@ pub(crate) async fn set_fields(
     doc: &DocumentId,
     fields: DocumentFields,
 ) -> ApiResult<DocumentInfo> {
-    let db = app.workspace_db(&access.membership.workspace.id).await?;
+    let db = app.workspace(&access.membership.workspace.id).await?.writer;
     let (doc_id, detail) = (doc.clone(), serde_json::to_value(FieldsDetail(&fields))?);
     let document = with_db(db, move |db| {
         db.set_document_fields(&doc_id, &fields)?;
@@ -872,7 +872,7 @@ pub(crate) async fn set_pinned(
     doc: &DocumentId,
     pinning: Pinning,
 ) -> ApiResult<DocumentInfo> {
-    let db = app.workspace_db(&access.membership.workspace.id).await?;
+    let db = app.workspace(&access.membership.workspace.id).await?.writer;
     let doc_id = doc.clone();
     let document = with_db(db, move |db| {
         db.set_document_pinning(&doc_id, pinning)?;
@@ -916,7 +916,7 @@ pub(crate) async fn delete_document(
     access: &Access,
     doc: &DocumentId,
 ) -> ApiResult<String> {
-    let db = app.workspace_db(&access.membership.workspace.id).await?;
+    let db = app.workspace(&access.membership.workspace.id).await?.writer;
     let doc_id = doc.clone();
     let filename = with_db(db, move |db| {
         let document = db

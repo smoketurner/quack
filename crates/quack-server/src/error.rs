@@ -48,6 +48,9 @@ pub(crate) enum ErrorCode {
     /// The server failed; the server's log has what happened, which the
     /// response does not repeat.
     Internal,
+    /// The request was carried out and stands, but its access-audit row
+    /// could not be written; the server's log has the row.
+    Unaudited,
     /// A model provider needs `quack auth login` first.
     AuthRequired,
     /// Another process holds the workspace file open.
@@ -367,6 +370,18 @@ impl ApiError {
 
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+
+    /// The work a request asked for was done, and its audit row was not
+    /// written (#600): a 500 that says the work stands, so a client does
+    /// not read it as a change that did not happen.
+    pub(crate) fn unaudited() -> Self {
+        Self::coded(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Unaudited,
+            "the request was carried out and its change stands, but its audit row could not \
+             be written; the server log has the row",
+        )
     }
 
     /// This error as a 422: the caller's own statement or source failed. A

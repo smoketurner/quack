@@ -97,7 +97,7 @@ impl Access {
         app: &App,
         content: String,
     ) -> ApiResult<ContextVersion> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let editor = self.identity.username.clone();
         let stored = with_db(db, move |db| context::set(db, &content, Some(&editor))).await?;
         self.audit(

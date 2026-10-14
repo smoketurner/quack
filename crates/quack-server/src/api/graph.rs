@@ -317,7 +317,7 @@ impl Access {
         let slot = app.begin_extraction(id).ok_or_else(|| {
             ApiError::conflict("a graph extraction is already running for this workspace")
         })?;
-        let db = app.workspace_db(id).await?;
+        let db = app.workspace(id).await?.writer;
         let (ontology, standing) = app
             .read(id, |db| {
                 Ok((
@@ -678,7 +678,7 @@ impl Access {
         app: &App,
         approval: DropApproval,
     ) -> ApiResult<Revalidation> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let outcome = with_db(db, move |db| {
             if let Some(refusal) = approval.refusal(&Revalidation::preview(db)?) {
                 return Ok(Err(refusal));
@@ -701,7 +701,7 @@ impl Access {
 
     /// Mark the provisional graph reviewed.
     pub(crate) async fn review_graph(&self, app: &App) -> ApiResult<GraphStatus> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let status = with_db(db, |db| {
             graph_store::mark_reviewed(db)?;
             graph_store::status(db)
@@ -719,7 +719,7 @@ impl Access {
         merge: &str,
         decision: MergeDecision,
     ) -> ApiResult<MergeProposal> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let author = self.identity.username.clone();
         let merge_id = merge.to_owned();
         let proposal = with_db(db, move |db| {
@@ -929,7 +929,7 @@ impl Access {
         app: &App,
         body: CreateNode,
     ) -> ApiResult<Asserted<Node>> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let assertion = self.assertion(body.note.clone());
         let node = NewNode {
             label: body.label,
@@ -968,7 +968,7 @@ impl Access {
                 "nothing to change: give label, class, or properties",
             ));
         }
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let assertion = self.assertion(body.note.clone());
         let (nid, edit) = (id.clone(), body.edit);
         let node = with_db(db, move |db| {
@@ -992,7 +992,7 @@ impl Access {
     }
 
     pub(crate) async fn delete_node(&self, app: &App, id: &NodeId) -> ApiResult<Node> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let nid = id.clone();
         let node = with_db(db, move |db| graph_store::delete_node(db, &nid)).await?;
         self.audit_edit(
@@ -1016,7 +1016,7 @@ impl Access {
         app: &App,
         body: CreateEdge,
     ) -> ApiResult<Asserted<Edge>> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let assertion = self.assertion(body.note.clone());
         let edge = NewEdge {
             source: body.source,
@@ -1045,7 +1045,7 @@ impl Access {
     }
 
     pub(crate) async fn delete_edge(&self, app: &App, id: &EdgeId) -> ApiResult<Edge> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let eid = id.clone();
         let edge = with_db(db, move |db| graph_store::delete_edge(db, &eid)).await?;
         self.audit_edit(

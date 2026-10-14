@@ -15,6 +15,7 @@ use super::{ChatClient, SchemaCall, Task};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::ids::{SessionId, WorkspaceId};
+use crate::jobs::store as jobs_store;
 use crate::jobs::{JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use crate::storage::sessions::{self, MessageRole};
 use crate::storage::writer::Writer;
@@ -117,8 +118,11 @@ impl SessionTitler {
         jobs: &JobQueue,
         workspace: Option<WorkspaceId>,
     ) {
-        let mut spec = JobSpec::new(JobKind::Title, format!("title session {session}"))
-            .lane(Lane::serial(&LaneKey::SessionTitle(session.clone())));
+        let mut spec = JobSpec::new(
+            JobKind::Title,
+            format!("{}{session}", jobs_store::TITLE_LABEL),
+        )
+        .lane(Lane::serial(&LaneKey::SessionTitle(session.clone())));
         if let Some(workspace) = workspace {
             spec = spec.workspace(workspace);
         }

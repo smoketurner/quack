@@ -1078,9 +1078,10 @@ async fn a_documents_chunks_page_through_the_api_and_open_on_the_passage_page() 
     let ws = h.workspace("docs", &owner).await;
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     db.run(|db| {
         let id = DocumentId::from("d");
         db.insert_document(
@@ -1556,9 +1557,10 @@ async fn read_requests_never_wait_for_the_writer() {
     let ws = h.workspace("data", &owner).await;
     let writer = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     writer
         .run(|db| db.execute_statement("CREATE TABLE t AS SELECT 1 AS a"))
         .await
@@ -1796,9 +1798,10 @@ async fn a_partly_read_document_says_so_over_rest_mcp_and_the_web() {
     let token = h.login("owner").await;
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     db.run(|db| {
         let id = DocumentId::from("d");
         db.insert_document(
@@ -2410,9 +2413,10 @@ async fn a_failed_authorized_search_on_a_db_error_is_audited_as_error() {
     let token = h.login("owner").await;
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     db.run(|db| db.execute_statement("DROP TABLE _quack_terms"))
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
@@ -2454,9 +2458,10 @@ async fn a_failed_authorized_graph_search_is_audited_as_error() {
     let token = h.login("owner").await;
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     db.run(|db| db.execute_statement("DROP TABLE _quack_graph_nodes"))
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
@@ -2511,9 +2516,10 @@ async fn sessions_are_deleted_by_their_creator_or_an_owner() {
     }
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     let (mine, theirs) = {
         let (viewer, other) = (viewer.clone(), other.clone());
         db.run(move |db| {
@@ -2921,9 +2927,10 @@ async fn ontology_page_forms_edit_property_meanings_and_measures() {
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
     h.app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
         .unwrap_or_else(|e| fail(&e.message))
+        .writer
         .run(|db| db.execute_statement("CREATE TABLE orders AS SELECT 250 AS amount"))
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
@@ -5124,9 +5131,10 @@ async fn allowed_reads_are_audited_and_table_names_stay_in_the_workspace() {
     // table the control row does not.
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     let details = with_db(db, |db| audit::list(db, 100))
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -7131,9 +7139,10 @@ async fn stale_vectors_are_reported_and_refreshed_over_the_api_and_the_page() {
     // recorded.
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     db.run(|db| {
         db.insert_document(
             &NewDocument::new(&DocumentId::from("d"), "a.md", "text/markdown", 1)
@@ -7600,9 +7609,10 @@ async fn closing_the_state_checkpoints_each_workspace() {
     let ws = h.workspace("closing", &owner).await;
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     db.run(|db| db.execute_query("CREATE TABLE t AS SELECT 1 AS n"))
         .await
         .unwrap_or_else(|e| fail(&e.to_string()));
@@ -7807,9 +7817,10 @@ async fn saved_questions_are_saved_run_and_removed_on_the_web() {
     let ws = h.workspace("s", &owner).await;
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     let (answered, no_sql) = {
         let owner = owner.clone();
         db.run(move |db| {
@@ -8024,6 +8035,87 @@ async fn a_logout_whose_audit_row_cannot_be_written_leaves_the_session_open() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     let (status, _) = h.get("/api/v1/auth/me", &session).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// A change already committed in the workspace file whose access row then
+/// fails is answered `unaudited`, saying the change stands, never as a
+/// failed delete; the workspace's own detail row, written first, still
+/// names who made it (#600).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_whose_access_row_fails_says_it_stands() {
+    use quack_core::storage::sessions::{self, ChatMode, create_session};
+
+    let h = harness(ServeMode::Login).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("m", &owner).await;
+    let token = h.login("owner").await;
+    let db = h
+        .app
+        .workspace(&ws)
+        .await
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
+    let sid = {
+        let owner = owner.clone();
+        db.run(move |db| create_session(db, "m", ChatMode::Chat, Some(&owner)))
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+            .id
+    };
+    let url = format!(
+        "sqlite:{}",
+        h.app
+            .engine
+            .config
+            .general
+            .data_dir
+            .join("control.db")
+            .display()
+    );
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    sqlx::query("DROP TABLE audit_log")
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    pool.close().await;
+
+    let (status, body) = h
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/workspaces/{ws}/sessions/{sid}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["code"], "unaudited", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stands"),
+        "{body}"
+    );
+    let gone = {
+        let sid = sid.clone();
+        db.run(move |db| sessions::get_session(db, &sid))
+            .await
+            .unwrap_or_else(|e| fail(&e.to_string()))
+    };
+    assert!(gone.is_none(), "the delete was applied");
+    let details = with_db(db, |db| audit::list(db, 100))
+        .await
+        .unwrap_or_else(|e| fail(&e.message));
+    assert!(
+        details
+            .iter()
+            .any(|d| d.action == "delete" && d.user_id.as_ref() == Some(&owner)),
+        "{details:?}"
+    );
 }
 
 /// `list`'s token branch filters out a removed non-admin member's workspace,
@@ -8449,9 +8541,10 @@ async fn a_turn_that_read_a_document_asks_or_refuses_its_write_under_allow_write
     let token = h.login("owner").await;
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     with_db(Arc::clone(&db), quack_testkit::seed_dictating_note)
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -8803,9 +8896,10 @@ async fn saved_questions_are_saved_run_and_removed_over_the_api() {
     }
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     let (answered, no_sql) = {
         let viewer = viewer.clone();
         db.run(move |db| {
@@ -9146,9 +9240,10 @@ async fn sessions_are_renamed_by_their_creator_and_searched_within_what_one_may_
     }
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     let (adas, bobs) = {
         let (ada, bob) = (ada.clone(), bob.clone());
         db.run(move |db| {
@@ -9558,9 +9653,10 @@ async fn a_person_edits_graph_nodes_and_edges_over_the_api_and_the_page() {
     );
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     let details = with_db(db, |db| audit::list(db, 100))
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -9708,9 +9804,10 @@ async fn an_upload_queues_the_graph_follow_up_the_setting_asks_for() {
     );
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     let details = with_db(db, |db| audit::list(db, 100))
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -10380,9 +10477,10 @@ async fn a_documents_fields_are_set_over_the_api_and_shown() {
 
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     let details = with_db(db, |db| audit::list(db, 100))
         .await
         .unwrap_or_else(|e| fail(&e.message));
@@ -10517,9 +10615,10 @@ async fn a_snapshot_copies_the_file_closed_and_the_workspace_reopens() {
     let probed = file.clone();
     let closed = h
         .app
+        .engine
         .with_workspace_closed(&ws, move || Ok(opens_in_another_process(&probed)))
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.to_string()));
     assert!(closed, "a connection held the file during the copy");
     assert!(
         !opens_in_another_process(&file),
@@ -10746,9 +10845,10 @@ async fn a_workspace_round_trips_through_a_snapshot_and_is_renamed_and_deleted()
 async fn seed_renewal_documents(h: &Harness, ws: &WorkspaceId) {
     let db = h
         .app
-        .workspace_db(ws)
+        .workspace(ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     db.run(|db| {
         for (id, name) in [("pol", "policy.md"), ("not", "notes.md")] {
             let id = DocumentId::from(id);
@@ -11278,9 +11378,10 @@ impl TicketsApp {
             .unwrap_or_else(|e| fail(&e.to_string()));
         let db = h
             .app
-            .workspace_db(&ws)
+            .workspace(&ws)
             .await
-            .unwrap_or_else(|e| fail(&e.message));
+            .unwrap_or_else(|e| fail(&e.message))
+            .writer;
         db.run(|db| {
             db.execute_statement(
                 "CREATE TABLE tickets AS SELECT range AS id, \
@@ -11554,9 +11655,10 @@ async fn a_request_that_cannot_be_carried_out_is_refused_with_a_coded_error() {
     // Another run holds the table.
     let db =
         l.h.app
-            .workspace_db(&l.ws)
+            .workspace(&l.ws)
             .await
-            .unwrap_or_else(|e| fail(&e.message));
+            .unwrap_or_else(|e| fail(&e.message))
+            .writer;
     let held = db.claim(Claimed(String::from("tickets_labels")));
     let (status, body) = l.classify(&l.owner, "").await;
     assert_eq!(
@@ -11964,9 +12066,10 @@ async fn a_run_over_mcp_is_audited_under_its_run_id_and_reports_its_progress() {
 
     let db =
         l.h.app
-            .workspace_db(&l.ws)
+            .workspace(&l.ws)
             .await
-            .unwrap_or_else(|e| fail(&e.message));
+            .unwrap_or_else(|e| fail(&e.message))
+            .writer;
     let recorded: (String, Option<String>) = db
         .run(|db| {
             Ok(db.connection().query_row(
@@ -12046,9 +12149,10 @@ async fn a_turn_that_labels_a_table_audits_the_run_under_its_id() {
     let token = h.login("owner").await;
     let db = h
         .app
-        .workspace_db(&ws)
+        .workspace(&ws)
         .await
-        .unwrap_or_else(|e| fail(&e.message));
+        .unwrap_or_else(|e| fail(&e.message))
+        .writer;
     db.run(|db| {
         db.execute_statement(
             "CREATE TABLE tickets AS SELECT range AS id, \

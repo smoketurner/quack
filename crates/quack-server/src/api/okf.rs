@@ -84,7 +84,7 @@ impl Download {
     where
         F: FnOnce(&WorkspaceDb, BodyWriter) -> CoreResult<serde_json::Value> + Send + 'static,
     {
-        let reader = app.reader_db(&id).await?;
+        let reader = app.workspace(&id).await?.reader;
         let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(CHUNKS_IN_FLIGHT);
         let failed = tx.clone();
         let audit_app = Arc::clone(app);

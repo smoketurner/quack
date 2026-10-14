@@ -107,8 +107,8 @@ impl PreparedTurn {
         let chat = app.engine.config.chat_model_ref()?;
         let model_names = (chat.provider_name.to_string(), chat.model.to_owned());
         let mode = body.mode;
-        let db = app.workspace_db(workspace_id).await?;
-        let reader = app.reader_db(workspace_id).await?;
+        let db = app.workspace(workspace_id).await?.writer;
+        let reader = app.workspace(workspace_id).await?.reader;
         let requested = body.session_id.clone();
         let model = chat.to_string();
         let user = access.identity.user_id.clone();
@@ -300,10 +300,12 @@ impl Turn {
             TurnEnd::Failed(_) => (Outcome::Error, Vec::new(), Vec::new()),
         };
         if outcome != Outcome::Allowed
-            && let Ok(db) = app.workspace_db(&self.access.membership.workspace.id).await
+            && let Ok(handle) = app.workspace(&self.access.membership.workspace.id).await
         {
             let sid = self.session_id.clone();
-            if let Err(e) = with_db(db, move |db| sessions::delete_if_empty(db, &sid)).await {
+            if let Err(e) =
+                with_db(handle.writer, move |db| sessions::delete_if_empty(db, &sid)).await
+            {
                 tracing::warn!(error = %e.message, "could not remove the empty session");
             }
         }
@@ -707,7 +709,7 @@ impl Access {
                 "only a read statement can be exported",
             ));
         }
-        let reader = app.reader_db(&workspace_id).await?;
+        let reader = app.workspace(&workspace_id).await?.reader;
         let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(CHUNKS_IN_FLIGHT);
         let failed = tx.clone();
         let audit_app = Arc::clone(app);
@@ -791,7 +793,7 @@ impl Access {
                 "writes need the member role and the write scope",
             ));
         }
-        let reader_db = app.reader_db(&access.membership.workspace.id).await?;
+        let reader_db = app.workspace(&access.membership.workspace.id).await?.reader;
         let sql = statement.to_owned();
         let max_rows = app.engine.config.analysis.max_query_rows;
         let timed = move |db: &WorkspaceDb| {
@@ -800,7 +802,7 @@ impl Access {
                 .map(|capped| (capped, began.elapsed()))
         };
         let result = if is_write {
-            let db = app.workspace_db(&access.membership.workspace.id).await?;
+            let db = app.workspace(&access.membership.workspace.id).await?.writer;
             let result = with_db(Arc::clone(&db), timed).await;
             // Whatever ran might have created a temp object the check above
             // did not catch (a leading comment, a multi-statement batch);
@@ -924,7 +926,7 @@ impl Access {
             )
             .await?;
         let found = async {
-            let reader = app.reader_db(&self.membership.workspace.id).await?;
+            let reader = app.workspace(&self.membership.workspace.id).await?.reader;
             search
                 .run(
                     &reader,

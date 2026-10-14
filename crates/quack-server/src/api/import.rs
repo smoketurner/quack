@@ -196,7 +196,7 @@ pub(crate) async fn run_import(
         })
         .await?;
     }
-    let db = app.workspace_db(&access.membership.workspace.id).await?;
+    let db = app.workspace(&access.membership.workspace.id).await?.writer;
     let embeddings = access
         .model(
             app,
@@ -291,9 +291,9 @@ impl Access {
             let app = app_for_job;
             let workspace = access_for_job.membership.workspace.id.clone();
             let db = app
-                .workspace_db(&workspace)
+                .workspace(&workspace)
                 .await
-                .map_err(|e| e.message)?;
+                .map_err(|e| e.message)?.writer;
             let policy = if app.mode == ServeMode::Local {
                 ImportPolicy::owner()
             } else {
@@ -333,7 +333,7 @@ impl Access {
 
     /// Remove `saved` and its sealed secret, audited; its table stays.
     pub(crate) async fn remove_import(&self, app: &App, saved: &SavedImport) -> ApiResult<()> {
-        let db = app.workspace_db(&self.membership.workspace.id).await?;
+        let db = app.workspace(&self.membership.workspace.id).await?.writer;
         let vault = Vault::new(app.engine.config.data_dir(), KeySource::Keychain);
         self.secrets(app, &vault).remove(&db, saved).await?;
         self.audit(
