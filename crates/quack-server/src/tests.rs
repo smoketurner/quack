@@ -3099,6 +3099,62 @@ async fn local_mode_refuses_a_host_that_is_not_loopback() {
     assert!(!LocalHosts::on(8080).allows("localhost"));
 }
 
+/// The local-host check names the port the listener took, not the one
+/// asked for: with `[server].bind` unset the terminal binds port 0 and the
+/// kernel picks the port, so a check built from the requested address
+/// refused every real request (#558). Only a server started through
+/// `Server::start` on port 0 and asked over TCP can see this.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_server_on_port_zero_answers_the_port_it_took() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut config = Config::default();
+    config.general.data_dir = dir.path().to_path_buf();
+    let control = ControlPlane::open(&config)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let engine = Engine::new(config, Holder::Serve);
+    let asked: std::net::SocketAddr = "127.0.0.1:0"
+        .parse()
+        .unwrap_or_else(|e| fail(&format!("{e}")));
+    let server = super::Server::start(Arc::clone(&engine), control, asked, ServeMode::Local)
+        .await
+        .unwrap_or_else(|e| fail(&format!("{e:#}")));
+    let bound = server.local_addr().unwrap_or_else(|e| fail(&e.to_string()));
+    assert_ne!(bound.port(), 0, "the listener took a port");
+    let running = tokio::spawn(server.run(std::time::Duration::from_secs(5)));
+    // A real client names the port it connected to.
+    let real = raw_get(bound, &format!("127.0.0.1:{}", bound.port())).await;
+    assert!(real.starts_with("HTTP/1.1 200"), "{real}");
+    // The port that was asked for is not a loopback name on this port.
+    let forged = raw_get(bound, "127.0.0.1:0").await;
+    assert!(forged.starts_with("HTTP/1.1 403"), "{forged}");
+    engine.begin_stop();
+    tokio::time::timeout(std::time::Duration::from_secs(10), running)
+        .await
+        .unwrap_or_else(|_| fail("the server did not stop"))
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .unwrap_or_else(|e| fail(&format!("{e:#}")));
+}
+
+/// One HTTP/1.1 `GET /api/v1/workspaces` over TCP with `host` as `Host`,
+/// returned whole; the server closes the connection.
+async fn raw_get(addr: std::net::SocketAddr, host: &str) -> String {
+    use std::io::{Read, Write};
+    let request =
+        format!("GET /api/v1/workspaces HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+        stream.write_all(request.as_bytes())?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response)
+    })
+    .await
+    .unwrap_or_else(|e| fail(&e.to_string()))
+    .unwrap_or_else(|e| fail(&e.to_string()))
+}
+
 /// A terminal serving beside itself serves its own workspace alone: the
 /// list shows one, and any other id is unknown here (404, a denied row),
 /// so a browser click cannot make the session's process open another
