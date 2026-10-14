@@ -926,6 +926,8 @@ pub enum Channel {
     Api,
     Mcp,
     Tui,
+    /// The desktop app, tried and set aside (`docs/desktop.md`): kept so
+    /// the rows it wrote still read; nothing writes it any more.
     Desktop,
     Cli,
 }

@@ -328,7 +328,13 @@ enum Prompt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteOrigin {
     Session,
-    Socket { shown: Instant, expires: Instant },
+    /// A write another process asked over the workspace socket: `shown`
+    /// guards the keys for a moment after it appears; `expires` is the
+    /// deadline core put on the ask, after which it is already refused.
+    Socket {
+        shown: Instant,
+        expires: Instant,
+    },
 }
 
 /// How long a socket turn's prompt ignores the keys after it appears.
@@ -1708,6 +1714,7 @@ impl App {
             job,
             session,
             request,
+            expires_at,
         } = asked;
         let number = self
             .jobs
@@ -1729,22 +1736,20 @@ impl App {
                 socket_answer_keys()
             ),
         );
-        let shown = Instant::now();
         self.prompts.push_back(Prompt::Write {
             job: Ticket { id: job, number },
             request,
             origin: WriteOrigin::Socket {
-                shown,
-                expires: shown
-                    .checked_add(self.config.server.permission_timeout())
-                    .unwrap_or(shown),
+                shown: Instant::now(),
+                expires: expires_at,
             },
         });
     }
 
-    /// Refuse the socket turns' writes nobody answered in time
-    /// (`[server].permission_timeout_seconds`), wherever they stand in the
-    /// line.
+    /// Take down the socket prompts whose time ran out, wherever they stand
+    /// in the line. The refusal itself happened in core at the deadline the
+    /// ask carried (`Approvals`); this only stops showing a prompt nobody
+    /// can answer any more.
     fn expire_socket_prompts(&mut self) {
         let now = Instant::now();
         let mut kept = VecDeque::new();

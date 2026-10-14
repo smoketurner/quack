@@ -15,9 +15,9 @@ use anyhow::{Context, Result};
 use quack_core::analysis::permissions::Approvals;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::config::Config;
-use quack_core::engine::{Engine, WorkspaceHandle};
+use quack_core::engine::{Drain, Engine, Holder, Stop, WorkspaceHandle};
 use quack_core::error::Error as CoreError;
-use quack_core::forward::{Holder, Listener};
+use quack_core::forward::Listener;
 use quack_core::ids::WorkspaceId;
 use quack_core::llm::egress::Egress;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
@@ -73,7 +73,6 @@ pub struct OpenedWorkspace {
     pub engine: Arc<Engine>,
     pub control: ControlPlane,
     pub workspace: WorkspaceRow,
-    pub name: String,
     /// Where a socket turn's write asks: the terminal session listens
     /// (`SessionSetup::approvals`); for a command nobody does, so a write
     /// is refused.
@@ -122,16 +121,15 @@ impl OpenedWorkspace {
         let workspace = control
             .workspace_or_default(workspace_name, &config.general.default_workspace)
             .await?;
-        let name = workspace.name.clone();
         // The command sends only to the model providers the workspace allows.
         Egress::Workspace(workspace.allowed_providers.clone()).enter();
         let engine = Engine::new(config, holder(workspace.id.clone()));
+        let approvals = Approvals::with_timeout(engine.config.server.permission_timeout());
         Ok(Self {
             engine,
             control,
             workspace,
-            name,
-            approvals: Approvals::new(),
+            approvals,
             socket: OnceCell::new(),
         })
     }
@@ -196,10 +194,14 @@ impl OpenedWorkspace {
     /// A socket that cannot be bound is logged once; the command runs
     /// without it.
     async fn serve_socket(&self, handle: &WorkspaceHandle) -> Option<SocketServer> {
-        let policy = match self.engine.holder() {
-            Holder::Terminal(_) => WritePolicy::Ask,
-            Holder::Command { .. } => WritePolicy::Deny,
-            Holder::Serve | Holder::Mcp => return None,
+        let holder = self.engine.holder();
+        if !holder.serves_socket() {
+            return None;
+        }
+        let policy = if matches!(holder, Holder::Terminal(_)) {
+            WritePolicy::Ask
+        } else {
+            WritePolicy::Deny
         };
         let dir = self.engine.config.workspace_dir(self.workspace.id.as_str());
         let listener = match Listener::bind(&dir, &self.workspace.id).await {
@@ -209,29 +211,24 @@ impl OpenedWorkspace {
                 return None;
             }
         };
-        let server = McpServer::new(McpSetup {
-            config: self.engine.config.clone(),
-            db: Arc::clone(&handle.writer),
-            reader: handle.reader.clone(),
-            workspace: self.workspace.clone(),
+        let server = McpServer::new(McpSetup::local(
+            &self.engine,
+            handle.clone(),
+            self.workspace.clone(),
             policy,
-            user_id: None,
-            transport: Transport::Socket,
-            jobs: self.engine.jobs.clone(),
-            stopping: self.engine.stopping(),
-            holder: self.engine.holder().to_string(),
-            approvals: self.approvals.clone(),
-        });
+            Transport::Socket,
+            Some(self.approvals.clone()),
+        ));
         Some(SocketServer::serve(listener, server))
     }
 
-    /// Stop serving the socket and wait up to `grace` for its sessions;
-    /// the socket file goes with it. Before the engine closes, so a
-    /// session in flight ends on an open workspace.
-    pub async fn close_socket(&mut self, grace: Duration) {
-        if let Some(Some(socket)) = self.socket.take() {
-            socket.close(grace).await;
-        }
+    /// The socket's drain for [`Engine::shutdown`]: stop serving it and
+    /// wait up to `grace` for its sessions; the socket file goes with it.
+    /// Before the engine closes, so a session in flight ends on an open
+    /// workspace. `None` when no socket was served.
+    fn socket_drain(&mut self, grace: Duration) -> Option<Drain> {
+        let socket = self.socket.take().flatten()?;
+        Some(Box::pin(socket.close(grace)))
     }
 
     /// Run `f` on the workspace's writer connection and await it: what a
@@ -252,11 +249,20 @@ impl OpenedWorkspace {
     /// Let the engine's jobs end under `grace` (a labelling or a title the
     /// command started finishes; nothing is cancelled), end the socket's
     /// sessions, and close the workspace, so the writer checkpoints before
-    /// the process exits. Every handle must be dropped first.
-    pub async fn finish(mut self, grace: Duration) {
-        self.engine.drain_jobs(grace).await;
-        self.close_socket(grace).await;
-        self.engine.close().await;
+    /// the process exits (`Engine::shutdown`). Every handle must be
+    /// dropped first.
+    pub async fn finish(self, grace: Duration) {
+        self.stop(Stop::Drain, grace, None).await;
+    }
+
+    /// The process's stop sequence (`Engine::shutdown`) with the socket's
+    /// drain and, for a session that served the web beside itself, the
+    /// server's: cancel or drain the jobs as `how` says, end the socket's
+    /// sessions and the server's requests under `grace`, then close the
+    /// workspace.
+    pub async fn stop(mut self, how: Stop, grace: Duration, server: Option<Drain>) {
+        let drains = self.socket_drain(grace).into_iter().chain(server).collect();
+        self.engine.shutdown(how, grace, drains).await;
     }
 }
 
@@ -265,8 +271,9 @@ mod tests {
     use std::path::Path;
 
     use quack_core::config::Config;
+    use quack_core::engine::Holder;
     use quack_core::error::Error as CoreError;
-    use quack_core::forward::{Holder, SocketPath};
+    use quack_core::forward::SocketPath;
     use quack_core::storage::control::ControlPlane;
 
     use super::OpenedWorkspace;
@@ -310,7 +317,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            opened.name,
+            opened.workspace.name,
             opened.config().general.default_workspace.to_string()
         );
         let n = opened

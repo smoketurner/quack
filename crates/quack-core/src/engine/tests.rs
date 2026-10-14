@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use super::Engine;
 use crate::config::Config;
+use crate::engine::Holder;
 use crate::error::Error;
-use crate::forward::Holder;
 use crate::ids::WorkspaceId;
 use crate::jobs::{JobKind, JobSpec, JobState};
 
@@ -215,6 +215,50 @@ async fn stop_jobs_ends_what_watches_stopping() {
             Ok(String::new())
         });
     assert_eq!(later.state, JobState::Cancelled);
+}
+
+/// The one stop sequence: the drains it is handed run while the jobs end
+/// as asked (a draining stop lets a running job finish), and the engine is
+/// closed after, refusing every later open.
+#[tokio::test]
+#[expect(clippy::unwrap_used, reason = "test")]
+async fn shutdown_runs_the_drains_ends_the_jobs_and_closes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{Drain, Stop};
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(config_in(dir.path()), Holder::Serve);
+    let id = WorkspaceId::from("ws");
+    engine.workspace(&id).await.unwrap();
+    let job = engine.jobs.submit(
+        JobSpec::new(JobKind::Ingest, "slow.md").workspace(id.clone()),
+        |_| async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(String::from("done"))
+        },
+    );
+    let drained = Arc::new(AtomicBool::new(false));
+    let drain: Drain = {
+        let drained = Arc::clone(&drained);
+        Box::pin(async move {
+            drained.store(true, Ordering::SeqCst);
+        })
+    };
+    let left = engine
+        .shutdown(Stop::Drain, Duration::from_secs(5), vec![drain])
+        .await;
+    assert!(left.is_empty(), "{left:?}");
+    assert!(drained.load(Ordering::SeqCst));
+    assert!(engine.stopping().is_cancelled());
+    assert_eq!(
+        engine.jobs.get(job.id).map(|j| j.state),
+        Some(JobState::Succeeded)
+    );
+    assert!(matches!(
+        engine.workspace(&id).await,
+        Err(Error::EngineClosed)
+    ));
 }
 
 /// A session a killed first turn left without a message (nothing ran

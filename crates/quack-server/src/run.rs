@@ -10,11 +10,10 @@ use quack_core::analysis::tools::SharedDb;
 use quack_core::graph::follow_up::{FollowUp, FollowUpSummary};
 use quack_core::ids::DocumentId;
 use quack_core::jobs::JobId;
-use quack_core::jobs::runs::{self, RunOwner};
+use quack_core::jobs::runs::RunOwner;
 use quack_core::llm::Embeddings;
 use quack_core::ontology::store as ontology_store;
 use quack_core::progress::{ChunkDone, RunControl};
-use quack_core::storage::audit::Recorder;
 use serde_json::Value;
 
 use crate::auth::Access;
@@ -23,9 +22,7 @@ use crate::state::App;
 
 pub(crate) use quack_core::jobs::runs::{GraphReport, RunKind};
 
-/// One run, from its start audit row to its closing one, audited by the
-/// person whose request started it.
-pub(crate) type BackgroundRun = runs::BackgroundRun<Recorder>;
+pub(crate) use quack_core::jobs::runs::BackgroundRun;
 
 /// Mint the run id and write the start audit row with `detail` as
 /// `access`; the request fails if that write does.

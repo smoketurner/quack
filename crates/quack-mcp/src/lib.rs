@@ -31,7 +31,7 @@ use quack_core::analysis::citations::Sources;
 use quack_core::analysis::events::{
     self, AgentEvent, Decision, FailureKind, PermissionRequest, TurnFailure,
 };
-use quack_core::analysis::permissions::{Approvals, Asked};
+use quack_core::analysis::permissions::Approvals;
 use quack_core::analysis::policy::{Hold, WritePolicy};
 use quack_core::analysis::search::{DocumentSearch, SearchDetail};
 use quack_core::analysis::tools::{FindPathArgs, ReaderDb, Rerank, SearchGraphArgs, SharedDb};
@@ -39,7 +39,7 @@ use quack_core::classify::{
     self, Draft, DraftContext, Drafter, LabelJobs, LabellingJob, Rows, Waiting,
 };
 use quack_core::config::Config;
-use quack_core::engine::Engine;
+use quack_core::engine::{Engine, WorkspaceHandle};
 use quack_core::ids::{DocumentId, RunId, SessionId, UserId, WorkspaceId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::ChatDrafter;
@@ -91,7 +91,10 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Stdio,
-    /// The workspace socket a holder serves (`socket::SocketServer`).
+    /// The workspace socket a holder serves (`socket::SocketServer`): the
+    /// caller is another process, so a `sql` write asks the holder (the
+    /// terminal session's prompt) or is refused naming it, where stdio
+    /// simply has no write permission.
     Socket,
     Http,
 }
@@ -246,6 +249,36 @@ pub struct McpSetup {
     /// Where a `query` turn's write asks a person: the terminal session's
     /// prompt, over the socket. Nobody listening refuses the write.
     pub approvals: Approvals,
+}
+
+impl McpSetup {
+    /// The setup every server in a process shares: the engine's
+    /// configuration, queue, stopping token, and name, and the workspace's
+    /// handles, with no server user and `approvals` where a write asked
+    /// over the socket goes (`None`: nobody listens, so it is refused).
+    #[must_use]
+    pub fn local(
+        engine: &Engine,
+        handle: WorkspaceHandle,
+        workspace: WorkspaceRow,
+        policy: WritePolicy,
+        transport: Transport,
+        approvals: Option<Approvals>,
+    ) -> Self {
+        Self {
+            config: engine.config.clone(),
+            db: handle.writer,
+            reader: handle.reader,
+            workspace,
+            policy,
+            user_id: None,
+            transport,
+            jobs: engine.jobs.clone(),
+            stopping: engine.stopping(),
+            holder: engine.holder().to_string(),
+            approvals: approvals.unwrap_or_default(),
+        }
+    }
 }
 
 /// What the `classify` tool takes: a labelling request, or with `preview`
@@ -1064,11 +1097,11 @@ impl McpServer {
             match event {
                 AgentEvent::TurnComplete(response) => complete = Some(response),
                 AgentEvent::Failed(failed) => failure = Some(failed),
-                AgentEvent::PermissionRequired(request) => self.inner.approvals.ask(Asked {
-                    job: job.id,
-                    session: Some(session_id.clone()),
-                    request,
-                }),
+                AgentEvent::PermissionRequired(request) => {
+                    self.inner
+                        .approvals
+                        .ask(job.id, Some(session_id.clone()), request);
+                }
                 other => reporter.event(other).await,
             }
         }
@@ -1188,11 +1221,7 @@ impl McpServer {
         let asked_at = holder.clone();
         let job = self.inner.jobs.submit(spec, move |ctx| async move {
             let (request, decision) = PermissionRequest::new(statement.clone(), Hold::NotPermitted);
-            approvals.ask(Asked {
-                job: ctx.id(),
-                session: None,
-                request,
-            });
+            approvals.ask(ctx.id(), None, request);
             let cancel = ctx.cancel_token();
             let decision = tokio::select! {
                 biased;

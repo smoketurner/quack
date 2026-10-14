@@ -30,8 +30,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use quack_core::DUCK;
 use quack_core::config::Config;
-use quack_core::engine::Engine;
-use quack_core::forward::Holder;
+use quack_core::engine::{Drain, Engine, Holder, Stop};
 use quack_core::jobs::webhook::Webhook;
 use quack_core::telemetry;
 use tower_governor::governor::GovernorConfigBuilder;
@@ -741,21 +740,35 @@ pub async fn serve(config: Config, bind: Option<String>, mode: ServeMode) -> any
         drop(hook.spawn(engine.jobs.subscribe()));
     }
     tracing::info!(%addr, ?mode, "quack serve listening");
-    // The signal begins the stop; `run` owns the drain, the queue's
-    // shutdown, and the close. A server that ends on its own returns.
+    // The signal begins the stop sequence (`Engine::shutdown`): `run`
+    // drains the open requests and drops the MCP transports as the stopping
+    // token fires, while the queue shuts down, and the workspaces close
+    // last. A server that ends on its own goes through the same sequence.
     let mut run = Box::pin(server.run(grace));
     tokio::select! {
         served = &mut run => {
-            engine.close().await;
+            engine.shutdown(Stop::Cancel, grace, Vec::new()).await;
             return served;
         }
         () = shutdown_signal() => {}
     }
-    engine.begin_stop();
-    let served = run.await;
-    engine.close().await;
+    let served: Arc<std::sync::Mutex<Option<anyhow::Result<()>>>> = Arc::default();
+    let drain: Drain = {
+        let served = Arc::clone(&served);
+        Box::pin(async move {
+            let outcome = run.await;
+            if let Ok(mut slot) = served.lock() {
+                *slot = Some(outcome);
+            }
+        })
+    };
+    engine.shutdown(Stop::Cancel, grace, vec![drain]).await;
     tracing::info!("stopped");
     served
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .unwrap_or(Ok(()))
 }
 
 /// Resolve on Ctrl-C or, on Unix, SIGTERM (what containers and systemd

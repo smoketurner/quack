@@ -30,71 +30,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::error::Error;
 use crate::ids::WorkspaceId;
-
-/// The process that holds workspaces open, as the MCP `initialize` reply
-/// names it to the person reading `quack -q`'s stderr, and the one
-/// workspace it holds: `quack serve` opens any workspace a request names;
-/// the terminal session and every command opened exactly one and refuse
-/// the rest (`engine::Engine::workspace`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Holder {
-    Serve,
-    Terminal(WorkspaceId),
-    /// A `quack` command, named by its verb (`-p`, `ingest`, ...).
-    Command {
-        workspace: WorkspaceId,
-        verb: &'static str,
-    },
-    /// `quack mcp`, which holds nothing between calls: it opens the
-    /// workspace for one call and closes it after, or reaches the holder;
-    /// while a call holds the file it serves the socket itself
-    /// (`quack_mcp::relay`), not through `OpenedWorkspace`.
-    Mcp,
-}
-
-impl Holder {
-    /// The holder a command with `verb` becomes once its workspace is
-    /// known: `OpenedWorkspace::resolve(name, Holder::command("ingest"))`.
-    pub fn command(verb: &'static str) -> impl FnOnce(WorkspaceId) -> Self {
-        move |workspace| Self::Command { workspace, verb }
-    }
-
-    /// The one workspace this holder opened, or `None` for the server.
-    #[must_use]
-    pub fn held(&self) -> Option<&WorkspaceId> {
-        match self {
-            Self::Serve | Self::Mcp => None,
-            Self::Terminal(id) | Self::Command { workspace: id, .. } => Some(id),
-        }
-    }
-
-    /// Whether `OpenedWorkspace` serves the workspace socket for this
-    /// holder while it holds the file: the session and every command; not
-    /// the server (a login-mode server would hand any same-user process
-    /// the agent with no audit row) and not `quack mcp`, which holds
-    /// nothing between calls and serves its own socket only while a call
-    /// holds the file (`quack_mcp::relay`).
-    #[must_use]
-    pub fn serves_socket(&self) -> bool {
-        match self {
-            Self::Terminal(_) | Self::Command { .. } => true,
-            Self::Serve | Self::Mcp => false,
-        }
-    }
-}
-
-impl std::fmt::Display for Holder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Serve => f.write_str("quack serve"),
-            Self::Terminal(_) => f.write_str("the quack terminal session"),
-            Self::Command { verb, .. } => write!(f, "quack {verb}"),
-            Self::Mcp => f.write_str("quack mcp"),
-        }
-    }
-}
 
 /// The socket a workspace's holder listens on, inside the workspace
 /// directory.
@@ -591,13 +527,6 @@ mod platform {
 
 #[cfg(windows)]
 pub use platform::{Listener, Stream, connect};
-
-/// Whether `err` is the lock another process holds on the workspace file:
-/// the case a command answers by reaching the holder.
-#[must_use]
-pub fn is_locked(err: &Error) -> bool {
-    matches!(err, Error::WorkspaceLocked { .. })
-}
 
 #[cfg(test)]
 mod tests {

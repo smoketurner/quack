@@ -17,7 +17,6 @@ use tower::ServiceExt;
 use super::auth::{Access, Identity, Need};
 use super::error::ApiResult;
 use super::state::{App, McpKey};
-use quack_core::analysis::permissions::Approvals;
 use quack_mcp::{McpCaller, McpServer, McpSetup, Transport};
 
 pub(crate) async fn handle(
@@ -34,22 +33,22 @@ pub(crate) async fn handle(
         user_id: access.identity.user_id.clone(),
         policy,
     };
-    let db = app.workspace_db(&access.membership.workspace.id).await?;
-    let reader = app.reader_db(&access.membership.workspace.id).await?;
+    let handle = app
+        .engine
+        .workspace(&access.membership.workspace.id)
+        .await?;
     let transport = app
         .mcp_transport(key, || {
             McpServer::new(McpSetup {
-                config: app.engine.config.clone(),
-                db,
-                reader,
-                workspace: access.membership.workspace.clone(),
-                policy,
                 user_id: Some(access.identity.user_id.clone()),
-                transport: Transport::Http,
-                jobs: app.engine.jobs.clone(),
-                stopping: app.engine.stopping(),
-                holder: app.engine.holder().to_string(),
-                approvals: Approvals::new(),
+                ..McpSetup::local(
+                    &app.engine,
+                    handle,
+                    access.membership.workspace.clone(),
+                    policy,
+                    Transport::Http,
+                    None,
+                )
             })
         })
         .await;

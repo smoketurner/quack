@@ -3,17 +3,16 @@
 //! classified. Each starts on a request and finishes in the background, as
 //! a job in its workspace's serial lane for its kind, and is audited twice
 //! under one run id: when it starts and when it ends (or is cancelled
-//! before it starts). The audit rows are written by whoever holds the
-//! workspace: the server's `Access`, the desktop app's local identity; a
-//! [`RunAudit`] is that writer.
+//! before it starts). The audit rows are written by the person whose
+//! request started the run, through their [`Recorder`].
 
-use std::fmt;
 use std::future::Future;
 
 use serde_json::Value;
 
 use crate::classify;
 use crate::embedding::refresh;
+use crate::error::Result as CoreResult;
 use crate::graph::extract;
 use crate::graph::follow_up::FollowUpSummary;
 use crate::graph::resolve::ResolutionSummary;
@@ -21,6 +20,7 @@ use crate::ids::{RunId, UserId, WorkspaceId};
 use crate::import::{ImportSummary, LoadStatus};
 use crate::jobs::{JobContext, JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use crate::ontology::documents;
+use crate::storage::audit::Recorder;
 use crate::storage::control::{AuditAction, AuditResource, Outcome, ResourceKind};
 
 /// What a background run is: the job kind whose workspace lane it takes,
@@ -202,18 +202,6 @@ impl RunRow {
     }
 }
 
-/// Who writes a run's audit rows, the `audit_log` row and its
-/// `_quack_audit` detail under one id: the server's `Access` for the person
-/// whose request started the run, the app's local identity on channel
-/// `desktop`.
-pub trait RunAudit: Clone + Send + Sync + 'static {
-    /// Why a row could not be written; the request fails with it when it is
-    /// the opening row, and it is logged when it is the closing one.
-    type Error: fmt::Display + Send;
-
-    fn record(&self, row: RunRow) -> impl Future<Output = Result<(), Self::Error>> + Send;
-}
-
 /// Whose run it is: the workspace whose lanes it takes and the person the
 /// job list shows as its owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,31 +212,31 @@ pub struct RunOwner {
 
 /// One run, from its start audit row to its closing one.
 #[derive(Clone)]
-pub struct BackgroundRun<A: RunAudit> {
+pub struct BackgroundRun {
     jobs: JobQueue,
-    audit: A,
+    audit: Recorder,
     owner: RunOwner,
     id: RunId,
     kind: RunKind,
 }
 
-impl<A: RunAudit> BackgroundRun<A> {
+impl BackgroundRun {
     /// Mint the run id and write the start audit row with `detail`.
     ///
     /// # Errors
     ///
-    /// The auditor's error when the start row could not be written: the
+    /// The recorder's error when the start row could not be written: the
     /// request fails, and no job is queued.
     pub async fn start(
         jobs: &JobQueue,
-        audit: A,
+        audit: Recorder,
         owner: RunOwner,
         kind: RunKind,
         detail: Value,
-    ) -> Result<Self, A::Error> {
+    ) -> CoreResult<Self> {
         let id = RunId::generate();
         audit
-            .record(RunRow {
+            .record_run(RunRow {
                 action: kind.action.clone(),
                 resource: kind.resource.clone(),
                 run: id.clone(),
@@ -341,7 +329,7 @@ impl<A: RunAudit> BackgroundRun<A> {
             outcome,
             detail,
         };
-        if let Err(e) = self.audit.record(row).await {
+        if let Err(e) = self.audit.record_run(row).await {
             tracing::error!(run = %self.id, kind = self.kind.label, error = %e, "audit write failed at the end of a background run");
         }
     }

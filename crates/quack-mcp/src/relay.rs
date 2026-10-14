@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use quack_core::analysis::permissions::Approvals;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::engine::{Engine, WorkspaceHandle};
 use quack_core::error::Error as CoreError;
@@ -154,19 +153,14 @@ impl PerCallServer {
     /// write policy, like any holder. A socket that cannot be bound is
     /// logged; the call runs without it.
     async fn local(&self, handle: WorkspaceHandle) -> McpServer {
-        let server = McpServer::new(McpSetup {
-            config: self.engine.config.clone(),
-            db: handle.writer,
-            reader: handle.reader,
-            workspace: self.workspace.clone(),
-            policy: self.policy,
-            user_id: None,
-            transport: Transport::Stdio,
-            jobs: self.engine.jobs.clone(),
-            stopping: self.engine.stopping(),
-            holder: self.engine.holder().to_string(),
-            approvals: Approvals::new(),
-        });
+        let server = McpServer::new(McpSetup::local(
+            &self.engine,
+            handle,
+            self.workspace.clone(),
+            self.policy,
+            Transport::Stdio,
+            None,
+        ));
         let mut socket = self.socket.lock().await;
         if socket.is_none() {
             let dir = self.engine.config.workspace_dir(self.workspace.id.as_str());

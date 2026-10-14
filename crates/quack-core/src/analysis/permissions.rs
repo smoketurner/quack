@@ -4,9 +4,10 @@
 //! `PermissionRequest` open in memory; the person answers it by its id;
 //! nobody answering within the timeout refuses the write. A restart ends
 //! the waiting turn with it. (The terminal needs none of this for its own
-//! turns: its prompt is on the same screen as the turn. A turn another
+//! turns: its prompt is on the same screen as the turn. A write another
 //! process asks of it over the workspace socket reaches that prompt
-//! through [`Approvals`].)
+//! through [`Approvals`], which times it out the same way: expiry is
+//! decided here, once, and the listener only renders and answers.)
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -25,25 +26,52 @@ use crate::jobs::JobId;
 /// A write a turn run for another process (`quack mcp` over the workspace
 /// socket) asks the person at this process's keyboard to decide: the
 /// terminal session listens and puts it in its own `y`/`n`/`a` prompt.
-/// Where nobody listens, the write is refused at once.
-#[derive(Clone, Default)]
-pub struct Approvals(Arc<Mutex<Option<mpsc::UnboundedSender<Asked>>>>);
+/// Where nobody listens, the write is refused at once; where nobody
+/// answers within the timeout (`[server].permission_timeout_seconds`), it
+/// is refused then, by this type, so no listener needs a clock of its own.
+#[derive(Clone)]
+pub struct Approvals {
+    listener: Arc<Mutex<Option<mpsc::UnboundedSender<Asked>>>>,
+    timeout: Duration,
+}
+
+/// How long an ask waits for its answer when nothing configured it.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+
+impl Default for Approvals {
+    fn default() -> Self {
+        Self::with_timeout(DEFAULT_TIMEOUT)
+    }
+}
 
 /// One write waiting for the person: the job running it (a turn, or a
 /// statement another process sent over the workspace socket), the turn's
-/// session when it is a turn, and the request to answer.
+/// session when it is a turn, the request to answer, and when the answer
+/// stops mattering: at `expires_at` the write is refused here, and an
+/// answer after that is [`Delivery::TurnGone`].
 #[derive(Debug)]
 pub struct Asked {
     pub job: JobId,
     pub session: Option<SessionId>,
     pub request: PermissionRequest,
+    pub expires_at: std::time::Instant,
 }
 
 impl Approvals {
-    /// Nobody listens yet.
+    /// Nobody listens yet; asks wait [`DEFAULT_TIMEOUT`] for an answer.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Nobody listens yet; asks wait `timeout` for an answer
+    /// (`[server].permission_timeout_seconds`).
+    #[must_use]
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            listener: Arc::default(),
+            timeout: timeout.max(Duration::from_millis(1)),
+        }
     }
 
     /// Take the requests from here on: the one interface with a person at
@@ -51,21 +79,44 @@ impl Approvals {
     #[must_use]
     pub fn listen(&self) -> mpsc::UnboundedReceiver<Asked> {
         let (sender, receiver) = mpsc::unbounded_channel();
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(sender);
+        *self.listener.lock().unwrap_or_else(PoisonError::into_inner) = Some(sender);
         receiver
     }
 
-    /// Hand `asked` to the listener; with none, or one that has gone, the
-    /// write is refused.
-    pub fn ask(&self, asked: Asked) {
+    /// Hand `job`'s write to the listener, with the deadline: the listener
+    /// gets a stand-in request, and the turn's own is answered here with
+    /// whatever the listener decides within the timeout, else refused. With
+    /// no listener, or one that has gone, the write is refused at once.
+    /// Runs on the Tokio runtime the caller is inside.
+    pub fn ask(&self, job: JobId, session: Option<SessionId>, request: PermissionRequest) {
         let sender = self
-            .0
+            .listener
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let Some(sender) = sender else {
-            asked.request.deny();
+            request.deny();
             return;
+        };
+        let (stand_in, answered) = PermissionRequest::new(request.sql.clone(), request.hold);
+        let timeout = self.timeout;
+        tokio::spawn(async move {
+            match tokio::time::timeout(timeout, answered).await {
+                // The turn may have stopped waiting; a `TurnGone` here is
+                // its business, not the listener's.
+                Ok(Ok(decision)) => drop(request.answer(decision)),
+                // The listener dropped the request, or nobody answered in
+                // time: refused.
+                Ok(Err(_)) | Err(_) => request.deny(),
+            }
+        });
+        let asked = Asked {
+            job,
+            session,
+            request: stand_in,
+            expires_at: std::time::Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(std::time::Instant::now),
         };
         if let Err(mpsc::error::SendError(asked)) = sender.send(asked) {
             asked.request.deny();
@@ -258,5 +309,51 @@ impl Permissions {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PermissionId, Waiting>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[cfg(test)]
+mod approvals_tests {
+    use std::time::Duration;
+
+    use super::Approvals;
+    use crate::analysis::events::{Decision, Delivery, PermissionRequest};
+    use crate::analysis::policy::Hold;
+    use crate::jobs::JobId;
+
+    /// An ask nobody answers in time is refused here, at the deadline the
+    /// ask carried, and the listener's late answer changes nothing; one
+    /// answered in time reaches the turn as given.
+    #[tokio::test(flavor = "multi_thread")]
+    #[expect(clippy::unwrap_used, reason = "test")]
+    async fn an_ask_is_refused_at_its_deadline_and_answered_before_it() {
+        let approvals = Approvals::with_timeout(Duration::from_millis(50));
+        let mut asked = approvals.listen();
+        let job: JobId = "0199d1f0-0000-7000-8000-0000000000aa".parse().unwrap();
+
+        let (request, answer) =
+            PermissionRequest::new(String::from("DELETE FROM t"), Hold::NotPermitted);
+        approvals.ask(job, None, request);
+        let shown = asked.recv().await.unwrap();
+        assert_eq!(shown.request.sql, "DELETE FROM t");
+        assert!(shown.expires_at > std::time::Instant::now());
+        // Nobody answers: the turn is told no at the deadline.
+        assert_eq!(answer.await.unwrap(), Decision::Deny);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(shown.request.answer(Decision::Allow), Delivery::TurnGone);
+
+        let (request, answer) =
+            PermissionRequest::new(String::from("INSERT INTO t VALUES (1)"), Hold::NotPermitted);
+        approvals.ask(job, None, request);
+        let shown = asked.recv().await.unwrap();
+        assert_eq!(shown.request.answer(Decision::Allow), Delivery::Delivered);
+        assert_eq!(answer.await.unwrap(), Decision::Allow);
+
+        // Nobody listening: refused at once.
+        let quiet = Approvals::new();
+        let (request, answer) =
+            PermissionRequest::new(String::from("DROP TABLE t"), Hold::NotPermitted);
+        quiet.ask(job, None, request);
+        assert_eq!(answer.await.unwrap(), Decision::Deny);
     }
 }

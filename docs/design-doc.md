@@ -295,7 +295,7 @@ line's long runs are recorded there too (`quack_cli::RecordedRun`: `ingest`, `im
 output and prompts, and a job mirrors it on the engine's queue (queued at the start, the
 run's progress, the command's outcome), so `quack jobs` from another shell shows an ingest
 running and the file keeps how it ended. `-q` and the listings are not recorded. The engine's
-recorder task reads every snapshot the queue broadcasts and writes the job's row into its
+`JobRecorder` task reads every snapshot the queue broadcasts and writes the job's row into its
 workspace's file when the job's state changed (a snapshot that changed only progress or a
 status line is not written), at background priority on that workspace's writer, and only
 while the workspace is open (it is never opened for a row). Opening a file marks the jobs
@@ -312,10 +312,15 @@ session deletes its turns' rows, whose labels quote the questions. A session's t
 exits (`quack -p`, `saved run --refresh`) drains the queue instead (`Engine::drain_jobs`),
 letting the title and labelling its turn started finish under the grace.
 
-**Stopping.** `Engine::stop_jobs(grace)` is the one way a process stops its jobs: it cancels
-the engine's stopping token (`Engine::begin_stop`, which a signal handler may call alone to
-let whoever owns the queue's shutdown run it), then `JobQueue::shutdown(grace)` closes the
-queue, so a job submitted afterwards is recorded as `cancelled` ("refused: the queue is
+**Stopping.** `Engine::shutdown(how, grace, drains)` is the one stop sequence of a process,
+and every entry point runs it: a command's `OpenedWorkspace::finish` (`Stop::Drain`), the
+terminal session's quit and `quack serve`'s signal (`Stop::Cancel`, with the socket server's
+and the HTTP server's drains passed in as futures, since the crates that own them sit above
+`quack-core`). It begins the stop, ends the jobs as `how` says while the drains run under the
+one grace, and closes the workspaces last. Under `Stop::Cancel`, `Engine::stop_jobs(grace)`
+cancels the engine's stopping token (`Engine::begin_stop`, which a signal handler may call
+alone to let whoever owns the queue's shutdown run it), then `JobQueue::shutdown(grace)` closes
+the queue, so a job submitted afterwards is recorded as `cancelled` ("refused: the queue is
 shutting down") and never runs, cancels every queued and running job, and waits up to
 `grace` for them to end and for what their ends record (`when_ended`). It returns the jobs
 still active when the grace ran out; the runtime drops those at their next await.
@@ -3973,8 +3978,11 @@ and kept for the record of what changed against the design.
       CLI spawns one too); parsing runs on the blocking pool; every job, the terminal's
       included, is a plain runtime task. The terminal's commands run their database step in
       typed order on a worker task, reads on the reader pool.
-    - Not yet: MCP `query` calls and print mode run their turn directly (one call, one
-      answer, nothing to keep responsive); jobs are not persisted across restarts.
+    - Done since: MCP `query` runs as a `chat` job in its session's lane (#548); jobs are
+      kept in `_quack_jobs` and restored at open (#557); the command line's long runs are
+      recorded there too (#570).
+    - Not yet: print mode runs its turn directly (one call, one answer, nothing to keep
+      responsive).
 
 ---
 
