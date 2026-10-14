@@ -964,11 +964,18 @@ async fn audit_rows_append_and_filter() {
 }
 
 /// A new workspace's name is trimmed, and refused when empty or when it
-/// holds a slash, a backslash, or a dot.
+/// holds a slash, a backslash, a dot, or a control character (a newline,
+/// a tab, NUL, an escape, a C1 control), which would break every one-line
+/// rendering of it.
 #[test]
-fn a_workspace_name_is_trimmed_and_refuses_empty_slashes_and_dots() {
+fn a_workspace_name_is_trimmed_and_refuses_empty_slashes_dots_and_controls() {
     assert!(matches!(" sales ".parse::<WorkspaceName>(), Ok(name) if name.as_str() == "sales"));
-    for refused in ["", "   ", "a/b", "a\\b", "a.b", ".."] {
+    assert!(
+        matches!("ventes régionales".parse::<WorkspaceName>(), Ok(name) if name.as_str() == "ventes régionales")
+    );
+    for refused in [
+        "", "   ", "a/b", "a\\b", "a.b", "..", "a\nb", "a\tb", "a\0b", "a\x1bb", "a\u{85}b", "a\rb",
+    ] {
         assert!(
             matches!(
                 refused.parse::<WorkspaceName>(),

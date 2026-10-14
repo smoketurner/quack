@@ -129,16 +129,20 @@ pub fn prune(db: &WorkspaceDb, keep: u32) -> Result<usize> {
     Ok(gone)
 }
 
-/// Delete the jobs of one chat session (its turns, whose labels quote the
-/// questions), when the session goes.
+/// Delete the jobs of one chat session when the session goes: its turns,
+/// whose labels quote the questions, and its title jobs, which name a
+/// session that no longer exists.
 ///
 /// # Errors
 ///
 /// Returns the statement's error.
 pub fn delete_session_jobs(db: &WorkspaceDb, session: &SessionId) -> Result<usize> {
     let gone = db.connection().execute(
-        "DELETE FROM _quack_jobs WHERE lane = ?",
-        duckdb::params![LaneKey::Session(session.clone()).to_string()],
+        "DELETE FROM _quack_jobs WHERE lane IN (?, ?)",
+        duckdb::params![
+            LaneKey::Session(session.clone()).to_string(),
+            LaneKey::SessionTitle(session.clone()).to_string(),
+        ],
     )?;
     Ok(gone)
 }

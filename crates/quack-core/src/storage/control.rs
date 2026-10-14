@@ -43,7 +43,10 @@ use crate::vault::Sealed;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// A name a new workspace may take: trimmed, non-empty, and without `/`,
-/// `\`, or `.`. Lookups take plain text, since older rows predate the rule.
+/// `\`, `.`, or a control character (a newline would break every one-line
+/// rendering of it: `quack workspace list`'s columns, the banner, the
+/// console, the audit rows). Lookups take plain text, since older rows
+/// predate the rule.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct WorkspaceName(String);
@@ -60,7 +63,7 @@ impl FromStr for WorkspaceName {
 
     fn from_str(name: &str) -> Result<Self> {
         let name = name.trim();
-        if name.is_empty() || name.contains(['/', '\\', '.']) {
+        if name.is_empty() || name.contains(['/', '\\', '.']) || name.contains(char::is_control) {
             return Err(Error::InvalidWorkspaceName);
         }
         Ok(Self(name.to_owned()))

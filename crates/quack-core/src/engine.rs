@@ -25,6 +25,7 @@ use crate::jobs::store as jobs_store;
 use crate::jobs::{JobId, JobInfo, JobQueue, JobState};
 use crate::priority::Priority;
 use crate::storage::audit::AuditLog;
+use crate::storage::sessions;
 use crate::storage::workspace::WorkspaceDb;
 use crate::storage::writer::Writer;
 use crate::telemetry;
@@ -363,6 +364,13 @@ impl Engine {
                 let interrupted = jobs_store::fail_interrupted(&db)?;
                 if interrupted > 0 {
                     tracing::warn!(workspace = %id, interrupted, "failed jobs left active by an earlier process");
+                }
+                // Sessions a killed first turn left without a message go
+                // the same way: no process owns a session in a file that
+                // is only now being opened.
+                let empty = sessions::delete_empty_sessions(&db)?;
+                if empty > 0 {
+                    tracing::info!(workspace = %id, empty, "removed sessions an earlier process left without a message");
                 }
                 jobs_store::prune(&db, history)?;
                 let earlier =

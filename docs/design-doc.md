@@ -288,7 +288,8 @@ workspace's file when the job's state changed (a snapshot that changed only prog
 status line is not written), at background priority on that workspace's writer, and only
 while the workspace is open (it is never opened for a row). Opening a file marks the jobs
 an earlier process left `queued` or `running` as failed ("the process running it ended
-before it finished") and restores the newest `[jobs].history` rows into the queue as
+before it finished"), removes the sessions an earlier process left without a message (a
+first turn killed before it recorded anything: `sessions::delete_empty_sessions`), and restores the newest `[jobs].history` rows into the queue as
 finished entries with fresh numbers (at most 20 per workspace, placed before this
 process's own jobs so the history bound evicts them first; the file keeps
 `[jobs].history` rows and is pruned to that at open), so `/jobs`, the Jobs page, `GET
@@ -3132,7 +3133,8 @@ pipe silent for a second (a supervisor's inherited stdin) is skipped with a warn
 waits for it. stdout carries the answer or result set; stderr carries steps. In `-f json` and
 `-f ndjson`, same-named columns keep every value under suffixed keys (`a`, `a_1`). Print mode
 streams text only on a terminal, and prints the validated answer again when validation
-changed what streamed; a pipeline gets the validated answer alone.
+changed what streamed; a pipeline gets the validated answer alone. An empty or whitespace-only
+`-p` prompt is a usage error (exit 2) before any session is created or any model is called.
 
 **Workspaces.** `-w NAME` names a workspace that exists. Any command given a name no
 workspace has stops with exit 2 and creates nothing:
@@ -3146,7 +3148,7 @@ no workspace named 'slaes'; create it with: quack workspace create slaes
 `[general].default_workspace`, and the first command to use it creates it (audited the same
 way), so a new install needs no setup step. Naming the default with `-w` does the same.
 `ControlPlane::workspace_or_default` is the one place this is decided. A new workspace's
-name is a `WorkspaceName`: trimmed, non-empty, and without `/`, `\`, or `.`. The CLI verb,
+name is a `WorkspaceName`: trimmed, non-empty, and without `/`, `\`, `.`, or a control character. The CLI verb,
 `POST /api/v1/workspaces`, the web console, and `default_workspace` in `config.toml` all go
 through that type. Workspaces created before the rule keep their names and still open.
 

@@ -318,6 +318,12 @@ pub struct Lane {
 pub enum LaneKey {
     /// One chat session's turns, answered in the order asked.
     Session(SessionId),
+    /// One chat session's title, written after a turn: its own key, so
+    /// the model call that titles the session never holds up the next
+    /// question, and a key of the session's, so the session's rows in
+    /// `_quack_jobs` go together when the session is deleted
+    /// (`jobs::store::delete_session_jobs`).
+    SessionTitle(SessionId),
     /// One kind of work in one workspace: its uploads, its graph
     /// extraction, its ontology document pass, its embedding refresh.
     Workspace(JobKind, WorkspaceId),
@@ -327,6 +333,7 @@ impl fmt::Display for LaneKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Session(id) => write!(f, "session:{id}"),
+            Self::SessionTitle(id) => write!(f, "session:{id}:title"),
             Self::Workspace(kind, workspace) => write!(f, "{kind}:{workspace}"),
         }
     }

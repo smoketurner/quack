@@ -44,7 +44,7 @@ pub enum Error {
     Unsavable(#[from] Unsavable),
 
     /// Text that cannot name a workspace.
-    #[error("workspace name must be non-empty and contain no slashes or dots")]
+    #[error("workspace name must be non-empty and contain no slashes, dots, or control characters")]
     InvalidWorkspaceName,
 
     #[error("embedding error: {0}")]

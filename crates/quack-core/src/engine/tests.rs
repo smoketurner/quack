@@ -217,6 +217,55 @@ async fn stop_jobs_ends_what_watches_stopping() {
     assert_eq!(later.state, JobState::Cancelled);
 }
 
+/// A session a killed first turn left without a message (nothing ran
+/// `delete_if_empty` for it) is removed when the file is next opened, the
+/// way the jobs it left active are failed; a session with a turn stays.
+#[tokio::test]
+#[expect(clippy::unwrap_used, reason = "test")]
+async fn empty_sessions_are_removed_when_the_file_is_opened() {
+    use crate::analysis::agent::AgentResponse;
+    use crate::analysis::search::DocumentScope;
+    use crate::storage::sessions::{self, ChatMode};
+    use crate::storage::workspace::WorkspaceDb;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(dir.path());
+    let id = WorkspaceId::from("ws");
+    let answered = {
+        let db = WorkspaceDb::open(&config, "ws").unwrap();
+        let killed = sessions::create_session(&db, "m", ChatMode::Chat, None).unwrap();
+        let answered = sessions::create_session(&db, "m", ChatMode::Chat, None).unwrap();
+        let response = AgentResponse {
+            content: String::from("a"),
+            steps: Vec::new(),
+            citations: Vec::new(),
+            chart: None,
+            graph: Vec::new(),
+            write_refused: false,
+            cancelled: false,
+            usage: None,
+            duration_ms: None,
+            documents: DocumentScope::default(),
+        };
+        sessions::record_turn(&db, &answered.id, "q", jiff::Timestamp::now(), &response).unwrap();
+        assert_eq!(sessions::list_sessions(&db, 10).unwrap().len(), 2);
+        drop(killed);
+        answered.id
+    };
+
+    let engine = Engine::new(config, Holder::Serve);
+    let handle = engine.workspace(&id).await.unwrap();
+    let left = handle
+        .writer
+        .run(|db| sessions::list_sessions(db, 10))
+        .await
+        .unwrap();
+    let ids: Vec<_> = left.into_iter().map(|s| s.id).collect();
+    assert_eq!(ids, vec![answered]);
+    drop(handle);
+    engine.close().await;
+}
+
 /// A job's end is kept in its workspace's file: the next process to open
 /// the file lists it, finished, with a fresh number; one an earlier
 /// process left running is listed as failed.

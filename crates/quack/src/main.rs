@@ -1109,6 +1109,13 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
         tracing::error!("-p accepts only --format text or json");
         return Ok(ExitCode::from(Exit::Usage));
     };
+    // An empty question is a usage error, decided before the workspace
+    // opens: no session is created, no model is called, and no title job is
+    // queued to fail on a session with nothing to title.
+    if prompt.trim().is_empty() {
+        tracing::error!("-p needs a question: the prompt is empty");
+        return Ok(ExitCode::from(Exit::Usage));
+    }
     let opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::command("-p")).await?;
     let config = opened.config();
     // Checked before the workspace opens, so a missing model is one line
