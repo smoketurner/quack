@@ -626,7 +626,16 @@ impl Server {
             }
             (None, _) => None,
         };
-        let local_hosts = (mode == ServeMode::Local).then(|| LocalHosts::on(addr.port()));
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("cannot listen on {addr}"))?;
+        // The port the listener took, not the one asked for: for port 0
+        // (the terminal with `[server].bind` unset) the kernel picks one,
+        // and that is the port every request's `Host` names (#558).
+        let bound = listener
+            .local_addr()
+            .with_context(|| format!("cannot read the address bound for {addr}"))?;
+        let local_hosts = (mode == ServeMode::Local).then(|| LocalHosts::on(bound.port()));
         let app = Arc::new(AppState::new(
             engine,
             control,
@@ -635,9 +644,6 @@ impl Server {
             sessions,
             oidc,
         ));
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("cannot listen on {addr}"))?;
         Ok(Self { app, listener })
     }
 
