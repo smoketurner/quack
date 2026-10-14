@@ -115,9 +115,13 @@ pub(crate) fn answer_keys() -> String {
 }
 
 /// The answers a socket turn's write takes: `y` and `n`, never `a` (a
-/// grant for the rest of a turn is for the session's own turns).
+/// grant for the rest of a turn is for the session's own turns), typed on
+/// an empty line; a command or question typed meanwhile goes through.
 fn socket_answer_keys() -> String {
-    keys_of(&[Decision::Allow, Decision::Deny])
+    format!(
+        "{}   (on an empty line; /cancel N and other commands work meanwhile)",
+        keys_of(&[Decision::Allow, Decision::Deny])
+    )
 }
 
 fn keys_of(choices: &[Decision]) -> String {
@@ -1999,7 +2003,7 @@ impl App {
                 }
             }
         }
-        if self.awaiting_permission() {
+        if self.awaiting_permission() && self.prompt_takes(code) {
             self.handle_permission_key(code);
             return;
         }
@@ -2058,6 +2062,34 @@ impl App {
                 self.history.leave();
             }
         }
+    }
+
+    /// Whether the front prompt takes `code`. The session's own prompts
+    /// take every key. Another process's write (over the workspace socket)
+    /// takes only its answer, `y`, `n`, or Esc, typed on an empty input
+    /// line: anything else is the person's own command or question
+    /// (`/cancel N` refuses the write), which goes to the input as usual,
+    /// so a `/cancel` is never cut at its `n` and the rest sent to the
+    /// model.
+    fn prompt_takes(&self, code: KeyCode) -> bool {
+        let socket = matches!(
+            self.prompts.front(),
+            Some(Prompt::Write {
+                origin: WriteOrigin::Socket { .. },
+                ..
+            })
+        );
+        if !socket {
+            return true;
+        }
+        let answer = match code {
+            KeyCode::Esc => true,
+            KeyCode::Char(key) => [Decision::Allow, Decision::Deny]
+                .into_iter()
+                .any(|decision| answer_key(decision) == key.to_ascii_lowercase()),
+            _ => false,
+        };
+        answer && self.textarea.is_empty()
     }
 
     /// The answer a key gives to the front prompt, if it is one: `y`,

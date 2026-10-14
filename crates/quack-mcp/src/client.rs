@@ -7,12 +7,13 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use quack_core::config::Config;
 use quack_core::engine::Holder;
 use quack_core::error::{Error, Result};
 use quack_core::forward;
 use quack_core::ids::WorkspaceId;
 use quack_core::jobs::JobInfo;
-use quack_core::storage::workspace::QueryResults;
+use quack_core::storage::workspace::{QueryResults, WorkspaceDb};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientConfig, Implementation,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, NumberOrString,
@@ -53,13 +54,64 @@ pub struct HeldElsewhere {
     /// Who holds the file, as its socket named it; `None` when no socket
     /// answered.
     pub holder: Option<String>,
-    /// What this process is: the command or server that was refused.
-    wanted: Holder,
+    /// What was refused.
+    wanted: Wanted,
     path: PathBuf,
     locked: Error,
 }
 
+/// What a holder's refusal stood in the way of.
+#[derive(Debug)]
+enum Wanted {
+    /// Opening the workspace, as this holder.
+    Open(Holder),
+    /// Deleting the workspace.
+    Delete,
+}
+
 impl HeldElsewhere {
+    /// Whether another process holds the workspace, before it is deleted
+    /// from under it: the socket's answer names the holder; with no socket
+    /// the file's own lock decides (`quack serve`, or a process starting
+    /// or stopping). `None` when nothing holds it, or it has no file yet.
+    /// A delete that went ahead would leave the holder on an unlinked
+    /// file, losing every write at its quit.
+    pub async fn before_delete(config: &Config, workspace_id: &WorkspaceId) -> Option<Self> {
+        let id = workspace_id.as_str();
+        let path = config.workspace_db_path(id);
+        if !path.exists() {
+            return None;
+        }
+        let locked = Error::WorkspaceLocked { path: path.clone() };
+        match holder_of(&config.workspace_dir(id), workspace_id).await {
+            Ok(Some(holder)) => {
+                return Some(Self {
+                    holder: Some(holder),
+                    wanted: Wanted::Delete,
+                    path,
+                    locked,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "could not ask the workspace socket who holds the file");
+            }
+        }
+        let probe = {
+            let (config, id) = (config.clone(), id.to_owned());
+            tokio::task::spawn_blocking(move || WorkspaceDb::recorded_schema(&config, &id)).await
+        };
+        match probe {
+            Ok(Err(Error::WorkspaceLocked { .. })) => Some(Self {
+                holder: None,
+                wanted: Wanted::Delete,
+                path,
+                locked,
+            }),
+            Ok(_) | Err(_) => None,
+        }
+    }
+
     /// Ask the socket of the workspace in `workspace_dir` who holds the
     /// file at `path`, for `wanted`, which `locked` refused. A socket that
     /// does not answer is logged and names nobody.
@@ -79,7 +131,7 @@ impl HeldElsewhere {
         };
         Self {
             holder,
-            wanted,
+            wanted: Wanted::Open(wanted),
             path,
             locked,
         }
@@ -91,15 +143,21 @@ impl fmt::Display for HeldElsewhere {
         let Some(holder) = &self.holder else {
             return f.write_str(&locked_without_socket(&self.path));
         };
-        write!(
-            f,
-            "the workspace is open in {holder}; `quack -q` and `quack jobs` read through it; \
-             quit it to "
-        )?;
+        write!(f, "the workspace is open in {holder}; ")?;
         match &self.wanted {
-            Holder::Command { verb, .. } => write!(f, "run `quack {verb}`"),
-            Holder::Terminal(_) => f.write_str("start a session here"),
-            Holder::Serve | Holder::Mcp => f.write_str("open it here"),
+            Wanted::Open(Holder::Command { verb, .. }) => {
+                write!(
+                    f,
+                    "`quack -q` and `quack jobs` read through it; quit it to run `quack {verb}`"
+                )
+            }
+            Wanted::Open(Holder::Terminal(_)) => f.write_str(
+                "`quack -q` and `quack jobs` read through it; quit it to start a session here",
+            ),
+            Wanted::Open(Holder::Serve | Holder::Mcp) => {
+                f.write_str("`quack -q` and `quack jobs` read through it; quit it to open it here")
+            }
+            Wanted::Delete => f.write_str("quit it before deleting the workspace"),
         }
     }
 }

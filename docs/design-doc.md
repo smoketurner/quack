@@ -3225,7 +3225,10 @@ workspace rename OLD NEW` and `name` on `PATCH .../workspaces/{id}` (the Setting
 field) change the name the unique index guards. `quack workspace delete NAME` (asks; `-y`
 skips), `DELETE .../workspaces/{id}`, and the Settings page's form (the name typed again)
 delete at once: the server closes the file the same way, its connections staying closed, and
-lets go of its MCP transports (409 while a job of the workspace is queued or running); the
+lets go of its MCP transports (409 while a job of the workspace is queued or running, and 409
+naming the holder, exit 1 from the CLI, while another process holds the file:
+`HeldElsewhere::before_delete` asks the workspace socket, and with no answer tries the file's
+lock, so a session is never left on an unlinked file); the
 row goes with its members and API tokens in one audited transaction, then the directory.
 `audit_log` has no foreign key to `workspaces`, so the rows stay. There is no archive state
 and no undo; the snapshot is the undo.

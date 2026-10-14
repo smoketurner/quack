@@ -23,6 +23,7 @@ use quack_core::storage::workspace::WorkspaceDb;
 
 use quack_cli::Confirm;
 use quack_cli::TextOrJson;
+use quack_mcp::client::{self, HeldElsewhere};
 
 /// Server administration: workspaces, users, tokens, membership, and the
 /// audit log.
@@ -285,10 +286,24 @@ impl WorkspaceAction {
                 let ws = control.rename_workspace(&ws.id, &new_name, entry).await?;
                 let mut out = stdout.lock();
                 writeln!(out, "Renamed '{name}' to '{}' ({})", ws.name, ws.id)?;
+                // A process holding it opened it under the old name: its
+                // banner and the `-w` it was given stay as they were.
+                if let Ok(Some(holder)) =
+                    client::holder_of(&config.workspace_dir(ws.id.as_str()), &ws.id).await
+                {
+                    writeln!(
+                        out,
+                        "Note: the workspace is open in {holder}, which shows the old name until \
+                         it is started again."
+                    )?;
+                }
                 out.flush()?;
             }
             Self::Delete { name, yes } => {
                 let ws = control.workspace_named(&name).await?;
+                if let Some(held) = HeldElsewhere::before_delete(config, &ws.id).await {
+                    anyhow::bail!("{held}");
+                }
                 let mut out = stdout.lock();
                 let question = format!(
                     "Delete workspace '{name}' ({}), its file, its members, and its tokens?",
