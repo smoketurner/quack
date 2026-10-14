@@ -11664,6 +11664,18 @@ async fn without_a_decision_model_the_route_says_so_and_a_forbidden_provider_is_
     );
 }
 
+/// A statement body past the router's small default is 413 before
+/// anything reads it; only the upload routes take `[ingestion].upload_max_mb`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sql_body_past_the_json_limit_is_refused_before_it_is_read() {
+    let l = TicketsApp::new().await;
+    let request =
+        serde_json::json!({ "sql": format!("SELECT '{}' AS a", "x".repeat(2 * 1024 * 1024)) });
+    let path = format!("/api/v1/workspaces/{}/sql", l.ws);
+    let (status, _) = l.h.post(&path, &l.owner, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
 /// A request past the cap is refused while it is read.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_past_the_cap_is_refused_over_rest() {

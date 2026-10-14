@@ -137,7 +137,7 @@ pub(crate) fn router(app: &App) -> ApiRoutes {
         .route("/workspaces/{id}/search", post(query::search))
         .route(
             "/workspaces/{id}/documents",
-            get(documents::list).post(documents::upload),
+            get(documents::list).post(documents::upload.layer(app.upload_body_limit())),
         )
         .route(
             "/workspaces/{id}/documents/{doc}",
@@ -242,7 +242,10 @@ fn control_routes(app: &App) -> ApiRoutes {
             "/workspaces",
             get(workspaces::list).post(workspaces::create),
         )
-        .route("/workspaces/restore", post(workspaces::restore))
+        .route(
+            "/workspaces/restore",
+            post(workspaces::restore.layer(app.upload_body_limit())),
+        )
         .route(
             "/workspaces/{id}",
             get(workspaces::show)

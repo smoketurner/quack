@@ -21,6 +21,7 @@ use quack_core::analysis::policy::{Hold, WritePolicy};
 use quack_core::analysis::search::{DocumentSearch, SearchBody, SearchDetail, SearchOutcome};
 use quack_core::analysis::tools::{ReaderDb, Rerank, SharedDb};
 use quack_core::classify::LabelJobs;
+use quack_core::error::Error as CoreError;
 use quack_core::ids::{PermissionId, SessionId, WorkspaceId};
 use quack_core::jobs::{JobId, JobKind, JobQueue, JobSpec, Lane, LaneKey};
 use quack_core::llm::{self, Embeddings};
@@ -594,6 +595,17 @@ pub(crate) async fn export(
     access.export_sql(&app, body.sql, body.format).await
 }
 
+/// What classifying a typed statement answered with: the classifier's own
+/// refusal (an internal table, transaction control, the server's catalog)
+/// is forbidden; `DuckDB` failing to parse it (out of memory on a huge
+/// literal) keeps its own code, a resource error, not a permission.
+fn classification_failed(e: CoreError) -> ApiError {
+    match e {
+        CoreError::Analysis(_) => ApiError::forbidden(e.to_string()),
+        other => ApiError::from(other),
+    }
+}
+
 /// Direct SQL. Reads need the viewer role; anything that mutates needs the
 /// member role and the write scope. `_quack_` tables are never reachable.
 /// A capped result set for the API and the web grid.
@@ -679,7 +691,7 @@ impl Access {
                     ),
                 )
                 .await?;
-                return Err(ApiError::forbidden(message));
+                return Err(classification_failed(e));
             }
         };
         if kind.writes().map_err(ApiError::bad_request)? {
@@ -762,7 +774,7 @@ impl Access {
                 Ok(db.classify_user_statement(&sql))
             })
             .await?
-            .map_err(|e| ApiError::forbidden(e.to_string()))?;
+            .map_err(classification_failed)?;
         let is_write = kind.writes().map_err(ApiError::bad_request)?;
         let detail = serde_json::json!({ "sql": statement });
         if is_write && creates_temp_object(statement) {

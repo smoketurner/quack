@@ -1078,7 +1078,10 @@ model`: `quack ingest`, `quack docs`, the terminal's `/docs` and load message, t
 Documents row, an upload job's result, the agent's `list_documents` output, and the documents
 block of the system prompt.
 
-**Decompression limit.** `[ingestion].upload_max_mb` counts compressed bytes. A DOCX, a PPTX,
+**Decompression limit.** `[ingestion].upload_max_mb` counts compressed bytes. It is the body
+limit of the routes that take a file (`POST .../documents`, `.../restore`, the Documents page's
+upload and replace forms) alone; every other route, a statement or a question, takes at most
+`JSON_BODY_BYTES` (1 MiB) and answers 413 before reading more. A DOCX, a PPTX,
 and a zipped workbook (XLSX, XLSM, XLSB, ODS) are zip archives, so a second limit,
 `[ingestion].max_decompressed_mb` (default 1024), bounds what one file may inflate to. Every
 part is read through one `ingestion::budget::DecompressionBudget` for the file. DOCX and PPTX

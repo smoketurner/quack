@@ -2,6 +2,7 @@
 //! workspaces), the control plane, the browser sessions, and the MCP
 //! transports.
 
+use axum::extract::DefaultBodyLimit;
 use quack_core::analysis::permissions::Permissions;
 use quack_core::ids::{UserId, WorkspaceId};
 use std::collections::{HashMap, HashSet};
@@ -384,6 +385,17 @@ impl AppState {
 
     /// The writer handle for a workspace, opening the file on first use
     /// (`Engine::workspace`, which is where one open per file is enforced).
+    /// The body limit of a route that takes a file (`[ingestion].upload_max_mb`):
+    /// a document upload, a snapshot to restore. Every other route keeps
+    /// the router's small default (`JSON_BODY_BYTES`), so a statement or a
+    /// question cannot make the server buffer half a gigabyte.
+    pub(crate) fn upload_body_limit(&self) -> DefaultBodyLimit {
+        let bytes = usize::try_from(self.engine.config.ingestion.upload_max_mb)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(1024 * 1024);
+        DefaultBodyLimit::max(bytes)
+    }
+
     pub(crate) async fn workspace_db(&self, workspace_id: &WorkspaceId) -> ApiResult<SharedDb> {
         Ok(self.open_workspace(workspace_id).await?.writer)
     }

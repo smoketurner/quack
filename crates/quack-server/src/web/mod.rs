@@ -14,7 +14,8 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use askama::Template;
-use axum::extract::{FromRequestParts, Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Multipart, Path, Query, State};
+use axum::handler::Handler;
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -1054,7 +1055,22 @@ pub(crate) fn assets() -> Router<App> {
     Router::new().route("/static/{*path}", get(static_asset))
 }
 
+/// The routes that take a file, under `[ingestion].upload_max_mb`
+/// (`files`); every other route keeps the router's small default.
+fn upload_routes(files: DefaultBodyLimit) -> Router<App> {
+    Router::new()
+        .route(
+            "/w/{id}/documents",
+            get(documents).post(upload.layer(files)),
+        )
+        .route(
+            "/w/{id}/documents/{doc}/replace",
+            post(replace_doc.layer(files)),
+        )
+}
+
 pub(crate) fn router(app: &App) -> Router<App> {
+    let files = app.upload_body_limit();
     Router::new()
         .route("/", get(index))
         .route(
@@ -1078,7 +1094,7 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/chat/{sid}/rename", post(rename_session))
         .route("/w/{id}/chat/search", get(search_sessions))
         .route("/w/{id}/chat/{sid}/unshare", post(unshare_session))
-        .route("/w/{id}/documents", get(documents).post(upload))
+        .merge(upload_routes(files))
         .route("/w/{id}/documents/rows", get(document_rows))
         .route("/w/{id}/documents/status", get(document_status))
         .route("/w/{id}/documents/{doc}/chunks/{n}", get(passage))
@@ -1086,7 +1102,6 @@ pub(crate) fn router(app: &App) -> Router<App> {
         .route("/w/{id}/documents/{doc}/pin", post(pin))
         .route("/w/{id}/documents/{doc}/unpin", post(unpin))
         .route("/w/{id}/documents/{doc}/delete", post(delete_doc))
-        .route("/w/{id}/documents/{doc}/replace", post(replace_doc))
         .route("/w/{id}/embeddings/refresh", post(refresh_embeddings))
         .route(
             "/w/{id}/search",
