@@ -58,7 +58,7 @@ impl RecordedRun {
     }
 
     /// The command line, as a job label: every argument after the binary,
-    /// on one line, at most [`LABEL_CHARS`] characters.
+    /// on one line, at most `LABEL_CHARS` (80) characters.
     #[must_use]
     pub fn command_line() -> String {
         let line = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
