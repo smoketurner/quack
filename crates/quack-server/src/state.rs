@@ -10,11 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use quack_core::analysis::policy::WritePolicy;
-use quack_core::analysis::tools::{ReaderDb, SharedDb};
+use quack_core::analysis::tools::SharedDb;
 use quack_core::engine::{Engine, WorkspaceHandle};
 use quack_core::error::Error as CoreError;
 use quack_core::llm::oauth::KeySource;
-use quack_core::storage::audit::AuditLog;
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_core::telemetry;
 use quack_core::vault::Vault;
