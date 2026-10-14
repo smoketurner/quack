@@ -29,12 +29,13 @@ use crate::jobs::JobId;
 #[derive(Clone, Default)]
 pub struct Approvals(Arc<Mutex<Option<mpsc::UnboundedSender<Asked>>>>);
 
-/// One write waiting for the person: the job running the turn, its
-/// session, and the request to answer.
+/// One write waiting for the person: the job running it (a turn, or a
+/// statement another process sent over the workspace socket), the turn's
+/// session when it is a turn, and the request to answer.
 #[derive(Debug)]
 pub struct Asked {
     pub job: JobId,
-    pub session: SessionId,
+    pub session: Option<SessionId>,
     pub request: PermissionRequest,
 }
 

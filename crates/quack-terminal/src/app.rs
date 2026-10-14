@@ -1717,10 +1717,13 @@ impl App {
             .hold
             .notice()
             .map_or(String::new(), |notice| format!("{notice}\n"));
+        // A turn's write names its session; a statement sent as such has
+        // none.
+        let session = session.map_or(String::new(), |session| format!(", session {session}"));
         self.note(
             MessageKind::System,
             format!(
-                "quack mcp (job #{number}, session {session}): {}\n{}\n{notice}{}",
+                "quack mcp (job #{number}{session}): {}\n{}\n{notice}{}",
                 Decision::HEADING,
                 request.sql,
                 socket_answer_keys()

@@ -6,6 +6,8 @@
 //! path), and serves it on the workspace socket while it holds it, so
 //! `quack mcp` and `quack -q` in another shell reach it (`quack_mcp::socket`).
 
+use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,14 +16,57 @@ use quack_core::analysis::permissions::Approvals;
 use quack_core::analysis::policy::WritePolicy;
 use quack_core::config::Config;
 use quack_core::engine::{Engine, WorkspaceHandle};
+use quack_core::error::Error as CoreError;
 use quack_core::forward::{Holder, Listener};
 use quack_core::ids::WorkspaceId;
 use quack_core::llm::egress::Egress;
 use quack_core::storage::control::{ControlPlane, WorkspaceRow};
 use quack_core::storage::workspace::WorkspaceDb;
 use quack_mcp::socket::SocketServer;
-use quack_mcp::{McpServer, McpSetup, Transport};
+use quack_mcp::{McpServer, McpSetup, Transport, client};
 use tokio::sync::OnceCell;
+
+/// Why a command could not open its workspace: another `quack` process
+/// holds the file. It names the holder when the holder's socket answers
+/// (`initialize` names it), and what still works, so the person knows
+/// which process to quit or which command to use instead; when no socket
+/// answers it says what that means. `Error::WorkspaceLocked` stays its
+/// source, so `-q` and `jobs`, which answer a lock by reaching the
+/// holder, still recognize it.
+#[derive(Debug)]
+pub struct HeldElsewhere {
+    /// Who holds the file, as its socket named it; `None` when no socket
+    /// answered.
+    pub holder: Option<String>,
+    /// What this process is: the command that was refused.
+    wanted: Holder,
+    path: PathBuf,
+    locked: CoreError,
+}
+
+impl fmt::Display for HeldElsewhere {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(holder) = &self.holder else {
+            return f.write_str(&client::locked_without_socket(&self.path));
+        };
+        write!(
+            f,
+            "the workspace is open in {holder}; `quack -q` and `quack jobs` read through it; \
+             quit it to "
+        )?;
+        match &self.wanted {
+            Holder::Command { verb, .. } => write!(f, "run `quack {verb}`"),
+            Holder::Terminal(_) => f.write_str("start a session here"),
+            Holder::Serve | Holder::Mcp => f.write_str("open it here"),
+        }
+    }
+}
+
+impl std::error::Error for HeldElsewhere {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.locked)
+    }
+}
 
 /// The engine and the workspace a command runs in.
 pub struct OpenedWorkspace {
@@ -102,16 +147,46 @@ impl OpenedWorkspace {
     ///
     /// # Errors
     ///
-    /// Returns an error when the workspace database does not open (another
-    /// process holds it, the file is too new, ...).
+    /// Returns [`HeldElsewhere`] when another process holds the file (who,
+    /// when its socket answers, and what still works), or an error when the
+    /// workspace database does not open (the file is too new, ...).
     pub async fn handle(&self) -> Result<WorkspaceHandle> {
-        let handle = self
-            .engine
-            .workspace(&self.workspace.id)
-            .await
-            .context("failed to open workspace database")?;
+        let handle = match self.engine.workspace(&self.workspace.id).await {
+            Ok(handle) => handle,
+            Err(locked @ CoreError::WorkspaceLocked { .. }) => {
+                return Err(self.held_elsewhere(locked).await.into());
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context("failed to open workspace database"));
+            }
+        };
         self.socket.get_or_init(|| self.serve_socket(&handle)).await;
         Ok(handle)
+    }
+
+    /// The refusal for a file another process holds: one connection to
+    /// the workspace socket asks who, and the answer (or that nothing
+    /// answered) goes on the error.
+    async fn held_elsewhere(&self, locked: CoreError) -> HeldElsewhere {
+        let id = self.workspace.id.as_str();
+        let holder = match client::holder_of(
+            &self.engine.config.workspace_dir(id),
+            &self.workspace.id,
+        )
+        .await
+        {
+            Ok(holder) => holder,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not ask the workspace socket who holds the file");
+                None
+            }
+        };
+        HeldElsewhere {
+            holder,
+            wanted: self.engine.holder().clone(),
+            path: self.engine.config.workspace_db_path(id),
+            locked,
+        }
     }
 
     /// Serve the workspace on its socket for other `quack` processes,
@@ -191,7 +266,7 @@ mod tests {
 
     use quack_core::config::Config;
     use quack_core::error::Error as CoreError;
-    use quack_core::forward::Holder;
+    use quack_core::forward::{Holder, SocketPath};
     use quack_core::storage::control::ControlPlane;
 
     use super::OpenedWorkspace;
@@ -247,6 +322,14 @@ mod tests {
         let second = opened.handle().await.unwrap();
         assert!(std::sync::Arc::ptr_eq(&first.writer, &second.writer));
         drop((first, second));
+        // The first handle started the socket; finishing at once, as every
+        // one-shot command does, takes the socket file with it.
+        let socket = SocketPath::of(
+            &opened.config().workspace_dir(opened.workspace.id.as_str()),
+            &opened.workspace.id,
+        );
+        assert!(socket.path().exists(), "the command serves its workspace");
         opened.finish(std::time::Duration::ZERO).await;
+        assert!(!socket.path().exists(), "the socket file was left behind");
     }
 }

@@ -657,6 +657,27 @@ pub const MODEL_RESULT_BYTES: usize = 20_000;
 /// instead (`…(+4500 chars)`).
 pub const MODEL_CELL_CHARS: usize = 500;
 
+/// Bytes of rows one `sql` tool answer carries in its structured content
+/// ([`CappedResults::bound_bytes`]). The row cap bounds no bytes, and a
+/// result relayed through the workspace socket is buffered whole at both
+/// ends, so without this a statement typed in another shell would have
+/// the holder serialize and send a value of any width.
+pub const STRUCTURED_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Characters of one value a structured answer keeps before the rest is
+/// counted instead (`…(+N chars)`), as [`MODEL_CELL_CHARS`] does for the
+/// model's text.
+pub const STRUCTURED_CELL_CHARS: usize = 64 * 1024;
+
+/// What [`CappedResults::bound_bytes`] left out.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Cut {
+    /// Values cut at the character limit, among the rows kept.
+    pub cells: usize,
+    /// Rows dropped at the byte limit.
+    pub rows: usize,
+}
+
 /// Query results with at most a caller's cap of rows kept, plus how many
 /// the statement produced in all.
 #[derive(Debug, Clone)]
@@ -682,6 +703,45 @@ impl CappedResults {
     #[must_use]
     pub fn omitted(&self) -> usize {
         self.total_rows.saturating_sub(self.results.rows.len())
+    }
+
+    /// Bound the kept rows in bytes for a structured answer: every string
+    /// value longer than `max_cell_chars` is cut to that many characters
+    /// with how much was left out appended (`…(+N chars)`), then rows are
+    /// kept only while their JSON fits in `max_bytes`, the first always.
+    /// `total_rows` is untouched, so [`Self::truncated`] says when rows
+    /// went; the return says what was cut.
+    pub fn bound_bytes(&mut self, max_bytes: usize, max_cell_chars: usize) -> Cut {
+        let mut cut = Cut::default();
+        let mut used = 0_usize;
+        let mut kept = 0_usize;
+        for row in &mut self.results.rows {
+            let mut cells = 0_usize;
+            for value in row.iter_mut() {
+                let serde_json::Value::String(text) = value else {
+                    continue;
+                };
+                let Some((at, _)) = text.char_indices().nth(max_cell_chars) else {
+                    continue;
+                };
+                let left = text.get(at..).map_or(0, |rest| rest.chars().count());
+                text.truncate(at);
+                text.push_str("\u{2026}(+");
+                text.push_str(&left.to_string());
+                text.push_str(" chars)");
+                cells = cells.saturating_add(1);
+            }
+            let bytes = serde_json::to_string(row).map_or(0, |json| json.len());
+            used = used.saturating_add(bytes);
+            if kept > 0 && used > max_bytes {
+                break;
+            }
+            kept = kept.saturating_add(1);
+            cut.cells = cut.cells.saturating_add(cells);
+        }
+        cut.rows = self.results.rows.len().saturating_sub(kept);
+        self.results.rows.truncate(kept);
+        cut
     }
 
     /// `at least ` when the count is a lower bound, else nothing: the

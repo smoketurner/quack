@@ -6731,8 +6731,8 @@ async fn jobs_report_uploads_hide_other_questions_and_cancel_by_their_owner() {
         h.wait_ready(&ws, &doc, &owner_token).await["status"],
         "ready"
     );
-    let (status, body) = h.get(&format!("{jobs}/{upload_job}"), &viewer_token).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    // The document is ready a moment before the job records its end.
+    let body = wait_for_job(&h, &ws, &upload_job, &viewer_token).await;
     assert_eq!(body["kind"], "ingest");
     assert_eq!(body["label"], "notes.md");
     assert_eq!(body["state"], "succeeded", "{body}");
