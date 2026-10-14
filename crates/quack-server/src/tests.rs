@@ -36,7 +36,7 @@ use crate::auth::{Access, Credential, Identity, Need};
 use crate::permissions;
 use crate::run::{self, RunKind};
 use quack_core::engine::Engine;
-use quack_core::forward::Holder;
+use quack_core::engine::Holder;
 use quack_core::ingestion::upload::UploadJob;
 use quack_core::jobs::runs::RunReport;
 use quack_core::jobs::{JobKind, LaneKey};
@@ -272,6 +272,12 @@ impl Harness {
             let (status, body) = self
                 .get(&format!("/api/v1/workspaces/{ws}/documents/{doc}"), bearer)
                 .await;
+            // Polling fast enough to meet the limiter (a slow runner, a long
+            // batch) is the limiter's answer, not the document's: wait it out.
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            }
             assert_eq!(status, StatusCode::OK, "{body}");
             match body["status"].as_str() {
                 Some("ready" | "error") => return body,

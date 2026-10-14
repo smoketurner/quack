@@ -191,10 +191,10 @@ extraction, and document pass have their own), cancel tokens, per-chunk progress
 broadcast of `JobInfo` snapshots every interface reports from. The process is one
 `quack_core::engine::Engine` (its config, its one queue, its open workspaces, its stopping token):
 `quack serve`, the terminal, and every command build one (`Engine::new(config,
-forward::Holder)`; the command line's `OpenedWorkspace` holds it, `with_db` runs a one-shot
+engine::Holder)`; the command line's `OpenedWorkspace` holds it, `with_db` runs a one-shot
 command's step on the writer, `finish` stops and closes) and `Engine::workspace(id)`
 opens a workspace file once per process (the `OnceCell` rule of `code-standards.md`), restores
-the jobs the file remembers (`_quack_jobs`, written by the engine's recorder as a job's state
+the jobs the file remembers (`_quack_jobs`, written by the engine's `JobRecorder` as a job's state
 changes; a job an earlier process left active is marked failed), and hands back the writer,
 reader pool, and audit connection as a `WorkspaceHandle`; a holder of one workspace is refused
 any other. Every holder but `quack serve` serves the workspace on its socket
@@ -202,16 +202,19 @@ any other. Every holder but `quack serve` serves the workspace on its socket
 `OpenedWorkspace::handle`; `quack mcp` relays to it, `quack -q` and `quack jobs` read through
 it; a `query` turn's write asks the terminal's prompt through `analysis::permissions::Approvals`;
 `quack mcp` holds nothing between calls: `quack_mcp::relay::PerCallServer`).
-A session's title after a turn is a `title` job on the same queue. `Engine::stop_jobs(grace)` is
-the one way a process stops its jobs: it cancels the stopping token (which ends `jobs/stream` and
-the MCP event streams, and cancels an MCP `query` turn, which runs under a child of it), then
-`JobQueue::shutdown(grace)`: a later `submit` is recorded as cancelled and never runs, queued and
-running jobs are cancelled, and it waits up to the grace for them and for what `when_ended`
-records. The terminal's quit calls it; `quack serve` calls it on SIGTERM or Ctrl-C beside the
-HTTP drain under `[server].shutdown_grace_seconds` (20), and then `AppState::close` drops the
-MCP transports and `Engine::close` the workspace handles so each writer checkpoints
-(`quack_server::Server`: `start` over an engine and a bound address, `run` until the engine
-stops; `serve` wraps them with the banner and the signal). There is no job pool:
+A session's title after a turn is a `title` job on the same queue. `Engine::shutdown(how, grace,
+drains)` is the one stop sequence of a process (`OpenedWorkspace::finish` and `stop`, the
+terminal's quit, `quack serve`'s signal): it cancels the stopping token (which ends `jobs/stream`
+and the MCP event streams, and cancels an MCP `query` turn, which runs under a child of it), ends
+the jobs as `Stop::Cancel` (`JobQueue::shutdown(grace)`: a later `submit` is recorded as cancelled
+and never runs, queued and running jobs are cancelled, and it waits up to the grace for them and
+for what `when_ended` records) or `Stop::Drain` (a command lets its title and labelling finish)
+while the drains it was handed run (the workspace socket's sessions, the HTTP server's open
+requests), then closes the workspaces so each writer checkpoints. `quack serve` runs it on
+SIGTERM or Ctrl-C under `[server].shutdown_grace_seconds` (20), handing it the HTTP drain,
+which also drops the MCP transports (`AppState::close`), as its drain (`quack_server::Server`:
+`start` over an engine and a bound address, `run` until the engine stops; `serve` wraps them
+with the banner and the signal). There is no job pool:
 resources are limited where they are used. Every rig HTTP client sends through
 `llm::LimitedHttp` (rig's reqwest transport over one process-wide connection pool, plus the provider's `headers`), which holds
 one permit of the process-wide gate for the provider and the model named in the request body (`[providers.NAME].max_concurrent_requests` each, 1

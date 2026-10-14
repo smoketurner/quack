@@ -211,7 +211,7 @@ async fn a_created_workspace_opens_by_name() {
     let opened = OpenedWorkspace::in_config(config.clone(), Some("sales"), Holder::Terminal)
         .await
         .unwrap();
-    assert_eq!(opened.name, "sales");
+    assert_eq!(opened.workspace.name, "sales");
     drop(opened.handle().await.unwrap());
     opened.finish(Duration::ZERO).await;
 

@@ -12,7 +12,7 @@ use super::*;
 use crate::commands::Suggestion;
 use crate::selection::{Position, Row};
 use quack_core::engine::Engine;
-use quack_core::forward::Holder;
+use quack_core::engine::Holder;
 use quack_core::ids::{ChunkId, DocumentId};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;

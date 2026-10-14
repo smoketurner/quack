@@ -8,9 +8,9 @@
 use std::sync::Arc;
 
 use crate::classify::{OnEnd, RunEnded};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::ids::{AuditId, SessionId, UserId, WorkspaceId};
-use crate::jobs::runs::{RunAudit, RunRow};
+use crate::jobs::runs::RunRow;
 use crate::storage::control::{
     AuditAction, AuditEntry, AuditResource, ControlPlane, Origin, Outcome, ResourceKind,
 };
@@ -378,10 +378,14 @@ impl Recorder {
     }
 }
 
-impl RunAudit for Recorder {
-    type Error = Error;
-
-    async fn record(&self, row: RunRow) -> Result<()> {
+impl Recorder {
+    /// Write a background run's row (its start, or its end): both audit
+    /// halves, as every row this recorder writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the write's error.
+    pub async fn record_run(&self, row: RunRow) -> Result<()> {
         let resource = row.resource();
         let RunRow {
             action,

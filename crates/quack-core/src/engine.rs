@@ -9,6 +9,8 @@
 //! the stdio MCP server each build one engine and hand it to what they run.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -18,7 +20,6 @@ use tokio_util::sync::CancellationToken;
 use crate::analysis::tools::{ReaderDb, SharedDb};
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::forward::Holder;
 use crate::ids::WorkspaceId;
 use crate::ingestion::upload::UploadJob;
 use crate::jobs::store as jobs_store;
@@ -43,7 +44,7 @@ pub struct Engine {
     /// it, so a connection left open cannot hold the process up.
     stopping: CancellationToken,
     /// The task writing each job's state into its workspace's file.
-    recorder: Recorder,
+    recorder: JobRecorder,
     /// A workspace file is opened once per process; every interface shares
     /// it. The cell is what enforces "once"; `None` once [`Engine::close`]
     /// ran, so nothing opens a file again beside a handle a straggler
@@ -64,16 +65,97 @@ pub struct WorkspaceHandle {
     pub audit: Arc<AuditLog>,
 }
 
-/// The task that keeps `_quack_jobs` current: it reads every snapshot the
-/// queue broadcasts and writes the job's row into its workspace's file
-/// (`jobs::store`) when the job's state changed, at background priority on
-/// that workspace's writer. A workspace that is not open gets no row (it
+/// The process that holds workspaces open, as the MCP `initialize` reply
+/// names it to the person reading `quack -q`'s stderr, and the one
+/// workspace it holds: `quack serve` opens any workspace a request names;
+/// the terminal session and every command opened exactly one and refuse
+/// the rest (`engine::Engine::workspace`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Holder {
+    Serve,
+    Terminal(WorkspaceId),
+    /// A `quack` command, named by its verb (`-p`, `ingest`, ...).
+    Command {
+        workspace: WorkspaceId,
+        verb: &'static str,
+    },
+    /// `quack mcp`, which holds nothing between calls: it opens the
+    /// workspace for one call and closes it after, or reaches the holder;
+    /// while a call holds the file it serves the socket itself
+    /// (`quack_mcp::relay`), not through `OpenedWorkspace`.
+    Mcp,
+}
+
+impl Holder {
+    /// The holder a command with `verb` becomes once its workspace is
+    /// known: `OpenedWorkspace::resolve(name, Holder::command("ingest"))`.
+    pub fn command(verb: &'static str) -> impl FnOnce(WorkspaceId) -> Self {
+        move |workspace| Self::Command { workspace, verb }
+    }
+
+    /// The one workspace this holder opened, or `None` for the server.
+    #[must_use]
+    pub fn held(&self) -> Option<&WorkspaceId> {
+        match self {
+            Self::Serve | Self::Mcp => None,
+            Self::Terminal(id) | Self::Command { workspace: id, .. } => Some(id),
+        }
+    }
+
+    /// Whether `OpenedWorkspace` serves the workspace socket for this
+    /// holder while it holds the file: the session and every command; not
+    /// the server (a login-mode server would hand any same-user process
+    /// the agent with no audit row) and not `quack mcp`, which holds
+    /// nothing between calls and serves its own socket only while a call
+    /// holds the file (`quack_mcp::relay`).
+    #[must_use]
+    pub fn serves_socket(&self) -> bool {
+        match self {
+            Self::Terminal(_) | Self::Command { .. } => true,
+            Self::Serve | Self::Mcp => false,
+        }
+    }
+}
+
+impl std::fmt::Display for Holder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Serve => f.write_str("quack serve"),
+            Self::Terminal(_) => f.write_str("the quack terminal session"),
+            Self::Command { verb, .. } => write!(f, "quack {verb}"),
+            Self::Mcp => f.write_str("quack mcp"),
+        }
+    }
+}
+
+/// The task that keeps `_quack_jobs` current (the job recorder, not
+/// `storage::audit::Recorder`, which writes audit rows): it reads every
+/// snapshot the queue broadcasts and writes the job's row into its
+/// workspace's file (`jobs::store`) when the job's state changed, at
+/// background priority on that workspace's writer. A workspace that is not open gets no row (it
 /// is never opened for one: a delete's close races a last snapshot).
 /// [`Engine::close`] tells it to drain and waits for it.
-struct Recorder {
+struct JobRecorder {
     closing: CancellationToken,
     task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
+
+/// How a stopping process ends its jobs ([`Engine::shutdown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// Cancel what runs and wait up to the grace for it to end: the
+    /// terminal session's quit, `quack serve`'s signal.
+    Cancel,
+    /// Let what runs finish within the grace and refuse anything new: a
+    /// command that answered one question, so the title and labelling its
+    /// turn started end.
+    Drain,
+}
+
+/// Something a stopping process waits for beside its jobs: the workspace
+/// socket's sessions, an HTTP server's open requests. The crate that owns
+/// it is above `quack-core`, so it is passed in as a future.
+pub type Drain = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// How long [`Engine::close`] waits for the recorder to write what is
 /// pending.
@@ -84,7 +166,7 @@ const RECORDER_DRAIN: Duration = Duration::from_secs(5);
 /// workspaces. The file keeps `[jobs].history` of them.
 const RESTORED_PER_WORKSPACE: u32 = 20;
 
-impl Recorder {
+impl JobRecorder {
     /// Run over `events` until the queue closes or `closing` fires, then
     /// write what is still pending.
     async fn run(
@@ -261,15 +343,15 @@ impl Engine {
             config,
             holder,
             stopping: CancellationToken::new(),
-            recorder: Recorder {
+            recorder: JobRecorder {
                 closing: closing.clone(),
                 task: std::sync::Mutex::new(None),
             },
             workspaces: Mutex::new(Some(HashMap::new())),
         });
-        let task = tokio::runtime::Handle::try_current()
-            .ok()
-            .map(|runtime| runtime.spawn(Recorder::run(Arc::downgrade(&engine), events, closing)));
+        let task = tokio::runtime::Handle::try_current().ok().map(|runtime| {
+            runtime.spawn(JobRecorder::run(Arc::downgrade(&engine), events, closing))
+        });
         if let Ok(mut slot) = engine.recorder.task.lock() {
             *slot = task;
         }
@@ -517,9 +599,43 @@ impl Engine {
 
     /// Begin to stop: everything watching [`Self::stopping`] ends (a
     /// server's drain starts, its streams end). Whoever owns the queue's
-    /// shutdown calls [`Self::stop_jobs`] next.
+    /// shutdown calls [`Self::stop_jobs`] next, or [`Self::shutdown`] runs
+    /// the whole sequence.
     pub fn begin_stop(&self) {
         self.stopping.cancel();
+    }
+
+    /// The one stop sequence of a process (design doc 4.1): begin the stop
+    /// (everything watching [`Self::stopping`] ends: a server's drain
+    /// starts, its streams and the MCP event streams end), then end the
+    /// jobs as `how` says while `drains` run (the workspace socket's
+    /// sessions, the HTTP server's open requests, in that order), both
+    /// under `grace`, then close the workspaces so each writer checkpoints.
+    /// Every entry point calls this: a command's `OpenedWorkspace::finish`,
+    /// the terminal session's quit, `quack serve`'s signal. Returns the jobs
+    /// still active when the grace ran out.
+    pub async fn shutdown(&self, how: Stop, grace: Duration, drains: Vec<Drain>) -> Vec<JobInfo> {
+        self.begin_stop();
+        let jobs = async {
+            match how {
+                Stop::Cancel => self.stop_jobs(grace).await,
+                Stop::Drain => self.drain_jobs(grace).await,
+            }
+        };
+        let drained = async {
+            for drain in drains {
+                drain.await;
+            }
+        };
+        let (left, drained) = tokio::join!(jobs, tokio::time::timeout(grace, drained));
+        if drained.is_err() {
+            tracing::warn!(
+                grace_seconds = grace.as_secs(),
+                "the stop's drains did not end within the grace"
+            );
+        }
+        self.close().await;
+        left
     }
 
     /// Begin to stop, and shut the queue down under `grace` (a later submit

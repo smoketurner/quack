@@ -18,7 +18,6 @@ use quack_core::config::{Config, Grant, LogFormat};
 use quack_core::crypto::{self, CryptoModule};
 use quack_core::doctor::{Options, Probing};
 use quack_core::error::{Error as CoreError, Result as CoreResult};
-use quack_core::forward;
 use quack_core::graph::export::Destination;
 use quack_core::graph::follow_up::FollowUp;
 use quack_core::ids::DocumentId;
@@ -63,7 +62,7 @@ use quack_cli::{ImportAction, ImportArgs, ImportContext};
 use quack_cli::{NamedInput, StdioPath};
 use quack_cli::{OpenedWorkspace, RecordedRun, SessionChoice, find_session, resolve_session};
 use quack_cli::{embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
-use quack_core::forward::Holder;
+use quack_core::engine::{Drain, Holder, Stop};
 use quack_mcp::client::HolderClient;
 
 use quack_core::config::ServerConfig;
@@ -1150,7 +1149,7 @@ async fn run_print_mode(cli: &Cli, prompt: &str, policy: WritePolicy) -> Result<
     if let Some(note) = note {
         tracing::warn!(
             "{note} Run `quack embeddings refresh -w {}` to update them.",
-            opened.name
+            opened.workspace.name
         );
     }
     let session_id = {
@@ -1585,7 +1584,7 @@ async fn run_okf_export(cli: &Cli, dir: &StdioPath) -> Result<ExitCode> {
     init_logging();
     let opened =
         OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::command("okf export")).await?;
-    let (name, dir) = (opened.name.clone(), dir.clone());
+    let (name, dir) = (opened.workspace.name.clone(), dir.clone());
     let exported = opened
         .with_db(move |db| {
             match &dir {
@@ -1964,7 +1963,7 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     if let Some(code) = init_cli::offer_on_first_run().await? {
         return Ok(code);
     }
-    let mut opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::Terminal).await?;
+    let opened = OpenedWorkspace::resolve(cli.workspace.as_deref(), Holder::Terminal).await?;
     let writes = WritePolicy::Ask.allowed_if(cli.allow_write);
     let handle = opened.handle().await?;
     let session_id = {
@@ -1994,7 +1993,7 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     let session = quack_terminal::run(SessionSetup {
         engine: Arc::clone(&opened.engine),
         web,
-        workspace_name: opened.name.clone(),
+        workspace_name: opened.workspace.name.clone(),
         workspace_id: opened.workspace.id.clone(),
         db: Arc::clone(&handle.writer),
         reader_db: handle.reader.clone(),
@@ -2004,18 +2003,18 @@ async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode
     })
     .await;
     // The session's quit stopped the jobs (a session that failed did not:
-    // begin the stop here, so the server drains either way), the server
-    // and the socket drain under the same grace, and the writer
-    // checkpoints last.
-    opened.engine.begin_stop();
-    if let Some(server) = server
-        && let Ok(Err(e)) = tokio::time::timeout(QUIT_GRACE, server).await
-    {
-        tracing::warn!(error = %e, "the web server beside the session ended with an error");
-    }
-    opened.close_socket(QUIT_GRACE).await;
+    // the stop sequence cancels them either way); the server and the
+    // socket drain under the same grace, and the writer checkpoints last
+    // (`Engine::shutdown`).
     drop(handle);
-    opened.engine.close().await;
+    let server = server.map(|server| -> Drain {
+        Box::pin(async move {
+            if let Ok(Err(e)) = server.await {
+                tracing::warn!(error = %e, "the web server beside the session ended with an error");
+            }
+        })
+    });
+    opened.stop(Stop::Cancel, QUIT_GRACE, server).await;
     session?;
     Ok(ExitCode::SUCCESS)
 }
@@ -2674,9 +2673,10 @@ async fn run_query(
 /// depth of its chain.
 fn is_workspace_locked(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
-        cause
-            .downcast_ref::<CoreError>()
-            .is_some_and(forward::is_locked)
+        matches!(
+            cause.downcast_ref::<CoreError>(),
+            Some(CoreError::WorkspaceLocked { .. })
+        )
     })
 }
 

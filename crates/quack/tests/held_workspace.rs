@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use quack_cli::OpenedWorkspace;
 use quack_core::config::Config;
-use quack_core::forward::Holder;
+use quack_core::engine::Holder;
 
 fn command(dir: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_quack"));
@@ -61,7 +61,7 @@ async fn commands_reach_the_workspace_through_its_holder() {
     // Hold the workspace as the terminal session does: the socket is served.
     let mut config = Config::default();
     config.general.data_dir = root.join("data");
-    let mut opened = OpenedWorkspace::in_config(config, Some("ws"), Holder::Terminal)
+    let opened = OpenedWorkspace::in_config(config, Some("ws"), Holder::Terminal)
         .await
         .unwrap_or_else(|e| fail(&format!("{e:#}")));
     let handle = opened
@@ -118,8 +118,7 @@ async fn commands_reach_the_workspace_through_its_holder() {
     );
 
     drop(handle);
-    opened.close_socket(Duration::from_secs(5)).await;
-    opened.finish(Duration::ZERO).await;
+    opened.finish(Duration::from_secs(5)).await;
 }
 
 /// `quack mcp` holds nothing between calls: started before anything holds
@@ -163,7 +162,7 @@ async fn quack_mcp_holds_nothing_between_calls() {
     // The file is free between calls: a session takes it.
     let mut config = Config::default();
     config.general.data_dir = root.join("data");
-    let mut opened = OpenedWorkspace::in_config(config, Some("ws"), Holder::Terminal)
+    let opened = OpenedWorkspace::in_config(config, Some("ws"), Holder::Terminal)
         .await
         .unwrap_or_else(|e| fail(&format!("{e:#}")));
     let handle = opened
@@ -186,8 +185,7 @@ async fn quack_mcp_holds_nothing_between_calls() {
     );
 
     drop(handle);
-    opened.close_socket(Duration::from_secs(5)).await;
-    opened.finish(Duration::ZERO).await;
+    opened.finish(Duration::from_secs(5)).await;
 }
 
 /// Two `quack mcp` processes on one workspace nobody else holds both

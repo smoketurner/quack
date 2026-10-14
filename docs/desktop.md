@@ -626,3 +626,9 @@ second binary that ships the first inside it". `crates/README.md` gets an eighth
 `docs/audit.md` already lists channel `desktop`; design doc 11.6 is rewritten to this, 14's
 "not a separate binary" line goes, and the section 7 permission table's Desktop row reads
 "a native confirm dialog with `Decision`'s words".
+
+## What stays in the code
+
+The audit channel `desktop` (`storage::control::Channel::Desktop`, the string `desktop` in
+`audit_log.channel`) is kept on purpose: rows written while the app was tried carry it, and the
+channel enum is the one reader of that column. Nothing writes it any more.
