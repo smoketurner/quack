@@ -788,11 +788,7 @@ async fn chat_settings_check(config: &Config, model: ModelRef<'_>) -> Check {
             &model.to_string(),
             chat,
             "",
-            format!(
-                "set effort to a level it takes, or temperature = false, under \
-                 [providers.{}.models.\"{}\"], [providers.{}], or [analysis]",
-                model.provider_name, model.model, model.provider_name
-            ),
+            EffortCheck::fix("effort", settings.temperature, model),
         )
 }
 
@@ -813,11 +809,7 @@ async fn background_check(config: &Config, model: ModelRef<'_>) -> Option<Check>
         &format!("{model}, background calls"),
         chat,
         "; graph extraction and the ontology's document pass fail, and sessions are not titled",
-        format!(
-            "set background_effort to a level it takes, or temperature = false, under \
-             [providers.{}.models.\"{}\"], [providers.{}], or [analysis]",
-            model.provider_name, model.model, model.provider_name
-        ),
+        EffortCheck::fix("background_effort", settings.temperature, model),
     ))
 }
 
@@ -852,6 +844,21 @@ impl EffortCheck {
             )
             .fix(fix),
         }
+    }
+
+    /// How to fix a refusal of `key`; the temperature is named only where
+    /// the config turns it on.
+    fn fix(key: &str, temperature: Option<bool>, model: ModelRef<'_>) -> String {
+        let or_temperature = if temperature == Some(true) {
+            ", or temperature = false,"
+        } else {
+            ""
+        };
+        format!(
+            "set {key} to a level it takes{or_temperature} under \
+             [providers.{}.models.\"{}\"], [providers.{}], or [analysis]",
+            model.provider_name, model.model, model.provider_name
+        )
     }
 
     async fn run(model: ModelRef<'_>, effort: Option<Effort>, temperature: Option<bool>) -> Self {
