@@ -725,6 +725,25 @@ async fn an_effort_rig_refuses_fails_when_the_model_is_built() {
             "{model} {effort}"
         );
     }
+    let config = parse(&format!(
+        "[general]\nchat_model = \"p/claude-opus-5-5\"\n[providers.p]\n{anthropic}"
+    ));
+    let chat = config
+        .chat_model_ref()
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    let Err(e) = ChatClient::without_credential(chat.provider_name, chat.provider)
+        .await
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .chat_model(chat.model, Some(Effort::High), Some(true))
+        .map(drop)
+    else {
+        fail("claude-opus-5-5 took a temperature")
+    };
+    let message = e.to_string();
+    assert!(
+        message.contains("temperature for claude-opus-5-5"),
+        "{message}"
+    );
 }
 
 #[test]

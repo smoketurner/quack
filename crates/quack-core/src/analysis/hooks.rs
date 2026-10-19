@@ -10,7 +10,7 @@ use rig::agent::{
     InvalidToolCallContext, InvalidToolCallReason, ModelTurnAction, ModelTurnFinished,
 };
 use rig::completion::FinishReason;
-use rig::message::AssistantContent;
+use rig::message;
 
 /// How many times one turn asks the model again after an invalid tool call.
 /// Each retry also counts against `[analysis].max_turns`.
@@ -77,14 +77,7 @@ impl EmptyAnswer {
             turn.finish_reason,
             Some(FinishReason::Length | FinishReason::ContentFilter)
         );
-        !cut_off
-            && turn.content.iter().all(|part| match part {
-                AssistantContent::Text(text) => text.text.trim().is_empty(),
-                AssistantContent::ToolCall(_) | AssistantContent::Image(_) => false,
-                // Reasoning, a provider's own item, or anything rig adds later
-                // alone answers nothing.
-                _ => true,
-            })
+        !cut_off && message::turn_delivered_no_answer(turn.content)
     }
 }
 

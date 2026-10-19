@@ -1997,7 +1997,7 @@ that does not exist is repaired when the name matches a registered tool after tr
 lowercasing; otherwise the model is told which tools exist and asked again, at most twice a
 turn, as it is for arguments that are not JSON. A reply with no text and no tool call is asked
 for once more, unless the output limit or a content filter cut it off. A replayed history that
-rig's `transcript::validate_canonical` refuses is dropped, and the answer says so. Every retry
+rig's `conversation::pairing::validate` refuses is dropped, and the answer says so. Every retry
 counts against `max_turns`.
 
 A turn the model derails anyway (a nonexistent tool past those retries, the `max_turns`
@@ -2255,11 +2255,10 @@ message.
   answers, and a note where a chart is attached). Export is audited because it moves content
   across the boundary.
 - History sent to the model is trimmed to `history_token_budget` (32,000), oldest first. Tool
-  messages are never replayed; only user and assistant text goes back. It loads through rig's
-  conversation memory (`llm::memory::History`): `storage::sessions::SessionMemory` reads the
-  session's turns (quack records each turn itself, so its `append` stores nothing), and
-  `TranscriptWindow` is rig's `TokenWindowMemory` at four characters per token that also
-  drops an answer whose question fell outside. The turns it leaves out are not replayed and
+  messages are never replayed; only user and assistant text goes back. It loads through
+  `llm::memory::History`: `storage::sessions::session_turns` reads the session's turns, and
+  `TranscriptWindow` is rig-memory's `recent::TokenBudget` at four characters per token that
+  also drops an answer whose question fell outside. The turns it leaves out are not replayed and
   nothing summarizes them; a turn's load calls no model. A file from a quack that kept
   summaries has its `_quack_session_summaries` dropped on open.
 - Server mode: sessions carry `created_by`. Members see their own, any marked `shared`, and

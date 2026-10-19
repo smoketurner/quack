@@ -248,6 +248,13 @@ async fn the_chat_model_check_says_what_a_turn_sends() {
             Status::Fail,
             "Ollama has no `xhigh` thinking level",
         ),
+        (
+            "an/claude-opus-5-5",
+            "[providers.an]\ntype = \"anthropic\"\nauth = \"api-key\"\n\
+             api_key_env = \"CARGO_PKG_NAME\"\ntemperature = true\n",
+            Status::Fail,
+            "temperature for claude-opus-5-5",
+        ),
     ] {
         let toml = format!("[general]\nchat_model = \"{chat}\"\n{gateway}{extra}");
         let config = Config::parse(&toml).unwrap();

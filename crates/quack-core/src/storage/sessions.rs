@@ -22,13 +22,10 @@ use crate::graph::GraphResult;
 use crate::ids::{MessageId, SessionId, UserId};
 use crate::storage::control::ResourceKind;
 use crate::text::Tokens;
-use rig::id::ConversationId;
-use rig::memory::{ConversationMemory, MemoryError, MemoryPolicy, TokenWindowMemory};
+use rig::memory::recent::{self, TokenBudget};
 use rig::message::{AssistantContent, Message, UserContent};
-use rig::wasm_compat::WasmBoxedFuture;
 
 use super::workspace::{QueryResults, WorkspaceDb};
-use super::writer::Writer;
 
 /// How the agent may answer in a session.
 #[derive(
@@ -864,52 +861,6 @@ pub fn session_turns(db: &WorkspaceDb, session_id: &SessionId) -> Result<Vec<Mes
     Ok(turns)
 }
 
-/// A session's replayable turns as rig's [`ConversationMemory`], under the
-/// session's id: `load` reads [`session_turns`]. quack records each turn
-/// itself ([`record_turn`]: the checked answer, its tool rows, and its
-/// usage), so `append` and `clear` store nothing, and a turn is in the next
-/// `load` as soon as it is recorded.
-pub struct SessionMemory {
-    db: Arc<Writer>,
-}
-
-impl SessionMemory {
-    #[must_use]
-    pub const fn new(db: Arc<Writer>) -> Self {
-        Self { db }
-    }
-}
-
-impl ConversationMemory for SessionMemory {
-    fn load<'a>(
-        &'a self,
-        conversation_id: &'a ConversationId,
-    ) -> WasmBoxedFuture<'a, std::result::Result<Vec<Message>, MemoryError>> {
-        let session = SessionId::from(conversation_id.as_str());
-        Box::pin(async move {
-            self.db
-                .run(move |db| session_turns(db, &session))
-                .await
-                .map_err(MemoryError::backend)
-        })
-    }
-
-    fn append<'a>(
-        &'a self,
-        _conversation_id: &'a ConversationId,
-        _messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, std::result::Result<(), MemoryError>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn clear<'a>(
-        &'a self,
-        _conversation_id: &'a ConversationId,
-    ) -> WasmBoxedFuture<'a, std::result::Result<(), MemoryError>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
 /// The words a message says: its text parts joined, without tool calls,
 /// tool results, images, or reasoning.
 pub trait SpokenText {
@@ -939,39 +890,38 @@ impl SpokenText for Message {
     }
 }
 
-/// The history window: rig's [`TokenWindowMemory`] over
+/// The history window: rig's [`TokenBudget`] over
 /// `[analysis].history_token_budget`, counting four characters per token
 /// ([`Tokens::estimate`]) so budgets read as before, then the window's
 /// leading answer dropped when its question fell outside: a replayed thread
 /// opens on a question.
-pub struct TranscriptWindow(TokenWindowMemory);
+pub struct TranscriptWindow(TokenBudget<fn(&Message) -> usize>);
 
 impl TranscriptWindow {
     #[must_use]
     pub fn new(budget: Tokens) -> Self {
-        let budget = usize::try_from(budget.get()).unwrap_or(usize::MAX);
-        Self(TokenWindowMemory::new(budget, |message: &Message| {
-            usize::try_from(Tokens::estimate(&message.spoken_text()).get()).unwrap_or(usize::MAX)
-        }))
-    }
-}
-
-impl MemoryPolicy for TranscriptWindow {
-    fn apply(&self, messages: Vec<Message>) -> std::result::Result<Vec<Message>, MemoryError> {
-        Ok(self.apply_with_demoted(messages)?.0)
+        Self(TokenBudget {
+            max_tokens: usize::try_from(budget.get()).unwrap_or(usize::MAX),
+            counter: |message: &Message| {
+                usize::try_from(Tokens::estimate(&message.spoken_text()).get())
+                    .unwrap_or(usize::MAX)
+            },
+        })
     }
 
-    fn apply_with_demoted(
-        &self,
-        messages: Vec<Message>,
-    ) -> std::result::Result<(Vec<Message>, Vec<Message>), MemoryError> {
-        let (mut kept, mut demoted) = self.0.apply_with_demoted(messages)?;
+    /// The newest `messages` within the budget, oldest first.
+    #[must_use]
+    pub fn apply(&self, messages: Vec<Message>) -> Vec<Message> {
+        let messages: Vec<Arc<Message>> = messages.into_iter().map(Arc::new).collect();
+        let kept = recent::view(&messages, &self.0);
         let answers = kept
             .iter()
-            .take_while(|m| matches!(m, Message::Assistant { .. }))
+            .take_while(|m| matches!(***m, Message::Assistant { .. }))
             .count();
-        demoted.extend(kept.drain(..answers));
-        Ok((kept, demoted))
+        kept.iter()
+            .skip(answers)
+            .map(|m| m.as_ref().clone())
+            .collect()
     }
 }
 

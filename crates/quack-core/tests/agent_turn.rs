@@ -850,7 +850,7 @@ async fn a_malformed_history_is_dropped_with_a_warning() {
         model.requests()[0]
             .chat_history
             .iter()
-            .all(|m| !matches!(m, Message::Assistant { .. })),
+            .all(|m| !matches!(**m, Message::Assistant { .. })),
         "the model saw none of the history"
     );
 }

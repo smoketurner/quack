@@ -6,9 +6,7 @@ use crate::storage::workspace::{DocumentStatus, NewDocument};
 /// The history the window keeps of a session's turns under `budget`.
 fn windowed(db: &WorkspaceDb, session: &SessionId, budget: u32) -> Result<Vec<Message>> {
     let turns = session_turns(db, session)?;
-    TranscriptWindow::new(Tokens::new(budget))
-        .apply(turns)
-        .map_err(|e| Error::Analysis(e.to_string()))
+    Ok(TranscriptWindow::new(Tokens::new(budget)).apply(turns))
 }
 
 /// The trim the window replaced: whole turns, newest first, until the

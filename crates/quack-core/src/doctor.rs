@@ -782,16 +782,18 @@ async fn chat_settings_check(config: &Config, model: ModelRef<'_>) -> Check {
         return Check::new(Area::ChatModel, Status::Fail, format!("{model}: {e}"));
     }
     let chat = ChatSettings::new(model.model, wire, settings.effort, settings.temperature);
-    EffortCheck::run(model, settings.effort).await.check(
-        &model.to_string(),
-        chat,
-        "",
-        format!(
-            "set effort to a level it takes under [providers.{}.models.\"{}\"], \
-             [providers.{}], or [analysis]",
-            model.provider_name, model.model, model.provider_name
-        ),
-    )
+    EffortCheck::run(model, settings.effort, settings.temperature)
+        .await
+        .check(
+            &model.to_string(),
+            chat,
+            "",
+            format!(
+                "set effort to a level it takes, or temperature = false, under \
+                 [providers.{}.models.\"{}\"], [providers.{}], or [analysis]",
+                model.provider_name, model.model, model.provider_name
+            ),
+        )
 }
 
 /// What a background call (graph extraction, the ontology's document pass,
@@ -807,22 +809,23 @@ async fn background_check(config: &Config, model: ModelRef<'_>) -> Option<Check>
         settings.background_effort,
         settings.temperature,
     );
-    Some(EffortCheck::run(model, settings.background_effort).await.check(
+    Some(EffortCheck::run(model, settings.background_effort, settings.temperature).await.check(
         &format!("{model}, background calls"),
         chat,
         "; graph extraction and the ontology's document pass fail, and sessions are not titled",
         format!(
-            "set background_effort to a level it takes under [providers.{}.models.\"{}\"], \
-             [providers.{}], or [analysis]",
+            "set background_effort to a level it takes, or temperature = false, under \
+             [providers.{}.models.\"{}\"], [providers.{}], or [analysis]",
             model.provider_name, model.model, model.provider_name
         ),
     ))
 }
 
 /// What building a chat model at an effort says, sending nothing: rig
-/// refuses a level the model does not take on its provider's API.
+/// refuses a level, or a temperature, the model does not take on its
+/// provider's API.
 enum EffortCheck {
-    /// No effort is set, or rig accepts the level for this model.
+    /// Neither is set, or rig accepts them for this model.
     Accepted,
     /// rig refuses the level; every request would fail.
     Refused(Error),
@@ -851,13 +854,13 @@ impl EffortCheck {
         }
     }
 
-    async fn run(model: ModelRef<'_>, effort: Option<Effort>) -> Self {
-        if effort.is_none() {
+    async fn run(model: ModelRef<'_>, effort: Option<Effort>, temperature: Option<bool>) -> Self {
+        if effort.is_none() && temperature != Some(true) {
             return Self::Accepted;
         }
         match ChatClient::without_credential(model.provider_name, model.provider).await {
             Err(e) => Self::Unchecked(e),
-            Ok(client) => match client.chat_model(model.model, effort, None) {
+            Ok(client) => match client.chat_model(model.model, effort, temperature) {
                 Ok(_) => Self::Accepted,
                 Err(e) => Self::Refused(e),
             },

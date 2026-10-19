@@ -133,8 +133,10 @@ field each API takes: `output_config.effort` with adaptive thinking for Claude,
 rig's model catalog says which levels a listed model takes, and a level it lacks is refused
 when the model is built, before any request. `none` turns reasoning off where the model
 allows it. A model the catalog does not list, such as a gateway alias or an open-weight model
-on vLLM, is sent the level as asked, and the server decides whether it accepts it. On Ollama,
-any model is sent `think`; a model that does not think answers with Ollama's own error.
+on vLLM, is sent the level as asked, and the server decides whether it accepts it. The same
+holds on Ollama: a listed model that does not reason, or lacks the level, is refused when it is
+built; an unlisted one is sent `think`, and if it does not think, Ollama answers with its own
+error.
 
 Ollama sizes each model's context window and decides how long it stays loaded. quack sends
 neither, so set them on the Ollama server: `OLLAMA_CONTEXT_LENGTH` (Ollama's own default
@@ -158,7 +160,9 @@ background_effort = "low"                # graph extraction and ontology inducti
 temperature = false                      # use the model's own sampling defaults
 ```
 
-`temperature = true` sends quack's temperature (0.0, for chat turns and extraction alike). If only
+`temperature = true` sends quack's temperature (0.0, for chat turns and extraction alike). A
+model whose catalog entry takes no temperature, such as current Claude models, is refused when it
+is built, and `quack doctor` names the setting. If only
 some of a gateway's models reason, set `effort` on those models rather than in `[analysis]`,
 because a model that does not reason rejects the field. `quack config` lists every key, and
 `quack doctor` shows what the chat model is sent. It checks `background_effort` too when that differs from

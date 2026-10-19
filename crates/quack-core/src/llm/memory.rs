@@ -1,17 +1,16 @@
-//! The history a turn replays: the session's turns ([`SessionMemory`])
-//! under the token window ([`TranscriptWindow`]). The turns the window
-//! leaves out are not replayed; nothing stands in for them.
+//! The history a turn replays: the session's turns
+//! ([`sessions::session_turns`]) under the token window
+//! ([`TranscriptWindow`]). The turns the window leaves out are not replayed;
+//! nothing stands in for them.
 
 use std::sync::Arc;
 
-use rig::id::ConversationId;
-use rig::memory::{ConversationMemory, MemoryPolicy};
 use rig::message::Message;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::ids::SessionId;
-use crate::storage::sessions::{SessionMemory, TranscriptWindow};
+use crate::storage::sessions::{self, TranscriptWindow};
 use crate::storage::writer::Writer;
 use crate::text::Tokens;
 
@@ -38,12 +37,13 @@ impl History {
     ///
     /// Returns an error if the session cannot be read.
     pub async fn load(&self, session: &SessionId) -> Result<Vec<Message>> {
-        let id = ConversationId::from(session.as_str());
-        let memory = SessionMemory::new(Arc::clone(&self.db));
-        let window = TranscriptWindow::new(self.budget);
-        let failed = |e| Error::Analysis(format!("could not load the session history: {e}"));
-        let messages = memory.load(&id).await.map_err(failed)?;
-        window.apply(messages).map_err(failed)
+        let session = session.clone();
+        let messages = self
+            .db
+            .run(move |db| sessions::session_turns(db, &session))
+            .await
+            .map_err(|e| Error::Analysis(format!("could not load the session history: {e}")))?;
+        Ok(TranscriptWindow::new(self.budget).apply(messages))
     }
 }
 
@@ -52,7 +52,7 @@ mod tests {
     use super::*;
     use crate::analysis::agent::AgentResponse;
     use crate::embedding::Dimension;
-    use crate::storage::sessions::{self, ChatMode, SpokenText};
+    use crate::storage::sessions::{ChatMode, SpokenText};
     use crate::storage::workspace::WorkspaceDb;
     use jiff::Timestamp;
 
