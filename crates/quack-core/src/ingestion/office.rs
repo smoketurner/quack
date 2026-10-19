@@ -150,13 +150,22 @@ fn slides(package: &Package, kind: &str) -> Result<Extracted> {
         {
             body.push(Section::body(heading.clone(), h.clone()));
         }
-        if let Some(notes) = slide
-            .speaker_notes
-            .as_deref()
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-        {
-            body.push(Section::note(heading.clone(), notes));
+        if let Some(notes) = &slide.speaker_notes {
+            let mut walker = Walker::default();
+            for element in notes {
+                walker.walk(element);
+            }
+            let mut text = String::new();
+            for section in walker.finish() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&section.text);
+            }
+            let text = text.trim();
+            if !text.is_empty() {
+                body.push(Section::note(heading.clone(), text));
+            }
         }
         for section in body {
             sections.push(section.on_page(Some(number)));

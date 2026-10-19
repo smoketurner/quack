@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::mem;
 use std::sync::{Arc, PoisonError};
 use std::time::Instant;
@@ -477,6 +478,13 @@ where
         .build_agent(completion_model, embedding_model, &read.prompt.text)?;
         let max_turns = usize::try_from(analysis_config.max_turns)
             .map_err(|e| Error::Analysis(format!("max_turns overflow: {e}")))?;
+        let registered: BTreeSet<String> = agent
+            .tool_definitions(None)
+            .await
+            .map_err(|e| Error::Analysis(format!("could not list the agent's tools: {e}")))?
+            .iter()
+            .map(|tool| tool.name.as_str().to_owned())
+            .collect();
 
         let stream = agent
             .prompt(user_message)
@@ -486,8 +494,15 @@ where
             .tool_context(turn.context())
             .stream();
 
-        let streamed =
-            Streamed::read(stream, &cancel, recorder, analysis_config.max_turns, window).await?;
+        let streamed = Streamed::read(
+            stream,
+            &cancel,
+            recorder,
+            &registered,
+            analysis_config.max_turns,
+            window,
+        )
+        .await?;
         let cancelled = streamed.cancelled;
         let ran_a_tool = !turn.recorder.steps().is_empty();
         let (mut answer, usage) = streamed.answer(window, |text| {
@@ -536,7 +551,8 @@ struct Streamed {
 }
 
 impl Streamed {
-    /// Read `stream` until it ends, stops early, or `cancel` fires.
+    /// Read `stream` until it ends, stops early, or `cancel` fires;
+    /// `registered` names the turn's tools.
     ///
     /// # Errors
     ///
@@ -545,6 +561,7 @@ impl Streamed {
         stream: S,
         cancel: &CancellationToken,
         recorder: &TurnRecorder,
+        registered: &BTreeSet<String>,
         max_turns: u32,
         window: Window,
     ) -> Result<Self>
@@ -602,8 +619,14 @@ impl Streamed {
                     this.cutoff = Cutoff::of(call.finish_reason.as_ref());
                     this.output.call_ended(recorder);
                 }
-                MultiTurnStreamItem::ToolCall { .. }
-                | MultiTurnStreamItem::ToolExecutionCommitted { .. } => this.output.call_kept(),
+                // rig also reports a call that invalid-call recovery
+                // answered; its text goes with the rejected call.
+                MultiTurnStreamItem::ToolCall { tool_call } => {
+                    if registered.contains(tool_call.function.name.as_str()) {
+                        this.output.call_kept();
+                    }
+                }
+                MultiTurnStreamItem::ToolExecutionCommitted { .. } => this.output.call_kept(),
                 MultiTurnStreamItem::ModelTurnRetried { .. } => this.output.call_rejected(),
                 _ => {}
             }
@@ -650,7 +673,7 @@ struct Replay {
 
 impl Replay {
     fn check(history: Vec<Message>) -> Self {
-        match rig::transcript::validate_canonical(&history) {
+        match rig::conversation::pairing::validate(&history) {
             Ok(()) => Self {
                 history,
                 dropped: None,
@@ -807,7 +830,7 @@ impl StreamStop<'_> {
             PromptError::UnknownToolCall { .. }
                 | PromptError::MaxTurns { .. }
                 | PromptError::Cancelled { .. }
-                | PromptError::Memory(_)
+                | PromptError::Memory { .. }
         )
     }
 
@@ -834,7 +857,7 @@ impl StreamStop<'_> {
                 format!("The turn was cancelled: {reason}")
             }
             PromptError::Provider(e) => format!("The model call failed part way through: {e}"),
-            PromptError::Memory(e) => format!("The turn failed: {e}"),
+            PromptError::Memory { error, .. } => format!("The turn failed: {error}"),
             PromptError::Report(report) => format!("The turn failed: {report}"),
             other => format!("The turn failed: {other}"),
         }

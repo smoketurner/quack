@@ -24,7 +24,7 @@
 
 use rig::AgentBuilder;
 use rig::DynModel;
-use rig::completion::{CompletionRequest, Message, options};
+use rig::completion::{CheckError, CompletionRequest, Message};
 use rig::driver::Transport;
 use rig::operation::Completion;
 use rig::providers::openai::extension::OpenAiOptions;
@@ -211,32 +211,45 @@ impl ChatModel {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Config`] when rig refuses the effort for the model on
-    /// its API: rig decides from its model catalog which levels the model
-    /// takes, and the setting fails here rather than on the first request.
+    /// Returns [`Error::Config`] when rig refuses the temperature or the
+    /// effort for the model on its API: rig decides from its model catalog
+    /// what the model takes, and the setting fails here rather than on the
+    /// first request.
     pub fn new<W, T>(model: rig::Model<W, T>, id: &str, settings: ChatSettings) -> Result<Self>
     where
         W: rig::wire::Wire<Op = Completion>,
         T: Transport<W>,
     {
-        let replay = model.wire.describe().replay;
-        if let (Some(effort), Some(target)) = (settings.effort, replay) {
-            let mut probe = CompletionRequest::new(Message::user("")).reasoning(effort);
-            options::check(target, &mut probe).map_err(|e| {
-                let why = e
-                    .unsupported_option()
-                    .map_or_else(|| e.to_string(), |refused| refused.reason.clone());
-                Error::Config(format!("effort \"{effort}\" for {id}: {why}"))
-            })?;
+        let model = model.erase();
+        let mut probe = CompletionRequest::new(Message::user(""))
+            .seed(SEED)
+            .max_tokens(settings.max_tokens);
+        if settings.temperature {
+            probe = probe.temperature(0.0);
         }
+        if let Some(effort) = settings.effort {
+            probe = probe.reasoning(effort);
+        }
+        let refused = match model.check(&probe) {
+            Ok(()) => Vec::new(),
+            Err(CheckError::Unsupported(refused)) => refused,
+            Err(e) => return Err(Error::Config(format!("{id}: {e}"))),
+        };
         // A seed goes only where rig says the API takes one (Anthropic's
         // does not); sending it elsewhere would fail every request.
-        let seed = replay.is_some_and(|target| {
-            let mut probe = CompletionRequest::new(Message::user("")).seed(SEED);
-            options::check(target, &mut probe).is_ok()
-        });
+        let seed = !refused.iter().any(|refusal| refusal.option == "seed");
+        if let Some(refusal) = refused.iter().find(|refusal| refusal.option != "seed") {
+            let setting = match settings.effort {
+                Some(effort) if refusal.option == "reasoning" => format!("effort \"{effort}\""),
+                _ => refusal.option.to_string(),
+            };
+            return Err(Error::Config(format!(
+                "{setting} for {id}: {}",
+                refusal.reason
+            )));
+        }
         Ok(Self {
-            model: model.erase(),
+            model,
             settings: ChatSettings { seed, ..settings },
         })
     }

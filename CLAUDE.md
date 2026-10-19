@@ -151,8 +151,8 @@ form go through the same `Access` methods (`list_saved`, `save_answer`, `run_sav
 
 Turns are recorded in `_quack_sessions` / `_quack_messages` inside the workspace DuckDB
 file (`quack_core::storage::sessions`); `-c` / `-r ID` replay history to the model through
-rig's conversation memory (`llm::memory::History`: `SessionMemory` under `TranscriptWindow`,
-rig's token window over `[analysis].history_token_budget`); the turns it leaves out are not
+`llm::memory::History` (the session's turns under `TranscriptWindow`, rig-memory's
+`recent::TokenBudget` over `[analysis].history_token_budget`); the turns it leaves out are not
 replayed, and loading the history calls no model. Retrieval is hybrid (exact cosine scan plus quack's own
 BM25 over `_quack_terms`, each document's chunks stemmed under the language
 `WorkspaceDb::chunk_writer` detects once for it, reciprocal rank fusion in `WorkspaceDb::explain_search`, whose vector leg runs on a reader clone beside the keyword leg;
