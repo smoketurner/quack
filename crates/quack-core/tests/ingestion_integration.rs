@@ -3379,7 +3379,11 @@ async fn word_and_powerpoint_97_files_are_read() {
         .unwrap();
     let slide = deck.first().unwrap();
     assert_eq!(slide.page, Some(1), "{slide:?}");
-    assert!(slide.content.contains("Q3 Board Update"), "{slide:?}");
+    assert_eq!(
+        slide.heading.as_deref(),
+        Some("Harbor Roasters Q3 Board Update"),
+        "{slide:?}"
+    );
 }
 
 /// Without a vision model, a PDF of scanned pages alone is refused with

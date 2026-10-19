@@ -40,7 +40,7 @@ publish      = false
 [workspace.dependencies]
 anyhow               = { version = "=1.0.104", default-features = false }
 apple-native-keyring-store = { version = "=1.0.2", default-features = false }
-arboard              = { version = "=3.6.1", default-features = false }
+arboard              = { version = "=3.7.0", default-features = false }
 argon2               = { version = "=0.6.0", default-features = false }
 askama               = { version = "=0.16.1", default-features = false }
 aws-config           = { version = "=1.12.0", default-features = false } # Bedrock credentials: the SDK's default chain
@@ -58,12 +58,12 @@ axum-extra           = { version = "=0.12.6", default-features = false }
 axum-server          = { version = "=0.8.0", default-features = false }
 base64               = { version = "=0.23.1", default-features = false }
 bytes                = { version = "=1.12.1", default-features = false }
-calamine             = { version = "=0.36.1", default-features = false }
+calamine             = { version = "=0.37.0", default-features = false }
 csv                  = { version = "=1.4.0", default-features = false }
 clap                 = { version = "=4.6.7", default-features = false }
 crossterm            = { version = "=0.29.0", default-features = false }
 dirs                 = { version = "=7.0.0", default-features = false }
-duckdb               = { version = "=1.10506.0", default-features = false }
+duckdb               = { version = "=1.10506.1", default-features = false }
 ego-tree             = { version = "=0.11.0", default-features = false } # scraper's DOM tree
 file-format          = { version = "=0.29.0", default-features = false } # a file's type from its bytes
 fluent-bundle        = { version = "=0.16.0", default-features = false }
@@ -86,7 +86,7 @@ metrics-exporter-prometheus = { version = "=0.18.3", default-features = false } 
 mimalloc             = { version = "=0.1.52", default-features = false }
 mime_guess           = { version = "=2.0.5", default-features = false }
 oauth2               = { version = "=5.0.0", default-features = false }
-office_oxide         = { version = "=0.1.11", default-features = false } # pdf_oxide 0.3.78 does not build against 0.1.12 or 0.1.13; not used directly
+office_oxide         = { version = "=0.1.15", default-features = false } # pdf_oxide's, pinned for one zip and quick-xml; not used directly
 pdf_oxide            = { version = "=0.3.78", default-features = false }
 proptest             = { version = "=1.12.0", default-features = false }
 pulldown-cmark       = { version = "=0.13.4", default-features = false }
@@ -117,7 +117,7 @@ tar                  = { version = "=0.4.46", default-features = false } # OKF b
 tempfile             = { version = "=3.27.0", default-features = false }
 thiserror            = { version = "=2.0.21", default-features = false }
 tiktoken             = { version = "=4.1.2", default-features = false }
-tokio                = { version = "=1.53.3", default-features = false }
+tokio                = { version = "=1.54.0", default-features = false }
 tokio-rustls         = { version = "=0.26.6", default-features = false }
 tokio-util           = { version = "=0.7.20", default-features = false }
 toml                 = { version = "=1.1.8", default-features = false }
@@ -135,7 +135,7 @@ webpki-roots         = { version = "=1.0.9", default-features = false }
 whatlang             = { version = "=0.18.0", default-features = false } # per-document language detection for the keyword index
 windows-native-keyring-store = { version = "=1.1.0", default-features = false }
 serde-saphyr         = { version = "=2.0.0", default-features = false } # YAML records loaded as tables; its default budget bounds alias expansion
-zip                  = { version = "=8.6.0", default-features = false } # calamine's version, to keep one copy
+zip                  = { version = "=9.0.5", default-features = false } # calamine's version, to keep one copy
 
 # ---------------------------------------------------------------------------
 # Lints — applied to every member crate via `[lints] workspace = true`.
