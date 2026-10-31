@@ -69,13 +69,13 @@ jobs:
           rustup toolchain list | awk '{print $1}' | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
       - name: Setup Rust cache
         # Restores the debug cache main's CI saves; this job never writes one.
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1"
           shared-key: "debug-${{ runner.os }}"
           save-if: false
       - name: Install and start Ollama
-        uses: ai-action/setup-ollama@6782d243db5fbcbf7583532ce0b5122f64242689 # v2.1.5
+        uses: ai-action/setup-ollama@4bf548198040c1344478ef71f5233d2249695539 # v2.1.13
         env:
           # The server the action starts inherits this: the agent's prompt
           # (tables, documents, and tool guidance) runs past Ollama's default

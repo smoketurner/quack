@@ -205,7 +205,7 @@ jobs:
 
       - name: Build the reproducible static binary
         if: matrix.platform == 'linux'
-        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
         with:
           source: .
           targets: ci
@@ -307,7 +307,7 @@ jobs:
         # Azure Trusted Signing over GitHub OIDC; the signing tool is an x86_64
         # executable, which the arm64 runner runs under emulation.
         if: matrix.platform == 'windows' && steps.signing.outputs.windows_sign == 'true'
-        uses: skeeto/aas-sign@0008af00d4dd2ff2e482ba5ede70831d78f9da59 # v1.1.0
+        uses: skeeto/aas-sign@058700fb89886acfce8d1cc511d69a11eb8f9862 # v1.1.1
         with:
           version: v1.1.0
           endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
@@ -580,7 +580,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         if: inputs.push-image
         with:
           registry: ghcr.io
@@ -677,7 +677,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
