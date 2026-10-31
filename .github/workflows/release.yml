@@ -78,7 +78,7 @@ jobs:
       # recompiled DuckDB's C++ amalgamation twice (once for clippy, once for
       # the tests) on every release. `save-if: false` is the restore-only knob.
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.2 # zizmor: ignore[cache-poisoning]
         with:
           prefix-key: "v1"
           # Matches ci.yml's `test` job, so this restores what CI already built —
