@@ -50,7 +50,7 @@ aws-sdk-bedrockruntime = { version = "=1.148.0", default-features = false } # ri
 aws-sigv4            = { version = "=1.6.0", default-features = false } # signs Bedrock's OpenAI-compatible requests
 aws-smithy-http-client = { version = "=1.5.0", default-features = false } # the SDK's HTTPS client, wrapped by the request limit
 aws-smithy-runtime-api = { version = "=1.19.0", default-features = false }
-aws-smithy-types     = { version = "=1.8.1", default-features = false }
+aws-smithy-types     = { version = "=1.9.0", default-features = false }
 aws-types            = { version = "=1.6.0", default-features = false } # Bedrock endpoint-URL override resolution (AWS_ENDPOINT_URL)
 axum                 = { version = "=0.8.9", default-features = false }
 criterion            = { version = "=0.8.2", default-features = false }
@@ -63,8 +63,8 @@ csv                  = { version = "=1.4.0", default-features = false }
 clap                 = { version = "=4.6.7", default-features = false }
 crossterm            = { version = "=0.29.0", default-features = false }
 dirs                 = { version = "=7.0.0", default-features = false }
-duckdb               = { version = "=1.10506.1", default-features = false }
-ego-tree             = { version = "=0.11.0", default-features = false } # scraper's DOM tree
+duckdb               = { version = "=1.20000.0", default-features = false }
+ego-tree             = { version = "=0.11.1", default-features = false } # scraper's DOM tree
 file-format          = { version = "=0.29.0", default-features = false } # a file's type from its bytes
 fluent-bundle        = { version = "=0.16.0", default-features = false }
 futures              = { version = "=0.3.34", default-features = false }
@@ -80,7 +80,7 @@ jiff                 = { version = "=0.2.38", default-features = false } # date/
 jsonwebtoken         = { version = "=11.1.0", default-features = false } # JWT verification of identity-provider access tokens; aws_lc_rs backend only
 keyring-core         = { version = "=1.0.1", default-features = false }
 linux-keyutils-keyring-store = { version = "=1.0.0", default-features = false }
-mail-parser          = { version = "=0.11.9", default-features = false } # .eml and .mbox ingestion
+mail-parser          = { version = "=1.0.0", default-features = false } # .eml and .mbox ingestion
 metrics              = { version = "=0.24.6", default-features = false } # the metrics facade quack_core::telemetry records through
 metrics-exporter-prometheus = { version = "=0.18.3", default-features = false } # renders them for GET /metrics; no listener of its own
 mimalloc             = { version = "=0.1.52", default-features = false }
@@ -89,20 +89,20 @@ oauth2               = { version = "=5.0.0", default-features = false }
 office_oxide         = { version = "=0.1.15", default-features = false } # pdf_oxide's, pinned for one zip and quick-xml; not used directly
 pdf_oxide            = { version = "=0.3.78", default-features = false }
 proptest             = { version = "=1.12.0", default-features = false }
-pulldown-cmark       = { version = "=0.13.4", default-features = false }
+pulldown-cmark       = { version = "=0.13.5", default-features = false }
 quick-xml            = { version = "=0.42.0", default-features = false } # calamine's version, to keep one copy
 ratatui              = { version = "=0.30.2", default-features = false }
 ratatui-textarea     = { version = "=0.9.3", default-features = false }
 rclip-rtf            = { version = "=0.1.0", default-features = false }
 reqwest              = { version = "=0.13.5", default-features = false }
 rig                  = { version = "=0.45.0", default-features = false }
-rmcp                 = { version = "=3.5.1", default-features = false } # MCP server (stdio and streamable HTTP)
+rmcp                 = { version = "=3.7.0", default-features = false } # MCP server (stdio and streamable HTTP)
 rust-embed           = { version = "=8.13.0", default-features = false }
 rust-stemmers        = { version = "=1.2.0", default-features = false } # Snowball stemmers for the keyword index
 rustix               = { version = "=1.1.5", default-features = false } # safe getuid for the forwarding socket's ownership checks
 rustls               = { version = "=0.23.46", default-features = false }
 schemars             = { version = "=1.2.3", default-features = false }
-scraper              = { version = "=0.27.0", default-features = false }
+scraper              = { version = "=0.29.0", default-features = false }
 sea-query            = { version = "=1.0.2", default-features = false }
 secrecy              = { version = "=0.10.3", default-features = false }
 serde                = { version = "=1.0.229", default-features = false }
@@ -117,7 +117,7 @@ tar                  = { version = "=0.4.46", default-features = false } # OKF b
 tempfile             = { version = "=3.27.0", default-features = false }
 thiserror            = { version = "=2.0.21", default-features = false }
 tiktoken             = { version = "=4.1.2", default-features = false }
-tokio                = { version = "=1.54.0", default-features = false }
+tokio                = { version = "=1.54.1", default-features = false }
 tokio-rustls         = { version = "=0.26.6", default-features = false }
 tokio-util           = { version = "=0.7.20", default-features = false }
 toml                 = { version = "=1.1.8", default-features = false }
@@ -130,12 +130,12 @@ tracing-subscriber   = { version = "=0.3.23", default-features = false }
 unic-langid          = { version = "=0.9.6", default-features = false }
 unicode-properties   = { version = "=0.1.4", default-features = false }
 utoipa               = { version = "=6.0.0", default-features = false } # the REST API's OpenAPI document
-uuid                 = { version = "=1.28.0", default-features = false } # IDs — enable "v7"; use Uuid::now_v7()
+uuid                 = { version = "=1.29.0", default-features = false } # IDs — enable "v7"; use Uuid::now_v7()
 webpki-roots         = { version = "=1.0.9", default-features = false }
 whatlang             = { version = "=0.18.0", default-features = false } # per-document language detection for the keyword index
 windows-native-keyring-store = { version = "=1.1.0", default-features = false }
 serde-saphyr         = { version = "=2.0.0", default-features = false } # YAML records loaded as tables; its default budget bounds alias expansion
-zip                  = { version = "=9.0.5", default-features = false } # calamine's version, to keep one copy
+zip                  = { version = "=9.1.0", default-features = false } # calamine's version, to keep one copy
 
 # ---------------------------------------------------------------------------
 # Lints — applied to every member crate via `[lints] workspace = true`.
