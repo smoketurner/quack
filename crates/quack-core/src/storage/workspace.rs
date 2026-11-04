@@ -6012,6 +6012,10 @@ pub enum TypedSql {
     /// workspace file's path or the server's settings, which tell a remote
     /// user where `control.db` and every workspace live on the host.
     ServerCatalog,
+    /// `CREATE TRIGGER`: a trigger stays in the workspace file and fires
+    /// later on quack's own writes (a table-replacing ingest, a retype),
+    /// running whatever statement its author left there.
+    Trigger,
 }
 
 impl TypedSql {
@@ -6028,34 +6032,52 @@ impl TypedSql {
     ];
 
     /// Why `sql` is refused, if it is: the first word of any statement in
-    /// it is transaction control, or any word in it names the server's
-    /// catalog. A statement the tokenizer cannot read is left to the
-    /// parser, which refuses it as a syntax error.
+    /// it is transaction control, a statement creates a trigger, or any
+    /// word in it names the server's catalog. A statement the tokenizer
+    /// cannot read is left to the parser, which refuses it as a syntax
+    /// error.
     #[must_use]
     pub fn refusal(sql: &str) -> Option<Self> {
         let tokens = Tokenizer::new(&DuckDbDialect {}, sql).tokenize().ok()?;
-        let mut statement_start = true;
+        // The words a statement starts with, as far as
+        // `CREATE OR REPLACE TEMPORARY TRIGGER`; anything but a word ends them.
+        let mut leading: Vec<&str> = Vec::new();
+        let mut collecting = true;
         for token in &tokens {
             match token {
                 Token::Whitespace(_) => {}
-                Token::SemiColon => statement_start = true,
+                Token::SemiColon => {
+                    leading.clear();
+                    collecting = true;
+                }
                 Token::Word(word) => {
-                    if statement_start
+                    let value = word.value.as_str();
+                    if collecting
+                        && leading.is_empty()
                         && Self::TRANSACTION_CONTROL
                             .iter()
-                            .any(|k| k.eq_ignore_ascii_case(&word.value))
+                            .any(|k| k.eq_ignore_ascii_case(value))
                     {
                         return Some(Self::TransactionControl);
                     }
                     if Self::SERVER_CATALOG
                         .iter()
-                        .any(|f| f.eq_ignore_ascii_case(&word.value))
+                        .any(|f| f.eq_ignore_ascii_case(value))
                     {
                         return Some(Self::ServerCatalog);
                     }
-                    statement_start = false;
+                    if collecting && leading.len() < 5 {
+                        leading.push(value);
+                        if value.eq_ignore_ascii_case("TRIGGER")
+                            && leading
+                                .first()
+                                .is_some_and(|w| w.eq_ignore_ascii_case("CREATE"))
+                        {
+                            return Some(Self::Trigger);
+                        }
+                    }
                 }
-                _ => statement_start = false,
+                _ => collecting = false,
             }
         }
         None
@@ -6072,6 +6094,10 @@ impl fmt::Display for TypedSql {
             Self::ServerCatalog => {
                 "the server's catalog (database_list, duckdb_databases, duckdb_settings, \
                  current_setting, duckdb_extensions) is not accessible"
+            }
+            Self::Trigger => {
+                "CREATE TRIGGER is not accepted: a trigger would run later, on quack's \
+                 own writes to the table"
             }
         })
     }
