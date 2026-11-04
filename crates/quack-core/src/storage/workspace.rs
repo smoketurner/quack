@@ -2908,10 +2908,10 @@ impl WorkspaceDb {
              OR NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = drop_node_id);",
         )?;
         tracing::info!(
-            document_id = %document_id,
+            document_id = ?document_id,
             orphan_nodes,
             orphan_edges,
-            "removed graph rows that only the deleted document supported"
+            "removed graph rows that only what was removed supported"
         );
         Ok(())
     }
