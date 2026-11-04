@@ -117,7 +117,8 @@ fn docs_hide_replaced_documents_unless_asked() {
     )
     .unwrap();
     db.begin_replacement(&old, &new).unwrap();
-    assert_eq!(db.finish_replacement(&new).unwrap(), Some(old));
+    let replaced = db.complete_document(&new, 0, None, &[]).unwrap();
+    assert_eq!(replaced.map(|r| r.old), Some(old));
     let mut out = Vec::new();
     list_documents(&db, TextOrJson::Text, Shown::Live, &mut out).unwrap();
     let live = String::from_utf8(out).unwrap();
