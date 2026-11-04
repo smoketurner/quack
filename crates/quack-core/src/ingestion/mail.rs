@@ -6,7 +6,7 @@
 use std::io::BufReader;
 
 use mail_parser::mailbox::mbox::MessageIterator;
-use mail_parser::{Address, Message, MessageParser};
+use mail_parser::{AddressList, Message, MessageParser, PartKind};
 
 use super::html;
 use super::parser::{DocumentMeta, Extracted, Flow, Section};
@@ -83,9 +83,9 @@ impl Mail<'_, '_> {
     fn section(&self) -> (Option<Section>, DocumentMeta) {
         let message = self.0;
         let mut meta = DocumentMeta::default();
-        let from = message.from().map(Self::addresses);
-        let to = message.to().map(Self::addresses);
-        let date = message.date().map(mail_parser::DateTime::to_rfc3339);
+        let from = message.from().map(|list| Self::addresses(&list));
+        let to = message.to().map(|list| Self::addresses(&list));
+        let date = message.date().map(|date| date.to_rfc3339());
         DocumentMeta::set(&mut meta.author, from.as_deref());
         DocumentMeta::set(&mut meta.authored_at, date.as_deref());
         meta.extra("to", to.as_deref());
@@ -113,17 +113,22 @@ impl Mail<'_, '_> {
         (Some(Section::body(heading, text)), meta)
     }
 
-    /// Every text part, else every HTML part as its text.
+    /// Every plain-text part of the text body, else every HTML part as
+    /// its text, read by quack's own HTML parser.
     fn body_text(&self) -> String {
         let message = self.0;
-        let mut parts: Vec<String> = (0..message.text_body_count())
-            .filter_map(|i| message.body_text(i))
+        let mut parts: Vec<String> = message
+            .text_body()
+            .filter(|part| matches!(part.kind(), PartKind::Text))
+            .filter_map(|part| part.text())
             .map(|t| t.trim().to_owned())
             .filter(|t| !t.is_empty())
             .collect();
         if parts.is_empty() {
-            parts = (0..message.html_body_count())
-                .filter_map(|i| message.body_html(i))
+            parts = message
+                .html_body()
+                .filter(|part| matches!(part.kind(), PartKind::Html))
+                .filter_map(|part| part.text())
                 .filter_map(|h| html::html(&h).ok())
                 .map(|extracted| {
                     extracted
@@ -140,11 +145,8 @@ impl Mail<'_, '_> {
     }
 
     /// `Name <address>, ...` for a header's addresses.
-    fn addresses(address: &Address<'_>) -> String {
-        address
-            .clone()
-            .into_list()
-            .iter()
+    fn addresses(list: &AddressList<'_>) -> String {
+        list.mailboxes()
             .map(|a| match (a.name(), a.address()) {
                 (Some(name), Some(addr)) => format!("{name} <{addr}>"),
                 (Some(name), None) => name.to_owned(),
