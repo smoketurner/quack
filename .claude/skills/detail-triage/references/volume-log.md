@@ -24,6 +24,7 @@ judgement columns come from the batch's record in `.local/`.
 | 2026-09-30 | 1 | 1 | 0 | 0 | 1 | not recorded | #315 merged | not recorded | 0 |
 | 2026-10-03 | 5 | 4 | 0 | 0 | 5 | 1 of 4 (#351 amended) | #349, #350, #352 ready as written; #351 amended with the workbook arm; #345 had no PR, fixed on `fix/345-permission-answer-undelivered` | none (first record) | 2 described, 0 requested (no CLI) |
 | 2026-10-05 | 6 | 5 | 0 | 1 | 6 | 3 of 5 (#371 and #372 superseded, #373 rebuilt) | #369, #370 merged as written; #373 rebuilt as #377 after its test stopped compiling on `main`; #371 superseded by #374; #372 superseded by #376; #363 had no PR and was fixed as a class in #375 | none | 1 described, 0 requested |
+| 2026-11-04 | 5 | 1 | 0 | 0 | 0 | 1 of 1 (#623 to be superseded) | pending: #620 already fixed on `main`; #619 and #621 one class fix; #618 class fix; #622 instance | none matched | 2 described, 0 requested (no CLI) |
 
 These three batches predate this skill and have no `.local/` record, so their
 judgement columns are reconstructed from GitHub, not from a review.
@@ -157,3 +158,33 @@ No rule was requested. The description for the `background_effort` class is
 in `.local/detail-triage-2026-10-05.md`. Residue: the reranker's degraded
 path in `dispatch` has no whole-turn test; a rejected call's text still
 streams as live deltas before rig rejects it.
+
+
+## 2026-11-04
+
+52 issues, 2026-09-25 through 2026-11-04; the batch's 5 are open at triage.
+
+| month | n | no attr | median age | p90 age | <30d | >90d |
+|-------|---|---------|-----------|---------|------|------|
+| 2026-11 | 5 | 0 | 29 | 30 | 4 | 0 |
+
+**Reading:** backlog. All five are in code merged on Oct 5–6 (#434, #435,
+and #438 three times), and PR≤3d is 0 of 5. There was no Detail batch for a
+month, and this pass reached back to those merges.
+
+### Classes
+
+- A turn error that emits no `Failed` event (#618): four sites in `dispatch`
+  and `Analysis::run`, so the event-only REST and web consumers misreport a
+  provider refusal. Joins "fail-open / misreported outcome".
+- The document replacement handoff from #438 (#619, #621): the transitions run
+  as separate autocommits with no restart recovery. A third member surfaced:
+  a crash between Ready and `finish_replacement` leaves two live documents.
+- #620 was already fixed on `main`; #622 is isolated.
+
+### Decided
+
+Pending go-ahead; see `.local/detail-triage-2026-11-04.md`. #623 (Detail's
+fix for #619) duplicates two existing helpers and is not transactional, so it
+is to be superseded by the class fix.
+
