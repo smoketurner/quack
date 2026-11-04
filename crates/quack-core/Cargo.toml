@@ -55,7 +55,7 @@ scraper       = { workspace = true }
 sea-query     = { workspace = true, features = ["backend-sqlite", "derive"] }
 secrecy       = { workspace = true }
 serde         = { workspace = true, features = ["derive", "std"] }
-serde_json    = { workspace = true, features = ["std"] }
+serde_json    = { workspace = true, features = ["std", "preserve_order", "float_roundtrip"] } # rig 0.45 enabled both and rig 0.46 no longer does: tool schemas, stored JSON, and exports keep their key order
 sqlparser     = { workspace = true, features = ["std"] }
 sqlx          = { workspace = true, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 strsim        = { workspace = true }
