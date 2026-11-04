@@ -2256,7 +2256,7 @@ impl WorkspaceDb {
     }
 
     /// Mark `old` as being replaced by `new`: `old` keeps serving until
-    /// `new` is ready ([`Self::finish_replacement`]), and a failure of
+    /// `new` is ready ([`Self::complete_document`]), and a failure of
     /// `new` undoes the mark ([`Self::mark_document_error`]).
     ///
     /// # Errors

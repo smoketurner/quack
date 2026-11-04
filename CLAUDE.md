@@ -548,9 +548,11 @@ ingest`, a folder, the terminal, and the server's spooled uploads pass it; `Docu
 title and uploader, its `RunControl`, and `replaces`, the ready document this file takes
 the place of: `quack ingest --replace [ID]`, `POST .../documents?replace={doc}`, the
 Documents row's Replace control). The old document keeps serving, marked `superseded_by`,
-until the new one is `ready`; then it becomes `DocumentStatus::Superseded` and its pin moves
-over (`WorkspaceDb::finish_replacement`); a failure clears the mark (`mark_document_error`).
-A table file loads over its predecessor's table. A superseded document leaves search, the
+until the new one is `ready`; then it becomes `DocumentStatus::Superseded`, its pin moves
+over, and its tables the new one did not load over are dropped (`WorkspaceDb::complete_document`);
+a failure clears the mark (`WorkspaceDb::fail_document`). Each step is one transaction
+(`insert_document_replacing` marks and registers together), and `fail_stale_uploads` finishes or
+abandons any replacement a crash interrupted. A table file loads over its predecessor's table. A superseded document leaves search, the
 prompt, `list_documents`, and `read_document`, but keeps its chunks so stored citations still
 open. Every listing is one page of `WorkspaceDb::documents` (`DocumentListing`: `Shown::Live` or
 `Shown::All` for `quack docs --all` and the page's `?all=true`, a `DocumentFilter`, and `after`,
