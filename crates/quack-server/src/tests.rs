@@ -8671,6 +8671,82 @@ async fn an_unanswered_write_expires() {
     assert!(details.contains("DROP TABLE t"), "{details}");
 }
 
+/// A workspace restricted to one provider, on a server whose chat model is
+/// on another and that embeds nothing: the refusal comes only when the turn
+/// builds its chat client, and is still a 403 with a denied row, and as a
+/// stream an `error` event naming it and a denied row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_on_a_disallowed_chat_provider_is_denied() {
+    let config = Config::parse(
+        "[general]\nchat_model = \"hosted/chat\"\n\
+         [providers.local]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n\
+         [providers.hosted]\ntype = \"ollama\"\nbase_url = \"http://127.0.0.1:9\"\n",
+    )
+    .unwrap_or_else(|e| fail(&e.to_string()));
+    let h = harness_with(ServeMode::Login, config).await;
+    let owner = h.user("owner", UserKind::Standard).await;
+    let ws = h.workspace("kept", &owner).await;
+    let token = h.login("owner").await;
+    let base = format!("/api/v1/workspaces/{ws}");
+    let (status, body) = h
+        .call(
+            Method::PATCH,
+            &base,
+            Some(&token),
+            Some(serde_json::json!({ "allowed_providers": ["local"] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let refusal = "provider 'hosted' is not allowed in this workspace, which allows only: local";
+    let rows = async |outcome: Outcome| {
+        h.audit(AuditFilter {
+            workspace_id: Some(ws.clone()),
+            action: Some(String::from("query")),
+            ..AuditFilter::default()
+        })
+        .await
+        .iter()
+        .filter(|r| r.entry.outcome == outcome)
+        .count()
+    };
+
+    let (status, body) = h
+        .post(
+            &format!("{base}/query"),
+            &token,
+            serde_json::json!({ "prompt": "what is excluded?" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], refusal);
+    assert_eq!(rows(Outcome::Denied).await, 1, "one denied query row");
+
+    let (status, events) = h
+        .post(
+            &format!("{base}/query/stream"),
+            &token,
+            serde_json::json!({ "prompt": "what is excluded?" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{events}");
+    let events = events.as_str().unwrap_or_default();
+    assert!(
+        events.contains("event: error") && events.contains(refusal),
+        "{events}"
+    );
+    assert_eq!(events.matches("event: error").count(), 1, "{events}");
+    assert_eq!(
+        rows(Outcome::Denied).await,
+        2,
+        "the stream's row is denied too"
+    );
+    assert_eq!(
+        rows(Outcome::Error).await,
+        0,
+        "no turn was recorded as an error"
+    );
+}
+
 /// A workspace restricted to one provider, on a server whose embedding
 /// model is on another: every path that would embed is refused before
 /// anything is sent, and each refusal is a denied audit row for its action.
