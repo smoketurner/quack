@@ -2291,26 +2291,50 @@ impl WorkspaceDb {
     }
 
     /// `new` is ready: the document it replaces becomes `superseded` and
-    /// `new` takes over its pin. Returns the replaced document's id, if
-    /// there was one.
+    /// `new` takes over its pin. The predecessor's tables that the successor
+    /// did not take over (e.g. a workbook whose sheets were renamed between
+    /// versions) are dropped, along with their per-sheet CSVs and graph
+    /// provenance, so they do not orphan. Returns the replaced document's
+    /// id, if there was one.
     ///
     /// # Errors
     ///
     /// Returns an error if an update fails.
     pub fn finish_replacement(&self, new: &DocumentId) -> Result<Option<DocumentId>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, pinned FROM _quack_documents WHERE superseded_by = ?")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, pinned, CAST(tables AS VARCHAR) FROM _quack_documents WHERE superseded_by = ?",
+        )?;
         let mut rows = stmt.query(duckdb::params![new])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
         let (old, pinned): (DocumentId, bool) = (row.get(0)?, row.get(1)?);
+        let old_tables_json: Option<String> = row.get(2)?;
         drop(rows);
         self.conn.execute(
             "UPDATE _quack_documents SET status = ? WHERE id = ?",
             duckdb::params![DocumentStatus::Superseded, old],
         )?;
+        let new_tables = self
+            .document(new)?
+            .and_then(|doc| doc.tables)
+            .unwrap_or_default();
+        let old_tables: Vec<String> = old_tables_json
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        let dropped: Vec<String> = old_tables
+            .iter()
+            .filter(|t| !new_tables.contains(t))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            self.forget_table_provenance(&dropped)?;
+            for table in &dropped {
+                self.conn
+                    .execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)))?;
+            }
+            self.remove_table_csvs(&dropped);
+        }
         if pinned {
             self.conn.execute(
                 "UPDATE _quack_documents SET pinned = true WHERE id = ?",
@@ -2780,6 +2804,60 @@ impl WorkspaceDb {
         Ok(())
     }
 
+    /// Drop the provenance `tables` gave the graph (by table name), then
+    /// the nodes and edges left without any provenance at all. Unlike
+    /// [`Self::forget_graph_provenance`], this does not clear provenance by
+    /// document id, so a replaced document's own chunk provenance stays.
+    fn forget_table_provenance(&self, tables: &[String]) -> Result<()> {
+        if tables.is_empty() {
+            return Ok(());
+        }
+        let table_list = sql_text_list(tables);
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT subject_id FROM _quack_provenance \
+             WHERE list_contains(?::VARCHAR[], table_name)",
+        )?;
+        let touched = stmt
+            .query_map(duckdb::params![table_list], |row| row.get::<_, String>(0))?
+            .collect::<duckdb::Result<Vec<_>>>()?;
+        drop(stmt);
+        if touched.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "DELETE FROM _quack_provenance \
+             WHERE list_contains(?::VARCHAR[], table_name)",
+            duckdb::params![table_list],
+        )?;
+        let touched_list = sql_text_list(&touched);
+        let orphan_nodes = self.conn.execute(
+            "DELETE FROM _quack_graph_nodes WHERE list_contains(?::VARCHAR[], id) \
+             AND NOT EXISTS (SELECT 1 FROM _quack_provenance p WHERE p.subject_id = _quack_graph_nodes.id)",
+            duckdb::params![touched_list],
+        )?;
+        let orphan_edges = self.conn.execute(
+            "DELETE FROM _quack_graph_edges WHERE (list_contains(?::VARCHAR[], id) \
+             AND NOT EXISTS (SELECT 1 FROM _quack_provenance p WHERE p.subject_id = _quack_graph_edges.id)) \
+             OR NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = source_node_id) \
+             OR NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = target_node_id)",
+            duckdb::params![touched_list],
+        )?;
+        self.conn.execute_batch(
+            "DELETE FROM _quack_provenance WHERE NOT EXISTS \
+               (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = subject_id) \
+             AND NOT EXISTS (SELECT 1 FROM _quack_graph_edges e WHERE e.id = subject_id); \
+             DELETE FROM _quack_graph_merges WHERE NOT EXISTS \
+               (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = keep_node_id) \
+             OR NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = drop_node_id);",
+        )?;
+        tracing::info!(
+            orphan_nodes,
+            orphan_edges,
+            "removed graph rows that only the dropped tables supported"
+        );
+        Ok(())
+    }
+
     /// The image `document` keeps in the workspace's `files/`, when it is
     /// an image and the connection knows the workspace's directory.
     #[must_use]
@@ -2810,6 +2888,26 @@ impl WorkspaceDb {
             candidates.push(files_dir.join(format!("{table}.csv")));
         }
         for path in candidates {
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::debug!(path = %path.display(), "removed an ingested file"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "could not remove an ingested file");
+                }
+            }
+        }
+    }
+
+    /// Remove the per-table CSV files under `files/` for `tables`, without
+    /// touching the document's own file (which a replacement may still own
+    /// under the same name). A missing file is fine; any other failure is
+    /// logged.
+    fn remove_table_csvs(&self, tables: &[String]) {
+        let Some(files_dir) = &self.files_dir else {
+            return;
+        };
+        for table in tables {
+            let path = files_dir.join(format!("{table}.csv"));
             match std::fs::remove_file(&path) {
                 Ok(()) => tracing::debug!(path = %path.display(), "removed an ingested file"),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
