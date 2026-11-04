@@ -234,6 +234,7 @@ async fn refresh_pin(
                 .db
                 .run(move |db| saved::repin(db, &id, &session, Answer::Last))
                 .await
+                .map_err(Into::into)
         }
         Err(e) => Err(e),
     };
