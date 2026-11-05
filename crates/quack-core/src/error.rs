@@ -172,6 +172,11 @@ pub enum Error {
     )]
     WorkspaceSchemaUnreadable { path: PathBuf, recorded: String },
 
+    /// Rewriting a workspace file in the newest storage format failed; the
+    /// file is as it was before the upgrade began.
+    #[error("could not upgrade workspace file {} to the newest storage format: {reason}; it was left as it was", path.display())]
+    StorageUpgrade { path: PathBuf, reason: String },
+
     /// The workspace's writer thread is gone, so no write can run.
     #[error("the workspace writer has stopped")]
     WriterStopped,

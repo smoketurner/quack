@@ -2139,76 +2139,104 @@ fn opening_a_workspace_records_its_writer() {
     );
 }
 
-/// `DuckDB` 2.0 creates files in its newest format by default, which no
-/// earlier `DuckDB` reads. quack names `v0.10.2`, and 2.0 honors it: a new
-/// workspace file gets the format a `DuckDB` before 2.0 reads (so a quack
-/// built on one can still open it), not the default's, and a file created
-/// in another format keeps it through an open that writes.
+/// A new workspace file is created in the newest storage format, the one
+/// a plain `DuckDB` open gives a file, and [`NEWEST_STORAGE_FORMAT`] names it:
+/// a `duckdb` upgrade whose newest format differs fails here until the
+/// constant follows it.
 #[test]
-fn a_new_workspace_file_keeps_the_named_storage_format() {
+fn a_new_workspace_file_is_in_the_newest_storage_format() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let config = config_in(dir.path());
-    let plain_path = dir.path().join("plain.duckdb");
-    let plain = duckdb::Connection::open(&plain_path).unwrap_or_else(|e| fail(&e.to_string()));
-    let default: String = plain
-        .query_row(
-            "SELECT current_setting('storage_compatibility_version')",
-            [],
-            |row| row.get(0),
+    let plain = duckdb::Connection::open(dir.path().join("plain.duckdb"))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(storage_version(&plain, "plain"), NEWEST_STORAGE_FORMAT);
+    let new = WorkspaceDb::open(&config, "new").unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(storage_version(&new.conn, "data"), NEWEST_STORAGE_FORMAT);
+    drop(new);
+    assert_eq!(
+        WorkspaceDb::upgrade_storage(&config, "new").unwrap_or_else(|e| fail(&e.to_string())),
+        None,
+        "nothing to upgrade"
+    );
+}
+
+/// A workspace file an older `DuckDB` wrote opens as it is and keeps its
+/// format until `upgrade_storage`, which rewrites it in the newest one with
+/// every row, key, view comment, and sequence, and leaves no other file.
+#[test]
+fn an_older_workspace_file_opens_as_is_and_upgrades_whole() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let config = config_in(dir.path());
+    // A workspace, then the same tables in a file in DuckDB 1.x's format.
+    let workspace_dir = config.workspace_dir("old");
+    std::fs::create_dir_all(&workspace_dir).unwrap_or_else(|e| fail(&e.to_string()));
+    let path = config.workspace_db_path("old");
+    let writer = duckdb::Connection::open_in_memory().unwrap_or_else(|e| fail(&e.to_string()));
+    writer
+        .execute(
+            "ATTACH ? AS old (STORAGE_VERSION 'v0.10.2')",
+            duckdb::params![path.to_string_lossy()],
         )
         .unwrap_or_else(|e| fail(&e.to_string()));
-    assert_eq!(
-        default, "latest",
-        "the bundled DuckDB's default changed again: decide the format of new workspace \
-         files and document the step in docs/migrations.md"
-    );
-    let pinned_path = dir.path().join("pinned.duckdb");
-    plain
-        .execute_batch(&format!(
-            "ATTACH '{}' AS pinned (STORAGE_VERSION '{STORAGE_COMPATIBILITY_VERSION}'); \
-             CREATE TABLE pinned.t AS SELECT 1 AS a; CHECKPOINT pinned;",
-            pinned_path.display()
-        ))
+    writer
+        .execute_batch(
+            "USE old; CREATE TABLE sales (id INTEGER PRIMARY KEY, region VARCHAR); \
+             INSERT INTO sales SELECT i, 'r' || i FROM range(1000) t(i); \
+             CREATE VIEW recent AS SELECT * FROM sales WHERE id > 990; \
+             COMMENT ON VIEW recent IS 'kept'; CREATE SEQUENCE ids START 7; CHECKPOINT; \
+             USE memory; DETACH old;",
+        )
         .unwrap_or_else(|e| fail(&e.to_string()));
-    plain
-        .execute_batch("CREATE TABLE t AS SELECT 1 AS a; CHECKPOINT;")
-        .unwrap_or_else(|e| fail(&e.to_string()));
+    drop(writer);
 
-    let new = WorkspaceDb::open(&config, "new").unwrap_or_else(|e| fail(&e.to_string()));
-    assert_eq!(
-        storage_version(&new.conn, "data"),
-        storage_version(&plain, "pinned"),
-        "a new workspace file is in the format quack names"
-    );
-    assert_ne!(
-        storage_version(&new.conn, "data"),
-        storage_version(&plain, "plain"),
-        "not in the default's"
-    );
-
-    // A file in the newest format this DuckDB writes, where a workspace
-    // file would be.
-    let newest_path = config.workspace_db_path("newest");
-    std::fs::create_dir_all(config.workspace_dir("newest"))
-        .unwrap_or_else(|e| fail(&e.to_string()));
-    plain
-        .execute_batch(&format!(
-            "ATTACH '{}' AS newest (STORAGE_VERSION 'latest'); \
-             CREATE TABLE newest.t AS SELECT 1 AS a; CHECKPOINT newest;",
-            newest_path.display()
-        ))
-        .unwrap_or_else(|e| fail(&e.to_string()));
-    let created_as = storage_version(&plain, "newest");
-    assert_ne!(created_as, storage_version(&plain, "pinned"));
-    plain
-        .execute_batch("DETACH newest")
-        .unwrap_or_else(|e| fail(&e.to_string()));
-
-    let opened = WorkspaceDb::open(&config, "newest").unwrap_or_else(|e| fail(&e.to_string()));
-    assert_eq!(storage_version(&opened.conn, "data"), created_as);
+    let outdated = WorkspaceDb::storage_format(&config, "old")
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .unwrap_or_else(|| fail("the file exists"));
+    assert!(outdated.is_outdated(), "{outdated}");
+    // Opening for work does not change the format.
+    let opened = WorkspaceDb::open(&config, "old").unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(storage_version(&opened.conn, "data"), outdated.0);
     drop(opened);
-    let reopened = duckdb::Connection::open(&newest_path).unwrap_or_else(|e| fail(&e.to_string()));
-    assert_eq!(storage_version(&reopened, "data"), created_as);
+
+    let upgrade = WorkspaceDb::upgrade_storage(&config, "old")
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .unwrap_or_else(|| fail("an older file upgrades"));
+    assert_eq!(upgrade.from, outdated);
+    assert_eq!(upgrade.to.0, NEWEST_STORAGE_FORMAT);
+    let mut left: Vec<String> = std::fs::read_dir(&workspace_dir)
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("data"))
+        .collect();
+    left.sort();
+    assert_eq!(left, ["data.duckdb"], "no copy, backup, or log is left");
+
+    let db = WorkspaceDb::open(&config, "old").unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(storage_version(&db.conn, "data"), NEWEST_STORAGE_FORMAT);
+    let one = |sql: &str| -> String {
+        db.conn
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap_or_else(|e| fail(&format!("{sql}: {e}")))
+    };
+    assert_eq!(one("SELECT count(*)::VARCHAR FROM sales"), "1000");
+    assert_eq!(one("SELECT count(*)::VARCHAR FROM recent"), "9");
+    assert_eq!(
+        one("SELECT comment FROM duckdb_views() WHERE view_name = 'recent'"),
+        "kept"
+    );
+    assert_eq!(one("SELECT nextval('ids')::VARCHAR"), "7");
+    assert!(
+        db.execute_statement("INSERT INTO sales VALUES (1, 'again')")
+            .is_err(),
+        "the primary key came along"
+    );
+    drop(db);
+    assert_eq!(
+        WorkspaceDb::upgrade_storage(&config, "old").unwrap_or_else(|e| fail(&e.to_string())),
+        None,
+        "a second upgrade has nothing to do"
+    );
 }
 
 /// Version 7 added joined identifier terms, so a workspace still

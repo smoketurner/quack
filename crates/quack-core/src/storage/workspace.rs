@@ -161,12 +161,46 @@ const SAVED_IMPORTS_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_imports (
 /// newest step above.
 const WORKSPACE_SCHEMA_VERSION: u32 = VALUE_RANGES;
 
-/// The oldest `DuckDB` that must read a file created here, given to `DuckDB`
-/// when the file is opened. It is the bundled library's own default, named so
-/// that a `duckdb` upgrade cannot change the format of new files unnoticed.
-/// `DuckDB` uses it only when it creates a file; an existing one keeps its
-/// format.
-const STORAGE_COMPATIBILITY_VERSION: &str = "v0.10.2";
+/// The storage format a file this quack's `DuckDB` creates reports
+/// (`duckdb_databases().tags['storage_version']`). A workspace file in an
+/// older one still opens; `WorkspaceDb::upgrade_storage` rewrites it in
+/// this one, and no quack built on an older `DuckDB` opens it after that.
+pub const NEWEST_STORAGE_FORMAT: &str = "v2.0.0+";
+
+/// A workspace file's storage format, as `DuckDB` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageFormat(pub String);
+
+impl StorageFormat {
+    /// Whether the file predates [`NEWEST_STORAGE_FORMAT`].
+    #[must_use]
+    pub fn is_outdated(&self) -> bool {
+        self.0 != NEWEST_STORAGE_FORMAT
+    }
+
+    /// The format of the database `conn` has open as its default.
+    fn of(conn: &duckdb::Connection) -> Result<Self> {
+        Ok(Self(conn.query_row(
+            "SELECT tags['storage_version']::VARCHAR FROM duckdb_databases() \
+             WHERE database_name = current_database()",
+            [],
+            |row| row.get(0),
+        )?))
+    }
+}
+
+impl fmt::Display for StorageFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A workspace file [`WorkspaceDb::upgrade_storage`] rewrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageUpgrade {
+    pub from: StorageFormat,
+    pub to: StorageFormat,
+}
 
 /// The tables that hold embedding vectors, with the same `embedding` and
 /// `embedding_profile` columns.
@@ -1204,6 +1238,170 @@ impl WorkspaceDb {
         })
     }
 
+    /// The storage format of workspace `workspace_id`'s file, read without
+    /// taking it over; `None` when the file does not exist yet.
+    ///
+    /// # Errors
+    ///
+    /// `Error::WorkspaceLocked` when another process holds the file, or an
+    /// error if it cannot be read.
+    pub fn storage_format(config: &Config, workspace_id: &str) -> Result<Option<StorageFormat>> {
+        let db_path = config.workspace_db_path(workspace_id);
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let read_only = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
+        let conn = Self::open_file(&db_path, read_only)?;
+        Ok(Some(StorageFormat::of(&conn)?))
+    }
+
+    /// Rewrite workspace `workspace_id`'s file in [`NEWEST_STORAGE_FORMAT`]:
+    /// `DuckDB` never changes a file's format in place, so the database is
+    /// copied into a new file in the newest format (`COPY FROM DATABASE`:
+    /// tables, keys, views and their comments, sequences, macros), every
+    /// table's row count is checked against the original, and the new file
+    /// takes the old one's place. The old file is kept beside it until the
+    /// new one opens in the newest format, then removed. One-way: no quack
+    /// built on an older `DuckDB` opens the file afterwards. Runs before the
+    /// file is opened for work, on a connection of its own, since a confined
+    /// workspace connection may not `ATTACH`. `None` when the file does not
+    /// exist or is already in the newest format.
+    ///
+    /// # Errors
+    ///
+    /// `Error::WorkspaceLocked` when another process holds the file,
+    /// `Error::WorkspaceTooNew` for a file a newer quack wrote, and
+    /// `Error::StorageUpgrade` when the copy or the swap fails, the file
+    /// then as it was.
+    pub fn upgrade_storage(config: &Config, workspace_id: &str) -> Result<Option<StorageUpgrade>> {
+        let db_path = config.workspace_db_path(workspace_id);
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Self::open_file(&db_path, duckdb::Config::default())?;
+        Self::refuse_newer_schema(&conn, &db_path)?;
+        let from = StorageFormat::of(&conn)?;
+        if !from.is_outdated() {
+            return Ok(None);
+        }
+        let failed = |reason: String| Error::StorageUpgrade {
+            path: db_path.clone(),
+            reason,
+        };
+        let upgraded = db_path.with_extension("upgrading.duckdb");
+        Self::remove_database_file(&upgraded)?;
+        let copied = Self::copy_to_newest(&conn, &upgraded);
+        drop(conn);
+        if let Err(e) = copied {
+            Self::remove_database_file(&upgraded)?;
+            return Err(failed(e.to_string()));
+        }
+        // A log left beside the old file would be replayed into the new one.
+        if db_path.with_extension("duckdb.wal").exists() {
+            Self::remove_database_file(&upgraded)?;
+            return Err(failed(String::from(
+                "its write-ahead log outlived the checkpoint",
+            )));
+        }
+        let previous = db_path.with_extension("before-upgrade.duckdb");
+        std::fs::rename(&db_path, &previous).map_err(|e| failed(e.to_string()))?;
+        if let Err(e) = std::fs::rename(&upgraded, &db_path) {
+            std::fs::rename(&previous, &db_path)?;
+            return Err(failed(e.to_string()));
+        }
+        let to = match Self::storage_format(config, workspace_id) {
+            Ok(Some(to)) if !to.is_outdated() => to,
+            other => {
+                // The new file is not what was written: put the old one back.
+                std::fs::rename(&db_path, &upgraded)?;
+                std::fs::rename(&previous, &db_path)?;
+                Self::remove_database_file(&upgraded)?;
+                return Err(failed(format!(
+                    "the rewritten file did not reopen as expected ({other:?})"
+                )));
+            }
+        };
+        Self::remove_database_file(&previous)?;
+        tracing::info!(workspace = %workspace_id, from = %from, to = %to, "upgraded the workspace file's storage format");
+        Ok(Some(StorageUpgrade { from, to }))
+    }
+
+    /// Copy the database `conn` has open into a new file at `target` in the
+    /// newest format, and check every table arrived whole.
+    fn copy_to_newest(conn: &duckdb::Connection, target: &Path) -> Result<()> {
+        let source: String = conn.query_row("SELECT current_database()", [], |row| row.get(0))?;
+        conn.execute_batch("CHECKPOINT")?;
+        let target_text = target
+            .to_str()
+            .ok_or_else(|| Error::Ingestion(format!("{} is not a UTF-8 path", target.display())))?;
+        conn.execute(
+            "ATTACH ? AS quack_upgraded (STORAGE_VERSION 'latest')",
+            duckdb::params![target_text],
+        )?;
+        conn.execute_batch(&format!(
+            "COPY FROM DATABASE {} TO quack_upgraded",
+            quote_ident(&source)
+        ))?;
+        let tables: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT schema_name, table_name FROM duckdb_tables() \
+                 WHERE database_name = ? AND NOT temporary ORDER BY schema_name, table_name",
+            )?;
+            stmt.query_map(duckdb::params![source], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<duckdb::Result<_>>()?
+        };
+        for (schema, table) in &tables {
+            let count = |database: &str| -> Result<i64> {
+                Ok(conn.query_row(
+                    &format!(
+                        "SELECT count(*) FROM {}.{}.{}",
+                        quote_ident(database),
+                        quote_ident(schema),
+                        quote_ident(table)
+                    ),
+                    [],
+                    |row| row.get(0),
+                )?)
+            };
+            let (before, after) = (count(&source)?, count("quack_upgraded")?);
+            if before != after {
+                return Err(Error::Ingestion(format!(
+                    "{schema}.{table} has {before} rows but its copy {after}"
+                )));
+            }
+        }
+        conn.execute_batch("CHECKPOINT quack_upgraded; DETACH quack_upgraded")?;
+        Ok(())
+    }
+
+    /// Remove a database file and its write-ahead log, if they exist.
+    fn remove_database_file(path: &Path) -> Result<()> {
+        for file in [path.to_path_buf(), path.with_extension("duckdb.wal")] {
+            match std::fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the database file at `path` with `flags`, a file another
+    /// process holds reported as `Error::WorkspaceLocked`.
+    fn open_file(path: &Path, flags: duckdb::Config) -> Result<duckdb::Connection> {
+        duckdb::Connection::open_with_flags(path, flags).map_err(|e| {
+            if e.to_string().contains("Could not set lock") {
+                Error::WorkspaceLocked {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                Error::from(e)
+            }
+        })
+    }
+
     /// The schema version a workspace's file records, read through a
     /// read-only connection so nothing is created or upgraded: 0 for a file
     /// from before versions were recorded. [`Self::open`] upgrades a file
@@ -1215,12 +1413,7 @@ impl WorkspaceDb {
     /// file, or an error if it cannot be read.
     pub fn recorded_schema(config: &Config, workspace_id: &str) -> Result<u32> {
         let db_path = config.workspace_db_path(workspace_id);
-        let read_only = duckdb::Config::default()
-            .with(
-                "storage_compatibility_version",
-                STORAGE_COMPATIBILITY_VERSION,
-            )?
-            .access_mode(duckdb::AccessMode::ReadOnly)?;
+        let read_only = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
         let conn = duckdb::Connection::open_with_flags(&db_path, read_only).map_err(|e| {
             if e.to_string().contains("Could not set lock") {
                 Error::WorkspaceLocked {
@@ -1263,11 +1456,9 @@ impl WorkspaceDb {
         // DuckDB reports a file held by another process only in its message
         // text ("Could not set lock on file ..."); it is classified here, once,
         // so callers match a variant instead.
-        let storage = duckdb::Config::default().with(
-            "storage_compatibility_version",
-            STORAGE_COMPATIBILITY_VERSION,
-        )?;
-        let conn = duckdb::Connection::open_with_flags(&db_path, storage).map_err(|e| {
+        // A new file is created in the newest storage format; an existing
+        // one keeps its own until `upgrade_storage` rewrites it.
+        let conn = duckdb::Connection::open(&db_path).map_err(|e| {
             if e.to_string().contains("Could not set lock") {
                 Error::WorkspaceLocked {
                     path: db_path.clone(),
@@ -1277,6 +1468,15 @@ impl WorkspaceDb {
             }
         })?;
         Self::refuse_newer_schema(&conn, &db_path)?;
+        let format = StorageFormat::of(&conn)?;
+        if format.is_outdated() {
+            tracing::warn!(
+                workspace = %workspace_id,
+                format = %format,
+                newest = NEWEST_STORAGE_FORMAT,
+                "the workspace file is in an older storage format; `quack workspace upgrade` rewrites it in the newest (one-way)"
+            );
+        }
         // The columns keep the width they were created with until the
         // reconciliation below decides otherwise.
         let column_dimension = Self::recorded_dimension(&conn)?
