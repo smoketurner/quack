@@ -35,7 +35,9 @@ use crate::llm::{ChatClient, Embeddings, OllamaCapability, ProviderModels, Reran
 use crate::oidc::SignIn;
 use crate::proxy::Proxies;
 use crate::storage::control::ControlPlane;
-use crate::storage::workspace::{DocumentListing, MetaKey, WorkspaceDb};
+use crate::storage::workspace::{
+    DocumentListing, MetaKey, NEWEST_STORAGE_FORMAT, StorageFormat, WorkspaceDb,
+};
 use crate::text::Count;
 use crate::vault::Vault;
 use rig::ProviderError;
@@ -164,6 +166,31 @@ impl Check {
             "to keep a way back, copy the data directory, or take a snapshot with the quack that \
              wrote it, before the next command opens the workspace",
         )
+    }
+
+    /// The check for a workspace file in an older storage format, read from
+    /// the file itself; only an upgrade a person agrees to rewrites it.
+    fn older_storage_of(config: &Config, name: &str, id: &WorkspaceId) -> Option<Self> {
+        WorkspaceDb::storage_format(config, id.as_str())
+            .ok()
+            .flatten()
+            .filter(StorageFormat::is_outdated)
+            .map(|format| Self::older_storage(name, &format.0))
+    }
+
+    /// A workspace whose file is in an older `DuckDB` storage format: it
+    /// works as it is, and an upgrade is one-way.
+    fn older_storage(name: &str, format: &str) -> Self {
+        Self::new(
+            Area::Workspace,
+            Status::Info,
+            format!(
+                "'{name}' is stored in DuckDB format {format}; this quack writes \
+                 {NEWEST_STORAGE_FORMAT}, and an upgrade is one-way (a quack built on an older \
+                 DuckDB won't open it after)"
+            ),
+        )
+        .fix(format!("quack workspace upgrade {name}"))
     }
 
     /// A workspace with no row: only the default one is created by using
@@ -663,6 +690,8 @@ async fn check_workspace(
         report.push(Check::pending_upgrade(name, recorded));
         return;
     }
+    let older = Check::older_storage_of(config, name, &row.id);
+    report.checks.extend(older);
     match WorkspaceDb::open(config, row.id.as_str()) {
         Ok(db) => {
             let tables = db.list_tables().map_or(0, |t| t.len());

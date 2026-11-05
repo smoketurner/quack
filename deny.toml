@@ -18,6 +18,9 @@ ignore = [
     # ttf-parser is unmaintained but only used transitively by pdf-extract for
     # font parsing during PDF text extraction. No security impact.
     "RUSTSEC-2026-0192",
+    # basic-toml is unmaintained with no successor release; askama_derive uses it
+    # only to read askama's own config file while templates compile, never input.
+    "RUSTSEC-2026-0374",
 ]
 
 [licenses]

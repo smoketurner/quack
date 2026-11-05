@@ -27,6 +27,7 @@ inquire            = { workspace = true, features = ["crossterm"] }
 jiff               = { workspace = true, features = ["serde", "std"] }
 mimalloc           = { workspace = true, features = ["secure"] }
 secrecy            = { workspace = true }
+serde              = { workspace = true, features = ["derive", "std"] }
 serde_json         = { workspace = true, features = ["std"] }
 tempfile           = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time", "fs", "io-util", "io-std"] }

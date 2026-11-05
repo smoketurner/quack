@@ -20,7 +20,7 @@ under headings, vectorized). This recipe is for the chunk kind; a table format g
    the format has headings and `Flow::Continuous` when it is one running text with page
    breaks (PDF). Return `Error::Ingestion` with the reason when there is no text at all.
    Declare the module in `ingestion/mod.rs`.
-3. **`crates/quack-core/tests/ingestion_integration.rs`**: a fixture file under
+3. **`crates/quack-core/tests/integration/ingestion_integration.rs`**: a fixture file under
    `crates/quack-eval/fixture/formats/` (small, redistributable; add it to `fixture/formats.json` with the phrase its text must hold) and a test that ingests it
    and checks the title, the section headings, and that the chunks cite the right pages.
 4. **`fuzz/`**: a target for the new `TextFormat` arm (copy `fuzz/fuzz_targets/docx.rs`), a
