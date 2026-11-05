@@ -16,7 +16,7 @@ use crate::ids::SessionId;
 
 use super::chart::ChartSpec;
 use super::citations::{Citation, CitedAnswer};
-use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnFailure, TurnRecorder};
+use super::events::{AgentEvent, EventSink, ToolName, ToolStep, TurnRecorder};
 use super::grounding;
 use super::hooks::{EmptyAnswer, INVALID_TOOL_CALL_RETRIES, InvalidToolCalls, RepeatedCalls};
 use super::policy::WritePolicy;
@@ -277,16 +277,11 @@ where
             )
             .await,
         );
-        match this.run_inner(completion_model, &recorder).await {
-            Ok(response) => {
-                recorder.emit(AgentEvent::TurnComplete(response.clone()));
-                Ok(response)
-            }
-            Err(e) => {
-                recorder.emit(AgentEvent::Failed(TurnFailure::from(&e)));
-                Err(e)
-            }
-        }
+        // A failure is the caller's to report (`TurnRequest::run`), with
+        // every other way the turn can fail before it gets here.
+        let response = this.run_inner(completion_model, &recorder).await?;
+        recorder.emit(AgentEvent::TurnComplete(response.clone()));
+        Ok(response)
     }
 }
 

@@ -1442,7 +1442,17 @@ impl TurnRequest<'_> {
         };
 
         let response = if let Some(outcome) = outcome {
-            outcome?
+            match outcome {
+                Ok(response) => response,
+                // The one place a dispatched turn's failure becomes its event:
+                // building the client, the model checks, and the analysis loop
+                // all end here, so an interface reading only the events sees
+                // every failure exactly once.
+                Err(e) => {
+                    drop(sink.send(AgentEvent::Failed(TurnFailure::from(&e))));
+                    return Err(e);
+                }
+            }
         } else {
             let response = AgentResponse {
                 content: String::from(CANCELLED_NOTE),
