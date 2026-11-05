@@ -6067,7 +6067,7 @@ fn is_single_read_only_statement(sql: &str) -> bool {
 
 /// Whether a serialized statement holds a data-modifying query node
 /// anywhere (`INSERT_QUERY_NODE`, `UPDATE_QUERY_NODE`, `DELETE_QUERY_NODE`,
-/// and whatever DuckDB names the same way next): every reading node is a
+/// and whatever `DuckDB` names the same way next): every reading node is a
 /// `SELECT_NODE`, `SET_OPERATION_NODE`, `RECURSIVE_CTE_NODE`, or `CTE_NODE`.
 fn modifies_data(node: &serde_json::Value) -> bool {
     match node {
@@ -6208,7 +6208,7 @@ fn column_of(node: &serde_json::Value) -> Option<(String, bool)> {
     }
 }
 
-/// A filter operand's text, when it is a string literal (DuckDB 2.0:
+/// A filter operand's text, when it is a string literal (`DuckDB` 2.0:
 /// `"literal": {"kind": "STRING", "text": ...}`).
 fn text_constant(node: &serde_json::Value) -> Option<String> {
     if node.get("class").and_then(serde_json::Value::as_str) != Some("CONSTANT") {

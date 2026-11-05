@@ -1378,7 +1378,7 @@ impl Tool for DescribeTableTool {
                 // list anything after it.
                 let tables = self
                     .0
-                    .with_db(|db| db.list_tables())
+                    .with_db(WorkspaceDb::list_tables)
                     .await
                     .unwrap_or_default();
                 let message = step.fail(message);
