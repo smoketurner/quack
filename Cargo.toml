@@ -19,9 +19,9 @@ resolver = "3"
 members  = ["crates/*"]
 
 [workspace.package]
-version      = "2026.10.9"
+version      = "2026.11.1"
 edition      = "2024"
-rust-version = "1.99.0"
+rust-version = "1.99.1"
 license      = "Apache-2.0 OR MIT"
 repository   = "https://github.com/smoketurner/quack"
 publish      = false
