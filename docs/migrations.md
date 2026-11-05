@@ -160,24 +160,29 @@ migration the binary lacks.
 
 ### DuckDB's storage format
 
-DuckDB versions its file format separately from quack's schema. Two facts, checked against
-the bundled DuckDB 1.5.6:
+DuckDB versions its file format separately from quack's schema. Facts checked against the
+bundled DuckDB 1.5.6, and again against 2.0.0:
 
 - DuckDB picks the format when it creates a file, from `storage_compatibility_version`.
-  The default is `v0.10.2`; `duckdb_databases()` reports such a file as storage version
-  `v1.0.0+`.
+  Through 1.5 the default was `v0.10.2`; `duckdb_databases()` reports such a file as storage
+  version `v1.0.0+`. **DuckDB 2.0 changed the default to `latest`**, a format no DuckDB
+  before 2.0 reads.
 - An existing file keeps its format. Files created as `v1.0.0+`, `v1.2.0+`, `v1.4.0+`, and
   `v1.5.0+` each reported the same storage version after a `SET` to `v1.5.0` or `latest`,
   a write, and a checkpoint. A `v1.0.0+` file kept its version when opened with the setting
-  at `v0.10.2`, `v1.5.0`, or `latest`, and a `v1.5.0+` file keeps it when quack opens it
-  (the test below).
+  at `v0.10.2`, `v1.5.0`, or `latest`, and a file in the newest format keeps it when quack
+  opens it (the test below).
 
 `WorkspaceDb::open` passes `storage_compatibility_version = 'v0.10.2'` when it opens the
 file (`STORAGE_COMPATIBILITY_VERSION`). The setting has to go in at open: a `SET` after the
-file exists changes nothing, and after `lock_configuration` it is an error. Naming the
-default changes no file today. It means a `duckdb` upgrade whose default differs cannot
-change the format of new workspace files: the test
-`naming_the_storage_compatibility_version_changes_no_file` fails until someone decides.
+file exists changes nothing, and after `lock_configuration` it is an error.
+
+**The DuckDB 2.0 upgrade kept `v0.10.2` (2026-11).** DuckDB 2.0 honors the named version, so
+quack on 2.0 creates `v1.0.0+` files exactly as it did on 1.5, not files in 2.0's default
+format. A workspace created after the upgrade still opens in a quack built on DuckDB 1.5,
+which keeps a rollback possible. The test `a_new_workspace_file_keeps_the_named_storage_format`
+checks both halves (the new file is in the named format and not in the default's), and fails
+if a later `duckdb` moves the default again, until someone decides.
 
 Raising the constant is a deliberate step. New files then need at least that DuckDB, so no
 quack built on an older one can open them. Existing files keep their format. Record the

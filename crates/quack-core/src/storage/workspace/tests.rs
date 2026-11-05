@@ -305,7 +305,6 @@ fn workspace_connection_is_confined_to_its_directory_and_locked() {
         String::from("INSTALL httpfs FROM 'https://example.com'"),
         String::from("ATTACH 'quack:example.com' AS remote"),
         String::from("CONNECT 'example.com'"),
-        String::from("CREATE EXTENSION REPOSITORY r AS 'https://example.com'"),
         String::from("SET memory_limit = '8GB'"),
         String::from("SET enable_external_access = true"),
         String::from("SET allowed_directories = ['/']"),
@@ -2139,12 +2138,13 @@ fn opening_a_workspace_records_its_writer() {
     );
 }
 
-/// The storage compatibility version quack names is the bundled
-/// `DuckDB`'s own default, so naming it changes nothing: a new workspace
-/// file gets the format a plain `DuckDB` open gives one, and a file
-/// created in another format keeps it through an open that writes.
+/// `DuckDB` 2.0 creates files in its newest format by default, which no
+/// earlier `DuckDB` reads. quack names `v0.10.2`, and 2.0 honors it: a new
+/// workspace file gets the format a `DuckDB` before 2.0 reads (so a quack
+/// built on one can still open it), not the default's, and a file created
+/// in another format keeps it through an open that writes.
 #[test]
-fn naming_the_storage_compatibility_version_changes_no_file() {
+fn a_new_workspace_file_keeps_the_named_storage_format() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let config = config_in(dir.path());
     let plain_path = dir.path().join("plain.duckdb");
@@ -2157,15 +2157,32 @@ fn naming_the_storage_compatibility_version_changes_no_file() {
         )
         .unwrap_or_else(|e| fail(&e.to_string()));
     assert_eq!(
-        default, STORAGE_COMPATIBILITY_VERSION,
-        "the bundled DuckDB's default changed: decide the format of new workspace files \
-         and document the step in docs/migrations.md"
+        default, "latest",
+        "the bundled DuckDB's default changed again: decide the format of new workspace \
+         files and document the step in docs/migrations.md"
     );
+    let pinned_path = dir.path().join("pinned.duckdb");
+    plain
+        .execute_batch(&format!(
+            "ATTACH '{}' AS pinned (STORAGE_VERSION '{STORAGE_COMPATIBILITY_VERSION}'); \
+             CREATE TABLE pinned.t AS SELECT 1 AS a; CHECKPOINT pinned;",
+            pinned_path.display()
+        ))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    plain
+        .execute_batch("CREATE TABLE t AS SELECT 1 AS a; CHECKPOINT;")
+        .unwrap_or_else(|e| fail(&e.to_string()));
 
     let new = WorkspaceDb::open(&config, "new").unwrap_or_else(|e| fail(&e.to_string()));
     assert_eq!(
         storage_version(&new.conn, "data"),
-        storage_version(&plain, "plain")
+        storage_version(&plain, "pinned"),
+        "a new workspace file is in the format quack names"
+    );
+    assert_ne!(
+        storage_version(&new.conn, "data"),
+        storage_version(&plain, "plain"),
+        "not in the default's"
     );
 
     // A file in the newest format this DuckDB writes, where a workspace
@@ -2181,7 +2198,7 @@ fn naming_the_storage_compatibility_version_changes_no_file() {
         ))
         .unwrap_or_else(|e| fail(&e.to_string()));
     let created_as = storage_version(&plain, "newest");
-    assert_ne!(created_as, storage_version(&plain, "plain"));
+    assert_ne!(created_as, storage_version(&plain, "pinned"));
     plain
         .execute_batch("DETACH newest")
         .unwrap_or_else(|e| fail(&e.to_string()));

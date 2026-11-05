@@ -372,15 +372,14 @@ impl OrderKey<'_> {
                 "alias": "",
                 "column_names": [name],
             }),
+            // A literal as DuckDB 2.0 serializes one: a typed `value` here
+            // reads back as `CAST(2 AS BIGINT)`, an expression that sorts
+            // nothing, where an INTEGER literal is a position.
             Self::Position(position) => serde_json::json!({
                 "class": "CONSTANT",
                 "type": "VALUE_CONSTANT",
                 "alias": "",
-                "value": {
-                    "type": { "id": "BIGINT", "type_info": null },
-                    "is_null": false,
-                    "value": position.get(),
-                },
+                "literal": { "kind": "INTEGER", "text": position.get().to_string() },
             }),
         }
     }
@@ -5891,8 +5890,11 @@ fn blank_constants(node: &mut serde_json::Value) {
     match node {
         serde_json::Value::Object(map) => {
             map.remove("query_location");
+            // DuckDB 2.0 also records each node's length in the source,
+            // which changes with a literal's.
+            map.remove("query_location_length");
             if map.get("class").and_then(serde_json::Value::as_str) == Some("CONSTANT") {
-                map.insert(String::from("value"), serde_json::Value::Null);
+                map.insert(String::from("literal"), serde_json::Value::Null);
             }
             for child in map.values_mut() {
                 blank_constants(child);
@@ -5991,10 +5993,13 @@ fn column_of(node: &serde_json::Value) -> Option<(String, bool)> {
             let name = node
                 .get("function_name")
                 .and_then(serde_json::Value::as_str)?;
-            let children = node.get("children").and_then(serde_json::Value::as_array)?;
-            let [child] = children.as_slice() else {
+            let arguments = node
+                .get("arguments")
+                .and_then(serde_json::Value::as_array)?;
+            let [argument] = arguments.as_slice() else {
                 return None;
             };
+            let child = argument.get("expression")?;
             matches!(name, "lower" | "upper" | "lcase" | "ucase" | "trim")
                 .then(|| column_of(child).map(|(column, _)| (column, true)))
                 .flatten()
@@ -6003,23 +6008,15 @@ fn column_of(node: &serde_json::Value) -> Option<(String, bool)> {
     }
 }
 
-/// A filter operand's text, when it is a `VARCHAR` constant.
+/// A filter operand's text, when it is a string literal (DuckDB 2.0:
+/// `"literal": {"kind": "STRING", "text": ...}`).
 fn text_constant(node: &serde_json::Value) -> Option<String> {
     if node.get("class").and_then(serde_json::Value::as_str) != Some("CONSTANT") {
         return None;
     }
-    let value = node.get("value")?;
-    let is_text = value
-        .get("type")
-        .and_then(|t| t.get("id"))
-        .and_then(serde_json::Value::as_str)
-        == Some("VARCHAR");
-    let is_null = value
-        .get("is_null")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    (is_text && !is_null)
-        .then(|| value.get("value").and_then(serde_json::Value::as_str))
+    let literal = node.get("literal")?;
+    (literal.get("kind").and_then(serde_json::Value::as_str) == Some("STRING"))
+        .then(|| literal.get("text").and_then(serde_json::Value::as_str))
         .flatten()
         .map(str::to_owned)
 }
@@ -6223,6 +6220,13 @@ pub fn quote_ident(name: &str) -> String {
 }
 
 fn extract_value(row: &duckdb::Row<'_>, idx: usize) -> serde_json::Value {
+    // A column of type NULL (`SELECT NULL AS n`) arrives as Arrow's
+    // NullArray, which reports no nulls; duckdb 1.20000.1 then panics in
+    // `get_ref` on its type. Its every value is NULL, so it is never read.
+    let statement: &duckdb::Statement<'_> = row.as_ref();
+    if statement.column_type(idx) == duckdb::arrow::datatypes::DataType::Null {
+        return serde_json::Value::Null;
+    }
     match row.get_ref(idx) {
         Ok(value) => json_of(duckdb::types::Value::from(value)),
         Err(_) => serde_json::Value::Null,
