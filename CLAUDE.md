@@ -280,7 +280,7 @@ and a read filtering such a column on a value the question does not name (`'TENN
 Texas) or a spelling the column does not hold is refused with the stored value
 (`WorkspaceDb::statement_filters` over `DuckDB`'s parse tree). The graph tools register only
 when the question names a node (`graph::store::named_in`, `Modeled::for_question`);
-`tests/agent_turn.rs` drives whole turns with rig's scripted model. The tools hold only the
+`tests/integration/agent_turn.rs` drives whole turns with rig's scripted model. The tools hold only the
 workspace and its settings; a turn's recorder, write policy, refusal flag, and chart and graph
 results are one `analysis::tools::Turn`, handed to every call as a runtime scope of rig's
 `ToolContext` (`.tool_context(turn.context())` on the run). `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
