@@ -196,8 +196,8 @@ async fn find(db: &Writer, name: &str) -> Result<SavedQuestion> {
 
 /// Ask `question` again as a print-mode turn in a new session of its
 /// mode, writes denied (the steps on stderr, the answer on stdout), and
-/// pin the statements the answer ran. A turn that fails leaves no empty
-/// session behind.
+/// pin the statements the answer ran. A refresh that does not end in a
+/// pin leaves no session behind: the session exists only to carry it.
 async fn refresh_pin(
     config: &Config,
     model: &Model,
@@ -227,21 +227,31 @@ async fn refresh_pin(
     }
     .run()
     .await;
-    if outcome.is_err() {
-        let id = session_id.clone();
-        drop(
+    let pinned = match outcome {
+        Ok(_) => {
+            let (id, session) = (question.id, session_id.clone());
             model
                 .db
-                .run(move |db| sessions::delete_if_empty(db, &id))
-                .await,
-        );
-    }
-    outcome?;
-    let id = question.id;
-    let pinned = model
-        .db
-        .run(move |db| saved::repin(db, &id, &session_id, Answer::Last))
-        .await?;
+                .run(move |db| saved::repin(db, &id, &session, Answer::Last))
+                .await
+                .map_err(Into::into)
+        }
+        Err(e) => Err(e),
+    };
+    let pinned = match pinned {
+        Ok(pinned) => pinned,
+        Err(e) => {
+            let id = session_id.clone();
+            if let Err(cleanup) = model
+                .db
+                .run(move |db| sessions::delete_session(db, &id))
+                .await
+            {
+                tracing::warn!(session = %session_id, error = %cleanup, "could not remove the refresh's session");
+            }
+            return Err(e);
+        }
+    };
     writeln!(
         std::io::stderr(),
         "refreshed '{}': {} statement{} pinned from session {}",
@@ -705,5 +715,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(paid, 1, "the refresh turn could not write");
+    }
+
+    /// A refresh whose new answer ran no SQL cannot be pinned, and the
+    /// session it opened for the turn goes with it: only the original
+    /// session remains, and the question keeps its old pin.
+    #[tokio::test(flavor = "multi_thread")]
+    #[expect(clippy::unwrap_used, reason = "test asserts Ok")]
+    async fn a_refresh_that_cannot_pin_leaves_no_session_behind() {
+        let ollama = ScriptedOllama::serve(vec![Reply::Text("Two invoices.")])
+            .await
+            .unwrap();
+        let config = ollama.config().unwrap();
+        let (db, session) = workspace();
+        quack(&db, add("overdue", Some(&session), None))
+            .await
+            .1
+            .unwrap();
+        let model = Model {
+            db: Arc::clone(&db),
+            reader_db: ReaderDb::open(&db, config.analysis.reader_pool_size).await,
+            jobs: JobQueue::new(10),
+            workspace_id: WorkspaceId::from("ws"),
+            verbose: false,
+        };
+        let mut out = Vec::new();
+        let egress = Egress::Workspace(AllowedProviders::All);
+        let refreshed = Egress::scope(
+            Some(egress),
+            run(
+                &config,
+                &db,
+                SavedAction::Run {
+                    name: String::from("overdue"),
+                    refresh: true,
+                    exit_code: false,
+                    format: Some(QueryFormat::Table),
+                },
+                None,
+                Some(model),
+                &mut out,
+            ),
+        )
+        .await;
+        assert!(refreshed.is_err(), "an answer with no SQL cannot be pinned");
+        let left = db.run(|db| sessions::list_sessions(db, 10)).await.unwrap();
+        assert_eq!(
+            left.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![session.clone()],
+            "only the original session remains"
+        );
+        let question = db
+            .run(|db| saved::by_name(db, "overdue"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(question.session_id, session, "the old pin stands");
     }
 }
