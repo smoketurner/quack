@@ -14,6 +14,7 @@ use ratatui::widgets::{
     Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
 };
 
+use crate::WebStatus;
 use crate::app::{App, Message, MessageKind, PendingPrompt};
 use crate::clipboard::CopyStatus;
 use crate::commands::Suggestion;
@@ -454,11 +455,6 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(&app.workspace_name, Style::default().fg(Color::Cyan)),
         Span::styled(" \u{00B7} ", Style::default().fg(Color::DarkGray)),
         Span::styled(&app.provider_display, Style::default().fg(Color::DarkGray)),
-        Span::styled(" \u{00B7} session ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            app.session_id.short().to_owned(),
-            Style::default().fg(Color::DarkGray),
-        ),
         Span::styled(
             match app.scope.documents().len() {
                 0 => String::new(),
@@ -466,6 +462,15 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 n => format!(" \u{00B7} scope: {n} documents"),
             },
             Style::default().fg(Color::Yellow),
+        ),
+        // Last, so a narrow screen cuts the address before the scope.
+        Span::styled(" \u{00B7} ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            app.web.header(),
+            match app.web {
+                WebStatus::Listening(_) => Style::default().fg(Color::Cyan),
+                WebStatus::Unavailable(_) => Style::default().fg(Color::DarkGray),
+            },
         ),
     ]);
 

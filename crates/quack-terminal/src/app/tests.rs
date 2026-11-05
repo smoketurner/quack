@@ -1941,17 +1941,35 @@ async fn without_a_chat_model_a_line_that_starts_like_sql_reports_its_syntax_err
     assert!(app.jobs.list().is_empty());
 }
 
-/// Where the web UI is served beside the session, or why it is not, is
-/// one line in the transcript after the welcome, and the session runs.
-#[test]
-fn the_web_server_beside_the_session_is_one_transcript_line() {
-    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
-    let app = app_with(dir.path(), Config::default());
-    assert_eq!(
-        last(&app).content,
-        "web: http://127.0.0.1:8080 serves this workspace's web UI, REST API, and MCP"
-    );
+/// The header's title row, drawn 80 columns wide.
+fn title_row(app: &App) -> String {
+    screen(app).into_iter().next().unwrap_or_default()
+}
 
+/// Where the web UI is served beside the session is in the header's title
+/// row, in the session id's place, not a transcript line that scrolls away.
+#[test]
+fn the_header_shows_the_web_address() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let app = app(dir.path());
+    let row = title_row(&app);
+    assert_eq!(
+        row.matches(" \u{00B7} http://127.0.0.1:8080").count(),
+        1,
+        "{row}"
+    );
+    assert!(!row.contains("session"), "{row}");
+    assert!(
+        !app.messages.iter().any(|m| m.content.starts_with("web:")),
+        "{:?}",
+        app.messages.iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+}
+
+/// A server that could not start is `web off` in the header and one
+/// transcript line saying why, and the session runs.
+#[test]
+fn an_unavailable_web_server_is_web_off_and_one_transcript_line() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let mut config = Config::default();
     config.general.data_dir = dir.path().to_path_buf();
@@ -1970,6 +1988,8 @@ fn the_web_server_beside_the_session_is_one_transcript_line() {
         writes: WritePolicy::Ask,
         approvals: Approvals::new(),
     });
+    let row = title_row(&app);
+    assert!(row.contains(" \u{00B7} web off"), "{row}");
     let last = last(&app);
     assert_eq!(last.kind, MessageKind::System);
     assert_eq!(

@@ -1961,7 +1961,8 @@ fn local_addr(server: &ServerConfig) -> SocketAddr {
 
 /// No arguments: the interactive session, which needs a terminal, and the
 /// web UI, REST API, and MCP on loopback beside it from the same engine. A
-/// server that cannot start is one transcript line.
+/// server that cannot start is `web off` in the header and one transcript
+/// line saying why.
 async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode> {
     if !std::io::stdin().is_terminal() || !stdout_is_tty {
         init_logging();

@@ -991,6 +991,8 @@ pub(crate) struct App {
     pub(crate) quit: Quit,
     pub(crate) spinner: Spinner,
     pub(crate) workspace_name: String,
+    /// Where the web UI beside the session listens, shown in the header.
+    pub(crate) web: WebStatus,
     pub(crate) provider_display: String,
     pub(crate) session_id: SessionId,
     /// Decisions owed, oldest first; the front one is on screen.
@@ -1065,13 +1067,11 @@ impl App {
             writes,
             approvals,
         } = setup;
-        let web_line = match web {
-            WebStatus::Listening(addr) => {
-                format!("web: http://{addr} serves this workspace's web UI, REST API, and MCP")
-            }
-            WebStatus::Unavailable(why) => {
-                format!("web: {why}; this session runs without the web UI and MCP")
-            }
+        let web_line = match &web {
+            WebStatus::Listening(_) => None,
+            WebStatus::Unavailable(why) => Some(format!(
+                "web: {why}; this session runs without the web UI and MCP"
+            )),
         };
         let config = engine.config.clone();
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
@@ -1090,6 +1090,7 @@ impl App {
             quit: Quit::Stay,
             spinner: Spinner::default(),
             workspace_name,
+            web,
             provider_display: config.chat_model_label(),
             session_id,
             prompts: VecDeque::new(),
@@ -1123,7 +1124,9 @@ impl App {
         if app.config.general.chat_model.is_none() {
             app.note(MessageKind::System, NO_CHAT_MODEL_TEXT);
         }
-        app.note(MessageKind::System, web_line);
+        if let Some(line) = web_line {
+            app.note(MessageKind::System, line);
+        }
         app
     }
 

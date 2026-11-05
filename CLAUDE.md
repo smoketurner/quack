@@ -14,7 +14,7 @@ server, terminal session, and print mode are thin clients of it, all subcommands
 tried (`docs/desktop.md`, #35, PR #546) and set aside on 2026-10-12; bare `quack` serves
 the web UI, REST API, and MCP on loopback beside the terminal session (from the session's
 engine, its workspace alone, `127.0.0.1` at `[server].bind`'s port or a random one when
-none is set, a transcript line saying where or why not), so a browser tab is the window. The
+none is set, the header saying where and a transcript line why not), so a browser tab is the window. The
 design is `docs/design-doc.md`; read it before any non-trivial change, and check its
 section 17 for where the code still lags. The chosen stack:
 
