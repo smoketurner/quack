@@ -302,6 +302,9 @@ fn workspace_connection_is_confined_to_its_directory_and_locked() {
             dir.path().join("other.duckdb").display()
         ),
         String::from("INSTALL httpfs"),
+        String::from("INSTALL httpfs FROM 'https://example.com'"),
+        String::from("ATTACH 'quack:example.com' AS remote"),
+        String::from("CONNECT 'example.com'"),
         String::from("SET memory_limit = '8GB'"),
         String::from("SET enable_external_access = true"),
         String::from("SET allowed_directories = ['/']"),
@@ -384,6 +387,15 @@ fn typed_sql_refuses_transaction_control_and_the_servers_catalog() {
         ),
         ("CALL pragma_database_list()", TypedSql::ServerCatalog),
         ("SELECT * FROM duckdb_extensions()", TypedSql::ServerCatalog),
+        (
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t; END",
+            TypedSql::Trigger,
+        ),
+        (
+            "create or replace temporary trigger tr after update on t execute delete from t",
+            TypedSql::Trigger,
+        ),
+        ("SELECT 1; CREATE TRIGGER tr", TypedSql::Trigger),
     ] {
         assert_eq!(TypedSql::refusal(sql), Some(why), "{sql}");
         let refused = db.classify_user_statement(sql).err().map(|e| e.to_string());
@@ -400,6 +412,9 @@ fn typed_sql_refuses_transaction_control_and_the_servers_catalog() {
         "SELECT * FROM beginnings",
         "SELECT end_date FROM t",
         "DESCRIBE t",
+        "SELECT 'CREATE TRIGGER' AS text",
+        "CREATE TABLE trigger_log (a INT)",
+        "SELECT trigger FROM t",
     ] {
         assert_eq!(TypedSql::refusal(sql), None, "{sql}");
     }
@@ -965,7 +980,8 @@ fn capped_query_names_each_column_type() {
             "INTEGER[]",
             "DATE",
             "STRUCT",
-            "INTEGER",
+            // DuckDB 2.0 types a bare NULL as NULL (1.5 made it INTEGER).
+            "NULL",
             "TIMESTAMP WITH TIME ZONE"
         ]
     );
@@ -2123,58 +2139,104 @@ fn opening_a_workspace_records_its_writer() {
     );
 }
 
-/// The storage compatibility version quack names is the bundled
-/// `DuckDB`'s own default, so naming it changes nothing: a new workspace
-/// file gets the format a plain `DuckDB` open gives one, and a file
-/// created in another format keeps it through an open that writes.
+/// A new workspace file is created in the newest storage format, the one
+/// a plain `DuckDB` open gives a file, and [`NEWEST_STORAGE_FORMAT`] names it:
+/// a `duckdb` upgrade whose newest format differs fails here until the
+/// constant follows it.
 #[test]
-fn naming_the_storage_compatibility_version_changes_no_file() {
+fn a_new_workspace_file_is_in_the_newest_storage_format() {
     let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
     let config = config_in(dir.path());
-    let plain_path = dir.path().join("plain.duckdb");
-    let plain = duckdb::Connection::open(&plain_path).unwrap_or_else(|e| fail(&e.to_string()));
-    let default: String = plain
-        .query_row(
-            "SELECT current_setting('storage_compatibility_version')",
-            [],
-            |row| row.get(0),
+    let plain = duckdb::Connection::open(dir.path().join("plain.duckdb"))
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(storage_version(&plain, "plain"), NEWEST_STORAGE_FORMAT);
+    let new = WorkspaceDb::open(&config, "new").unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(storage_version(&new.conn, "data"), NEWEST_STORAGE_FORMAT);
+    drop(new);
+    assert_eq!(
+        WorkspaceDb::upgrade_storage(&config, "new").unwrap_or_else(|e| fail(&e.to_string())),
+        None,
+        "nothing to upgrade"
+    );
+}
+
+/// A workspace file an older `DuckDB` wrote opens as it is and keeps its
+/// format until `upgrade_storage`, which rewrites it in the newest one with
+/// every row, key, view comment, and sequence, and leaves no other file.
+#[test]
+fn an_older_workspace_file_opens_as_is_and_upgrades_whole() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let config = config_in(dir.path());
+    // A workspace, then the same tables in a file in DuckDB 1.x's format.
+    let workspace_dir = config.workspace_dir("old");
+    std::fs::create_dir_all(&workspace_dir).unwrap_or_else(|e| fail(&e.to_string()));
+    let path = config.workspace_db_path("old");
+    let writer = duckdb::Connection::open_in_memory().unwrap_or_else(|e| fail(&e.to_string()));
+    writer
+        .execute(
+            "ATTACH ? AS old (STORAGE_VERSION 'v0.10.2')",
+            duckdb::params![path.to_string_lossy()],
         )
         .unwrap_or_else(|e| fail(&e.to_string()));
-    assert_eq!(
-        default, STORAGE_COMPATIBILITY_VERSION,
-        "the bundled DuckDB's default changed: decide the format of new workspace files \
-         and document the step in docs/migrations.md"
-    );
-
-    let new = WorkspaceDb::open(&config, "new").unwrap_or_else(|e| fail(&e.to_string()));
-    assert_eq!(
-        storage_version(&new.conn, "data"),
-        storage_version(&plain, "plain")
-    );
-
-    // A file in the newest format this DuckDB writes, where a workspace
-    // file would be.
-    let newest_path = config.workspace_db_path("newest");
-    std::fs::create_dir_all(config.workspace_dir("newest"))
+    writer
+        .execute_batch(
+            "USE old; CREATE TABLE sales (id INTEGER PRIMARY KEY, region VARCHAR); \
+             INSERT INTO sales SELECT i, 'r' || i FROM range(1000) t(i); \
+             CREATE VIEW recent AS SELECT * FROM sales WHERE id > 990; \
+             COMMENT ON VIEW recent IS 'kept'; CREATE SEQUENCE ids START 7; CHECKPOINT; \
+             USE memory; DETACH old;",
+        )
         .unwrap_or_else(|e| fail(&e.to_string()));
-    plain
-        .execute_batch(&format!(
-            "ATTACH '{}' AS newest (STORAGE_VERSION 'latest'); \
-             CREATE TABLE newest.t AS SELECT 1 AS a; CHECKPOINT newest;",
-            newest_path.display()
-        ))
-        .unwrap_or_else(|e| fail(&e.to_string()));
-    let created_as = storage_version(&plain, "newest");
-    assert_ne!(created_as, storage_version(&plain, "plain"));
-    plain
-        .execute_batch("DETACH newest")
-        .unwrap_or_else(|e| fail(&e.to_string()));
+    drop(writer);
 
-    let opened = WorkspaceDb::open(&config, "newest").unwrap_or_else(|e| fail(&e.to_string()));
-    assert_eq!(storage_version(&opened.conn, "data"), created_as);
+    let outdated = WorkspaceDb::storage_format(&config, "old")
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .unwrap_or_else(|| fail("the file exists"));
+    assert!(outdated.is_outdated(), "{outdated}");
+    // Opening for work does not change the format.
+    let opened = WorkspaceDb::open(&config, "old").unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(storage_version(&opened.conn, "data"), outdated.0);
     drop(opened);
-    let reopened = duckdb::Connection::open(&newest_path).unwrap_or_else(|e| fail(&e.to_string()));
-    assert_eq!(storage_version(&reopened, "data"), created_as);
+
+    let upgrade = WorkspaceDb::upgrade_storage(&config, "old")
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .unwrap_or_else(|| fail("an older file upgrades"));
+    assert_eq!(upgrade.from, outdated);
+    assert_eq!(upgrade.to.0, NEWEST_STORAGE_FORMAT);
+    let mut left: Vec<String> = std::fs::read_dir(&workspace_dir)
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("data"))
+        .collect();
+    left.sort();
+    assert_eq!(left, ["data.duckdb"], "no copy, backup, or log is left");
+
+    let db = WorkspaceDb::open(&config, "old").unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(storage_version(&db.conn, "data"), NEWEST_STORAGE_FORMAT);
+    let one = |sql: &str| -> String {
+        db.conn
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap_or_else(|e| fail(&format!("{sql}: {e}")))
+    };
+    assert_eq!(one("SELECT count(*)::VARCHAR FROM sales"), "1000");
+    assert_eq!(one("SELECT count(*)::VARCHAR FROM recent"), "9");
+    assert_eq!(
+        one("SELECT comment FROM duckdb_views() WHERE view_name = 'recent'"),
+        "kept"
+    );
+    assert_eq!(one("SELECT nextval('ids')::VARCHAR"), "7");
+    assert!(
+        db.execute_statement("INSERT INTO sales VALUES (1, 'again')")
+            .is_err(),
+        "the primary key came along"
+    );
+    drop(db);
+    assert_eq!(
+        WorkspaceDb::upgrade_storage(&config, "old").unwrap_or_else(|e| fail(&e.to_string())),
+        None,
+        "a second upgrade has nothing to do"
+    );
 }
 
 /// Version 7 added joined identifier terms, so a workspace still
@@ -3505,4 +3567,70 @@ fn a_failed_registration_leaves_the_old_document_unmarked() {
     assert!(refused.is_err());
     assert_eq!(marked(&db), Vec::new());
     assert_eq!(db.document(&old).unwrap().unwrap().superseded_by, None);
+}
+
+/// `DuckDB` 2.0 serializes a data-modifying common table expression inside a
+/// SELECT: classified by its tree alone it would be a read. Each one is a
+/// write, its `_quack_` target is still refused though an INSERT node
+/// names it as a bare string, and it has no shape a saved question or a
+/// sort could reuse.
+#[test]
+fn a_data_modifying_cte_is_a_write() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    db.execute_statement("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1)")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    for sql in [
+        "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+        "WITH d AS (INSERT INTO t VALUES (2) RETURNING *) SELECT * FROM d",
+        "WITH d AS (UPDATE t SET a = 3 RETURNING *) SELECT count(*) FROM d",
+        "SELECT * FROM (WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d)",
+    ] {
+        assert_eq!(
+            db.classify_statement(sql)
+                .unwrap_or_else(|e| fail(&e.to_string())),
+            StatementKind::Write,
+            "{sql}"
+        );
+        assert_eq!(db.statement_shape(sql).ok().flatten(), None, "{sql}");
+        assert!(
+            db.sortable(sql).ok().flatten().is_none(),
+            "{sql} has no rows of its own to reorder"
+        );
+    }
+    for sql in [
+        "WITH d AS (INSERT INTO _quack_meta VALUES ('k', 'v') RETURNING *) SELECT * FROM d",
+        "WITH d AS (DELETE FROM _quack_documents RETURNING *) SELECT count(*) FROM d",
+    ] {
+        assert!(
+            db.references_internal_table(sql)
+                .unwrap_or_else(|e| fail(&e.to_string())),
+            "{sql}"
+        );
+    }
+    // A plain CTE is still a read with a shape.
+    let read = "WITH d AS (SELECT * FROM t) SELECT * FROM d";
+    assert_eq!(
+        db.classify_statement(read)
+            .unwrap_or_else(|e| fail(&e.to_string())),
+        StatementKind::Read
+    );
+    assert!(db.statement_shape(read).ok().flatten().is_some());
+}
+
+/// `DuckDB` 2.0 disables the arrow lambda by default; the prompt asks for
+/// `lambda x:`, which runs.
+#[test]
+fn the_lambda_keyword_runs_and_the_arrow_form_is_refused() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    let ran = db
+        .execute_query("SELECT list_transform([1, 2], lambda x: x * 2) AS l")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(ran.rows.len(), 1);
+    assert!(
+        db.execute_query("SELECT list_transform([1, 2], x -> x * 2) AS l")
+            .is_err(),
+        "the arrow form ran; DuckDB re-enabled it"
+    );
 }

@@ -3050,7 +3050,7 @@ async fn a_pdf_page_without_text_is_counted_on_the_document() {
 /// A two-page PDF: typed text on the first page, the second only a
 /// scanned picture.
 fn scanned_pdf(pages_of_text: bool) -> Vec<u8> {
-    const SCAN: &[u8] = include_bytes!("fixtures/scanned_page.jpg");
+    const SCAN: &[u8] = include_bytes!("../fixtures/scanned_page.jpg");
     let page = pdf_oxide::geometry::Rect::new(0.0, 0.0, 612.0, 792.0);
     let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Scanned");
     if pages_of_text {
@@ -3129,7 +3129,7 @@ async fn a_scanned_pdf_page_is_read_by_the_vision_model() {
 /// A PDF page of text with a figure on it: the text, then the figure's
 /// picture once (repeated on the next page, it is not read again).
 fn pdf_with_figure() -> Vec<u8> {
-    const FIGURE: &[u8] = include_bytes!("fixtures/scanned_page.jpg");
+    const FIGURE: &[u8] = include_bytes!("../fixtures/scanned_page.jpg");
     let place = pdf_oxide::geometry::Rect::new(72.0, 300.0, 240.0, 240.0);
     let mut pdf = pdf_oxide::writer::DocumentBuilder::new().title("Ops review");
     for text in ["Regional volumes are charted below.", "The chart again."] {
@@ -3198,7 +3198,7 @@ async fn a_figure_inside_a_pdf_is_read_by_the_vision_model() {
 /// not blank; `shade` makes its bytes differ from another's, so neither
 /// is a repeat.
 fn office_picture(alt: &str, shade: u8) -> office_oxide::ir::Element {
-    const PICTURE: &[u8] = include_bytes!("fixtures/scanned_page.jpg");
+    const PICTURE: &[u8] = include_bytes!("../fixtures/scanned_page.jpg");
     let mut data = PICTURE.to_vec();
     data.push(shade);
     office_oxide::ir::Element::Image(office_oxide::ir::Image {
@@ -3325,7 +3325,7 @@ async fn a_deck_of_unread_pictures_names_the_vision_setting() {
 /// 97-2003 files, kept zipped since the `.ppt` is mostly empty masters.
 fn legacy_office(name: &str) -> Vec<u8> {
     use std::io::Read as _;
-    const ZIPPED: &[u8] = include_bytes!("fixtures/legacy_office.zip");
+    const ZIPPED: &[u8] = include_bytes!("../fixtures/legacy_office.zip");
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(ZIPPED)).unwrap();
     let mut bytes = Vec::new();
     archive

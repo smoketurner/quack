@@ -161,12 +161,46 @@ const SAVED_IMPORTS_DDL: &str = "CREATE TABLE IF NOT EXISTS _quack_imports (
 /// newest step above.
 const WORKSPACE_SCHEMA_VERSION: u32 = VALUE_RANGES;
 
-/// The oldest `DuckDB` that must read a file created here, given to `DuckDB`
-/// when the file is opened. It is the bundled library's own default, named so
-/// that a `duckdb` upgrade cannot change the format of new files unnoticed.
-/// `DuckDB` uses it only when it creates a file; an existing one keeps its
-/// format.
-const STORAGE_COMPATIBILITY_VERSION: &str = "v0.10.2";
+/// The storage format a file this quack's `DuckDB` creates reports
+/// (`duckdb_databases().tags['storage_version']`). A workspace file in an
+/// older one still opens; `WorkspaceDb::upgrade_storage` rewrites it in
+/// this one, and no quack built on an older `DuckDB` opens it after that.
+pub const NEWEST_STORAGE_FORMAT: &str = "v2.0.0+";
+
+/// A workspace file's storage format, as `DuckDB` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageFormat(pub String);
+
+impl StorageFormat {
+    /// Whether the file predates [`NEWEST_STORAGE_FORMAT`].
+    #[must_use]
+    pub fn is_outdated(&self) -> bool {
+        self.0 != NEWEST_STORAGE_FORMAT
+    }
+
+    /// The format of the database `conn` has open as its default.
+    fn of(conn: &duckdb::Connection) -> Result<Self> {
+        Ok(Self(conn.query_row(
+            "SELECT tags['storage_version']::VARCHAR FROM duckdb_databases() \
+             WHERE database_name = current_database()",
+            [],
+            |row| row.get(0),
+        )?))
+    }
+}
+
+impl fmt::Display for StorageFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A workspace file [`WorkspaceDb::upgrade_storage`] rewrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageUpgrade {
+    pub from: StorageFormat,
+    pub to: StorageFormat,
+}
 
 /// The tables that hold embedding vectors, with the same `embedding` and
 /// `embedding_profile` columns.
@@ -372,15 +406,14 @@ impl OrderKey<'_> {
                 "alias": "",
                 "column_names": [name],
             }),
+            // A literal as DuckDB 2.0 serializes one: a typed `value` here
+            // reads back as `CAST(2 AS BIGINT)`, an expression that sorts
+            // nothing, where an INTEGER literal is a position.
             Self::Position(position) => serde_json::json!({
                 "class": "CONSTANT",
                 "type": "VALUE_CONSTANT",
                 "alias": "",
-                "value": {
-                    "type": { "id": "BIGINT", "type_info": null },
-                    "is_null": false,
-                    "value": position.get(),
-                },
+                "literal": { "kind": "INTEGER", "text": position.get().to_string() },
             }),
         }
     }
@@ -1205,6 +1238,170 @@ impl WorkspaceDb {
         })
     }
 
+    /// The storage format of workspace `workspace_id`'s file, read without
+    /// taking it over; `None` when the file does not exist yet.
+    ///
+    /// # Errors
+    ///
+    /// `Error::WorkspaceLocked` when another process holds the file, or an
+    /// error if it cannot be read.
+    pub fn storage_format(config: &Config, workspace_id: &str) -> Result<Option<StorageFormat>> {
+        let db_path = config.workspace_db_path(workspace_id);
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let read_only = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
+        let conn = Self::open_file(&db_path, read_only)?;
+        Ok(Some(StorageFormat::of(&conn)?))
+    }
+
+    /// Rewrite workspace `workspace_id`'s file in [`NEWEST_STORAGE_FORMAT`]:
+    /// `DuckDB` never changes a file's format in place, so the database is
+    /// copied into a new file in the newest format (`COPY FROM DATABASE`:
+    /// tables, keys, views and their comments, sequences, macros), every
+    /// table's row count is checked against the original, and the new file
+    /// takes the old one's place. The old file is kept beside it until the
+    /// new one opens in the newest format, then removed. One-way: no quack
+    /// built on an older `DuckDB` opens the file afterwards. Runs before the
+    /// file is opened for work, on a connection of its own, since a confined
+    /// workspace connection may not `ATTACH`. `None` when the file does not
+    /// exist or is already in the newest format.
+    ///
+    /// # Errors
+    ///
+    /// `Error::WorkspaceLocked` when another process holds the file,
+    /// `Error::WorkspaceTooNew` for a file a newer quack wrote, and
+    /// `Error::StorageUpgrade` when the copy or the swap fails, the file
+    /// then as it was.
+    pub fn upgrade_storage(config: &Config, workspace_id: &str) -> Result<Option<StorageUpgrade>> {
+        let db_path = config.workspace_db_path(workspace_id);
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Self::open_file(&db_path, duckdb::Config::default())?;
+        Self::refuse_newer_schema(&conn, &db_path)?;
+        let from = StorageFormat::of(&conn)?;
+        if !from.is_outdated() {
+            return Ok(None);
+        }
+        let failed = |reason: String| Error::StorageUpgrade {
+            path: db_path.clone(),
+            reason,
+        };
+        let upgraded = db_path.with_extension("upgrading.duckdb");
+        Self::remove_database_file(&upgraded)?;
+        let copied = Self::copy_to_newest(&conn, &upgraded);
+        drop(conn);
+        if let Err(e) = copied {
+            Self::remove_database_file(&upgraded)?;
+            return Err(failed(e.to_string()));
+        }
+        // A log left beside the old file would be replayed into the new one.
+        if db_path.with_extension("duckdb.wal").exists() {
+            Self::remove_database_file(&upgraded)?;
+            return Err(failed(String::from(
+                "its write-ahead log outlived the checkpoint",
+            )));
+        }
+        let previous = db_path.with_extension("before-upgrade.duckdb");
+        std::fs::rename(&db_path, &previous).map_err(|e| failed(e.to_string()))?;
+        if let Err(e) = std::fs::rename(&upgraded, &db_path) {
+            std::fs::rename(&previous, &db_path)?;
+            return Err(failed(e.to_string()));
+        }
+        let to = match Self::storage_format(config, workspace_id) {
+            Ok(Some(to)) if !to.is_outdated() => to,
+            other => {
+                // The new file is not what was written: put the old one back.
+                std::fs::rename(&db_path, &upgraded)?;
+                std::fs::rename(&previous, &db_path)?;
+                Self::remove_database_file(&upgraded)?;
+                return Err(failed(format!(
+                    "the rewritten file did not reopen as expected ({other:?})"
+                )));
+            }
+        };
+        Self::remove_database_file(&previous)?;
+        tracing::info!(workspace = %workspace_id, from = %from, to = %to, "upgraded the workspace file's storage format");
+        Ok(Some(StorageUpgrade { from, to }))
+    }
+
+    /// Copy the database `conn` has open into a new file at `target` in the
+    /// newest format, and check every table arrived whole.
+    fn copy_to_newest(conn: &duckdb::Connection, target: &Path) -> Result<()> {
+        let source: String = conn.query_row("SELECT current_database()", [], |row| row.get(0))?;
+        conn.execute_batch("CHECKPOINT")?;
+        let target_text = target
+            .to_str()
+            .ok_or_else(|| Error::Ingestion(format!("{} is not a UTF-8 path", target.display())))?;
+        conn.execute(
+            "ATTACH ? AS quack_upgraded (STORAGE_VERSION 'latest')",
+            duckdb::params![target_text],
+        )?;
+        conn.execute_batch(&format!(
+            "COPY FROM DATABASE {} TO quack_upgraded",
+            quote_ident(&source)
+        ))?;
+        let tables: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT schema_name, table_name FROM duckdb_tables() \
+                 WHERE database_name = ? AND NOT temporary ORDER BY schema_name, table_name",
+            )?;
+            stmt.query_map(duckdb::params![source], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<duckdb::Result<_>>()?
+        };
+        for (schema, table) in &tables {
+            let count = |database: &str| -> Result<i64> {
+                Ok(conn.query_row(
+                    &format!(
+                        "SELECT count(*) FROM {}.{}.{}",
+                        quote_ident(database),
+                        quote_ident(schema),
+                        quote_ident(table)
+                    ),
+                    [],
+                    |row| row.get(0),
+                )?)
+            };
+            let (before, after) = (count(&source)?, count("quack_upgraded")?);
+            if before != after {
+                return Err(Error::Ingestion(format!(
+                    "{schema}.{table} has {before} rows but its copy {after}"
+                )));
+            }
+        }
+        conn.execute_batch("CHECKPOINT quack_upgraded; DETACH quack_upgraded")?;
+        Ok(())
+    }
+
+    /// Remove a database file and its write-ahead log, if they exist.
+    fn remove_database_file(path: &Path) -> Result<()> {
+        for file in [path.to_path_buf(), path.with_extension("duckdb.wal")] {
+            match std::fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the database file at `path` with `flags`, a file another
+    /// process holds reported as `Error::WorkspaceLocked`.
+    fn open_file(path: &Path, flags: duckdb::Config) -> Result<duckdb::Connection> {
+        duckdb::Connection::open_with_flags(path, flags).map_err(|e| {
+            if e.to_string().contains("Could not set lock") {
+                Error::WorkspaceLocked {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                Error::from(e)
+            }
+        })
+    }
+
     /// The schema version a workspace's file records, read through a
     /// read-only connection so nothing is created or upgraded: 0 for a file
     /// from before versions were recorded. [`Self::open`] upgrades a file
@@ -1216,12 +1413,7 @@ impl WorkspaceDb {
     /// file, or an error if it cannot be read.
     pub fn recorded_schema(config: &Config, workspace_id: &str) -> Result<u32> {
         let db_path = config.workspace_db_path(workspace_id);
-        let read_only = duckdb::Config::default()
-            .with(
-                "storage_compatibility_version",
-                STORAGE_COMPATIBILITY_VERSION,
-            )?
-            .access_mode(duckdb::AccessMode::ReadOnly)?;
+        let read_only = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
         let conn = duckdb::Connection::open_with_flags(&db_path, read_only).map_err(|e| {
             if e.to_string().contains("Could not set lock") {
                 Error::WorkspaceLocked {
@@ -1264,11 +1456,9 @@ impl WorkspaceDb {
         // DuckDB reports a file held by another process only in its message
         // text ("Could not set lock on file ..."); it is classified here, once,
         // so callers match a variant instead.
-        let storage = duckdb::Config::default().with(
-            "storage_compatibility_version",
-            STORAGE_COMPATIBILITY_VERSION,
-        )?;
-        let conn = duckdb::Connection::open_with_flags(&db_path, storage).map_err(|e| {
+        // A new file is created in the newest storage format; an existing
+        // one keeps its own until `upgrade_storage` rewrites it.
+        let conn = duckdb::Connection::open(&db_path).map_err(|e| {
             if e.to_string().contains("Could not set lock") {
                 Error::WorkspaceLocked {
                     path: db_path.clone(),
@@ -1278,6 +1468,15 @@ impl WorkspaceDb {
             }
         })?;
         Self::refuse_newer_schema(&conn, &db_path)?;
+        let format = StorageFormat::of(&conn)?;
+        if format.is_outdated() {
+            tracing::warn!(
+                workspace = %workspace_id,
+                format = %format,
+                newest = NEWEST_STORAGE_FORMAT,
+                "the workspace file is in an older storage format; `quack workspace upgrade` rewrites it in the newest (one-way)"
+            );
+        }
         // The columns keep the width they were created with until the
         // reconciliation below decides otherwise.
         let column_dimension = Self::recorded_dimension(&conn)?
@@ -1522,7 +1721,17 @@ impl WorkspaceDb {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
         if !is_error {
-            return Ok(SerializedStatement::Tree(parsed));
+            // DuckDB 2.0 serializes a data-modifying common table expression
+            // (`WITH d AS (DELETE ... RETURNING *) SELECT ...`) inside a
+            // SELECT, so the tree alone would call it a read; and an INSERT
+            // node names its table as a bare string the reference walk does
+            // not see. Such a tree is treated like any statement the
+            // serializer does not cover: a write, checked by its tokens.
+            return Ok(if modifies_data(&parsed) {
+                SerializedStatement::Unserializable
+            } else {
+                SerializedStatement::Tree(parsed)
+            });
         }
         let error_type = parsed.get("error_type").and_then(serde_json::Value::as_str);
         Ok(if error_type == Some("parser") {
@@ -6022,6 +6231,23 @@ fn is_single_read_only_statement(sql: &str) -> bool {
         .any(|k| k.eq_ignore_ascii_case(first))
 }
 
+/// Whether a serialized statement holds a data-modifying query node
+/// anywhere (`INSERT_QUERY_NODE`, `UPDATE_QUERY_NODE`, `DELETE_QUERY_NODE`,
+/// and whatever `DuckDB` names the same way next): every reading node is a
+/// `SELECT_NODE`, `SET_OPERATION_NODE`, `RECURSIVE_CTE_NODE`, or `CTE_NODE`.
+fn modifies_data(node: &serde_json::Value) -> bool {
+    match node {
+        serde_json::Value::Object(map) => {
+            map.get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind.ends_with("_QUERY_NODE"))
+                || map.values().any(modifies_data)
+        }
+        serde_json::Value::Array(items) => items.iter().any(modifies_data),
+        _ => false,
+    }
+}
+
 /// Walk a serialized statement tree collecting `table_name` values from
 /// base-table references.
 /// Null out the `value` of every `CONSTANT` node and drop every
@@ -6030,8 +6256,11 @@ fn blank_constants(node: &mut serde_json::Value) {
     match node {
         serde_json::Value::Object(map) => {
             map.remove("query_location");
+            // DuckDB 2.0 also records each node's length in the source,
+            // which changes with a literal's.
+            map.remove("query_location_length");
             if map.get("class").and_then(serde_json::Value::as_str) == Some("CONSTANT") {
-                map.insert(String::from("value"), serde_json::Value::Null);
+                map.insert(String::from("literal"), serde_json::Value::Null);
             }
             for child in map.values_mut() {
                 blank_constants(child);
@@ -6130,10 +6359,13 @@ fn column_of(node: &serde_json::Value) -> Option<(String, bool)> {
             let name = node
                 .get("function_name")
                 .and_then(serde_json::Value::as_str)?;
-            let children = node.get("children").and_then(serde_json::Value::as_array)?;
-            let [child] = children.as_slice() else {
+            let arguments = node
+                .get("arguments")
+                .and_then(serde_json::Value::as_array)?;
+            let [argument] = arguments.as_slice() else {
                 return None;
             };
+            let child = argument.get("expression")?;
             matches!(name, "lower" | "upper" | "lcase" | "ucase" | "trim")
                 .then(|| column_of(child).map(|(column, _)| (column, true)))
                 .flatten()
@@ -6142,23 +6374,15 @@ fn column_of(node: &serde_json::Value) -> Option<(String, bool)> {
     }
 }
 
-/// A filter operand's text, when it is a `VARCHAR` constant.
+/// A filter operand's text, when it is a string literal (`DuckDB` 2.0:
+/// `"literal": {"kind": "STRING", "text": ...}`).
 fn text_constant(node: &serde_json::Value) -> Option<String> {
     if node.get("class").and_then(serde_json::Value::as_str) != Some("CONSTANT") {
         return None;
     }
-    let value = node.get("value")?;
-    let is_text = value
-        .get("type")
-        .and_then(|t| t.get("id"))
-        .and_then(serde_json::Value::as_str)
-        == Some("VARCHAR");
-    let is_null = value
-        .get("is_null")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    (is_text && !is_null)
-        .then(|| value.get("value").and_then(serde_json::Value::as_str))
+    let literal = node.get("literal")?;
+    (literal.get("kind").and_then(serde_json::Value::as_str) == Some("STRING"))
+        .then(|| literal.get("text").and_then(serde_json::Value::as_str))
         .flatten()
         .map(str::to_owned)
 }
@@ -6178,6 +6402,10 @@ pub enum TypedSql {
     /// workspace file's path or the server's settings, which tell a remote
     /// user where `control.db` and every workspace live on the host.
     ServerCatalog,
+    /// `CREATE TRIGGER`: a trigger stays in the workspace file and fires
+    /// later on quack's own writes (a table-replacing ingest, a retype),
+    /// running whatever statement its author left there.
+    Trigger,
 }
 
 impl TypedSql {
@@ -6194,34 +6422,52 @@ impl TypedSql {
     ];
 
     /// Why `sql` is refused, if it is: the first word of any statement in
-    /// it is transaction control, or any word in it names the server's
-    /// catalog. A statement the tokenizer cannot read is left to the
-    /// parser, which refuses it as a syntax error.
+    /// it is transaction control, a statement creates a trigger, or any
+    /// word in it names the server's catalog. A statement the tokenizer
+    /// cannot read is left to the parser, which refuses it as a syntax
+    /// error.
     #[must_use]
     pub fn refusal(sql: &str) -> Option<Self> {
         let tokens = Tokenizer::new(&DuckDbDialect {}, sql).tokenize().ok()?;
-        let mut statement_start = true;
+        // The words a statement starts with, as far as
+        // `CREATE OR REPLACE TEMPORARY TRIGGER`; anything but a word ends them.
+        let mut leading: Vec<&str> = Vec::new();
+        let mut collecting = true;
         for token in &tokens {
             match token {
                 Token::Whitespace(_) => {}
-                Token::SemiColon => statement_start = true,
+                Token::SemiColon => {
+                    leading.clear();
+                    collecting = true;
+                }
                 Token::Word(word) => {
-                    if statement_start
+                    let value = word.value.as_str();
+                    if collecting
+                        && leading.is_empty()
                         && Self::TRANSACTION_CONTROL
                             .iter()
-                            .any(|k| k.eq_ignore_ascii_case(&word.value))
+                            .any(|k| k.eq_ignore_ascii_case(value))
                     {
                         return Some(Self::TransactionControl);
                     }
                     if Self::SERVER_CATALOG
                         .iter()
-                        .any(|f| f.eq_ignore_ascii_case(&word.value))
+                        .any(|f| f.eq_ignore_ascii_case(value))
                     {
                         return Some(Self::ServerCatalog);
                     }
-                    statement_start = false;
+                    if collecting && leading.len() < 5 {
+                        leading.push(value);
+                        if value.eq_ignore_ascii_case("TRIGGER")
+                            && leading
+                                .first()
+                                .is_some_and(|w| w.eq_ignore_ascii_case("CREATE"))
+                        {
+                            return Some(Self::Trigger);
+                        }
+                    }
                 }
-                _ => statement_start = false,
+                _ => collecting = false,
             }
         }
         None
@@ -6238,6 +6484,10 @@ impl fmt::Display for TypedSql {
             Self::ServerCatalog => {
                 "the server's catalog (database_list, duckdb_databases, duckdb_settings, \
                  current_setting, duckdb_extensions) is not accessible"
+            }
+            Self::Trigger => {
+                "CREATE TRIGGER is not accepted: a trigger would run later, on quack's \
+                 own writes to the table"
             }
         })
     }
@@ -6336,6 +6586,13 @@ pub fn quote_ident(name: &str) -> String {
 }
 
 fn extract_value(row: &duckdb::Row<'_>, idx: usize) -> serde_json::Value {
+    // A column of type NULL (`SELECT NULL AS n`) arrives as Arrow's
+    // NullArray, which reports no nulls; duckdb 1.20000.1 then panics in
+    // `get_ref` on its type. Its every value is NULL, so it is never read.
+    let statement: &duckdb::Statement<'_> = row.as_ref();
+    if statement.column_type(idx) == duckdb::arrow::datatypes::DataType::Null {
+        return serde_json::Value::Null;
+    }
     match row.get_ref(idx) {
         Ok(value) => json_of(duckdb::types::Value::from(value)),
         Err(_) => serde_json::Value::Null,

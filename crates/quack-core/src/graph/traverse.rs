@@ -105,7 +105,7 @@ pub fn resolve_entry(
         "SELECT id, label, class_id, CAST(properties AS VARCHAR), provisional FROM _quack_graph_nodes \
          WHERE (normalized_label = ? \
                 OR list_contains(list_transform(CAST(json_extract(properties, '$.aliases') AS VARCHAR[]), \
-                                                 x -> lower(trim(regexp_replace(x, '\\s+', ' ', 'g')))), ?)) \
+                                                 lambda x: lower(trim(regexp_replace(x, '\\s+', ' ', 'g')))), ?)) \
          AND (? IS NULL OR class_id = ?) ORDER BY label",
     )?;
     let mut rows = stmt.query(duckdb::params![normalized, normalized, class_id, class_id])?;

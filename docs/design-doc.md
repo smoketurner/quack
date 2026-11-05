@@ -2002,7 +2002,7 @@ counts against `max_turns`.
 
 A turn the model derails anyway (a nonexistent tool past those retries, the `max_turns`
 limit), or that fails after text streamed, keeps its text, gains a note saying what happened,
-and is recorded. Only an unreachable model is an error. `crates/quack-core/tests/agent_turn.rs`
+and is recorded. Only an unreachable model is an error. `crates/quack-core/tests/integration/agent_turn.rs`
 runs whole turns through rig against its scripted model (`test-utils`, a dev-dependency
 feature only).
 
