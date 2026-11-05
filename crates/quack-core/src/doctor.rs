@@ -170,8 +170,8 @@ impl Check {
 
     /// The check for a workspace file in an older storage format, read from
     /// the file itself; only an upgrade a person agrees to rewrites it.
-    fn older_storage_of(config: &Config, name: &str, id: &str) -> Option<Self> {
-        WorkspaceDb::storage_format(config, id)
+    fn older_storage_of(config: &Config, name: &str, id: &WorkspaceId) -> Option<Self> {
+        WorkspaceDb::storage_format(config, id.as_str())
             .ok()
             .flatten()
             .filter(StorageFormat::is_outdated)
@@ -690,9 +690,8 @@ async fn check_workspace(
         report.push(Check::pending_upgrade(name, recorded));
         return;
     }
-    report
-        .checks
-        .extend(Check::older_storage_of(config, name, row.id.as_str()));
+    let older = Check::older_storage_of(config, name, &row.id);
+    report.checks.extend(older);
     match WorkspaceDb::open(config, row.id.as_str()) {
         Ok(db) => {
             let tables = db.list_tables().map_or(0, |t| t.len());

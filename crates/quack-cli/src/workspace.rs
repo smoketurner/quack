@@ -230,6 +230,52 @@ impl OpenedWorkspace {
     }
 }
 
+/// Before a workspace in an older `DuckDB` storage format is opened at a
+/// terminal, ask whether to rewrite it in the newest; a no opens it as it is
+/// and the question comes back next time. Nothing is asked without a
+/// terminal on stdin and stderr (`quack mcp`, a pipe, cron): the file opens
+/// as it is, and opening it logs that `quack workspace upgrade` can.
+async fn offer_storage_upgrade(config: &Config, name: &str, id: &str) -> Result<()> {
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        return Ok(());
+    }
+    let format = {
+        let (config, id) = (config.clone(), id.to_owned());
+        tokio::task::spawn_blocking(move || WorkspaceDb::storage_format(&config, &id)).await?
+    };
+    // Held by another process, or unreadable: opening it says why.
+    let Ok(Some(format)) = format else {
+        return Ok(());
+    };
+    if !format.is_outdated() {
+        return Ok(());
+    }
+    let mut err = std::io::stderr().lock();
+    let question = format!(
+        "Workspace '{name}' is stored in DuckDB format {format}. Upgrade it to \
+         {NEWEST_STORAGE_FORMAT}? This can't be undone: a quack built on an older DuckDB \
+         won't open it afterwards."
+    );
+    if !Confirm::Ask.ask(&mut err, &question, None)? {
+        writeln!(err, "Opening it as it is; quack will ask again next time.")?;
+        return Ok(());
+    }
+    writeln!(err, "Upgrading '{name}'...")?;
+    drop(err);
+    let (config, id) = (config.clone(), id.to_owned());
+    let upgraded =
+        tokio::task::spawn_blocking(move || WorkspaceDb::upgrade_storage(&config, &id)).await??;
+    if let Some(upgrade) = upgraded {
+        writeln!(
+            std::io::stderr(),
+            "Upgraded '{name}' from {} to {}.",
+            upgrade.from,
+            upgrade.to
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -303,50 +349,4 @@ mod tests {
         opened.finish(std::time::Duration::ZERO).await;
         assert!(!socket.path().exists(), "the socket file was left behind");
     }
-}
-
-/// Before a workspace in an older `DuckDB` storage format is opened at a
-/// terminal, ask whether to rewrite it in the newest; a no opens it as it is
-/// and the question comes back next time. Nothing is asked without a
-/// terminal on stdin and stderr (`quack mcp`, a pipe, cron): the file opens
-/// as it is, and opening it logs that `quack workspace upgrade` can.
-async fn offer_storage_upgrade(config: &Config, name: &str, id: &str) -> Result<()> {
-    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
-        return Ok(());
-    }
-    let format = {
-        let (config, id) = (config.clone(), id.to_owned());
-        tokio::task::spawn_blocking(move || WorkspaceDb::storage_format(&config, &id)).await?
-    };
-    // Held by another process, or unreadable: opening it says why.
-    let Ok(Some(format)) = format else {
-        return Ok(());
-    };
-    if !format.is_outdated() {
-        return Ok(());
-    }
-    let mut err = std::io::stderr().lock();
-    let question = format!(
-        "Workspace '{name}' is stored in DuckDB format {format}. Upgrade it to \
-         {NEWEST_STORAGE_FORMAT}? This can't be undone: a quack built on an older DuckDB \
-         won't open it afterwards."
-    );
-    if !Confirm::Ask.ask(&mut err, &question, None)? {
-        writeln!(err, "Opening it as it is; quack will ask again next time.")?;
-        return Ok(());
-    }
-    writeln!(err, "Upgrading '{name}'...")?;
-    drop(err);
-    let (config, id) = (config.clone(), id.to_owned());
-    let upgraded =
-        tokio::task::spawn_blocking(move || WorkspaceDb::upgrade_storage(&config, &id)).await??;
-    if let Some(upgrade) = upgraded {
-        writeln!(
-            std::io::stderr(),
-            "Upgraded '{name}' from {} to {}.",
-            upgrade.from,
-            upgrade.to
-        )?;
-    }
-    Ok(())
 }

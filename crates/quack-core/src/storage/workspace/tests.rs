@@ -2205,7 +2205,7 @@ fn an_older_workspace_file_opens_as_is_and_upgrades_whole() {
     assert_eq!(upgrade.to.0, NEWEST_STORAGE_FORMAT);
     let mut left: Vec<String> = std::fs::read_dir(&workspace_dir)
         .unwrap_or_else(|e| fail(&e.to_string()))
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| name.starts_with("data"))
         .collect();
@@ -3441,7 +3441,7 @@ fn opening_a_version_15_workspace_lists_each_columns_values() {
     assert_eq!(range.as_deref(), Some("1 to 3"));
 }
 
-/// DuckDB 2.0 serializes a data-modifying common table expression inside a
+/// `DuckDB` 2.0 serializes a data-modifying common table expression inside a
 /// SELECT: classified by its tree alone it would be a read. Each one is a
 /// write, its `_quack_` target is still refused though an INSERT node
 /// names it as a bare string, and it has no shape a saved question or a
@@ -3490,7 +3490,7 @@ fn a_data_modifying_cte_is_a_write() {
     assert!(db.statement_shape(read).ok().flatten().is_some());
 }
 
-/// DuckDB 2.0 disables the arrow lambda by default; the prompt asks for
+/// `DuckDB` 2.0 disables the arrow lambda by default; the prompt asks for
 /// `lambda x:`, which runs.
 #[test]
 fn the_lambda_keyword_runs_and_the_arrow_form_is_refused() {

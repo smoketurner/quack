@@ -4405,6 +4405,7 @@ dependencies = [
  "quack-terminal",
  "rustix",
  "secrecy",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

@@ -19,7 +19,7 @@ use quack_core::storage::control::{
     AuditAction, AuditEntry, AuditFilter, AuditRow, Channel, ControlPlane, Expiry, GrantedBy,
     IssuedToken, Outcome, ResourceKind, Role, Scope, UserKind, WorkspaceName, WorkspaceRow,
 };
-use quack_core::storage::workspace::{NEWEST_STORAGE_FORMAT, WorkspaceDb};
+use quack_core::storage::workspace::{NEWEST_STORAGE_FORMAT, StorageFormat, WorkspaceDb};
 
 use quack_cli::Confirm;
 use quack_cli::TextOrJson;
@@ -92,8 +92,8 @@ pub(crate) enum WorkspaceAction {
         yes: bool,
     },
     /// Rewrite a workspace's file in the newest storage format this quack's
-    /// DuckDB writes. One-way: a quack built on an older DuckDB will not open
-    /// it afterwards
+    /// `DuckDB` writes. One-way: a quack built on an older `DuckDB` will not
+    /// open it afterwards
     Upgrade {
         name: String,
         /// Upgrade without asking
@@ -304,49 +304,7 @@ impl WorkspaceAction {
                 )?;
                 out.flush()?;
             }
-            Self::Upgrade { name, yes } => {
-                let ws = control.workspace_named(&name).await?;
-                let id = ws.id.as_str().to_owned();
-                let format = {
-                    let (config, id) = (config.clone(), id.clone());
-                    tokio::task::spawn_blocking(move || WorkspaceDb::storage_format(&config, &id))
-                        .await??
-                };
-                let mut out = stdout.lock();
-                let Some(format) = format.filter(|f| f.is_outdated()) else {
-                    writeln!(
-                        out,
-                        "Workspace '{name}' is already in the newest storage format ({NEWEST_STORAGE_FORMAT})."
-                    )?;
-                    return Ok(());
-                };
-                let question = format!(
-                    "Upgrade workspace '{name}' from DuckDB storage format {format} to \
-                     {NEWEST_STORAGE_FORMAT}? This can't be undone: a quack built on an older \
-                     DuckDB won't open it afterwards."
-                );
-                if !Confirm::Ask
-                    .or_yes(yes)
-                    .ask(&mut out, &question, Some("--yes"))?
-                {
-                    writeln!(out, "Not upgraded.")?;
-                    return Ok(());
-                }
-                drop(out);
-                let config = config.clone();
-                let upgraded =
-                    tokio::task::spawn_blocking(move || WorkspaceDb::upgrade_storage(&config, &id))
-                        .await??;
-                let mut out = stdout.lock();
-                match upgraded {
-                    Some(upgrade) => writeln!(
-                        out,
-                        "Upgraded '{name}' from {} to {}.",
-                        upgrade.from, upgrade.to
-                    )?,
-                    None => writeln!(out, "Workspace '{name}' needed no upgrade.")?,
-                }
-            }
+            Self::Upgrade { name, yes } => upgrade_workspace(config, &control, &name, yes).await?,
             Self::Rename { name, new_name } => {
                 let ws = control.workspace_named(&name).await?;
                 let entry = AuditEntry::new(AuditAction::Workspace, Outcome::Allowed, Channel::Cli);
@@ -1120,6 +1078,57 @@ where
 #[cfg(test)]
 mod tests;
 
+/// `quack workspace upgrade NAME`: ask, then rewrite the workspace's file
+/// in the newest storage format.
+async fn upgrade_workspace(
+    config: &Config,
+    control: &ControlPlane,
+    name: &str,
+    yes: bool,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    let ws = control.workspace_named(name).await?;
+    let id = ws.id.as_str().to_owned();
+    let format = {
+        let (config, id) = (config.clone(), id.clone());
+        tokio::task::spawn_blocking(move || WorkspaceDb::storage_format(&config, &id)).await??
+    };
+    let mut out = stdout.lock();
+    let Some(format) = format.filter(StorageFormat::is_outdated) else {
+        writeln!(
+            out,
+            "Workspace '{name}' is already in the newest storage format ({NEWEST_STORAGE_FORMAT})."
+        )?;
+        return Ok(());
+    };
+    let question = format!(
+        "Upgrade workspace '{name}' from DuckDB storage format {format} to \
+             {NEWEST_STORAGE_FORMAT}? This can't be undone: a quack built on an older \
+             DuckDB won't open it afterwards."
+    );
+    if !Confirm::Ask
+        .or_yes(yes)
+        .ask(&mut out, &question, Some("--yes"))?
+    {
+        writeln!(out, "Not upgraded.")?;
+        return Ok(());
+    }
+    drop(out);
+    let config = config.clone();
+    let upgraded =
+        tokio::task::spawn_blocking(move || WorkspaceDb::upgrade_storage(&config, &id)).await??;
+    let mut out = stdout.lock();
+    match upgraded {
+        Some(upgrade) => writeln!(
+            out,
+            "Upgraded '{name}' from {} to {}.",
+            upgrade.from, upgrade.to
+        )?,
+        None => writeln!(out, "Workspace '{name}' needed no upgrade.")?,
+    }
+    Ok(())
+}
+
 /// A workspace as `quack workspace list` shows it: the control plane's row
 /// and the storage format its file reports (read from the file itself).
 #[derive(serde::Serialize)]
@@ -1138,7 +1147,7 @@ impl ListedWorkspace {
             .ok()
             .flatten();
         Self {
-            storage_outdated: format.as_ref().is_some_and(|f| f.is_outdated()),
+            storage_outdated: format.as_ref().is_some_and(StorageFormat::is_outdated),
             storage_format: format.map(|f| f.0),
             workspace,
         }
