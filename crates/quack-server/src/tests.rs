@@ -8662,7 +8662,17 @@ async fn an_unanswered_write_expires() {
         StatusCode::NOT_FOUND
     );
 
-    let (outcomes, details) = writes.audited().await;
+    // The expiry's row is written by the timer after it refuses the
+    // turn, so it can land after the late answer's: wait for both.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (outcomes, details) = loop {
+        let (outcomes, details) = writes.audited().await;
+        let denied = outcomes.iter().filter(|o| *o == "denied").count();
+        if denied >= 2 || std::time::Instant::now() >= deadline {
+            break (outcomes, details);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     assert!(
         outcomes.iter().filter(|o| *o == "denied").count() >= 2,
         "{outcomes:?}"
