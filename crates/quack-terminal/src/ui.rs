@@ -14,6 +14,7 @@ use ratatui::widgets::{
     Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
 };
 
+use crate::WebStatus;
 use crate::app::{App, Message, MessageKind, PendingPrompt};
 use crate::clipboard::CopyStatus;
 use crate::commands::Suggestion;
@@ -454,11 +455,6 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(&app.workspace_name, Style::default().fg(Color::Cyan)),
         Span::styled(" \u{00B7} ", Style::default().fg(Color::DarkGray)),
         Span::styled(&app.provider_display, Style::default().fg(Color::DarkGray)),
-        Span::styled(" \u{00B7} session ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            app.session_id.short().to_owned(),
-            Style::default().fg(Color::DarkGray),
-        ),
         Span::styled(
             match app.scope.documents().len() {
                 0 => String::new(),
@@ -467,7 +463,30 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
             },
             Style::default().fg(Color::Yellow),
         ),
+        Span::styled(" \u{00B7} ", Style::default().fg(Color::DarkGray)),
     ]);
+    // Last, so a narrow screen cuts the address before the scope.
+    let style = match app.web {
+        WebStatus::Listening(_) => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::UNDERLINED),
+        WebStatus::Unavailable(_) => Style::default().fg(Color::DarkGray),
+    };
+    let address = Span::styled(app.web.header(), style);
+    let drawn = Rect {
+        x: title_area
+            .x
+            .saturating_add(u16::try_from(title.width()).unwrap_or(u16::MAX)),
+        width: u16::try_from(address.width()).unwrap_or(u16::MAX),
+        ..title_area
+    }
+    .intersection(title_area);
+    app.web_link.set(match app.web {
+        WebStatus::Listening(_) => (!drawn.is_empty()).then_some(drawn),
+        WebStatus::Unavailable(_) => None,
+    });
+    let mut title = title;
+    title.push_span(address);
 
     frame.render_widget(Paragraph::new(title), title_area);
     frame.render_widget(Paragraph::new(separator_line(sep_area.width)), sep_area);

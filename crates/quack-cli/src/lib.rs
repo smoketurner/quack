@@ -1,9 +1,10 @@
 //! The command-line verbs the binary and the terminal share: print mode,
 //! saved questions, the graph, ontology, tables, and embeddings commands,
-//! the arguments they take, and opening the workspace they run in
-//! (`OpenedWorkspace`). Design doc section 11.
+//! the arguments they take, opening the workspace they run in
+//! (`OpenedWorkspace`), and opening a URL in the browser. Design doc section 11.
 
 mod args;
+pub mod browser;
 pub mod classify_cli;
 mod confirm;
 pub mod embeddings_cli;

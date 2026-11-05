@@ -47,12 +47,23 @@ pub struct SessionSetup {
 /// session, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebStatus {
-    /// Listening on loopback; the transcript's first lines say where, and
-    /// that address's console lists the one workspace served.
+    /// Listening on loopback; the header shows where, and that address's
+    /// console lists the one workspace served.
     Listening(SocketAddr),
     /// It could not start (the port is taken, a client registration is
-    /// missing); the transcript says so once, and the session runs without.
+    /// missing); the header says `web off`, the transcript says why once,
+    /// and the session runs without.
     Unavailable(String),
+}
+
+impl WebStatus {
+    /// What the header's right end shows.
+    pub(crate) fn header(&self) -> String {
+        match self {
+            Self::Listening(addr) => format!("http://{addr}"),
+            Self::Unavailable(_) => String::from("web off"),
+        }
+    }
 }
 
 /// How long a quitting session gives its jobs, and the server beside it

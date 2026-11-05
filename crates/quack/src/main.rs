@@ -61,7 +61,7 @@ use quack_cli::{ExportFlags, ModeArg, QueryFormat};
 use quack_cli::{ImportAction, ImportArgs, ImportContext};
 use quack_cli::{NamedInput, StdioPath};
 use quack_cli::{OpenedWorkspace, RecordedRun, SessionChoice, find_session, resolve_session};
-use quack_cli::{embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
+use quack_cli::{browser, embeddings_cli, graph_cli, ontology_cli, saved_cli, tables_cli};
 use quack_core::engine::{Drain, Holder, Stop};
 use quack_mcp::client::{CommandClient, HolderClient};
 
@@ -1713,7 +1713,7 @@ async fn run_register(config: &Config, args: auth_cli::RegisterArgs) -> Result<(
         args,
         confirm,
         auth_cli::SignInWith {
-            browser: browser_can_open(),
+            browser: browser::can_open(),
             notify: &show_login_prompt,
             interrupt: Box::pin(async {
                 // A signal handler that cannot be installed must not read as
@@ -1736,7 +1736,7 @@ async fn run_auth(config: &Config, action: AuthAction) -> Result<()> {
             device_code,
         } => {
             let manager = TokenManager::for_provider(config, &provider)?;
-            let flow = if device_code || !browser_can_open() {
+            let flow = if device_code || !browser::can_open() {
                 LoginFlow::DeviceCode
             } else {
                 LoginFlow::Configured
@@ -1881,7 +1881,7 @@ fn show_login_prompt(prompt: LoginPrompt) {
     let mut out = stdout.lock();
     let written = match prompt {
         LoginPrompt::Browser { url } => {
-            let opened = open_browser(&url);
+            let opened = browser::open(&url);
             writeln!(
                 out,
                 "{}\n\n  {url}\n\nWaiting for the sign-in to finish...",
@@ -1913,38 +1913,6 @@ fn show_login_prompt(prompt: LoginPrompt) {
     drop(out.flush());
 }
 
-/// Whether a browser on this machine can reach the loopback redirect: not
-/// over SSH, and on Linux only with a display.
-fn browser_can_open() -> bool {
-    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
-        return false;
-    }
-    if cfg!(target_os = "linux") {
-        return std::env::var_os("DISPLAY").is_some()
-            || std::env::var_os("WAYLAND_DISPLAY").is_some();
-    }
-    true
-}
-
-/// Launch the platform's URL opener. Returns whether it started.
-fn open_browser(url: &str) -> bool {
-    let mut command = if cfg!(target_os = "macos") {
-        std::process::Command::new("open")
-    } else if cfg!(target_os = "windows") {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", ""]);
-        c
-    } else {
-        std::process::Command::new("xdg-open")
-    };
-    command
-        .arg(url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .is_ok()
-}
-
 /// Where the session serves the web UI, REST API, and MCP beside itself:
 /// `[server].bind`'s port on loopback, or a random loopback port when
 /// nothing set one. The host part is not used, since local mode serves
@@ -1961,7 +1929,8 @@ fn local_addr(server: &ServerConfig) -> SocketAddr {
 
 /// No arguments: the interactive session, which needs a terminal, and the
 /// web UI, REST API, and MCP on loopback beside it from the same engine. A
-/// server that cannot start is one transcript line.
+/// server that cannot start is `web off` in the header and one transcript
+/// line saying why.
 async fn run_terminal_session(cli: &Cli, stdout_is_tty: bool) -> Result<ExitCode> {
     if !std::io::stdin().is_terminal() || !stdout_is_tty {
         init_logging();
