@@ -236,6 +236,7 @@ impl ErrorCode {
             | CoreError::WriterStopped
             | CoreError::WritePanicked(_)
             | CoreError::WorkspaceSchemaUnreadable { .. }
+            | CoreError::StorageUpgrade { .. }
             | CoreError::ModelRequestUnscoped { .. } => {
                 (Self::Internal, StatusCode::INTERNAL_SERVER_ERROR)
             }

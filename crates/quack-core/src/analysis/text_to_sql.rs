@@ -47,6 +47,8 @@ UNPIVOT reshape between wide and long\n\
 LATERAL correlates a subquery with the rows before it\n\
 - Lists and structs: [1, 2, 3] is a list, l[1] is its first element and l[-1] its last, \
 {'a': 1} is a struct read as s.a, [x * 2 FOR x IN l] is a comprehension, UNNEST(l) explodes\n\
+- Lambdas are written lambda x: x * 2, as in list_transform(l, lambda x: x * 2) or \
+list_filter(l, lambda x: x > 0); the arrow form x -> x * 2 is an error\n\
 - Strings: || concatenates, ILIKE is case-insensitive, 'text'.upper() chains a function with \
 a dot, s[1:3] slices, regexp_matches(s, 'pat') tests a pattern\n\
 - Dates and times: date_trunc('month', ts), strftime(ts, '%Y-%m-%d'), ts + INTERVAL 7 DAY, \

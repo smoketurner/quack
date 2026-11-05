@@ -612,13 +612,17 @@ impl<M: EmbeddingModel> Processing<'_, M> {
             Ok(result) => {
                 let (chunks, tables) = (result.chunks_stored, result.tables.clone());
                 let pages = result.pages;
+                // One transaction: a reader sees the new document ready
+                // only once the old one is superseded.
                 result.replaced = db
                     .run(move |db| {
-                        db.set_document_chunk_count(&id, chunks)?;
-                        db.set_document_pages(&id, pages)?;
-                        db.set_document_tables(&id, &tables)?;
-                        db.update_document_status(&id, DocumentStatus::Ready)?;
-                        db.finish_replacement(&id)
+                        db.write_transaction(|db| {
+                            db.set_document_chunk_count(&id, chunks)?;
+                            db.set_document_pages(&id, pages)?;
+                            db.set_document_tables(&id, &tables)?;
+                            db.update_document_status(&id, DocumentStatus::Ready)?;
+                            db.finish_replacement(&id)
+                        })
                     })
                     .await?;
             }
