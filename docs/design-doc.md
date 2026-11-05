@@ -3002,8 +3002,8 @@ resolved through the control plane like every interface). Bare `quack` also serv
 and on a random loopback port otherwise, so a browser and
 Claude Code's MCP entry (`http://127.0.0.1:8080/mcp/v1/{workspace}`) reach the workspace the
 session holds without a second process. The header's title row says where
-(`http://127.0.0.1:8080`, at its end; that address's console lists the one workspace
-served); a server that cannot start (the port is taken, a provider client has no registration)
+(`http://127.0.0.1:8080`, at its end, and a click on it opens this machine's browser there, or
+says how to forward the port over SSH; that address's console lists the one workspace served); a server that cannot start (the port is taken, a provider client has no registration)
 is `web off` there and one transcript line saying why, and the session runs without it.
 That server serves the session's workspace alone: the console lists one, and any other id is
 unknown there (404), so a browser click never makes the session's process open another

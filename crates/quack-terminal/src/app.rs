@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io::Write as _;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use futures::future::BoxFuture;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::{broadcast, mpsc};
@@ -71,6 +73,7 @@ use crate::{QUIT_GRACE, SessionSetup, WebStatus};
 use quack_cli::Confirm;
 use quack_cli::ModeArg;
 use quack_cli::TextOrJson;
+use quack_cli::browser;
 use quack_cli::classify_cli::{ClassifyCommand, Prepared};
 use quack_cli::embeddings_cli::{self, EmbeddingsAction};
 use quack_cli::graph_cli::GraphAction;
@@ -993,6 +996,11 @@ pub(crate) struct App {
     pub(crate) workspace_name: String,
     /// Where the web UI beside the session listens, shown in the header.
     pub(crate) web: WebStatus,
+    /// Where the header drew the web address, when it did; a left click
+    /// there opens it.
+    pub(crate) web_link: Cell<Option<Rect>>,
+    /// A clicked web address, until the loop opens it.
+    pub(crate) to_open: Option<SocketAddr>,
     pub(crate) provider_display: String,
     pub(crate) session_id: SessionId,
     /// Decisions owed, oldest first; the front one is on screen.
@@ -1091,6 +1099,8 @@ impl App {
             spinner: Spinner::default(),
             workspace_name,
             web,
+            web_link: Cell::new(None),
+            to_open: None,
             provider_display: config.chat_model_label(),
             session_id,
             prompts: VecDeque::new(),
@@ -1296,6 +1306,9 @@ impl App {
             if let Some(text) = self.to_copy.take() {
                 self.copy_status = Some(clipboard.copy(&text));
             }
+            if let Some(addr) = self.to_open.take() {
+                self.open_in_browser(addr);
+            }
             if dirty {
                 self.pump();
             }
@@ -1354,6 +1367,15 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.clear_selection();
+                if let WebStatus::Listening(addr) = self.web
+                    && self
+                        .web_link
+                        .get()
+                        .is_some_and(|link| link.contains(Position::new(mouse.column, mouse.row)))
+                {
+                    self.to_open = Some(addr);
+                    return false;
+                }
                 if self.picker.is_none()
                     && !self.awaiting_permission()
                     && let Some(Located {
@@ -1387,6 +1409,27 @@ impl App {
             | MouseEventKind::Moved
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight => false,
+        }
+    }
+
+    /// Open the header's web address in this machine's browser, or say
+    /// where to open it when no browser here can.
+    fn open_in_browser(&mut self, addr: SocketAddr) {
+        let url = format!("http://{addr}");
+        if !browser::can_open() {
+            let port = addr.port();
+            self.note(
+                MessageKind::System,
+                format!(
+                    "web: no browser here; from your own machine, forward the port with \
+                     `ssh -L {port}:127.0.0.1:{port}` and open {url}"
+                ),
+            );
+        } else if !browser::open(&url) {
+            self.note(
+                MessageKind::Error,
+                format!("web: could not start a browser; open {url} yourself"),
+            );
         }
     }
 

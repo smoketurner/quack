@@ -67,7 +67,7 @@ fn app_in(dir: &Path, workspace: &str, mut config: Config) -> App {
     let reader_db = ReaderDb::new(Arc::clone(&db));
     App::new(SessionSetup {
         engine: Engine::new(config, Holder::Terminal(WorkspaceId::from(workspace))),
-        web: WebStatus::Listening(std::net::SocketAddr::from(([127, 0, 0, 1], 8080))),
+        web: WebStatus::Listening(SocketAddr::from(([127, 0, 0, 1], 8080))),
         workspace_name: String::from(workspace),
         workspace_id: WorkspaceId::from(workspace),
         db,
@@ -1977,7 +1977,7 @@ fn an_unavailable_web_server_is_web_off_and_one_transcript_line() {
     let session = sessions::create_session(&db, "m", ChatMode::Chat, None)
         .unwrap_or_else(|e| fail(&e.to_string()));
     let db: SharedDb = Arc::new(Writer::spawn(db).unwrap_or_else(|e| fail(&e.to_string())));
-    let app = App::new(SessionSetup {
+    let mut app = App::new(SessionSetup {
         engine: Engine::new(config, Holder::Terminal(WorkspaceId::from("ws"))),
         web: WebStatus::Unavailable(String::from("cannot listen on 127.0.0.1:8080")),
         workspace_name: String::from("ws"),
@@ -1996,6 +1996,43 @@ fn an_unavailable_web_server_is_web_off_and_one_transcript_line() {
         last.content,
         "web: cannot listen on 127.0.0.1:8080; this session runs without the web UI and MCP"
     );
+    let left = MouseEventKind::Down(MouseButton::Left);
+    app.handle_terminal_event(&mouse(left, column_of(&row, "web off"), 0));
+    assert_eq!(app.to_open, None, "web off is not a link");
+}
+
+/// The screen column `needle` starts at in `row`.
+fn column_of(row: &str, needle: &str) -> u16 {
+    let Some((before, _)) = row.split_once(needle) else {
+        fail(&format!("{needle} is not in {row}"))
+    };
+    u16::try_from(before.chars().count()).unwrap_or_else(|e| fail(&e.to_string()))
+}
+
+/// A left click on the header's address queues it for the browser; a
+/// click beside it does not.
+#[test]
+fn clicking_the_web_address_opens_it() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| fail(&e.to_string()));
+    let mut app = app(dir.path());
+    let row = title_row(&app);
+    let first = column_of(&row, "http://");
+    let last = first.saturating_add(20);
+    let left = MouseEventKind::Down(MouseButton::Left);
+
+    app.handle_terminal_event(&mouse(left, first.saturating_sub(1), 0));
+    assert_eq!(app.to_open, None, "the separator before it");
+    app.handle_terminal_event(&mouse(left, last.saturating_add(1), 0));
+    assert_eq!(app.to_open, None, "past its end");
+    app.handle_terminal_event(&mouse(left, first, 1));
+    assert_eq!(app.to_open, None, "the row under it");
+
+    app.handle_terminal_event(&mouse(left, last, 0));
+    assert_eq!(app.to_open, Some(SocketAddr::from(([127, 0, 0, 1], 8080))));
+    assert!(
+        app.selection.is_none(),
+        "a click on the link starts no selection"
+    );
 }
 
 /// A second session over `app`'s workspace, as the next `quack -w` sees it.
@@ -2005,7 +2042,7 @@ fn next_session(app: &App) -> App {
             Config::clone(&app.config),
             Holder::Terminal(app.workspace_id.clone()),
         ),
-        web: WebStatus::Listening(std::net::SocketAddr::from(([127, 0, 0, 1], 8080))),
+        web: WebStatus::Listening(SocketAddr::from(([127, 0, 0, 1], 8080))),
         workspace_name: app.workspace_name.clone(),
         workspace_id: app.workspace_id.clone(),
         db: Arc::clone(&app.db),
