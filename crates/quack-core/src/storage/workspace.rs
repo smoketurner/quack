@@ -1522,7 +1522,17 @@ impl WorkspaceDb {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
         if !is_error {
-            return Ok(SerializedStatement::Tree(parsed));
+            // DuckDB 2.0 serializes a data-modifying common table expression
+            // (`WITH d AS (DELETE ... RETURNING *) SELECT ...`) inside a
+            // SELECT, so the tree alone would call it a read; and an INSERT
+            // node names its table as a bare string the reference walk does
+            // not see. Such a tree is treated like any statement the
+            // serializer does not cover: a write, checked by its tokens.
+            return Ok(if modifies_data(&parsed) {
+                SerializedStatement::Unserializable
+            } else {
+                SerializedStatement::Tree(parsed)
+            });
         }
         let error_type = parsed.get("error_type").and_then(serde_json::Value::as_str);
         Ok(if error_type == Some("parser") {
@@ -5854,6 +5864,23 @@ fn is_single_read_only_statement(sql: &str) -> bool {
     READ_ONLY_KEYWORDS
         .iter()
         .any(|k| k.eq_ignore_ascii_case(first))
+}
+
+/// Whether a serialized statement holds a data-modifying query node
+/// anywhere (`INSERT_QUERY_NODE`, `UPDATE_QUERY_NODE`, `DELETE_QUERY_NODE`,
+/// and whatever DuckDB names the same way next): every reading node is a
+/// `SELECT_NODE`, `SET_OPERATION_NODE`, `RECURSIVE_CTE_NODE`, or `CTE_NODE`.
+fn modifies_data(node: &serde_json::Value) -> bool {
+    match node {
+        serde_json::Value::Object(map) => {
+            map.get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind.ends_with("_QUERY_NODE"))
+                || map.values().any(modifies_data)
+        }
+        serde_json::Value::Array(items) => items.iter().any(modifies_data),
+        _ => false,
+    }
 }
 
 /// Walk a serialized statement tree collecting `table_name` values from

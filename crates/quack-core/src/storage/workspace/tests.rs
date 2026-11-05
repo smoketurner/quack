@@ -302,6 +302,10 @@ fn workspace_connection_is_confined_to_its_directory_and_locked() {
             dir.path().join("other.duckdb").display()
         ),
         String::from("INSTALL httpfs"),
+        String::from("INSTALL httpfs FROM 'https://example.com'"),
+        String::from("ATTACH 'quack:example.com' AS remote"),
+        String::from("CONNECT 'example.com'"),
+        String::from("CREATE EXTENSION REPOSITORY r AS 'https://example.com'"),
         String::from("SET memory_limit = '8GB'"),
         String::from("SET enable_external_access = true"),
         String::from("SET allowed_directories = ['/']"),
@@ -384,6 +388,15 @@ fn typed_sql_refuses_transaction_control_and_the_servers_catalog() {
         ),
         ("CALL pragma_database_list()", TypedSql::ServerCatalog),
         ("SELECT * FROM duckdb_extensions()", TypedSql::ServerCatalog),
+        (
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN DELETE FROM t; END",
+            TypedSql::Trigger,
+        ),
+        (
+            "create or replace temporary trigger tr after update on t execute delete from t",
+            TypedSql::Trigger,
+        ),
+        ("SELECT 1; CREATE TRIGGER tr", TypedSql::Trigger),
     ] {
         assert_eq!(TypedSql::refusal(sql), Some(why), "{sql}");
         let refused = db.classify_user_statement(sql).err().map(|e| e.to_string());
@@ -400,6 +413,9 @@ fn typed_sql_refuses_transaction_control_and_the_servers_catalog() {
         "SELECT * FROM beginnings",
         "SELECT end_date FROM t",
         "DESCRIBE t",
+        "SELECT 'CREATE TRIGGER' AS text",
+        "CREATE TABLE trigger_log (a INT)",
+        "SELECT trigger FROM t",
     ] {
         assert_eq!(TypedSql::refusal(sql), None, "{sql}");
     }
@@ -3377,4 +3393,70 @@ fn opening_a_version_15_workspace_lists_each_columns_values() {
         .and_then(|c| c.range.as_ref())
         .map(ToString::to_string);
     assert_eq!(range.as_deref(), Some("1 to 3"));
+}
+
+/// DuckDB 2.0 serializes a data-modifying common table expression inside a
+/// SELECT: classified by its tree alone it would be a read. Each one is a
+/// write, its `_quack_` target is still refused though an INSERT node
+/// names it as a bare string, and it has no shape a saved question or a
+/// sort could reuse.
+#[test]
+fn a_data_modifying_cte_is_a_write() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    db.execute_statement("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1)")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    for sql in [
+        "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+        "WITH d AS (INSERT INTO t VALUES (2) RETURNING *) SELECT * FROM d",
+        "WITH d AS (UPDATE t SET a = 3 RETURNING *) SELECT count(*) FROM d",
+        "SELECT * FROM (WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d)",
+    ] {
+        assert_eq!(
+            db.classify_statement(sql)
+                .unwrap_or_else(|e| fail(&e.to_string())),
+            StatementKind::Write,
+            "{sql}"
+        );
+        assert_eq!(db.statement_shape(sql).ok().flatten(), None, "{sql}");
+        assert!(
+            db.sortable(sql).ok().flatten().is_none(),
+            "{sql} has no rows of its own to reorder"
+        );
+    }
+    for sql in [
+        "WITH d AS (INSERT INTO _quack_meta VALUES ('k', 'v') RETURNING *) SELECT * FROM d",
+        "WITH d AS (DELETE FROM _quack_documents RETURNING *) SELECT count(*) FROM d",
+    ] {
+        assert!(
+            db.references_internal_table(sql)
+                .unwrap_or_else(|e| fail(&e.to_string())),
+            "{sql}"
+        );
+    }
+    // A plain CTE is still a read with a shape.
+    let read = "WITH d AS (SELECT * FROM t) SELECT * FROM d";
+    assert_eq!(
+        db.classify_statement(read)
+            .unwrap_or_else(|e| fail(&e.to_string())),
+        StatementKind::Read
+    );
+    assert!(db.statement_shape(read).ok().flatten().is_some());
+}
+
+/// DuckDB 2.0 disables the arrow lambda by default; the prompt asks for
+/// `lambda x:`, which runs.
+#[test]
+fn the_lambda_keyword_runs_and_the_arrow_form_is_refused() {
+    let db =
+        WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap_or_else(|e| fail(&e.to_string()));
+    let ran = db
+        .execute_query("SELECT list_transform([1, 2], lambda x: x * 2) AS l")
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    assert_eq!(ran.rows.len(), 1);
+    assert!(
+        db.execute_query("SELECT list_transform([1, 2], x -> x * 2) AS l")
+            .is_err(),
+        "the arrow form ran; DuckDB re-enabled it"
+    );
 }
