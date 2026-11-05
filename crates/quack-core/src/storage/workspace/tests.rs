@@ -980,7 +980,8 @@ fn capped_query_names_each_column_type() {
             "INTEGER[]",
             "DATE",
             "STRUCT",
-            "INTEGER",
+            // DuckDB 2.0 types a bare NULL as NULL (1.5 made it INTEGER).
+            "NULL",
             "TIMESTAMP WITH TIME ZONE"
         ]
     );

@@ -1368,19 +1368,19 @@ impl Tool for DescribeTableTool {
         let table_name = args.table_name.clone();
         let outcome = self
             .0
-            .with_db(move |db| {
-                Ok(match db.describe_table(&table_name) {
-                    Ok(d) => Ok(d),
-                    Err(e) => {
-                        let tables = db.list_tables().unwrap_or_default();
-                        Err((e.to_string(), tables))
-                    }
-                })
-            })
+            .with_db(move |db| Ok(db.describe_table(&table_name).map_err(|e| e.to_string())))
             .await?;
         let desc = match outcome {
             Ok(d) => d,
-            Err((message, tables)) => {
+            Err(message) => {
+                // In a read of its own: DuckDB 2.0 aborts the transaction
+                // a failed statement ran in, so the same read could not
+                // list anything after it.
+                let tables = self
+                    .0
+                    .with_db(|db| db.list_tables())
+                    .await
+                    .unwrap_or_default();
                 let message = step.fail(message);
                 return Err(ToolExecutionError::not_found(format!(
                     "{SQL_ERROR_PREFIX}{message}\nTables in this workspace: {}",
