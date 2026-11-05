@@ -25,7 +25,7 @@ A tool is a rig `Tool` the agent may call during a turn. `read_document`
    `crates/quack-cli/src/print.rs` (the step line on stderr), `crates/quack-server/src/web/mod.rs` (the chat
    page's step view), and `crates/quack-terminal/src/app.rs` (the transcript's step message). The compiler
    lists every exhaustive match the new variant breaks.
-6. **`crates/quack-core/tests/agent_turn.rs`**: a whole turn through rig's scripted model
+6. **`crates/quack-core/tests/integration/agent_turn.rs`**: a whole turn through rig's scripted model
    that calls the tool and checks the step, its summary, and the response.
 7. **`crates/quack-mcp/src/lib.rs`**, when the tool is also an MCP tool: its handler, audited
    with channel `mcp`.

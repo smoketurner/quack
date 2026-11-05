@@ -576,7 +576,7 @@ async fn a_first_run_that_asked_for_everything_is_recorded_as_a_first_labelling(
     let token = CancellationToken::new();
     let firing = token.clone();
     let progress = move |_: ChunkDone| firing.cancel();
-    scoped(async {
+    scoped(Box::pin(async {
         let stopped = fixture
             .try_run(
                 &Classification {
@@ -604,7 +604,7 @@ async fn a_first_run_that_asked_for_everything_is_recorded_as_a_first_labelling(
             },
             "later questions are compared against the first run's"
         );
-    })
+    }))
     .await;
 }
 
@@ -1676,7 +1676,7 @@ fn the_statement_a_person_approves_shows_each_question_on_one_line() {
 #[tokio::test]
 async fn a_retyped_source_key_labels_every_row_again() {
     let fixture = Fixture::new().await;
-    scoped(async {
+    scoped(Box::pin(async {
         let first = fixture.run(&request()).await;
         assert_eq!(first.key_type, "BIGINT");
         fixture
@@ -1693,7 +1693,7 @@ async fn a_retyped_source_key_labels_every_row_again() {
             (again.rows, again.key_type.as_str()),
             (Rows::All, "INTEGER")
         );
-    })
+    }))
     .await;
 }
 
@@ -2521,7 +2521,7 @@ async fn a_cancelled_relabel_leaves_its_questions_to_be_the_next_run() {
 #[tokio::test]
 async fn an_outline_says_what_the_run_does_to_the_output() {
     let fixture = Fixture::new().await;
-    scoped(async {
+    scoped(Box::pin(async {
         let first = fixture.outline(&request()).await;
         assert_eq!(first.effect, Effect::NewTable);
         assert_eq!((first.remaining, first.estimate_seconds), (600, None));
@@ -2561,7 +2561,7 @@ async fn an_outline_says_what_the_run_does_to_the_output() {
         fixture.run(&request()).await;
         let nothing = fixture.outline(&request()).await;
         assert_eq!((nothing.effect, nothing.remaining), (Effect::AddsRows, 0));
-    })
+    }))
     .await;
 }
 

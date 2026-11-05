@@ -20,7 +20,7 @@ use crate::ids::{ChunkId, DocumentId};
 use crate::storage::profile::TableProfile;
 use crate::storage::workspace::{
     ChunkSearchResult, DocumentFilter, DocumentListing, DocumentStatus, HybridLimits, SearchMode,
-    StatementKind, TEMP_OBJECT_REFUSED, WorkspaceDb, creates_temp_object, quote_ident,
+    StatementKind, TEMP_OBJECT_REFUSED, TypedSql, WorkspaceDb, creates_temp_object, quote_ident,
 };
 use crate::storage::writer::Writer;
 
@@ -588,6 +588,9 @@ enum Screened {
     Internal,
     /// It writes something named `graph_`.
     ReservedGraph,
+    /// It does what no SQL may on the workspace's shared connection: a
+    /// transaction, the server's catalog, a trigger.
+    Refused(TypedSql),
     /// A read of a `graph_` view, whose labels and properties were
     /// extracted from document text.
     GraphRead,
@@ -619,6 +622,7 @@ impl SqlGate {
             Screened::ReservedGraph => {
                 return Ok(Gate::Reject(String::from(graph::views::RESERVED_REFUSED)));
             }
+            Screened::Refused(refused) => return Ok(Gate::Reject(refused.to_string())),
         };
         match kind {
             StatementKind::Read => self.named_values(sql, turn).await,
@@ -649,6 +653,7 @@ impl SqlGate {
                 Gate::Read
             }
             Screened::Internal => Gate::Reject(String::from(INTERNAL_TABLE_REFUSED)),
+            Screened::Refused(refused) => Gate::Reject(refused.to_string()),
             Screened::Kind(StatementKind::Read) => self.named_values(sql, turn).await?,
             Screened::Kind(StatementKind::Invalid(msg)) => {
                 Gate::Reject(format!("SQL syntax error: {msg}"))
@@ -691,6 +696,9 @@ impl SqlGate {
             .with_db(move |db| {
                 if db.references_internal_table(&sql)? {
                     return Ok(Screened::Internal);
+                }
+                if let Some(refused) = TypedSql::refusal(&sql) {
+                    return Ok(Screened::Refused(refused));
                 }
                 let kind = db.classify_statement(&sql)?;
                 if graph::views::write_names_reserved(&sql, &kind) {
@@ -1360,19 +1368,19 @@ impl Tool for DescribeTableTool {
         let table_name = args.table_name.clone();
         let outcome = self
             .0
-            .with_db(move |db| {
-                Ok(match db.describe_table(&table_name) {
-                    Ok(d) => Ok(d),
-                    Err(e) => {
-                        let tables = db.list_tables().unwrap_or_default();
-                        Err((e.to_string(), tables))
-                    }
-                })
-            })
+            .with_db(move |db| Ok(db.describe_table(&table_name).map_err(|e| e.to_string())))
             .await?;
         let desc = match outcome {
             Ok(d) => d,
-            Err((message, tables)) => {
+            Err(message) => {
+                // In a read of its own: DuckDB 2.0 aborts the transaction
+                // a failed statement ran in, so the same read could not
+                // list anything after it.
+                let tables = self
+                    .0
+                    .with_db(WorkspaceDb::list_tables)
+                    .await
+                    .unwrap_or_default();
                 let message = step.fail(message);
                 return Err(ToolExecutionError::not_found(format!(
                     "{SQL_ERROR_PREFIX}{message}\nTables in this workspace: {}",

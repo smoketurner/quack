@@ -96,7 +96,7 @@ cargo run --bin quack -- -q "SELECT 1" [-f table|json|ndjson|csv|markdown]   # S
 cargo run --bin quack -- jobs [--format json]                                 # the workspace's jobs: what runs, what ran and how it ended (_quack_jobs; restored on open); through the holder's quack://workspace/jobs when another quack holds it
 cat x.csv | cargo run --bin quack -- -p "..."                                  # piped stdin is the temp table `stdin` (-p and -q; --stdin waits for a slow pipe)
 cargo run --bin quack -- workspace create ws | workspace list [--format json]  # -w must name a workspace that exists (else exit 2); only [general].default_workspace is created on first use
-cargo run --bin quack -- workspace rename OLD NEW | delete NAME [-y] | snapshot NAME [--to FILE|-] | restore FILE|- [--name N]   # storage::backup: one tar (manifest.json, data.duckdb, files/); delete is at once (refused, naming the holder, while another process holds the workspace: the socket's answer, else the file's lock), the audit rows stay; rename notes a holder, which keeps the old name until restarted
+cargo run --bin quack -- workspace rename OLD NEW | delete NAME [-y] | upgrade NAME [-y] | snapshot NAME [--to FILE|-] | restore FILE|- [--name N]   # storage::backup: one tar (manifest.json, data.duckdb, files/); delete is at once (refused, naming the holder, while another process holds the workspace: the socket's answer, else the file's lock), the audit rows stay; rename notes a holder, which keeps the old name until restarted; upgrade rewrites a file in an older DuckDB storage format in the newest (one-way; the terminal asks before opening one, docs/migrations.md)
 cargo run --bin quack -- ingest sales.csv -w ws [--replace [ID]] [--types amount=DOUBLE]   # file -> table(s) or chunks; --replace supersedes the document with the same name (or ID) once the new one is ready; --types retypes columns strictly after the load; an image needs [ingestion].vision_model
 cargo run --bin quack -- ingest DIR -w ws [--prune]                            # every supported file under DIR (not a bundle), root and path recorded; re-run skips unchanged, replaces changed, reports gone files of that root (--prune deletes them)
 #   tables: CSV/TSV, Parquet, JSON/JSONL, XLSX/XLS/ODS (one table per sheet), YAML that is a list of records; chunks: PDF, Markdown, text, HTML, DOCX/DOC, PPTX/PPT, EPUB, ODT, EML/MBOX, VTT/SRT, source code, RTF, other YAML
@@ -280,7 +280,7 @@ and a read filtering such a column on a value the question does not name (`'TENN
 Texas) or a spelling the column does not hold is refused with the stored value
 (`WorkspaceDb::statement_filters` over `DuckDB`'s parse tree). The graph tools register only
 when the question names a node (`graph::store::named_in`, `Modeled::for_question`);
-`tests/agent_turn.rs` drives whole turns with rig's scripted model. The tools hold only the
+`tests/integration/agent_turn.rs` drives whole turns with rig's scripted model. The tools hold only the
 workspace and its settings; a turn's recorder, write policy, refusal flag, and chart and graph
 results are one `analysis::tools::Turn`, handed to every call as a runtime scope of rig's
 `ToolContext` (`.tool_context(turn.context())` on the run). `--allow-write` lets the agent run mutating SQL without asking; otherwise the terminal
