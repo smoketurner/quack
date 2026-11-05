@@ -690,9 +690,9 @@ async fn check_workspace(
         report.push(Check::pending_upgrade(name, recorded));
         return;
     }
-    if let Some(check) = Check::older_storage_of(config, name, row.id.as_str()) {
-        report.push(check);
-    }
+    report
+        .checks
+        .extend(Check::older_storage_of(config, name, row.id.as_str()));
     match WorkspaceDb::open(config, row.id.as_str()) {
         Ok(db) => {
             let tables = db.list_tables().map_or(0, |t| t.len());
