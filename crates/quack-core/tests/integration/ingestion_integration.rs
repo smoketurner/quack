@@ -4789,6 +4789,214 @@ async fn a_table_replacement_swaps_the_table_and_a_failed_one_changes_nothing() 
     assert!(db.list_tables().unwrap().contains(&String::from("sales")));
 }
 
+/// A replacement workbook whose sheet names changed drops the old
+/// per-sheet tables (and their per-sheet CSVs) that the successor did not
+/// take over, so they do not orphan in `list_tables` or on disk.
+#[tokio::test]
+async fn repro_replaced_workbook_with_changed_sheet_names_leaks_old_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let ingested = |o: ingestion::IngestOutcome| o.ingested().unwrap();
+
+    let first = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("Report.xlsx", &two_sheet_xlsx("Q1", "Q2")),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        first.tables,
+        vec!["Report_Q1".to_owned(), "Report_Q2".to_owned()]
+    );
+
+    let second = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("Report.xlsx", &two_sheet_xlsx("Q1_2024", "Q2_2024"))
+                .replaces(Some(&first.document_id)),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        second.tables,
+        vec!["Report_Q1_2024".to_owned(), "Report_Q2_2024".to_owned()]
+    );
+
+    let tables = db.list_tables().unwrap();
+    assert!(
+        !tables.contains(&String::from("Report_Q1"))
+            && !tables.contains(&String::from("Report_Q2")),
+        "old sheet tables should be gone after replacement, but list_tables = {tables:?}"
+    );
+    assert!(
+        tables.contains(&String::from("Report_Q1_2024"))
+            && tables.contains(&String::from("Report_Q2_2024")),
+        "new sheet tables should be present, but list_tables = {tables:?}"
+    );
+    assert_eq!(
+        db.table_owner("Report_Q1_2024").unwrap().map(|d| d.id),
+        Some(second.document_id)
+    );
+    assert_eq!(
+        db.document(&first.document_id).unwrap().unwrap().status,
+        DocumentStatus::Superseded
+    );
+}
+
+/// A replacement workbook that keeps some sheet names and renames others
+/// drops only the renamed sheets' old tables; the kept-name sheets' tables
+/// survive (the successor took them over).
+#[tokio::test]
+async fn replacement_workbook_with_partially_renamed_sheets_drops_only_renamed() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let ingested = |o: ingestion::IngestOutcome| o.ingested().unwrap();
+
+    let first = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("Report.xlsx", &two_sheet_xlsx("Q1", "Q2")),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        first.tables,
+        vec!["Report_Q1".to_owned(), "Report_Q2".to_owned()]
+    );
+
+    let second = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("Report.xlsx", &two_sheet_xlsx("Q1", "Q2_renamed"))
+                .replaces(Some(&first.document_id)),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        second.tables,
+        vec!["Report_Q1".to_owned(), "Report_Q2_renamed".to_owned()]
+    );
+
+    let tables = db.list_tables().unwrap();
+    assert!(
+        !tables.contains(&String::from("Report_Q2")),
+        "the renamed sheet's old table should be gone, but list_tables = {tables:?}"
+    );
+    assert!(
+        tables.contains(&String::from("Report_Q1")),
+        "the kept-name sheet's table should survive, but list_tables = {tables:?}"
+    );
+    assert!(
+        tables.contains(&String::from("Report_Q2_renamed")),
+        "the new sheet's table should be present, but list_tables = {tables:?}"
+    );
+    assert_eq!(
+        db.table_owner("Report_Q1").unwrap().map(|d| d.id),
+        Some(second.document_id)
+    );
+}
+
+/// Replacing a workbook with a non-table file (e.g. Markdown) drops all the
+/// old per-sheet tables, since the successor takes over none of them.
+#[tokio::test]
+async fn replacing_a_workbook_with_a_chunked_file_drops_all_sheet_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let ingested = |o: ingestion::IngestOutcome| o.ingested().unwrap();
+
+    let first = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("Report.xlsx", &two_sheet_xlsx("Q1", "Q2")),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        first.tables,
+        vec!["Report_Q1".to_owned(), "Report_Q2".to_owned()]
+    );
+
+    let second = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("Report.md", b"The report is now text.\n")
+                .replaces(Some(&first.document_id)),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(second.tables.is_empty());
+
+    let tables = db.list_tables().unwrap();
+    assert!(
+        !tables.contains(&String::from("Report_Q1"))
+            && !tables.contains(&String::from("Report_Q2")),
+        "all old sheet tables should be gone after replacing with text, but list_tables = {tables:?}"
+    );
+}
+
+/// Deleting a superseded workbook document after its replacement dropped
+/// the orphaned tables does not drop the successor's tables.
+#[tokio::test]
+async fn deleting_a_superseded_workbook_after_replacement_keeps_successor_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config_no_provider(dir.path());
+    let db = WorkspaceDb::open(&config, "ws-replace").unwrap();
+    let writer = writer_of(&db);
+    let ingested = |o: ingestion::IngestOutcome| o.ingested().unwrap();
+
+    let first = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("Report.xlsx", &two_sheet_xlsx("Q1", "Q2")),
+        )
+        .await
+        .unwrap(),
+    );
+    let _second = ingested(
+        ingest(
+            &config,
+            &writer,
+            ingestion::NewFile::new("Report.xlsx", &two_sheet_xlsx("Q1_2024", "Q2_2024"))
+                .replaces(Some(&first.document_id)),
+        )
+        .await
+        .unwrap(),
+    );
+
+    assert!(db.delete_document(&first.document_id).unwrap());
+    let tables = db.list_tables().unwrap();
+    assert!(
+        tables.contains(&String::from("Report_Q1_2024"))
+            && tables.contains(&String::from("Report_Q2_2024")),
+        "successor tables should survive deleting the superseded doc, but list_tables = {tables:?}"
+    );
+    assert!(
+        !tables.contains(&String::from("Report_Q1"))
+            && !tables.contains(&String::from("Report_Q2")),
+        "old tables should still be gone after deleting the superseded doc, but list_tables = {tables:?}"
+    );
+}
+
 /// Captions and source code are chunked with locators that reach the
 /// stored chunk, the search hit, and the citation label.
 #[tokio::test]

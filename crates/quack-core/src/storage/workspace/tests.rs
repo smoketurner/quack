@@ -3441,6 +3441,134 @@ fn opening_a_version_15_workspace_lists_each_columns_values() {
     assert_eq!(range.as_deref(), Some("1 to 3"));
 }
 
+/// Live documents still marked as being replaced: after the restart
+/// sweep, none.
+fn marked(db: &WorkspaceDb) -> Vec<(String, String)> {
+    let mut stmt = db
+        .conn
+        .prepare(
+            "SELECT id, superseded_by FROM _quack_documents \
+             WHERE superseded_by IS NOT NULL AND status <> 'superseded' ORDER BY id",
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap_or_else(|e| fail(&e.to_string()))
+        .collect::<duckdb::Result<_>>()
+        .unwrap_or_else(|e| fail(&e.to_string()))
+}
+
+/// Every state a crash can leave a replacement in ends at the next open:
+/// a new document still queued fails and frees the old one, a mark naming
+/// a document that was never written is cleared, and a new document that
+/// became ready before the old one was superseded finishes the handoff,
+/// dropping the sheet table it did not take over.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test")]
+fn the_restart_sweep_ends_every_interrupted_replacement() {
+    let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
+    let ready = |id: &DocumentId, name: &str| {
+        db.insert_document(
+            &NewDocument::new(id, name, "text/markdown", 1).with_status(DocumentStatus::Ready),
+        )
+        .unwrap();
+    };
+    let mark = |old: &DocumentId, new: &str| {
+        db.conn
+            .execute(
+                "UPDATE _quack_documents SET superseded_by = ? WHERE id = ?",
+                duckdb::params![new, old],
+            )
+            .unwrap();
+    };
+
+    // Crashed while the new document was queued.
+    let (queued_old, queued_new) = (DocumentId::from("a-old"), DocumentId::from("a-new"));
+    ready(&queued_old, "a.md");
+    db.insert_document_replacing(
+        &NewDocument::new(&queued_new, "a.md", "text/markdown", 2),
+        Some(&queued_old),
+    )
+    .unwrap();
+    // Crashed between marking and inserting, as an earlier quack could.
+    let orphan = DocumentId::from("b-old");
+    ready(&orphan, "b.md");
+    mark(&orphan, "b-never-written");
+    // Crashed after the new document became ready, before the handoff.
+    let (wb_old, wb_new) = (DocumentId::from("c-old"), DocumentId::from("c-new"));
+    ready(&wb_old, "Report.xlsx");
+    ready(&wb_new, "Report.xlsx");
+    db.conn
+        .execute_batch(
+            "CREATE TABLE \"Report_Q1\" (a INTEGER); CREATE TABLE \"Report_Q2\" (a INTEGER); \
+             CREATE TABLE \"Report_Q2_2024\" (a INTEGER);",
+        )
+        .unwrap();
+    db.set_document_tables(
+        &wb_old,
+        &[String::from("Report_Q1"), String::from("Report_Q2")],
+    )
+    .unwrap();
+    db.set_document_tables(
+        &wb_new,
+        &[String::from("Report_Q1"), String::from("Report_Q2_2024")],
+    )
+    .unwrap();
+    db.conn
+        .execute(
+            "UPDATE _quack_documents SET pinned = true WHERE id = ?",
+            duckdb::params![wb_old],
+        )
+        .unwrap();
+    mark(&wb_old, wb_new.as_str());
+    assert_eq!(marked(&db).len(), 3);
+
+    assert_eq!(db.fail_stale_uploads().unwrap(), 1, "the queued one failed");
+    assert_eq!(marked(&db), Vec::new(), "no live document is still marked");
+    let doc = |id: &DocumentId| db.document(id).unwrap().unwrap();
+    assert_eq!(doc(&queued_new).status, DocumentStatus::Error);
+    assert_eq!(doc(&queued_old).status, DocumentStatus::Ready);
+    assert_eq!(doc(&orphan).status, DocumentStatus::Ready);
+    assert_eq!(doc(&wb_old).status, DocumentStatus::Superseded);
+    assert_eq!(
+        doc(&wb_new).pinning,
+        Pinning::Pinned,
+        "the pin moved to the new workbook"
+    );
+    let tables = db.list_tables().unwrap();
+    assert!(!tables.contains(&String::from("Report_Q2")), "{tables:?}");
+    assert!(tables.contains(&String::from("Report_Q1")), "{tables:?}");
+    assert!(
+        tables.contains(&String::from("Report_Q2_2024")),
+        "{tables:?}"
+    );
+
+    // Each one can be replaced again.
+    for old in [&queued_old, &orphan] {
+        db.begin_replacement(old, &DocumentId::generate()).unwrap();
+    }
+}
+
+/// A registration that fails leaves no mark behind: the old document can
+/// still be replaced.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test")]
+fn a_failed_registration_leaves_the_old_document_unmarked() {
+    let db = WorkspaceDb::open_in_memory(Dimension::new(4)).unwrap();
+    let old = DocumentId::from("old");
+    db.insert_document(
+        &NewDocument::new(&old, "a.md", "text/markdown", 1).with_status(DocumentStatus::Ready),
+    )
+    .unwrap();
+    // The same id twice: the insert fails after the mark was made.
+    let refused = db.insert_document_replacing(
+        &NewDocument::new(&old, "a.md", "text/markdown", 2),
+        Some(&old),
+    );
+    assert!(refused.is_err());
+    assert_eq!(marked(&db), Vec::new());
+    assert_eq!(db.document(&old).unwrap().unwrap().superseded_by, None);
+}
+
 /// `DuckDB` 2.0 serializes a data-modifying common table expression inside a
 /// SELECT: classified by its tree alone it would be a read. Each one is a
 /// write, its `_quack_` target is still refused though an INSERT node

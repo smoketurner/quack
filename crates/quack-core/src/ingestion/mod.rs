@@ -556,22 +556,22 @@ impl Pending {
             tracing::info!(document = %failed, file = %self.filename, "removed an earlier failed attempt at the file");
         }
         let doc_id = DocumentId::generate();
-        if let Some(old) = &self.replaces {
-            db.begin_replacement(old, &doc_id)?;
-        }
-        db.insert_document(&NewDocument {
-            id: &doc_id,
-            filename: &self.filename,
-            title: self.title.as_deref(),
-            mime_type: self.file_type.mime_type(),
-            size_bytes: self.size_bytes,
-            sha256: &self.sha256,
-            source: self.source,
-            status: DocumentStatus::Queued,
-            ingested_by: self.ingested_by.as_deref(),
-            source_root: self.source_root.as_deref(),
-            source_path: self.source_path.as_deref(),
-        })?;
+        db.insert_document_replacing(
+            &NewDocument {
+                id: &doc_id,
+                filename: &self.filename,
+                title: self.title.as_deref(),
+                mime_type: self.file_type.mime_type(),
+                size_bytes: self.size_bytes,
+                sha256: &self.sha256,
+                source: self.source,
+                status: DocumentStatus::Queued,
+                ingested_by: self.ingested_by.as_deref(),
+                source_root: self.source_root.as_deref(),
+                source_path: self.source_path.as_deref(),
+            },
+            self.replaces.as_ref(),
+        )?;
         Ok(Registration::New(doc_id))
     }
 }
@@ -615,24 +615,13 @@ impl<M: EmbeddingModel> Processing<'_, M> {
                 // One transaction: a reader sees the new document ready
                 // only once the old one is superseded.
                 result.replaced = db
-                    .run(move |db| {
-                        db.write_transaction(|db| {
-                            db.set_document_chunk_count(&id, chunks)?;
-                            db.set_document_pages(&id, pages)?;
-                            db.set_document_tables(&id, &tables)?;
-                            db.update_document_status(&id, DocumentStatus::Ready)?;
-                            db.finish_replacement(&id)
-                        })
-                    })
-                    .await?;
+                    .run(move |db| db.complete_document(&id, chunks, pages, &tables))
+                    .await?
+                    .map(|replacement| replacement.old);
             }
             Err(e) => {
                 let message = e.to_string();
-                db.run(move |db| {
-                    db.discard_chunks(&id)?;
-                    db.mark_document_error(&id, &message)
-                })
-                .await?;
+                db.run(move |db| db.fail_document(&id, &message)).await?;
             }
         }
         outcome

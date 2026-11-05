@@ -2465,7 +2465,7 @@ impl WorkspaceDb {
     }
 
     /// Mark `old` as being replaced by `new`: `old` keeps serving until
-    /// `new` is ready ([`Self::finish_replacement`]), and a failure of
+    /// `new` is ready ([`Self::complete_document`]), and a failure of
     /// `new` undoes the mark ([`Self::mark_document_error`]).
     ///
     /// # Errors
@@ -2499,23 +2499,22 @@ impl WorkspaceDb {
         Ok(())
     }
 
-    /// `new` is ready: the document it replaces becomes `superseded` and
-    /// `new` takes over its pin. Returns the replaced document's id, if
-    /// there was one.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if an update fails.
-    pub fn finish_replacement(&self, new: &DocumentId) -> Result<Option<DocumentId>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, pinned FROM _quack_documents WHERE superseded_by = ?")?;
-        let mut rows = stmt.query(duckdb::params![new])?;
+    /// `new` is ready: the document it replaces becomes `superseded`, `new`
+    /// takes over its pin, and the replaced document's tables that `new` did
+    /// not load over (a workbook sheet renamed, a document with fewer
+    /// tables) are dropped with what they gave the graph. Part of
+    /// [`Self::complete_document`]'s transaction, or the restart sweep's.
+    fn finish_replacement(&self, new: &DocumentId) -> Result<Option<Replacement>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, pinned FROM _quack_documents WHERE superseded_by = ? AND status <> ?",
+        )?;
+        let mut rows = stmt.query(duckdb::params![new, DocumentStatus::Superseded])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
         let (old, pinned): (DocumentId, bool) = (row.get(0)?, row.get(1)?);
         drop(rows);
+        drop(stmt);
         self.conn.execute(
             "UPDATE _quack_documents SET status = ? WHERE id = ?",
             duckdb::params![DocumentStatus::Superseded, old],
@@ -2526,7 +2525,97 @@ impl WorkspaceDb {
                 duckdb::params![new],
             )?;
         }
-        Ok(Some(old))
+        let dropped = self.drop_unclaimed_tables(&old)?;
+        Ok(Some(Replacement { old, dropped }))
+    }
+
+    /// Drop the tables the superseded document `old` recorded that no live
+    /// document lists: its replacement loaded others in their place.
+    /// Returns those that existed, whose `files/` copies the caller removes
+    /// once this commits.
+    fn drop_unclaimed_tables(&self, old: &DocumentId) -> Result<Vec<String>> {
+        let Some(tables) = self.document(old)?.and_then(|doc| doc.tables) else {
+            return Ok(Vec::new());
+        };
+        let existing = self.list_tables()?;
+        let mut dropped = Vec::new();
+        for table in tables {
+            if !existing.contains(&table) || self.table_owner(&table)?.is_some() {
+                continue;
+            }
+            dropped.push(table);
+        }
+        if dropped.is_empty() {
+            return Ok(dropped);
+        }
+        self.forget_graph_provenance(None, &dropped)?;
+        for table in &dropped {
+            self.conn
+                .execute_batch(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)))?;
+        }
+        tracing::info!(document = %old, tables = ?dropped, "dropped the tables a replacement did not take over");
+        Ok(dropped)
+    }
+
+    /// Register `doc`, marking `replaces` as being replaced by it, in one
+    /// transaction: a crash cannot leave the mark without its replacement.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::begin_replacement`] and
+    /// [`Self::insert_document`]; nothing is written then.
+    pub fn insert_document_replacing(
+        &self,
+        doc: &NewDocument<'_>,
+        replaces: Option<&DocumentId>,
+    ) -> Result<()> {
+        self.write_transaction(|db| {
+            if let Some(old) = replaces {
+                db.begin_replacement(old, doc.id)?;
+            }
+            db.insert_document(doc)
+        })
+    }
+
+    /// Record what document `id` loaded and make it `ready`, finishing the
+    /// replacement it carries, in one transaction: a crash leaves either
+    /// the old document serving or the new one, never both. Returns the
+    /// replacement; its dropped tables' files are removed once this commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a statement fails; nothing is written then.
+    pub fn complete_document(
+        &self,
+        id: &DocumentId,
+        chunks: u32,
+        pages: Option<PageCounts>,
+        tables: &[String],
+    ) -> Result<Option<Replacement>> {
+        let replacement = self.write_transaction(|db| {
+            db.set_document_chunk_count(id, chunks)?;
+            db.set_document_pages(id, pages)?;
+            db.set_document_tables(id, tables)?;
+            db.update_document_status(id, DocumentStatus::Ready)?;
+            db.finish_replacement(id)
+        })?;
+        if let Some(replacement) = &replacement {
+            self.remove_table_files(&replacement.dropped);
+        }
+        Ok(replacement)
+    }
+
+    /// Discard what document `id` stored and record its failure, in one
+    /// transaction; a replacement it carried is abandoned with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a statement fails; nothing is written then.
+    pub fn fail_document(&self, id: &DocumentId, message: &str) -> Result<()> {
+        self.write_transaction(|db| {
+            db.discard_chunks(id)?;
+            db.mark_document_error(id, message)
+        })
     }
 
     /// Forget that `new` was to replace anything: the document it would
@@ -2638,17 +2727,60 @@ impl WorkspaceDb {
     ///
     /// Returns an error if the update fails.
     pub fn fail_stale_uploads(&self) -> Result<usize> {
-        let changed = self.conn.execute(
-            "UPDATE _quack_documents SET status = ?, \
-             error_message = 'interrupted by a restart before it was processed; upload it again' \
-             WHERE status IN (?, ?)",
-            duckdb::params![
-                DocumentStatus::Error,
-                DocumentStatus::Queued,
-                DocumentStatus::Processing
-            ],
-        )?;
+        let (changed, dropped) = self.write_transaction(|db| {
+            let changed = db.conn.execute(
+                "UPDATE _quack_documents SET status = ?, \
+                 error_message = 'interrupted by a restart before it was processed; upload it again' \
+                 WHERE status IN (?, ?)",
+                duckdb::params![
+                    DocumentStatus::Error,
+                    DocumentStatus::Queued,
+                    DocumentStatus::Processing
+                ],
+            )?;
+            Ok((changed, db.settle_replacements()?))
+        })?;
+        self.remove_table_files(&dropped);
         Ok(changed)
+    }
+
+    /// Bring every replacement a crash interrupted to an end, when nothing
+    /// is queued or processing: one whose new document is ready finishes,
+    /// any other is abandoned (its new document failed, or was never
+    /// written). Afterwards a `superseded_by` on a live document names
+    /// nothing. Returns the tables the finished replacements dropped.
+    /// Tables an earlier quack left behind a finished replacement are not
+    /// touched: by now one of that name may be a person's own.
+    fn settle_replacements(&self) -> Result<Vec<String>> {
+        let pending: Vec<(DocumentId, DocumentId)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT d.id, d.superseded_by FROM _quack_documents d \
+                 WHERE d.superseded_by IS NOT NULL AND d.status <> ? ORDER BY d.id",
+            )?;
+            stmt.query_map(duckdb::params![DocumentStatus::Superseded], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<duckdb::Result<_>>()?
+        };
+        let mut dropped = Vec::new();
+        for (old, new) in pending {
+            let ready = self
+                .document(&new)?
+                .is_some_and(|doc| doc.status == DocumentStatus::Ready);
+            if ready {
+                tracing::warn!(old = %old, new = %new, "finishing a replacement a restart interrupted");
+                if let Some(replacement) = self.finish_replacement(&new)? {
+                    dropped.extend(replacement.dropped);
+                }
+            } else {
+                tracing::warn!(old = %old, new = %new, "abandoning a replacement a restart interrupted");
+                self.conn.execute(
+                    "UPDATE _quack_documents SET superseded_by = NULL WHERE id = ?",
+                    duckdb::params![old],
+                )?;
+            }
+        }
+        Ok(dropped)
     }
 
     /// Set the title parsed from the content, when the caller gave none.
@@ -2901,7 +3033,7 @@ impl WorkspaceDb {
             }
             unowned
         };
-        self.forget_graph_provenance(id, &tables)?;
+        self.forget_graph_provenance(Some(id), &tables)?;
         self.conn.execute(
             "DELETE FROM _quack_graph_extracted WHERE chunk_id IN (SELECT id FROM _quack_chunks WHERE document_id = ?)",
             duckdb::params![id],
@@ -2935,11 +3067,15 @@ impl WorkspaceDb {
         Ok(true)
     }
 
-    /// Drop the provenance a document and its tables gave the graph, then
-    /// the nodes and edges left without any provenance at all (an edge
-    /// whose endpoint goes falls with it, as `graph::store::delete_nodes`
-    /// does).
-    fn forget_graph_provenance(&self, document_id: &DocumentId, tables: &[String]) -> Result<()> {
+    /// Drop the provenance a document (when one is named) and `tables` gave
+    /// the graph, then the nodes and edges left without any provenance at
+    /// all (an edge whose endpoint goes falls with it, as
+    /// `graph::store::delete_nodes` does).
+    fn forget_graph_provenance(
+        &self,
+        document_id: Option<&DocumentId>,
+        tables: &[String],
+    ) -> Result<()> {
         let table_list = sql_text_list(tables);
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT subject_id FROM _quack_provenance \
@@ -2981,10 +3117,10 @@ impl WorkspaceDb {
              OR NOT EXISTS (SELECT 1 FROM _quack_graph_nodes n WHERE n.id = drop_node_id);",
         )?;
         tracing::info!(
-            document_id = %document_id,
+            document_id = ?document_id,
             orphan_nodes,
             orphan_edges,
-            "removed graph rows that only the deleted document supported"
+            "removed graph rows that only what was removed supported"
         );
         Ok(())
     }
@@ -3015,10 +3151,31 @@ impl WorkspaceDb {
         if let Some(FileType::Image(format)) = FileType::of(filename) {
             candidates.push(StoredImage::in_dir(files_dir, id, format).path().to_owned());
         }
-        for table in tables {
-            candidates.push(files_dir.join(format!("{table}.csv")));
+        candidates.extend(Self::table_files(files_dir, tables));
+        Self::remove_files(candidates);
+    }
+
+    /// The copies of `tables` a load keeps under `files/`.
+    fn table_files<'t>(
+        files_dir: &'t Path,
+        tables: &'t [String],
+    ) -> impl Iterator<Item = PathBuf> + 't {
+        tables
+            .iter()
+            .map(move |table| files_dir.join(format!("{table}.csv")))
+    }
+
+    /// Remove the `files/` copies of tables a replacement dropped. Called
+    /// once the drop has committed, so a rolled-back drop keeps its files.
+    pub fn remove_table_files(&self, tables: &[String]) {
+        if let Some(files_dir) = &self.files_dir {
+            Self::remove_files(Self::table_files(files_dir, tables));
         }
-        for path in candidates {
+    }
+
+    /// Remove each file; a missing one is fine, any other failure is logged.
+    fn remove_files(paths: impl IntoIterator<Item = PathBuf>) {
+        for path in paths {
             match std::fs::remove_file(&path) {
                 Ok(()) => tracing::debug!(path = %path.display(), "removed an ingested file"),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -5001,6 +5158,15 @@ impl DocumentInfo {
             }
         }
     }
+}
+
+/// A replacement [`WorkspaceDb::complete_document`] finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replacement {
+    /// The document now `superseded`.
+    pub old: DocumentId,
+    /// Its tables the new document did not load over, now dropped.
+    pub dropped: Vec<String>,
 }
 
 /// How a document reached the workspace.
