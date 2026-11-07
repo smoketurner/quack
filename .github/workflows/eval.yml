@@ -75,7 +75,7 @@ jobs:
           shared-key: "debug-${{ runner.os }}"
           save-if: false
       - name: Install and start Ollama
-        uses: ai-action/setup-ollama@4bf548198040c1344478ef71f5233d2249695539 # v2.1.13
+        uses: ai-action/setup-ollama@85cd2094215be6b76d0ad90e93393647dc7a55ba # v2.1.16
         env:
           # The server the action starts inherits this: the agent's prompt
           # (tables, documents, and tool guidance) runs past Ollama's default
